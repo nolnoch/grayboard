@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "grayboard": {
+      "command": "bun",
+      "args": ["./src/server.ts"],
+      "env": {
+        "BUS_IDENTITY": "dev"
+      }
+    }
+  }
+}

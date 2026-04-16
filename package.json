@@ -1,0 +1,18 @@
+{
+  "name": "grayboard",
+  "version": "0.0.1",
+  "description": "Durable Claude-to-Claude message bus over the channels protocol",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "server": "bun src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}
