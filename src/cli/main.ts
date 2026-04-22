@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, ApiError, type Credentials } from "./api.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -131,7 +132,7 @@ program
   .name("grayboard")
   .description("Grayboard CLI — manage identities, teams, and sessions")
   .option("--json", "output JSON")
-  .version("0.1.0");
+  .version(pkg.version);
 
 const globalJson = () => !!(program.opts() as { json?: boolean }).json;
 

@@ -15,6 +15,7 @@ import {
   unreadFor,
 } from "./db.ts";
 import { listenForWakeup, poke } from "./wakeup.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 const rawIdentity = process.env.BUS_IDENTITY;
 if (!rawIdentity) {
@@ -25,7 +26,7 @@ if (!rawIdentity) {
 const IDENTITY: string = rawIdentity;
 
 const mcp = new Server(
-  { name: "grayboard", version: "0.0.1" },
+  { name: "grayboard", version: pkg.version },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

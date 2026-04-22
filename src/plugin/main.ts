@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk } from "../shared/protocol.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 // ── credentials ───────────────────────────────────────────────────────────────
 
@@ -42,30 +43,25 @@ if (!identity) {
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 
-const server = new McpServer({
-  name: "grayboard",
-  version: "0.1.0",
-});
-
-// ── channel notification helper ───────────────────────────────────────────────
-
-function buildChannelTag(msg: Message): string {
-  const attrs: Record<string, string | number> = {
-    source:     "grayboard",
-    message_id: msg.id,
-    from:       msg.sender,
-    created_at: msg.created_at,
-  };
-  if (msg.parent_id !== null) attrs.in_reply_to = msg.parent_id;
-  if (msg.recipient_type === "team") {
-    // extract team name from "team:name"
-    attrs.team = msg.recipient.slice(5);
-  }
-  const attrStr = Object.entries(attrs)
-    .map(([k, v]) => `${k}="${v}"`)
-    .join(" ");
-  return `<channel ${attrStr}>${msg.body}</channel>`;
-}
+const server = new McpServer(
+  {
+    name: "grayboard",
+    version: pkg.version,
+  },
+  {
+    capabilities: {
+      experimental: { "claude/channel": {} },
+      tools: {},
+    },
+    instructions: [
+      `You are identity "${identity}" on the grayboard bus, which coordinates between Claude instances.`,
+      `Incoming peer messages arrive as <channel source="grayboard" message_id="..." from="..." [in_reply_to="..."] [team="..."]>body</channel>.`,
+      `To send: call bus_send with recipient (user@org/name or team:name) and body; add parent_id to thread.`,
+      `To catch up without waiting for a push, call bus_history. For a full thread, call bus_thread.`,
+      `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
+    ].join(" "),
+  },
+);
 
 // ── WS client setup ───────────────────────────────────────────────────────────
 
@@ -74,10 +70,16 @@ const client = new GrayboardClient(
   creds.session_token,
   identity,
   (msg: Message) => {
-    // Push received — notify Claude via channels protocol
+    const meta: Record<string, string> = {
+      message_id: String(msg.id),
+      from:       msg.sender,
+      created_at: String(msg.created_at),
+    };
+    if (msg.parent_id !== null) meta.in_reply_to = String(msg.parent_id);
+    if (msg.recipient_type === "team") meta.team = msg.recipient.slice(5);
     server.server.notification({
       method: "notifications/claude/channel",
-      params: { content: buildChannelTag(msg) },
+      params: { content: msg.body, meta },
     });
   },
 );
