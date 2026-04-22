@@ -95,14 +95,25 @@ Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
 ### Server-side install (one-time, ops)
 
-On a fresh EC2 instance (Ubuntu 24.04 LTS, t4g.small is enough):
+On a fresh EC2 instance (Ubuntu 24.04 LTS, t4g.small is enough — pick the ARM AMI to keep that instance type available; Bun supports linux-arm64).
 
 ```bash
 sudo useradd -r -m -d /var/lib/grayboard grayboard
-sudo mkdir -p /opt/grayboard /etc/grayboard
-sudo git clone https://github.com/nolnoch/grayboard.git /opt/grayboard
-sudo chown -R grayboard:grayboard /opt/grayboard /var/lib/grayboard
-cd /opt/grayboard && sudo -u grayboard bun install
+sudo mkdir -p /var/lib/grayboard /etc/grayboard
+sudo chown grayboard:grayboard /var/lib/grayboard
+
+# Install the server binary (and the CLI + plugin, which are useful for ops smoke tests)
+curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
+  | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
+```
+
+Fetch the deploy artifacts (systemd unit, Caddyfile, backup script). Either clone the repo for them, or curl them individually:
+
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/grayboard.service -o /etc/systemd/system/grayboard.service
+sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/Caddyfile         -o /etc/caddy/Caddyfile
+sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/backup.sh         -o /usr/local/bin/grayboard-backup
+sudo chmod +x /usr/local/bin/grayboard-backup
 ```
 
 Create `/etc/grayboard/env` (mode `0600`, owned by `grayboard`):
@@ -118,22 +129,38 @@ GRAYBOARD_MESSAGE_RETENTION_DAYS=90
 GRAYBOARD_AUDIT_RETENTION_DAYS=90
 ```
 
-Install systemd, Caddy, and the backup cron from `deploy/`:
+Adjust the hostname in `/etc/caddy/Caddyfile`, then start everything:
 
 ```bash
-sudo cp deploy/grayboard.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now grayboard
-
-sudo cp deploy/Caddyfile /etc/caddy/Caddyfile   # adjust the hostname first
 sudo systemctl reload caddy
 
-sudo cp deploy/backup.sh /usr/local/bin/grayboard-backup
-sudo chmod +x /usr/local/bin/grayboard-backup
 echo "0 3 * * * grayboard S3_BUCKET=<bucket> /usr/local/bin/grayboard-backup" | sudo tee /etc/cron.d/grayboard-backup
 ```
 
-Caddy handles TLS via Let's Encrypt automatically. WS upgrade is transparent in `reverse_proxy`.
+Caddy handles TLS via Let's Encrypt automatically. WS upgrade is transparent in `reverse_proxy`. Updating the server later is just `INSTALL_SERVER=1 GRAYBOARD_VERSION=v0.2.0 bash install.sh && systemctl restart grayboard`.
+
+<details>
+<summary>Alternative: source-tree install (for hacking on the server itself)</summary>
+
+```bash
+sudo useradd -r -m -d /var/lib/grayboard grayboard
+sudo mkdir -p /opt/grayboard /etc/grayboard /var/lib/grayboard
+sudo git clone https://github.com/nolnoch/grayboard.git /opt/grayboard
+sudo chown -R grayboard:grayboard /opt/grayboard /var/lib/grayboard
+cd /opt/grayboard && sudo -u grayboard bun install
+```
+
+Then in `/etc/systemd/system/grayboard.service`, swap the `ExecStart` for the source-mode form (commented in `deploy/grayboard.service`):
+
+```ini
+WorkingDirectory=/opt/grayboard
+ExecStart=/usr/local/bin/bun run src/server/main.ts
+```
+
+Everything else (env file, Caddyfile, backup cron) is identical.
+</details>
 
 **Google OAuth setup.** Create an OAuth 2.0 client in Google Cloud Console (Web application). Authorized redirect URIs: not needed for the server-side exchange used here, but the loopback flow uses `http://127.0.0.1:<random-port>/cb` — Google permits loopback redirects without registration. Restrict the consent screen to your workspace if you want extra belt-and-suspenders alongside the `hd` claim check.
 

@@ -418,12 +418,13 @@ Each binary is ~100 MB (Bun runtime + bundled JS). Bun cross-compiles via `--tar
 **`install.sh`** at repo root:
 - Detects OS + arch.
 - Downloads `grayboard-<target>` and `grayboard-plugin-<target>` from `releases/latest/download` to `~/.local/bin/grayboard` and `~/.local/bin/grayboard-plugin`.
-- `chmod +x`, warns if `~/.local/bin` isn't on `PATH`.
-- Overrides: `GRAYBOARD_VERSION=v0.1.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`.
+- With `INSTALL_SERVER=1`, also fetches `grayboard-server-<target>`. Used on the EC2 host alongside `INSTALL_DIR=/usr/local/bin`.
+- `chmod +x`, warns if `INSTALL_DIR` isn't on `PATH`.
+- Overrides: `GRAYBOARD_VERSION=v0.1.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`, `INSTALL_SERVER=1`.
 
 The compiled CLI's `findPluginCommand` (§8.1) finds the sibling `grayboard-plugin` binary automatically and writes a binary-form `.mcp.json` (no `bun` invocation). Source-tree installs continue to write the `bun src/plugin/main.ts` form. Both are valid; the user just sees `grayboard identity create fe --mcp` and the right thing happens.
 
-**`grayboard-server`** is shipped in releases for ops convenience (drop-in for `bun run src/server/main.ts` in the systemd unit) but `install.sh` does **not** install it on developer machines — the server is one-deployment-per-org, not per-developer.
+**`grayboard-server`** is shipped in releases as the default server install path. The systemd unit (`deploy/grayboard.service`) points at `/usr/local/bin/grayboard-server` out of the box; the source-tree alternative (`bun run src/server/main.ts` with `WorkingDirectory=/opt/grayboard`) is documented in the unit file as a comment. Server upgrades are `INSTALL_SERVER=1 GRAYBOARD_VERSION=vX.Y.Z bash install.sh && systemctl restart grayboard` — no git pull, no `bun install`, no source on the host.
 
 ### 10b.1 Cutting a release
 
