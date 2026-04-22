@@ -1,0 +1,18 @@
+[Unit]
+Description=grayboard server
+After=network.target
+
+[Service]
+Type=simple
+User=grayboard
+EnvironmentFile=/etc/grayboard/env
+ExecStart=/usr/local/bin/grayboard-server
+Restart=always
+RestartSec=3
+
+# To run from source instead of the compiled binary, swap ExecStart for:
+#   WorkingDirectory=/opt/grayboard
+#   ExecStart=/usr/local/bin/bun run src/server/main.ts
+
+[Install]
+WantedBy=multi-user.target
