@@ -6,3 +6,4 @@ bun.lockb
 *.db-wal
 *.db-shm
 .DS_Store
+meta/
