@@ -425,6 +425,32 @@ The compiled CLI's `findPluginCommand` (§8.1) finds the sibling `grayboard-plug
 
 **`grayboard-server`** is shipped in releases for ops convenience (drop-in for `bun run src/server/main.ts` in the systemd unit) but `install.sh` does **not** install it on developer machines — the server is one-deployment-per-org, not per-developer.
 
+### 10b.1 Cutting a release
+
+Recommended flow for the first release (and a useful template for later ones):
+
+1. **Pre-flight on a release-candidate tag.** Tag from any branch — the workflow runs against whatever commit the tag points at, not against the default branch. This lets you validate the pipeline without merging anything.
+   ```bash
+   git tag v0.1.0-rc1 -m "release candidate"
+   git push origin v0.1.0-rc1
+   ```
+2. **Watch the run.** GitHub → Actions → "Release". Confirm the four matrix jobs build and the publish job attaches 12 binaries (3 entry points × 4 targets) plus `install.sh` to the auto-created release.
+3. **Smoke-test the install on a clean machine** (or a temp dir):
+   ```bash
+   GRAYBOARD_VERSION=v0.1.0-rc1 INSTALL_DIR=/tmp/gb bash install.sh
+   /tmp/gb/grayboard --version
+   ```
+4. **Promote to a real release.** Either move the rc to a clean tag (`git tag v0.1.0 && git push origin v0.1.0`) or, if you want to throw the rc away, delete the rc release + tag in the GitHub UI first to keep the release list tidy.
+
+**Operational notes / gotchas** (standard GitHub Actions behavior, captured here so you don't have to re-derive):
+
+- **First-run approval.** A brand-new repo with no prior Actions history may show your first tagged run as "pending approval" in Settings → Actions → General. Click through it once and subsequent runs go straight through.
+- **`workflow_dispatch` only appears on the default branch.** The "Run workflow" button in the GitHub Actions UI requires `release.yml` to be present on `master`. Tag-triggered runs don't have this restriction. So if you want manual-trigger as a fallback, get the workflow merged to `master` at some point.
+- **Tags are not branch-scoped.** A tag is a pointer to a commit; the workflow runs against that commit's tree. You can release from a feature branch, but the audit trail (release notes, `Source: <branch>`) won't be ideal. Default to tagging from `master`.
+- **Re-running a failed release.** Delete the partial release (UI), delete the tag locally and remotely (`git tag -d v0.1.0 && git push origin :refs/tags/v0.1.0`), fix, re-tag, re-push. There's no in-place "retry" because the artifacts are tied to the release.
+- **Cross-compile is hostless.** Bun cross-compiles all four targets from one Linux x64 runner — no per-OS matrix runners needed. If a target ever needs native deps that don't cross-compile, that's the day this assumption breaks; `release.yml` will need a real per-OS matrix.
+- **Permissions.** The workflow declares `permissions: contents: write` so the default `GITHUB_TOKEN` can create the release. No PAT needed.
+
 ---
 
 ## 11. Spec deviations
