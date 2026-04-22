@@ -100,7 +100,7 @@ On a fresh EC2 instance (Ubuntu 24.04 LTS, t4g.small is enough — pick the ARM 
 Install Caddy (it isn't preinstalled):
 
 ```bash
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+sudo apt install -y apt-transport-https curl gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
   | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
