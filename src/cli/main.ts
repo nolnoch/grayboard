@@ -42,22 +42,28 @@ function findPluginCommand(): PluginInvocation {
       : { command: override, args: [] };
   }
 
-  const cliDir = dirname(resolve(process.argv[1]));
-
-  // 2. compiled sibling binary next to the grayboard CLI (the install.sh case)
+  // 2. compiled sibling binary next to the grayboard CLI (the install.sh case).
+  //    Use execPath, not argv[1]: in a `bun build --compile` binary, argv[1] is a
+  //    virtual filesystem path (/$bunfs/root/...) while execPath is the actual
+  //    on-disk binary location.
+  const execDir = dirname(resolve(process.execPath));
   for (const name of ["grayboard-plugin", "grayboard-plugin.exe"]) {
-    const candidate = join(cliDir, name);
+    const candidate = join(execDir, name);
     if (existsSync(candidate)) return { command: resolve(candidate), args: [] };
   }
 
-  // 3. source tree — walk up from the CLI invocation looking for src/plugin/main.ts
-  let dir = cliDir;
-  for (let i = 0; i < 6; i++) {
-    const candidate = join(dir, "src", "plugin", "main.ts");
-    if (existsSync(candidate)) return { command: "bun", args: [resolve(candidate)] };
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+  // 3. source tree — walk up from the CLI script (argv[1]) looking for
+  //    src/plugin/main.ts. In source mode execPath is the bun binary itself, so
+  //    argv[1] is what tells us where our script lives.
+  if (process.argv[1]) {
+    let dir = dirname(resolve(process.argv[1]));
+    for (let i = 0; i < 6; i++) {
+      const candidate = join(dir, "src", "plugin", "main.ts");
+      if (existsSync(candidate)) return { command: "bun", args: [resolve(candidate)] };
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
 
   throw new Error(
@@ -233,10 +239,16 @@ identityCmd
   .option("--mcp [path]",  "Write .mcp.json entry (default: ./.mcp.json)")
   .option("--force",       "Overwrite entire .mcp.json instead of merging")
   .action(async (name: string, opts: { mcp?: string | boolean; force?: boolean }) => {
+    let res: { name: string; created_at: number };
     try {
-      const res = await makeClient().post("/api/identities", { name });
-      output(res, globalJson());
+      res = await makeClient().post("/api/identities", { name }) as typeof res;
     } catch (e) { handleApiError(e); }
+
+    if (globalJson()) {
+      output(res!, true);
+    } else {
+      console.log(`Created identity '${res!.name}'`);
+    }
 
     if (opts.mcp !== undefined) {
       const mcpPath = opts.mcp === true ? "./.mcp.json" : (opts.mcp as string);
