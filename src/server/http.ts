@@ -54,6 +54,15 @@ async function healthz(repo: Repo): Promise<Response> {
   }
 }
 
+function authConfig(config: Config): Response {
+  // Public bootstrap endpoint. Returns only non-secret values the CLI needs to
+  // start the PKCE loopback flow against Google. The client_secret never appears here.
+  return json({
+    google_client_id: config.googleClientId,
+    org_domain:       config.orgDomain,
+  });
+}
+
 async function authExchange(req: Request, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
@@ -220,6 +229,7 @@ export async function handleHttp(req: Request, repo: Repo, config: Config): Prom
   const method = req.method;
 
   if (path === "/healthz" && method === "GET") return healthz(repo);
+  if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
   if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, config);
   if (path === "/api/auth/dev-login" && method === "POST") {
     if (!config.devAuth) return notFound();

@@ -7,3 +7,4 @@ bun.lockb
 *.db-shm
 .DS_Store
 meta/
+dist/

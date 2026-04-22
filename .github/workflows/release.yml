@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release as (e.g. v0.1.0). Required for manual runs."
+        required: true
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            bun_target: bun-linux-x64
+          - target: linux-arm64
+            bun_target: bun-linux-arm64
+          - target: darwin-x64
+            bun_target: bun-darwin-x64
+          - target: darwin-arm64
+            bun_target: bun-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile binaries for ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          bun build --compile --target=${{ matrix.bun_target }} src/cli/main.ts    --outfile dist/grayboard-${{ matrix.target }}
+          bun build --compile --target=${{ matrix.bun_target }} src/plugin/main.ts --outfile dist/grayboard-plugin-${{ matrix.target }}
+          bun build --compile --target=${{ matrix.bun_target }} src/server/main.ts --outfile dist/grayboard-server-${{ matrix.target }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/grayboard-*
+            install.sh
+          fail_on_unmatched_files: true

@@ -31,38 +31,54 @@ function handleApiError(e: unknown): never {
 
 // ── plugin path resolution ────────────────────────────────────────────────────
 
-function findPluginPath(): string {
-  if (process.env.GRAYBOARD_PLUGIN_PATH) return process.env.GRAYBOARD_PLUGIN_PATH;
+type PluginInvocation = { command: string; args: string[] };
 
-  // Walk up from CLI binary location looking for src/plugin/main.ts
-  let dir = dirname(resolve(process.argv[1]));
+function findPluginCommand(): PluginInvocation {
+  // 1. explicit override (env var) — accepts either a .ts source path or a binary path
+  const override = process.env.GRAYBOARD_PLUGIN_PATH;
+  if (override) {
+    return override.endsWith(".ts")
+      ? { command: "bun", args: [override] }
+      : { command: override, args: [] };
+  }
+
+  const cliDir = dirname(resolve(process.argv[1]));
+
+  // 2. compiled sibling binary next to the grayboard CLI (the install.sh case)
+  for (const name of ["grayboard-plugin", "grayboard-plugin.exe"]) {
+    const candidate = join(cliDir, name);
+    if (existsSync(candidate)) return { command: resolve(candidate), args: [] };
+  }
+
+  // 3. source tree — walk up from the CLI invocation looking for src/plugin/main.ts
+  let dir = cliDir;
   for (let i = 0; i < 6; i++) {
     const candidate = join(dir, "src", "plugin", "main.ts");
-    if (existsSync(candidate)) return resolve(candidate);
+    if (existsSync(candidate)) return { command: "bun", args: [resolve(candidate)] };
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
 
   throw new Error(
-    "Cannot find src/plugin/main.ts. Set GRAYBOARD_PLUGIN_PATH to the absolute path to src/plugin/main.ts.",
+    "Cannot locate grayboard-plugin. Install the release binaries (curl …install.sh | bash), or set GRAYBOARD_PLUGIN_PATH to either a compiled grayboard-plugin binary or src/plugin/main.ts.",
   );
 }
 
 // ── .mcp.json helpers ─────────────────────────────────────────────────────────
 
 function writeMcpJson(targetPath: string, identityName: string, force: boolean): void {
-  let pluginPath: string;
+  let plugin: PluginInvocation;
   try {
-    pluginPath = findPluginPath();
+    plugin = findPluginCommand();
   } catch (e) {
     console.error(String(e));
     process.exit(1);
   }
 
   const entry = {
-    command: "bun",
-    args:    [pluginPath],
+    command: plugin.command,
+    args:    plugin.args,
     env:     { BUS_IDENTITY: identityName },
   };
 
@@ -137,15 +153,25 @@ program
       return;
     }
 
-    // Real OAuth flow — we need the client_id; fetch it from the server or use the hard-coded public value.
-    // For simplicity, we rely on the user having GOOGLE_OAUTH_CLIENT_ID set or a well-known default.
-    const googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+    // Bootstrap: fetch the public OAuth config from the server. Env vars override
+    // for unusual setups (e.g. pointing the loopback flow at a different OAuth app
+    // than the server's own).
+    let googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+    let orgDomain      = process.env.GRAYBOARD_ORG_DOMAIN;
+    if (!googleClientId || !orgDomain) {
+      try {
+        const cfg = await client.get("/api/auth/config") as { google_client_id: string; org_domain: string };
+        googleClientId ??= cfg.google_client_id;
+        orgDomain      ??= cfg.org_domain;
+      } catch (e) {
+        handleApiError(e);
+      }
+    }
     if (!googleClientId) {
-      console.error("Set GOOGLE_OAUTH_CLIENT_ID to your Google OAuth application client ID.");
+      console.error("Server did not return a google_client_id and GOOGLE_OAUTH_CLIENT_ID is not set.");
       process.exit(1);
     }
 
-    const orgDomain = process.env.GRAYBOARD_ORG_DOMAIN;
     let oauthResult;
     try {
       oauthResult = await runOAuthFlow(googleClientId, serverUrl, orgDomain);

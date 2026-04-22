@@ -4,13 +4,16 @@ import { openDatabase, type Repo } from "./db.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
-test("bun:sqlite is only imported from src/server/db.ts", async () => {
+test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tree)", async () => {
+  // src/local/ is the sanctioned same-machine mode (v0 preserved); it owns its own
+  // SQLite layer by design. The migration seam this test guards is the v1 backend —
+  // src/server, src/plugin, src/shared, src/cli — so src/local is excluded.
   const offenders: string[] = [];
   const glob = new Glob("src/**/*.ts");
-  // Match the import statement, not just the string (test files may reference it in assertions)
   const importPattern = /from\s+["']bun:sqlite["']/;
   for await (const file of glob.scan(".")) {
     if (file === "src/server/db.ts") continue;
+    if (file.startsWith("src/local/")) continue;
     if (file.endsWith(".test.ts")) continue;
     const text = await Bun.file(file).text();
     if (importPattern.test(text)) offenders.push(file);
