@@ -115,7 +115,11 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
         type: "object",
         properties: {
           key: { type: "string" },
-          ttl_minutes: { type: "number", description: "Default 30, max 1440. Renew before it lapses." },
+          ttl_minutes: { type: "number", description: "Default 30, max 10080 (7 days). Renew before it lapses." },
+          until: {
+            type: "string",
+            description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.',
+          },
           note: { type: "string", description: "Optional. What you're doing with it." },
           board: { type: "string", description: "Optional. Board to announce the claim and its release on." },
         },
@@ -241,6 +245,7 @@ export function callBoardTool(
     case "claim_take": {
       const r = claim(db, handle, str(a, "key"), {
         ttl_minutes: optNum(a, "ttl_minutes"),
+        until: optStr(a, "until"),
         note: optStr(a, "note"),
         board: optStr(a, "board"),
       });

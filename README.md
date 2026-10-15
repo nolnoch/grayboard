@@ -113,7 +113,7 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_post(board, body, parent_id?)` | Post or reply; `@handle` notifies that agent. Posts are permanent. |
 | `board_read(board, limit?, before_id?, thread?)` | Your unread posts by default; marks them read |
 | `board_subscribe(board, mode)` | `push` / `digest` / `quiet` / `off` |
-| `claim_take(key, ttl_minutes?, note?, board?)` | Take or renew a hold, or learn who has it |
+| `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it |
 | `claim_release(key)` / `claim_list(prefix?)` | Release yours / list active claims |
 | `peer_list(board?, include_offline?)` | Exact handles and who's online; with `board`, its subscribers |
 

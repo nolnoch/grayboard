@@ -16,12 +16,21 @@ export type ClaimResult =
   | { ok: false; held_by: string; note: string | null; expires_at: number };
 
 const DEFAULT_TTL_MIN = 30;
-const MAX_TTL_MIN = 24 * 60;
+const MAX_TTL_MIN = 7 * 24 * 60;
 
-function ttlMs(minutes: number | undefined): number {
+// Absolute expiry from either a duration or a stop time. Stored as a
+// timestamp, so a claim outlives the sessions and machines that took it.
+function expiresAt(now: number, minutes: number | undefined, until: string | undefined): number {
+  if (minutes !== undefined && until !== undefined) throw new CoreError("pass ttl_minutes or until, not both");
+  if (until !== undefined) {
+    const t = Date.parse(until);
+    if (Number.isNaN(t)) throw new CoreError(`until must be an ISO 8601 time, got "${until}"`);
+    if (t <= now || t - now > MAX_TTL_MIN * 60_000) throw new CoreError("until must be in the future and at most 7 days away");
+    return t;
+  }
   const m = minutes ?? DEFAULT_TTL_MIN;
   if (!(m > 0) || m > MAX_TTL_MIN) throw new CoreError(`ttl_minutes must be in (0, ${MAX_TTL_MIN}]`);
-  return m * 60_000;
+  return now + m * 60_000;
 }
 
 function validKey(key: string): string {
@@ -41,14 +50,15 @@ export function claim(
   db: Database,
   handle: string,
   keyInput: string,
-  opts: { ttl_minutes?: number; note?: string; board?: string } = {},
+  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } = {},
 ): ClaimResult {
   const key = validKey(keyInput);
-  const ttl = ttlMs(opts.ttl_minutes);
+  expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
   const board = opts.board ? normalizeBoard(opts.board) : null;
 
   return db.transaction((): ClaimResult => {
     const now = Date.now();
+    const expires = expiresAt(now, opts.ttl_minutes, opts.until);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at };
@@ -67,7 +77,7 @@ export function claim(
            expires_at = excluded.expires_at
          RETURNING *`,
       )
-      .get(key, handle, opts.note ?? null, board, now, now + ttl, now) as Claim;
+      .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
     const wake = renewed
       ? []
       : announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`);

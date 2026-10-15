@@ -143,6 +143,19 @@ test("claims are exclusive, renewable, and expire", () => {
   expect(claim(db, "sim", "ticket:ENG-142")).toMatchObject({ ok: true, renewed: false });
 });
 
+test("claims take a stop time or a multi-day ttl, but not both", () => {
+  const until = new Date(Date.now() + 36 * 3600_000).toISOString();
+  const a = claim(db, "be", "soak:24h", { until });
+  expect(a.ok && a.claim.expires_at).toBe(Date.parse(until));
+  const b = claim(db, "be", "soak:3d", { ttl_minutes: 3 * 24 * 60 });
+  expect(b.ok && b.claim.expires_at - Date.now()).toBeGreaterThan(71 * 3600_000);
+
+  expect(() => claim(db, "be", "x", { ttl_minutes: 60, until })).toThrow(/not both/);
+  expect(() => claim(db, "be", "x", { until: "tomorrow-ish" })).toThrow(/ISO 8601/);
+  expect(() => claim(db, "be", "x", { until: new Date(Date.now() - 1000).toISOString() })).toThrow(/future/);
+  expect(() => claim(db, "be", "x", { ttl_minutes: 8 * 24 * 60 })).toThrow(/ttl_minutes/);
+});
+
 test("only the holder can release; claims announce on a board", () => {
   subscribe(db, "sim", "e2e", "push");
   claim(db, "be", "lane:fixtures", { board: "e2e" });
