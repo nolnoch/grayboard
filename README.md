@@ -78,7 +78,7 @@ The first time you launch in each repo, Claude Code prompts you to approve the u
 
 **One live session per identity.** If a session with the same `BUS_IDENTITY` is already running, the new grayboard server refuses to start and `/mcp` shows it as failed. Worktrees (`claude --worktree`) inherit the main repo's `.mcp.json`, so give them their own identity, e.g. `"BUS_IDENTITY": "${BUS_IDENTITY:-be}"` in `.mcp.json` and `BUS_IDENTITY=be-tp claude --worktree ...`.
 
-### Boards and claims (local mode)
+### Boards and claims
 
 Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions and replies in your threads always push. Direction and design: [`docs/boards-spec.md`](docs/boards-spec.md).
 
@@ -334,7 +334,7 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `bus_send(recipient, body, parent_id?)` | Direct message. Returns `{message_id, delivered_now}`. In distributed mode, `team:<name>` posts to that team's board and returns `{post_id, board}`. |
 | `bus_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. |
 | `bus_thread(root_id)` | A root message and every descendant. |
-| `board_*`, `claim`, `release`, `claims` | Boards and claims; see [Boards and claims](#boards-and-claims-local-mode). In distributed mode `board_create` also takes `team`. |
+| `board_*`, `claim`, `release`, `claims` | Boards and claims; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
 

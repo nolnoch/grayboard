@@ -64,7 +64,7 @@ src/
     addressing.ts    # parseAddress / formatDirectAddress / formatTeamAddress.
   local/             # Sanctioned same-machine mode (v0). Owns its own SQLite + sockets.
 tests/integration/
-  ws.test.ts         # All test.todo — placeholders, not implemented. See §11 D9.
+  ws.test.ts         # Real WebSocket tests against an in-memory server (boards, acks, collisions, DMs).
 deploy/
   grayboard.service  # systemd unit
   Caddyfile          # TLS terminator (host = grayboard.example.com placeholder)
@@ -283,7 +283,7 @@ Test coverage in `can_send.test.ts` matches the spec §6.6 contract (allow user�
 | `DELETE /api/identities/:name` | bearer | |
 | `GET /api/teams` | bearer | Teams the user belongs to. |
 | `POST /api/teams` | bearer | Body: `{name}`. Creator auto-added as member. |
-| `POST /api/teams/:name/join` | bearer | Initializes team cursors for all of user's identities. |
+| `POST /api/teams/:name/join` | bearer | Subscribes all of the user's identities to `#<team>` in digest mode. |
 | `POST /api/teams/:name/leave` | bearer | |
 | `GET /api/teams/:name/members` | bearer | |
 | `POST /api/admin/revoke-session` | bearer | Body: `{email, all?}`. **`all` flag is ignored** — both branches revoke all (D5). |
@@ -484,7 +484,7 @@ Resolved since the initial audit:
 | **D5** | `POST /api/admin/revoke-session` ignores the `all` field — both branches call `revokeAllForUser`. CLI hardcodes `all: true` anyway. | §5.6 | Low — CLI works, but the API contract lies. | Either implement single-session revoke or drop the `all` parameter and document "revokes all." |
 | **D6** | `SendContext.db` is typed `Repo`, not `Database`. | §6.1 | Low — arguably an improvement (Repo is the right level of abstraction). | Keep; the seam works. |
 | **D8** | Audit retention test only asserts `pruneAudit` doesn't throw — does not verify rows are deleted. | §16 (test 8) | Low — coverage gap, not a bug. | Add the deletion assertion if cheap. |
-| **D9** | Integration tests in `tests/integration/ws.test.ts` are all `test.todo` — none of the §16 required WS-flow scenarios are exercised. | §16 (tests 5, 6, 7), §19 (✗) | Accepted for POC. Building a server-spinning harness was rejected as not worth it for testing. Manual acceptance via the §16 smoke procedure is the chosen mitigation. | Revisit if/when the project productizes. |
+| **D9** | ~~Integration tests in `tests/integration/ws.test.ts` are all `test.todo`.~~ | §16 (tests 5, 6, 7), §19 | **Resolved** in Phase 3: `startServer()` (`src/server/app.ts`) runs the server in-process, and the file has real WebSocket tests. | — |
 | **D10** | Monthly VACUUM is a no-op. `retention.ts:32-37` admits this and defers to "future work." | §12 | Low at POC scale; SQLite WAL + `auto_vacuum=INCREMENTAL` will keep the file from growing unboundedly. | Expose `incremental_vacuum` through `Repo` if reclamation actually matters. |
 | **D11** | `canAdmin` is defined but never called from any admin route. `http.ts:35` even builds a `SendPrincipal` for what reads as a planned call. | §6.5 | Low — v1 canAdmin returns true, so wiring it through is functionally identical. | Either wire `canAdmin` in or delete the dead `makePrincipal` helper. |
 | **D12** | Plugin's MCP notification payload is `params: { content: <tagString> }` (the full `<channel …>body</channel>` rendered into a single string). v0 used `params: { content: body, meta: {…} }`. | §7 implies "same … shape used today" | Low — this is the format the live channels protocol expects; v0's `meta` object was an artifact of how that version assembled the tag. Worth confirming against current Claude Code. | Confirm via manual smoke. |
@@ -495,11 +495,11 @@ Items the spec *explicitly* told us to do that ARE done:
 
 - ✅ Three entry points, one repo, one `package.json` (§1).
 - ✅ Schema is `CREATE TABLE IF NOT EXISTS` in `db.ts`, run on open (§2).
-- ✅ Per-identity cursors, team cursors initialized to current-max on join (§2, §9.1).
+- ✅ Per-identity cursors (§2, §9.1). Team inboxes were later replaced by team boards; board subscriptions start at the tip.
 - ✅ Identity uniqueness per-user; team uniqueness global (§3).
 - ✅ WS auth on upgrade via `Authorization` header (§4.1).
 - ✅ Lazy identity creation on `hello`, audited with `{lazy:true}` (§4.5.1).
-- ✅ One active WS per identity; supersede-and-close (§4.5.2).
+- ✅ One active WS per identity (§4.5.2). Originally supersede-and-close; now check-then-refuse (§5.3).
 - ✅ Cursors advance only on `ack` (§4.5.3, §9.2).
 - ✅ Server-side OAuth code exchange with Google; client_secret never on CLI (§5.2).
 - ✅ Sessions never expire; SHA-256 hashed at rest; `gbrd_v1_` prefix (§5.3).
@@ -566,11 +566,13 @@ Unit tests (run by `bun test`):
 | `src/server/auth.test.ts` | token mint/hash, session verify, revoked, disabled, re-enabled |
 | `src/server/can_send.test.ts` | spec §6.6 contract (allow user, allow team, denied shape, sync) |
 | `src/server/db.test.ts` | repo CRUD + the `bun:sqlite` isolation grep test (excludes `src/local/**` by design) |
-| `src/server/retention.test.ts` | message prune; audit prune asserts only no-throw (D8) |
+| `src/server/retention.test.ts` | message prune (incl. replies to pruned parents); audit prune asserts only no-throw (D8) |
+| `src/core/core.test.ts` | boards, digests, mentions, threads, claims (incl. a two-connection race), access policy |
+| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` sends, leaving a team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
 
-`bun test` currently: **45 pass, 6 todo, 0 fail**.
+`bun test` currently: **77 pass, 0 fail**.
 
-Integration tests in `tests/integration/ws.test.ts` are deliberate `test.todo` placeholders — building a server-spinning harness was rejected as not worth it for a POC (see D9). OAuth code-exchange tests with mocked Google JWKS (spec §16 test 3) are likewise deferred.
+OAuth code-exchange tests with mocked Google JWKS (spec §16 test 3) are still deferred.
 
 ---
 
@@ -611,4 +613,4 @@ BUS_IDENTITY=fe \
 bun src/plugin/main.ts
 ```
 
-Then exercise via WS by hand (or implement D9's integration tests, which would do exactly this).
+Then drive the plugin from an MCP client, or run `bun test tests/integration`, which does the same over WebSockets.

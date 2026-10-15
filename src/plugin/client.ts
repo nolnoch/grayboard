@@ -56,6 +56,8 @@ export class GrayboardClient {
     };
 
     this.ws.onclose = () => {
+      for (const p of this.pending.values()) p.reject(new Error("connection to the grayboard server was lost"));
+      this.pending.clear();
       if (this.dead) return;
       this.ws = null;
       this.helloData = null;
@@ -158,8 +160,10 @@ export class GrayboardClient {
   /** Send a request and wait for the corresponding response. */
   request<T extends ServerMessage>(msg: { type: string; [key: string]: unknown }): Promise<T> {
     return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error("not connected"));
+      // Before hello_ok the server rejects requests and closes the socket,
+      // so fail fast instead of leaving the tool call hanging.
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
+        reject(new Error("not connected to the grayboard server (reconnecting); try again shortly"));
         return;
       }
       const req_id = this.nextId();
