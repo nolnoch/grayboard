@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { describeLocation } from "../shared/identity.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -97,6 +98,30 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
     `INSERT INTO handles (name, first_seen, last_seen) VALUES (?, ?, ?)
      ON CONFLICT(name) DO UPDATE SET last_seen = excluded.last_seen`,
   ).run(handle, now, now);
+}
+
+// A session started: refresh last_seen, record where it runs (null when the
+// mode can't know, e.g. a remote server), and clear the previous session's status.
+export function startSession(db: Database, handle: string, cwd: string | null, now = Date.now()): void {
+  touchHandle(db, handle, now);
+  db.prepare(`UPDATE handles SET cwd = ?, status = NULL, status_at = NULL WHERE name = ?`).run(cwd, handle);
+}
+
+const MAX_STATUS = 200;
+
+// One line saying what this session is doing; empty clears it.
+export function setStatus(db: Database, handle: string, text: string, now = Date.now()): void {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
+  touchHandle(db, handle, now);
+  db.prepare(`UPDATE handles SET status = ?, status_at = ? WHERE name = ?`).run(t || null, t ? now : null, handle);
+}
+
+function age(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`;
 }
 
 // A handle that no longer exists (e.g. a deleted identity) leaves the roster
@@ -350,7 +375,15 @@ function threadRoot(db: Database, postId: number): number {
 
 // ── who ──────────────────────────────────────────────────────────────────────
 
-export type Peer = { handle: string; online: boolean; last_seen: number; mode?: SubMode };
+export type Peer = {
+  handle: string;
+  online: boolean;
+  last_seen: number;
+  mode?: SubMode;
+  where?: string;
+  status?: string;
+  status_age?: string;
+};
 export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
 
 // The roster: every handle that has connected (the `handles` table), or a
@@ -362,14 +395,15 @@ export function who(
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
 ): WhoResult {
-  let rows: { handle: string; last_seen: number | null; mode?: SubMode }[];
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; status: string | null; status_at: number | null };
+  let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
     const a = access(db);
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.status, h.status_at FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -377,15 +411,21 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, status, status_at FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
-  const all: Peer[] = rows.map((r) => ({
-    handle: r.handle,
-    online: r.handle === handle || online(r.handle),
-    last_seen: r.last_seen ?? 0,
-    ...(r.mode ? { mode: r.mode } : {}),
-  }));
+  const now = Date.now();
+  const all: Peer[] = rows.map((r) => {
+    const where = r.cwd ? describeLocation(r.cwd) : null;
+    return {
+      handle: r.handle,
+      online: r.handle === handle || online(r.handle),
+      last_seen: r.last_seen ?? 0,
+      ...(r.mode ? { mode: r.mode } : {}),
+      ...(where ? { where } : {}),
+      ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+    };
+  });
   if (opts.include_offline) return { you: handle, peers: all };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;

@@ -10,6 +10,7 @@ import { GrayboardClient } from "./client.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk } from "../shared/protocol.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
+import { checkArgs, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // ── credentials ───────────────────────────────────────────────────────────────
@@ -104,54 +105,63 @@ await Promise.race([
 
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "dm_send",
-      description:
-        `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online, or queued until their next session. To reach a team, board_post to its board.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          to:        { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
-          body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
-          parent_id: { type: "number", description: "Optional. message_id to reply to." },
-        },
-        required: ["to", "body"],
+const TOOLS = [
+  {
+    name: "dm_send",
+    description:
+      `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online, or queued until their next session. To reach a team, board_post to its board.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        to:        { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
+        body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
+        parent_id: { type: "number", description: "Optional. message_id to reply to." },
+      },
+      required: ["to", "body"],
+    },
+  },
+  {
+    name: "dm_history",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        peer:      { type: "string", description: "Optional. Only messages with this address." },
+        limit:     { type: "number", description: "Max messages (default 20, max 200)." },
+        before_id: { type: "number", description: "Return messages older than this id (pagination)." },
       },
     },
-    {
-      name: "dm_history",
-      description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          peer:      { type: "string", description: "Optional. Only messages with this address." },
-          limit:     { type: "number", description: "Max messages (default 20, max 200)." },
-          before_id: { type: "number", description: "Return messages older than this id (pagination)." },
-        },
-      },
+  },
+  {
+    name: "dm_thread",
+    description: "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
+    inputSchema: {
+      type: "object",
+      properties: { thread: { type: "number", description: "Any message_id in the thread." } },
+      required: ["thread"],
     },
-    {
-      name: "dm_thread",
-      description: "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
-      inputSchema: {
-        type: "object",
-        properties: { thread: { type: "number", description: "Any message_id in the thread." } },
-        required: ["thread"],
-      },
-    },
-    ...boardTools({ teams: true }),
-  ],
-}));
+  },
+...boardTools({ teams: true }),
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 const text = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
+const staleNotice = updateNotice();
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
-  const a = args as Record<string, unknown>;
+  const r = await call(name, args as Record<string, unknown>);
+  const notice = staleNotice();
+  return notice ? { ...r, content: [...r.content, { type: "text" as const, text: notice }] } : r;
+});
+
+async function call(name: string, a: Record<string, unknown>) {
+  const bad = checkArgs(TOOLS, name, a);
+  if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
     if (isBoardTool(name)) {
       return text((await client.request<CallOk>({ type: "call", tool: name, args: a })).result);
@@ -177,7 +187,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // Server errors arrive as "code: message"; show them to the agent.
     return { ...text(`error: ${(e as Error).message}`), isError: true };
   }
-});
+}
 
 // ── start stdio transport ─────────────────────────────────────────────────────
 

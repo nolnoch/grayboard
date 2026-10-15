@@ -11,6 +11,7 @@ import {
   pendingFor,
   post,
   refOf,
+  startSession,
   touchHandle,
   type CoreDb,
   type PendingRef,
@@ -248,7 +249,7 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
   }
 
   registry.set(full, ws);
-  touchHandle(db, full);
+  startSession(db, full, null);
   ws.data.identityId   = identity.id;
   ws.data.identityName = name;
   ws.data.identityFull = full;

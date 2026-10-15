@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultIdentity, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -55,6 +55,19 @@ describe("defaultIdentity", () => {
   test("submodule is its own repo", () => expect(defaultIdentity(at("repo", "vendor", "lib"))).toBe("lib"));
   test("sanitized", () => expect(defaultIdentity(at("My Repo!"))).toBe("my-repo"));
   test("outside git: the directory name", () => expect(defaultIdentity(at("plain", "sub"))).toBe("sub"));
+});
+
+describe("describeLocation", () => {
+  test("main checkout and linked worktree, with live branch", () => {
+    writeFileSync(at("repo", ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(at("repo", ".git", "worktrees", "stream"), { recursive: true });
+    writeFileSync(at("repo", ".git", "worktrees", "stream", "HEAD"), "ref: refs/heads/wt-stream\n");
+    expect(describeLocation(at("repo", "src"))).toBe("repo on main");
+    expect(describeLocation(at("repo", ".wt", "stream", "src"))).toBe("repo worktree stream on wt-stream");
+    writeFileSync(at("repo", ".git", "HEAD"), "0123456789abcdef\n");
+    expect(describeLocation(at("repo"))).toBe("repo on 0123456");
+  });
+  test("outside git: the directory name", () => expect(describeLocation(at("plain", "sub"))).toBe("sub"));
 });
 
 describe("sessionIdentity", () => {

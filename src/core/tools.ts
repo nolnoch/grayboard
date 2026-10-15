@@ -9,12 +9,13 @@ import {
   listBoards,
   post,
   read,
+  setStatus,
   subscribe,
   who,
   type Pending,
   type SubMode,
 } from "./boards.ts";
-import { claim, listClaims, release } from "./claims.ts";
+import { claim, listClaims, release, type Claim } from "./claims.ts";
 
 export type ToolDef = {
   name: string;
@@ -108,6 +109,16 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       },
     },
     {
+      name: "peer_status",
+      description:
+        'peer_status(text): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string", description: "At most 200 chars. Empty clears." } },
+        required: ["text"],
+      },
+    },
+    {
       name: "claim_take",
       description:
         'claim_take(key, ttl_minutes? | until?, note?, board?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead.',
@@ -150,6 +161,16 @@ const NAMES = new Set(boardTools({ teams: true }).map((t) => t.name));
 
 export function isBoardTool(name: string): boolean {
   return NAMES.has(name);
+}
+
+// Active claims as of session start, for the server instructions: the one
+// place a fresh or /clear-ed session is sure to see them.
+export function claimsInstruction(claims: Claim[]): string[] {
+  if (claims.length === 0) return [];
+  const list = claims
+    .map((c) => `${c.key} (held by ${c.holder} until ${new Date(c.expires_at).toISOString()}${c.note ? `: ${c.note}` : ""})`)
+    .join("; ");
+  return [`Active claims when this session started: ${list}. Respect them; claim_list shows the current state.`];
 }
 
 export const BOARD_INSTRUCTIONS = [
@@ -219,15 +240,20 @@ export function callBoardTool(
       };
     }
 
-    case "board_read":
-      return {
-        result: read(db, handle, str(a, "board"), {
-          limit: optNum(a, "limit"),
-          before_id: optNum(a, "before_id"),
-          thread: optNum(a, "thread"),
-        }),
-        wake: [],
-      };
+    case "board_read": {
+      const r = read(db, handle, str(a, "board"), {
+        limit: optNum(a, "limit"),
+        before_id: optNum(a, "before_id"),
+        thread: optNum(a, "thread"),
+      });
+      // Claims announced here stay in front of anyone reading the board.
+      const held = listClaims(db).filter((c) => c.board === r.board);
+      return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
+    }
+
+    case "peer_status":
+      setStatus(db, handle, str(a, "text"));
+      return { result: "ok", wake: [] };
 
     case "board_subscribe": {
       const mode = str(a, "mode") as SubMode | "off";

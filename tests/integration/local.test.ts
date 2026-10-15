@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -76,8 +76,8 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
   await call(sim, "board_subscribe", { board: "e2e", mode: "quiet" });
   expect((await call(sim, "peer_list", { board: "#e2e" })).peers).toEqual([
-    { handle: "be", online: true, last_seen: expect.any(Number), mode: "push" },
-    { handle: "sim", online: true, last_seen: expect.any(Number), mode: "quiet" },
+    { handle: "be", online: true, last_seen: expect.any(Number), mode: "push", where: expect.any(String) },
+    { handle: "sim", online: true, last_seen: expect.any(Number), mode: "quiet", where: expect.any(String) },
   ]);
 }, 20_000);
 
@@ -136,6 +136,35 @@ test("dm_thread from any message returns the whole thread; pushes carry parent_i
   expect(thread.map((m: any) => m.id)).toEqual([root.message_id, reply.message_id, leaf.message_id]);
   await Bun.sleep(300);
   expect(pushes.find((m) => m.message_id === String(leaf.message_id))?.parent_id).toBe(String(reply.message_id));
+}, 20_000);
+
+test("peer_list shows where a session runs and its status; a restart clears the status", async () => {
+  const be = await start("be");
+  let sim = await start("sim");
+  await call(sim, "peer_status", { text: "spec 163 soak" });
+  const row = (await call(be, "peer_list")).peers.find((p: any) => p.handle === "sim");
+  expect(row).toMatchObject({ where: basename(dir), status: "spec 163 soak", status_age: "0m" });
+  await stop(sim);
+  sim = await start("sim");
+  expect((await call(be, "peer_list")).peers.find((p: any) => p.handle === "sim").status).toBeUndefined();
+}, 20_000);
+
+test("active claims show in board_read and in a new session's instructions", async () => {
+  const be = await start("be");
+  await call(be, "board_create", { name: "dev-deploys", purpose: "rolls" });
+  await call(be, "claim_take", { key: "dev:freeze", board: "dev-deploys", note: "24h soak", ttl_minutes: 60 });
+  const r = await call(be, "board_read", { board: "dev-deploys" });
+  expect(r.active_claims).toMatchObject([{ key: "dev:freeze", holder: "be", note: "24h soak" }]);
+  const fe = await start("fe");
+  expect(fe.getInstructions()).toContain("dev:freeze (held by be until");
+}, 20_000);
+
+test("a wrong argument name gets an error naming the expected call", async () => {
+  const be = await start("be");
+  await start("fe");
+  await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
+    "dm_send(to, body, parent_id?): missing to; unknown recipient.",
+  );
 }, 20_000);
 
 test("identities from before the handles roster are backfilled", async () => {

@@ -26,6 +26,40 @@ export function gitLocation(cwd: string): { repo: string; worktree: string | nul
   }
 }
 
+/** The branch checked out at `cwd` (short sha if detached), or null outside git. */
+export function gitBranch(cwd: string): string | null {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    const dotGit = join(dir, ".git");
+    if (existsSync(dotGit)) {
+      let gitdir = dotGit;
+      if (!statSync(dotGit).isDirectory()) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+        if (!m) return null;
+        gitdir = resolve(dir, m[1]!.trim());
+      }
+      const head = readFileSync(join(gitdir, "HEAD"), "utf8").trim();
+      return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
+    }
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+/**
+ * Where a session runs, for peer_list: "doxus-backend on main" or
+ * "doxus-backend worktree be-stream on worktree-be-stream". Read live, so the
+ * branch is current. Null if `cwd` is gone.
+ */
+export function describeLocation(cwd: string): string | null {
+  try {
+    const loc = gitLocation(cwd);
+    if (!loc) return basename(cwd);
+    const branch = gitBranch(cwd);
+    return `${basename(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Name of the linked git worktree containing `cwd`, or null in a main checkout or outside git. */
 export function linkedWorktreeName(cwd: string): string | null {
   return gitLocation(cwd)?.worktree ?? null;

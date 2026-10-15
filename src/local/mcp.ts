@@ -7,9 +7,11 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, markDelivered, pendingFor, rosterHandles, touchHandle } from "../core/boards.ts";
+import { CoreError, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
+  claimsInstruction,
   boardNotification,
   boardTools,
   callBoardTool,
@@ -26,6 +28,7 @@ import {
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
+import { checkArgs, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
@@ -47,6 +50,7 @@ const mcp = new Server(
       `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       ...BOARD_INSTRUCTIONS,
+      ...claimsInstruction(listClaims(db)),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
   },
@@ -54,73 +58,73 @@ const mcp = new Server(
 
 // Tool discovery
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "dm_send",
-      description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online, or queued until their next session.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          to: {
-            type: "string",
-            description: "The peer's exact handle, as peer_list shows it.",
-          },
-          body: {
-            type: "string",
-            description: "Message body. Plain text or markdown.",
-          },
-          parent_id: {
-            type: "number",
-            description:
-              "Optional. message_id this is replying to; sets the thread parent.",
-          },
+const TOOLS = [
+  {
+    name: "dm_send",
+    description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online, or queued until their next session.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: {
+          type: "string",
+          description: "The peer's exact handle, as peer_list shows it.",
         },
-        required: ["to", "body"],
+        body: {
+          type: "string",
+          description: "Message body. Plain text or markdown.",
+        },
+        parent_id: {
+          type: "number",
+          description:
+            "Optional. message_id this is replying to; sets the thread parent.",
+        },
       },
+      required: ["to", "body"],
     },
-    {
-      name: "dm_history",
-      description:
-        "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          peer: {
-            type: "string",
-            description:
-              "Optional. Only return messages between you and this peer identity.",
-          },
-          limit: {
-            type: "number",
-            description: "Max messages to return (default 20, max 200).",
-          },
-          before_id: {
-            type: "number",
-            description:
-              "Return messages with id strictly less than this; use for pagination.",
-          },
+  },
+  {
+    name: "dm_history",
+    description:
+      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        peer: {
+          type: "string",
+          description:
+            "Optional. Only return messages between you and this peer identity.",
+        },
+        limit: {
+          type: "number",
+          description: "Max messages to return (default 20, max 200).",
+        },
+        before_id: {
+          type: "number",
+          description:
+            "Return messages with id strictly less than this; use for pagination.",
         },
       },
     },
-    {
-      name: "dm_thread",
-      description:
-        "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          thread: {
-            type: "number",
-            description: "Any message_id in the thread.",
-          },
+  },
+  {
+    name: "dm_thread",
+    description:
+      "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: {
+          type: "number",
+          description: "Any message_id in the thread.",
         },
-        required: ["thread"],
       },
+      required: ["thread"],
     },
-    ...boardTools({ teams: false }),
-  ],
-}));
+  },
+...boardTools({ teams: false }),
+];
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 // Tool dispatch
 
@@ -134,18 +138,28 @@ async function wakeAll(handles: string[]): Promise<void> {
   await Promise.all(handles.map((h) => poke(h)));
 }
 
+const staleNotice = updateNotice();
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   touchHandle(db, IDENTITY);
+  const r = await call(name, args as Record<string, any>);
+  const notice = staleNotice();
+  return notice ? { ...r, content: [...r.content, { type: "text", text: notice }] } : r;
+});
+
+async function call(name: string, args: Record<string, any>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+  const bad = checkArgs(TOOLS, name, args);
+  if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
-    return await dispatch(name, args as Record<string, any>);
+    return await dispatch(name, args);
   } catch (err) {
     if (err instanceof CoreError) {
       return { ...text(`error: ${err.message}`), isError: true };
     }
     throw err;
   }
-});
+}
 
 async function dispatch(name: string, a: Record<string, any>) {
   if (name === "dm_send") {
@@ -251,7 +265,9 @@ async function drainToClaude(): Promise<void> {
 // shows the server as failed. Then connect MCP so notifications are accepted,
 // bind the wakeup socket (rechecking), and replay what arrived while offline.
 if (PUSH) await assertIdentityFree(IDENTITY);
-touchHandle(db, IDENTITY);
+// A tools-only server runs beside the session that owns the identity; leave its status alone.
+if (PUSH) startSession(db, IDENTITY, process.cwd());
+else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
 
 let cleanup = () => {};
