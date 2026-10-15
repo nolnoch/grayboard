@@ -67,7 +67,23 @@ export function resolveIdentity(base: string, cwd = process.cwd()): string {
   return sanitizeIdentity(name.startsWith(`${b}-`) ? name : `${b}-${name}`);
 }
 
-/** BUS_IDENTITY if set, else the default; then the worktree suffix. */
+/**
+ * The name pinned in the repo's .mcp.json (mcpServers.grayboard.env.BUS_IDENTITY).
+ * Harnesses disagree on whether a repo's .mcp.json beats a user-level entry
+ * (omp's user config wins), so grayboard reads the pin itself. Worktrees use
+ * the main checkout's file, since .mcp.json is usually untracked.
+ */
+export function pinnedIdentity(cwd = process.cwd()): string | undefined {
+  try {
+    const file = join(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
+    const pin = JSON.parse(readFileSync(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    return typeof pin === "string" && pin ? pin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** BUS_IDENTITY if set, else the repo's pin, else the default; then the worktree suffix. */
 export function sessionIdentity(env = process.env, cwd = process.cwd()): string {
-  return resolveIdentity(env.BUS_IDENTITY || defaultIdentity(cwd), cwd);
+  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
 }

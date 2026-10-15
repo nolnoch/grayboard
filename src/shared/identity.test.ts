@@ -61,4 +61,18 @@ describe("sessionIdentity", () => {
   test("BUS_IDENTITY wins", () => expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be"));
   test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
   test("empty BUS_IDENTITY falls back", () => expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("repo"));
+
+  test("unset BUS_IDENTITY uses the repo's .mcp.json pin, worktrees included", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({}, at("repo", "src"))).toBe("be");
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("be-stream");
+      expect(sessionIdentity({ BUS_IDENTITY: "other" }, at("repo"))).toBe("other");
+      writeFileSync(at("repo", ".mcp.json"), "{ not json");
+      expect(sessionIdentity({}, at("repo"))).toBe("repo");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
 });

@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
-import { join, basename, dirname, resolve } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
@@ -295,14 +295,25 @@ program
         console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
       }
 
-      // 3. omp: install the push adapter, which wakes the session when a message arrives
+      // 3. omp: register for every project (it ignores Claude Code's user
+      // registration), and install the push adapter that wakes the session.
+      // The user entry outranks a repo's .mcp.json in omp, so it carries no
+      // BUS_IDENTITY; grayboard reads the repo's pin itself.
       const omp = !!Bun.which("omp");
-      const ompExt = join(homedir(), ".omp", "agent", "extensions", "grayboard.ts");
-      if (opts.register && omp && (await confirm("Install grayboard's omp extension, so messages wake omp sessions?", true))) {
-        mkdirSync(dirname(ompExt), { recursive: true });
-        rmSync(ompExt, { force: true }); // replace, never write through, an existing symlink
-        writeFileSync(ompExt, ompAdapterSource());
-        console.log(`Installed ${ompExt}`);
+      const ompDir = join(homedir(), ".omp", "agent");
+      if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
+        const cfgPath = join(ompDir, "mcp.json");
+        let cfg: { mcpServers?: Record<string, unknown> } = {};
+        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+        }
+        cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
+        mkdirSync(join(ompDir, "extensions"), { recursive: true });
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+        const ext = join(ompDir, "extensions", "grayboard.ts");
+        rmSync(ext, { force: true }); // replace, never write through, an existing symlink
+        writeFileSync(ext, ompAdapterSource());
+        console.log(`Registered in ${cfgPath}; installed ${ext}`);
       }
 
       console.log(
