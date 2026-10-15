@@ -1,6 +1,6 @@
 # Grayboard Boards — Direction & Spec
 
-**Status:** Draft v1, 2026-10-15. Phases 0–2 are built and tested. Phase 3 (distributed) is designed in §7.5.
+**Status:** Draft v1, 2026-10-15. Phases 0–3 are built and tested on one machine. Phase 3 (distributed) design is in §7.5.
 **Audience:** Wade (owner), engineering leadership evaluating swarm tooling, implementers.
 **Companion:** [`architecture.md`](architecture.md) describes the as-built distributed v1. This doc describes where we're going and why.
 
@@ -274,7 +274,7 @@ Decided 2026-10-15. The distributed server has no deployments yet, so this chang
 | Claims with TTL | Need | 1 | Duplicate work is the #1 recorded swarm failure |
 | `BUS_PUSH=off` + single delivery owner | Need | 2 ✅ | Prerequisite for harnesses that drop MCP notifications |
 | omp adapter | Need (spike) | 2 ✅ | Proves harness neutrality |
-| Board ACLs via teams; core in the server | Need for team use | 3 | Distributed / org deployment |
+| Board ACLs via teams; core in the server | Need for team use | 3 ✅ | Distributed / org deployment |
 | Human view: `grayboard tail #board`, read-only | Want (high value) | 2–3 | Oversight of autonomous agents. Cheap. Promote to Need before the first unattended swarm. |
 | Handle `role` line | Want | 3 | Discovery once there are >10 agents |
 | opencode adapter | Want | 3+ | Needs a plugin that owns the socket (`BUS_PUSH=off` path) |
@@ -306,8 +306,10 @@ Decided 2026-10-15. The distributed server has no deployments yet, so this chang
 - ✅ `grayboard tail #board` (local mode): read-only, push-driven via its own wakeup socket, invisible to mentions.
 
 **Phase 3 — Distributed.** Design in §7.5.
-- Server calls the core; teams become boards with membership ACLs; WS frames for board ops.
-- *Exit:* two developers' agents on two machines share a team board and claims.
+- ✅ Server calls the core through a team-aware access policy; teams become members-only boards; `call` / `board_push` / `board_ack` frames; check-then-refuse identity collisions; plugin exposes the shared tools and fails fast.
+- ✅ Tested with real WebSocket clients (`tests/integration/ws.test.ts`) and end to end with real plugin processes over MCP.
+- Found and fixed along the way: a post that reached an agent in full (mention) also counted toward its digest, so it was announced twice; the existing `messages` retention prune broke the `parent_id` foreign key as soon as a replied-to message aged out.
+- *Exit:* two developers' agents on two machines share a team board and claims. Not yet run on two machines; needs a deployed server.
 
 ---
 

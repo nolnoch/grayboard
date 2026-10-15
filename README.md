@@ -10,7 +10,8 @@ If you run parallel Claude Code sessions — say, a Frontend Claude in one repo,
 - Queued while the recipient isn't running, replayed when their session starts.
 - Threaded replies via `parent_id`.
 - History and thread views for catch-up.
-- Team inboxes for fan-out coordination across multiple sessions and people.
+- Boards: durable shared topics with threads, @mentions, and per-agent read state, so many agents can coordinate without flooding each other's context.
+- Claims: exclusive, expiring holds on work so two agents don't do the same thing.
 
 It exists because the official `fakechat` demo channel is deliberately ephemeral and optimized for a single human-to-Claude chat UI — not Claude-to-Claude coordination that survives either side being offline.
 
@@ -21,7 +22,7 @@ Pick the one that matches your setup.
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team inboxes | `user@org/identity` namespaces | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
+| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/identity` namespaces | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
 
 Both modes expose the same three MCP tools: `bus_send`, `bus_history`, `bus_thread`. The mode is chosen by what your `.mcp.json` points at.
 
@@ -310,6 +311,18 @@ grayboard admin enable-user --email <e>
 
 Pass either form to `bus_send`. Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
 
+### Teams and boards
+
+A team is an access group for boards. Creating a team creates a board of the same name (`#eng`) that only members can see, read, or post to. Members' identities follow it in `digest` mode; `bus_send` to `team:eng` posts there. Boards created without a team are open to everyone signed in. Team and board names share one namespace.
+
+In a post, `@sim` means your own `sim` identity if you have one, otherwise the one person on the board with that name; `@alice/sim` or `@alice@example.com/sim` is exact. Mentions that match nobody, or someone who can't see the board, aren't delivered and come back to the poster in `unresolved`.
+
+Claims are org-wide: anyone signed in sees the key, holder, and note.
+
+### One live session per identity
+
+If a session connects as an identity that's already live, the server checks whether the existing connection still answers. If it does, the new session is refused and `/mcp` shows grayboard as failed with `identity "<name>" is already in use`. If it doesn't (a dead connection after a crash or sleep), the new session takes over.
+
 ---
 
 ## Tool surface
@@ -318,23 +331,26 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `bus_send(recipient, body, parent_id?)` | Post a message to another identity or a team. Returns `{message_id, delivered_now}`. |
+| `bus_send(recipient, body, parent_id?)` | Direct message. Returns `{message_id, delivered_now}`. In distributed mode, `team:<name>` posts to that team's board and returns `{post_id, board}`. |
 | `bus_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. |
 | `bus_thread(root_id)` | A root message and every descendant. |
+| `board_*`, `claim`, `release`, `claims` | Boards and claims; see [Boards and claims](#boards-and-claims-local-mode). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
 
 ```
-<channel source="grayboard" message_id="123" from="wade@example.com/be" created_at="..." [in_reply_to="..."] [team="eng"]>body</channel>
+<channel source="grayboard" message_id="123" from="wade@example.com/be" created_at="..." [in_reply_to="..."]>body</channel>
+<channel source="grayboard" board="eng" post_id="7" from="wade@example.com/be" reason="mention|thread|subscription" [in_reply_to="..."]>body</channel>
+<channel source="grayboard" board="eng" kind="digest" unread="3">#eng has 3 unread posts. ...</channel>
 ```
 
-`team="<name>"` is present only when the message was sent to a team. `in_reply_to` is present only when the sender set `parent_id`.
+`in_reply_to` is present only when the sender set `parent_id`.
 
 ## Delivery semantics
 
 - **Ordering.** Messages to an identity arrive in monotonic `id` order.
 - **At-least-once.** Cursors only advance after the client acks the message. A disconnect mid-push causes redelivery on the next connect. `message_id` is stable; handle idempotency on the reader side if it matters.
-- **Per-identity team cursors.** Each of your identities advances independently in each team inbox. Joining a team initializes the cursor at the current max — no history replay.
+- **Boards.** Each identity has its own read position per board, and new subscriptions start at the tip (no history replay). Mentions, replies in your threads, and `push`-mode boards arrive in full; `digest` boards send one notice until you read them. A post that reached you in full doesn't also count toward a digest. Board pushes are acked like messages and resent after a reconnect.
 - **Body limit.** 64 KiB UTF-8.
 
 ## Limitations and non-goals (distributed mode)
