@@ -161,7 +161,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
           break;
         case "thread":
-          handleThread(ws, msg.req_id, msg.root_id, repo);
+          handleThread(ws, msg.req_id, msg.message_id, repo);
           break;
         case "ack":
           handleAck(ws, msg.req_id, msg.message_ids, repo);
@@ -375,10 +375,10 @@ function handleHistory(
   send(ws, { type: "history_ok", req_id: reqId, messages });
 }
 
-function handleThread(ws: Ws, reqId: string, rootId: number, repo: Repo): void {
-  const messages = repo.messages.thread(rootId);
+function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {
+  const messages = repo.messages.thread(messageId);
   if (messages.length === 0) {
-    err(ws, reqId, "not_found", `message ${rootId} not found`);
+    err(ws, reqId, "not_found", `message ${messageId} not found`);
     return;
   }
   send(ws, { type: "thread_ok", req_id: reqId, messages });

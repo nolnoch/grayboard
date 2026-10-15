@@ -196,6 +196,10 @@ test("mention tokens cover bare, local/name, and full addresses, not emails", ()
   ]);
 });
 
+test("mentions inside inline code or fenced blocks don't count", () => {
+  expect(mentionTokens("see `@be` and `` `@fe` `` but ping @sim\n```\n@ghost\n```")).toEqual(["sim"]);
+});
+
 test("unresolved mentions are reported to the poster", () => {
   const r = post(db, "be", "e2e", "@fe and @ghost");
   expect(r.wake).toEqual(["fe"]);

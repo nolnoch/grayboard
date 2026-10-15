@@ -57,7 +57,7 @@ const server = new Server(
     },
     instructions: [
       `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
-      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [in_reply_to="..."]>body</channel>.`,
+      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       ...BOARD_INSTRUCTIONS,
       `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
@@ -80,7 +80,7 @@ const client = new GrayboardClient(
       from:       msg.sender,
       created_at: String(msg.created_at),
     };
-    if (msg.parent_id !== null) meta.in_reply_to = String(msg.parent_id);
+    if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
     void notify({ content: msg.body, meta });
   },
   (item) => notify(boardNotification(item)),
@@ -109,20 +109,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "dm_send",
       description:
-        `Send a direct message to one other agent. You are "${identity}". Delivered now if they're online, or queued until their next session. Use peer_list for exact handles; to reach a team, board_post to its board.`,
+        `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online, or queued until their next session. To reach a team, board_post to its board.`,
       inputSchema: {
         type: "object",
         properties: {
-          recipient: { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
+          to:        { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
           body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
           parent_id: { type: "number", description: "Optional. message_id to reply to." },
         },
-        required: ["recipient", "body"],
+        required: ["to", "body"],
       },
     },
     {
       name: "dm_history",
-      description: "List recent direct messages you are involved in, optionally filtered by peer.",
+      description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent.",
       inputSchema: {
         type: "object",
         properties: {
@@ -134,11 +134,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "dm_thread",
-      description: "Return a root direct message and all its replies, ordered by id.",
+      description: "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
       inputSchema: {
         type: "object",
-        properties: { root_id: { type: "number", description: "message_id of the root message." } },
-        required: ["root_id"],
+        properties: { thread: { type: "number", description: "Any message_id in the thread." } },
+        required: ["thread"],
       },
     },
     ...boardTools({ teams: true }),
@@ -159,7 +159,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "dm_send") {
       const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
         type: "send",
-        recipient: a.recipient,
+        recipient: a.to,
         body: a.body,
         ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
       });
@@ -170,7 +170,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return text(resp.messages);
     }
     if (name === "dm_thread") {
-      return text((await client.request<ThreadOk>({ type: "thread", root_id: a.root_id })).messages);
+      return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {

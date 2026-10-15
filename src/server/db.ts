@@ -49,7 +49,7 @@ export interface Repo {
     insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null): MessageRow;
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
-    thread(rootId: number): MessageRow[];
+    thread(id: number): MessageRow[];
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     prune(olderThanMs: number): void;
   };
@@ -316,15 +316,21 @@ function makeRepo(db: Database): Repo {
            ORDER BY id DESC LIMIT ?`,
         ).all(identityFull, identityFull, cap);
       },
-      thread(rootId) {
+      // The whole thread containing message `id`: walk up to its root, then down.
+      thread(id) {
         return db.query<MessageRow, [number]>(`
-          WITH RECURSIVE tree(id) AS (
-            SELECT id FROM messages WHERE id = ?
+          WITH RECURSIVE up(id, parent_id) AS (
+            SELECT id, parent_id FROM messages WHERE id = ?
+            UNION ALL
+            SELECT m.id, m.parent_id FROM messages m JOIN up ON m.id = up.parent_id
+          ),
+          tree(id) AS (
+            SELECT id FROM up WHERE parent_id IS NULL
             UNION ALL
             SELECT m.id FROM messages m JOIN tree t ON m.parent_id = t.id
           )
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
-        `).all(rootId);
+        `).all(id);
       },
       unreadSince(streams) {
         if (streams.length === 0) return [];

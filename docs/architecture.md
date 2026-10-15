@@ -166,7 +166,7 @@ Client → Server:
 { type: "hello",   req_id, identity }
 { type: "send",    req_id, recipient, body, parent_id? }
 { type: "history", req_id, peer?, limit?, before_id? }
-{ type: "thread",  req_id, root_id }
+{ type: "thread",  req_id, message_id }
 { type: "ack",     req_id, message_ids: number[] }
 { type: "pong" }
 { type: "call",      req_id, tool, args }      // board/claim tools (src/core/tools.ts)
@@ -352,9 +352,9 @@ Read by `cli/api.ts:loadCredentials` and `plugin/mcp.ts:loadCredentials`. Env-va
 
 | Tool | Maps to WS request |
 |---|---|
-| `dm_send(recipient, body, parent_id?)` | `{type:"send"}` |
+| `dm_send(to, body, parent_id?)` | `{type:"send"}` |
 | `dm_history(peer?, limit?, before_id?)` | `{type:"history"}` |
-| `dm_thread(root_id)` | `{type:"thread"}` |
+| `dm_thread(thread)` | `{type:"thread"}` |
 | `board_*`, `claim_take`, `claim_release`, `claim_list`, `peer_list` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`; `peer_list` reads the core `handles` table, which the server touches on connect and disconnect, and checks liveness against the open connections) |
 
 Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits with a message if the server doesn't answer or refuses the identity. That way `/mcp` shows an error instead of hitting Claude Code's own 30s startup timeout.
@@ -374,7 +374,7 @@ Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits wi
 **Channel notification format** (`plugin/mcp.ts:buildChannelTag`):
 
 ```
-<channel source="grayboard" message_id="123" from="a@org/fe" created_at="…" [in_reply_to="…"] [team="eng"]>body</channel>
+<channel source="grayboard" message_id="123" from="a@org/fe" created_at="…" [parent_id="…"] [team="eng"]>body</channel>
 ```
 
 `team="<name>"` is included only for team messages. The MCP `notification` payload uses `params: { content: <tag string> }` — note this differs from the v0 shape which used a separate `meta` object. The on-the-wire `<channel>` tag content matches what Claude Code expects.

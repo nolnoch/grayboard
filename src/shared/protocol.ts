@@ -14,7 +14,7 @@ export type Message = {
 export type HelloRequest   = { type: "hello";   req_id: string; identity: string };
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
-export type ThreadRequest  = { type: "thread";  req_id: string; root_id: number };
+export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
 export type PongMessage    = { type: "pong" };
 // Board and claim tools (src/core/tools.ts), run server-side as this identity.
@@ -68,7 +68,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       return m as unknown as HistoryRequest;
     case "thread":
       assertStr(m, "req_id");
-      if (typeof m.root_id !== "number") throw new Error("root_id must be number");
+      if (typeof m.message_id !== "number") throw new Error("message_id must be number");
       return m as unknown as ThreadRequest;
     case "ack":
       assertStr(m, "req_id");

@@ -84,6 +84,7 @@ describe("Repo", () => {
     expect(thread).toHaveLength(2);
     expect(thread[0].id).toBe(root.id);
     expect(thread[1].id).toBe(reply.id);
+    expect(repo.messages.thread(reply.id).map(m => m.id)).toEqual([root.id, reply.id]);
   });
 
   test("cursors: advance is idempotent and takes MAX", () => {

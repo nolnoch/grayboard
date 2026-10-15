@@ -225,10 +225,15 @@ export function unsubscribeScope(db: Database, handle: string, scope: string): v
   ).run(handle, scope);
 }
 
-// Raw @tokens in a body, lowercased, trailing sentence punctuation removed.
+// Inline code and fenced blocks: a backtick run up to the next run of the
+// same length. Text inside is quoted, not addressed.
+const CODE_RE = /(`+)[\s\S]*?\1/g;
+
+// Raw @tokens in a body, outside code, lowercased, trailing sentence
+// punctuation removed.
 export function mentionTokens(body: string): string[] {
   const out = new Set<string>();
-  for (const m of body.matchAll(MENTION_RE)) {
+  for (const m of body.replace(CODE_RE, " ").matchAll(MENTION_RE)) {
     const t = m[1]!.toLowerCase().replace(/[.]+$/, "");
     if (t) out.add(t);
   }

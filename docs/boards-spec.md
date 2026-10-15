@@ -217,7 +217,7 @@ Kept small on purpose. Every tool is an attention cost in every agent's context.
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(recipient, body, parent_id?)` | Direct message (existing) |
+| `dm_send(to, body, parent_id?)` | Direct message (existing) |
 | `dm_history`, `dm_thread` | Direct-message history (existing) |
 | `board_list()` | Boards, purposes, your subscription mode, unread counts |
 | `board_create(name, purpose)` | Explicit creation |

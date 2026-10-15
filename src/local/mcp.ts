@@ -45,7 +45,7 @@ const mcp = new Server(
     },
     instructions: [
       `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
-      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [in_reply_to="..."]>body</channel>.`,
+      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       ...BOARD_INSTRUCTIONS,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
@@ -58,11 +58,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "dm_send",
-      description: `Send a direct message to one other agent. You are "${IDENTITY}". Delivered now if they're online, or queued until their next session. Use peer_list for exact handles.`,
+      description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online, or queued until their next session.`,
       inputSchema: {
         type: "object",
         properties: {
-          recipient: {
+          to: {
             type: "string",
             description: "The peer's exact handle, as peer_list shows it.",
           },
@@ -76,13 +76,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               "Optional. message_id this is replying to; sets the thread parent.",
           },
         },
-        required: ["recipient", "body"],
+        required: ["to", "body"],
       },
     },
     {
       name: "dm_history",
       description:
-        "List recent direct messages you are involved in (as sender or recipient), optionally filtered by peer. Returns chronological order.",
+        "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent.",
       inputSchema: {
         type: "object",
         properties: {
@@ -106,16 +106,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "dm_thread",
       description:
-        "Return a root direct message and all its descendants (replies of replies), ordered by id.",
+        "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
       inputSchema: {
         type: "object",
         properties: {
-          root_id: {
+          thread: {
             type: "number",
-            description: "message_id of the root message to expand.",
+            description: "Any message_id in the thread.",
           },
         },
-        required: ["root_id"],
+        required: ["thread"],
       },
     },
     ...boardTools({ teams: false }),
@@ -149,8 +149,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 async function dispatch(name: string, a: Record<string, any>) {
   if (name === "dm_send") {
-    const { recipient, body, parent_id } = a as {
-      recipient: string;
+    const { to: recipient, body, parent_id } = a as {
+      to: string;
       body: string;
       parent_id?: number;
     };
@@ -185,7 +185,7 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_thread") {
-    return text(getThread(a.root_id));
+    return text(getThread(a.thread));
   }
 
   if (isBoardTool(name)) {
@@ -227,7 +227,7 @@ async function drainToClaude(): Promise<void> {
           from: msg.sender,
           created_at: String(msg.created_at),
         };
-        if (msg.parent_id !== null) meta.in_reply_to = String(msg.parent_id);
+        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
         await mcp.notification({
           method: "notifications/claude/channel",
           params: { content: msg.body, meta },

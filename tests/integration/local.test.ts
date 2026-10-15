@@ -117,9 +117,25 @@ test("grayboard mcp --mode local overrides a signed-in credentials file", async 
 
 test("dm_send to a handle that never connected is an error, not a silent queue", async () => {
   const be = await start("be");
-  await expect(call(be, "dm_send", { recipient: "backend", body: "hi" })).rejects.toThrow(/peer_list/);
+  await expect(call(be, "dm_send", { to: "backend", body: "hi" })).rejects.toThrow(/peer_list/);
   await start("fe");
-  expect((await call(be, "dm_send", { recipient: "fe", body: "hi" })).delivered_now).toBe(true);
+  expect((await call(be, "dm_send", { to: "fe", body: "hi" })).delivered_now).toBe(true);
+}, 20_000);
+
+test("dm_thread from any message returns the whole thread; pushes carry parent_id", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const pushes: Record<string, string>[] = [];
+  fe.fallbackNotificationHandler = async (n) => {
+    pushes.push((n.params as { meta: Record<string, string> }).meta);
+  };
+  const root = await call(be, "dm_send", { to: "fe", body: "q" });
+  const reply = await call(fe, "dm_send", { to: "be", body: "a", parent_id: root.message_id });
+  const leaf = await call(be, "dm_send", { to: "fe", body: "thanks", parent_id: reply.message_id });
+  const thread = await call(fe, "dm_thread", { thread: leaf.message_id });
+  expect(thread.map((m: any) => m.id)).toEqual([root.message_id, reply.message_id, leaf.message_id]);
+  await Bun.sleep(300);
+  expect(pushes.find((m) => m.message_id === String(leaf.message_id))?.parent_id).toBe(String(reply.message_id));
 }, 20_000);
 
 test("identities from before the handles roster are backfilled", async () => {
@@ -134,6 +150,6 @@ test("identities from before the handles roster are backfilled", async () => {
   const be = await start("be");
   const all = await call(be, "peer_list", { include_offline: true });
   expect(all.peers.map((p: any) => p.handle)).toEqual(["be", "docs", "fe"]);
-  expect((await call(be, "dm_send", { recipient: "fe", body: "still there?" })).delivered_now).toBe(false);
-  await expect(call(be, "dm_send", { recipient: "typo", body: "x" })).rejects.toThrow(/peer_list/);
+  expect((await call(be, "dm_send", { to: "fe", body: "still there?" })).delivered_now).toBe(false);
+  await expect(call(be, "dm_send", { to: "typo", body: "x" })).rejects.toThrow(/peer_list/);
 }, 20_000);

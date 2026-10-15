@@ -110,18 +110,24 @@ export function getMessage(id: number): Message | undefined {
     | undefined;
 }
 
-export function getThread(rootId: number): Message[] {
+// The whole thread containing message `id`: walk up to its root, then down.
+export function getThread(id: number): Message[] {
   return db
     .prepare(
-      `WITH RECURSIVE thread AS (
-         SELECT * FROM messages WHERE id = ?
+      `WITH RECURSIVE up(id, parent_id) AS (
+         SELECT id, parent_id FROM messages WHERE id = ?
+         UNION ALL
+         SELECT m.id, m.parent_id FROM messages m JOIN up ON m.id = up.parent_id
+       ),
+       thread AS (
+         SELECT * FROM messages WHERE id = (SELECT id FROM up WHERE parent_id IS NULL)
          UNION ALL
          SELECT m.* FROM messages m
          JOIN thread t ON m.parent_id = t.id
        )
        SELECT * FROM thread ORDER BY id ASC`,
     )
-    .all(rootId) as Message[];
+    .all(id) as Message[];
 }
 
 export function getHistory(
