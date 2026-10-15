@@ -141,6 +141,7 @@ async function wakeAll(handles: string[]): Promise<void> {
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
+  touchHandle(db, IDENTITY);
   try {
     return await dispatch(name, args as Record<string, any>);
   } catch (err) {
@@ -187,7 +188,6 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (isBoardTool(name)) {
-    touchHandle(db, IDENTITY);
     const ctx = name === "who" ? { online: await liveHandles() } : {};
     const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
     await wakeAll(wake);
