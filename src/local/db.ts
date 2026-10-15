@@ -29,6 +29,13 @@ function openDb(): Database {
       reader        TEXT PRIMARY KEY,
       last_seen_id  INTEGER NOT NULL
     );
+    -- Received messages marked handled without a reply (dm_ack).
+    CREATE TABLE IF NOT EXISTS dm_acks (
+      reader      TEXT NOT NULL,
+      message_id  INTEGER NOT NULL,
+      acked_at    INTEGER NOT NULL,
+      PRIMARY KEY (reader, message_id)
+    );
   `);
   initCoreSchema(db);
   // The handles roster arrived after the bus did. Backfill identities that have
@@ -187,4 +194,20 @@ export function getHistory(
   return rows.reverse().map((m) =>
     m.sender === identity && m.recipient !== identity ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
   );
+}
+
+export function ackMessage(reader: string, id: number): void {
+  db.prepare(`INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)`).run(reader, id, Date.now());
+}
+
+// Messages to `reader` since `since` that it hasn't acked, oldest first.
+export function receivedUnacked(reader: string, since: number): Message[] {
+  return db
+    .prepare(
+      `SELECT * FROM messages m
+        WHERE m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+        ORDER BY m.id ASC`,
+    )
+    .all(reader, since) as Message[];
 }

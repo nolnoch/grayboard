@@ -367,3 +367,21 @@ test("senders see what hasn't reached an offline peer", async () => {
   await b2.request({ type: "ack", message_ids: ids });
   expect(await delivered()).toEqual([true, true]);
 });
+
+test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  await a.connect();
+  await b.connect();
+  const q = await b.request({ type: "send", recipient: "alice@example.com/be", body: "question?" });
+  const fyi = await b.request({ type: "send", recipient: "alice@example.com/be", body: "FYI" });
+  const inbox = async () => (await a.request({ type: "inbox" })).unanswered.map((m: any) => m.id);
+  expect(await inbox()).toEqual([q.message_id, fyi.message_id]);
+
+  await a.request({ type: "send", recipient: "bob@example.com/fe", body: "answer", parent_id: q.message_id });
+  expect(await b.request({ type: "dm_ack", message_id: fyi.message_id })).toMatchObject({ type: "error", code: "not_found" });
+  expect(await a.request({ type: "dm_ack", message_id: fyi.message_id })).toMatchObject({ type: "ack_ok" });
+  expect(await inbox()).toEqual([]);
+});

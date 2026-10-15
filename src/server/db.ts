@@ -53,6 +53,9 @@ export interface Repo {
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     // Direct messages from sender still past each recipient's cursor, per recipient.
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
+    // Direct messages to reader since `since` that it hasn't acked, oldest first.
+    receivedUnacked(reader: string, since: number): MessageRow[];
+    ack(reader: string, id: number): void;
     prune(olderThanMs: number): void;
   };
   cursors: {
@@ -153,6 +156,14 @@ function initSchema(db: Database): void {
       detail TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_at ON access_log(at);
+
+    -- Received direct messages marked handled without a reply (dm_ack).
+    CREATE TABLE IF NOT EXISTS dm_acks (
+      reader      TEXT NOT NULL,
+      message_id  INTEGER NOT NULL,
+      acked_at    INTEGER NOT NULL,
+      PRIMARY KEY (reader, message_id)
+    );
   `);
 }
 
@@ -358,9 +369,24 @@ function makeRepo(db: Database): Repo {
             GROUP BY m.recipient ORDER BY m.recipient`,
         ).all(sender, olderThan);
       },
+      receivedUnacked(reader, since) {
+        return db.query<MessageRow, [string, number]>(
+          `SELECT * FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+            ORDER BY m.id ASC`,
+        ).all(reader, since);
+      },
+      ack(reader, id) {
+        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+      },
       prune(olderThanMs) {
         // Replies outlive pruned parents as roots; parent_id is a foreign key.
         db.transaction(() => {
+          db.run(
+            "DELETE FROM dm_acks WHERE message_id IN (SELECT id FROM messages WHERE created_at < ?)",
+            [olderThanMs],
+          );
           db.run(
             "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)",
             [olderThanMs],

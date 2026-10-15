@@ -1,4 +1,5 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
+import type { InboxItem } from "./inbox.ts";
 
 export type Message = {
   id: number;
@@ -17,13 +18,15 @@ export type HistoryRequest = { type: "history"; req_id: string; peer?: string; l
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
 export type PongMessage    = { type: "pong" };
+export type InboxRequest   = { type: "inbox";   req_id: string; days?: number };
+export type DmAckRequest   = { type: "dm_ack";  req_id: string; message_id: number };
 // Board and claim tools (src/core/tools.ts), run server-side as this identity.
 export type CallRequest    = { type: "call";      req_id: string; tool: string; args: Record<string, unknown> };
 export type BoardAckRequest = { type: "board_ack"; req_id: string; refs: PendingRef[] };
 
 export type ClientMessage =
   | HelloRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
-  | CallRequest | BoardAckRequest;
+  | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest;
 
 // Server -> Client
 export type HelloOk     = { type: "hello_ok";   req_id: string; identity_full: string; user_email: string; teams: string[] };
@@ -37,6 +40,10 @@ export type SendOk      = {
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
 export type AckOk       = { type: "ack_ok";     req_id: string };
+export type InboxOk     = {
+  type: "inbox_ok"; req_id: string; unanswered: InboxItem[];
+  undelivered_from_you?: { to: string; n: number; oldest_id: number; last_seen?: string }[];
+};
 export type PushMessage = { type: "push"; message: Message };
 export type PingMessage = { type: "ping" };
 export type CallOk      = { type: "call_ok";    req_id: string; result: unknown };
@@ -45,7 +52,7 @@ export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; me
 
 export type ServerMessage =
   | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
-  | CallOk | BoardPush;
+  | CallOk | BoardPush | InboxOk;
 
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
@@ -83,6 +90,14 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       return m as unknown as AckRequest;
     case "pong":
       return { type: "pong" };
+    case "inbox":
+      assertStr(m, "req_id");
+      if (m.days !== undefined && typeof m.days !== "number") throw new Error("days must be number");
+      return m as unknown as InboxRequest;
+    case "dm_ack":
+      assertStr(m, "req_id");
+      if (typeof m.message_id !== "number") throw new Error("message_id must be number");
+      return m as unknown as DmAckRequest;
     case "call":
       assertStr(m, "req_id"); assertStr(m, "tool");
       if (m.args !== undefined && (typeof m.args !== "object" || m.args === null || Array.isArray(m.args)))

@@ -8,7 +8,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import type { Message, SendOk, HistoryOk, ThreadOk, CallOk } from "../shared/protocol.ts";
+import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk } from "../shared/protocol.ts";
+import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import { checkArgs, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -59,6 +60,7 @@ const server = new Server(
     instructions: [
       `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
+      DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
@@ -141,6 +143,8 @@ const TOOLS = [
       required: ["thread"],
     },
   },
+  DM_INBOX_TOOL,
+  DM_ACK_TOOL,
 ...boardTools({ teams: true }),
 ];
 
@@ -178,6 +182,14 @@ async function call(name: string, a: Record<string, unknown>) {
     if (name === "dm_history") {
       const resp = await client.request<HistoryOk>({ type: "history", peer: a.peer, limit: a.limit, before_id: a.before_id });
       return text(resp.messages);
+    }
+    if (name === "dm_inbox") {
+      const { type: _t, req_id: _r, ...rest } = await client.request<InboxOk>({ type: "inbox", days: a.days });
+      return text(rest);
+    }
+    if (name === "dm_ack") {
+      await client.request({ type: "dm_ack", message_id: a.id });
+      return text("ok");
     }
     if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);

@@ -18,11 +18,13 @@ import {
   isBoardTool,
 } from "../core/tools.ts";
 import {
+  ackMessage,
   db,
   getHistory,
   getMessage,
   getThread,
   insertMessage,
+  receivedUnacked,
   setCursor,
   undeliveredFrom,
   unreadFor,
@@ -30,6 +32,7 @@ import {
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import { checkArgs, updateNotice } from "../shared/toolguard.ts";
+import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, inboxDays, unanswered } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
@@ -64,6 +67,7 @@ const mcp = new Server(
     instructions: [
       `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
+      DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...claimsInstruction(listClaims(db)),
       ...undeliveredInstruction(),
@@ -137,6 +141,8 @@ const TOOLS = [
       required: ["thread"],
     },
   },
+  DM_INBOX_TOOL,
+  DM_ACK_TOOL,
 ...boardTools({ teams: false }),
 ];
 
@@ -221,6 +227,25 @@ async function dispatch(name: string, a: Record<string, any>) {
 
   if (name === "dm_thread") {
     return text(getThread(a.thread));
+  }
+
+  if (name === "dm_inbox") {
+    const since = Date.now() - inboxDays(a.days) * 86_400_000;
+    const owed = unanswered(IDENTITY, receivedUnacked(IDENTITY, since), getThread);
+    const queued = undeliveredFrom(IDENTITY).map((u) => {
+      const seen = lastSeen(db, u.recipient);
+      return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
+    });
+    return text({ unanswered: owed, ...(queued.length ? { undelivered_from_you: queued } : {}) });
+  }
+
+  if (name === "dm_ack") {
+    const m = typeof a.id === "number" ? getMessage(a.id) : undefined;
+    if (!m || m.recipient !== IDENTITY) {
+      return { ...text(`error: no message ${a.id} to you; dm_inbox lists them`), isError: true };
+    }
+    ackMessage(IDENTITY, m.id);
+    return text("ok");
   }
 
   if (isBoardTool(name)) {

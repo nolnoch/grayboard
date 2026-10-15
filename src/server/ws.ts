@@ -21,6 +21,7 @@ import {
 import { callBoardTool, isBoardTool } from "../core/tools.ts";
 import { claimExpiryTimer } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
+import { inboxDays, unanswered } from "../shared/inbox.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -172,6 +173,19 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
         case "ack":
           handleAck(ws, msg.req_id, msg.message_ids, repo);
           break;
+        case "inbox":
+          handleInbox(hub, ws, msg.req_id, msg.days);
+          break;
+        case "dm_ack": {
+          const m = repo.messages.getById(msg.message_id);
+          if (!m || m.recipient_type !== "user" || m.recipient !== ws.data.identityFull) {
+            err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you; dm_inbox lists them`);
+            break;
+          }
+          repo.messages.ack(ws.data.identityFull, m.id);
+          send(ws, { type: "ack_ok", req_id: msg.req_id });
+          break;
+        }
         case "call":
           handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
           expiry.arm();
@@ -400,6 +414,23 @@ function handleHistory(
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
   send(ws, { type: "history_ok", req_id: reqId, messages });
+}
+
+function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined): void {
+  const { repo, db } = hub;
+  const me = ws.data.identityFull;
+  let since: number;
+  try {
+    since = Date.now() - inboxDays(days) * 86_400_000;
+  } catch (e) {
+    return err(ws, reqId, "bad_request", (e as Error).message);
+  }
+  const owed = unanswered(me, repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
+  const queued = repo.messages.undeliveredFrom(me).map((u) => {
+    const seen = lastSeen(db, u.recipient);
+    return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
+  });
+  send(ws, { type: "inbox_ok", req_id: reqId, unanswered: owed, ...(queued.length ? { undelivered_from_you: queued } : {}) });
 }
 
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {

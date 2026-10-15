@@ -342,6 +342,8 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen` and `undelivered_from_you` (your messages queued for them, this one included). An unknown handle is an error pointing to `peer_list`. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). In local mode, a new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. |
+| `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
+| `dm_ack(id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
 | `board_*`, `claim_take`, `claim_release`, `claim_list` | Boards and claims; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:

@@ -145,7 +145,7 @@ claims(prefix?)                             → active claims
 
 ### 5.6 Direct messages (unchanged)
 
-`dm_send` / `dm_history` / `dm_thread` keep working as they do today. In local mode, direct messages continue to use the existing `messages` and `cursors` tables.
+`dm_send` / `dm_history` / `dm_thread` keep working as they do today. In local mode, direct messages continue to use the existing `messages` and `cursors` tables. `dm_inbox` and `dm_ack` (a `dm_acks` table in each mode) cover what a pushed message can't: pushes live in the conversation, so `/clear` loses them. A message is owed until a later message from you lands in its thread, or you ack it.
 
 ---
 
