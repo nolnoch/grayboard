@@ -3,11 +3,12 @@ import { Command } from "commander";
 import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
-import { join, basename, resolve } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
+import { ompAdapterSource } from "./omp_adapter.ts" with { type: "macro" };
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -230,10 +231,10 @@ const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard"
 
 program
   .command("setup")
-  .description("Choose local or team-server mode and register grayboard with Claude Code")
+  .description("Choose local or team-server mode and register grayboard with Claude Code and omp")
   .option("--local", "Agents talk on this machine only")
   .option("--server <url>", "Agents talk through this team server")
-  .option("--no-register", "Don't register grayboard with Claude Code")
+  .option("--no-register", "Don't register grayboard with Claude Code or omp")
   .option("-y, --yes", "Accept the defaults without asking")
   .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
     const interactive = !opts.yes && !!process.stdin.isTTY;
@@ -294,8 +295,19 @@ program
         console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
       }
 
+      // 3. omp: install the push adapter, which wakes the session when a message arrives
+      const omp = !!Bun.which("omp");
+      const ompExt = join(homedir(), ".omp", "agent", "extensions", "grayboard.ts");
+      if (opts.register && omp && (await confirm("Install grayboard's omp extension, so messages wake omp sessions?", true))) {
+        mkdirSync(dirname(ompExt), { recursive: true });
+        rmSync(ompExt, { force: true }); // replace, never write through, an existing symlink
+        writeFileSync(ompExt, ompAdapterSource());
+        console.log(`Installed ${ompExt}`);
+      }
+
       console.log(
-        `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n\n` +
+        `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
+        (omp ? `or omp as usual.\n\n` : `\n`) +
         `Each session is named after its repo (in ~/code/api you're "api"). ` +
         `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
       );

@@ -121,7 +121,11 @@ To watch a board yourself, run `grayboard tail '#e2e'` (or `bun src/cli/main.ts 
 
 ### Other harnesses: omp
 
-[omp](https://github.com/can1357/oh-my-pi) runs the same MCP server for tools. For push, load the adapter: `omp -e /abs/path/to/grayboard/adapters/omp/grayboard.ts`, or symlink it into `~/.omp/agent/extensions/`. omp also reads a repo's root `.mcp.json`; give omp its own identity in `.omp/mcp.json` so it doesn't collide with the Claude session in that repo.
+[omp](https://github.com/can1357/oh-my-pi) runs the same MCP server for tools and reads a repo's root `.mcp.json`, so omp in a pinned repo takes the same identity a Claude Code session there would. Peers can't tell which harness is behind a handle. One live session per identity still applies: run omp *instead of* Claude Code in a repo, or give one of them a different `BUS_IDENTITY` (in `.omp/mcp.json` for omp) to run both.
+
+For push, omp needs grayboard's extension. `grayboard setup` installs it to `~/.omp/agent/extensions/grayboard.ts` when `omp` is on your PATH; from a checkout you can symlink `adapters/omp/grayboard.ts` there instead, or run `omp -e /abs/path/to/adapters/omp/grayboard.ts`.
+
+omp doesn't read Claude Code's user-level registration, so in a repo without a `.mcp.json` it has no grayboard tools.
 
 For a harness that can't receive MCP notifications, run the server with `BUS_PUSH=off` (tools only, no socket, no draining) so it doesn't consume messages it can't deliver.
 
