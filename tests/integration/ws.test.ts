@@ -161,6 +161,46 @@ test("team board: members see it and get pushes; non-members can't see or be men
   expect((await c.call("board_list")).result).toMatchObject([{ name: "eng", scope: "team:eng", mode: "digest" }]);
 });
 
+test("who: live connections are online; a closed one is offline with last_seen; team board scopes it", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(bob, "POST", "/api/teams/eng/join");
+
+  const a = new Client(alice, "be");
+  const a2 = new Client(alice, "be-stream");
+  const b = new Client(bob, "fe");
+  const c = new Client(carol, "sim");
+  for (const x of [a, a2, b, c]) expect((await x.connect()).type).toBe("hello_ok");
+
+  const online = await c.call("who");
+  expect(online.result.you).toBe("carol@example.com/sim");
+  expect(online.result.peers.map((p: any) => p.handle)).toEqual([
+    "alice@example.com/be",
+    "alice@example.com/be-stream",
+    "bob@example.com/fe",
+    "carol@example.com/sim",
+  ]);
+
+  const before = Date.now();
+  await closeAndSettle(a2);
+  const after = await c.call("who");
+  expect(after.result.offline_hidden).toBe(1);
+  const all = await c.call("who", { include_offline: true });
+  const gone = all.result.peers.find((p: any) => p.handle === "alice@example.com/be-stream");
+  expect(gone.online).toBe(false);
+  expect(gone.last_seen).toBeGreaterThanOrEqual(before);
+
+  const team = await b.call("who", { board: "eng", include_offline: true });
+  expect(team.result.peers.map((p: any) => [p.handle, p.online])).toEqual([
+    ["alice@example.com/be", true],
+    ["alice@example.com/be-stream", false],
+    ["bob@example.com/fe", true],
+  ]);
+  expect(await c.call("who", { board: "eng" })).toMatchObject({ type: "error", message: "no such board #eng; see board_list" });
+});
+
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
   const alice = await login("alice@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });

@@ -11,6 +11,7 @@ import {
   pendingFor,
   post,
   refOf,
+  touchHandle,
   type CoreDb,
   type PendingRef,
 } from "../core/boards.ts";
@@ -180,7 +181,10 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 
     close(ws: Ws) {
       const full = ws.data.identityFull;
-      if (full && hub.registry.get(full) === ws) hub.registry.delete(full);
+      if (full && hub.registry.get(full) === ws) {
+        hub.registry.delete(full);
+        touchHandle(hub.db, full);
+      }
       ws.data.onPong = undefined;
     },
   };
@@ -244,6 +248,7 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
   }
 
   registry.set(full, ws);
+  touchHandle(db, full);
   ws.data.identityId   = identity.id;
   ws.data.identityName = name;
   ws.data.identityFull = full;
@@ -366,7 +371,9 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   }
   let outcome;
   try {
-    outcome = callBoardTool(db, ws.data.identityFull, tool, args);
+    outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
+      online: (h) => hub.registry.get(h)?.data.ready === true,
+    });
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);

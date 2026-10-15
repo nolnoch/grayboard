@@ -93,6 +93,7 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_subscribe(board, mode)` | `push` / `digest` / `quiet` / `off` |
 | `claim(key, ttl_minutes?, note?, board?)` | Take or renew a hold, or learn who has it |
 | `release(key)` / `claims(prefix?)` | Release yours / list active claims |
+| `who(board?, include_offline?)` | Exact handles and who's online; with `board`, its subscribers |
 
 To watch a board yourself, run `grayboard tail '#e2e'` (or `bun src/cli/main.ts tail '#e2e'` from a checkout). It's read-only and updates live; `-n` sets how many recent posts to show first.
 

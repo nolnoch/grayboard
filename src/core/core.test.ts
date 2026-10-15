@@ -19,8 +19,10 @@ import {
   setAccess,
   subscribe,
   touchHandle,
+  who,
   type Access,
 } from "./boards.ts";
+import { callBoardTool } from "./tools.ts";
 import { claim, listClaims, release } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -202,6 +204,39 @@ test("prune keeps replies whose parent is pruned, and clears the outbox", () => 
 
 // ── access policy (the distributed server installs one like this) ────────────
 
+describe("who", () => {
+  const online = (h: string) => h === "sim";
+
+  test("lists online handles; offline ones are counted, or listed on request", () => {
+    expect(who(db, "be", {}, online)).toEqual({
+      you: "be",
+      peers: [
+        { handle: "be", online: true, last_seen: expect.any(Number) },
+        { handle: "sim", online: true, last_seen: expect.any(Number) },
+      ],
+      offline_hidden: 1,
+    });
+    const all = who(db, "be", { include_offline: true }, online);
+    expect(all.peers.map((p) => [p.handle, p.online])).toEqual([["be", true], ["fe", false], ["sim", true]]);
+    expect(all.offline_hidden).toBeUndefined();
+  });
+
+  test("board scope: subscribers with their mode", () => {
+    subscribe(db, "fe", "e2e", "quiet");
+    expect(who(db, "sim", { board: "#e2e", include_offline: true }, online).peers).toEqual([
+      { handle: "be", online: false, last_seen: expect.any(Number), mode: "push" },
+      { handle: "fe", online: false, last_seen: expect.any(Number), mode: "quiet" },
+    ]);
+    expect(() => who(db, "be", { board: "nope" }, online)).toThrow(/no such board/);
+  });
+
+  test("the tool needs the mode's liveness check", () => {
+    expect(() => callBoardTool(db, "be", "who", {})).toThrow(/isn't available/);
+    expect(callBoardTool(db, "be", "who", { include_offline: true }, { online }).result).toMatchObject({ you: "be" });
+    expect(() => callBoardTool(db, "be", "who", { include_offline: "yes" }, { online })).toThrow(/boolean/);
+  });
+});
+
 describe("with a scoped access policy", () => {
   const members = new Set(["be", "sim"]); // members of team:eng; fe is not
   const policy: Access = {
@@ -240,6 +275,17 @@ describe("with a scoped access policy", () => {
       members.add("sim");
       // The push was acknowledged while hidden; only the digest remains.
       expect(pendingFor(db, "sim").map((i) => i.kind)).toEqual(["digest"]);
+    } finally {
+      members.add("sim");
+    }
+  });
+
+  test("who on a team board: non-members can't see it, members don't see outsiders", () => {
+    subscribe(db, "sim", "eng", "digest");
+    expect(() => who(db, "fe", { board: "eng" }, () => true)).toThrow(/no such board/);
+    members.delete("sim");
+    try {
+      expect(who(db, "be", { board: "eng" }, () => true).peers.map((p) => p.handle)).toEqual(["be"]);
     } finally {
       members.add("sim");
     }

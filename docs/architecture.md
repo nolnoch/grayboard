@@ -355,7 +355,7 @@ Read by `cli/api.ts:loadCredentials` and `plugin/main.ts:loadCredentials`. Env-v
 | `bus_send(recipient, body, parent_id?)` | `{type:"send"}` |
 | `bus_history(peer?, limit?, before_id?)` | `{type:"history"}` |
 | `bus_thread(root_id)` | `{type:"thread"}` |
-| `board_*`, `claim`, `release`, `claims` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`) |
+| `board_*`, `claim`, `release`, `claims`, `who` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`; `who` reads the core `handles` table, which the server touches on connect and disconnect, and checks liveness against the open connections) |
 
 Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits with a message if the server doesn't answer or refuses the identity. That way `/mcp` shows an error instead of hitting Claude Code's own 30s startup timeout.
 

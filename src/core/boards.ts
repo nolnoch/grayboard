@@ -99,6 +99,13 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
   ).run(handle, now, now);
 }
 
+// A handle that no longer exists (e.g. a deleted identity) leaves the roster
+// and its board subscriptions. Its posts and claims stay: they're history.
+export function forgetHandle(db: Database, handle: string): void {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
+  db.prepare(`DELETE FROM handles WHERE name = ?`).run(handle);
+}
+
 export function createBoard(
   db: Database,
   handle: string,
@@ -334,6 +341,55 @@ function threadRoot(db: Database, postId: number): number {
     if (!row || row.parent_id === null) return id;
     id = row.parent_id;
   }
+}
+
+// ── who ──────────────────────────────────────────────────────────────────────
+
+export type Peer = { handle: string; online: boolean; last_seen: number; mode?: SubMode };
+export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
+
+// The roster: every handle that has connected (the `handles` table), or a
+// board's subscribers. `online` comes from the mode: a live session that will
+// receive pushes (local: its wakeup socket answers; server: an open connection).
+export function who(
+  db: Database,
+  handle: string,
+  opts: { board?: string; include_offline?: boolean },
+  online: (h: string) => boolean,
+): WhoResult {
+  let rows: { handle: string; last_seen: number | null; mode?: SubMode }[];
+  if (opts.board !== undefined) {
+    const b = visibleBoard(db, handle, opts.board);
+    const a = access(db);
+    rows = (
+      db
+        .prepare(
+          `SELECT s.handle, s.mode, h.last_seen FROM subscriptions s
+             LEFT JOIN handles h ON h.name = s.handle
+            WHERE s.board = ? ORDER BY s.handle`,
+        )
+        .all(b.name) as typeof rows
+    ).filter((r) => a.canSee(r.handle, b));
+  } else {
+    rows = db
+      .prepare(`SELECT name AS handle, last_seen FROM handles ORDER BY name`)
+      .all() as typeof rows;
+  }
+  const all: Peer[] = rows.map((r) => ({
+    handle: r.handle,
+    online: r.handle === handle || online(r.handle),
+    last_seen: r.last_seen ?? 0,
+    ...(r.mode ? { mode: r.mode } : {}),
+  }));
+  if (opts.include_offline) return { you: handle, peers: all };
+  const peers = all.filter((p) => p.online);
+  const hidden = all.length - peers.length;
+  return { you: handle, peers, ...(hidden ? { offline_hidden: hidden } : {}) };
+}
+
+/** Every handle in the roster, for a mode that must check liveness up front. */
+export function rosterHandles(db: Database): string[] {
+  return (db.prepare(`SELECT name FROM handles`).all() as { name: string }[]).map((r) => r.name);
 }
 
 export function getPost(db: Database, id: number): Post | undefined {

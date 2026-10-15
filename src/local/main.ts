@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, markDelivered, pendingFor, touchHandle } from "../core/boards.ts";
+import { CoreError, markDelivered, pendingFor, rosterHandles, touchHandle } from "../core/boards.ts";
 import {
   BOARD_INSTRUCTIONS,
   boardNotification,
@@ -187,12 +187,23 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (isBoardTool(name)) {
-    const { result, wake } = callBoardTool(db, IDENTITY, name, a);
+    touchHandle(db, IDENTITY);
+    const ctx = name === "who" ? { online: await liveHandles() } : {};
+    const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
     await wakeAll(wake);
     return text(result);
   }
 
   throw new Error(`unknown tool: ${name}`);
+}
+
+// Which handles have a live session, by probing each wakeup socket. A probe is
+// also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
+async function liveHandles(): Promise<(h: string) => boolean> {
+  const others = rosterHandles(db).filter((h) => h !== IDENTITY);
+  const alive = await Promise.all(others.map((h) => poke(h)));
+  const live = new Set(others.filter((_, i) => alive[i]));
+  return (h) => live.has(h);
 }
 
 // Drain: emit unread direct messages and pending board items as channel
@@ -244,6 +255,9 @@ await mcp.connect(new StdioServerTransport());
 
 let cleanup = () => {};
 const shutdown = () => {
+  try {
+    touchHandle(db, IDENTITY);
+  } catch {}
   cleanup();
   process.exit(0);
 };

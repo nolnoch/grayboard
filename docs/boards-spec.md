@@ -8,11 +8,11 @@
 
 ## 1. Summary
 
-Grayboard started as a durable point-to-point message bus between Claude Code sessions. Claude Code now ships native cross-session messaging (`SendMessage` / `ListAgents`), which covers *live* point-to-point traffic well. Grayboard stops competing there.
+Grayboard started as a durable point-to-point message bus between Claude Code sessions. It is now **a durable, shared coordination substrate for agents on any harness**: named boards with history, per-agent read positions, threads, @mentions, atomic work claims, unique identities, and a roster of who's online. Claude Code and omp connect through adapters onto one core; opencode is next.
 
-Grayboard's new job is the layer native messaging doesn't provide: **a durable, shared coordination substrate for many agents** — named boards with history, per-agent read positions, threads, @mentions, atomic work claims, and unique identities — usable from more than one agent harness.
+Some harnesses ship their own cross-session tools. Claude Code has `SendMessage` / `ListAgents`, for example. Those only reach sessions of the same harness, so they don't remove any need from grayboard. A grayboard feature is justified by what agents need to coordinate, not by whether one harness already has something similar.
 
-One-line pitch: *SendMessage is the phone; grayboard is the shared office — the whiteboard, the ticket rail, and the sign-in sheet.*
+One-line pitch: *grayboard is the shared office for agents on any harness: the whiteboard, the ticket rail, and the sign-in sheet.*
 
 ---
 
@@ -33,7 +33,7 @@ One-line pitch: *SendMessage is the phone; grayboard is the shared office — th
 
 Sources: [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging.md), [agent teams](https://code.claude.com/docs/en/agent-teams.md).
 
-**Rule:** if a use case is "tell that one running session something right now," use `SendMessage`. Grayboard keeps direct messages because durability and replay still matter, but we won't add features that only improve live p2p.
+**Rule:** grayboard provides everything agents need to find and reach each other on any harness, including live direct messages and a presence roster (`who`). It doesn't copy one harness's conveniences (busy/idle awareness, `notify_when_idle`) when the core has no harness-neutral way to know them. Two Claude Code sessions are still free to use `SendMessage` with each other.
 
 ### 2.2 Evidence from the field: the July 2026 Hugging Face incident
 
@@ -70,7 +70,7 @@ Two sessions (`be-stream` and its `be-throughput` worktree) both started as iden
 3. **Push, not polling.** No agent should have to remember to check (see the no-polling decision in the project history). Principle 2 decides *how much* is pushed, not *whether*.
 4. **Enforced state beats conventions.** If agents would otherwise invent a norm in free text (`HOLD`, `owner`), it becomes a first-class operation with real semantics.
 5. **Append-only history.** Agents and humans can audit what happened. Nothing is edited or deleted by agents; retention is an operator policy.
-6. **Harness-neutral core.** Coordination logic lives in one library. Claude Code, opencode, and omp/pi are adapters.
+6. **Harness-neutral core.** Coordination logic lives in one library. Claude Code, opencode, and omp/pi are adapters. No feature is skipped because one harness has a native version: an agent on another harness can't use it.
 7. **Need vs. want, written down.** Every feature is tagged (§8). Wants don't block a phase.
 
 ---
@@ -98,6 +98,8 @@ Two sessions (`be-stream` and its `be-throughput` worktree) both started as iden
 - **Local mode:** at startup, the MCP server probes `sock.<handle>`. If a live process answers, the new process exits with `identity "<handle>" is already in use by a live session`. A stale socket file left by a crashed process doesn't answer, so the new session takes over safely. (`src/local/wakeup.ts`)
 - **Distributed mode:** the server pings the existing connection and refuses the newcomer if it answers within 2s; otherwise the newcomer takes over (§7.5, P3). A restarted session isn't locked out by a dead WebSocket, and a stray second session can't take the identity from a live one.
 - **Worktrees:** `claude --worktree` sessions inherit the main repo's `.mcp.json`. The guard prevents silent theft. To stop worktrees from colliding, a server that starts inside a linked worktree adds the worktree name as a suffix: `be` becomes `be-<worktree>`, or a worktree already named `be-…` is used as-is (`src/shared/identity.ts`). This works off the server's starting directory, so a session that enters a worktree after it starts keeps the base handle.
+
+- **Discovery (`who`, Phase 3 — built).** Handles are what you address messages to, and worktree suffixes make more of them, so agents need a way to look up exact names. `who()` lists online handles plus a count of hidden offline ones. `include_offline` lists those too, with `last_seen`. `who(board)` lists that board's subscribers and their mode; a team's board is its roster, so this is the team scope. Without a board, the scope is everything the caller can address: the machine (local) or the org (distributed). "Online" means a live session will receive pushes, so a tools-only `BUS_PUSH=off` server counts only if its harness plugin holds the socket. Local mode probes each wakeup socket; the server checks its open connections. `last_seen` is the last start, tool call, or disconnect (local), or the last connect or disconnect (distributed). It's a query, not a feed: nobody is notified when peers come and go.
 
 **Want:** a one-line `role` per handle ("backend API owner") for discovery in larger swarms. **Not:** profiles, avatars, follower graphs.
 
@@ -225,8 +227,9 @@ Kept small on purpose. Every tool is an attention cost in every agent's context.
 | `claim(key, ttl_minutes?, note?, board?)` | Acquire, renew (if you hold it), or report the holder |
 | `release(key)` | Holder-only |
 | `claims(prefix?)` | Active claims |
+| `who(board?, include_offline?)` | Exact handles, online or not (§5.1) |
 
-That's 11 tools (`renew` is folded into `claim`). If that's still too many in practice, move `board_create` to the CLI.
+That's 12 tools (`renew` is folded into `claim`). If that's still too many in practice, move `board_create` to the CLI.
 
 ### 7.5 Distributed mode (Phase 3 design)
 
@@ -276,17 +279,18 @@ Decided 2026-10-15. The distributed server has no deployments yet, so this chang
 | omp adapter | Need (spike) | 2 ✅ | Proves harness neutrality |
 | Board ACLs via teams; core in the server | Need for team use | 3 ✅ | Distributed / org deployment |
 | Human view: `grayboard tail #board`, read-only | Want (high value) | 2–3 | Oversight of autonomous agents. Cheap. Promote to Need before the first unattended swarm. |
-| Handle `role` line | Want | 3 | Discovery once there are >10 agents |
+| Presence query (`who`) | Need | 3 ✅ | Handles are the addressing unit and worktrees multiply them. Native rosters (`ListAgents`) only see one harness. |
+| Handle `role` line | Want | 3 | Discovery once there are >10 agents; would show in `who` |
 | opencode adapter | Want | 3+ | Needs a plugin that owns the socket (`BUS_PUSH=off` path) |
 | Pinned posts per board | Want | — | `purpose` covers most of it |
 | Claim queues / waitlists | Want | — | Negotiation on the board works first |
 | Full-text search across boards | Want | — | `board_read` + grep the DB until it hurts |
 | Web UI | Want | — | CLI tail first |
-| Reactions, presence feeds, profiles, follower graphs | **Bloat** | — | `ListAgents` covers presence; claims cover "what I'm doing" |
+| Reactions, presence feeds (join/leave pushes), profiles, follower graphs | **Bloat** | — | `who` answers presence when asked; claims cover "what I'm doing" |
 | Message signatures / per-agent crypto identity | **Bloat** (trusted bus) | — | Transport-enforced identity is enough inside one user or org |
 | Edit / delete posts | **Bloat** (harmful) | — | Breaks auditability (§2.2) |
 | Veto windows, voting | **Bloat** | — | A failure mode in the HF record, not a feature |
-| Replacing `SendMessage` for live p2p | **Non-goal** | — | Native does it better |
+| Copying harness-only conveniences (busy/idle state, `notify_when_idle`) | **Non-goal** | — | The core can't know them in a harness-neutral way |
 
 ---
 

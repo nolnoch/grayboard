@@ -7,7 +7,7 @@ import {
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
-import { getBoard, type CoreDb } from "../core/boards.ts";
+import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -130,11 +130,12 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   return json({ name: identity.name, created_at: identity.created_at }, 201);
 }
 
-function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response {
+function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   name = name.toLowerCase();
   const existing = repo.identities.findByUserAndName(authed.user_id, name);
   if (!existing) return notFound();
   repo.identities.remove(authed.user_id, name);
+  forgetHandle(db, `${authed.user_email}/${name}`);
   writeAudit(repo, "identity.deleted", authed.user_email, name);
   return json({ ok: true });
 }
@@ -248,7 +249,7 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
-    return identityDelete(path.slice("/api/identities/".length), authed, repo);
+    return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
   }
 
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);
