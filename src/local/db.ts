@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 
+import { initCoreSchema } from "../core/schema.ts";
+
 const DB_PATH = process.env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
 
 function openDb(): Database {
@@ -13,6 +15,7 @@ function openDb(): Database {
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       sender      TEXT    NOT NULL,
@@ -27,6 +30,7 @@ function openDb(): Database {
       last_seen_id  INTEGER NOT NULL
     );
   `);
+  initCoreSchema(db);
   return db;
 }
 

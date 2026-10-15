@@ -8,12 +8,15 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
   // src/local/ is the sanctioned same-machine mode (v0 preserved); it owns its own
   // SQLite layer by design. The migration seam this test guards is the v1 backend —
   // src/server, src/plugin, src/shared, src/cli — so src/local is excluded.
+  // src/core/ (boards + claims, shared by both modes) takes a Database handle and
+  // is part of the seam: a Postgres port reimplements it alongside db.ts.
   const offenders: string[] = [];
   const glob = new Glob("src/**/*.ts");
   const importPattern = /from\s+["']bun:sqlite["']/;
   for await (const file of glob.scan(".")) {
     if (file === "src/server/db.ts") continue;
     if (file.startsWith("src/local/")) continue;
+    if (file.startsWith("src/core/")) continue;
     if (file.endsWith(".test.ts")) continue;
     const text = await Bun.file(file).text();
     if (importPattern.test(text)) offenders.push(file);

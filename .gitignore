@@ -8,3 +8,5 @@ bun.lockb
 .DS_Store
 meta/
 dist/
+.claude/settings.local.json
+.claude/HANDOFF*.md

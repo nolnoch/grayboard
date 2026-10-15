@@ -9,12 +9,13 @@ function sockPath(identity: string): string {
 
 export type WakeupHandler = () => void;
 
-export function listenForWakeup(
+export async function listenForWakeup(
   identity: string,
   onWake: WakeupHandler,
-): () => void {
+): Promise<() => void> {
   if (!existsSync(SOCK_DIR)) mkdirSync(SOCK_DIR, { recursive: true });
   const path = sockPath(identity);
+  await assertIdentityFree(identity);
   try {
     if (existsSync(path)) unlinkSync(path);
   } catch {}
@@ -40,8 +41,24 @@ export function listenForWakeup(
   };
 }
 
+// A live listener means another session already owns this identity. Taking
+// the socket over would silently steal its pushes and share its cursor.
+export async function assertIdentityFree(identity: string): Promise<void> {
+  if (await canConnect(sockPath(identity))) {
+    throw new Error(
+      `grayboard: identity "${identity}" is already in use by a live session. ` +
+        `Give this session a different BUS_IDENTITY or don't load grayboard here.`,
+    );
+  }
+}
+
 export async function poke(identity: string): Promise<boolean> {
-  const path = sockPath(identity);
+  return canConnect(sockPath(identity));
+}
+
+// Connecting is the wakeup: the listener drains on open, so a probe also
+// nudges the owner, which is harmless (drain is idempotent).
+async function canConnect(path: string): Promise<boolean> {
   if (!existsSync(path)) return false;
   try {
     await Bun.connect({

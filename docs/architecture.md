@@ -466,7 +466,7 @@ Resolved since the initial audit:
 | # | Deviation | Spec ref | Severity | Recommendation |
 |---|---|---|---|---|
 | **D3** | README is the v0 README — no mention of three entry points, login flow, or backend deploy. The `.mcp.json` snippet still points at the now-renamed `src/server.ts` (it should be `src/local/main.ts` for local mode or `src/plugin/main.ts` for distributed). | §19 (✗) | High — a new reader gets the wrong picture and a broken `.mcp.json` template. | Rewrite around the two operating modes (local via `src/local/`, distributed via `src/plugin/` + backend). |
-| **D4** | Domain restriction is `GRAYBOARD_ORG_DOMAIN` (env var) instead of hardcoded `stablekernel.com`. | §3 | Low — generalization the spec didn't ask for but doesn't break anything. | Keep. Already documented here in §4. |
+| **D4** | Domain restriction is `GRAYBOARD_ORG_DOMAIN` (env var) instead of a hardcoded company domain. | §3 | Low — generalization the spec didn't ask for but doesn't break anything. | Keep. Already documented here in §4. |
 | **D5** | `POST /api/admin/revoke-session` ignores the `all` field — both branches call `revokeAllForUser`. CLI hardcodes `all: true` anyway. | §5.6 | Low — CLI works, but the API contract lies. | Either implement single-session revoke or drop the `all` parameter and document "revokes all." |
 | **D6** | `SendContext.db` is typed `Repo`, not `Database`. | §6.1 | Low — arguably an improvement (Repo is the right level of abstraction). | Keep; the seam works. |
 | **D8** | Audit retention test only asserts `pruneAudit` doesn't throw — does not verify rows are deleted. | §16 (test 8) | Low — coverage gap, not a bug. | Add the deletion assertion if cheap. |
