@@ -115,7 +115,7 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_subscribe(board, mode)` | `push` / `digest` / `quiet` / `off` |
 | `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it |
 | `claim_release(key)` / `claim_list(prefix?)` | Release yours / list active claims |
-| `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, live git branch) and its status; with `board`, its subscribers |
+| `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, live git branch) and its status; your own row has `self: true`; with `board`, its subscribers |
 | `peer_status(text)` | Set a one-line status shown in `peer_list` with its age; empty clears; a session restart clears it |
 
 Active claims are also listed in each session's instructions when it starts, so a fresh or `/clear`-ed session sees a merge freeze without knowing to look. A claim taken after a session started reaches it only as the board announcement.

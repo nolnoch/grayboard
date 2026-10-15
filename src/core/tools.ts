@@ -99,7 +99,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "peer_list",
       description:
-        "peer_list(board?, include_offline?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start). With board: its subscribers and their mode (a team's board is its roster).",
+        "peer_list(board?, include_offline?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own row has self: true. With board: its subscribers and their mode (a team's board is its roster).",
       inputSchema: {
         type: "object",
         properties: {

@@ -379,6 +379,7 @@ export type Peer = {
   handle: string;
   online: boolean;
   last_seen: number;
+  self?: true;
   mode?: SubMode;
   where?: string;
   status?: string;
@@ -421,6 +422,7 @@ export function who(
       handle: r.handle,
       online: r.handle === handle || online(r.handle),
       last_seen: r.last_seen ?? 0,
+      ...(r.handle === handle ? { self: true as const } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
       ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),

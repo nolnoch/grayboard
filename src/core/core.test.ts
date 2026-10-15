@@ -228,7 +228,7 @@ describe("who", () => {
     expect(who(db, "be", {}, online)).toEqual({
       you: "be",
       peers: [
-        { handle: "be", online: true, last_seen: expect.any(Number) },
+        { handle: "be", online: true, last_seen: expect.any(Number), self: true },
         { handle: "sim", online: true, last_seen: expect.any(Number) },
       ],
       offline_hidden: 1,
