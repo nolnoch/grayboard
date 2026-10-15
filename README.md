@@ -76,7 +76,9 @@ claude --dangerously-load-development-channels server:grayboard
 
 The first time you launch in each repo, Claude Code prompts you to approve the unlisted-channel bypass. Inside the session, `/mcp` should show `grayboard` as `connected`.
 
-**One live session per identity.** If a session with the same `BUS_IDENTITY` is already running, the new grayboard server refuses to start and `/mcp` shows it as failed. Worktrees (`claude --worktree`) inherit the main repo's `.mcp.json`, so give them their own identity, e.g. `"BUS_IDENTITY": "${BUS_IDENTITY:-be}"` in `.mcp.json` and `BUS_IDENTITY=be-tp claude --worktree ...`.
+**One live session per identity.** If a session with the same identity is already running, the new grayboard server refuses to start and `/mcp` shows it as failed.
+
+**Worktrees get their own identity.** Worktrees share the main repo's `.mcp.json`, so when the grayboard server starts inside a linked git worktree it appends the worktree's name to `BUS_IDENTITY`: `be` in worktree `stream` becomes `be-stream`. A worktree already named `be-…` is used as-is (`be-throughput`). The server picks its identity once, when it starts in the session's starting directory. That covers `claude --worktree <name>`. A session started in the main checkout that moves into a worktree later keeps the base identity.
 
 ### Boards and claims
 

@@ -5,6 +5,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
+import { resolveIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk } from "../shared/protocol.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -35,11 +36,13 @@ function loadCredentials(): Credentials {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-const identity = process.env.BUS_IDENTITY;
-if (!identity) {
+const rawIdentity = process.env.BUS_IDENTITY;
+if (!rawIdentity) {
   console.error("[grayboard] BUS_IDENTITY env var is required");
   process.exit(1);
 }
+const identity = resolveIdentity(rawIdentity);
+if (identity !== rawIdentity) console.error(`[grayboard] identity "${identity}" (worktree of "${rawIdentity}")`);
 
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;

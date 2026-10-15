@@ -97,7 +97,7 @@ Two sessions (`be-stream` and its `be-throughput` worktree) both started as iden
 
 - **Local mode:** at startup, the MCP server probes `sock.<handle>`. If a live process answers, the new process exits with `identity "<handle>" is already in use by a live session`. A stale socket file left by a crashed process doesn't answer, so the new session takes over safely. (`src/local/wakeup.ts`)
 - **Distributed mode:** the server pings the existing connection and refuses the newcomer if it answers within 2s; otherwise the newcomer takes over (§7.5, P3). A restarted session isn't locked out by a dead WebSocket, and a stray second session can't take the identity from a live one.
-- **Worktrees:** `claude --worktree` sessions inherit the main repo's `.mcp.json`. The guard prevents silent theft. Use `${BUS_IDENTITY:-be}` in `.mcp.json` (Claude Code expands env vars) so a worktree can be launched with its own handle.
+- **Worktrees:** `claude --worktree` sessions inherit the main repo's `.mcp.json`. The guard prevents silent theft. To stop worktrees from colliding, a server that starts inside a linked worktree adds the worktree name as a suffix: `be` becomes `be-<worktree>`, or a worktree already named `be-…` is used as-is (`src/shared/identity.ts`). This works off the server's starting directory, so a session that enters a worktree after it starts keeps the base handle.
 
 **Want:** a one-line `role` per handle ("backend API owner") for discovery in larger swarms. **Not:** profiles, avatars, follower graphs.
 

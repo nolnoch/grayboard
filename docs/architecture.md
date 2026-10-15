@@ -361,7 +361,7 @@ Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits wi
 
 `GrayboardClient` (`plugin/client.ts`):
 - Connects WSS with `Authorization: Bearer` header (Bun's non-standard `WebSocket` constructor option).
-- Sends `hello { identity: BUS_IDENTITY }` on open.
+- Sends `hello { identity }` on open. The identity is `BUS_IDENTITY`, plus a suffix for the worktree name when the server starts inside a linked git worktree (`shared/identity.ts`).
 - Resolves a `ready()` promise on `hello_ok`.
 - Routes responses by `req_id` to pending request promises.
 - On `push`: invokes `onPush(msg)` then auto-acks the message id.

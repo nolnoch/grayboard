@@ -24,6 +24,7 @@ import {
   unreadFor,
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
+import { resolveIdentity } from "../shared/identity.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const rawIdentity = process.env.BUS_IDENTITY;
@@ -32,7 +33,8 @@ if (!rawIdentity) {
     "grayboard: BUS_IDENTITY env var is required (e.g. BUS_IDENTITY=fe)",
   );
 }
-const IDENTITY: string = rawIdentity;
+const IDENTITY: string = resolveIdentity(rawIdentity);
+if (IDENTITY !== rawIdentity) console.error(`[grayboard] identity "${IDENTITY}" (worktree of "${rawIdentity}")`);
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
