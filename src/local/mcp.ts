@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError, age, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
@@ -24,6 +24,7 @@ import {
   getThread,
   insertMessage,
   setCursor,
+  undeliveredFrom,
   unreadFor,
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
@@ -39,6 +40,20 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
 
+// Sent direct messages still queued a day later, so a stale "told them" in a
+// handoff gets caught when the session starts.
+function undeliveredInstruction(): string[] {
+  const stale = undeliveredFrom(IDENTITY, Date.now() - 86_400_000);
+  if (stale.length === 0) return [];
+  const list = stale
+    .map((u) => {
+      const seen = lastSeen(db, u.recipient);
+      return `${u.recipient}: ${u.n} since message_id ${u.oldest_id}${seen ? ` (last seen ${age(Date.now() - seen)} ago)` : ""}`;
+    })
+    .join("; ");
+  return [`Direct messages you sent that still haven't reached the recipient after 24h: ${list}. Don't count them as read.`];
+}
+
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
   {
@@ -51,6 +66,7 @@ const mcp = new Server(
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       ...BOARD_INSTRUCTIONS,
       ...claimsInstruction(listClaims(db)),
+      ...undeliveredInstruction(),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
   },
@@ -61,7 +77,7 @@ const mcp = new Server(
 const TOOLS = [
   {
     name: "dm_send",
-    description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online, or queued until their next session.`,
+    description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -85,7 +101,7 @@ const TOOLS = [
   {
     name: "dm_history",
     description:
-      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent.",
+      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
     inputSchema: {
       type: "object",
       properties: {
@@ -187,15 +203,15 @@ async function dispatch(name: string, a: Record<string, any>) {
     }
     const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null);
     const delivered = await poke(recipient);
-    return text(
-      JSON.stringify({
-        message_id: id,
-        delivered_now: delivered,
-        note: delivered
-          ? "Recipient was online; pushed."
-          : "Recipient offline; will be delivered on their next session.",
-      }),
-    );
+    if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, note: "Recipient was online; pushed." }));
+    const seen = lastSeen(db, recipient);
+    return text(JSON.stringify({
+      message_id: id,
+      delivered_now: false,
+      note: "Recipient offline; will be delivered on their next session.",
+      ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+      undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === recipient)?.n ?? 1,
+    }));
   }
 
   if (name === "dm_history") {

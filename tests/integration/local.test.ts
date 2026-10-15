@@ -182,3 +182,25 @@ test("identities from before the handles roster are backfilled", async () => {
   expect((await call(be, "dm_send", { to: "fe", body: "still there?" })).delivered_now).toBe(false);
   await expect(call(be, "dm_send", { to: "typo", body: "x" })).rejects.toThrow(/peer_list/);
 }, 20_000);
+
+test("senders see what hasn't reached an offline peer: send result, history, and next session", async () => {
+  const fe = await start("fe");
+  await stop(fe);
+  let be = await start("be");
+  await call(be, "dm_send", { to: "fe", body: "contract change 1" });
+  const second = await call(be, "dm_send", { to: "fe", body: "contract change 2" });
+  expect(second).toMatchObject({ delivered_now: false, recipient_last_seen: expect.stringMatching(/ago$/), undelivered_from_you: 2 });
+  expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.delivered)).toEqual([false, false]);
+
+  await stop(be);
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(join(dir, "bus.db"));
+  db.exec(`UPDATE messages SET created_at = created_at - 2 * 86400000`);
+  db.close();
+  be = await start("be");
+  expect(be.getInstructions()).toMatch(/haven't reached the recipient after 24h: fe: 2 since message_id \d+ \(last seen/);
+
+  await start("fe");
+  await Bun.sleep(300); // fe's first drain moves its cursor
+  expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.delivered)).toEqual([true, true]);
+}, 20_000);

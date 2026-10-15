@@ -27,8 +27,14 @@ export type ClientMessage =
 
 // Server -> Client
 export type HelloOk     = { type: "hello_ok";   req_id: string; identity_full: string; user_email: string; teams: string[] };
-export type SendOk      = { type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean };
-export type HistoryOk   = { type: "history_ok"; req_id: string; messages: Message[] };
+export type SendOk      = {
+  type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
+  // When not delivered now: the recipient's last session, e.g. "14d ago", and
+  // how many of your messages are queued for them, this one included.
+  recipient_last_seen?: string; undelivered_from_you?: number;
+};
+// Messages you sent carry delivered: whether they've reached the recipient's session.
+export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
 export type AckOk       = { type: "ack_ok";     req_id: string };
 export type PushMessage = { type: "push"; message: Message };

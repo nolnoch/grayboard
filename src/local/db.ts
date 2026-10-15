@@ -130,12 +130,34 @@ export function getThread(id: number): Message[] {
     .all(id) as Message[];
 }
 
+// Messages `sender` sent that haven't reached the recipient's session yet
+// (past its cursor), per recipient. olderThan: only count those sent before it.
+export function undeliveredFrom(
+  sender: string,
+  olderThan = Infinity,
+): { recipient: string; n: number; oldest_id: number }[] {
+  return db
+    .prepare(
+      `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+         LEFT JOIN cursors c ON c.reader = m.recipient
+        WHERE m.sender = ? AND m.recipient != m.sender
+          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+        GROUP BY m.recipient ORDER BY m.recipient`,
+    )
+    .all(sender, Number.isFinite(olderThan) ? olderThan : Number.MAX_SAFE_INTEGER) as {
+    recipient: string;
+    n: number;
+    oldest_id: number;
+  }[];
+}
+
+// Rows you sent carry delivered: whether they've reached the recipient's session.
 export function getHistory(
   identity: string,
   peer: string | undefined,
   limit: number,
   beforeId: number | undefined,
-): Message[] {
+): (Message & { delivered?: boolean })[] {
   const clauses: string[] = [];
   const args: (string | number)[] = [];
 
@@ -162,5 +184,7 @@ export function getHistory(
   `;
   args.push(limit);
   const rows = db.prepare(sql).all(...args) as Message[];
-  return rows.reverse();
+  return rows.reverse().map((m) =>
+    m.sender === identity && m.recipient !== identity ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
+  );
 }

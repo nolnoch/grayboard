@@ -339,8 +339,8 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`. An unknown handle is an error pointing to `peer_list`. |
-| `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. |
+| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen` and `undelivered_from_you` (your messages queued for them, this one included). An unknown handle is an error pointing to `peer_list`. |
+| `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). In local mode, a new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. |
 | `board_*`, `claim_take`, `claim_release`, `claim_list` | Boards and claims; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 

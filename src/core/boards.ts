@@ -117,7 +117,8 @@ export function setStatus(db: Database, handle: string, text: string, now = Date
   db.prepare(`UPDATE handles SET status = ?, status_at = ? WHERE name = ?`).run(t || null, t ? now : null, handle);
 }
 
-function age(ms: number): string {
+// A duration as one short unit: 45m, 6h, 14d.
+export function age(ms: number): string {
   const m = Math.round(ms / 60_000);
   if (m < 60) return `${m}m`;
   const h = Math.round(m / 60);
@@ -432,6 +433,12 @@ export function who(
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
   return { you: handle, peers, ...(hidden ? { offline_hidden: hidden } : {}) };
+}
+
+// When a handle last had a session, or null if it never connected.
+export function lastSeen(db: Database, handle: string): number | null {
+  const row = db.prepare(`SELECT last_seen FROM handles WHERE name = ?`).get(handle) as { last_seen: number } | undefined;
+  return row?.last_seen ?? null;
 }
 
 /** Every handle in the roster, for a mode that must check liveness up front. */

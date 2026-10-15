@@ -345,3 +345,25 @@ test("direct messages still deliver live", async () => {
   expect(sent).toMatchObject({ type: "send_ok", delivered_now: true });
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
 });
+
+test("senders see what hasn't reached an offline peer", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const b = new Client(bob, "fe");
+  await b.connect();
+  await closeAndSettle(b);
+  const a = new Client(alice, "be");
+  await a.connect();
+  await a.request({ type: "send", recipient: "bob@example.com/fe", body: "one" });
+  const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "two" });
+  expect(sent).toMatchObject({ delivered_now: false, recipient_last_seen: expect.stringMatching(/ago$/), undelivered_from_you: 2 });
+  const delivered = async () =>
+    (await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.delivered);
+  expect(await delivered()).toEqual([false, false]);
+
+  const b2 = new Client(bob, "fe");
+  await b2.connect();
+  const ids = [(await b2.next((m) => m.type === "push")).message.id, (await b2.next((m) => m.type === "push")).message.id];
+  await b2.request({ type: "ack", message_ids: ids });
+  expect(await delivered()).toEqual([true, true]);
+});

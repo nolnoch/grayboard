@@ -8,6 +8,8 @@ import type { AuthedUser } from "./auth.ts";
 import {
   CoreError,
   acknowledge,
+  age,
+  lastSeen,
   pendingFor,
   post,
   refOf,
@@ -339,7 +341,19 @@ function handleSend(
     deliveredNow = true;
   }
 
-  send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: deliveredNow });
+  if (deliveredNow) {
+    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true });
+    return;
+  }
+  const seen = lastSeen(db, parsed.full);
+  send(ws, {
+    type: "send_ok",
+    req_id: reqId,
+    message_id: msg.id,
+    delivered_now: false,
+    ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+    undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
+  });
 }
 
 function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {
@@ -376,7 +390,15 @@ function handleHistory(
     err(ws, reqId, "bad_request", String(e));
     return;
   }
-  const messages = repo.messages.history(ws.data.identityFull, peer, limit, beforeId);
+  const me = ws.data.identityFull;
+  const cursors = new Map<string, number>();
+  const reached = (to: string) => {
+    if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(to));
+    return cursors.get(to)!;
+  };
+  const messages = repo.messages.history(me, peer, limit, beforeId).map((m) =>
+    m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
+  );
   send(ws, { type: "history_ok", req_id: reqId, messages });
 }
 

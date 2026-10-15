@@ -109,7 +109,7 @@ const TOOLS = [
   {
     name: "dm_send",
     description:
-      `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online, or queued until their next session. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -122,7 +122,7 @@ const TOOLS = [
   },
   {
     name: "dm_history",
-    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
     inputSchema: {
       type: "object",
       properties: {

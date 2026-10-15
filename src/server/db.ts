@@ -51,10 +51,14 @@ export interface Repo {
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    // Direct messages from sender still past each recipient's cursor, per recipient.
+    undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
     prune(olderThanMs: number): void;
   };
   cursors: {
     get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
+    // How far an identity (by full address) has received its direct messages.
+    directFor(identityFull: string): number;
     advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
@@ -345,6 +349,15 @@ function makeRepo(db: Database): Repo {
         all.sort((a, b) => a.id - b.id);
         return all;
       },
+      undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
+        return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
+          `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
+            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+            GROUP BY m.recipient ORDER BY m.recipient`,
+        ).all(sender, olderThan);
+      },
       prune(olderThanMs) {
         // Replies outlive pruned parents as roots; parent_id is a foreign key.
         db.transaction(() => {
@@ -363,6 +376,12 @@ function makeRepo(db: Database): Repo {
           "SELECT last_seen_id FROM cursors WHERE identity_id = ? AND stream_type = ? AND stream_ref = ?",
         ).get(identityId, streamType, streamRef);
         return row?.last_seen_id ?? 0;
+      },
+      directFor(identityFull) {
+        const row = db.query<{ id: number | null }, [string]>(
+          "SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?",
+        ).get(identityFull);
+        return row?.id ?? 0;
       },
       advance(identityId, streamType, streamRef, messageId) {
         db.run(
