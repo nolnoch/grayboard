@@ -13,6 +13,7 @@ export function initCoreSchema(db: Database): void {
     CREATE TABLE IF NOT EXISTS boards (
       name        TEXT PRIMARY KEY,
       purpose     TEXT NOT NULL,
+      scope       TEXT,
       created_by  TEXT NOT NULL,
       created_at  INTEGER NOT NULL
     );
@@ -58,4 +59,8 @@ export function initCoreSchema(db: Database): void {
       expires_at   INTEGER NOT NULL
     );
   `);
+
+  // Local databases from before board scopes.
+  const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === "scope")) db.exec(`ALTER TABLE boards ADD COLUMN scope TEXT`);
 }

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { CoreError, normalizeBoard, post } from "./boards.ts";
+import { CoreError, canSeeBoard, normalizeBoard, post } from "./boards.ts";
 
 export type Claim = {
   key: string;
@@ -82,14 +82,20 @@ export function release(db: Database, handle: string, keyInput: string): { wake:
     if (!cur || cur.expires_at <= Date.now()) throw new CoreError(`no active claim on "${key}"`);
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-    return { wake: announce(db, handle, cur.board, `[release] ${key}`) };
+    // If the holder lost access to the board since claiming, release quietly.
+    const board = cur.board && canSeeBoard(db, handle, cur.board) ? cur.board : null;
+    return { wake: announce(db, handle, board, `[release] ${key}`) };
   }).immediate();
 }
 
-export function listClaims(db: Database, prefix?: string): Claim[] {
-  return db
+// Claims are visible to everyone on the bus. The announcing board's name is
+// hidden from handles that can't see that board.
+export function listClaims(db: Database, prefix?: string, viewer?: string): Claim[] {
+  const rows = db
     .prepare(
       `SELECT * FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
+  if (viewer === undefined) return rows;
+  return rows.map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
 }

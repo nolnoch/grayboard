@@ -1,18 +1,25 @@
 import { Database } from "bun:sqlite";
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  acknowledge,
   createBoard,
+  getBoard,
   listBoards,
   markDelivered,
+  mentionTokens,
   pendingFor,
   post,
+  prunePosts,
   read,
+  refOf,
+  setAccess,
   subscribe,
   touchHandle,
+  type Access,
 } from "./boards.ts";
 import { claim, listClaims, release } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
@@ -153,4 +160,95 @@ test("two connections cannot both win a claim", () => {
   const r1 = claim(a, "be", "k");
   const r2 = claim(b, "sim", "k");
   expect([r1.ok, r2.ok]).toEqual([true, false]);
+});
+
+test("mention tokens cover bare, local/name, and full addresses, not emails", () => {
+  expect(mentionTokens("@be and @wade/sim, cc @a.b@example.com/fe. mail x@y.com @end.")).toEqual([
+    "be",
+    "wade/sim",
+    "a.b@example.com/fe",
+    "end",
+  ]);
+});
+
+test("unresolved mentions are reported to the poster", () => {
+  const r = post(db, "be", "e2e", "@fe and @ghost");
+  expect(r.wake).toEqual(["fe"]);
+  expect(r.unresolved).toEqual(["ghost"]);
+});
+
+test("local mode refuses scoped boards", () => {
+  expect(() => createBoard(db, "be", "secret", "x", "team:eng")).toThrow(/distributed/);
+});
+
+test("prune keeps replies whose parent is pruned, and clears the outbox", () => {
+  const root = post(db, "sim", "e2e", "old root").post;
+  db.prepare(`UPDATE posts SET created_at = 0 WHERE id = ?`).run(root.id);
+  const reply = post(db, "fe", "e2e", "@be newer reply", root.id).post;
+  prunePosts(db, 1);
+  expect(pendingFor(db, "be").map((i) => i.kind === "push" && i.post.id)).toEqual([reply.id]);
+  expect(read(db, "be", "e2e", { before_id: 999 }).posts.map((p) => p.id)).toEqual([reply.id]);
+});
+
+// ── access policy (the distributed server installs one like this) ────────────
+
+describe("with a scoped access policy", () => {
+  const members = new Set(["be", "sim"]); // members of team:eng; fe is not
+  const policy: Access = {
+    canSee: (h, b) => b.scope === null || members.has(h),
+    checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
+    resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+  };
+  beforeEach(() => {
+    setAccess(db, policy);
+    createBoard(db, "be", "eng", "Team eng", "team:eng");
+  });
+
+  test("non-members can't see, read, post, or subscribe", () => {
+    expect(listBoards(db, "fe").map((b) => b.name)).toEqual(["e2e"]);
+    expect(listBoards(db, "sim").map((b) => b.name)).toEqual(["e2e", "eng"]);
+    expect(() => read(db, "fe", "eng")).toThrow(/no such board/);
+    expect(() => post(db, "fe", "eng", "hi")).toThrow(/no such board/);
+    expect(() => subscribe(db, "fe", "eng", "push")).toThrow(/no such board/);
+    expect(() => createBoard(db, "fe", "eng2", "x", "team:eng")).toThrow(/not a member/);
+  });
+
+  test("mentioning a non-member doesn't leak the post", () => {
+    const r = post(db, "be", "eng", "@fe @sim secret plan");
+    expect(r.wake).toEqual(["sim"]);
+    expect(r.unresolved).toEqual(["fe"]);
+    expect(pendingFor(db, "fe")).toEqual([]);
+  });
+
+  test("losing access drops queued pushes and digests", () => {
+    subscribe(db, "sim", "eng", "digest");
+    post(db, "be", "eng", "@sim one");
+    post(db, "be", "eng", "two");
+    members.delete("sim");
+    try {
+      expect(pendingFor(db, "sim")).toEqual([]);
+      members.add("sim");
+      // The push was acknowledged while hidden; only the digest remains.
+      expect(pendingFor(db, "sim").map((i) => i.kind)).toEqual(["digest"]);
+    } finally {
+      members.add("sim");
+    }
+  });
+
+  test("claims hide a board the viewer can't see", () => {
+    claim(db, "be", "ticket:ENG-1", { board: "eng" });
+    expect(listClaims(db, "ticket:", "fe")[0]!.board).toBeNull();
+    expect(listClaims(db, "ticket:", "sim")[0]!.board).toBe("eng");
+    expect(() => claim(db, "fe", "ticket:ENG-2", { board: "eng" })).toThrow(/no such board/);
+  });
+});
+
+test("acknowledge by ref matches markDelivered", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  post(db, "be", "e2e", "@sim hello");
+  const items = pendingFor(db, "sim");
+  expect(items.map((i) => i.kind).sort()).toEqual(["digest", "push"]);
+  for (const i of items) acknowledge(db, "sim", JSON.parse(JSON.stringify(refOf(i))));
+  expect(pendingFor(db, "sim")).toEqual([]);
+  expect(getBoard(db, "e2e")!.scope).toBeNull();
 });

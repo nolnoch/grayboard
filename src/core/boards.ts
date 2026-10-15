@@ -2,11 +2,22 @@ import type { Database } from "bun:sqlite";
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
-const MENTION_RE = /(?:^|[^\w@])@([a-z0-9_-]{1,32})\b/gi;
+// @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
+// so plain email addresses in prose aren't mentions.
+const MENTION_RE =
+  /(?:^|[^\w@])@([a-z0-9._%+-]+(?:@[a-z0-9.-]+\.[a-z]{2,})?(?:\/[a-z0-9_-]{1,32})?)/gi;
 
 export type SubMode = "push" | "digest" | "quiet";
 
-export type Board = { name: string; purpose: string; created_by: string; created_at: number };
+// scope: null for an open board, or an opaque string the Access policy
+// interprets (the distributed server uses "team:<name>").
+export type Board = {
+  name: string;
+  purpose: string;
+  scope: string | null;
+  created_by: string;
+  created_at: number;
+};
 export type Post = {
   id: number;
   board: string;
@@ -20,11 +31,58 @@ export type Pending =
   | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
+// Enough to acknowledge a Pending item after it crossed a wire.
+export type PendingRef =
+  | { kind: "push"; post_id: number }
+  | { kind: "digest"; board: string; latest_id: number };
+
 export class CoreError extends Error {}
+
+// ── access policy ────────────────────────────────────────────────────────────
+
+// Who can see which board, and who an @token means. Every core read and write
+// goes through this, so a mode can't forget to filter at a call site.
+export type Access = {
+  canSee(handle: string, board: Board): boolean;
+  // Returns an error message, or null if allowed.
+  checkCreate(handle: string, scope: string | null): string | null;
+  // The handle a mention token refers to, or null if unknown or ambiguous.
+  resolveMention(token: string, author: string, board: Board): string | null;
+};
+
+// Local mode: one trusted machine, every board open, bare handles only.
+export const openAccess = (db: Database): Access => ({
+  canSee: () => true,
+  checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
+  resolveMention: (token) => {
+    if (!BOARD_NAME_RE.test(token)) return null;
+    const row = db.prepare(`SELECT name FROM handles WHERE name = ?`).get(token) as
+      | { name: string }
+      | undefined;
+    return row?.name ?? null;
+  },
+});
+
+const policies = new WeakMap<Database, Access>();
+
+export function setAccess(db: Database, access: Access): void {
+  policies.set(db, access);
+}
+
+function access(db: Database): Access {
+  let a = policies.get(db);
+  if (!a) {
+    a = openAccess(db);
+    policies.set(db, a);
+  }
+  return a;
+}
+
+// ── boards ───────────────────────────────────────────────────────────────────
 
 // Accepts "#name" or "name".
 export function normalizeBoard(input: string): string {
-  const name = input.replace(/^#/, "").toLowerCase();
+  const name = String(input).replace(/^#/, "").toLowerCase();
   if (!BOARD_NAME_RE.test(name)) {
     throw new CoreError(`invalid board name "${input}": use [a-z0-9_-], 1-32 chars`);
   }
@@ -38,29 +96,46 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
   ).run(handle, now, now);
 }
 
-export function createBoard(db: Database, handle: string, name: string, purpose: string): Board {
+export function createBoard(
+  db: Database,
+  handle: string,
+  name: string,
+  purpose: string,
+  scope: string | null = null,
+): Board {
   const board = normalizeBoard(name);
-  if (!purpose.trim()) throw new CoreError("purpose is required");
-  const now = Date.now();
+  if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  const denied = access(db).checkCreate(handle, scope);
+  if (denied) throw new CoreError(denied);
   const res = db
     .prepare(
-      `INSERT INTO boards (name, purpose, created_by, created_at) VALUES (?, ?, ?, ?)
+      `INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
     )
-    .run(board, purpose.trim(), handle, now);
+    .run(board, purpose.trim(), scope, handle, Date.now());
   if (res.changes === 0) throw new CoreError(`board #${board} already exists`);
   subscribe(db, handle, board, "push");
   return getBoard(db, board)!;
 }
 
+// Unchecked lookup, for modes and policies. Tools go through visibleBoard.
 export function getBoard(db: Database, name: string): Board | undefined {
   return db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | undefined;
 }
 
-function requireBoard(db: Database, input: string): string {
+// A board you can't see reads as missing, so its existence doesn't leak.
+function visibleBoard(db: Database, handle: string, input: string): Board {
   const name = normalizeBoard(input);
-  if (!getBoard(db, name)) throw new CoreError(`no such board #${name}; see board_list`);
-  return name;
+  const b = getBoard(db, name);
+  if (!b || !access(db).canSee(handle, b)) {
+    throw new CoreError(`no such board #${name}; see board_list`);
+  }
+  return b;
+}
+
+export function canSeeBoard(db: Database, handle: string, name: string): boolean {
+  const b = getBoard(db, name);
+  return !!b && access(db).canSee(handle, b);
 }
 
 function tipOf(db: Database, board: string): number {
@@ -73,7 +148,7 @@ function tipOf(db: Database, board: string): number {
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
 export function listBoards(db: Database, handle: string): BoardSummary[] {
-  return db
+  const rows = db
     .prepare(
       `SELECT b.*, s.mode AS mode,
               (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
@@ -85,14 +160,19 @@ export function listBoards(db: Database, handle: string): BoardSummary[] {
         ORDER BY b.name`,
     )
     .all(handle, handle) as BoardSummary[];
+  const a = access(db);
+  return rows.filter((b) => a.canSee(handle, b));
 }
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.
 export function subscribe(db: Database, handle: string, boardInput: string, mode: SubMode | "off"): void {
-  const board = requireBoard(db, boardInput);
+  const board = visibleBoard(db, handle, boardInput).name;
   if (mode === "off") {
     db.prepare(`DELETE FROM subscriptions WHERE board = ? AND handle = ?`).run(board, handle);
     return;
+  }
+  if (!["push", "digest", "quiet"].includes(mode)) {
+    throw new CoreError(`mode must be push, digest, quiet, or off`);
   }
   const tip = tipOf(db, board);
   db.prepare(
@@ -101,26 +181,49 @@ export function subscribe(db: Database, handle: string, boardInput: string, mode
   ).run(board, handle, mode, tip, tip);
 }
 
-export function mentionsIn(db: Database, body: string): string[] {
-  const names = new Set<string>();
-  for (const m of body.matchAll(MENTION_RE)) names.add(m[1]!.toLowerCase());
-  if (names.size === 0) return [];
-  const known = db
-    .prepare(`SELECT name FROM handles WHERE name IN (${[...names].map(() => "?").join(",")})`)
-    .all(...names) as { name: string }[];
-  return known.map((r) => r.name);
+// Raw @tokens in a body, lowercased, trailing sentence punctuation removed.
+export function mentionTokens(body: string): string[] {
+  const out = new Set<string>();
+  for (const m of body.matchAll(MENTION_RE)) {
+    const t = m[1]!.toLowerCase().replace(/[.]+$/, "");
+    if (t) out.add(t);
+  }
+  return [...out];
 }
 
-// Inserts the post and queues pushes. Returns every handle that should be
-// woken (outbox targets plus digest subscribers); delivery is the caller's job.
+function resolveMentions(
+  db: Database,
+  body: string,
+  author: string,
+  board: Board,
+): { handles: string[]; unresolved: string[] } {
+  const a = access(db);
+  const handles = new Set<string>();
+  const unresolved: string[] = [];
+  for (const t of mentionTokens(body)) {
+    const h = a.resolveMention(t, author, board);
+    if (h && a.canSee(h, board)) handles.add(h);
+    else unresolved.push(t);
+  }
+  return { handles: [...handles], unresolved };
+}
+
+export type PostResult = { post: Post; wake: string[]; unresolved: string[] };
+
+// Inserts the post and queues pushes for handles that can see the board.
+// Returns every handle that should be woken (outbox targets plus digest
+// subscribers); delivery is the caller's job. `unresolved` lists @tokens that
+// matched nobody (or nobody who can see this board).
 export function post(
   db: Database,
   handle: string,
   boardInput: string,
   body: string,
   parentId: number | null = null,
-): { post: Post; wake: string[] } {
-  const board = requireBoard(db, boardInput);
+): PostResult {
+  const b = visibleBoard(db, handle, boardInput);
+  const board = b.name;
+  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
   if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
     throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
   }
@@ -130,8 +233,9 @@ export function post(
       throw new CoreError(`parent_id ${parentId} is not a post on #${board}`);
     }
   }
+  const a = access(db);
 
-  return db.transaction(() => {
+  return db.transaction((): PostResult => {
     const p = db
       .prepare(
         `INSERT INTO posts (board, author, body, parent_id, created_at)
@@ -141,14 +245,20 @@ export function post(
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     const targets = new Map<string, "mention" | "thread" | "subscription">();
-    const subs = db
-      .prepare(`SELECT handle, mode FROM subscriptions WHERE board = ?`)
-      .all(board) as { handle: string; mode: SubMode }[];
+    const subs = (
+      db.prepare(`SELECT handle, mode FROM subscriptions WHERE board = ?`).all(board) as {
+        handle: string;
+        mode: SubMode;
+      }[]
+    ).filter((s) => a.canSee(s.handle, b));
     for (const s of subs) if (s.mode === "push") targets.set(s.handle, "subscription");
     if (parentId !== null) {
-      for (const author of threadAuthors(db, parentId)) targets.set(author, "thread");
+      for (const author of threadAuthors(db, parentId)) {
+        if (a.canSee(author, b)) targets.set(author, "thread");
+      }
     }
-    for (const m of mentionsIn(db, body)) targets.set(m, "mention");
+    const { handles: mentioned, unresolved } = resolveMentions(db, body, handle, b);
+    for (const m of mentioned) targets.set(m, "mention");
     targets.delete(handle);
 
     const ins = db.prepare(
@@ -159,7 +269,7 @@ export function post(
     const wake = new Set(targets.keys());
     for (const s of subs) if (s.mode === "digest" && s.handle !== handle) wake.add(s.handle);
 
-    return { post: p, wake: [...wake] };
+    return { post: p, wake: [...wake], unresolved };
   })();
 }
 
@@ -204,7 +314,7 @@ export function read(
   boardInput: string,
   opts: { limit?: number; before_id?: number; thread?: number } = {},
 ): ReadResult {
-  const board = requireBoard(db, boardInput);
+  const board = visibleBoard(db, handle, boardInput).name;
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   let posts: Post[];
 
@@ -268,9 +378,24 @@ export function read(
   return { board, posts, unread_remaining: remaining.n };
 }
 
-// Everything this handle should be told about now. Call markDelivered for
-// each item after it's actually handed to the agent (at-least-once).
+// ── delivery ─────────────────────────────────────────────────────────────────
+
+// Everything this handle should be told about now. Call markDelivered (or
+// acknowledge) for each item after it's handed to the agent (at-least-once).
+// Items for boards the handle can no longer see are dropped here.
 export function pendingFor(db: Database, handle: string): Pending[] {
+  const a = access(db);
+  const seen = new Map<string, boolean>();
+  const visible = (name: string) => {
+    let v = seen.get(name);
+    if (v === undefined) {
+      const b = getBoard(db, name);
+      v = !!b && a.canSee(handle, b);
+      seen.set(name, v);
+    }
+    return v;
+  };
+
   const out: Pending[] = [];
   const pushes = db
     .prepare(
@@ -278,7 +403,10 @@ export function pendingFor(db: Database, handle: string): Pending[] {
         WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
     )
     .all(handle) as (Post & { reason: "mention" | "thread" | "subscription" })[];
-  for (const { reason, ...p } of pushes) out.push({ kind: "push", reason, post: p });
+  for (const { reason, ...p } of pushes) {
+    if (visible(p.board)) out.push({ kind: "push", reason, post: p });
+    else acknowledge(db, handle, { kind: "push", post_id: p.id });
+  }
 
   // Digest: unread exists and nothing has been sent since the last catch-up.
   const digests = db
@@ -291,30 +419,61 @@ export function pendingFor(db: Database, handle: string): Pending[] {
     )
     .all(handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
-    if (d.unread > 0 && d.latest_id !== null) {
+    if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
       out.push({ kind: "digest", board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! });
     }
   }
   return out;
 }
 
+export function refOf(item: Pending): PendingRef {
+  return item.kind === "push"
+    ? { kind: "push", post_id: item.post.id }
+    : { kind: "digest", board: item.board, latest_id: item.latest.id };
+}
+
 export function markDelivered(db: Database, handle: string, item: Pending): void {
-  if (item.kind === "push") {
+  acknowledge(db, handle, refOf(item));
+}
+
+export function acknowledge(db: Database, handle: string, ref: PendingRef): void {
+  if (ref.kind === "push") {
+    const row = db
+      .prepare(
+        `SELECT o.reason, p.board FROM outbox o JOIN posts p ON p.id = o.post_id
+          WHERE o.handle = ? AND o.post_id = ?`,
+      )
+      .get(handle, ref.post_id) as { reason: string; board: string } | undefined;
+    if (!row) return;
     db.prepare(`UPDATE outbox SET delivered_at = ? WHERE handle = ? AND post_id = ?`).run(
       Date.now(),
       handle,
-      item.post.id,
+      ref.post_id,
     );
     // Push-mode subscribers have now seen it in full: count it as read.
-    if (item.reason === "subscription") {
+    if (row.reason === "subscription") {
       db.prepare(
         `UPDATE subscriptions SET cursor = MAX(cursor, ?), notified_id = MAX(notified_id, ?)
           WHERE board = ? AND handle = ? AND mode = 'push'`,
-      ).run(item.post.id, item.post.id, item.post.board, handle);
+      ).run(ref.post_id, ref.post_id, row.board, handle);
     }
   } else {
     db.prepare(
       `UPDATE subscriptions SET notified_id = MAX(notified_id, ?) WHERE board = ? AND handle = ?`,
-    ).run(item.latest.id, item.board, handle);
+    ).run(ref.latest_id, ref.board, handle);
   }
+}
+
+// ── retention ────────────────────────────────────────────────────────────────
+
+// Operator retention, not an agent operation. Replies outlive their pruned
+// parents as thread roots.
+export function prunePosts(db: Database, olderThanMs: number): void {
+  db.transaction(() => {
+    const old = `SELECT id FROM posts WHERE created_at < ?`;
+    db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
+    db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
+    db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
+    db.prepare(`DELETE FROM claims WHERE expires_at < ?`).run(Date.now());
+  })();
 }
