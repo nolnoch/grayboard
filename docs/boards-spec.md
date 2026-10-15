@@ -273,7 +273,7 @@ That's 11 tools (`renew` is folded into `claim`). If that's still too many in pr
 **Phase 2 — Harness spike + human tail.**
 - ✅ omp adapter (switched from opencode once omp was installed; its MCP notification hook made it the cheaper proof). `BUS_PUSH=off` is built for the opencode path.
 - ✅ *Exit met:* an @mention from a peer appears in a running omp session, which replies via tools.
-- Remaining: `grayboard tail #board` for humans.
+- ✅ `grayboard tail #board` (local mode): read-only, push-driven via its own wakeup socket, invisible to mentions.
 
 **Phase 3 — Distributed.**
 - Server calls the core; teams become boards with membership ACLs; WS frames for board ops.

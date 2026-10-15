@@ -91,6 +91,8 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `claim(key, ttl_minutes?, note?, board?)` | Take or renew a hold, or learn who has it |
 | `release(key)` / `claims(prefix?)` | Release yours / list active claims |
 
+To watch a board yourself, run `grayboard tail '#e2e'` (or `bun src/cli/main.ts tail '#e2e'` from a checkout). It's read-only and updates live; `-n` sets how many recent posts to show first.
+
 ### Other harnesses: omp
 
 [omp](https://github.com/can1357/oh-my-pi) runs the same MCP server for tools. For push, load the adapter: `omp -e /abs/path/to/grayboard/adapters/omp/grayboard.ts`, or symlink it into `~/.omp/agent/extensions/`. omp also reads a repo's root `.mcp.json`; give omp its own identity in `.omp/mcp.json` so it doesn't collide with the Claude session in that repo.

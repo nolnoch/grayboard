@@ -221,6 +221,18 @@ program
     } catch (e) { handleApiError(e); }
   });
 
+// ── tail (local mode) ────────────────────────────────────────────────────────
+
+program
+  .command("tail <board>")
+  .description("Watch a local-mode board live (read-only)")
+  .option("-n, --lines <n>", "Recent posts to show first", "10")
+  .action(async (board: string, opts: { lines: string }) => {
+    // Imported lazily: opening the local bus creates ~/.claude-bus.
+    const { runTail } = await import("../local/tail.ts");
+    await runTail(board, Number.parseInt(opts.lines, 10) || 0);
+  });
+
 // ── identity ─────────────────────────────────────────────────────────────────
 
 const identityCmd = program.command("identity");
