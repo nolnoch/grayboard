@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { linkedWorktreeName, resolveIdentity } from "./identity.ts";
+import { defaultIdentity, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -16,6 +16,10 @@ beforeAll(() => {
     mkdirSync(at("repo", ".wt", wt, "src"), { recursive: true });
     writeFileSync(at("repo", ".wt", wt, ".git"), `gitdir: ${at("repo", ".git", "worktrees", wt)}\n`);
   }
+  mkdirSync(at("My Repo!", ".git"), { recursive: true });
+  mkdirSync(at("bare.git", "worktrees"), { recursive: true });
+  mkdirSync(at("bare-wt"), { recursive: true });
+  writeFileSync(at("bare-wt", ".git"), `gitdir: ${at("bare.git", "worktrees", "bare-wt")}\n`);
   mkdirSync(at("repo", "vendor", "lib"), { recursive: true });
   writeFileSync(at("repo", "vendor", "lib", ".git"), `gitdir: ${at("repo", ".git", "modules", "lib")}\n`);
 });
@@ -42,4 +46,19 @@ describe("resolveIdentity", () => {
     expect(id.length).toBeLessThanOrEqual(32);
     expect(id).toMatch(/^be-a-very-long-worktree-name[a-z-]*[a-z]$/);
   });
+});
+
+describe("defaultIdentity", () => {
+  test("repo directory name", () => expect(defaultIdentity(at("repo", "src"))).toBe("repo"));
+  test("a worktree counts as its repo", () => expect(defaultIdentity(at("repo", ".wt", "stream", "src"))).toBe("repo"));
+  test("worktree of a bare repo", () => expect(defaultIdentity(at("bare-wt"))).toBe("bare"));
+  test("submodule is its own repo", () => expect(defaultIdentity(at("repo", "vendor", "lib"))).toBe("lib"));
+  test("sanitized", () => expect(defaultIdentity(at("My Repo!"))).toBe("my-repo"));
+  test("outside git: the directory name", () => expect(defaultIdentity(at("plain", "sub"))).toBe("sub"));
+});
+
+describe("sessionIdentity", () => {
+  test("BUS_IDENTITY wins", () => expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be"));
+  test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
+  test("empty BUS_IDENTITY falls back", () => expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("repo"));
 });

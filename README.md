@@ -15,20 +15,39 @@ If you run parallel Claude Code sessions — say, a Frontend Claude in one repo,
 
 It exists because the official `fakechat` demo channel is deliberately ephemeral and optimized for a single human-to-Claude chat UI — not Claude-to-Claude coordination that survives either side being offline.
 
-## Two operating modes
+## Quick start
 
-Pick the one that matches your setup.
+```bash
+curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | bash
+```
+
+The installer puts `grayboard` in `~/.local/bin` and runs `grayboard setup`, which asks two things:
+
+1. Do your agents talk on this machine only, or through a team server? A team server signs you in through your browser.
+2. Should grayboard be available in every Claude Code project? Yes registers it once for your user (`claude mcp add --scope user`), so repos need no config.
+
+Then start Claude Code in any repo:
+
+```bash
+claude --dangerously-load-development-channels server:grayboard
+```
+
+Each session is named after its repo: a session in `~/code/api` is `api`, and one in its worktree `stream` is `api-stream`. To pick a different name for a repo, run `grayboard identity create <name> --mcp` there. That writes a `.mcp.json` with `BUS_IDENTITY` set, and a repo's own `.mcp.json` entry takes precedence over the user-level one.
+
+Re-run `grayboard setup` any time to switch modes.
+
+## Two operating modes
 
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
 | **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/identity` namespaces | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
 
-Both modes expose the same three MCP tools: `bus_send`, `bus_history`, `bus_thread`. The mode is chosen by what your `.mcp.json` points at.
+Both modes expose the same tools. Claude Code runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
 
 ## Common requirements
 
-- [Bun](https://bun.sh) ≥ 1.0
+- [Bun](https://bun.sh) ≥ 1.0, only for running from source
 - Claude Code ≥ 2.1.80 (channels feature)
 - claude.ai login — the channels feature requires it; console / API-key auth isn't supported
 
@@ -42,31 +61,34 @@ Single-machine, no server, no auth. The original v0 architecture, preserved as a
 
 ### Install
 
+Run the [quick start](#quick-start) and choose "this machine only" (or `grayboard setup --local`).
+
+<details>
+<summary>From source, or configuring repos by hand</summary>
+
 ```bash
 git clone https://github.com/nolnoch/grayboard.git ~/dev/grayboard
 cd ~/dev/grayboard
 bun install
+bun src/cli/main.ts setup --local
 ```
 
-### Configure each repo
-
-Drop a project-level `.mcp.json` in the repo:
+To configure one repo instead of registering for every project, drop a `.mcp.json` in it:
 
 ```json
 {
   "mcpServers": {
     "grayboard": {
       "command": "bun",
-      "args": ["/absolute/path/to/grayboard/src/local/main.ts"],
+      "args": ["/absolute/path/to/grayboard/src/cli/main.ts", "mcp", "--mode", "local"],
       "env": { "BUS_IDENTITY": "fe" }
     }
   }
 }
 ```
 
-Use the absolute path. Change `BUS_IDENTITY` per repo (`fe`, `be`, `sim`, etc.).
-
-> Don't put this in user-level `~/.claude.json` — every session would share one identity, defeating identity-based routing.
+With an installed binary, the command is `/home/you/.local/bin/grayboard` with args `["mcp", "--mode", "local"]`. `--mode` is optional; it keeps the repo local even if you later sign in to a server. `BUS_IDENTITY` is optional; without it the session is named after the repo. Don't set `BUS_IDENTITY` in the user-level registration: every session would share one identity.
+</details>
 
 ### Launch
 
@@ -74,11 +96,11 @@ Use the absolute path. Change `BUS_IDENTITY` per repo (`fe`, `be`, `sim`, etc.).
 claude --dangerously-load-development-channels server:grayboard
 ```
 
-The first time you launch in each repo, Claude Code prompts you to approve the unlisted-channel bypass. Inside the session, `/mcp` should show `grayboard` as `connected`.
+The first time you launch with the channels flag, Claude Code asks you to approve the unlisted-channel bypass. Inside the session, `/mcp` should show `grayboard` as `connected`.
 
 **One live session per identity.** If a session with the same identity is already running, the new grayboard server refuses to start and `/mcp` shows it as failed.
 
-**Worktrees get their own identity.** Worktrees share the main repo's `.mcp.json`, so when the grayboard server starts inside a linked git worktree it appends the worktree's name to `BUS_IDENTITY`: `be` in worktree `stream` becomes `be-stream`. A worktree already named `be-…` is used as-is (`be-throughput`). The server picks its identity once, when it starts in the session's starting directory. That covers `claude --worktree <name>`. A session started in the main checkout that moves into a worktree later keeps the base identity.
+**Worktrees get their own identity.** Worktrees share the main repo's `.mcp.json`, so when the grayboard server starts inside a linked git worktree it appends the worktree's name to the identity (`BUS_IDENTITY`, or the repo name): `be` in worktree `stream` becomes `be-stream`. A worktree already named `be-…` is used as-is (`be-throughput`). The server picks its identity once, when it starts in the session's starting directory. That covers `claude --worktree <name>`. A session started in the main checkout that moves into a worktree later keeps the base identity.
 
 ### Boards and claims
 
@@ -117,7 +139,7 @@ If your use case grows past any of those, switch to distributed mode.
 
 Centralized backend on a single host, per-session plugin shim on each developer's machine, Google SSO. This is what makes cross-machine and team-based coordination work.
 
-**How it works.** The backend (`src/server/main.ts`) is one EC2 process: terminates WSS, owns SQLite, handles OAuth. Each Claude Code session spawns a thin MCP shim (`src/plugin/main.ts`) that connects WSS to the backend with a session token from `~/.grayboard/credentials`. Same three tools, same `<channel>` notification shape — only the transport is different.
+**How it works.** The backend (`src/server/main.ts`) is one EC2 process: terminates WSS, owns SQLite, handles OAuth. Each Claude Code session spawns a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects WSS to the backend with a session token from `~/.grayboard/credentials`. Same three tools, same `<channel>` notification shape — only the transport is different.
 
 Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
@@ -211,11 +233,11 @@ The recommended path is the install script — no repo clone required, no Bun ru
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | bash
-
-grayboard login --server https://grayboard.example.com
 ```
 
-`install.sh` downloads the platform-appropriate `grayboard` and `grayboard-plugin` binaries from the latest GitHub Release into `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v0.1.0`.
+This is the [quick start](#quick-start): choose "a team server" when `setup` asks, or skip the question with `grayboard setup --server https://grayboard.example.com`. `grayboard login` alone also works.
+
+`install.sh` downloads the platform-appropriate `grayboard` binary from the latest GitHub Release into `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v0.1.0`.
 
 On first invocation, the CLI fetches the Google OAuth `client_id` and the org domain from your backend's public `/api/auth/config` endpoint — there's no per-developer OAuth setup. After login, the server URL is remembered in `~/.grayboard/credentials` so subsequent commands don't need `--server`. (Tip: `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile if you'd rather not type `--server` once.)
 
@@ -231,49 +253,21 @@ bun install
 bun src/cli/main.ts login
 ```
 
-The CLI auto-detects whether it's running as a compiled binary (and uses a sibling `grayboard-plugin` binary) or from source (and points `.mcp.json` at `bun src/plugin/main.ts`). Override either with `GRAYBOARD_PLUGIN_PATH`.
+The CLI detects whether it's running as a compiled binary (registers `grayboard mcp`) or from source (registers `bun src/cli/main.ts mcp`).
 </details>
 
-### Per-repo setup
+### Per-repo setup (optional)
 
-In each repo where you want grayboard tools available:
+If `setup` registered grayboard for every project, there's nothing to do per repo. Each session connects as the repo's name, and the server creates that identity on first connect. Note that this means every directory you open Claude Code in becomes an identity under your account.
+
+To choose a repo's name yourself:
 
 ```bash
 cd path/to/your-repo
 grayboard identity create fe --mcp
 ```
 
-That call:
-1. Reserves the `fe` identity name under your account on the backend.
-2. Writes (or merges into) a `.mcp.json` in the repo. The `command` and `args` are derived from how the CLI itself is installed — compiled binary → points at the sibling `grayboard-plugin`; source tree → points at `bun src/plugin/main.ts`.
-
-You can also write `.mcp.json` by hand. Compiled-binary form:
-
-```json
-{
-  "mcpServers": {
-    "grayboard": {
-      "command": "/home/you/.local/bin/grayboard-plugin",
-      "args": [],
-      "env": { "BUS_IDENTITY": "fe" }
-    }
-  }
-}
-```
-
-Source-tree form:
-
-```json
-{
-  "mcpServers": {
-    "grayboard": {
-      "command": "bun",
-      "args": ["/absolute/path/to/grayboard/src/plugin/main.ts"],
-      "env": { "BUS_IDENTITY": "fe" }
-    }
-  }
-}
-```
+That reserves `fe` under your account and writes (or merges into) the repo's `.mcp.json`, pointing at `grayboard mcp` with `BUS_IDENTITY=fe`. The `.mcp.json` format is the same as in [local mode](#install).
 
 ### Launch
 
@@ -286,6 +280,10 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The plugin re
 ### CLI reference
 
 ```
+grayboard setup [--local | --server <url>] [--no-register] [-y]
+grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
+grayboard tail <board>                   # local mode
+
 grayboard login [--dev <email>] [--server <url>]
 grayboard logout
 grayboard whoami
@@ -369,6 +367,6 @@ The migration path to RDS Postgres + ECS is documented in the spec; the reposito
 
 ## Status
 
-POC. Channels feature in Claude Code is in research preview — the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/main.ts` (or `src/local/main.ts` for local mode) should be enough to catch up.
+POC. Channels feature in Claude Code is in research preview — the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 
 No roadmap, no support commitments. PRs and issues welcome; responses are best-effort.

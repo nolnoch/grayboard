@@ -1,3 +1,5 @@
+// Server-mode MCP server: a WSS client of the grayboard backend. `grayboard mcp`
+// imports this; it starts on import.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -5,7 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
-import { resolveIdentity } from "../shared/identity.ts";
+import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk } from "../shared/protocol.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -26,8 +28,13 @@ function loadCredentials(): Credentials {
     console.error(`[grayboard] credentials not found at ${credPath}. Run \`grayboard login\` first.`);
     process.exit(1);
   }
+  const raw = readFileSync(credPath, "utf8");
+  if (!raw.trim()) {
+    console.error("[grayboard] signed out. Run `grayboard login`, or `grayboard setup --local` to use local mode.");
+    process.exit(1);
+  }
   try {
-    return JSON.parse(readFileSync(credPath, "utf8")) as Credentials;
+    return JSON.parse(raw) as Credentials;
   } catch {
     console.error(`[grayboard] failed to parse credentials at ${credPath}. Run \`grayboard login\` again.`);
     process.exit(1);
@@ -36,16 +43,10 @@ function loadCredentials(): Credentials {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-const rawIdentity = process.env.BUS_IDENTITY;
-if (!rawIdentity) {
-  console.error("[grayboard] BUS_IDENTITY env var is required");
-  process.exit(1);
-}
-const identity = resolveIdentity(rawIdentity);
-if (identity !== rawIdentity) console.error(`[grayboard] identity "${identity}" (worktree of "${rawIdentity}")`);
-
+const identity = sessionIdentity();
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
+console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
 
 const server = new Server(
   { name: "grayboard", version: pkg.version },

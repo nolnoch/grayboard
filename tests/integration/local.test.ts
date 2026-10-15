@@ -1,6 +1,6 @@
 // End-to-end over real local-mode processes: each session is a separate
-// `bun src/local/main.ts` driven by an MCP client, sharing a temp database and
-// socket directory. Covers liveness in `who`, which only works across processes.
+// `grayboard mcp --mode local` driven by an MCP client, sharing a temp database
+// and socket directory. Covers liveness in `who`, which only works across processes.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const MAIN = resolve(import.meta.dir, "../../src/local/main.ts");
+const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
 let dir: string;
 const open: Client[] = [];
@@ -22,16 +22,18 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function start(identity: string, cwd = dir): Promise<Client> {
+// Local-mode env for a session in `dir`; no credentials file, so `grayboard mcp` picks local.
+function busEnv(identity?: string): Record<string, string> {
+  const env = { ...process.env, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir, GRAYBOARD_CREDENTIALS: join(dir, "credentials") };
+  delete env.BUS_IDENTITY;
+  delete env.GRAYBOARD_TOKEN;
+  return (identity ? { ...env, BUS_IDENTITY: identity } : env) as Record<string, string>;
+}
+
+async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp", "--mode", "local"]): Promise<Client> {
   const c = new Client({ name: "test", version: "0" });
   await c.connect(
-    new StdioClientTransport({
-      command: process.execPath,
-      args: [MAIN],
-      cwd,
-      env: { ...process.env, BUS_IDENTITY: identity, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir } as Record<string, string>,
-      stderr: "ignore",
-    }),
+    new StdioClientTransport({ command: process.execPath, args, cwd, env: busEnv(identity), stderr: "ignore" }),
   );
   open.push(c);
   return c;
@@ -89,4 +91,26 @@ test("a session started in a linked worktree gets a suffixed handle", async () =
   const stream = await start("be", wt);
   expect((await call(stream, "who")).you).toBe("be-stream");
   expect((await call(main, "who")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
+}, 20_000);
+
+test("grayboard mcp: local mode when signed out, named after the repo", async () => {
+  const repo = join(dir, "api");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const api = await start(undefined, repo, [CLI, "mcp"]);
+  const be = await start("be", dir, [CLI, "mcp"]);
+  expect((await call(api, "who")).you).toBe("api");
+  expect((await call(be, "who")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
+}, 20_000);
+
+test("grayboard mcp: a signed-out credentials file fails instead of falling back to local", async () => {
+  writeFileSync(join(dir, "credentials"), "");
+  const p = Bun.spawn([process.execPath, CLI, "mcp"], { cwd: dir, env: busEnv("be"), stdin: "ignore", stderr: "pipe" });
+  expect(await p.exited).toBe(1);
+  expect(await new Response(p.stderr).text()).toContain("signed out");
+}, 20_000);
+
+test("grayboard mcp --mode local overrides a signed-in credentials file", async () => {
+  writeFileSync(join(dir, "credentials"), JSON.stringify({ session_token: "x", server: "http://127.0.0.1:9", user_email: "a@b.c" }));
+  const be = await start("be");
+  expect((await call(be, "who")).you).toBe("be");
 }, 20_000);

@@ -4,8 +4,23 @@ import { join } from "node:path";
 
 export type Credentials = { session_token: string; server: string; user_email: string };
 
+export function credentialsPath(env = process.env): string {
+  return env.GRAYBOARD_CREDENTIALS ?? join(homedir(), ".grayboard", "credentials");
+}
+
+/**
+ * Which bus `grayboard mcp` joins. Signed in to a server (a credentials file
+ * exists) → server mode; otherwise local. A signed-out credentials file still
+ * counts as server mode, so the MCP server fails with "run grayboard login"
+ * instead of quietly moving you to a different bus.
+ */
+export function busMode(env = process.env): "local" | "server" {
+  if (env.GRAYBOARD_TOKEN) return "server";
+  return existsSync(credentialsPath(env)) ? "server" : "local";
+}
+
 export function loadCredentials(): Credentials | null {
-  const credPath = process.env.GRAYBOARD_CREDENTIALS ?? join(homedir(), ".grayboard", "credentials");
+  const credPath = credentialsPath();
   if (!existsSync(credPath)) return null;
   try {
     return JSON.parse(readFileSync(credPath, "utf8")) as Credentials;

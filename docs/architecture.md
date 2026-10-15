@@ -15,10 +15,10 @@ Three distinct processes, one repo, one `package.json`:
 | Process | Entry | Run as | Role |
 |---|---|---|---|
 | **Backend server** | `src/server/main.ts` | systemd on EC2 | Single central HTTP+WSS endpoint. Owns SQLite. |
-| **MCP server** (a.k.a. plugin shim) | `src/plugin/main.ts` | spawned by Claude Code per `.mcp.json` | Stdio MCP server inside a Claude session. WSS client to backend. |
-| **CLI** | `src/cli/main.ts` | invoked by humans | `grayboard login / identity / team / admin` against backend HTTP API. |
+| **MCP server** (a.k.a. plugin shim) | `src/plugin/mcp.ts` | spawned by Claude Code as `grayboard mcp` | Stdio MCP server inside a Claude session. WSS client to backend. |
+| **CLI** | `src/cli/main.ts` | invoked by humans | `grayboard setup / login / identity / team / admin` against backend HTTP API; `grayboard mcp` starts the MCP server. |
 
-A fourth tree, **`src/local/`**, is the **sanctioned same-machine mode** (v0 preserved): Unix-socket wakeup, direct SQLite, no central server. It exists because live push between concurrent sessions on one machine doesn't need a managed server process — Unix sockets are the right primitive for that. Point a repo's `.mcp.json` at `src/local/main.ts` for local-only use, or at `src/plugin/main.ts` for the distributed v1 backend. Rationale captured in `meta/future-notes.log`.
+A fourth tree, **`src/local/`**, is the **sanctioned same-machine mode** (v0 preserved): Unix-socket wakeup, direct SQLite, no central server. It exists because live push between concurrent sessions on one machine doesn't need a managed server process — Unix sockets are the right primitive for that. `grayboard mcp` loads `src/plugin/mcp.ts` when a credentials file exists (or `GRAYBOARD_TOKEN` is set) and `src/local/mcp.ts` otherwise; `--mode local|server` forces one, e.g. in a repo's `.mcp.json`. The CLI is the only entry point for both. Rationale captured in `meta/future-notes.log`.
 
 ```
 ┌──────────────────────┐    WSS  /ws    ┌────────────────────────┐
@@ -73,7 +73,7 @@ meta/                # Spec + proposal
 docs/                # This file.
 ```
 
-Bin entries in `package.json`: `grayboard`, `grayboard-plugin`, `grayboard-server`.
+Bin entries in `package.json`: `grayboard`, `grayboard-server`.
 
 ---
 
@@ -329,17 +329,17 @@ Convenience: also writes/merges `.mcp.json` so engineers don't hand-craft it.
 - Default: **merge** — preserve other `mcpServers` entries; overwrite only `grayboard`. Refuse if file exists but is invalid JSON or has no `mcpServers` object.
 - `--force` clobbers, with a warning listing lost keys.
 
-Plugin-path resolution (`cli/main.ts:findPluginPath`):
-1. `GRAYBOARD_PLUGIN_PATH` env var. If it ends in `.ts` → `bun <path>`; otherwise treated as a binary path → `<path>` with no args.
-2. Sibling `grayboard-plugin` (or `grayboard-plugin.exe`) in the same directory as the running CLI binary (the `install.sh` case).
-3. Walk up to 6 levels from `process.argv[1]` looking for `src/plugin/main.ts` (the source-tree case → `bun src/plugin/main.ts`).
-4. Else fail with a clear error — never write a broken file.
+MCP command resolution (`cli/main.ts:mcpCommand`, shared with `grayboard setup`):
+1. Compiled CLI → `<absolute path of this binary> mcp`.
+2. Source tree → `bun <absolute path of src/cli/main.ts> mcp`.
 
-The resolver returns `{command, args}` and the same shape lands in the `.mcp.json` entry, so compiled-binary installs and source-tree installs produce different (but each correct) `.mcp.json` files.
+The resolver returns `{command, args}` and the same shape lands in the `.mcp.json` entry (or the `claude mcp add --scope user` registration).
+
+`BUS_IDENTITY` is optional. Without it the session is named after its git repo's directory (or the current directory outside git), sanitized to a valid identity, then the worktree suffix applies (`shared/identity.ts:sessionIdentity`). Claude Code starts MCP servers in the session's directory, which is what makes one user-level registration work for every repo.
 
 ### 8.2 Credentials
 
-Read by `cli/api.ts:loadCredentials` and `plugin/main.ts:loadCredentials`. Env-var overrides:
+Read by `cli/api.ts:loadCredentials` and `plugin/mcp.ts:loadCredentials`. Env-var overrides:
 - `GRAYBOARD_CREDENTIALS` — alternate path.
 - `GRAYBOARD_SERVER` — override `server` field.
 - `GRAYBOARD_TOKEN` — raw token bypass (plugin only; dev convenience).
@@ -348,7 +348,7 @@ Read by `cli/api.ts:loadCredentials` and `plugin/main.ts:loadCredentials`. Env-v
 
 ## 9. MCP server (plugin shim)
 
-`src/plugin/main.ts` exposes the same tool surface as local mode:
+`src/plugin/mcp.ts` exposes the same tool surface as local mode:
 
 | Tool | Maps to WS request |
 |---|---|
@@ -371,7 +371,7 @@ Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits wi
 - Otherwise, reconnect with exponential backoff (1s → 2s → … capped at 30s).
 - On `ping`: sends `pong`.
 
-**Channel notification format** (`plugin/main.ts:buildChannelTag`):
+**Channel notification format** (`plugin/mcp.ts:buildChannelTag`):
 
 ```
 <channel source="grayboard" message_id="123" from="a@org/fe" created_at="…" [in_reply_to="…"] [team="eng"]>body</channel>
@@ -379,14 +379,14 @@ Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits wi
 
 `team="<name>"` is included only for team messages. The MCP `notification` payload uses `params: { content: <tag string> }` — note this differs from the v0 shape which used a separate `meta` object. The on-the-wire `<channel>` tag content matches what Claude Code expects.
 
-Per-repo `.mcp.json` template:
+Per-repo `.mcp.json` template (optional; `grayboard setup` registers this once at user scope without `env`):
 
 ```json
 {
   "mcpServers": {
     "grayboard": {
-      "command": "bun",
-      "args": ["/abs/path/to/grayboard/src/plugin/main.ts"],
+      "command": "/home/you/.local/bin/grayboard",
+      "args": ["mcp"],
       "env": { "BUS_IDENTITY": "fe" }
     }
   }
@@ -414,10 +414,9 @@ Two delivery mechanisms, both supported.
 **Compiled binaries** (recommended for end users). `bun build --compile` produces self-contained executables — no Bun runtime needed at the install site.
 
 ```bash
-bun run build           # builds all three into dist/
+bun run build           # builds both into dist/
 # or individually:
 bun run build:cli       # → dist/grayboard
-bun run build:plugin    # → dist/grayboard-plugin
 bun run build:server    # → dist/grayboard-server
 ```
 
@@ -426,17 +425,18 @@ Each binary is ~100 MB (Bun runtime + bundled JS). Bun cross-compiles via `--tar
 **GitHub Actions release pipeline** (`.github/workflows/release.yml`):
 - Triggered by pushing a `v*` tag (or manual `workflow_dispatch`).
 - Matrix-builds all four `{linux,darwin}×{x64,arm64}` targets in parallel.
-- Uploads each binary as `dist/grayboard-<target>`, `grayboard-plugin-<target>`, `grayboard-server-<target>` to the GitHub Release.
+- Uploads each binary as `dist/grayboard-<target>`, `grayboard-server-<target>` to the GitHub Release.
 - Also attaches `install.sh` to the release.
 
 **`install.sh`** at repo root:
 - Detects OS + arch.
-- Downloads `grayboard-<target>` and `grayboard-plugin-<target>` from `releases/latest/download` to `~/.local/bin/grayboard` and `~/.local/bin/grayboard-plugin`.
+- Downloads `grayboard-<target>` from `releases/latest/download` to `~/.local/bin/grayboard`.
 - With `INSTALL_SERVER=1`, also fetches `grayboard-server-<target>`. Used on the EC2 host alongside `INSTALL_DIR=/usr/local/bin`.
 - `chmod +x`, warns if `INSTALL_DIR` isn't on `PATH`.
-- Overrides: `GRAYBOARD_VERSION=v0.1.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`, `INSTALL_SERVER=1`.
+- Then runs `grayboard setup` on the terminal (`< /dev/tty`, since under `curl | bash` stdin is the script). Skipped for server installs, without a terminal, or with `GRAYBOARD_NO_SETUP=1`.
+- Overrides: `GRAYBOARD_VERSION=v0.1.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`, `INSTALL_SERVER=1`, `GRAYBOARD_NO_SETUP=1`.
 
-The compiled CLI's `findPluginCommand` (§8.1) finds the sibling `grayboard-plugin` binary automatically and writes a binary-form `.mcp.json` (no `bun` invocation). Source-tree installs continue to write the `bun src/plugin/main.ts` form. Both are valid; the user just sees `grayboard identity create fe --mcp` and the right thing happens.
+`grayboard setup` picks the mode (signs in for a server; for local, removes the credentials file after confirming), then registers `grayboard mcp` with `claude mcp add --scope user` (remove-then-add, so re-running is safe), and prints the launch command.
 
 **`grayboard-server`** is shipped in releases as the default server install path. The systemd unit (`deploy/grayboard.service`) points at `/usr/local/bin/grayboard-server` out of the box; the source-tree alternative (`bun run src/server/main.ts` with `WorkingDirectory=/opt/grayboard`) is documented in the unit file as a comment. Server upgrades are `INSTALL_SERVER=1 GRAYBOARD_VERSION=vX.Y.Z bash install.sh && systemctl restart grayboard` — no git pull, no `bun install`, no source on the host.
 
@@ -532,7 +532,6 @@ Loaded once in `server/config.ts`. Fail-fast on missing required vars.
 | `GRAYBOARD_MESSAGE_RETENTION_DAYS` | no | `90` | server (retention job) |
 | `GRAYBOARD_AUDIT_RETENTION_DAYS` | no | `90` | server (retention job) |
 | `GRAYBOARD_DEV_AUTH` | no | unset | server (enables `/api/auth/dev-login`) |
-| `GRAYBOARD_PLUGIN_PATH` | no | auto-detect | CLI (`identity create --mcp`) |
 | `GOOGLE_OAUTH_CLIENT_ID` | yes (CLI side) | — | CLI (PKCE; client_id is public) |
 | `GRAYBOARD_SERVER` | no | from credentials | CLI + plugin |
 | `GRAYBOARD_CREDENTIALS` | no | `~/.grayboard/credentials` | CLI + plugin |
@@ -606,11 +605,11 @@ bun src/cli/main.ts whoami
 bun src/cli/main.ts identity create fe
 bun src/cli/main.ts team create eng
 
-# Plugin (a third terminal, simulating an MCP child)
+# MCP server (a third terminal, simulating an MCP child)
 GRAYBOARD_TOKEN=$(jq -r .session_token ~/.grayboard/credentials) \
 GRAYBOARD_SERVER=http://localhost:8080 \
 BUS_IDENTITY=fe \
-bun src/plugin/main.ts
+bun src/cli/main.ts mcp --mode server
 ```
 
 Then drive the plugin from an MCP client, or run `bun test tests/integration`, which does the same over WebSockets.

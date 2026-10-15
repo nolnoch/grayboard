@@ -3,7 +3,7 @@
 #
 # Default install (developer machine):
 #   curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | bash
-#   → installs `grayboard` and `grayboard-plugin` to ~/.local/bin
+#   → installs `grayboard` to ~/.local/bin, then runs `grayboard setup`
 #
 # Server install (one-deployment-per-org):
 #   curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
@@ -15,6 +15,7 @@
 #   INSTALL_DIR=/some/path     install dir   (default: ~/.local/bin)
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   INSTALL_SERVER=1           also fetch grayboard-server
+#   GRAYBOARD_NO_SETUP=1       skip `grayboard setup`
 
 set -euo pipefail
 
@@ -53,7 +54,7 @@ fi
 
 # ── pick binaries ────────────────────────────────────────────────────────────
 
-bins=(grayboard grayboard-plugin)
+bins=(grayboard)
 if [ "$INSTALL_SERVER" = "1" ]; then
   bins+=(grayboard-server)
 fi
@@ -98,8 +99,9 @@ if [ "$INSTALL_SERVER" = "1" ]; then
   echo "  2. Install the systemd unit (deploy/grayboard.service in the repo)"
   echo "  3. Put Caddy in front for TLS (deploy/Caddyfile)"
   echo "  4. Schedule the nightly backup cron (deploy/backup.sh)"
+elif [ "${GRAYBOARD_NO_SETUP:-0}" != "1" ] && [ -t 1 ] && (: < /dev/tty) 2>/dev/null; then
+  # Under `curl | bash`, stdin is this script; setup asks its questions on the terminal.
+  "${INSTALL_DIR}/grayboard" setup < /dev/tty
 else
-  echo "Next steps:"
-  echo "  1. grayboard login --server https://your-grayboard-host"
-  echo "  2. cd into a repo and run: grayboard identity create <name> --mcp"
+  echo "Next: run \`grayboard setup\` to choose local or team-server mode and connect Claude Code."
 fi

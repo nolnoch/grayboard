@@ -1,4 +1,5 @@
-#!/usr/bin/env bun
+// Local-mode MCP server: SQLite + Unix-socket wakeup. `grayboard mcp` imports
+// this; it starts on import.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -24,17 +25,11 @@ import {
   unreadFor,
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
-import { resolveIdentity } from "../shared/identity.ts";
+import { sessionIdentity } from "../shared/identity.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-const rawIdentity = process.env.BUS_IDENTITY;
-if (!rawIdentity) {
-  throw new Error(
-    "grayboard: BUS_IDENTITY env var is required (e.g. BUS_IDENTITY=fe)",
-  );
-}
-const IDENTITY: string = resolveIdentity(rawIdentity);
-if (IDENTITY !== rawIdentity) console.error(`[grayboard] identity "${IDENTITY}" (worktree of "${rawIdentity}")`);
+const IDENTITY: string = sessionIdentity();
+console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
