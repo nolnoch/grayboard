@@ -1,11 +1,12 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
-import type { Message, SendOk, HistoryOk, ThreadOk } from "../shared/protocol.ts";
+import type { Message, SendOk, HistoryOk, ThreadOk, CallOk } from "../shared/protocol.ts";
+import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // ── credentials ───────────────────────────────────────────────────────────────
@@ -43,27 +44,27 @@ if (!identity) {
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 
-const server = new McpServer(
-  {
-    name: "grayboard",
-    version: pkg.version,
-  },
+const server = new Server(
+  { name: "grayboard", version: pkg.version },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
     instructions: [
-      `You are identity "${identity}" on the grayboard bus, which coordinates between Claude instances.`,
-      `Incoming peer messages arrive as <channel source="grayboard" message_id="..." from="..." [in_reply_to="..."] [team="..."]>body</channel>.`,
-      `To send: call bus_send with recipient (user@org/name or team:name) and body; add parent_id to thread.`,
-      `To catch up without waiting for a push, call bus_history. For a full thread, call bus_thread.`,
+      `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
+      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [in_reply_to="..."]>body</channel>.`,
+      ...BOARD_INSTRUCTIONS,
+      `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
   },
 );
 
 // ── WS client setup ───────────────────────────────────────────────────────────
+
+const notify = (params: { content: string; meta: Record<string, string> }) =>
+  server.notification({ method: "notifications/claude/channel", params });
 
 const client = new GrayboardClient(
   serverUrl,
@@ -76,21 +77,21 @@ const client = new GrayboardClient(
       created_at: String(msg.created_at),
     };
     if (msg.parent_id !== null) meta.in_reply_to = String(msg.parent_id);
-    if (msg.recipient_type === "team") meta.team = msg.recipient.slice(5);
-    server.server.notification({
-      method: "notifications/claude/channel",
-      params: { content: msg.body, meta },
-    });
+    void notify({ content: msg.body, meta });
   },
+  (item) => notify(boardNotification(item)),
 );
 
 client.connect();
 
-// Wait for hello_ok before registering tools (with 30s timeout)
-const helloData = await Promise.race([
+// Wait for hello_ok before the MCP handshake, so a refused identity or an
+// unreachable server shows as a failed server in the client. Keep this well
+// under the client's own startup timeout (30s in Claude Code) so it's an
+// error, not a timeout.
+await Promise.race([
   client.ready(),
   new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("timeout waiting for grayboard server")), 30_000),
+    setTimeout(() => reject(new Error(`no answer from grayboard server at ${serverUrl} within 10s`)), 10_000),
   ),
 ]).catch((e: Error) => {
   console.error(`[grayboard] ${e.message}`);
@@ -99,56 +100,89 @@ const helloData = await Promise.race([
 
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 
-server.tool(
-  "bus_send",
-  "Send a message to another identity or team on the grayboard bus",
-  {
-    recipient: z.string().describe("Recipient address: user@your-org.com/identity-name or team:name"),
-    body:      z.string().describe("Message body (plain text, max 64 KiB)"),
-    parent_id: z.number().int().optional().describe("Parent message ID to create a thread reply"),
-  },
-  async ({ recipient, body, parent_id }) => {
-    const resp = await client.request<SendOk>({ type: "send", recipient, body, ...(parent_id ? { parent_id } : {}) });
-    return {
-      content: [{ type: "text", text: JSON.stringify({ message_id: resp.message_id, delivered_now: resp.delivered_now }) }],
-    };
-  },
-);
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "bus_send",
+      description:
+        `Send a direct message to another agent. You are "${identity}". Delivered now if they're online, or queued until their next session. ` +
+        `team:<name> posts to that team's board instead (same as board_post).`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          recipient: { type: "string", description: "user@your-org.com/identity-name, or team:name" },
+          body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
+          parent_id: { type: "number", description: "Optional. message_id (or post_id, for team:) to reply to." },
+        },
+        required: ["recipient", "body"],
+      },
+    },
+    {
+      name: "bus_history",
+      description: "List recent direct messages you are involved in, optionally filtered by peer.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          peer:      { type: "string", description: "Optional. Only messages with this address." },
+          limit:     { type: "number", description: "Max messages (default 20, max 200)." },
+          before_id: { type: "number", description: "Return messages older than this id (pagination)." },
+        },
+      },
+    },
+    {
+      name: "bus_thread",
+      description: "Return a root direct message and all its replies, ordered by id.",
+      inputSchema: {
+        type: "object",
+        properties: { root_id: { type: "number", description: "message_id of the root message." } },
+        required: ["root_id"],
+      },
+    },
+    ...boardTools({ teams: true }),
+  ],
+}));
 
-server.tool(
-  "bus_history",
-  "Fetch recent message history from the grayboard bus",
-  {
-    peer:      z.string().optional().describe("Filter to conversation with this address"),
-    limit:     z.number().int().min(1).max(200).optional().describe("Number of messages (default 20, max 200)"),
-    before_id: z.number().int().optional().describe("Fetch messages before this ID (pagination)"),
-  },
-  async ({ peer, limit, before_id }) => {
-    const resp = await client.request<HistoryOk>({ type: "history", peer, limit, before_id });
-    return {
-      content: [{ type: "text", text: JSON.stringify(resp.messages) }],
-    };
-  },
-);
+const text = (value: unknown) => ({
+  content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+});
 
-server.tool(
-  "bus_thread",
-  "Fetch a message thread (root message and all replies) from the grayboard bus",
-  {
-    root_id: z.number().int().describe("ID of the root message"),
-  },
-  async ({ root_id }) => {
-    const resp = await client.request<ThreadOk>({ type: "thread", root_id });
-    return {
-      content: [{ type: "text", text: JSON.stringify(resp.messages) }],
-    };
-  },
-);
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: args = {} } = req.params;
+  const a = args as Record<string, unknown>;
+  try {
+    if (isBoardTool(name)) {
+      return text((await client.request<CallOk>({ type: "call", tool: name, args: a })).result);
+    }
+    if (name === "bus_send") {
+      const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
+        type: "send",
+        recipient: a.recipient,
+        body: a.body,
+        ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
+      });
+      return text(rest);
+    }
+    if (name === "bus_history") {
+      const resp = await client.request<HistoryOk>({ type: "history", peer: a.peer, limit: a.limit, before_id: a.before_id });
+      return text(resp.messages);
+    }
+    if (name === "bus_thread") {
+      return text((await client.request<ThreadOk>({ type: "thread", root_id: a.root_id })).messages);
+    }
+    return { ...text(`error: unknown tool: ${name}`), isError: true };
+  } catch (e) {
+    // Server errors arrive as "code: message"; show them to the agent.
+    return { ...text(`error: ${(e as Error).message}`), isError: true };
+  }
+});
 
 // ── start stdio transport ─────────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+await server.connect(new StdioServerTransport());
 
-process.on("SIGINT",  () => { client.close(); process.exit(0); });
-process.on("SIGTERM", () => { client.close(); process.exit(0); });
+const shutdown = () => { client.close(); process.exit(0); };
+process.on("SIGINT",  shutdown);
+process.on("SIGTERM", shutdown);
+// Exit when the MCP client goes away, so an orphan can't keep holding the identity.
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
