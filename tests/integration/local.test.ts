@@ -63,19 +63,19 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   const before = Date.now();
   await stop(tmp);
 
-  const online = await call(sim, "who");
+  const online = await call(sim, "peer_list");
   expect(online.you).toBe("sim");
   expect(online.peers.map((p: any) => p.handle)).toEqual(["be", "sim"]);
   expect(online.offline_hidden).toBe(1);
 
-  const all = await call(sim, "who", { include_offline: true });
+  const all = await call(sim, "peer_list", { include_offline: true });
   const gone = all.peers.find((p: any) => p.handle === "tmp");
   expect(gone.online).toBe(false);
   expect(gone.last_seen).toBeGreaterThanOrEqual(before);
 
   await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
   await call(sim, "board_subscribe", { board: "e2e", mode: "quiet" });
-  expect((await call(sim, "who", { board: "#e2e" })).peers).toEqual([
+  expect((await call(sim, "peer_list", { board: "#e2e" })).peers).toEqual([
     { handle: "be", online: true, last_seen: expect.any(Number), mode: "push" },
     { handle: "sim", online: true, last_seen: expect.any(Number), mode: "quiet" },
   ]);
@@ -89,8 +89,8 @@ test("a session started in a linked worktree gets a suffixed handle", async () =
 
   const main = await start("be", join(dir, "repo"));
   const stream = await start("be", wt);
-  expect((await call(stream, "who")).you).toBe("be-stream");
-  expect((await call(main, "who")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
+  expect((await call(stream, "peer_list")).you).toBe("be-stream");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
@@ -98,8 +98,8 @@ test("grayboard mcp: local mode when signed out, named after the repo", async ()
   mkdirSync(join(repo, ".git"), { recursive: true });
   const api = await start(undefined, repo, [CLI, "mcp"]);
   const be = await start("be", dir, [CLI, "mcp"]);
-  expect((await call(api, "who")).you).toBe("api");
-  expect((await call(be, "who")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
+  expect((await call(api, "peer_list")).you).toBe("api");
+  expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
 }, 20_000);
 
 test("grayboard mcp: a signed-out credentials file fails instead of falling back to local", async () => {
@@ -112,5 +112,12 @@ test("grayboard mcp: a signed-out credentials file fails instead of falling back
 test("grayboard mcp --mode local overrides a signed-in credentials file", async () => {
   writeFileSync(join(dir, "credentials"), JSON.stringify({ session_token: "x", server: "http://127.0.0.1:9", user_email: "a@b.c" }));
   const be = await start("be");
-  expect((await call(be, "who")).you).toBe("be");
+  expect((await call(be, "peer_list")).you).toBe("be");
+}, 20_000);
+
+test("dm_send to a handle that never connected is an error, not a silent queue", async () => {
+  const be = await start("be");
+  await expect(call(be, "dm_send", { recipient: "backend", body: "hi" })).rejects.toThrow(/peer_list/);
+  await start("fe");
+  expect((await call(be, "dm_send", { recipient: "fe", body: "hi" })).delivered_now).toBe(true);
 }, 20_000);

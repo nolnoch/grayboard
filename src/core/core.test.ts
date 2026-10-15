@@ -231,9 +231,9 @@ describe("who", () => {
   });
 
   test("the tool needs the mode's liveness check", () => {
-    expect(() => callBoardTool(db, "be", "who", {})).toThrow(/isn't available/);
-    expect(callBoardTool(db, "be", "who", { include_offline: true }, { online }).result).toMatchObject({ you: "be" });
-    expect(() => callBoardTool(db, "be", "who", { include_offline: "yes" }, { online })).toThrow(/boolean/);
+    expect(() => callBoardTool(db, "be", "peer_list", {})).toThrow(/isn't available/);
+    expect(callBoardTool(db, "be", "peer_list", { include_offline: true }, { online }).result).toMatchObject({ you: "be" });
+    expect(() => callBoardTool(db, "be", "peer_list", { include_offline: "yes" }, { online })).toThrow(/boolean/);
   });
 });
 

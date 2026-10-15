@@ -58,22 +58,32 @@ export async function poke(identity: string): Promise<boolean> {
 
 // Connecting is the wakeup: the listener drains on open, so a probe also
 // nudges the owner, which is harmless (drain is idempotent).
+//
+// A refused connect doesn't prove the owner is gone: a live listener whose
+// process is busy can refuse too. Treating that as "dead" would let a second
+// session take over a live identity, or skip a wakeup. So retry briefly; a
+// stale socket file from a crashed session costs the full ~150ms.
+const RETRY_MS = [25, 50, 75];
+
 async function canConnect(path: string): Promise<boolean> {
-  if (!existsSync(path)) return false;
-  try {
-    await Bun.connect({
-      unix: path,
-      socket: {
-        open(socket) {
-          socket.end();
+  for (let attempt = 0; ; attempt++) {
+    if (!existsSync(path)) return false;
+    try {
+      await Bun.connect({
+        unix: path,
+        socket: {
+          open(socket) {
+            socket.end();
+          },
+          data() {},
+          close() {},
+          error() {},
         },
-        data() {},
-        close() {},
-        error() {},
-      },
-    });
-    return true;
-  } catch {
-    return false;
+      });
+      return true;
+    } catch {
+      if (attempt >= RETRY_MS.length) return false;
+      await Bun.sleep(RETRY_MS[attempt]!);
+    }
   }
 }

@@ -14,9 +14,7 @@ export type SendPrincipal = {
   identity_full: string;
 };
 
-export type SendTarget =
-  | { kind: "user"; address: string }
-  | { kind: "team"; team_id: number; name: string };
+export type SendTarget = { kind: "user"; address: string };
 
 export type SendDecision =
   | { allow: true }

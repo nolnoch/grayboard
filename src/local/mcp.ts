@@ -57,14 +57,14 @@ const mcp = new Server(
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "bus_send",
-      description: `Send a direct message to another agent over the grayboard bus. You are "${IDENTITY}". Delivered to the peer immediately if they're online, or queued until their next session.`,
+      name: "dm_send",
+      description: `Send a direct message to one other agent. You are "${IDENTITY}". Delivered now if they're online, or queued until their next session. Use peer_list for exact handles.`,
       inputSchema: {
         type: "object",
         properties: {
           recipient: {
             type: "string",
-            description: 'Peer identity to send to, e.g. "be", "fe", "sim".',
+            description: "The peer's exact handle, as peer_list shows it.",
           },
           body: {
             type: "string",
@@ -80,7 +80,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: "bus_history",
+      name: "dm_history",
       description:
         "List recent direct messages you are involved in (as sender or recipient), optionally filtered by peer. Returns chronological order.",
       inputSchema: {
@@ -104,7 +104,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: "bus_thread",
+      name: "dm_thread",
       description:
         "Return a root direct message and all its descendants (replies of replies), ordered by id.",
       inputSchema: {
@@ -148,12 +148,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 async function dispatch(name: string, a: Record<string, any>) {
-  if (name === "bus_send") {
+  if (name === "dm_send") {
     const { recipient, body, parent_id } = a as {
       recipient: string;
       body: string;
       parent_id?: number;
     };
+    if (!rosterHandles(db).includes(recipient)) {
+      return {
+        ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
+        isError: true,
+      };
+    }
     if (parent_id !== undefined && !getMessage(parent_id)) {
       return {
         ...text(`error: parent_id ${parent_id} does not exist`),
@@ -173,17 +179,17 @@ async function dispatch(name: string, a: Record<string, any>) {
     );
   }
 
-  if (name === "bus_history") {
+  if (name === "dm_history") {
     const lim = Math.min(Math.max(a.limit ?? 20, 1), 200);
     return text(getHistory(IDENTITY, a.peer, lim, a.before_id));
   }
 
-  if (name === "bus_thread") {
+  if (name === "dm_thread") {
     return text(getThread(a.root_id));
   }
 
   if (isBoardTool(name)) {
-    const ctx = name === "who" ? { online: await liveHandles() } : {};
+    const ctx = name === "peer_list" ? { online: await liveHandles() } : {};
     const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
     await wakeAll(wake);
     return text(result);

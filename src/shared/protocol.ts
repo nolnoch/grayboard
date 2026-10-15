@@ -27,11 +27,7 @@ export type ClientMessage =
 
 // Server -> Client
 export type HelloOk     = { type: "hello_ok";   req_id: string; identity_full: string; user_email: string; teams: string[] };
-// A team:<name> send is a post on that team's board: post_id and board instead of message_id.
-export type SendOk      = {
-  type: "send_ok"; req_id: string; delivered_now: boolean;
-  message_id?: number; post_id?: number; board?: string; unresolved?: string[];
-};
+export type SendOk      = { type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean };
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: Message[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
 export type AckOk       = { type: "ack_ok";     req_id: string };

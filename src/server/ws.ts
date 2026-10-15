@@ -305,33 +305,7 @@ function handleSend(
   };
 
   if (parsed.kind === "team") {
-    // Teams are boards: a team send is a post on #<team> (members only).
-    const team = repo.teams.findByName(parsed.name);
-    if (!team) {
-      err(ws, reqId, "not_found", `team "${parsed.name}" not found`);
-      return;
-    }
-    const decision = canSend(principal, { kind: "team", team_id: team.id, name: team.name }, { db: repo, now: Date.now() });
-    if (!decision.allow) {
-      err(ws, reqId, decision.code, decision.reason);
-      return;
-    }
-    let result;
-    try {
-      result = post(db, ws.data.identityFull, team.name, body, parentId);
-    } catch (e) {
-      if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
-      throw e;
-    }
-    wake(hub, result.wake);
-    send(ws, {
-      type: "send_ok",
-      req_id: reqId,
-      post_id: result.post.id,
-      board: result.post.board,
-      delivered_now: result.wake.some(h => registry.has(h)),
-      ...(result.unresolved.length ? { unresolved: result.unresolved } : {}),
-    });
+    err(ws, reqId, "bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
     return;
   }
 
@@ -342,7 +316,7 @@ function handleSend(
   }
   const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
   if (!recipientIdentity) {
-    err(ws, reqId, "not_found", `identity "${parsed.full}" not found`);
+    err(ws, reqId, "not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
     return;
   }
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now() });

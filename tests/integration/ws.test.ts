@@ -174,7 +174,7 @@ test("who: live connections are online; a closed one is offline with last_seen; 
   const c = new Client(carol, "sim");
   for (const x of [a, a2, b, c]) expect((await x.connect()).type).toBe("hello_ok");
 
-  const online = await c.call("who");
+  const online = await c.call("peer_list");
   expect(online.result.you).toBe("carol@example.com/sim");
   expect(online.result.peers.map((p: any) => p.handle)).toEqual([
     "alice@example.com/be",
@@ -185,20 +185,20 @@ test("who: live connections are online; a closed one is offline with last_seen; 
 
   const before = Date.now();
   await closeAndSettle(a2);
-  const after = await c.call("who");
+  const after = await c.call("peer_list");
   expect(after.result.offline_hidden).toBe(1);
-  const all = await c.call("who", { include_offline: true });
+  const all = await c.call("peer_list", { include_offline: true });
   const gone = all.result.peers.find((p: any) => p.handle === "alice@example.com/be-stream");
   expect(gone.online).toBe(false);
   expect(gone.last_seen).toBeGreaterThanOrEqual(before);
 
-  const team = await b.call("who", { board: "eng", include_offline: true });
+  const team = await b.call("peer_list", { board: "eng", include_offline: true });
   expect(team.result.peers.map((p: any) => [p.handle, p.online])).toEqual([
     ["alice@example.com/be", true],
     ["alice@example.com/be-stream", false],
     ["bob@example.com/fe", true],
   ]);
-  expect(await c.call("who", { board: "eng" })).toMatchObject({ type: "error", message: "no such board #eng; see board_list" });
+  expect(await c.call("peer_list", { board: "eng" })).toMatchObject({ type: "error", message: "no such board #eng; see board_list" });
 });
 
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
@@ -226,7 +226,7 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   await s3.none(boardPush);
 });
 
-test("team: sends post to the team board; digests coalesce until read", async () => {
+test("team boards: digests coalesce until read; team: is not a DM recipient", async () => {
   const alice = await login("alice@example.com");
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
@@ -236,12 +236,15 @@ test("team: sends post to the team board; digests coalesce until read", async ()
   await a.connect();
   await c.connect();
 
-  const sent = await a.request({ type: "send", recipient: "team:eng", body: "standup in 5" });
-  expect(sent).toMatchObject({ type: "send_ok", board: "eng", delivered_now: true });
+  expect(await a.request({ type: "send", recipient: "team:eng", body: "standup in 5" })).toMatchObject({
+    type: "error",
+    code: "bad_request",
+  });
+  await a.call("board_post", { board: "eng", body: "standup in 5" });
   const digest = await c.next(boardPush);
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
 
-  await a.request({ type: "send", recipient: "team:eng", body: "make that 10" });
+  await a.call("board_post", { board: "eng", body: "make that 10" });
   await c.none(boardPush); // one digest until carol catches up
 
   await c.request({ type: "board_ack", refs: [{ kind: "digest", board: "eng", latest_id: digest.item.latest.id }] });
@@ -251,7 +254,7 @@ test("team: sends post to the team board; digests coalesce until read", async ()
   const bob = await login("bob@example.com");
   const b = new Client(bob, "fe");
   await b.connect();
-  expect(await b.request({ type: "send", recipient: "team:eng", body: "hi" })).toMatchObject({
+  expect(await b.call("board_post", { board: "eng", body: "hi" })).toMatchObject({
     type: "error",
     message: "no such board #eng; see board_list",
   });
@@ -303,13 +306,13 @@ test("claims are org-wide and atomic across users", async () => {
   const b = new Client(bob, "be");
   await a.connect();
   await b.connect();
-  expect((await a.call("claim", { key: "ticket:ENG-1", note: "on it" })).result.ok).toBe(true);
-  expect((await b.call("claim", { key: "ticket:ENG-1" })).result).toMatchObject({
+  expect((await a.call("claim_take", { key: "ticket:ENG-1", note: "on it" })).result.ok).toBe(true);
+  expect((await b.call("claim_take", { key: "ticket:ENG-1" })).result).toMatchObject({
     ok: false,
     held_by: "alice@example.com/be",
     note: "on it",
   });
-  expect((await b.call("claims")).result.map((c: any) => c.key)).toEqual(["ticket:ENG-1"]);
+  expect((await b.call("claim_list")).result.map((c: any) => c.key)).toEqual(["ticket:ENG-1"]);
 });
 
 test("a live identity refuses a second connection", async () => {

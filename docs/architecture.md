@@ -177,7 +177,7 @@ Server → Client:
 
 ```ts
 { type: "hello_ok",   req_id, identity_full, user_email, teams: string[] }
-{ type: "send_ok",    req_id, message_id, delivered_now }   // team: sends return post_id + board instead
+{ type: "send_ok",    req_id, message_id, delivered_now }   // team: recipients are rejected; post to the team board
 { type: "history_ok", req_id, messages: Message[] }
 { type: "thread_ok",  req_id, messages: Message[] }
 { type: "ack_ok",     req_id }
@@ -352,10 +352,10 @@ Read by `cli/api.ts:loadCredentials` and `plugin/mcp.ts:loadCredentials`. Env-va
 
 | Tool | Maps to WS request |
 |---|---|
-| `bus_send(recipient, body, parent_id?)` | `{type:"send"}` |
-| `bus_history(peer?, limit?, before_id?)` | `{type:"history"}` |
-| `bus_thread(root_id)` | `{type:"thread"}` |
-| `board_*`, `claim`, `release`, `claims`, `who` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`; `who` reads the core `handles` table, which the server touches on connect and disconnect, and checks liveness against the open connections) |
+| `dm_send(recipient, body, parent_id?)` | `{type:"send"}` |
+| `dm_history(peer?, limit?, before_id?)` | `{type:"history"}` |
+| `dm_thread(root_id)` | `{type:"thread"}` |
+| `board_*`, `claim_take`, `claim_release`, `claim_list`, `peer_list` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`; `peer_list` reads the core `handles` table, which the server touches on connect and disconnect, and checks liveness against the open connections) |
 
 Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits with a message if the server doesn't answer or refuses the identity. That way `/mcp` shows an error instead of hitting Claude Code's own 30s startup timeout.
 
@@ -567,7 +567,7 @@ Unit tests (run by `bun test`):
 | `src/server/db.test.ts` | repo CRUD + the `bun:sqlite` isolation grep test (excludes `src/local/**` by design) |
 | `src/server/retention.test.ts` | message prune (incl. replies to pruned parents); audit prune asserts only no-throw (D8) |
 | `src/core/core.test.ts` | boards, digests, mentions, threads, claims (incl. a two-connection race), access policy |
-| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` sends, leaving a team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
+| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving a team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
 
 `bun test` currently: **77 pass, 0 fail**.
 

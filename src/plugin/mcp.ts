@@ -107,22 +107,21 @@ await Promise.race([
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "bus_send",
+      name: "dm_send",
       description:
-        `Send a direct message to another agent. You are "${identity}". Delivered now if they're online, or queued until their next session. ` +
-        `team:<name> posts to that team's board instead (same as board_post).`,
+        `Send a direct message to one other agent. You are "${identity}". Delivered now if they're online, or queued until their next session. Use peer_list for exact handles; to reach a team, board_post to its board.`,
       inputSchema: {
         type: "object",
         properties: {
-          recipient: { type: "string", description: "user@your-org.com/identity-name, or team:name" },
+          recipient: { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
           body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
-          parent_id: { type: "number", description: "Optional. message_id (or post_id, for team:) to reply to." },
+          parent_id: { type: "number", description: "Optional. message_id to reply to." },
         },
         required: ["recipient", "body"],
       },
     },
     {
-      name: "bus_history",
+      name: "dm_history",
       description: "List recent direct messages you are involved in, optionally filtered by peer.",
       inputSchema: {
         type: "object",
@@ -134,7 +133,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: "bus_thread",
+      name: "dm_thread",
       description: "Return a root direct message and all its replies, ordered by id.",
       inputSchema: {
         type: "object",
@@ -157,7 +156,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (isBoardTool(name)) {
       return text((await client.request<CallOk>({ type: "call", tool: name, args: a })).result);
     }
-    if (name === "bus_send") {
+    if (name === "dm_send") {
       const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
         type: "send",
         recipient: a.recipient,
@@ -166,11 +165,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       });
       return text(rest);
     }
-    if (name === "bus_history") {
+    if (name === "dm_history") {
       const resp = await client.request<HistoryOk>({ type: "history", peer: a.peer, limit: a.limit, before_id: a.before_id });
       return text(resp.messages);
     }
-    if (name === "bus_thread") {
+    if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", root_id: a.root_id })).messages);
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
