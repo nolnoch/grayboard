@@ -1,5 +1,8 @@
 import type { Database } from "bun:sqlite";
 
+// For callers outside the storage seam (src/server/*) that pass the handle through.
+export type CoreDb = Database;
+
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
 // @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
@@ -118,6 +121,24 @@ export function createBoard(
   return getBoard(db, board)!;
 }
 
+// For a mode's own bookkeeping (e.g. a team's board), not agent requests:
+// no access check, no creator subscription. Returns false if it exists.
+export function ensureBoard(
+  db: Database,
+  name: string,
+  purpose: string,
+  scope: string | null,
+  createdBy: string,
+): boolean {
+  const res = db
+    .prepare(
+      `INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(name) DO NOTHING`,
+    )
+    .run(normalizeBoard(name), purpose, scope, createdBy, Date.now());
+  return res.changes > 0;
+}
+
 // Unchecked lookup, for modes and policies. Tools go through visibleBoard.
 export function getBoard(db: Database, name: string): Board | undefined {
   return db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | undefined;
@@ -145,6 +166,10 @@ function tipOf(db: Database, board: string): number {
   return row.tip ?? 0;
 }
 
+// Unread = after your cursor, not yours, and not already pushed to you in
+// full (a mention or thread reply), so one post never notifies twice.
+const NOT_PUSHED = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.post_id = p.id)`;
+
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
 export function listBoards(db: Database, handle: string): BoardSummary[] {
@@ -154,12 +179,12 @@ export function listBoards(db: Database, handle: string): BoardSummary[] {
               (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
               CASE WHEN s.handle IS NULL THEN 0 ELSE
                 (SELECT COUNT(*) FROM posts p
-                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ?) END AS unread
+                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED}) END AS unread
          FROM boards b
          LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
         ORDER BY b.name`,
     )
-    .all(handle, handle) as BoardSummary[];
+    .all(handle, handle, handle) as BoardSummary[];
   const a = access(db);
   return rows.filter((b) => a.canSee(handle, b));
 }
@@ -179,6 +204,18 @@ export function subscribe(db: Database, handle: string, boardInput: string, mode
     `INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(board, handle) DO UPDATE SET mode = excluded.mode`,
   ).run(board, handle, mode, tip, tip);
+}
+
+export function isSubscribed(db: Database, handle: string, board: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM subscriptions WHERE board = ? AND handle = ?`).get(board, handle);
+}
+
+// Drop a handle's subscriptions to every board with this scope (e.g. on
+// leaving a team).
+export function unsubscribeScope(db: Database, handle: string, scope: string): void {
+  db.prepare(
+    `DELETE FROM subscriptions WHERE handle = ? AND board IN (SELECT name FROM boards WHERE scope = ?)`,
+  ).run(handle, scope);
 }
 
 // Raw @tokens in a body, lowercased, trailing sentence punctuation removed.
@@ -342,9 +379,10 @@ export function read(
     posts = sub
       ? (db
           .prepare(
-            `SELECT * FROM posts WHERE board = ? AND id > ? AND author != ? ORDER BY id ASC LIMIT ?`,
+            `SELECT * FROM posts p WHERE board = ? AND id > ? AND author != ? AND ${NOT_PUSHED}
+              ORDER BY id ASC LIMIT ?`,
           )
-          .all(board, sub.cursor, handle, limit) as Post[])
+          .all(board, sub.cursor, handle, handle, limit) as Post[])
       : [];
     if (posts.length === 0) {
       posts = (
@@ -371,9 +409,9 @@ export function read(
     .prepare(
       `SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s
          ON s.board = p.board AND s.handle = ?
-        WHERE p.board = ? AND p.id > s.cursor AND p.author != ?`,
+        WHERE p.board = ? AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED}`,
     )
-    .get(handle, board, handle) as { n: number };
+    .get(handle, board, handle, handle) as { n: number };
 
   return { board, posts, unread_remaining: remaining.n };
 }
@@ -412,12 +450,13 @@ export function pendingFor(db: Database, handle: string): Pending[] {
   const digests = db
     .prepare(
       `SELECT s.board, s.cursor,
-              (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor AND p.author != ?) AS unread,
-              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ?) AS latest_id
+              (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
+                 AND p.author != ? AND ${NOT_PUSHED}) AS unread,
+              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ? AND ${NOT_PUSHED}) AS latest_id
          FROM subscriptions s
         WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor`,
     )
-    .all(handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
+    .all(handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
     if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
       out.push({ kind: "digest", board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! });

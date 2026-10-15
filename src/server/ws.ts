@@ -1,11 +1,21 @@
 import type { ServerWebSocket } from "bun";
 import type { Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk } from "../shared/protocol.ts";
-import { formatTeamAddress, isValidIdentityName } from "../shared/addressing.ts";
+import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
+import { formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
 import { canSend, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { parseAddress } from "../shared/addressing.ts";
+import {
+  CoreError,
+  acknowledge,
+  pendingFor,
+  post,
+  refOf,
+  type CoreDb,
+  type PendingRef,
+} from "../core/boards.ts";
+import { callBoardTool, isBoardTool } from "../core/tools.ts";
+import { onIdentityCreated } from "./teams.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -15,37 +25,100 @@ export type WsData = {
   identityName: string;
   identityFull: string;
   ready: boolean;
+  // Board items sent and not yet acked on this connection. Cleared with the
+  // connection, so a reconnect resends them (at-least-once, like DMs).
+  inflight?: Set<string>;
+  // Set while a collision probe is waiting for this connection's pong.
+  onPong?: () => void;
 };
 
-// identity_id -> open WebSocket
-const registry = new Map<number, ServerWebSocket<WsData>>();
+type Ws = ServerWebSocket<WsData>;
 
-export function getRegistry(): Map<number, ServerWebSocket<WsData>> {
-  return registry;
-}
+export type WsOptions = {
+  // How long a live connection has to answer a collision probe.
+  probeMs?: number;
+};
 
-function send(ws: ServerWebSocket<WsData>, msg: ServerMessage): void {
+// Per server instance.
+type Hub = {
+  // identity_full -> open WebSocket
+  registry: Map<string, Ws>;
+  // identity_full values with a hello currently probing the existing holder
+  probing: Set<string>;
+  repo: Repo;
+  db: CoreDb;
+  probeMs: number;
+};
+
+function send(ws: Ws, msg: ServerMessage): void {
   ws.send(JSON.stringify(msg));
 }
 
-function err(ws: ServerWebSocket<WsData>, reqId: string | undefined, code: ServerMessage & { type: "error" } extends { code: infer C } ? C : never, message: string): void {
-  ws.send(JSON.stringify({ type: "error", req_id: reqId, code, message }));
+function err(ws: Ws, reqId: string | undefined, code: ErrorCode, message: string): void {
+  send(ws, { type: "error", req_id: reqId, code, message });
 }
 
-export function createWsHandlers(repo: Repo) {
-  return {
-    open(_ws: ServerWebSocket<WsData>) {
+function refKey(r: PendingRef): string {
+  // Digests are keyed by board: until one is acked, newer posts don't send another.
+  return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
+}
+
+// Send this connection everything pending on boards that it hasn't been sent.
+function drainBoards(ws: Ws, db: CoreDb): void {
+  const inflight = (ws.data.inflight ??= new Set());
+  for (const item of pendingFor(db, ws.data.identityFull)) {
+    const key = refKey(refOf(item));
+    if (inflight.has(key)) continue;
+    inflight.add(key);
+    send(ws, { type: "board_push", item });
+  }
+}
+
+function wake(hub: Hub, handles: string[]): void {
+  for (const h of handles) {
+    const ws = hub.registry.get(h);
+    if (ws?.data.ready) drainBoards(ws, hub.db);
+  }
+}
+
+// Does the connection answer a ping within ms? The plugin pongs every ping.
+function probe(ws: Ws, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      ws.data.onPong = undefined;
+      resolve(false);
+    }, ms);
+    ws.data.onPong = () => {
+      clearTimeout(timer);
+      ws.data.onPong = undefined;
+      resolve(true);
+    };
+    try {
+      send(ws, { type: "ping" });
+    } catch {
+      clearTimeout(timer);
+      ws.data.onPong = undefined;
+      resolve(false);
+    }
+  });
+}
+
+export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
+  const hub: Hub = { registry: new Map(), probing: new Set(), repo, db, probeMs: opts.probeMs ?? 2000 };
+
+  const handlers = {
+    open(_ws: Ws) {
       // wait for hello
     },
 
-    message(ws: ServerWebSocket<WsData>, rawData: string | Buffer) {
+    message(ws: Ws, rawData: string | Buffer) {
       const raw = typeof rawData === "string" ? rawData : rawData.toString("utf8");
 
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
       } catch {
-        ws.send(JSON.stringify({ type: "error", code: "bad_request", message: "invalid JSON" }));
+        err(ws, undefined, "bad_request", "invalid JSON");
         return;
       }
 
@@ -53,28 +126,35 @@ export function createWsHandlers(repo: Repo) {
       try {
         msg = parseClientMessage(parsed);
       } catch (e) {
-        ws.send(JSON.stringify({ type: "error", code: "bad_request", message: String(e) }));
+        err(ws, undefined, "bad_request", String(e));
         return;
       }
 
-      if (msg.type === "pong") return;
+      if (msg.type === "pong") {
+        ws.data.onPong?.();
+        return;
+      }
 
       if (!ws.data.ready) {
         if (msg.type !== "hello") {
-          ws.send(JSON.stringify({ type: "error", code: "bad_request", message: "send hello first" }));
+          err(ws, undefined, "bad_request", "send hello first");
           ws.close();
           return;
         }
-        handleHello(ws, msg.req_id, msg.identity, repo);
+        handleHello(hub, ws, msg.req_id, msg.identity).catch((e) => {
+          console.error("[grayboard] hello failed:", e);
+          err(ws, msg.req_id, "internal", "hello failed");
+          ws.close();
+        });
         return;
       }
 
       switch (msg.type) {
         case "hello":
-          ws.send(JSON.stringify({ type: "error", req_id: msg.req_id, code: "bad_request", message: "already authenticated" }));
+          err(ws, msg.req_id, "bad_request", "already authenticated");
           break;
         case "send":
-          handleSend(ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, repo);
+          handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null);
           break;
         case "history":
           handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -85,100 +165,120 @@ export function createWsHandlers(repo: Repo) {
         case "ack":
           handleAck(ws, msg.req_id, msg.message_ids, repo);
           break;
+        case "call":
+          handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
+          break;
+        case "board_ack":
+          for (const r of msg.refs) {
+            acknowledge(db, ws.data.identityFull, r);
+            ws.data.inflight?.delete(refKey(r));
+          }
+          send(ws, { type: "ack_ok", req_id: msg.req_id });
+          break;
       }
     },
 
-    close(ws: ServerWebSocket<WsData>) {
-      const id = ws.data.identityId;
-      if (id !== undefined && registry.get(id) === ws) {
-        registry.delete(id);
-      }
+    close(ws: Ws) {
+      const full = ws.data.identityFull;
+      if (full && hub.registry.get(full) === ws) hub.registry.delete(full);
+      ws.data.onPong = undefined;
     },
   };
+
+  // Heartbeat: keeps idle connections open through proxies.
+  const startPing = () =>
+    setInterval(() => {
+      for (const ws of hub.registry.values()) {
+        if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
+      }
+    }, 30_000);
+
+  return { handlers, startPing };
 }
 
-function handleHello(
-  ws: ServerWebSocket<WsData>,
-  reqId: string,
-  identityInput: string,
-  repo: Repo,
-): void {
+async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string): Promise<void> {
+  const { repo, db, registry } = hub;
   const name = identityInput.toLowerCase();
   if (!isValidIdentityName(name)) {
-    ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "bad_request", message: "invalid identity name" }));
+    err(ws, reqId, "bad_request", "invalid identity name");
     ws.close();
     return;
   }
 
   const { authed } = ws.data;
+  const full = `${authed.user_email}/${name}`;
+
+  // One live connection per identity. If the current holder still answers,
+  // refuse the newcomer: taking over would let a stray second session (e.g.
+  // a worktree that inherited .mcp.json) silently steal this identity's
+  // deliveries. A holder that doesn't answer is dead; replace it.
+  const existing = registry.get(full);
+  if (existing && existing !== ws) {
+    const refuse = () => {
+      err(ws, reqId, "identity_in_use",
+        `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
+      ws.close();
+    };
+    if (hub.probing.has(full)) return refuse();
+    hub.probing.add(full);
+    let alive: boolean;
+    try {
+      alive = await probe(existing, hub.probeMs);
+    } finally {
+      hub.probing.delete(full);
+    }
+    if (alive) return refuse();
+    if (ws.readyState !== 1 /* OPEN */) return;
+    if (registry.get(full) === existing) {
+      err(existing, undefined, "superseded", "a newer session connected with this identity");
+      existing.close();
+      registry.delete(full);
+    }
+  }
 
   let identity = repo.identities.findByUserAndName(authed.user_id, name);
   if (!identity) {
     identity = repo.identities.create(authed.user_id, name);
     writeAudit(repo, "identity.created", authed.user_email, name, { lazy: true });
+    onIdentityCreated(db, repo, authed.user_id, full);
   }
 
-  // Supersede any existing connection for this identity
-  const existing = registry.get(identity.id);
-  if (existing && existing !== ws) {
-    existing.send(JSON.stringify({ type: "error", code: "superseded", message: "a newer session connected with this identity" }));
-    existing.close();
-    registry.delete(identity.id);
-  }
-
-  registry.set(identity.id, ws);
+  registry.set(full, ws);
   ws.data.identityId   = identity.id;
   ws.data.identityName = name;
-  ws.data.identityFull = `${authed.user_email}/${name}`;
+  ws.data.identityFull = full;
   ws.data.ready        = true;
 
   const teams = repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name));
 
-  // Initialize missing team cursors (new member — no history replay)
-  for (const teamRef of teams) {
-    repo.cursors.initTeamCursorToCurrentMax(identity.id, teamRef);
-  }
-
   const helloOk: HelloOk = {
     type: "hello_ok",
     req_id: reqId,
-    identity_full: ws.data.identityFull,
+    identity_full: full,
     user_email: authed.user_email,
     teams,
   };
-  ws.send(JSON.stringify(helloOk));
+  send(ws, helloOk);
 
-  drainForIdentity(ws, identity.id, ws.data.identityFull, teams, repo);
-}
-
-function drainForIdentity(
-  ws: ServerWebSocket<WsData>,
-  identityId: number,
-  identityFull: string,
-  teams: string[],
-  repo: Repo,
-): void {
-  const streams: { type: "direct" | "team"; ref: string; since: number }[] = [
-    { type: "direct", ref: identityFull, since: repo.cursors.get(identityId, "direct", identityFull) },
-    ...teams.map(ref => ({ type: "team" as const, ref, since: repo.cursors.get(identityId, "team", ref) })),
-  ];
-
-  const messages = repo.messages.unreadSince(streams);
-  for (const msg of messages) {
-    ws.send(JSON.stringify({ type: "push", message: msg }));
+  // Direct messages since the cursor (unacked ones are resent), then boards.
+  const since = repo.cursors.get(identity.id, "direct", full);
+  for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
+    send(ws, { type: "push", message });
   }
+  drainBoards(ws, db);
 }
 
 function handleSend(
-  ws: ServerWebSocket<WsData>,
+  hub: Hub,
+  ws: Ws,
   reqId: string,
   recipientStr: string,
   body: string,
   parentId: number | null,
-  repo: Repo,
 ): void {
+  const { repo, db, registry } = hub;
   if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
-    ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "bad_request", message: "body exceeds 64 KiB limit" }));
+    err(ws, reqId, "bad_request", "body exceeds 64 KiB limit");
     return;
   }
 
@@ -186,7 +286,7 @@ function handleSend(
   try {
     parsed = parseAddress(recipientStr);
   } catch (e) {
-    ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "bad_request", message: String(e) }));
+    err(ws, reqId, "bad_request", String(e));
     return;
   }
 
@@ -200,69 +300,84 @@ function handleSend(
   };
 
   if (parsed.kind === "team") {
+    // Teams are boards: a team send is a post on #<team> (members only).
     const team = repo.teams.findByName(parsed.name);
     if (!team) {
-      ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "not_found", message: `team "${parsed.name}" not found` }));
+      err(ws, reqId, "not_found", `team "${parsed.name}" not found`);
       return;
     }
     const decision = canSend(principal, { kind: "team", team_id: team.id, name: team.name }, { db: repo, now: Date.now() });
     if (!decision.allow) {
-      ws.send(JSON.stringify({ type: "error", req_id: reqId, code: decision.code, message: decision.reason }));
+      err(ws, reqId, decision.code, decision.reason);
       return;
     }
-
-    const msg = repo.messages.insert(ws.data.identityFull, "team", parsed.full, body, parentId);
-    const delivered = fanOutToTeam(team.id, msg, repo);
-    ws.send(JSON.stringify({ type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: delivered > 0 }));
-  } else {
-    // Direct
-    const recipientUser = repo.users.findByEmail(parsed.email);
-    if (!recipientUser) {
-      ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "not_found", message: `user "${parsed.email}" not found` }));
-      return;
+    let result;
+    try {
+      result = post(db, ws.data.identityFull, team.name, body, parentId);
+    } catch (e) {
+      if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+      throw e;
     }
-    const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
-    if (!recipientIdentity) {
-      ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "not_found", message: `identity "${parsed.full}" not found` }));
-      return;
-    }
-    const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now() });
-    if (!decision.allow) {
-      ws.send(JSON.stringify({ type: "error", req_id: reqId, code: decision.code, message: decision.reason }));
-      return;
-    }
-
-    const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId);
-
-    let deliveredNow = false;
-    const recipientWs = registry.get(recipientIdentity.id);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({ type: "push", message: msg }));
-      deliveredNow = true;
-    }
-
-    ws.send(JSON.stringify({ type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: deliveredNow }));
+    wake(hub, result.wake);
+    send(ws, {
+      type: "send_ok",
+      req_id: reqId,
+      post_id: result.post.id,
+      board: result.post.board,
+      delivered_now: result.wake.some(h => registry.has(h)),
+      ...(result.unresolved.length ? { unresolved: result.unresolved } : {}),
+    });
+    return;
   }
+
+  const recipientUser = repo.users.findByEmail(parsed.email);
+  if (!recipientUser) {
+    err(ws, reqId, "not_found", `user "${parsed.email}" not found`);
+    return;
+  }
+  const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
+  if (!recipientIdentity) {
+    err(ws, reqId, "not_found", `identity "${parsed.full}" not found`);
+    return;
+  }
+  const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now() });
+  if (!decision.allow) {
+    err(ws, reqId, decision.code, decision.reason);
+    return;
+  }
+
+  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId);
+
+  let deliveredNow = false;
+  const recipientWs = registry.get(parsed.full);
+  if (recipientWs?.data.ready) {
+    send(recipientWs, { type: "push", message: msg });
+    deliveredNow = true;
+  }
+
+  send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: deliveredNow });
 }
 
-function fanOutToTeam(teamId: number, msg: import("../shared/protocol.ts").Message | import("./db.ts").MessageRow, repo: Repo): number {
-  const memberUserIds = repo.teams.listMemberUserIds(teamId);
-  let delivered = 0;
-  for (const userId of memberUserIds) {
-    const identities = repo.identities.listForUser(userId);
-    for (const identity of identities) {
-      const recipientWs = registry.get(identity.id);
-      if (recipientWs) {
-        recipientWs.send(JSON.stringify({ type: "push", message: msg }));
-        delivered++;
-      }
-    }
+function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {
+  const { db } = hub;
+  if (!isBoardTool(tool)) {
+    err(ws, reqId, "bad_request", `unknown tool: ${tool}`);
+    return;
   }
-  return delivered;
+  let outcome;
+  try {
+    outcome = callBoardTool(db, ws.data.identityFull, tool, args);
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    console.error(`[grayboard] ${tool} failed:`, e);
+    return err(ws, reqId, "internal", `${tool} failed`);
+  }
+  send(ws, { type: "call_ok", req_id: reqId, result: outcome.result });
+  wake(hub, outcome.wake);
 }
 
 function handleHistory(
-  ws: ServerWebSocket<WsData>,
+  ws: Ws,
   reqId: string,
   peer: string | undefined,
   limit: number | undefined,
@@ -272,52 +387,28 @@ function handleHistory(
   try {
     if (peer) parseAddress(peer); // validate
   } catch (e) {
-    ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "bad_request", message: String(e) }));
+    err(ws, reqId, "bad_request", String(e));
     return;
   }
   const messages = repo.messages.history(ws.data.identityFull, peer, limit, beforeId);
-  ws.send(JSON.stringify({ type: "history_ok", req_id: reqId, messages }));
+  send(ws, { type: "history_ok", req_id: reqId, messages });
 }
 
-function handleThread(
-  ws: ServerWebSocket<WsData>,
-  reqId: string,
-  rootId: number,
-  repo: Repo,
-): void {
+function handleThread(ws: Ws, reqId: string, rootId: number, repo: Repo): void {
   const messages = repo.messages.thread(rootId);
   if (messages.length === 0) {
-    ws.send(JSON.stringify({ type: "error", req_id: reqId, code: "not_found", message: `message ${rootId} not found` }));
+    err(ws, reqId, "not_found", `message ${rootId} not found`);
     return;
   }
-  ws.send(JSON.stringify({ type: "thread_ok", req_id: reqId, messages }));
+  send(ws, { type: "thread_ok", req_id: reqId, messages });
 }
 
-function handleAck(
-  ws: ServerWebSocket<WsData>,
-  reqId: string,
-  messageIds: number[],
-  repo: Repo,
-): void {
+function handleAck(ws: Ws, reqId: string, messageIds: number[], repo: Repo): void {
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(msgId);
-    if (!msg) continue;
-    const identityId = ws.data.identityId;
-    if (msg.recipient_type === "user") {
-      repo.cursors.advance(identityId, "direct", ws.data.identityFull, msgId);
-    } else {
-      repo.cursors.advance(identityId, "team", msg.recipient, msgId);
-    }
+    // Only your own direct messages move your cursor.
+    if (!msg || msg.recipient_type !== "user" || msg.recipient !== ws.data.identityFull) continue;
+    repo.cursors.advance(ws.data.identityId, "direct", ws.data.identityFull, msgId);
   }
-  ws.send(JSON.stringify({ type: "ack_ok", req_id: reqId }));
-}
-
-export function startPingInterval(): void {
-  setInterval(() => {
-    for (const ws of registry.values()) {
-      if (ws.readyState === 1 /* OPEN */) {
-        ws.send(JSON.stringify({ type: "ping" }));
-      }
-    }
-  }, 30_000);
+  send(ws, { type: "ack_ok", req_id: reqId });
 }

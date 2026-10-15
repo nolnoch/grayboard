@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { setAccess } from "../core/boards.ts";
+import { initCoreSchema } from "../core/schema.ts";
+import { serverAccess } from "./access.ts";
+
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
@@ -28,6 +32,7 @@ export interface Repo {
     create(userId: number, name: string): Identity;
     listForUser(userId: number): Identity[];
     findByUserAndName(userId: number, name: string): Identity | undefined;
+    findAllByName(name: string): { email: string; name: string }[];
     remove(userId: number, name: string): void;
   };
   teams: {
@@ -38,6 +43,7 @@ export interface Repo {
     removeMember(teamId: number, userId: number): void;
     listMembers(teamId: number): { user_id: number; email: string }[];
     listMemberUserIds(teamId: number): number[];
+    isMember(teamId: number, userId: number): boolean;
   };
   messages: {
     insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null): MessageRow;
@@ -50,7 +56,6 @@ export interface Repo {
   cursors: {
     get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
     advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
-    initTeamCursorToCurrentMax(identityId: number, teamRef: string): void;
   };
   audit: {
     write(row: AccessLogRow): void;
@@ -65,7 +70,10 @@ export function openDatabase(path: string): { db: Database; repo: Repo } {
     "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA auto_vacuum = INCREMENTAL;",
   );
   initSchema(db);
-  return { db, repo: makeRepo(db) };
+  initCoreSchema(db);
+  const repo = makeRepo(db);
+  setAccess(db, serverAccess(repo));
+  return { db, repo };
 }
 
 function initSchema(db: Database): void {
@@ -215,6 +223,11 @@ function makeRepo(db: Database): Repo {
           ).get(userId, name) ?? undefined
         );
       },
+      findAllByName(name) {
+        return db.query<{ email: string; name: string }, [string]>(
+          "SELECT u.email, i.name FROM identities i JOIN users u ON u.id = i.user_id WHERE i.name = ?",
+        ).all(name);
+      },
       remove(userId, name) {
         db.run("DELETE FROM identities WHERE user_id = ? AND name = ?", [userId, name]);
       },
@@ -252,6 +265,11 @@ function makeRepo(db: Database): Repo {
         return db.query<{ user_id: number }, [number]>(
           "SELECT user_id FROM team_members WHERE team_id = ?",
         ).all(teamId).map(r => r.user_id);
+      },
+      isMember(teamId, userId) {
+        return !!db.query<{ x: number }, [number, number]>(
+          "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
+        ).get(teamId, userId);
       },
     },
 
@@ -322,7 +340,14 @@ function makeRepo(db: Database): Repo {
         return all;
       },
       prune(olderThanMs) {
-        db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
+        // Replies outlive pruned parents as roots; parent_id is a foreign key.
+        db.transaction(() => {
+          db.run(
+            "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)",
+            [olderThanMs],
+          );
+          db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
+        })();
       },
     },
 
@@ -339,16 +364,6 @@ function makeRepo(db: Database): Repo {
            ON CONFLICT(identity_id, stream_type, stream_ref)
            DO UPDATE SET last_seen_id = MAX(excluded.last_seen_id, cursors.last_seen_id)`,
           [identityId, streamType, streamRef, messageId],
-        );
-      },
-      initTeamCursorToCurrentMax(identityId, teamRef) {
-        const row = db.query<{ max_id: number | null }, [string]>(
-          "SELECT MAX(id) as max_id FROM messages WHERE recipient_type = 'team' AND recipient = ?",
-        ).get(teamRef);
-        const maxId = row?.max_id ?? 0;
-        db.run(
-          `INSERT OR IGNORE INTO cursors (identity_id, stream_type, stream_ref, last_seen_id) VALUES (?, 'team', ?, ?)`,
-          [identityId, teamRef, maxId],
         );
       },
     },

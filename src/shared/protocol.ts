@@ -1,3 +1,5 @@
+import type { Pending, PendingRef } from "../core/boards.ts";
+
 export type Message = {
   id: number;
   sender: string;
@@ -15,24 +17,39 @@ export type HistoryRequest = { type: "history"; req_id: string; peer?: string; l
 export type ThreadRequest  = { type: "thread";  req_id: string; root_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
 export type PongMessage    = { type: "pong" };
+// Board and claim tools (src/core/tools.ts), run server-side as this identity.
+export type CallRequest    = { type: "call";      req_id: string; tool: string; args: Record<string, unknown> };
+export type BoardAckRequest = { type: "board_ack"; req_id: string; refs: PendingRef[] };
 
-export type ClientMessage = HelloRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage;
+export type ClientMessage =
+  | HelloRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
+  | CallRequest | BoardAckRequest;
 
 // Server -> Client
 export type HelloOk     = { type: "hello_ok";   req_id: string; identity_full: string; user_email: string; teams: string[] };
-export type SendOk      = { type: "send_ok";    req_id: string; message_id: number; delivered_now: boolean };
+// A team:<name> send is a post on that team's board: post_id and board instead of message_id.
+export type SendOk      = {
+  type: "send_ok"; req_id: string; delivered_now: boolean;
+  message_id?: number; post_id?: number; board?: string; unresolved?: string[];
+};
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: Message[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
 export type AckOk       = { type: "ack_ok";     req_id: string };
 export type PushMessage = { type: "push"; message: Message };
 export type PingMessage = { type: "ping" };
+export type CallOk      = { type: "call_ok";    req_id: string; result: unknown };
+export type BoardPush   = { type: "board_push"; item: Pending };
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string };
 
-export type ServerMessage = HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage;
+export type ServerMessage =
+  | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
+  | CallOk | BoardPush;
 
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
-  | "rate_limited" | "internal" | "superseded";
+  | "rate_limited" | "internal" | "superseded"
+  // hello refused: another live connection holds this identity
+  | "identity_in_use";
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
@@ -64,9 +81,26 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       return m as unknown as AckRequest;
     case "pong":
       return { type: "pong" };
+    case "call":
+      assertStr(m, "req_id"); assertStr(m, "tool");
+      if (m.args !== undefined && (typeof m.args !== "object" || m.args === null || Array.isArray(m.args)))
+        throw new Error("args must be an object");
+      return { type: "call", req_id: m.req_id as string, tool: m.tool as string, args: (m.args ?? {}) as Record<string, unknown> };
+    case "board_ack":
+      assertStr(m, "req_id");
+      if (!Array.isArray(m.refs) || !m.refs.every(isPendingRef)) throw new Error("refs must be PendingRef[]");
+      return m as unknown as BoardAckRequest;
     default:
       throw new Error(`unknown message type: ${String(m.type)}`);
   }
+}
+
+function isPendingRef(r: unknown): r is PendingRef {
+  if (typeof r !== "object" || r === null) return false;
+  const x = r as Record<string, unknown>;
+  if (x.kind === "push") return typeof x.post_id === "number";
+  if (x.kind === "digest") return typeof x.board === "string" && typeof x.latest_id === "number";
+  return false;
 }
 
 function assertStr(m: Record<string, unknown>, key: string) {

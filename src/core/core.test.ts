@@ -85,6 +85,16 @@ test("posting does not mark others' unread posts as read", () => {
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
 
+test("a mention doesn't also count toward the mentioned subscriber's digest", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  post(db, "be", "e2e", "@sim look at this");
+  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention" }]);
+  expect(listBoards(db, "sim")[0]!.unread).toBe(0);
+  post(db, "be", "e2e", "unrelated");
+  expect(drain("sim")).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
+  expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
+});
+
 test("quiet subscribers are never pushed but see unread counts", () => {
   subscribe(db, "sim", "e2e", "quiet");
   const { wake } = post(db, "be", "e2e", "hi");
@@ -246,6 +256,7 @@ describe("with a scoped access policy", () => {
 test("acknowledge by ref matches markDelivered", () => {
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "@sim hello");
+  post(db, "be", "e2e", "and something else");
   const items = pendingFor(db, "sim");
   expect(items.map((i) => i.kind).sort()).toEqual(["digest", "push"]);
   for (const i of items) acknowledge(db, "sim", JSON.parse(JSON.stringify(refOf(i))));

@@ -7,8 +7,8 @@ import {
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { getBoard, type CoreDb } from "../core/boards.ts";
+import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -117,7 +117,7 @@ function identityList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.identities.listForUser(authed.user_id).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
-async function identityCreate(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -126,6 +126,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo): Pro
   if (existing) return conflict(`identity "${name}" already exists`);
   const identity = repo.identities.create(authed.user_id, name);
   writeAudit(repo, "identity.created", authed.user_email, name);
+  onIdentityCreated(db, repo, authed.user_id, `${authed.user_email}/${name}`);
   return json({ name: identity.name, created_at: identity.created_at }, 201);
 }
 
@@ -144,36 +145,38 @@ function teamList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.teams.listForUser(authed.user_id).map(t => ({ name: t.name, created_at: t.created_at })));
 }
 
-async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid team name");
   if (repo.teams.findByName(name)) return conflict(`team "${name}" already exists`);
+  // The team's board shares its name, so the name must be free as a board too.
+  if (getBoard(db, name)) return conflict(`a board named "#${name}" already exists`);
   const team = repo.teams.create(name, authed.user_id);
   repo.teams.addMember(team.id, authed.user_id);
+  ensureTeamBoard(db, team, authed.user_email);
+  onTeamJoined(db, repo, team, authed.user_id, authed.user_email);
   writeAudit(repo, "team.created", authed.user_email, name);
   writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email });
   return json({ name: team.name, created_at: team.created_at }, 201);
 }
 
-function teamJoin(teamName: string, authed: AuthedUser, repo: Repo): Response {
+function teamJoin(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const team = repo.teams.findByName(teamName.toLowerCase());
   if (!team) return notFound();
   repo.teams.addMember(team.id, authed.user_id);
-  // Initialize team cursors for all existing identities of this user
-  const identities = repo.identities.listForUser(authed.user_id);
-  for (const ident of identities) {
-    repo.cursors.initTeamCursorToCurrentMax(ident.id, `team:${team.name}`);
-  }
+  // Every identity follows #<team> in digest mode, starting at the tip.
+  onTeamJoined(db, repo, team, authed.user_id, authed.user_email);
   writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: authed.user_email });
   return json({ ok: true });
 }
 
-function teamLeave(teamName: string, authed: AuthedUser, repo: Repo): Response {
+function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const team = repo.teams.findByName(teamName.toLowerCase());
   if (!team) return notFound();
   repo.teams.removeMember(team.id, authed.user_id);
+  onTeamLeft(db, repo, team, authed.user_id, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
   return json({ ok: true });
 }
@@ -223,7 +226,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo): Pr
 
 // ── main router ──────────────────────────────────────────────────────────────
 
-export async function handleHttp(req: Request, repo: Repo, config: Config): Promise<Response> {
+export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
   const method = req.method;
@@ -243,19 +246,19 @@ export async function handleHttp(req: Request, repo: Repo, config: Config): Prom
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
-  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo);
+  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
     return identityDelete(path.slice("/api/identities/".length), authed, repo);
   }
 
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);
-  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo);
+  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo, db);
 
   const teamOp = path.match(/^\/api\/teams\/([^/]+)\/([^/]+)$/);
   if (teamOp) {
     const [, teamName, action] = teamOp;
-    if (action === "join"    && method === "POST") return teamJoin(teamName, authed, repo);
-    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo);
+    if (action === "join"    && method === "POST") return teamJoin(teamName, authed, repo, db);
+    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo);
   }
 
