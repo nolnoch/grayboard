@@ -31,6 +31,22 @@ function openDb(): Database {
     );
   `);
   initCoreSchema(db);
+  // The handles roster arrived after the bus did. Backfill identities that have
+  // run a session (sent, read, posted, or subscribed) so peer_list shows them
+  // and dm_send accepts them. Recipients alone don't count: that would
+  // legitimize old typos.
+  db.exec(`
+    INSERT OR IGNORE INTO handles (name, first_seen, last_seen)
+    SELECT h, MIN(t), MAX(t) FROM (
+      SELECT sender AS h, created_at AS t FROM messages
+      UNION ALL
+      SELECT c.reader, COALESCE(m.created_at, 0) FROM cursors c LEFT JOIN messages m ON m.id = c.last_seen_id
+      UNION ALL
+      SELECT author, created_at FROM posts
+      UNION ALL
+      SELECT handle, 0 FROM subscriptions
+    ) GROUP BY h;
+  `);
   return db;
 }
 

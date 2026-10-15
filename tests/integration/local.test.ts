@@ -121,3 +121,19 @@ test("dm_send to a handle that never connected is an error, not a silent queue",
   await start("fe");
   expect((await call(be, "dm_send", { recipient: "fe", body: "hi" })).delivered_now).toBe(true);
 }, 20_000);
+
+test("identities from before the handles roster are backfilled", async () => {
+  const { Database } = await import("bun:sqlite");
+  const old = new Database(join(dir, "bus.db"));
+  old.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+              body TEXT NOT NULL, parent_id INTEGER, created_at INTEGER NOT NULL);
+            CREATE TABLE cursors (reader TEXT PRIMARY KEY, last_seen_id INTEGER NOT NULL);
+            INSERT INTO messages (sender, recipient, body, created_at) VALUES ('fe', 'be', 'hi', 1), ('be', 'typo', 'x', 2);
+            INSERT INTO cursors VALUES ('docs', 1);`);
+  old.close();
+  const be = await start("be");
+  const all = await call(be, "peer_list", { include_offline: true });
+  expect(all.peers.map((p: any) => p.handle)).toEqual(["be", "docs", "fe"]);
+  expect((await call(be, "dm_send", { recipient: "fe", body: "still there?" })).delivered_now).toBe(false);
+  await expect(call(be, "dm_send", { recipient: "typo", body: "x" })).rejects.toThrow(/peer_list/);
+}, 20_000);
