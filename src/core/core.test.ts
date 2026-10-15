@@ -23,7 +23,7 @@ import {
   type Access,
 } from "./boards.ts";
 import { callBoardTool } from "./tools.ts";
-import { claim, listClaims, release } from "./claims.ts";
+import { claim, claimExpiryTimer, listClaims, release, sweepExpired } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -166,6 +166,36 @@ test("only the holder can release; claims announce on a board", () => {
     "[claim] lane:fixtures",
     "[release] lane:fixtures",
   ]);
+});
+
+test("a lapsed claim is announced on its board once, by the first sweep or takeover", () => {
+  subscribe(db, "sim", "e2e", "push");
+  claim(db, "be", "dev:freeze", { board: "e2e" });
+  claim(db, "be", "quiet:one");
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  expect(sweepExpired(db).wake).toEqual(["sim"]);
+  expect(sweepExpired(db).wake).toEqual([]);
+  expect(listClaims(db)).toEqual([]);
+  const bodies = () => read(db, "sim", "e2e", { before_id: 999 }).posts.map((p) => p.body);
+  expect(bodies().at(-1)).toBe("[expired] dev:freeze: not released by be; check with them before relying on it");
+
+  claim(db, "be", "dev:freeze", { board: "e2e" });
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  const taken = claim(db, "fe", "dev:freeze");
+  expect(taken.ok && taken.wake).toContain("sim");
+  expect(bodies().slice(-1)).toEqual(["[expired] dev:freeze: not released by be; check with them before relying on it"]);
+});
+
+test("the expiry timer fires at the next lapse without anyone asking", async () => {
+  subscribe(db, "sim", "e2e", "push");
+  const woken: string[][] = [];
+  const timer = claimExpiryTimer(db, (h) => woken.push(h));
+  claim(db, "be", "soon", { board: "e2e", ttl_minutes: 0.001 });
+  timer.arm();
+  await Bun.sleep(150);
+  timer.stop();
+  expect(woken).toEqual([["sim"]]);
+  expect(listClaims(db)).toEqual([]);
 });
 
 test("claim prefix filter escapes LIKE wildcards", () => {

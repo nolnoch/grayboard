@@ -132,7 +132,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
             description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.',
           },
           note: { type: "string", description: "Optional. What you're doing with it." },
-          board: { type: "string", description: "Optional. Board to announce the claim and its release on." },
+          board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on." },
         },
         required: ["key"],
       },

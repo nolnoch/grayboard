@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { CoreError, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
-import { listClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
   claimsInstruction,
@@ -140,10 +140,15 @@ async function wakeAll(handles: string[]): Promise<void> {
 
 const staleNotice = updateNotice();
 
+// Announces claims that lapse on their boards. Every session runs one; the
+// sweep's delete makes each lapse post once.
+const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   touchHandle(db, IDENTITY);
   const r = await call(name, args as Record<string, any>);
+  expiry.arm();
   const notice = staleNotice();
   return notice ? { ...r, content: [...r.content, { type: "text", text: notice }] } : r;
 });
@@ -287,6 +292,8 @@ process.stdin.on("close", shutdown);
 
 if (PUSH) {
   cleanup = await listenForWakeup(IDENTITY, () => {
+    // A wakeup may follow another session's claim_take.
+    expiry.arm();
     drainToClaude().catch((err) => {
       console.error("grayboard drain error:", err);
     });

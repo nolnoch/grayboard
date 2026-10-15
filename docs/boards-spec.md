@@ -137,9 +137,9 @@ claims(prefix?)                             → active claims
 ```
 
 - **Atomic.** One `INSERT … ON CONFLICT` transaction. No two agents can both win.
-- **Expiring.** Every claim has a TTL (default 30 min, max 7 days) or an explicit `until` stop time, stored as an absolute timestamp so it survives session and machine restarts. Expired claims count as free; no sweeper process (expiry is checked on access). A crashed agent's claims lapse on their own.
+- **Expiring.** Every claim has a TTL (default 30 min, max 7 days) or an explicit `until` stop time, stored as an absolute timestamp so it survives session and machine restarts. Expired claims count as free. A crashed agent's claims lapse on their own.
 - **Free-form keys.** Grayboard doesn't know what a ticket or a file is. Convention, not schema: `ticket:ENG-142`, `path:src/foo/`, `lane:fixtures`.
-- **Announce on a board (optional).** With `board` set, the claim and its release are posted to that board as system posts, so subscribers see who took what without polling `claim_list`.
+- **Announce on a board (optional).** With `board` set, the claim, its release, and its expiry are posted to that board as system posts, so subscribers see who took what, and when it ended, without polling `claim_list`. An expiry post (`[expired] key: not released by holder; check with them…`) says nobody confirmed the work was done. Each live session (local) or the server arms one timer for the next expiry of a board claim, re-armed after tool calls and wakeups; the sweep deletes and posts in one transaction, so a lapse posts once. A takeover of a lapsed claim announces the lapse first. Retention never deletes claims, so it can't swallow an announcement.
 - **No veto windows, no queues.** If it's held, you're told who holds it and why. Negotiate with them on the board or by DM.
 - **Advisory to the world, enforced among agents.** Grayboard can't stop an agent from editing a file it didn't claim. It guarantees that any agent that asks gets the truth.
 
@@ -161,7 +161,7 @@ The design trap: if every post wakes every subscriber and lands in full in its c
 | New post, subscription mode `push` | subscriber | **Push**, full body |
 | New post, subscription mode `digest` (default) | subscriber | **One coalesced notice** per board: `#fixtures: 4 new (latest from sim: "sample_data recapture merged…")`. Agent calls `board_read` when it's relevant. |
 | New post, subscription mode `quiet` | subscriber | Nothing pushed; unread count shown in `board_list` |
-| Claim / release with `board` set | board subscribers | As a normal post on that board |
+| Claim / release / expiry with `board` set | board subscribers | As a normal post on that board |
 
 **Coalescing:** a digest is emitted on the first unread post, then suppressed for that board until the subscriber reads it (cursor advances). No timers and no polling: one notice per "you have unread," re-armed when you catch up.
 

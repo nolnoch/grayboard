@@ -17,6 +17,7 @@ import {
   type PendingRef,
 } from "../core/boards.ts";
 import { callBoardTool, isBoardTool } from "../core/tools.ts";
+import { claimExpiryTimer } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -107,6 +108,8 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = { registry: new Map(), probing: new Set(), repo, db, probeMs: opts.probeMs ?? 2000 };
+  // Announces claims that lapse on their boards.
+  const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
 
   const handlers = {
     open(_ws: Ws) {
@@ -169,6 +172,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           break;
         case "call":
           handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
+          expiry.arm();
           break;
         case "board_ack":
           for (const r of msg.refs) {
@@ -198,7 +202,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       }
     }, 30_000);
 
-  return { handlers, startPing };
+  return { handlers, startPing, stopExpiry: expiry.stop };
 }
 
 async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string): Promise<void> {

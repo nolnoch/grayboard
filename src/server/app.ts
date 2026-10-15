@@ -12,7 +12,7 @@ export type StartOptions = WsOptions & {
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const { db, repo } = openDatabase(config.dbPath);
-  const { handlers, startPing } = createWsHandlers(repo, db, opts);
+  const { handlers, startPing, stopExpiry } = createWsHandlers(repo, db, opts);
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -59,6 +59,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     db,
     stop() {
       for (const t of timers) clearInterval(t);
+      stopExpiry();
       server.stop(true);
     },
   };

@@ -59,6 +59,8 @@ export function claim(
   return db.transaction((): ClaimResult => {
     const now = Date.now();
     const expires = expiresAt(now, opts.ttl_minutes, opts.until);
+    // Announce a lapsed claim before anyone takes it over.
+    const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at };
@@ -81,7 +83,7 @@ export function claim(
     const wake = renewed
       ? []
       : announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`);
-    return { ok: true, claim: row, renewed, wake };
+    return { ok: true, claim: row, renewed, wake: [...new Set([...lapsed, ...wake])] };
   }).immediate();
 }
 
@@ -108,4 +110,68 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
   return rows.map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
+}
+
+// Delete lapsed claims and say so on their boards. The holder never confirmed
+// the work was done, so the post says to check with them. Runs inside the
+// caller's transaction: the delete makes each lapse announce once, however
+// many sessions sweep.
+function sweepIn(db: Database, now: number): string[] {
+  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
+  const wake = new Set<string>();
+  for (const c of gone) {
+    // As in release(): a holder who lost access to the board lapses quietly.
+    if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
+    const text = `[expired] ${c.key}: not released by ${c.holder}; check with them before relying on it`;
+    for (const h of announce(db, c.holder, c.board, text)) wake.add(h);
+  }
+  return [...wake];
+}
+
+export function sweepExpired(db: Database, now = Date.now()): { wake: string[] } {
+  return db.transaction(() => ({ wake: sweepIn(db, now) })).immediate();
+}
+
+// One timer, armed for the next expiry of a claim with a board, so a lapse is
+// announced when it happens. Call arm() after anything that may have added a
+// claim (a tool call, a wakeup); it only ever moves the timer earlier.
+export function claimExpiryTimer(
+  db: Database,
+  onWake: (handles: string[]) => void,
+): { arm(): void; stop(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let at = Infinity;
+  const set = (when: number) => {
+    clearTimeout(timer);
+    at = when;
+    timer = setTimeout(fire, Math.max(0, when - Date.now()));
+    timer.unref?.();
+  };
+  const fire = () => {
+    timer = undefined;
+    at = Infinity;
+    try {
+      const { wake } = sweepExpired(db);
+      if (wake.length) onWake(wake);
+    } catch (e) {
+      console.error("[grayboard] claim expiry sweep failed:", e);
+      return set(Date.now() + 5_000);
+    }
+    arm();
+  };
+  const arm = () => {
+    const row = db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as {
+      next: number | null;
+    };
+    if (row.next !== null && row.next < at) set(row.next);
+  };
+  arm();
+  return {
+    arm,
+    stop: () => {
+      clearTimeout(timer);
+      timer = undefined;
+      at = Infinity;
+    },
+  };
 }
