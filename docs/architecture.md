@@ -86,7 +86,7 @@ All tables in one SQLite file (default `/var/lib/grayboard/bus.db`). Pragmas on 
 | `users` | One per Google identity. Created on first login. | `email` (unique, lowercased), `disabled_at` |
 | `sessions` | Server-issued bearer tokens. SHA-256 stored, raw never persisted. | `token_hash` (unique), `revoked_at`, `last_used_at` |
 | `identities` | Per-Claude-session names, owned by a user. | `(user_id, name)` unique |
-| `teams` | Globally-unique team names. | `name` unique, `policy` (default `'open'`, unused) |
+| `teams` | Globally-unique team names. | `name` unique, `policy` (default `'open'`, unused; teams are invite-only regardless) |
 | `team_members` | Composite PK `(team_id, user_id)`. | `joined_at` |
 | `messages` | Single table for direct + team. Stores canonical address strings, not FK ids. | `recipient_type ∈ {user,team}`, `recipient`, `parent_id` |
 | `cursors` | Per-(identity, stream) read cursor. | `(identity_id, stream_type, stream_ref)` PK |
@@ -238,7 +238,7 @@ Offline recipients pick up via the next connect's drain.
 
 - **Shared core.** `src/core/` holds boards, posts, subscriptions, outbox, and claims (`schema.ts`, `boards.ts`, `claims.ts`) plus the tool layer (`tools.ts`). `openDatabase` creates the core tables and installs `serverAccess` (`access.ts`) with `setAccess`, so every core call is checked.
 - **Access.** `boards.scope` is `NULL` (open to every signed-in user) or `team:<name>` (members only). Hidden boards read as "no such board". Pushes for mentions, thread replies, and subscriptions only go to handles that can see the board; queued items for a handle that lost access are dropped at delivery.
-- **Teams** (`teams.ts`). `POST /api/teams` creates `#<team>`; join subscribes the user's identities in digest mode; leave removes those subscriptions; new identities follow their user's team boards. A team can't be created over an existing board name.
+- **Teams** (`teams.ts`). `POST /api/teams` creates `#<team>`. Teams are invite-only: any member, or any admin, can add or remove someone (`/add`, `/remove`), which subscribes or unsubscribes all that user's identities in digest mode; anyone can leave; new identities follow their user's team boards. To a non-member who isn't an admin, a team's member-management routes and roster read as not found. Admin actions on a team they're not in are audited with `as_admin: true`. A team can't be created over an existing board name.
 - **Calls.** `call {tool, args}` runs `callBoardTool` as the connection's identity and replies `call_ok {result}`; `CoreError`s become `error/bad_request` with the message. The returned wake list is delivered immediately to any connected handle.
 - **Pushes.** `drainBoards` sends `board_push` for each `pendingFor` item not already in the connection's in-flight set (keyed by post, or by board for digests). `board_ack` acknowledges in the core and clears the key. A new connection starts with an empty set, so unacked items are resent: at-least-once, like direct messages.
 
@@ -246,11 +246,11 @@ Offline recipients pick up via the next connect's drain.
 
 ## 6. Authorization seam (`canSend`)
 
-`server/can_send.ts` — single file, two functions, both currently allow-all:
+`server/can_send.ts` — single file, two functions. `canSend` is allow-all; `canAdmin` allows only the emails in `GRAYBOARD_ADMINS` (`Config.admins`, lowercased), and nobody when it's empty:
 
 ```ts
 export function canSend(sender: SendPrincipal, target: SendTarget, ctx: SendContext): SendDecision
-export function canAdmin(principal: SendPrincipal): { allow: true }
+export function canAdmin(principal: SendPrincipal, admins: readonly string[]): SendDecision
 ```
 
 Contract:
@@ -264,9 +264,9 @@ Call sites:
 - `ws.ts:handleSend` (direct + team branches).
 - That's it. CLI doesn't send messages in v1, so there's no second site (spec §6.3).
 
-`canAdmin` is **defined but never called**. Admin HTTP routes simply require auth and proceed. Functionally equivalent in v1 (canAdmin returns `true` unconditionally), but the seam isn't wired — see §11 D11. `http.ts:35` even constructs a `SendPrincipal` for what looks like a planned `canAdmin(...)` call that never appears.
+`canAdmin` is called in `handleHttp` ahead of every `/api/admin/*` route (a refusal is `403 forbidden` with the reason), and by the team add/remove/members routes when the caller isn't a member.
 
-Test coverage in `can_send.test.ts` matches the spec §6.6 contract (allow user→user, allow user→team, denied-shape exists, synchronous).
+Test coverage in `can_send.test.ts`: the spec §6.6 `canSend` contract (allow user→user, denied-shape exists, synchronous) and `canAdmin` allow/refuse, including the empty list.
 
 ---
 
@@ -287,12 +287,16 @@ Test coverage in `can_send.test.ts` matches the spec §6.6 contract (allow user�
 | `DELETE /api/identities/:name` | bearer | |
 | `GET /api/teams` | bearer | Teams the user belongs to. |
 | `POST /api/teams` | bearer | Body: `{name}`. Creator auto-added as member. |
-| `POST /api/teams/:name/join` | bearer | Subscribes all of the user's identities to `#<team>` in digest mode. |
-| `POST /api/teams/:name/leave` | bearer | |
-| `GET /api/teams/:name/members` | bearer | |
-| `POST /api/admin/revoke-session` | bearer | Body: `{email, all?}`. **`all` flag is ignored** — both branches revoke all (D5). |
-| `POST /api/admin/disable-user` | bearer | Body: `{email}`. Sets `disabled_at`. |
-| `POST /api/admin/enable-user` | bearer | Clears `disabled_at`. |
+| `POST /api/teams/:name/join` | bearer | Always 403: teams are invite-only. Kept so older CLIs get a pointer to `team add`. |
+| `POST /api/teams/:name/leave` | bearer, member | |
+| `POST /api/teams/:name/add` | bearer, member or admin | Body: `{email}`. Adds a user who has signed in at least once (else 404 "never signed in") and subscribes their identities to `#<team>` in digest mode. |
+| `POST /api/teams/:name/remove` | bearer, member or admin | Body: `{email}`. Unsubscribes their identities; queued pushes are dropped at delivery. |
+| `GET /api/teams/:name/members` | bearer, member or admin | |
+| `POST /api/admin/revoke-session` | bearer, admin | Body: `{email, all?}`. **`all` flag is ignored** — both branches revoke all (D5). |
+| `POST /api/admin/disable-user` | bearer, admin | Body: `{email}`. Sets `disabled_at`. |
+| `POST /api/admin/enable-user` | bearer, admin | Clears `disabled_at`. |
+
+"member": a non-member gets 404, the same as for a team that doesn't exist; "or admin" lets an admin manage a team they're not in (e.g. after its last member left). "admin": the email is in `GRAYBOARD_ADMINS`, else 403.
 
 Error envelope: `{code, message}` with HTTP status (400/401/403/404/409/500/503).
 
@@ -313,7 +317,8 @@ grayboard identity rm <name>
 
 grayboard team list
 grayboard team create <name>
-grayboard team join <name>
+grayboard team add <team> <email>
+grayboard team remove <team> <email>
 grayboard team leave <name>
 grayboard team members <name>
 
@@ -492,7 +497,7 @@ Resolved since the initial audit:
 | **D8** | Audit retention test only asserts `pruneAudit` doesn't throw — does not verify rows are deleted. | §16 (test 8) | Low — coverage gap, not a bug. | Add the deletion assertion if cheap. |
 | **D9** | ~~Integration tests in `tests/integration/ws.test.ts` are all `test.todo`.~~ | §16 (tests 5, 6, 7), §19 | **Resolved** in Phase 3: `startServer()` (`src/server/app.ts`) runs the server in-process, and the file has real WebSocket tests. | — |
 | **D10** | Monthly VACUUM is a no-op. `retention.ts:32-37` admits this and defers to "future work." | §12 | Low at POC scale; SQLite WAL + `auto_vacuum=INCREMENTAL` will keep the file from growing unboundedly. | Expose `incremental_vacuum` through `Repo` if reclamation actually matters. |
-| **D11** | `canAdmin` is defined but never called from any admin route. `http.ts:35` even builds a `SendPrincipal` for what reads as a planned call. | §6.5 | Low — v1 canAdmin returns true, so wiring it through is functionally identical. | Either wire `canAdmin` in or delete the dead `makePrincipal` helper. |
+| **D11** | ~~`canAdmin` is defined but never called from any admin route.~~ | §6.5 | **Resolved** in v1.1.7: admin routes call `canAdmin` against `GRAYBOARD_ADMINS`. | — |
 | **D12** | Plugin's MCP notification payload is `params: { content: <tagString> }` (the full `<channel …>body</channel>` rendered into a single string). v0 used `params: { content: body, meta: {…} }`. | §7 implies "same … shape used today" | Low — this is the format the live channels protocol expects; v0's `meta` object was an artifact of how that version assembled the tag. Worth confirming against current Claude Code. | Confirm via manual smoke. |
 | **D13** | Logout truncates the credentials file instead of unlinking it. | §5.5 | Trivial. | Use `unlinkSync`. |
 | **D14** | `cli/main.ts` writes the `--mcp` file but does not verify the parent directory exists; also accepts the boolean `--mcp` form without explicit validation. | §8.1 | Trivial — would surface as a confusing fs error. | Add an explicit existence check on `dirname(path)`. |
@@ -569,13 +574,13 @@ Unit tests (run by `bun test`):
 |---|---|
 | `src/shared/addressing.test.ts` | parse, format, validation, lowercase, length bounds |
 | `src/server/auth.test.ts` | token mint/hash, session verify, revoked, disabled, re-enabled |
-| `src/server/can_send.test.ts` | spec §6.6 contract (allow user, allow team, denied shape, sync) |
+| `src/server/can_send.test.ts` | spec §6.6 contract (allow user, denied shape, sync); `canAdmin` allow/refuse |
 | `src/server/db.test.ts` | repo CRUD + the `bun:sqlite` isolation grep test (excludes `src/local/**` by design) |
 | `src/server/retention.test.ts` | message prune (incl. replies to pruned parents); audit prune asserts only no-throw (D8) |
 | `src/core/core.test.ts` | boards, digests, mentions, threads, claims (incl. a two-connection race), access policy |
-| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving a team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
+| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving or being removed from a team, invite-only membership, admin gating, admin recovery of an empty team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
 
-`bun test` currently: **77 pass, 0 fail**.
+`bun test` currently: **149 pass, 0 fail**.
 
 OAuth code-exchange tests with mocked Google JWKS (spec §16 test 3) are still deferred.
 

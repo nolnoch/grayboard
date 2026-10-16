@@ -30,6 +30,7 @@ beforeEach(() => {
       messageRetentionDays: 90,
       auditRetentionDays: 90,
       devAuth: true,
+      admins: [],
     },
     { background: false },
   );

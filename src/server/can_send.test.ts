@@ -37,8 +37,14 @@ describe("canSend — v1 contract", () => {
   });
 });
 
-describe("canAdmin — v1 contract", () => {
-  test("always allows in v1", () => {
-    expect(canAdmin(principal).allow).toBe(true);
+describe("canAdmin", () => {
+  test("allows emails on the admin list, case-insensitively", () => {
+    expect(canAdmin(principal, ["wade@example.com"]).allow).toBe(true);
+    expect(canAdmin({ ...principal, user_email: "Wade@Example.com" }, ["wade@example.com"]).allow).toBe(true);
+  });
+
+  test("refuses everyone else, and everyone when no admins are configured", () => {
+    expect(canAdmin(principal, ["bob@example.com"])).toMatchObject({ allow: false, code: "forbidden" });
+    expect(canAdmin(principal, [])).toMatchObject({ allow: false, code: "forbidden", reason: expect.stringContaining("GRAYBOARD_ADMINS") });
   });
 });

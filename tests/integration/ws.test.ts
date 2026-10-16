@@ -7,7 +7,7 @@ import { startServer } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
 import type { ServerMessage } from "../../src/shared/protocol.ts";
 
-const config = (): Config => ({
+const config = (overrides: Partial<Config> = {}): Config => ({
   dbPath: ":memory:",
   httpPort: 0,
   googleClientId: "dev",
@@ -17,6 +17,8 @@ const config = (): Config => ({
   messageRetentionDays: 90,
   auditRetentionDays: 90,
   devAuth: true,
+  admins: [],
+  ...overrides,
 });
 
 let app: ReturnType<typeof startServer>;
@@ -134,7 +136,7 @@ test("team board: members see it and get pushes; non-members can't see or be men
   const carol = await login("carol@example.com");
   await api(bob, "POST", "/api/identities", { name: "fe" });
   expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
-  await api(carol, "POST", "/api/teams/eng/join");
+  await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
 
   const a = new Client(alice, "be");
   const b = new Client(bob, "fe");
@@ -166,7 +168,7 @@ test("who: live connections are online; a closed one is offline with last_seen; 
   const bob = await login("bob@example.com");
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
-  await api(bob, "POST", "/api/teams/eng/join");
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
 
   const a = new Client(alice, "be");
   const a2 = new Client(alice, "be-stream");
@@ -254,7 +256,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   const alice = await login("alice@example.com");
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
-  await api(carol, "POST", "/api/teams/eng/join");
+  await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
   const a = new Client(alice, "be");
   const c = new Client(carol, "sim");
   await a.connect();
@@ -288,7 +290,7 @@ test("leaving a team drops its board and pending pushes", async () => {
   const alice = await login("alice@example.com");
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
-  await api(carol, "POST", "/api/teams/eng/join");
+  await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
   const a = new Client(alice, "be");
   await a.connect();
   // carol is offline when mentioned, then leaves before connecting.
@@ -300,6 +302,105 @@ test("leaving a team drops its board and pending pushes", async () => {
   await c.connect();
   await c.none(boardPush);
   expect((await c.call("board_list")).result).toEqual([]);
+});
+
+test("removing a member drops their board and pending pushes", async () => {
+  const alice = await login("alice@example.com");
+  const carol = await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
+  const a = new Client(alice, "be");
+  await a.connect();
+  await api(carol, "POST", "/api/identities", { name: "sim" });
+  await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "carol@example.com" })).status).toBe(200);
+
+  const c = new Client(carol, "sim");
+  await c.connect();
+  await c.none(boardPush);
+  expect((await c.call("board_list")).result).toEqual([]);
+  expect((await api(carol, "GET", "/api/teams/eng/members")).status).toBe(404);
+});
+
+test("teams are invite-only: members add and remove; outsiders can't join, add, or see the roster", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+
+  const join = await api(bob, "POST", "/api/teams/eng/join");
+  expect(join).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("team add") } });
+  // A non-member gets the same answer whether or not the team exists.
+  for (const team of ["eng", "nope"]) {
+    expect((await api(bob, "POST", `/api/teams/${team}/add`, { email: "bob@example.com" })).status).toBe(404);
+    expect((await api(bob, "GET", `/api/teams/${team}/members`)).status).toBe(404);
+    expect((await api(bob, "POST", `/api/teams/${team}/remove`, { email: "alice@example.com" })).status).toBe(404);
+  }
+
+  const never = await api(alice, "POST", "/api/teams/eng/add", { email: "dave@example.com" });
+  expect(never).toMatchObject({ status: 404, body: { message: expect.stringContaining("never signed in") } });
+
+  // Any member can add; the added member can add others and remove.
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "Bob@Example.com" })).status).toBe(200);
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(200);
+  const members = await api(carol, "GET", "/api/teams/eng/members");
+  expect(members.body.map((m: { email: string }) => m.email).sort()).toEqual([
+    "alice@example.com", "bob@example.com", "carol@example.com",
+  ]);
+  expect((await api(carol, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(carol, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(404);
+  expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual([]);
+
+  const audit = app.db
+    .query("SELECT actor, action, detail FROM access_log WHERE action = 'team.member_removed'")
+    .all();
+  expect(audit).toEqual([{ actor: "carol@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com"}' }]);
+});
+
+test("admin routes: refused for non-admins and when no admins are configured", async () => {
+  const alice = await login("alice@example.com");
+  await login("bob@example.com");
+  const none = await api(alice, "POST", "/api/admin/disable-user", { email: "bob@example.com" });
+  expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("GRAYBOARD_ADMINS") } });
+
+  app.stop();
+  app = startServer(config({ admins: ["alice@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const admin = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session"]) {
+    expect((await api(bob, "POST", path, { email: "alice@example.com" })).status).toBe(403);
+  }
+  expect((await api(admin, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+});
+
+test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const root = await login("root@example.com");
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/leave");
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(404);
+
+  expect((await api(root, "GET", "/api/teams/eng/members")).body).toEqual([]);
+  expect((await api(root, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(root, "GET", "/api/teams/nope/members")).status).toBe(404);
+  expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual(["eng"]);
+  // Managing doesn't make the admin a member.
+  expect((await api(root, "GET", "/api/whoami")).body.teams).toEqual([]);
+  expect((await api(root, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
+
+  const audit = app.db
+    .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
+    .all();
+  expect(audit).toEqual([
+    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","as_admin":true}' },
+    { actor: "root@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com","as_admin":true}' },
+  ]);
 });
 
 test("org boards are open to everyone; bare @name prefers the author's own identity", async () => {

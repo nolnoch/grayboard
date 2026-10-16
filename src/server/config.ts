@@ -8,6 +8,8 @@ export type Config = {
   messageRetentionDays: number;
   auditRetentionDays: number;
   devAuth: boolean;
+  // Emails allowed to run admin commands. Empty means nobody can.
+  admins: string[];
 };
 
 export function loadConfig(): Config {
@@ -36,7 +38,12 @@ export function loadConfig(): Config {
     messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? "90", 10),
     auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
     devAuth,
+    admins: parseList(process.env.GRAYBOARD_ADMINS),
   };
+}
+
+function parseList(raw: string | undefined): string[] {
+  return (raw ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 
 function requireEnv(name: string): string {
