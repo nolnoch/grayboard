@@ -8,7 +8,7 @@ import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { ompAdapterSource } from "./omp_adapter.ts" with { type: "macro" };
+import { adapterSource } from "./adapters.ts" with { type: "macro" };
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -231,10 +231,10 @@ const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard"
 
 program
   .command("setup")
-  .description("Choose local or team-server mode and register grayboard with Claude Code and omp")
+  .description("Choose local or team-server mode and register grayboard with Claude Code, omp, and opencode")
   .option("--local", "Agents talk on this machine only")
   .option("--server <url>", "Agents talk through this team server")
-  .option("--no-register", "Don't register grayboard with Claude Code or omp")
+  .option("--no-register", "Don't register grayboard with Claude Code, omp, or opencode")
   .option("-y, --yes", "Accept the defaults without asking")
   .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
     const interactive = !opts.yes && !!process.stdin.isTTY;
@@ -312,13 +312,34 @@ program
         writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
         const ext = join(ompDir, "extensions", "grayboard.ts");
         rmSync(ext, { force: true }); // replace, never write through, an existing symlink
-        writeFileSync(ext, ompAdapterSource());
+        writeFileSync(ext, adapterSource("omp"));
         console.log(`Registered in ${cfgPath}; installed ${ext}`);
       }
 
+      // 4. opencode: it drops MCP notifications, so its entry is tools only
+      // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
+      // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
+      const opencode = !!Bun.which("opencode");
+      const ocDir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+      if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
+        const cfgPath = join(ocDir, "opencode.json");
+        let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
+        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+        }
+        cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
+        mkdirSync(join(ocDir, "plugin"), { recursive: true });
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+        const plugin = join(ocDir, "plugin", "grayboard.ts");
+        rmSync(plugin, { force: true });
+        writeFileSync(plugin, adapterSource("opencode"));
+        console.log(`Registered in ${cfgPath}; installed ${plugin}`);
+      }
+
+      const others = [omp && "omp", opencode && "opencode"].filter(Boolean).join(" or ");
       console.log(
         `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
-        (omp ? `or omp as usual.\n\n` : `\n`) +
+        (others ? `or ${others} as usual.\n\n` : `\n`) +
         `Each session is named after its repo (in ~/code/api you're "api"). ` +
         `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
       );

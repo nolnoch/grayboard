@@ -163,11 +163,13 @@ Client opens `wss://<host>/ws` with `Authorization: Bearer <token>` on the upgra
 Client → Server:
 
 ```ts
-{ type: "hello",   req_id, identity }
+{ type: "hello",   req_id, identity, push? }  // push:false = tools only (BUS_PUSH=off): no pushes, not online
 { type: "send",    req_id, recipient, body, parent_id? }
 { type: "history", req_id, peer?, limit?, before_id? }
 { type: "thread",  req_id, message_id }
 { type: "ack",     req_id, message_ids: number[] }
+{ type: "inbox",   req_id, days? }
+{ type: "dm_ack",  req_id, message_id }
 { type: "pong" }
 { type: "call",      req_id, tool, args }      // board/claim tools (src/core/tools.ts)
 { type: "board_ack", req_id, refs: PendingRef[] }
