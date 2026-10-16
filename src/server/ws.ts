@@ -1,5 +1,5 @@
 import type { ServerWebSocket } from "bun";
-import type { Repo } from "./db.ts";
+import type { MessageRow, Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
 import { formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
 import { canSend, type SendPrincipal } from "./can_send.ts";
@@ -346,6 +346,11 @@ function handleSend(
     return;
   }
 
+  if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.identityFull)) {
+    err(ws, reqId, "not_found", `parent_id ${parentId} is not a message you sent or received`);
+    return;
+  }
+
   const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId);
 
   let deliveredNow = false;
@@ -433,12 +438,19 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   send(ws, { type: "inbox_ok", req_id: reqId, unanswered: owed, ...(queued.length ? { undelivered_from_you: queued } : {}) });
 }
 
+// Only a message's sender and recipient can see it, or thread from it. A
+// message you're not in reads as missing, so its existence doesn't leak.
+function participant(m: MessageRow | undefined, me: string): m is MessageRow {
+  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
+}
+
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {
-  const messages = repo.messages.thread(messageId);
-  if (messages.length === 0) {
+  const me = ws.data.identityFull;
+  if (!participant(repo.messages.getById(messageId), me)) {
     err(ws, reqId, "not_found", `message ${messageId} not found`);
     return;
   }
+  const messages = repo.messages.thread(messageId).filter((m) => participant(m, me));
   send(ws, { type: "thread_ok", req_id: reqId, messages });
 }
 

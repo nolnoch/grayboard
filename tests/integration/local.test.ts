@@ -134,6 +134,9 @@ test("dm_thread from any message returns the whole thread; pushes carry parent_i
   const leaf = await call(be, "dm_send", { to: "fe", body: "thanks", parent_id: reply.message_id });
   const thread = await call(fe, "dm_thread", { thread: leaf.message_id });
   expect(thread.map((m: any) => m.id)).toEqual([root.message_id, reply.message_id, leaf.message_id]);
+  const sim = await start("sim");
+  await expect(call(sim, "dm_thread", { thread: root.message_id })).rejects.toThrow(/not found/);
+  await expect(call(sim, "dm_send", { to: "be", body: "x", parent_id: root.message_id })).rejects.toThrow(/not a message you/);
   await Bun.sleep(300);
   expect(pushes.find((m) => m.message_id === String(leaf.message_id))?.parent_id).toBe(String(reply.message_id));
 }, 20_000);

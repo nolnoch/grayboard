@@ -385,3 +385,25 @@ test("dm_inbox: replied and acked messages drop out; only the recipient can ack"
   expect(await a.request({ type: "dm_ack", message_id: fyi.message_id })).toMatchObject({ type: "ack_ok" });
   expect(await inbox()).toEqual([]);
 });
+
+test("only a message's sender and recipient can read its thread or reply to it", async () => {
+  const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
+  const a = new Client(alice!, "be");
+  const b = new Client(bob!, "fe");
+  const c = new Client(carol!, "sim");
+  await Promise.all([a.connect(), b.connect(), c.connect()]);
+  const root = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "private" });
+  const reply = await b.request({ type: "send", recipient: "alice@example.com/be", body: "re", parent_id: root.message_id });
+  expect((await b.request({ type: "thread", message_id: root.message_id })).messages.map((m: any) => m.id)).toEqual([
+    root.message_id,
+    reply.message_id,
+  ]);
+  expect(await c.request({ type: "thread", message_id: reply.message_id })).toMatchObject({ type: "error", code: "not_found" });
+  expect(await c.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: root.message_id })).toMatchObject({
+    type: "error",
+    code: "not_found",
+  });
+  expect(await a.request({ type: "send", recipient: "bob@example.com/fe", body: "x", parent_id: 99999 })).toMatchObject({
+    type: "error",
+  });
+});

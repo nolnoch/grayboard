@@ -1,8 +1,9 @@
 import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 
-export type PushCallback = (msg: Message) => void;
-// Resolve once the item has been handed to the agent; it's acked after that.
+// Both resolve once the item has been handed to the agent; it's acked after
+// that, so a failed handoff is resent on the next connection.
+export type PushCallback = (msg: Message) => Promise<void>;
 export type BoardPushCallback = (item: Pending) => Promise<void>;
 export type ReadyCallback = (data: HelloOk) => void;
 
@@ -77,13 +78,18 @@ export class GrayboardClient {
         for (const r of resolvers) r();
         break;
 
-      case "push":
-        this.onPush(msg.message);
-        // ack immediately
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.send({ type: "ack", req_id: this.nextId(), message_ids: [msg.message.id] });
-        }
+      case "push": {
+        const id = msg.message.id;
+        this.onPush(msg.message).then(
+          () => {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+              this.send({ type: "ack", req_id: this.nextId(), message_ids: [id] });
+            }
+          },
+          (e) => console.error("[grayboard] message delivery failed:", e),
+        );
         break;
+      }
 
       case "board_push": {
         const ref = refOf(msg.item);

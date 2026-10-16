@@ -13,7 +13,7 @@ export type Claim = {
 
 export type ClaimResult =
   | { ok: true; claim: Claim; renewed: boolean; wake: string[] }
-  | { ok: false; held_by: string; note: string | null; expires_at: number };
+  | { ok: false; held_by: string; note: string | null; expires_at: number; wake: string[] };
 
 const DEFAULT_TTL_MIN = 30;
 const MAX_TTL_MIN = 7 * 24 * 60;
@@ -63,7 +63,7 @@ export function claim(
     const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
-      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at };
+      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
     }
     const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
     const row = db

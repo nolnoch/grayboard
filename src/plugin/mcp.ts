@@ -84,7 +84,7 @@ const client = new GrayboardClient(
       created_at: String(msg.created_at),
     };
     if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-    void notify({ content: msg.body, meta });
+    return notify({ content: msg.body, meta });
   },
   (item) => notify(boardNotification(item)),
 );
@@ -136,7 +136,7 @@ const TOOLS = [
   },
   {
     name: "dm_thread",
-    description: "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
+    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: { thread: { type: "number", description: "Any message_id in the thread." } },

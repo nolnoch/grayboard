@@ -275,7 +275,6 @@ export function callBoardTool(
         note: optStr(a, "note"),
         board: optStr(a, "board"),
       });
-      if (!r.ok) return { result: r, wake: [] };
       const { wake, ...rest } = r;
       return { result: rest, wake };
     }

@@ -27,6 +27,7 @@ import {
   receivedUnacked,
   setCursor,
   undeliveredFrom,
+  type Message,
   unreadFor,
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
@@ -129,7 +130,7 @@ const TOOLS = [
   {
     name: "dm_thread",
     description:
-      "dm_thread(thread): a whole direct-message thread, from its first message through every reply, ordered by id.",
+      "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -188,6 +189,9 @@ async function call(name: string, args: Record<string, any>): Promise<{ content:
   }
 }
 
+// Only a message's sender and recipient can see it or thread from it.
+const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
+
 async function dispatch(name: string, a: Record<string, any>) {
   if (name === "dm_send") {
     const { to: recipient, body, parent_id } = a as {
@@ -201,9 +205,9 @@ async function dispatch(name: string, a: Record<string, any>) {
         isError: true,
       };
     }
-    if (parent_id !== undefined && !getMessage(parent_id)) {
+    if (parent_id !== undefined && !mine(getMessage(parent_id))) {
       return {
-        ...text(`error: parent_id ${parent_id} does not exist`),
+        ...text(`error: parent_id ${parent_id} is not a message you sent or received`),
         isError: true,
       };
     }
@@ -226,7 +230,10 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_thread") {
-    return text(getThread(a.thread));
+    if (!mine(getMessage(a.thread))) {
+      return { ...text(`error: message ${a.thread} not found`), isError: true };
+    }
+    return text(getThread(a.thread).filter(mine));
   }
 
   if (name === "dm_inbox") {
