@@ -7,6 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
+import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
@@ -68,9 +69,13 @@ const notify = async (params: { content: string; meta: Record<string, string> })
   await server.notification({ method: "notifications/claude/channel", params });
 };
 
+// Read on each connect: after `grayboard login`, the next reconnect uses the new token.
+const envToken = !!process.env.GRAYBOARD_TOKEN;
+const currentToken = () => process.env.GRAYBOARD_TOKEN ?? savedCredentials()?.session_token ?? creds.session_token;
+
 const client = new GrayboardClient(
   serverUrl,
-  creds.session_token,
+  currentToken,
   identity,
   (msg: Message) => {
     const meta: Record<string, string> = {
@@ -83,6 +88,7 @@ const client = new GrayboardClient(
   },
   (item) => notify(boardNotification(item)),
   PUSH,
+  (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
 );
 
 client.connect();

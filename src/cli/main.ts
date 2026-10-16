@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
-import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
+import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "./adapters.ts" with { type: "macro" };
@@ -27,7 +27,8 @@ function output(data: unknown, json: boolean): void {
 
 function handleApiError(e: unknown): never {
   if (e instanceof ApiError) {
-    console.error(`Error (${e.code}): ${e.message}`);
+    const msg = e.status === 401 ? signInHint(process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server) : e.message;
+    console.error(`Error (${e.code}): ${msg}`);
   } else {
     console.error(String(e));
   }

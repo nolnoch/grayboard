@@ -417,7 +417,7 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 | `login` returns 403 after Google succeeds | The account isn't on `GRAYBOARD_ORG_DOMAIN` (`hd` mismatch), or its email isn't verified |
 | `login --dev` returns 404 | Dev auth is off (`GRAYBOARD_DEV_AUTH=1` not set) |
 | `/mcp` shows grayboard failed: `identity "<name>" is already in use` | Another live session holds that identity; see [below](#one-live-session-per-identity) |
-| `/mcp` or tools fail with `unauthenticated` (401) | The session's token is gone from the server, e.g. after the step 6 database reset; `grayboard login`, then reconnect the session |
+| `Error (unauthenticated): your sign-in isn't valid on …`, or grayboard fails in `/mcp` with the same message | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
 | Tools fail with "signed out" | You ran `grayboard logout`; sign in again, or `grayboard setup --local` |
 | Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard` (including on `--resume`; grayboard warns the agent when it sees this), or isn't on a claude.ai login |
 

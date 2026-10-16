@@ -29,6 +29,14 @@ export function loadCredentials(): Credentials | null {
   }
 }
 
+/** What to tell someone whose token the server refused (401). envToken: it came from GRAYBOARD_TOKEN (MCP only). */
+export function signInHint(server: string | undefined, envToken = false): string {
+  const at = server ? ` at ${server}` : "";
+  if (envToken) return `the server${at} refused GRAYBOARD_TOKEN; set a valid one or unset it`;
+  return `your sign-in isn't valid on ${server ?? "the server"} (signed out, expired, revoked, or the server's database was reset). ` +
+    `Run: grayboard login${server ? ` --server ${server}` : ""}`;
+}
+
 export class ApiClient {
   constructor(
     private readonly baseUrl: string,

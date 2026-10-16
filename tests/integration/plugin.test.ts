@@ -5,6 +5,9 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { startServer } from "../../src/server/app.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
@@ -107,7 +110,7 @@ test("BUS_PUSH=off runs beside the session that owns the identity, for tools onl
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};
-  const be = new GrayboardClient(base, alice, "be", noop, noop);
+  const be = new GrayboardClient(base, () => alice, "be", noop, noop);
   be.connect();
   await be.ready();
   await be.request({ type: "call", tool: "peer_status", args: { text: "soaking" } });
@@ -119,4 +122,40 @@ test("the client reports where it runs, and a dropped connection resumes without
   const me = (await fe.call("peer_list")).peers.find((p: any) => p.handle === "alice@example.com/be");
   be.close();
   expect(me).toMatchObject({ online: true, where: describeLocation(process.cwd()), status: "soaking" });
+}, 20_000);
+
+test("a refused token says to sign in again: at startup, in a running session's tools, and in the CLI", async () => {
+  const noop = async () => {};
+  const msg = (running: boolean) => (running ? "sign in; reconnecting" : "sign in");
+
+  const stale = new GrayboardClient(base, () => "stale", "be", noop, noop, true, msg);
+  stale.connect();
+  await expect(stale.ready()).rejects.toThrow(/^sign in$/);
+
+  // A running session whose token is revoked (as by a database reset)...
+  let token = await login("alice@example.com");
+  const be = new GrayboardClient(base, () => token, "be", noop, noop, true, msg);
+  be.connect();
+  await be.ready();
+  await fetch(`${base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  (be as any).ws.close();
+  await Bun.sleep(1500); // the first reconnect (after 1s) is refused
+  await expect(be.request({ type: "inbox" })).rejects.toThrow("sign in; reconnecting");
+  // ...picks up a new sign-in on its next reconnect (2s later).
+  token = await login("alice@example.com");
+  await Bun.sleep(2500);
+  expect(await be.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok" });
+  be.close();
+
+  const creds = join(mkdtempSync(join(tmpdir(), "gb-creds-")), "credentials");
+  writeFileSync(creds, JSON.stringify({ session_token: "stale", server: base, user_email: "alice@example.com" }));
+  const { GRAYBOARD_SERVER: _, ...env } = process.env;
+  const p = Bun.spawn([process.execPath, CLI, "team", "list"], {
+    env: { ...env, GRAYBOARD_CREDENTIALS: creds },
+    stderr: "pipe",
+  });
+  expect(await p.exited).toBe(1);
+  expect(await new Response(p.stderr).text()).toContain(
+    `Error (unauthenticated): your sign-in isn't valid on ${base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${base}`,
+  );
 }, 20_000);
