@@ -37,16 +37,6 @@ export function signInHint(server: string | undefined, envToken = false): string
     `Run: grayboard login${server ? ` --server ${server}` : ""}`;
 }
 
-/**
- * Why a WebSocket connection failed, for the MCP server's exit message. A
- * refused token looks like any failed upgrade ("Expected 101 status code"),
- * so ask over HTTP.
- */
-export async function explainConnectFailure(server: string, token: string, fallback: string, envToken = false): Promise<string> {
-  const r = await fetch(`${server}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
-  return r?.status === 401 ? signInHint(server, envToken) : fallback;
-}
-
 export class ApiClient {
   constructor(
     private readonly baseUrl: string,

@@ -16,17 +16,22 @@ export class GrayboardClient {
   private dead      = false; // set on superseded; do not reconnect
 
   private helloData: HelloOk | null = null;
+  private refused: string | null = null; // set while the server refuses our token
   private wasReady  = false; // a later hello is a reconnect, not a new session
   private readyResolvers: Array<(err?: Error) => void> = [];
 
   constructor(
     private readonly serverUrl: string,
-    private readonly token: string,
+    // Read on each connect, so signing in again takes effect on the next reconnect.
+    private readonly token: () => string,
     private readonly identity: string,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
     // false: a tools-only connection that never receives pushes.
     private readonly push = true,
+    // What to say when the server refuses the token: at startup (fatal), or
+    // in tool results while a running session waits to reconnect.
+    private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -46,7 +51,7 @@ export class GrayboardClient {
 
     // Bun extends WebSocket with a headers option (non-standard)
     this.ws = new (WebSocket as any)(url, {
-      headers: { Authorization: `Bearer ${this.token}` },
+      headers: { Authorization: `Bearer ${this.token()}` },
     }) as WebSocket;
 
     this.ws.onopen = () => {
@@ -71,8 +76,10 @@ export class GrayboardClient {
       for (const p of this.pending.values()) p.reject(new Error("connection to the grayboard server was lost"));
       this.pending.clear();
       if (this.dead) return;
+      const neverOpened = !this.helloData;
       this.ws = null;
       this.helloData = null;
+      if (neverOpened) void this.checkToken();
       this.scheduleReconnect();
     };
 
@@ -86,6 +93,7 @@ export class GrayboardClient {
       case "hello_ok":
         this.helloData = msg;
         this.wasReady = true;
+        this.refused = null;
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
         break;
@@ -161,6 +169,20 @@ export class GrayboardClient {
     }
   }
 
+  // A refused token fails the upgrade like anything else (Bun shows only
+  // "Expected 101 status code"), so ask over HTTP. At startup that's fatal;
+  // later, tool calls say to sign in again until a reconnect succeeds.
+  private async checkToken(): Promise<void> {
+    const r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${this.token()}` } }).catch(() => null);
+    if (!r) return;
+    this.refused = r.status === 401 ? this.refusedMessage(this.wasReady) : null;
+    if (this.refused && !this.wasReady) {
+      this.dead = true;
+      const err = new Error(this.refused);
+      for (const res of this.readyResolvers.splice(0)) res(err);
+    }
+  }
+
   private scheduleReconnect(): void {
     const delay = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
@@ -181,7 +203,7 @@ export class GrayboardClient {
       // Before hello_ok the server rejects requests and closes the socket,
       // so fail fast instead of leaving the tool call hanging.
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
-        reject(new Error("not connected to the grayboard server (reconnecting); try again shortly"));
+        reject(new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly"));
         return;
       }
       const req_id = this.nextId();
