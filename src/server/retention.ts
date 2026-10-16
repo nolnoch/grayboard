@@ -1,5 +1,6 @@
 import type { Repo } from "./db.ts";
 import type { Config } from "./config.ts";
+import { prunePosts, type CoreDb } from "../core/boards.ts";
 
 export function pruneMessages(repo: Repo, cutoffMs: number): void {
   repo.messages.prune(cutoffMs);
@@ -21,11 +22,17 @@ function isFirstSundayOfMonth(d: Date): boolean {
   return d.getUTCDay() === 0 && d.getUTCDate() <= 7;
 }
 
-export function startRetentionJobs(repo: Repo, config: Config): void {
+export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void {
   const runNightly = () => {
     const now = Date.now();
-    pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
-    pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
+    try {
+      // Board posts share the message retention window.
+      pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
+      prunePosts(db, now - config.messageRetentionDays * 86_400_000);
+      pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
+    } catch (e) {
+      console.error("[grayboard] retention failed:", e);
+    }
   };
 
   const runVacuumIfNeeded = () => {

@@ -1,7 +1,10 @@
 import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/protocol.ts";
-import { parseClientMessage } from "../shared/protocol.ts";
+import { refOf, type Pending } from "../core/boards.ts";
 
-export type PushCallback = (msg: Message) => void;
+// Both resolve once the item has been handed to the agent; it's acked after
+// that, so a failed handoff is resent on the next connection.
+export type PushCallback = (msg: Message) => Promise<void>;
+export type BoardPushCallback = (item: Pending) => Promise<void>;
 export type ReadyCallback = (data: HelloOk) => void;
 
 export class GrayboardClient {
@@ -12,22 +15,25 @@ export class GrayboardClient {
   private dead      = false; // set on superseded; do not reconnect
 
   private helloData: HelloOk | null = null;
-  private readyResolvers: Array<() => void> = [];
+  private readyResolvers: Array<(err?: Error) => void> = [];
 
   constructor(
     private readonly serverUrl: string,
     private readonly token: string,
     private readonly identity: string,
     private readonly onPush: PushCallback,
+    private readonly onBoardPush: BoardPushCallback,
+    // false: a tools-only connection that never receives pushes.
+    private readonly push = true,
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
   ready(): Promise<HelloOk> {
     if (this.helloData) return Promise.resolve(this.helloData);
     return new Promise<HelloOk>((resolve, reject) => {
-      this.readyResolvers.push(() => {
+      this.readyResolvers.push((err) => {
         if (this.helloData) resolve(this.helloData);
-        else reject(new Error("client died before hello_ok"));
+        else reject(err ?? new Error("client died before hello_ok"));
       });
     });
   }
@@ -43,7 +49,7 @@ export class GrayboardClient {
 
     this.ws.onopen = () => {
       this.backoffMs = 1000; // reset backoff on success
-      this.send({ type: "hello", req_id: this.nextId(), identity: this.identity });
+      this.send({ type: "hello", req_id: this.nextId(), identity: this.identity, ...(this.push ? {} : { push: false }) });
     };
 
     this.ws.onmessage = (event) => {
@@ -53,6 +59,8 @@ export class GrayboardClient {
     };
 
     this.ws.onclose = () => {
+      for (const p of this.pending.values()) p.reject(new Error("connection to the grayboard server was lost"));
+      this.pending.clear();
       if (this.dead) return;
       this.ws = null;
       this.helloData = null;
@@ -72,13 +80,31 @@ export class GrayboardClient {
         for (const r of resolvers) r();
         break;
 
-      case "push":
-        this.onPush(msg.message);
-        // ack immediately
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.send({ type: "ack", req_id: this.nextId(), message_ids: [msg.message.id] });
-        }
+      case "push": {
+        const id = msg.message.id;
+        this.onPush(msg.message).then(
+          () => {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+              this.send({ type: "ack", req_id: this.nextId(), message_ids: [id] });
+            }
+          },
+          (e) => console.error("[grayboard] message delivery failed:", e),
+        );
         break;
+      }
+
+      case "board_push": {
+        const ref = refOf(msg.item);
+        this.onBoardPush(msg.item).then(
+          () => {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+              this.send({ type: "board_ack", req_id: this.nextId(), refs: [ref] });
+            }
+          },
+          (e) => console.error("[grayboard] board delivery failed:", e),
+        );
+        break;
+      }
 
       case "ping":
         if (this.ws?.readyState === WebSocket.OPEN) {
@@ -91,6 +117,19 @@ export class GrayboardClient {
           this.dead = true;
           console.error("[grayboard] connection superseded by a newer session — exiting");
           process.exit(1);
+        }
+        if (msg.code === "identity_in_use") {
+          // Another live session holds this identity. Don't retry.
+          this.dead = true;
+          if (this.readyResolvers.length) {
+            const err = new Error(msg.message);
+            for (const r of this.readyResolvers.splice(0)) r(err);
+          } else {
+            // Lost it while reconnecting: the other session owns it now.
+            console.error(`[grayboard] ${msg.message} — exiting`);
+            process.exit(1);
+          }
+          break;
         }
         if (msg.req_id) {
           const p = this.pending.get(msg.req_id);
@@ -129,8 +168,10 @@ export class GrayboardClient {
   /** Send a request and wait for the corresponding response. */
   request<T extends ServerMessage>(msg: { type: string; [key: string]: unknown }): Promise<T> {
     return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error("not connected"));
+      // Before hello_ok the server rejects requests and closes the socket,
+      // so fail fast instead of leaving the tool call hanging.
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
+        reject(new Error("not connected to the grayboard server (reconnecting); try again shortly"));
         return;
       }
       const req_id = this.nextId();

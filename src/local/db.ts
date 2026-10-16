@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 
+import { initCoreSchema } from "../core/schema.ts";
+
 const DB_PATH = process.env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
 
 function openDb(): Database {
@@ -13,6 +15,7 @@ function openDb(): Database {
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       sender      TEXT    NOT NULL,
@@ -26,6 +29,30 @@ function openDb(): Database {
       reader        TEXT PRIMARY KEY,
       last_seen_id  INTEGER NOT NULL
     );
+    -- Received messages marked handled without a reply (dm_ack).
+    CREATE TABLE IF NOT EXISTS dm_acks (
+      reader      TEXT NOT NULL,
+      message_id  INTEGER NOT NULL,
+      acked_at    INTEGER NOT NULL,
+      PRIMARY KEY (reader, message_id)
+    );
+  `);
+  initCoreSchema(db);
+  // The handles roster arrived after the bus did. Backfill identities that have
+  // run a session (sent, read, posted, or subscribed) so peer_list shows them
+  // and dm_send accepts them. Recipients alone don't count: that would
+  // legitimize old typos.
+  db.exec(`
+    INSERT OR IGNORE INTO handles (name, first_seen, last_seen)
+    SELECT h, MIN(t), MAX(t) FROM (
+      SELECT sender AS h, created_at AS t FROM messages
+      UNION ALL
+      SELECT c.reader, COALESCE(m.created_at, 0) FROM cursors c LEFT JOIN messages m ON m.id = c.last_seen_id
+      UNION ALL
+      SELECT author, created_at FROM posts
+      UNION ALL
+      SELECT handle, 0 FROM subscriptions
+    ) GROUP BY h;
   `);
   return db;
 }
@@ -90,26 +117,54 @@ export function getMessage(id: number): Message | undefined {
     | undefined;
 }
 
-export function getThread(rootId: number): Message[] {
+// The whole thread containing message `id`: walk up to its root, then down.
+export function getThread(id: number): Message[] {
   return db
     .prepare(
-      `WITH RECURSIVE thread AS (
-         SELECT * FROM messages WHERE id = ?
+      `WITH RECURSIVE up(id, parent_id) AS (
+         SELECT id, parent_id FROM messages WHERE id = ?
+         UNION ALL
+         SELECT m.id, m.parent_id FROM messages m JOIN up ON m.id = up.parent_id
+       ),
+       thread AS (
+         SELECT * FROM messages WHERE id = (SELECT id FROM up WHERE parent_id IS NULL)
          UNION ALL
          SELECT m.* FROM messages m
          JOIN thread t ON m.parent_id = t.id
        )
        SELECT * FROM thread ORDER BY id ASC`,
     )
-    .all(rootId) as Message[];
+    .all(id) as Message[];
 }
 
+// Messages `sender` sent that haven't reached the recipient's session yet
+// (past its cursor), per recipient. olderThan: only count those sent before it.
+export function undeliveredFrom(
+  sender: string,
+  olderThan = Infinity,
+): { recipient: string; n: number; oldest_id: number }[] {
+  return db
+    .prepare(
+      `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+         LEFT JOIN cursors c ON c.reader = m.recipient
+        WHERE m.sender = ? AND m.recipient != m.sender
+          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+        GROUP BY m.recipient ORDER BY m.recipient`,
+    )
+    .all(sender, Number.isFinite(olderThan) ? olderThan : Number.MAX_SAFE_INTEGER) as {
+    recipient: string;
+    n: number;
+    oldest_id: number;
+  }[];
+}
+
+// Rows you sent carry delivered: whether they've reached the recipient's session.
 export function getHistory(
   identity: string,
   peer: string | undefined,
   limit: number,
   beforeId: number | undefined,
-): Message[] {
+): (Message & { delivered?: boolean })[] {
   const clauses: string[] = [];
   const args: (string | number)[] = [];
 
@@ -136,5 +191,23 @@ export function getHistory(
   `;
   args.push(limit);
   const rows = db.prepare(sql).all(...args) as Message[];
-  return rows.reverse();
+  return rows.reverse().map((m) =>
+    m.sender === identity && m.recipient !== identity ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
+  );
+}
+
+export function ackMessage(reader: string, id: number): void {
+  db.prepare(`INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)`).run(reader, id, Date.now());
+}
+
+// Messages to `reader` since `since` that it hasn't acked, oldest first.
+export function receivedUnacked(reader: string, since: number): Message[] {
+  return db
+    .prepare(
+      `SELECT * FROM messages m
+        WHERE m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+        ORDER BY m.id ASC`,
+    )
+    .all(reader, since) as Message[];
 }

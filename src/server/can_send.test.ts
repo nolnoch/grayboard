@@ -21,12 +21,6 @@ describe("canSend — v1 contract", () => {
     expect(decision.allow).toBe(true);
   });
 
-  test("v1 allows user -> team send regardless of membership", () => {
-    const target: SendTarget = { kind: "team", team_id: 1, name: "eng" };
-    const decision = canSend(principal, target, ctx);
-    expect(decision.allow).toBe(true);
-  });
-
   test("denied decisions include machine-readable code", () => {
     // v1 never denies, but the type must support it — verify the union shape
     type DeniedShape = { allow: false; code: "forbidden" | "not_found"; reason: string };

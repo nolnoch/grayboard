@@ -1,23 +1,20 @@
 {
   "name": "grayboard",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Durable Claude-to-Claude message bus over the channels protocol",
   "type": "module",
   "private": true,
   "bin": {
     "grayboard": "src/cli/main.ts",
-    "grayboard-plugin": "src/plugin/main.ts",
     "grayboard-server": "src/server/main.ts"
   },
   "scripts": {
     "server": "bun src/server/main.ts",
-    "plugin": "bun src/plugin/main.ts",
     "cli": "bun src/cli/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build": "bun run build:cli && bun run build:plugin && bun run build:server",
+    "build": "bun run build:cli && bun run build:server",
     "build:cli":    "bun build --compile src/cli/main.ts    --outfile dist/grayboard",
-    "build:plugin": "bun build --compile src/plugin/main.ts --outfile dist/grayboard-plugin",
     "build:server": "bun build --compile src/server/main.ts --outfile dist/grayboard-server"
   },
   "dependencies": {

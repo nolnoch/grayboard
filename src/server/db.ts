@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { setAccess } from "../core/boards.ts";
+import { initCoreSchema } from "../core/schema.ts";
+import { serverAccess } from "./access.ts";
+
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
@@ -28,6 +32,7 @@ export interface Repo {
     create(userId: number, name: string): Identity;
     listForUser(userId: number): Identity[];
     findByUserAndName(userId: number, name: string): Identity | undefined;
+    findAllByName(name: string): { email: string; name: string }[];
     remove(userId: number, name: string): void;
   };
   teams: {
@@ -38,19 +43,26 @@ export interface Repo {
     removeMember(teamId: number, userId: number): void;
     listMembers(teamId: number): { user_id: number; email: string }[];
     listMemberUserIds(teamId: number): number[];
+    isMember(teamId: number, userId: number): boolean;
   };
   messages: {
     insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null): MessageRow;
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
-    thread(rootId: number): MessageRow[];
+    thread(id: number): MessageRow[];
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    // Direct messages from sender still past each recipient's cursor, per recipient.
+    undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
+    // Direct messages to reader since `since` that it hasn't acked, oldest first.
+    receivedUnacked(reader: string, since: number): MessageRow[];
+    ack(reader: string, id: number): void;
     prune(olderThanMs: number): void;
   };
   cursors: {
     get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
+    // How far an identity (by full address) has received its direct messages.
+    directFor(identityFull: string): number;
     advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
-    initTeamCursorToCurrentMax(identityId: number, teamRef: string): void;
   };
   audit: {
     write(row: AccessLogRow): void;
@@ -65,7 +77,10 @@ export function openDatabase(path: string): { db: Database; repo: Repo } {
     "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA auto_vacuum = INCREMENTAL;",
   );
   initSchema(db);
-  return { db, repo: makeRepo(db) };
+  initCoreSchema(db);
+  const repo = makeRepo(db);
+  setAccess(db, serverAccess(repo));
+  return { db, repo };
 }
 
 function initSchema(db: Database): void {
@@ -141,6 +156,14 @@ function initSchema(db: Database): void {
       detail TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_at ON access_log(at);
+
+    -- Received direct messages marked handled without a reply (dm_ack).
+    CREATE TABLE IF NOT EXISTS dm_acks (
+      reader      TEXT NOT NULL,
+      message_id  INTEGER NOT NULL,
+      acked_at    INTEGER NOT NULL,
+      PRIMARY KEY (reader, message_id)
+    );
   `);
 }
 
@@ -215,6 +238,11 @@ function makeRepo(db: Database): Repo {
           ).get(userId, name) ?? undefined
         );
       },
+      findAllByName(name) {
+        return db.query<{ email: string; name: string }, [string]>(
+          "SELECT u.email, i.name FROM identities i JOIN users u ON u.id = i.user_id WHERE i.name = ?",
+        ).all(name);
+      },
       remove(userId, name) {
         db.run("DELETE FROM identities WHERE user_id = ? AND name = ?", [userId, name]);
       },
@@ -252,6 +280,11 @@ function makeRepo(db: Database): Repo {
         return db.query<{ user_id: number }, [number]>(
           "SELECT user_id FROM team_members WHERE team_id = ?",
         ).all(teamId).map(r => r.user_id);
+      },
+      isMember(teamId, userId) {
+        return !!db.query<{ x: number }, [number, number]>(
+          "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
+        ).get(teamId, userId);
       },
     },
 
@@ -298,15 +331,21 @@ function makeRepo(db: Database): Repo {
            ORDER BY id DESC LIMIT ?`,
         ).all(identityFull, identityFull, cap);
       },
-      thread(rootId) {
+      // The whole thread containing message `id`: walk up to its root, then down.
+      thread(id) {
         return db.query<MessageRow, [number]>(`
-          WITH RECURSIVE tree(id) AS (
-            SELECT id FROM messages WHERE id = ?
+          WITH RECURSIVE up(id, parent_id) AS (
+            SELECT id, parent_id FROM messages WHERE id = ?
+            UNION ALL
+            SELECT m.id, m.parent_id FROM messages m JOIN up ON m.id = up.parent_id
+          ),
+          tree(id) AS (
+            SELECT id FROM up WHERE parent_id IS NULL
             UNION ALL
             SELECT m.id FROM messages m JOIN tree t ON m.parent_id = t.id
           )
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
-        `).all(rootId);
+        `).all(id);
       },
       unreadSince(streams) {
         if (streams.length === 0) return [];
@@ -321,8 +360,39 @@ function makeRepo(db: Database): Repo {
         all.sort((a, b) => a.id - b.id);
         return all;
       },
+      undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
+        return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
+          `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
+            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+            GROUP BY m.recipient ORDER BY m.recipient`,
+        ).all(sender, olderThan);
+      },
+      receivedUnacked(reader, since) {
+        return db.query<MessageRow, [string, number]>(
+          `SELECT * FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
+            ORDER BY m.id ASC`,
+        ).all(reader, since);
+      },
+      ack(reader, id) {
+        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+      },
       prune(olderThanMs) {
-        db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
+        // Replies outlive pruned parents as roots; parent_id is a foreign key.
+        db.transaction(() => {
+          db.run(
+            "DELETE FROM dm_acks WHERE message_id IN (SELECT id FROM messages WHERE created_at < ?)",
+            [olderThanMs],
+          );
+          db.run(
+            "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)",
+            [olderThanMs],
+          );
+          db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
+        })();
       },
     },
 
@@ -333,22 +403,18 @@ function makeRepo(db: Database): Repo {
         ).get(identityId, streamType, streamRef);
         return row?.last_seen_id ?? 0;
       },
+      directFor(identityFull) {
+        const row = db.query<{ id: number | null }, [string]>(
+          "SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?",
+        ).get(identityFull);
+        return row?.id ?? 0;
+      },
       advance(identityId, streamType, streamRef, messageId) {
         db.run(
           `INSERT INTO cursors (identity_id, stream_type, stream_ref, last_seen_id) VALUES (?, ?, ?, ?)
            ON CONFLICT(identity_id, stream_type, stream_ref)
            DO UPDATE SET last_seen_id = MAX(excluded.last_seen_id, cursors.last_seen_id)`,
           [identityId, streamType, streamRef, messageId],
-        );
-      },
-      initTeamCursorToCurrentMax(identityId, teamRef) {
-        const row = db.query<{ max_id: number | null }, [string]>(
-          "SELECT MAX(id) as max_id FROM messages WHERE recipient_type = 'team' AND recipient = ?",
-        ).get(teamRef);
-        const maxId = row?.max_id ?? 0;
-        db.run(
-          `INSERT OR IGNORE INTO cursors (identity_id, stream_type, stream_ref, last_seen_id) VALUES (?, 'team', ?, ?)`,
-          [identityId, teamRef, maxId],
         );
       },
     },

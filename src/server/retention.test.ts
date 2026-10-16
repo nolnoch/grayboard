@@ -27,6 +27,16 @@ describe("retention pruning", () => {
     expect(still).not.toBeUndefined();
   });
 
+  test("pruneMessages keeps replies whose parent aged out", () => {
+    const { db, repo: r } = openDatabase(":memory:");
+    const root = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+    db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
+    const reply = r.messages.insert("b@example.com/be", "user", "a@example.com/fe", "reply", root.id);
+    expect(() => pruneMessages(r, 1)).not.toThrow(); // used to fail the parent_id foreign key
+    expect(r.messages.getById(root.id)).toBeUndefined();
+    expect(r.messages.getById(reply.id)?.parent_id).toBeNull();
+  });
+
   test("pruneAudit does not throw", () => {
     repo.audit.write({ at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null });
     expect(() => pruneAudit(repo, Date.now())).not.toThrow();

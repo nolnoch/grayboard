@@ -1,11 +1,14 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
-import { join, dirname, resolve } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
-import { makeClient, makeUnauthClient, loadCredentials, ApiError, type Credentials } from "./api.ts";
+import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
+import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
+import { adapterSource } from "./adapters.ts" with { type: "macro" };
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -30,59 +33,24 @@ function handleApiError(e: unknown): never {
   process.exit(1);
 }
 
-// ── plugin path resolution ────────────────────────────────────────────────────
+// ── MCP server command ────────────────────────────────────────────────────────
 
-type PluginInvocation = { command: string; args: string[] };
+type McpInvocation = { command: string; args: string[] };
 
-function findPluginCommand(): PluginInvocation {
-  // 1. explicit override (env var) — accepts either a .ts source path or a binary path
-  const override = process.env.GRAYBOARD_PLUGIN_PATH;
-  if (override) {
-    return override.endsWith(".ts")
-      ? { command: "bun", args: [override] }
-      : { command: override, args: [] };
+/** How Claude Code should start grayboard's MCP server: this CLI, `mcp` subcommand. */
+function mcpCommand(): McpInvocation {
+  // In a `bun build --compile` binary, execPath is the binary itself; from
+  // source it's bun, and import.meta.path is this script.
+  if (!/^bun(\.exe)?$/.test(basename(process.execPath))) {
+    return { command: resolve(process.execPath), args: ["mcp"] };
   }
-
-  // 2. compiled sibling binary next to the grayboard CLI (the install.sh case).
-  //    Use execPath, not argv[1]: in a `bun build --compile` binary, argv[1] is a
-  //    virtual filesystem path (/$bunfs/root/...) while execPath is the actual
-  //    on-disk binary location.
-  const execDir = dirname(resolve(process.execPath));
-  for (const name of ["grayboard-plugin", "grayboard-plugin.exe"]) {
-    const candidate = join(execDir, name);
-    if (existsSync(candidate)) return { command: resolve(candidate), args: [] };
-  }
-
-  // 3. source tree — walk up from the CLI script (argv[1]) looking for
-  //    src/plugin/main.ts. In source mode execPath is the bun binary itself, so
-  //    argv[1] is what tells us where our script lives.
-  if (process.argv[1]) {
-    let dir = dirname(resolve(process.argv[1]));
-    for (let i = 0; i < 6; i++) {
-      const candidate = join(dir, "src", "plugin", "main.ts");
-      if (existsSync(candidate)) return { command: "bun", args: [resolve(candidate)] };
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-  }
-
-  throw new Error(
-    "Cannot locate grayboard-plugin. Install the release binaries (curl …install.sh | bash), or set GRAYBOARD_PLUGIN_PATH to either a compiled grayboard-plugin binary or src/plugin/main.ts.",
-  );
+  return { command: "bun", args: [import.meta.path, "mcp"] };
 }
 
 // ── .mcp.json helpers ─────────────────────────────────────────────────────────
 
 function writeMcpJson(targetPath: string, identityName: string, force: boolean): void {
-  let plugin: PluginInvocation;
-  try {
-    plugin = findPluginCommand();
-  } catch (e) {
-    console.error(String(e));
-    process.exit(1);
-  }
-
+  const plugin = mcpCommand();
   const entry = {
     command: plugin.command,
     args:    plugin.args,
@@ -138,6 +106,53 @@ const globalJson = () => !!(program.opts() as { json?: boolean }).json;
 
 // ── login / logout / whoami ───────────────────────────────────────────────────
 
+async function login(serverUrl: string, devEmail?: string): Promise<void> {
+  const client = makeUnauthClient(serverUrl);
+
+  if (devEmail) {
+    try {
+      const res = await client.post("/api/auth/dev-login", { email: devEmail }) as { session_token: string; user_email: string };
+      writeCredentials({ session_token: res.session_token, server: serverUrl, user_email: res.user_email });
+      console.log(`Logged in as ${res.user_email} (dev mode)`);
+    } catch (e) { handleApiError(e); }
+    return;
+  }
+
+  // Bootstrap: fetch the public OAuth config from the server. Env vars override
+  // for unusual setups (e.g. pointing the loopback flow at a different OAuth app
+  // than the server's own).
+  let googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  let orgDomain      = process.env.GRAYBOARD_ORG_DOMAIN;
+  if (!googleClientId || !orgDomain) {
+    try {
+      const cfg = await client.get("/api/auth/config") as { google_client_id: string; org_domain: string };
+      googleClientId ??= cfg.google_client_id;
+      orgDomain      ??= cfg.org_domain;
+    } catch (e) {
+      handleApiError(e);
+    }
+  }
+  if (!googleClientId) {
+    console.error("Server did not return a google_client_id and GOOGLE_OAUTH_CLIENT_ID is not set.");
+    process.exit(1);
+  }
+
+  let oauthResult;
+  try {
+    oauthResult = await runOAuthFlow(googleClientId, serverUrl, orgDomain);
+  } catch (e) { handleApiError(e); }
+
+  try {
+    const res = await client.post("/api/auth/exchange", {
+      code:          oauthResult.code,
+      code_verifier: oauthResult.codeVerifier,
+      redirect_uri:  oauthResult.redirectUri,
+    }) as { session_token: string; user_email: string };
+    writeCredentials({ session_token: res.session_token, server: serverUrl, user_email: res.user_email });
+    console.log(`Logged in as ${res.user_email}`);
+  } catch (e) { handleApiError(e); }
+}
+
 program
   .command("login")
   .description("Authenticate with Google and store credentials")
@@ -149,50 +164,7 @@ program
       console.error("Server URL required: use --server <url> or set GRAYBOARD_SERVER");
       process.exit(1);
     }
-    const client = makeUnauthClient(serverUrl);
-
-    if (opts.dev) {
-      try {
-        const res = await client.post("/api/auth/dev-login", { email: opts.dev }) as { session_token: string; user_email: string };
-        writeCredentials({ session_token: res.session_token, server: serverUrl, user_email: res.user_email });
-        console.log(`Logged in as ${res.user_email} (dev mode)`);
-      } catch (e) { handleApiError(e); }
-      return;
-    }
-
-    // Bootstrap: fetch the public OAuth config from the server. Env vars override
-    // for unusual setups (e.g. pointing the loopback flow at a different OAuth app
-    // than the server's own).
-    let googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-    let orgDomain      = process.env.GRAYBOARD_ORG_DOMAIN;
-    if (!googleClientId || !orgDomain) {
-      try {
-        const cfg = await client.get("/api/auth/config") as { google_client_id: string; org_domain: string };
-        googleClientId ??= cfg.google_client_id;
-        orgDomain      ??= cfg.org_domain;
-      } catch (e) {
-        handleApiError(e);
-      }
-    }
-    if (!googleClientId) {
-      console.error("Server did not return a google_client_id and GOOGLE_OAUTH_CLIENT_ID is not set.");
-      process.exit(1);
-    }
-
-    let oauthResult;
-    try {
-      oauthResult = await runOAuthFlow(googleClientId, serverUrl, orgDomain);
-    } catch (e) { handleApiError(e); }
-
-    try {
-      const res = await client.post("/api/auth/exchange", {
-        code:          oauthResult.code,
-        code_verifier: oauthResult.codeVerifier,
-        redirect_uri:  oauthResult.redirectUri,
-      }) as { session_token: string; user_email: string };
-      writeCredentials({ session_token: res.session_token, server: serverUrl, user_email: res.user_email });
-      console.log(`Logged in as ${res.user_email}`);
-    } catch (e) { handleApiError(e); }
+    await login(serverUrl, opts.dev);
   });
 
 program
@@ -221,6 +193,161 @@ program
     } catch (e) { handleApiError(e); }
   });
 
+// ── tail (local mode) ────────────────────────────────────────────────────────
+
+program
+  .command("tail <board>")
+  .description("Watch a local-mode board live (read-only)")
+  .option("-n, --lines <n>", "Recent posts to show first", "10")
+  .action(async (board: string, opts: { lines: string }) => {
+    // Imported lazily: opening the local bus creates ~/.claude-bus.
+    const { runTail } = await import("../local/tail.ts");
+    await runTail(board, Number.parseInt(opts.lines, 10) || 0);
+  });
+
+// ── mcp / setup ──────────────────────────────────────────────────────────────
+
+program
+  .command("mcp")
+  .description("Run the MCP server for Claude Code: server mode when signed in, local otherwise")
+  .option("--mode <mode>", "Force local or server mode, e.g. for one repo")
+  .action(async (opts: { mode?: string }) => {
+    const mode = opts.mode ?? busMode();
+    if (mode !== "local" && mode !== "server") {
+      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
+      process.exit(1);
+    }
+    // stdout is the MCP transport from here on; log to stderr only.
+    try {
+      if (mode === "server") await import("../plugin/mcp.ts");
+      else await import("../local/mcp.ts");
+    } catch (e) {
+      console.error(`[grayboard] ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard";
+
+program
+  .command("setup")
+  .description("Choose local or team-server mode and register grayboard with Claude Code, omp, and opencode")
+  .option("--local", "Agents talk on this machine only")
+  .option("--server <url>", "Agents talk through this team server")
+  .option("--no-register", "Don't register grayboard with Claude Code, omp, or opencode")
+  .option("-y, --yes", "Accept the defaults without asking")
+  .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
+    const interactive = !opts.yes && !!process.stdin.isTTY;
+    const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+    const ask = async (q: string, dflt = ""): Promise<string> => {
+      if (!rl) return dflt;
+      const a = (await rl.question(dflt ? `${q} [${dflt}] ` : `${q} `)).trim() || dflt;
+      return a || ask(q, dflt);
+    };
+    const confirm = async (q: string, dflt: boolean): Promise<boolean> => {
+      if (!rl) return dflt;
+      const a = (await rl.question(`${q} [${dflt ? "Y/n" : "y/N"}] `)).trim();
+      return a ? /^y/i.test(a) : dflt;
+    };
+
+    try {
+      const creds = loadCredentials();
+
+      // 1. Mode
+      let server = opts.server;
+      if (!opts.local && !server) {
+        const signedIn = busMode() === "server";
+        if (rl) console.log("How will your agents talk?\n  1) On this machine only (no account needed)\n  2) Through a team server");
+        const pick = await ask("Choose", signedIn ? "2" : "1");
+        if (pick === "2") {
+          server = await ask("Server URL:", creds?.server ?? process.env.GRAYBOARD_SERVER);
+          if (!server) { console.error("Server URL required: pass --server <url>"); process.exit(1); }
+        }
+      }
+
+      if (server) {
+        if (creds?.session_token && creds.server === server) {
+          console.log(`Signed in to ${server} as ${creds.user_email}.`);
+        } else {
+          await login(server);
+        }
+      } else if (existsSync(credentialsPath())) {
+        const where = creds?.server ? ` from ${creds.server}` : "";
+        if (!(await confirm(`Local mode signs you out${where}. Continue?`, true))) process.exit(1);
+        if (creds?.session_token) {
+          try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch {}
+        }
+        rmSync(credentialsPath(), { force: true });
+        console.log("Using local mode.");
+      } else {
+        console.log("Using local mode.");
+      }
+
+      // 2. Register with Claude Code, for every project (user scope)
+      const { command, args } = mcpCommand();
+      const addArgs = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
+      const claude = Bun.which("claude");
+      if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
+        Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
+        const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
+        if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
+      } else if (opts.register && !claude) {
+        console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+      }
+
+      // 3. omp: register for every project (it ignores Claude Code's user
+      // registration), and install the push adapter that wakes the session.
+      // The user entry outranks a repo's .mcp.json in omp, so it carries no
+      // BUS_IDENTITY; grayboard reads the repo's pin itself.
+      const omp = !!Bun.which("omp");
+      const ompDir = join(homedir(), ".omp", "agent");
+      if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
+        const cfgPath = join(ompDir, "mcp.json");
+        let cfg: { mcpServers?: Record<string, unknown> } = {};
+        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+        }
+        cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
+        mkdirSync(join(ompDir, "extensions"), { recursive: true });
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+        const ext = join(ompDir, "extensions", "grayboard.ts");
+        rmSync(ext, { force: true }); // replace, never write through, an existing symlink
+        writeFileSync(ext, adapterSource("omp"));
+        console.log(`Registered in ${cfgPath}; installed ${ext}`);
+      }
+
+      // 4. opencode: it drops MCP notifications, so its entry is tools only
+      // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
+      // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
+      const opencode = !!Bun.which("opencode");
+      const ocDir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+      if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
+        const cfgPath = join(ocDir, "opencode.json");
+        let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
+        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+        }
+        cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
+        mkdirSync(join(ocDir, "plugin"), { recursive: true });
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+        const plugin = join(ocDir, "plugin", "grayboard.ts");
+        rmSync(plugin, { force: true });
+        writeFileSync(plugin, adapterSource("opencode"));
+        console.log(`Registered in ${cfgPath}; installed ${plugin}`);
+      }
+
+      const others = [omp && "omp", opencode && "opencode"].filter(Boolean).join(" or ");
+      console.log(
+        `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
+        (others ? `or ${others} as usual.\n\n` : `\n`) +
+        `Each session is named after its repo (in ~/code/api you're "api"). ` +
+        `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
+      );
+    } finally {
+      rl?.close();
+    }
+  });
+
 // ── identity ─────────────────────────────────────────────────────────────────
 
 const identityCmd = program.command("identity");
@@ -236,10 +363,24 @@ identityCmd
 
 identityCmd
   .command("create <name>")
-  .description("Create an identity")
+  .description("Create an identity (local mode: nothing to reserve; use with --mcp)")
   .option("--mcp [path]",  "Write .mcp.json entry (default: ./.mcp.json)")
   .option("--force",       "Overwrite entire .mcp.json instead of merging")
   .action(async (name: string, opts: { mcp?: string | boolean; force?: boolean }) => {
+    const mcpPath = opts.mcp === undefined ? null : opts.mcp === true ? "./.mcp.json" : opts.mcp;
+    if (busMode() === "local") {
+      if (!mcpPath) {
+        console.error("Local mode has no identities to reserve. Use --mcp to name this repo's sessions.");
+        process.exit(1);
+      }
+      if (!isValidIdentityName(name)) {
+        console.error(`Invalid identity "${name}": 1–32 chars, a-z 0-9 _ -`);
+        process.exit(1);
+      }
+      writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
+      return;
+    }
+
     let res: { name: string; created_at: number };
     try {
       res = await makeClient().post("/api/identities", { name }) as typeof res;
@@ -251,10 +392,7 @@ identityCmd
       console.log(`Created identity '${res!.name}'`);
     }
 
-    if (opts.mcp !== undefined) {
-      const mcpPath = opts.mcp === true ? "./.mcp.json" : (opts.mcp as string);
-      writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
-    }
+    if (mcpPath) writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
   });
 
 identityCmd

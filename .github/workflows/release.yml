@@ -45,7 +45,6 @@ jobs:
         run: |
           mkdir -p dist
           bun build --compile --target=${{ matrix.bun_target }} src/cli/main.ts    --outfile dist/grayboard-${{ matrix.target }}
-          bun build --compile --target=${{ matrix.bun_target }} src/plugin/main.ts --outfile dist/grayboard-plugin-${{ matrix.target }}
           bun build --compile --target=${{ matrix.bun_target }} src/server/main.ts --outfile dist/grayboard-server-${{ matrix.target }}
 
       - name: Upload artifacts
