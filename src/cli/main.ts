@@ -35,16 +35,18 @@ function handleApiError(e: unknown): never {
   process.exit(1);
 }
 
-// ── push adapters (omp, opencode) ─────────────────────────────────────────────
+// ── push adapters (omp, opencode, pi) ─────────────────────────────────────────────
 
 const OMP_DIR = join(homedir(), ".omp", "agent");
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+const PI_DIR  = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
 const ADAPTERS = [
   { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
   { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode") },
+  { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi") },
 ];
 
 function writeAdapter(path: string, source: string): void {
@@ -251,10 +253,10 @@ const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard"
 
 program
   .command("setup")
-  .description("Choose local or team-server mode and register grayboard with Claude Code, omp, and opencode")
+  .description("Choose local or team-server mode and register grayboard with Claude Code, omp, opencode, and pi")
   .option("--local", "Agents talk on this machine only")
   .option("--server <url>", "Agents talk through this team server")
-  .option("--no-register", "Don't register grayboard with Claude Code, omp, or opencode")
+  .option("--no-register", "Don't register grayboard with Claude Code, omp, opencode, or pi")
   .option("-y, --yes", "Accept the defaults without asking")
   .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
     const interactive = !opts.yes && !!process.stdin.isTTY;
@@ -352,7 +354,25 @@ program
         console.log(`Registered in ${cfgPath}; installed ${plugin.path}`);
       }
 
-      const others = [omp && "omp", opencode && "opencode"].filter(Boolean).join(" or ");
+      // 5. pi: its MCP client drops notifications and, for direct tools, the
+      // server's instructions, so like opencode its entry is tools only and
+      // the extension runs the push side and supplies the instructions.
+      const piCli = !!Bun.which("pi");
+      if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
+        const cfgPath = join(PI_DIR, "mcp.json");
+        let cfg: { mcpServers?: Record<string, unknown> } = {};
+        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+        }
+        cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args, env: { BUS_PUSH: "off" }, exposure: "direct" } };
+        mkdirSync(PI_DIR, { recursive: true });
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+        const ext = ADAPTERS[2]!;
+        writeAdapter(ext.path, ext.source);
+        console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
+      }
+
+      const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
       console.log(
         `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
         (others ? `or ${others} as usual.\n\n` : `\n`) +
@@ -382,12 +402,12 @@ program
     // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
     // command; `setup` reinstalls adapters there.
     const r = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });
-    if (r.exitCode !== 0) console.log("If you use omp or opencode, run `grayboard setup` to refresh their adapters.");
+    if (r.exitCode !== 0) console.log("If you use omp, opencode, or pi, run `grayboard setup` to refresh their adapters.");
   });
 
 program
   .command("refresh-adapters", { hidden: true })
-  .description("Rewrite installed omp/opencode push adapters from this binary")
+  .description("Rewrite installed omp/opencode/pi push adapters from this binary")
   .action(() => {
     for (const a of ADAPTERS) {
       // A symlink means a checkout is installed there on purpose: leave it.

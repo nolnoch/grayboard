@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["bun"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "adapters/pi/**/*.ts"]
 }

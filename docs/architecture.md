@@ -579,8 +579,9 @@ Unit tests (run by `bun test`):
 | `src/server/retention.test.ts` | message prune (incl. replies to pruned parents); audit prune asserts only no-throw (D8) |
 | `src/core/core.test.ts` | boards, digests, mentions, threads, claims (incl. a two-connection race), access policy |
 | `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving or being removed from a team, invite-only membership, admin gating, admin recovery of an empty team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
+| `tests/integration/pi.test.ts` | the real pi CLI (pinned devDependency, RPC mode) with a scripted fake model: the pi adapter's DM wake and `dm_send` reply round trip, grayboard instructions in the system prompt, digests as context only, identity released on quit |
 
-`bun test` currently: **149 pass, 0 fail**.
+`bun test` currently: **150 pass, 0 fail**.
 
 OAuth code-exchange tests with mocked Google JWKS (spec §16 test 3) are still deferred.
 
