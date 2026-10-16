@@ -6,6 +6,7 @@ import type { Database } from "bun:sqlite";
 import {
   CoreError,
   createBoard,
+  isViewer,
   listBoards,
   post,
   read,
@@ -235,7 +236,7 @@ export function callBoardTool(
         optNum(a, "parent_id") ?? null,
       );
       return {
-        result: { post_id: p.id, board: p.board, notified: wake, ...(unresolved.length ? { unresolved } : {}) },
+        result: { post_id: p.id, board: p.board, notified: wake.filter((h) => !isViewer(h)), ...(unresolved.length ? { unresolved } : {}) },
         wake,
       };
     }
