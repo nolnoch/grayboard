@@ -81,7 +81,7 @@ const TOOLS = [
   {
     name: "dm_send",
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
-    // missed that the reply tool exists. Same for dm_inbox and board_post.
+    // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
@@ -257,9 +257,9 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_ack") {
-    const m = typeof a.id === "number" ? getMessage(a.id) : undefined;
+    const m = typeof a.message_id === "number" ? getMessage(a.message_id) : undefined;
     if (!m || m.recipient !== IDENTITY) {
-      return { ...text(`error: no message ${a.id} to you; dm_inbox lists them`), isError: true };
+      return { ...text(`error: no message ${a.message_id} to you; dm_inbox lists them`), isError: true };
     }
     ackMessage(IDENTITY, m.id);
     return text("ok");

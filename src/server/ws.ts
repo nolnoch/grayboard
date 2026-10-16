@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import type { MessageRow, Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
-import { formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
+import { formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
 import { canSend, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -13,6 +13,7 @@ import {
   pendingFor,
   post,
   refOf,
+  setPlace,
   startSession,
   touchHandle,
   type CoreDb,
@@ -151,7 +152,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false).catch((e) => {
+        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
@@ -224,7 +225,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   return { handlers, startPing, stopExpiry: expiry.stop };
 }
 
-async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean): Promise<void> {
+async function handleHello(
+  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false,
+): Promise<void> {
   const { repo, db, registry } = hub;
   const name = identityInput.toLowerCase();
   if (!isValidIdentityName(name)) {
@@ -273,7 +276,9 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
 
   if (push) {
     registry.set(full, ws);
-    startSession(db, full, null);
+    if (resume) touchHandle(db, full);
+    else startSession(db, full, null);
+    setPlace(db, full, where ?? null);
   } else {
     hub.toolsOnly.add(ws);
     touchHandle(db, full);
@@ -322,6 +327,25 @@ function handleSend(
     return;
   }
 
+  const { authed } = ws.data;
+
+  // A bare name means your own identity of that name, else the one identity
+  // anyone has with it (as @name does in a post).
+  if (isValidIdentityName(recipientStr)) {
+    const name = recipientStr.toLowerCase();
+    if (repo.identities.findByUserAndName(authed.user_id, name)) {
+      recipientStr = formatDirectAddress(authed.user_email, name);
+    } else {
+      const all = repo.identities.findAllByName(name);
+      if (all.length !== 1) {
+        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
+        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
+        return;
+      }
+      recipientStr = formatDirectAddress(all[0]!.email, name);
+    }
+  }
+
   let parsed;
   try {
     parsed = parseAddress(recipientStr);
@@ -330,7 +354,6 @@ function handleSend(
     return;
   }
 
-  const { authed } = ws.data;
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
     user_email:    authed.user_email,

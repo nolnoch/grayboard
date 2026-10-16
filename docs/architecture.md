@@ -163,7 +163,9 @@ Client opens `wss://<host>/ws` with `Authorization: Bearer <token>` on the upgra
 Client → Server:
 
 ```ts
-{ type: "hello",   req_id, identity, push? }  // push:false = tools only (BUS_PUSH=off): no pushes, not online
+{ type: "hello",   req_id, identity, push?, where?, resume? }  // push:false = tools only (BUS_PUSH=off): no pushes, not online
+                                                  // where: "api worktree stream on stream", from the client (peer_list)
+                                                  // resume: a reconnect within the session; keeps its peer_status
 { type: "send",    req_id, recipient, body, parent_id? }
 { type: "history", req_id, peer?, limit?, before_id? }
 { type: "thread",  req_id, message_id }
@@ -358,7 +360,7 @@ Read by `cli/api.ts:loadCredentials` and `plugin/mcp.ts:loadCredentials`. Env-va
 | `dm_history(peer?, limit?, before_id?)` | `{type:"history"}` |
 | `dm_thread(thread)` | `{type:"thread"}` |
 | `dm_inbox(days?)` | `{type:"inbox"}` |
-| `dm_ack(id)` | `{type:"dm_ack", message_id}` |
+| `dm_ack(message_id)` | `{type:"dm_ack", message_id}` |
 | `board_*`, `claim_take`, `claim_release`, `claim_list`, `peer_list` | `{type:"call", tool, args}` (definitions from `src/core/tools.ts`; `peer_list` reads the core `handles` table, which the server touches on connect and disconnect, and checks liveness against the open connections) |
 
 Before the MCP handshake the plugin waits up to 10s for `hello_ok`, and exits with a message if the server doesn't answer or refuses the identity. That way `/mcp` shows an error instead of hitting Claude Code's own 30s startup timeout. The MCP server is built after `hello_ok`, so its instructions include the `notices`.

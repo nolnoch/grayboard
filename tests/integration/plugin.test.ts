@@ -5,7 +5,9 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { GrayboardClient } from "../../src/plugin/client.ts";
 import { startServer } from "../../src/server/app.ts";
+import { describeLocation } from "../../src/shared/identity.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -100,4 +102,21 @@ test("BUS_PUSH=off runs beside the session that owns the identity, for tools onl
   await Bun.sleep(300);
   expect(owner.pushes.map((p) => p.content)).toEqual(["hi"]);
   expect(tools.pushes).toEqual([]);
+}, 20_000);
+
+test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
+  const alice = await login("alice@example.com");
+  const noop = async () => {};
+  const be = new GrayboardClient(base, alice, "be", noop, noop);
+  be.connect();
+  await be.ready();
+  await be.request({ type: "call", tool: "peer_status", args: { text: "soaking" } });
+
+  (be as any).ws.close();
+  await Bun.sleep(1500); // first reconnect backoff is 1s
+  await be.ready();
+  const fe = await session(await login("bob@example.com"), "fe");
+  const me = (await fe.call("peer_list")).peers.find((p: any) => p.handle === "alice@example.com/be");
+  be.close();
+  expect(me).toMatchObject({ online: true, where: describeLocation(process.cwd()), status: "soaking" });
 }, 20_000);

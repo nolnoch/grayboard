@@ -116,7 +116,7 @@ const server = new Server(
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...(hello.notices ?? []),
-      `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
+      `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
   },
@@ -130,10 +130,10 @@ const TOOLS = [
   {
     name: "dm_send",
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
-    // missed that the reply tool exists. Same for dm_inbox and board_post.
+    // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description:
-      `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -219,7 +219,7 @@ async function call(name: string, a: Record<string, unknown>) {
       return text(rest);
     }
     if (name === "dm_ack") {
-      await client.request({ type: "dm_ack", message_id: a.id });
+      await client.request({ type: "dm_ack", message_id: a.message_id });
       return text("ok");
     }
     if (name === "dm_thread") {

@@ -61,7 +61,7 @@ class Client {
   constructor(
     private token: string,
     private identity: string,
-    private opts: { pong?: boolean; push?: boolean } = {},
+    private opts: { pong?: boolean; push?: boolean; hello?: Record<string, unknown> } = {},
   ) {}
 
   // Resolves with hello_ok, or the error that refused the hello.
@@ -78,7 +78,7 @@ class Client {
       else this.inbox.push(m);
     };
     this.ws.onopen = () =>
-      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}) }));
+      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello }));
     return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
   }
 
@@ -226,6 +226,30 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   await s3.none(boardPush);
 });
 
+test("peer_list shows where the client says it runs; a resumed hello keeps the status, a new session clears it", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const watcher = new Client(bob, "fe");
+  await watcher.connect();
+  const be = async () => (await watcher.call("peer_list", { include_offline: true })).result.peers.find((p: any) => p.handle === "alice@example.com/be");
+
+  const first = new Client(alice, "be", { hello: { where: "api worktree stream \n on stream" } });
+  await first.connect();
+  await first.call("peer_status", { text: "soaking" });
+  expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
+
+  await closeAndSettle(first);
+  const resumed = new Client(alice, "be", { hello: { where: "api worktree stream on main", resume: true } });
+  await resumed.connect();
+  expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
+
+  await closeAndSettle(resumed);
+  await new Client(alice, "be").connect();
+  const fresh = await be();
+  expect(fresh.where).toBeUndefined();
+  expect(fresh.status).toBeUndefined();
+});
+
 test("team boards: digests coalesce until read; team: is not a DM recipient", async () => {
   const alice = await login("alice@example.com");
   const carol = await login("carol@example.com");
@@ -344,6 +368,28 @@ test("direct messages still deliver live", async () => {
   const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "hi" });
   expect(sent).toMatchObject({ type: "send_ok", delivered_now: true });
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
+});
+
+test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
+  const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
+  const a = new Client(alice, "be");
+  const a2 = new Client(alice, "be-stream");
+  const b = new Client(bob, "be-stream");
+  const b2 = new Client(bob, "fe");
+  const c = new Client(carol, "fe");
+  await Promise.all([a, a2, b, b2, c].map((x) => x.connect()));
+
+  // alice and bob both have be-stream: alice's bare name means her own.
+  expect(await a.request({ type: "send", recipient: "be-stream", body: "mine" })).toMatchObject({ type: "send_ok" });
+  expect((await a2.next((m) => m.type === "push")).message.body).toBe("mine");
+  // carol has no be: the only be is alice's.
+  expect(await c.request({ type: "send", recipient: "be", body: "only one" })).toMatchObject({ type: "send_ok" });
+  expect((await a.next((m) => m.type === "push")).message.body).toBe("only one");
+  // alice has no fe, and bob and carol each have one: ambiguous.
+  const amb = await a.request({ type: "send", recipient: "fe", body: "?" });
+  expect(amb).toMatchObject({ type: "error", code: "not_found" });
+  expect(amb.message).toContain("bob@example.com/fe, carol@example.com/fe");
+  expect(await a.request({ type: "send", recipient: "nobody", body: "?" })).toMatchObject({ type: "error", code: "not_found" });
 });
 
 test("senders see what hasn't reached an offline peer", async () => {

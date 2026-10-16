@@ -59,10 +59,11 @@ export function initCoreSchema(db: Database): void {
       expires_at   INTEGER NOT NULL
     );
   `);
-  // Session context, added after the roster: where the session runs (local
-  // mode), and a free-text status it set. Both reset when a session starts.
+  // Session context, added after the roster: where the session runs (cwd in
+  // local mode; place, as the client described it, in server mode), and a
+  // free-text status it set. All reset when a session starts.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["cwd", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"]]) {
+  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
   }
 

@@ -55,11 +55,12 @@ export const DM_INBOX_TOOL = {
 
 export const DM_ACK_TOOL = {
   name: "dm_ack",
-  description: "dm_ack(id): mark a direct message to you handled without replying (an FYI), so dm_inbox drops it.",
+  _meta: { "anthropic/alwaysLoad": true },
+  description: "dm_ack(message_id): mark a direct message to you handled without replying (an FYI), so dm_inbox drops it.",
   inputSchema: {
     type: "object",
-    properties: { id: { type: "number", description: "The message_id." } },
-    required: ["id"],
+    properties: { message_id: { type: "number", description: "The message's message_id." } },
+    required: ["message_id"],
   },
 };
 

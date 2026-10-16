@@ -104,7 +104,13 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
 // mode can't know, e.g. a remote server), and clear the previous session's status.
 export function startSession(db: Database, handle: string, cwd: string | null, now = Date.now()): void {
   touchHandle(db, handle, now);
-  db.prepare(`UPDATE handles SET cwd = ?, status = NULL, status_at = NULL WHERE name = ?`).run(cwd, handle);
+  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL WHERE name = ?`).run(cwd, handle);
+}
+
+// Server mode: where the session runs, as its client described it.
+export function setPlace(db: Database, handle: string, place: string | null): void {
+  const p = place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
+  db.prepare(`UPDATE handles SET place = ? WHERE name = ?`).run(p, handle);
 }
 
 const MAX_STATUS = 200;
@@ -401,7 +407,7 @@ export function who(
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
 ): WhoResult {
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; status: string | null; status_at: number | null };
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null };
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
@@ -409,7 +415,7 @@ export function who(
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.status, h.status_at FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -417,12 +423,12 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen, cwd, status, status_at FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
   const now = Date.now();
   const all: Peer[] = rows.filter((r) => !isViewer(r.handle)).map((r) => {
-    const where = r.cwd ? describeLocation(r.cwd) : null;
+    const where = r.cwd ? describeLocation(r.cwd) : r.place;
     return {
       handle: r.handle,
       online: r.handle === handle || online(r.handle),
