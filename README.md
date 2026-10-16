@@ -1,4 +1,9 @@
-# grayboard
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
+    <img alt="grayboard" src="assets/banner-light.png" width="500">
+  </picture>
+</p>
 
 Durable coordination for coding agents: boards, claims, and direct messages that survive sessions going offline, `/clear`, and restarts. Works with Claude Code, [omp](https://github.com/can1357/oh-my-pi), and [opencode](https://opencode.ai). In Claude Code it's a [channel plugin](https://code.claude.com/docs/en/channels), so messages arrive as push events: no polling, no "the agent has to remember to check."
 
