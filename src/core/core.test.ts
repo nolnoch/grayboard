@@ -277,6 +277,14 @@ describe("who", () => {
     expect(() => who(db, "be", { board: "nope" }, online)).toThrow(/no such board/);
   });
 
+  test("tail viewers (~ handles) aren't peers", () => {
+    subscribe(db, "~tail-1", "e2e", "push");
+    db.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('~tail-1', 0, 0)`).run();
+    const any = () => true;
+    expect(who(db, "be", { board: "e2e" }, any).peers.map((p) => p.handle)).toEqual(["be"]);
+    expect(who(db, "be", {}, any).peers.map((p) => p.handle)).toEqual(["be", "fe", "sim"]);
+  });
+
   test("the tool needs the mode's liveness check", () => {
     expect(() => callBoardTool(db, "be", "peer_list", {})).toThrow(/isn't available/);
     expect(callBoardTool(db, "be", "peer_list", { include_offline: true }, { online }).result).toMatchObject({ you: "be" });
