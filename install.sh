@@ -11,7 +11,7 @@
 #   → also installs `grayboard-server`
 #
 # Overrides:
-#   GRAYBOARD_VERSION=v0.1.0   pin a release (default: latest)
+#   GRAYBOARD_VERSION=v1.0.0   pin a release (default: latest)
 #   INSTALL_DIR=/some/path     install dir   (default: ~/.local/bin)
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   INSTALL_SERVER=1           also fetch grayboard-server

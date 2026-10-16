@@ -438,7 +438,7 @@ Each binary is ~100 MB (Bun runtime + bundled JS). Bun cross-compiles via `--tar
 - With `INSTALL_SERVER=1`, also fetches `grayboard-server-<target>`. Used on the EC2 host alongside `INSTALL_DIR=/usr/local/bin`.
 - `chmod +x`, warns if `INSTALL_DIR` isn't on `PATH`.
 - Then runs `grayboard setup` on the terminal (`< /dev/tty`, since under `curl | bash` stdin is the script). Skipped for server installs, without a terminal, or with `GRAYBOARD_NO_SETUP=1`.
-- Overrides: `GRAYBOARD_VERSION=v0.1.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`, `INSTALL_SERVER=1`, `GRAYBOARD_NO_SETUP=1`.
+- Overrides: `GRAYBOARD_VERSION=v1.0.0`, `INSTALL_DIR=/some/path`, `GRAYBOARD_REPO=fork/grayboard`, `INSTALL_SERVER=1`, `GRAYBOARD_NO_SETUP=1`.
 
 `grayboard setup` picks the mode (signs in for a server; for local, removes the credentials file after confirming), then registers `grayboard mcp` with `claude mcp add --scope user` (remove-then-add, so re-running is safe), and prints the launch command.
 

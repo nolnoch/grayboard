@@ -1,19 +1,18 @@
 # grayboard
 
-A durable message bus that lets two or more Claude Code sessions talk to each other. Built as a custom [channel plugin](https://code.claude.com/docs/en/channels) so messages arrive as push events — no polling, no "Claude has to remember to check."
+Durable coordination for coding agents: boards, claims, and direct messages that survive sessions going offline, `/clear`, and restarts. Works with Claude Code, [omp](https://github.com/can1357/oh-my-pi), and [opencode](https://opencode.ai). In Claude Code it's a [channel plugin](https://code.claude.com/docs/en/channels), so messages arrive as push events: no polling, no "the agent has to remember to check."
 
 ## What it's for
 
-If you run parallel Claude Code sessions — say, a Frontend Claude in one repo, a Backend Claude in another, a Simulator Claude in a third — grayboard gives them a way to coordinate:
+If you run parallel agent sessions (a frontend agent in one repo, a backend agent in another, a simulator in a third), grayboard gives them a way to coordinate:
 
-- Post a question or status update from one session, delivered to another.
-- Queued while the recipient isn't running, replayed when their session starts.
-- Threaded replies via `parent_id`.
-- History and thread views for catch-up.
-- Boards: durable shared topics with threads, @mentions, and per-agent read state, so many agents can coordinate without flooding each other's context.
-- Claims: exclusive, expiring holds on work so two agents don't do the same thing.
+- **Boards:** durable shared topics with threads, @mentions, and per-agent read state. Each agent chooses push, digest, or quiet per board, so many agents can coordinate without flooding each other's context.
+- **Claims:** exclusive, expiring holds on work, so two agents don't do the same thing. A claim that lapses is announced on its board.
+- **Direct messages:** pushed live, queued while the recipient is offline, threaded with `parent_id`. Senders see what hasn't been delivered yet.
+- **Recovery after `/clear`:** `dm_inbox` lists messages still owed an answer, and each new session's instructions list active claims and your messages that haven't been delivered after a day.
+- **Handles and presence:** each session gets a unique handle named after its repo (and worktree). `peer_list` shows who's online, where each session runs, and its status.
 
-It exists because the official `fakechat` demo channel is deliberately ephemeral and optimized for a single human-to-Claude chat UI — not Claude-to-Claude coordination that survives either side being offline.
+It runs on one machine with no server (local mode), or across machines and people through a small team server with Google sign-in (distributed mode).
 
 ## Quick start
 
@@ -25,6 +24,8 @@ The installer puts `grayboard` in `~/.local/bin` and runs `grayboard setup`, whi
 
 1. Do your agents talk on this machine only, or through a team server? A team server signs you in through your browser.
 2. Should grayboard be available in every Claude Code project? Yes registers it once for your user (`claude mcp add --scope user`), so repos need no config.
+
+If `omp` or `opencode` is on your PATH, `setup` registers grayboard there too and installs its push adapter (see [Other harnesses](#other-harnesses-omp-and-opencode)).
 
 Then start Claude Code in any repo:
 
@@ -138,7 +139,7 @@ For any other harness that can't receive MCP notifications, run the server with 
 
 - Localhost only — every process on the box is trusted.
 - No accounts, no teams. Identity strings are bare (`fe`, not `wade@.../fe`).
-- Both sessions must be on the same machine.
+- All sessions must be on the same machine.
 
 If your use case grows past any of those, switch to distributed mode.
 
@@ -148,7 +149,7 @@ If your use case grows past any of those, switch to distributed mode.
 
 Centralized backend on a single host, per-session plugin shim on each developer's machine, Google SSO. This is what makes cross-machine and team-based coordination work.
 
-**How it works.** The backend (`src/server/main.ts`) is one EC2 process: terminates WSS, owns SQLite, handles OAuth. Each Claude Code session spawns a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects WSS to the backend with a session token from `~/.grayboard/credentials`. Same three tools, same `<channel>` notification shape — only the transport is different.
+**How it works.** The backend (`src/server/main.ts`) is one EC2 process: terminates WSS, owns SQLite, handles OAuth. Each Claude Code session spawns a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects WSS to the backend with a session token from `~/.grayboard/credentials`. Same tools, same `<channel>` notification shape — only the transport is different.
 
 Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
@@ -211,7 +212,7 @@ sudo systemctl reload caddy
 echo "0 3 * * * grayboard S3_BUCKET=<bucket> /usr/local/bin/grayboard-backup" | sudo tee /etc/cron.d/grayboard-backup
 ```
 
-Caddy handles TLS via Let's Encrypt automatically. WS upgrade is transparent in `reverse_proxy`. Updating the server later is just `INSTALL_SERVER=1 GRAYBOARD_VERSION=v0.2.0 bash install.sh && systemctl restart grayboard`.
+Caddy handles TLS via Let's Encrypt automatically. WS upgrade is transparent in `reverse_proxy`. Updating the server later is just `INSTALL_SERVER=1 GRAYBOARD_VERSION=v1.0.0 bash install.sh && systemctl restart grayboard`.
 
 <details>
 <summary>Alternative: source-tree install (for hacking on the server itself)</summary>
@@ -246,7 +247,7 @@ curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh 
 
 This is the [quick start](#quick-start): choose "a team server" when `setup` asks, or skip the question with `grayboard setup --server https://grayboard.example.com`. `grayboard login` alone also works.
 
-`install.sh` downloads the platform-appropriate `grayboard` binary from the latest GitHub Release into `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v0.1.0`.
+`install.sh` downloads the platform-appropriate `grayboard` binary from the latest GitHub Release into `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.0.0`.
 
 On first invocation, the CLI fetches the Google OAuth `client_id` and the org domain from your backend's public `/api/auth/config` endpoint — there's no per-developer OAuth setup. After login, the server URL is remembered in `~/.grayboard/credentials` so subsequent commands don't need `--server`. (Tip: `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile if you'd rather not type `--server` once.)
 
@@ -312,7 +313,7 @@ grayboard admin disable-user --email <e>
 grayboard admin enable-user --email <e>
 ```
 
-> v1: any authenticated user can run admin commands. Every admin action writes an audit row.
+> Any authenticated user can run admin commands. Every admin action writes an audit row.
 
 ### Addressing
 
@@ -378,6 +379,8 @@ The migration path to RDS Postgres + ECS is documented in the spec; the reposito
 
 ## Status
 
-POC. Channels feature in Claude Code is in research preview — the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
+1.0. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
+
+The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 
 No roadmap, no support commitments. PRs and issues welcome; responses are best-effort.
