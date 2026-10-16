@@ -3,7 +3,7 @@ import { loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
-  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET",
+  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
 ];
 
 describe("loadConfig", () => {
@@ -32,5 +32,12 @@ describe("loadConfig", () => {
   test("dev auth starts without Google credentials", () => {
     process.env.GRAYBOARD_DEV_AUTH = "1";
     expect(loadConfig().devAuth).toBe(true);
+  });
+
+  test("GRAYBOARD_ADMINS is a trimmed, lowercased email list; unset means none", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().admins).toEqual([]);
+    process.env.GRAYBOARD_ADMINS = " Alice@Example.com, bob@example.com ,,";
+    expect(loadConfig().admins).toEqual(["alice@example.com", "bob@example.com"]);
   });
 });

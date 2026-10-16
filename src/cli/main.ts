@@ -467,17 +467,25 @@ teamCmd
 
 teamCmd
   .command("create <name>")
-  .description("Create a team (you are auto-added as a member)")
+  .description("Create a team (you are auto-added as a member; teams are invite-only)")
   .action(async (name: string) => {
     try { output(await makeClient().post("/api/teams", { name }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 
 teamCmd
-  .command("join <name>")
-  .description("Join a team")
-  .action(async (name: string) => {
-    try { output(await makeClient().post(`/api/teams/${name}/join`), globalJson()); }
+  .command("add <team> <email>")
+  .description("Add someone to a team you're in (they must have signed in once)")
+  .action(async (team: string, email: string) => {
+    try { output(await makeClient().post(`/api/teams/${team}/add`, { email }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+teamCmd
+  .command("remove <team> <email>")
+  .description("Remove someone from a team you're in")
+  .action(async (team: string, email: string) => {
+    try { output(await makeClient().post(`/api/teams/${team}/remove`, { email }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 
@@ -501,7 +509,7 @@ teamCmd
 
 const adminCmd = program
   .command("admin")
-  .description("Admin commands (v1: any authenticated user; all actions are logged)");
+  .description("Admin commands (emails in the server's GRAYBOARD_ADMINS only; all actions are logged)");
 
 adminCmd
   .command("revoke-session")

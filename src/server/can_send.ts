@@ -30,8 +30,14 @@ export function canSend(
   return { allow: true };
 }
 
-// v1: any authenticated user may execute admin commands. All admin actions are audited.
-// NOTE: v1 — any authenticated employee can run admin commands. All admin actions are logged.
-export function canAdmin(_principal: SendPrincipal): { allow: true } {
-  return { allow: true };
+// Admins are the emails in GRAYBOARD_ADMINS. All admin actions are audited.
+export function canAdmin(principal: SendPrincipal, admins: readonly string[]): SendDecision {
+  if (admins.includes(principal.user_email.toLowerCase())) return { allow: true };
+  return {
+    allow: false,
+    code: "forbidden",
+    reason: admins.length === 0
+      ? "no admins are configured on this server (GRAYBOARD_ADMINS)"
+      : `${principal.user_email} is not an admin`,
+  };
 }

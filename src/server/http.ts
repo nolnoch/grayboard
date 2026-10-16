@@ -1,4 +1,4 @@
-import type { Repo } from "./db.ts";
+import type { Repo, Team } from "./db.ts";
 import type { Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
@@ -21,6 +21,7 @@ function jsonErr(code: string, message: string, status: number): Response {
 function notFound(): Response { return jsonErr("not_found", "not found", 404); }
 function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 400); }
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
+function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
 function requireAuth(req: Request, repo: Repo): AuthedUser | null {
   const raw = extractBearer(req);
@@ -32,7 +33,7 @@ async function parseBody<T>(req: Request): Promise<T | null> {
   try { return (await req.json()) as T; } catch { return null; }
 }
 
-function makePrincipal(authed: AuthedUser, repo: Repo): SendPrincipal | null {
+function makePrincipal(authed: AuthedUser): SendPrincipal {
   // Used only for canAdmin — identity_id can be 0 since admin doesn't need it
   return {
     user_id:       authed.user_id,
@@ -163,18 +164,19 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
   return json({ name: team.name, created_at: team.created_at }, 201);
 }
 
-function teamJoin(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+// Teams are invite-only: members add people. Older CLIs still offer `team join`.
+function teamJoin(): Response {
+  return forbidden("teams are invite-only; ask a member to run: grayboard team add <team> <your email>");
+}
+
+// A team the caller isn't in reads as not found, like its board.
+function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | null {
   const team = repo.teams.findByName(teamName.toLowerCase());
-  if (!team) return notFound();
-  repo.teams.addMember(team.id, authed.user_id);
-  // Every identity follows #<team> in digest mode, starting at the tip.
-  onTeamJoined(db, repo, team, authed.user_id, authed.user_email);
-  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: authed.user_email });
-  return json({ ok: true });
+  return team && repo.teams.isMember(team.id, authed.user_id) ? team : null;
 }
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
-  const team = repo.teams.findByName(teamName.toLowerCase());
+  const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
   repo.teams.removeMember(team.id, authed.user_id);
   onTeamLeft(db, repo, team, authed.user_id, authed.user_email);
@@ -182,8 +184,38 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb)
   return json({ ok: true });
 }
 
-function teamMembers(teamName: string, _authed: AuthedUser, repo: Repo): Response {
-  const team = repo.teams.findByName(teamName.toLowerCase());
+async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+  const team = memberTeam(teamName, authed, repo);
+  if (!team) return notFound();
+  const body = await parseBody<{ email: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  const email = body.email.toLowerCase();
+  const user  = repo.users.findByEmail(email);
+  if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
+  repo.teams.addMember(team.id, user.id);
+  onTeamJoined(db, repo, team, user.id, email);
+  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email });
+  return json({ ok: true });
+}
+
+async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+  const team = memberTeam(teamName, authed, repo);
+  if (!team) return notFound();
+  const body = await parseBody<{ email: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  const email = body.email.toLowerCase();
+  const user  = repo.users.findByEmail(email);
+  if (!user || !repo.teams.isMember(team.id, user.id)) {
+    return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
+  }
+  repo.teams.removeMember(team.id, user.id);
+  onTeamLeft(db, repo, team, user.id, email);
+  writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email });
+  return json({ ok: true });
+}
+
+function teamMembers(teamName: string, authed: AuthedUser, repo: Repo): Response {
+  const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
   return json(repo.teams.listMembers(team.id));
 }
@@ -258,11 +290,17 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
   const teamOp = path.match(/^\/api\/teams\/([^/]+)\/([^/]+)$/);
   if (teamOp) {
     const [, teamName, action] = teamOp;
-    if (action === "join"    && method === "POST") return teamJoin(teamName, authed, repo, db);
+    if (action === "join"    && method === "POST") return teamJoin();
     if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db);
+    if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db);
+    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo);
   }
 
+  if (path.startsWith("/api/admin/")) {
+    const decision = canAdmin(makePrincipal(authed), config.admins);
+    if (!decision.allow) return forbidden(decision.reason);
+  }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo);
