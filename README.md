@@ -253,7 +253,7 @@ Point Caddy at your hostname, and write the env file (mode `0600`; systemd reads
 ```bash
 HOST=grayboard.example.com                   # your hostname
 sudo sed -i "s/grayboard.example.com/$HOST/" /etc/caddy/Caddyfile
-sudo install -m 600 /dev/null /etc/grayboard/env
+[ -f /etc/grayboard/env ] || sudo install -m 600 /dev/null /etc/grayboard/env
 sudoedit /etc/grayboard/env
 ```
 
@@ -272,7 +272,7 @@ GRAYBOARD_DEV_AUTH=1
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now grayboard
-sudo systemctl reload caddy
+sudo systemctl restart caddy
 journalctl -u grayboard -n 20 --no-pager     # "grayboard server listening on port 8080"
 curl -s localhost:8080/healthz               # {"ok":true}
 ```
@@ -339,7 +339,7 @@ sudo systemctl start grayboard
 curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
 ```
 
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions read the token when they start, so reconnect them (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
+**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions read the token when they start and still hold the deleted dev-auth one, so reconnect them (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
 
 ### 7. Backups (optional)
 
@@ -417,6 +417,7 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 | `login` returns 403 after Google succeeds | The account isn't on `GRAYBOARD_ORG_DOMAIN` (`hd` mismatch), or its email isn't verified |
 | `login --dev` returns 404 | Dev auth is off (`GRAYBOARD_DEV_AUTH=1` not set) |
 | `/mcp` shows grayboard failed: `identity "<name>" is already in use` | Another live session holds that identity; see [below](#one-live-session-per-identity) |
+| `/mcp` or tools fail with `unauthenticated` (401) | The session's token is gone from the server, e.g. after the step 6 database reset; `grayboard login`, then reconnect the session |
 | Tools fail with "signed out" | You ran `grayboard logout`; sign in again, or `grayboard setup --local` |
 | Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard`, or isn't on a claude.ai login |
 
