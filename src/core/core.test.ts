@@ -285,6 +285,13 @@ describe("who", () => {
     expect(who(db, "be", {}, any).peers.map((p) => p.handle)).toEqual(["be", "fe", "sim"]);
   });
 
+  test("a post wakes tail viewers but doesn't report them as notified", () => {
+    subscribe(db, "~tail-1", "e2e", "push");
+    const out = callBoardTool(db, "fe", "board_post", { board: "e2e", body: "hi" });
+    expect(out.wake).toContain("~tail-1");
+    expect((out.result as { notified: string[] }).notified).not.toContain("~tail-1");
+  });
+
   test("the tool needs the mode's liveness check", () => {
     expect(() => callBoardTool(db, "be", "peer_list", {})).toThrow(/isn't available/);
     expect(callBoardTool(db, "be", "peer_list", { include_offline: true }, { online }).result).toMatchObject({ you: "be" });
