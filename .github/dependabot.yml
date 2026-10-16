@@ -1,0 +1,10 @@
+# New pi releases arrive as PRs, so the Test workflow runs the pi adapter's
+# end-to-end test against them before anyone updates.
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: "@earendil-works/pi-coding-agent"
