@@ -13,9 +13,9 @@ export type Config = {
 export function loadConfig(): Config {
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
-  if (devAuth && process.env.GOOGLE_CLIENT_SECRET) {
+  if (devAuth && process.env.GOOGLE_OAUTH_CLIENT_SECRET) {
     throw new Error(
-      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_CLIENT_SECRET (prevents prod misconfig)",
+      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET (prevents prod misconfig)",
     );
   }
 
