@@ -144,7 +144,7 @@ Sessions never auto-expire (`expires_at: null`). Rotation = explicit logout or a
 
 ### 4.4 Dev-mode auth
 
-`GRAYBOARD_DEV_AUTH=1` enables `POST /api/auth/dev-login { email }` which mints a session without Google. Server **refuses to start** if both `GRAYBOARD_DEV_AUTH=1` and `GOOGLE_CLIENT_SECRET` are set (`config.ts:16-20`). CLI: `grayboard login --dev <email>`.
+`GRAYBOARD_DEV_AUTH=1` enables `POST /api/auth/dev-login { email }` which mints a session without Google. Server **refuses to start** if both `GRAYBOARD_DEV_AUTH=1` and `GOOGLE_OAUTH_CLIENT_SECRET` are set (`config.ts:16-20`). CLI: `grayboard login --dev <email>`.
 
 ### 4.5 Logout
 
@@ -508,7 +508,7 @@ Items the spec *explicitly* told us to do that ARE done:
 - ✅ Server-side OAuth code exchange with Google; client_secret never on CLI (§5.2).
 - ✅ Sessions never expire; SHA-256 hashed at rest; `gbrd_v1_` prefix (§5.3).
 - ✅ Logout doesn't kick live WSs (§5.5).
-- ✅ Dev-auth refuses to coexist with `GOOGLE_CLIENT_SECRET` (§5.9).
+- ✅ Dev-auth refuses to coexist with `GOOGLE_OAUTH_CLIENT_SECRET` (§5.9).
 - ✅ `canSend` is sync, pure, tagged-union return, `ctx` carries the seam (§6.1).
 - ✅ All sends route through `canSend` — exactly two call sites in `ws.ts` (§6.3).
 - ✅ Repository facade in `db.ts`; the only file in the v1 tree that imports `bun:sqlite` (§13). `src/local/` is excluded from the isolation test by design.
