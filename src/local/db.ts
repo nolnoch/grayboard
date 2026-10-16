@@ -52,7 +52,9 @@ function openDb(): Database {
       SELECT author, created_at FROM posts
       UNION ALL
       SELECT handle, 0 FROM subscriptions
-    ) GROUP BY h;
+    ) WHERE h NOT LIKE '~%' GROUP BY h;
+    -- Earlier builds backfilled tail viewers (~tail-<pid>) as peers.
+    DELETE FROM handles WHERE name LIKE '~%';
   `);
   return db;
 }

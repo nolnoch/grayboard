@@ -386,6 +386,10 @@ export type Peer = {
   status?: string;
   status_age?: string;
 };
+// Read-only viewers (`grayboard tail`) subscribe under "~" handles, which no
+// identity can have. They aren't agents: keep them out of the roster.
+export const isViewer = (handle: string): boolean => handle.startsWith("~");
+
 export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
 
 // The roster: every handle that has connected (the `handles` table), or a
@@ -417,7 +421,7 @@ export function who(
       .all() as typeof rows;
   }
   const now = Date.now();
-  const all: Peer[] = rows.map((r) => {
+  const all: Peer[] = rows.filter((r) => !isViewer(r.handle)).map((r) => {
     const where = r.cwd ? describeLocation(r.cwd) : null;
     return {
       handle: r.handle,
