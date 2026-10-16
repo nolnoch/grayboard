@@ -368,6 +368,26 @@ test("senders see what hasn't reached an offline peer", async () => {
   expect(await delivered()).toEqual([true, true]);
 });
 
+test("hello_ok carries active claims and DMs undelivered after a day", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const b = new Client(bob, "fe");
+  await b.connect();
+  await closeAndSettle(b);
+  const a = new Client(alice, "be");
+  expect((await a.connect()).notices).toBeUndefined();
+  await a.call("claim_take", { key: "ticket:ENG-2", note: "on it" });
+  const old = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "stale" });
+  await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fresh" });
+  app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
+  await closeAndSettle(a);
+
+  const notices: string[] = (await new Client(alice, "be").connect()).notices;
+  expect(notices).toHaveLength(2);
+  expect(notices[0]).toContain("ticket:ENG-2 (held by alice@example.com/be until");
+  expect(notices[1]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
+});
+
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

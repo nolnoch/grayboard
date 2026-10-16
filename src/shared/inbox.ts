@@ -61,3 +61,22 @@ export const DM_ACK_TOOL = {
     required: ["id"],
   },
 };
+
+// Sent direct messages still queued a day later, so a stale "told them" in a
+// handoff gets caught when the session starts.
+export const STALE_UNDELIVERED_MS = 86_400_000;
+
+export function undeliveredInstruction(
+  stale: { recipient: string; n: number; oldest_id: number }[],
+  lastSeen: (handle: string) => number | null,
+  now = Date.now(),
+): string[] {
+  if (stale.length === 0) return [];
+  const list = stale
+    .map((u) => {
+      const seen = lastSeen(u.recipient);
+      return `${u.recipient}: ${u.n} since message_id ${u.oldest_id}${seen ? ` (last seen ${age(now - seen)} ago)` : ""}`;
+    })
+    .join("; ");
+  return [`Direct messages you sent that still haven't reached the recipient after 24h: ${list}. Don't count them as read.`];
+}

@@ -66,7 +66,7 @@ async function session(token: string, identity: string, extraEnv: Record<string,
   return { c, pushes, call };
 }
 
-test("messages and board posts queued while offline are pushed when the session starts", async () => {
+test("queued messages and posts are pushed at session start; instructions list claims", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   const be = await session(alice, "be");
@@ -78,10 +78,12 @@ test("messages and board posts queued while offline are pushed when the session 
   const fe = await session(bob, "fe");
   await fe.call("dm_send", { to: "alice@example.com/be", body: "queued dm" });
   await fe.call("board_post", { board: "e2e", body: "queued post" });
+  await fe.call("claim_take", { key: "ticket:ENG-3" });
 
   const again = await session(alice, "be");
   await Bun.sleep(500);
   expect(again.pushes.map((p) => p.content).sort()).toEqual(["queued dm", "queued post"]);
+  expect(again.c.getInstructions()).toContain("ticket:ENG-3 (held by bob@example.com/fe");
 }, 20_000);
 
 test("BUS_PUSH=off runs beside the session that owns the identity, for tools only", async () => {

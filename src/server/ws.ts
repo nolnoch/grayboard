@@ -18,10 +18,10 @@ import {
   type CoreDb,
   type PendingRef,
 } from "../core/boards.ts";
-import { callBoardTool, isBoardTool } from "../core/tools.ts";
-import { claimExpiryTimer } from "../core/claims.ts";
+import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
-import { inboxDays, unanswered } from "../shared/inbox.ts";
+import { STALE_UNDELIVERED_MS, inboxDays, unanswered, undeliveredInstruction } from "../shared/inbox.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -292,6 +292,11 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
     user_email: authed.user_email,
     teams,
   };
+  const notices = [
+    ...claimsInstruction(listClaims(db, undefined, full)),
+    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+  ];
+  if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;
 

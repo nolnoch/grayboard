@@ -33,7 +33,15 @@ import {
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import { checkArgs, updateNotice } from "../shared/toolguard.ts";
-import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, inboxDays, unanswered } from "../shared/inbox.ts";
+import {
+  DM_ACK_TOOL,
+  DM_INBOX_INSTRUCTION,
+  DM_INBOX_TOOL,
+  STALE_UNDELIVERED_MS,
+  inboxDays,
+  unanswered,
+  undeliveredInstruction,
+} from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
@@ -43,20 +51,6 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // separate adapter owns the wakeup socket and delivery. Draining here would
 // consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
-
-// Sent direct messages still queued a day later, so a stale "told them" in a
-// handoff gets caught when the session starts.
-function undeliveredInstruction(): string[] {
-  const stale = undeliveredFrom(IDENTITY, Date.now() - 86_400_000);
-  if (stale.length === 0) return [];
-  const list = stale
-    .map((u) => {
-      const seen = lastSeen(db, u.recipient);
-      return `${u.recipient}: ${u.n} since message_id ${u.oldest_id}${seen ? ` (last seen ${age(Date.now() - seen)} ago)` : ""}`;
-    })
-    .join("; ");
-  return [`Direct messages you sent that still haven't reached the recipient after 24h: ${list}. Don't count them as read.`];
-}
 
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
@@ -71,7 +65,7 @@ const mcp = new Server(
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...claimsInstruction(listClaims(db)),
-      ...undeliveredInstruction(),
+      ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
   },

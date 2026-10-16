@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk } from "../shared/protocol.ts";
+import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import { checkArgs, updateNotice } from "../shared/toolguard.ts";
@@ -52,27 +52,9 @@ const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
 
-const server = new Server(
-  { name: "grayboard", version: pkg.version },
-  {
-    capabilities: {
-      experimental: { "claude/channel": {} },
-      tools: {},
-    },
-    instructions: [
-      `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
-      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
-      DM_INBOX_INSTRUCTION,
-      ...BOARD_INSTRUCTIONS,
-      `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
-      `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
-    ].join(" "),
-  },
-);
-
 // ── WS client setup ───────────────────────────────────────────────────────────
 
-const notify = (params: { content: string; meta: Record<string, string> }) =>
+const notify = (params: { content: string; meta: Record<string, string> }): Promise<void> =>
   server.notification({ method: "notifications/claude/channel", params });
 
 const client = new GrayboardClient(
@@ -95,10 +77,10 @@ const client = new GrayboardClient(
 client.connect();
 
 // Wait for hello_ok before the MCP handshake, so a refused identity or an
-// unreachable server shows as a failed server in the client. Keep this well
-// under the client's own startup timeout (30s in Claude Code) so it's an
-// error, not a timeout.
-await Promise.race([
+// unreachable server shows as a failed server in the client, and so the
+// instructions can carry its notices. Keep this well under the client's own
+// startup timeout (30s in Claude Code) so it's an error, not a timeout.
+const hello: HelloOk = await Promise.race([
   client.ready(),
   new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error(`no answer from grayboard server at ${serverUrl} within 10s`)), 10_000),
@@ -107,6 +89,27 @@ await Promise.race([
   console.error(`[grayboard] ${e.message}`);
   process.exit(1);
 });
+
+// Built after hello_ok; pushes reach notify only after this runs (each WS
+// message is its own task, and nothing awaits between here and connect).
+const server = new Server(
+  { name: "grayboard", version: pkg.version },
+  {
+    capabilities: {
+      experimental: { "claude/channel": {} },
+      tools: {},
+    },
+    instructions: [
+      `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
+      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
+      DM_INBOX_INSTRUCTION,
+      ...BOARD_INSTRUCTIONS,
+      ...(hello.notices ?? []),
+      `Handles are user@org/name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
+      `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
+    ].join(" "),
+  },
+);
 
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 

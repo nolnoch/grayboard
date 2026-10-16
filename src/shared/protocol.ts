@@ -31,7 +31,12 @@ export type ClientMessage =
   | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest;
 
 // Server -> Client
-export type HelloOk     = { type: "hello_ok";   req_id: string; identity_full: string; user_email: string; teams: string[] };
+export type HelloOk     = {
+  type: "hello_ok"; req_id: string; identity_full: string; user_email: string; teams: string[];
+  // Sentences for the session's MCP instructions: active claims, and direct
+  // messages you sent that still haven't arrived a day later.
+  notices?: string[];
+};
 export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
