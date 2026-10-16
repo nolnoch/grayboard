@@ -76,6 +76,9 @@ const mcp = new Server(
 const TOOLS = [
   {
     name: "dm_send",
+    // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
+    // missed that the reply tool exists. Same for dm_inbox and board_post.
+    _meta: { "anthropic/alwaysLoad": true },
     description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
       type: "object",

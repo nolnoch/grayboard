@@ -248,3 +248,10 @@ test("a message queued while offline is pushed when the session starts", async (
   await Bun.sleep(500);
   expect(be.pushes).toEqual(["queued dm"]);
 }, 20_000);
+
+test("the reply and recovery tools ask Claude Code to load them upfront", async () => {
+  const c = await start("be");
+  const { tools } = await c.listTools();
+  const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
+  expect(upfront).toEqual(["board_post", "dm_inbox", "dm_send"]);
+}, 20_000);

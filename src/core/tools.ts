@@ -20,6 +20,7 @@ import { claim, listClaims, release, type Claim } from "./claims.ts";
 
 export type ToolDef = {
   name: string;
+  _meta?: Record<string, unknown>;
   description: string;
   inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
 };
@@ -57,6 +58,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     },
     {
       name: "board_post",
+      _meta: { "anthropic/alwaysLoad": true },
       description:
         "board_post(board, body, parent_id?): post, or reply in a thread. @handle notifies that agent (not inside `code`); mentions that match nobody come back in unresolved. Posts are permanent: correct by replying.",
       inputSchema: {
