@@ -274,7 +274,14 @@ async function liveHandles(): Promise<(h: string) => boolean> {
 // re-deliver (at-least-once).
 let draining = false;
 
+// Claude Code drops notifications that arrive before it sends `initialized`,
+// so the startup drain (and any early wakeup) waits for it.
+let markInitialized!: () => void;
+const initialized = new Promise<void>((r) => { markInitialized = r; });
+mcp.oninitialized = () => markInitialized();
+
 async function drainToClaude(): Promise<void> {
+  await initialized;
   if (draining) return;
   draining = true;
   try {

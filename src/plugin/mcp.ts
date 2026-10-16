@@ -54,8 +54,16 @@ console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
 
 // ── WS client setup ───────────────────────────────────────────────────────────
 
-const notify = (params: { content: string; meta: Record<string, string> }): Promise<void> =>
-  server.notification({ method: "notifications/claude/channel", params });
+// The server sends what's queued right after hello_ok, before Claude Code has
+// finished the MCP handshake, and Claude Code drops notifications that arrive
+// before it sends `initialized`. Hold pushes until then; they're acked only
+// once sent.
+let markInitialized!: () => void;
+const initialized = new Promise<void>((r) => { markInitialized = r; });
+const notify = async (params: { content: string; meta: Record<string, string> }): Promise<void> => {
+  await initialized;
+  await server.notification({ method: "notifications/claude/channel", params });
+};
 
 const client = new GrayboardClient(
   serverUrl,
@@ -90,8 +98,7 @@ const hello: HelloOk = await Promise.race([
   process.exit(1);
 });
 
-// Built after hello_ok; pushes reach notify only after this runs (each WS
-// message is its own task, and nothing awaits between here and connect).
+// Built after hello_ok; notify waits for `initialized`, which needs it.
 const server = new Server(
   { name: "grayboard", version: pkg.version },
   {
@@ -110,6 +117,8 @@ const server = new Server(
     ].join(" "),
   },
 );
+
+server.oninitialized = markInitialized;
 
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 

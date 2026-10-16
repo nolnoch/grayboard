@@ -39,6 +39,23 @@ async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp"
   return c;
 }
 
+// Like start, collecting channel notifications. Like Claude Code, it drops
+// any that arrive before it has sent `initialized`.
+async function startCollecting(identity: string): Promise<{ c: Client; pushes: string[] }> {
+  const pushes: string[] = [];
+  const c = new Client({ name: "test", version: "0" });
+  let initialized = false;
+  c.fallbackNotificationHandler = async (n) => {
+    if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
+  };
+  await c.connect(
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity), stderr: "ignore" }),
+  );
+  initialized = true;
+  open.push(c);
+  return { c, pushes };
+}
+
 async function stop(c: Client): Promise<void> {
   open.splice(open.indexOf(c), 1);
   await c.close();
@@ -221,4 +238,13 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
   await expect(call(fe, "dm_ack", { id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
+}, 20_000);
+
+test("a message queued while offline is pushed when the session starts", async () => {
+  await stop(await start("be"));
+  const fe = await start("fe");
+  expect((await call(fe, "dm_send", { to: "be", body: "queued dm" })).delivered_now).toBe(false);
+  const be = await startCollecting("be");
+  await Bun.sleep(500);
+  expect(be.pushes).toEqual(["queued dm"]);
 }, 20_000);
