@@ -346,6 +346,28 @@ test("direct messages still deliver live", async () => {
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
 });
 
+test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
+  const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
+  const a = new Client(alice, "be");
+  const a2 = new Client(alice, "be-stream");
+  const b = new Client(bob, "be-stream");
+  const b2 = new Client(bob, "fe");
+  const c = new Client(carol, "fe");
+  await Promise.all([a, a2, b, b2, c].map((x) => x.connect()));
+
+  // alice and bob both have be-stream: alice's bare name means her own.
+  expect(await a.request({ type: "send", recipient: "be-stream", body: "mine" })).toMatchObject({ type: "send_ok" });
+  expect((await a2.next((m) => m.type === "push")).message.body).toBe("mine");
+  // carol has no be: the only be is alice's.
+  expect(await c.request({ type: "send", recipient: "be", body: "only one" })).toMatchObject({ type: "send_ok" });
+  expect((await a.next((m) => m.type === "push")).message.body).toBe("only one");
+  // alice has no fe, and bob and carol each have one: ambiguous.
+  const amb = await a.request({ type: "send", recipient: "fe", body: "?" });
+  expect(amb).toMatchObject({ type: "error", code: "not_found" });
+  expect(amb.message).toContain("bob@example.com/fe, carol@example.com/fe");
+  expect(await a.request({ type: "send", recipient: "nobody", body: "?" })).toMatchObject({ type: "error", code: "not_found" });
+});
+
 test("senders see what hasn't reached an offline peer", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

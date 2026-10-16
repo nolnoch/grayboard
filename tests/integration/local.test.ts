@@ -234,9 +234,9 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect((await call(be, "dm_inbox")).unanswered.map((m: any) => m.id)).toEqual([q.message_id, fyi.message_id, later.message_id]);
 
   await call(be, "dm_send", { to: "fe", body: "answer", parent_id: q.message_id });
-  await call(be, "dm_ack", { id: fyi.message_id });
+  await call(be, "dm_ack", { message_id: fyi.message_id });
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
-  await expect(call(fe, "dm_ack", { id: fyi.message_id })).rejects.toThrow(/no message/);
+  await expect(call(fe, "dm_ack", { message_id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
 }, 20_000);
 
@@ -253,7 +253,7 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   const c = await start("be");
   const { tools } = await c.listTools();
   const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
-  expect(upfront).toEqual(["board_post", "dm_inbox", "dm_send"]);
+  expect(upfront).toEqual(["board_post", "dm_ack", "dm_inbox", "dm_send"]);
 }, 20_000);
 
 test("a Claude Code session started without a channels flag is warned that pushes are off", async () => {

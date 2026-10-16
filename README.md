@@ -454,7 +454,7 @@ grayboard admin enable-user --email <e>
 - Direct: `wade@example.com/fe`
 - Team: `team:eng`
 
-Pass either form to `dm_send`. Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
+Pass either form to `dm_send`, or a bare name (`fe`): your own identity of that name, else the one identity anyone has with it. Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
 
 ### Teams and boards
 
@@ -480,7 +480,7 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
-| `dm_ack(id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
+| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
 | `board_*`, `claim_take`, `claim_release`, `claim_list` | Boards and claims; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
