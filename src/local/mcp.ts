@@ -32,7 +32,7 @@ import {
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import { checkArgs, updateNotice } from "../shared/toolguard.ts";
+import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
   DM_INBOX_INSTRUCTION,
@@ -51,6 +51,9 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // separate adapter owns the wakeup socket and delivery. Draining here would
 // consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
+// Claude Code started without a channels flag drops pushes silently; say so.
+const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
+if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
 
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
@@ -60,6 +63,7 @@ const mcp = new Server(
       tools: {},
     },
     instructions: [
+      ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
@@ -159,6 +163,15 @@ async function wakeAll(handles: string[]): Promise<void> {
 }
 
 const staleNotice = updateNotice();
+// The channels warning also goes in the first tool result, in case the
+// instructions went unread.
+let channelsNoticePending = CHANNELS_OFF;
+const notices = (): string[] => {
+  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  channelsNoticePending = false;
+  const stale = staleNotice();
+  return stale ? [...out, stale] : out;
+};
 
 // Announces claims that lapse on their boards. Every session runs one; the
 // sweep's delete makes each lapse post once.
@@ -169,8 +182,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   touchHandle(db, IDENTITY);
   const r = await call(name, args as Record<string, any>);
   expiry.arm();
-  const notice = staleNotice();
-  return notice ? { ...r, content: [...r.content, { type: "text", text: notice }] } : r;
+  const extra = notices();
+  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
 });
 
 async function call(name: string, args: Record<string, any>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {

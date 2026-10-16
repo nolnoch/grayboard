@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
 
 type Tool = { name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } };
@@ -47,4 +47,34 @@ export function updateNotice(): () => string | null {
       ? "Note: grayboard was updated after this session started, so these tools may be out of date. Ask the user to reconnect it (/mcp → grayboard → reconnect)."
       : null;
   };
+}
+
+export const CHANNELS_OFF_NOTICE =
+  "Warning: this Claude Code session was started without --dangerously-load-development-channels, so grayboard messages and board posts can't reach you as pushes; tools still work. Tell the user to restart the session with `claude --dangerously-load-development-channels server:grayboard` (add --resume to keep this conversation). Until then, check dm_inbox and board_read yourself.";
+
+/**
+ * True when the MCP client is a Claude Code session started without a
+ * channels flag: Claude Code then drops channel notifications silently. Claude
+ * Code sets CLAUDECODE=1 for the servers it starts, but that's inherited by
+ * anything it launches, so the parent must also be `claude` itself. Unknown
+ * (no parent command line) counts as not off.
+ */
+export function channelsOff(env: Record<string, string | undefined>, parentCmd: string | null): boolean {
+  if (env.CLAUDECODE !== "1" || !parentCmd) return false;
+  const argv0 = parentCmd.trim().split(/\s+/)[0] ?? "";
+  if (basename(argv0) !== "claude") return false;
+  return !/(^|\s)--(channels|dangerously-load-development-channels)(=|\s|$)/.test(parentCmd);
+}
+
+/** The parent process's command line, space-joined, or null if unreadable. */
+export function parentCommandLine(): string | null {
+  try {
+    if (process.platform === "linux") {
+      return readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").split("\0").join(" ").trim() || null;
+    }
+    const r = Bun.spawnSync(["ps", "-o", "args=", "-p", String(process.ppid)]);
+    return r.exitCode === 0 ? r.stdout.toString().trim() || null : null;
+  } catch {
+    return null;
+  }
 }

@@ -11,7 +11,7 @@ import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
-import { checkArgs, updateNotice } from "../shared/toolguard.ts";
+import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // ── credentials ───────────────────────────────────────────────────────────────
@@ -48,6 +48,9 @@ function loadCredentials(): Credentials {
 const identity = sessionIdentity();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
+// Claude Code started without a channels flag drops pushes silently; say so.
+const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
+if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
@@ -107,6 +110,7 @@ const server = new Server(
       tools: {},
     },
     instructions: [
+      ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
@@ -173,12 +177,21 @@ const text = (value: unknown) => ({
 });
 
 const staleNotice = updateNotice();
+// The channels warning also goes in the first tool result, in case the
+// instructions went unread.
+let channelsNoticePending = CHANNELS_OFF;
+const notices = (): string[] => {
+  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  channelsNoticePending = false;
+  const stale = staleNotice();
+  return stale ? [...out, stale] : out;
+};
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   const r = await call(name, args as Record<string, unknown>);
-  const notice = staleNotice();
-  return notice ? { ...r, content: [...r.content, { type: "text" as const, text: notice }] } : r;
+  const extra = notices();
+  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
 });
 
 async function call(name: string, a: Record<string, unknown>) {
