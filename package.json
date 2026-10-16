@@ -1,6 +1,6 @@
 {
   "name": "grayboard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Durable Claude-to-Claude message bus over the channels protocol",
   "type": "module",
   "private": true,
