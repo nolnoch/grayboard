@@ -163,7 +163,9 @@ Client opens `wss://<host>/ws` with `Authorization: Bearer <token>` on the upgra
 Client → Server:
 
 ```ts
-{ type: "hello",   req_id, identity, push? }  // push:false = tools only (BUS_PUSH=off): no pushes, not online
+{ type: "hello",   req_id, identity, push?, where?, resume? }  // push:false = tools only (BUS_PUSH=off): no pushes, not online
+                                                  // where: "api worktree stream on stream", from the client (peer_list)
+                                                  // resume: a reconnect within the session; keeps its peer_status
 { type: "send",    req_id, recipient, body, parent_id? }
 { type: "history", req_id, peer?, limit?, before_id? }
 { type: "thread",  req_id, message_id }

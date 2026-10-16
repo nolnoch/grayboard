@@ -13,6 +13,7 @@ import {
   pendingFor,
   post,
   refOf,
+  setPlace,
   startSession,
   touchHandle,
   type CoreDb,
@@ -151,7 +152,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false).catch((e) => {
+        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
@@ -224,7 +225,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   return { handlers, startPing, stopExpiry: expiry.stop };
 }
 
-async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean): Promise<void> {
+async function handleHello(
+  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false,
+): Promise<void> {
   const { repo, db, registry } = hub;
   const name = identityInput.toLowerCase();
   if (!isValidIdentityName(name)) {
@@ -273,7 +276,9 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
 
   if (push) {
     registry.set(full, ws);
-    startSession(db, full, null);
+    if (resume) touchHandle(db, full);
+    else startSession(db, full, null);
+    setPlace(db, full, where ?? null);
   } else {
     hub.toolsOnly.add(ws);
     touchHandle(db, full);

@@ -1,5 +1,6 @@
 import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
+import { describeLocation } from "../shared/identity.ts";
 
 // Both resolve once the item has been handed to the agent; it's acked after
 // that, so a failed handoff is resent on the next connection.
@@ -15,6 +16,7 @@ export class GrayboardClient {
   private dead      = false; // set on superseded; do not reconnect
 
   private helloData: HelloOk | null = null;
+  private wasReady  = false; // a later hello is a reconnect, not a new session
   private readyResolvers: Array<(err?: Error) => void> = [];
 
   constructor(
@@ -49,7 +51,14 @@ export class GrayboardClient {
 
     this.ws.onopen = () => {
       this.backoffMs = 1000; // reset backoff on success
-      this.send({ type: "hello", req_id: this.nextId(), identity: this.identity, ...(this.push ? {} : { push: false }) });
+      // Read each time, so a reconnect picks up a branch switch.
+      const where = describeLocation(process.cwd());
+      this.send({
+        type: "hello", req_id: this.nextId(), identity: this.identity,
+        ...(this.push ? {} : { push: false }),
+        ...(where ? { where } : {}),
+        ...(this.wasReady ? { resume: true } : {}),
+      });
     };
 
     this.ws.onmessage = (event) => {
@@ -76,6 +85,7 @@ export class GrayboardClient {
     switch (msg.type) {
       case "hello_ok":
         this.helloData = msg;
+        this.wasReady = true;
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
         break;

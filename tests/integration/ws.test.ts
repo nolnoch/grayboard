@@ -61,7 +61,7 @@ class Client {
   constructor(
     private token: string,
     private identity: string,
-    private opts: { pong?: boolean; push?: boolean } = {},
+    private opts: { pong?: boolean; push?: boolean; hello?: Record<string, unknown> } = {},
   ) {}
 
   // Resolves with hello_ok, or the error that refused the hello.
@@ -78,7 +78,7 @@ class Client {
       else this.inbox.push(m);
     };
     this.ws.onopen = () =>
-      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}) }));
+      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello }));
     return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
   }
 
@@ -224,6 +224,30 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   const s3 = new Client(alice, "sim");
   await s3.connect();
   await s3.none(boardPush);
+});
+
+test("peer_list shows where the client says it runs; a resumed hello keeps the status, a new session clears it", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const watcher = new Client(bob, "fe");
+  await watcher.connect();
+  const be = async () => (await watcher.call("peer_list", { include_offline: true })).result.peers.find((p: any) => p.handle === "alice@example.com/be");
+
+  const first = new Client(alice, "be", { hello: { where: "api worktree stream \n on stream" } });
+  await first.connect();
+  await first.call("peer_status", { text: "soaking" });
+  expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
+
+  await closeAndSettle(first);
+  const resumed = new Client(alice, "be", { hello: { where: "api worktree stream on main", resume: true } });
+  await resumed.connect();
+  expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
+
+  await closeAndSettle(resumed);
+  await new Client(alice, "be").connect();
+  const fresh = await be();
+  expect(fresh.where).toBeUndefined();
+  expect(fresh.status).toBeUndefined();
 });
 
 test("team boards: digests coalesce until read; team: is not a DM recipient", async () => {
