@@ -61,7 +61,7 @@ class Client {
   constructor(
     private token: string,
     private identity: string,
-    private opts: { pong?: boolean } = {},
+    private opts: { pong?: boolean; push?: boolean } = {},
   ) {}
 
   // Resolves with hello_ok, or the error that refused the hello.
@@ -78,7 +78,7 @@ class Client {
       else this.inbox.push(m);
     };
     this.ws.onopen = () =>
-      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity }));
+      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}) }));
     return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
   }
 
@@ -406,4 +406,26 @@ test("only a message's sender and recipient can read its thread or reply to it",
   expect(await a.request({ type: "send", recipient: "bob@example.com/fe", body: "x", parent_id: 99999 })).toMatchObject({
     type: "error",
   });
+});
+
+test("a tools-only connection works beside the live owner without taking its pushes", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const owner = new Client(alice, "be");
+  await owner.connect();
+  const tools = new Client(alice, "be", { push: false });
+  expect(await tools.connect()).toMatchObject({ type: "hello_ok" });
+  const b = new Client(bob, "fe");
+  await b.connect();
+
+  const sent = await b.request({ type: "send", recipient: "alice@example.com/be", body: "hi" });
+  expect(sent.delivered_now).toBe(true);
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("hi");
+  expect((await b.call("board_create", { name: "e2e", purpose: "x" })).type).toBe("call_ok");
+  expect((await tools.request({ type: "call", tool: "board_list", args: {} })).type).toBe("call_ok");
+  await tools.none((m) => m.type === "push" || m.type === "board_push");
+
+  await closeAndSettle(tools);
+  const peers = (await b.call("peer_list")).result.peers;
+  expect(peers.find((p: any) => p.handle === "alice@example.com/be")?.online).toBe(true);
 });

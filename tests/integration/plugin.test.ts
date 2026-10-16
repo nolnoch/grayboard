@@ -42,13 +42,13 @@ async function login(email: string): Promise<string> {
 }
 
 // A grayboard MCP session in server mode; collects channel notifications.
-async function session(token: string, identity: string) {
+async function session(token: string, identity: string, extraEnv: Record<string, string> = {}) {
   const pushes: { content: string; meta: Record<string, string> }[] = [];
   const c = new Client({ name: "test", version: "0" });
   c.fallbackNotificationHandler = async (n) => {
     if (n.method === "notifications/claude/channel") pushes.push(n.params as any);
   };
-  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity } as Record<string, string>;
+  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, ...extraEnv } as Record<string, string>;
   await c.connect(
     new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
   );
@@ -82,4 +82,17 @@ test("messages and board posts queued while offline are pushed when the session 
   const again = await session(alice, "be");
   await Bun.sleep(500);
   expect(again.pushes.map((p) => p.content).sort()).toEqual(["queued dm", "queued post"]);
+}, 20_000);
+
+test("BUS_PUSH=off runs beside the session that owns the identity, for tools only", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const owner = await session(alice, "be");
+  const tools = await session(alice, "be", { BUS_PUSH: "off" });
+  const fe = await session(bob, "fe");
+  expect((await fe.call("dm_send", { to: "alice@example.com/be", body: "hi" })).delivered_now).toBe(true);
+  expect((await tools.call("dm_inbox")).unanswered.map((m: any) => m.body)).toEqual(["hi"]);
+  await Bun.sleep(300);
+  expect(owner.pushes.map((p) => p.content)).toEqual(["hi"]);
+  expect(tools.pushes).toEqual([]);
 }, 20_000);

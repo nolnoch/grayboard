@@ -12,7 +12,9 @@ export type Message = {
 };
 
 // Client -> Server
-export type HelloRequest   = { type: "hello";   req_id: string; identity: string };
+// push: false is a tools-only connection beside the session that owns the
+// identity (a harness that can't show pushes): no pushes, not "online".
+export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean };
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
@@ -67,6 +69,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
   switch (m.type) {
     case "hello":
       assertStr(m, "req_id"); assertStr(m, "identity");
+      if (m.push !== undefined && typeof m.push !== "boolean") throw new Error("push must be boolean");
       return m as unknown as HelloRequest;
     case "send":
       assertStr(m, "req_id"); assertStr(m, "recipient"); assertStr(m, "body");

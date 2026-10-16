@@ -23,6 +23,8 @@ export class GrayboardClient {
     private readonly identity: string,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
+    // false: a tools-only connection that never receives pushes.
+    private readonly push = true,
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -47,7 +49,7 @@ export class GrayboardClient {
 
     this.ws.onopen = () => {
       this.backoffMs = 1000; // reset backoff on success
-      this.send({ type: "hello", req_id: this.nextId(), identity: this.identity });
+      this.send({ type: "hello", req_id: this.nextId(), identity: this.identity, ...(this.push ? {} : { push: false }) });
     };
 
     this.ws.onmessage = (event) => {

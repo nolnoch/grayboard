@@ -51,6 +51,8 @@ type Hub = {
   registry: Map<string, Ws>;
   // identity_full values with a hello currently probing the existing holder
   probing: Set<string>;
+  // Tools-only connections (hello push: false): pinged, never pushed to.
+  toolsOnly: Set<Ws>;
   repo: Repo;
   db: CoreDb;
   probeMs: number;
@@ -110,7 +112,7 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 }
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
-  const hub: Hub = { registry: new Map(), probing: new Set(), repo, db, probeMs: opts.probeMs ?? 2000 };
+  const hub: Hub = { registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db, probeMs: opts.probeMs ?? 2000 };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
 
@@ -149,7 +151,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity).catch((e) => {
+        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
@@ -201,6 +203,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     },
 
     close(ws: Ws) {
+      hub.toolsOnly.delete(ws);
       const full = ws.data.identityFull;
       if (full && hub.registry.get(full) === ws) {
         hub.registry.delete(full);
@@ -213,7 +216,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   // Heartbeat: keeps idle connections open through proxies.
   const startPing = () =>
     setInterval(() => {
-      for (const ws of hub.registry.values()) {
+      for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
     }, 30_000);
@@ -221,7 +224,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   return { handlers, startPing, stopExpiry: expiry.stop };
 }
 
-async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string): Promise<void> {
+async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean): Promise<void> {
   const { repo, db, registry } = hub;
   const name = identityInput.toLowerCase();
   if (!isValidIdentityName(name)) {
@@ -237,7 +240,7 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
   // refuse the newcomer: taking over would let a stray second session (e.g.
   // a worktree that inherited .mcp.json) silently steal this identity's
   // deliveries. A holder that doesn't answer is dead; replace it.
-  const existing = registry.get(full);
+  const existing = push ? registry.get(full) : undefined;
   if (existing && existing !== ws) {
     const refuse = () => {
       err(ws, reqId, "identity_in_use",
@@ -268,8 +271,13 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
     onIdentityCreated(db, repo, authed.user_id, full);
   }
 
-  registry.set(full, ws);
-  startSession(db, full, null);
+  if (push) {
+    registry.set(full, ws);
+    startSession(db, full, null);
+  } else {
+    hub.toolsOnly.add(ws);
+    touchHandle(db, full);
+  }
   ws.data.identityId   = identity.id;
   ws.data.identityName = name;
   ws.data.identityFull = full;
@@ -285,6 +293,7 @@ async function handleHello(hub: Hub, ws: Ws, reqId: string, identityInput: strin
     teams,
   };
   send(ws, helloOk);
+  if (!push) return;
 
   // Direct messages since the cursor (unacked ones are resent), then boards.
   const since = repo.cursors.get(identity.id, "direct", full);

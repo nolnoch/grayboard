@@ -46,6 +46,8 @@ function loadCredentials(): Credentials {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const identity = sessionIdentity();
+// BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
+const PUSH = process.env.BUS_PUSH !== "off";
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
@@ -87,6 +89,7 @@ const client = new GrayboardClient(
     return notify({ content: msg.body, meta });
   },
   (item) => notify(boardNotification(item)),
+  PUSH,
 );
 
 client.connect();
