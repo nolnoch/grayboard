@@ -86,7 +86,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_subscribe",
       description:
-        'board_subscribe(board, mode): how a board reaches you. "push" = every post in full; "digest" = one notice while there\'s unread; "quiet" = unread counts only; "off" = unsubscribe. Mentions and replies in your threads always reach you.',
+        'board_subscribe(board, mode): how a board reaches you. "push" = every post in full; "digest" = one notice while there\'s unread; "quiet" = only @mentions and replies to your threads, plus unread counts in board_list; "off" = unsubscribe. Mentions and thread replies reach you in every mode.',
       inputSchema: {
         type: "object",
         properties: {

@@ -1,14 +1,15 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
-import { join, basename, resolve } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "./adapters.ts" with { type: "macro" };
+import { selfUpdate } from "./update.ts";
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -31,6 +32,24 @@ function handleApiError(e: unknown): never {
     console.error(String(e));
   }
   process.exit(1);
+}
+
+// ── push adapters (omp, opencode) ─────────────────────────────────────────────
+
+const OMP_DIR = join(homedir(), ".omp", "agent");
+const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+
+// Adapter files carry this binary's source (inlined at build time), so
+// `update` rewrites them from the new binary.
+const ADAPTERS = [
+  { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
+  { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode") },
+];
+
+function writeAdapter(path: string, source: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  rmSync(path, { force: true }); // replace, never write through, an existing symlink
+  writeFileSync(path, source);
 }
 
 // ── MCP server command ────────────────────────────────────────────────────────
@@ -300,40 +319,36 @@ program
       // The user entry outranks a repo's .mcp.json in omp, so it carries no
       // BUS_IDENTITY; grayboard reads the repo's pin itself.
       const omp = !!Bun.which("omp");
-      const ompDir = join(homedir(), ".omp", "agent");
       if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
-        const cfgPath = join(ompDir, "mcp.json");
+        const cfgPath = join(OMP_DIR, "mcp.json");
         let cfg: { mcpServers?: Record<string, unknown> } = {};
         try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
           if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
         }
         cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
-        mkdirSync(join(ompDir, "extensions"), { recursive: true });
+        mkdirSync(OMP_DIR, { recursive: true });
         writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-        const ext = join(ompDir, "extensions", "grayboard.ts");
-        rmSync(ext, { force: true }); // replace, never write through, an existing symlink
-        writeFileSync(ext, adapterSource("omp"));
-        console.log(`Registered in ${cfgPath}; installed ${ext}`);
+        const ext = ADAPTERS[0]!;
+        writeAdapter(ext.path, ext.source);
+        console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
       }
 
       // 4. opencode: it drops MCP notifications, so its entry is tools only
       // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
       // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
       const opencode = !!Bun.which("opencode");
-      const ocDir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
       if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
-        const cfgPath = join(ocDir, "opencode.json");
+        const cfgPath = join(OC_DIR, "opencode.json");
         let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
         try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
           if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
         }
         cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
-        mkdirSync(join(ocDir, "plugin"), { recursive: true });
+        mkdirSync(OC_DIR, { recursive: true });
         writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-        const plugin = join(ocDir, "plugin", "grayboard.ts");
-        rmSync(plugin, { force: true });
-        writeFileSync(plugin, adapterSource("opencode"));
-        console.log(`Registered in ${cfgPath}; installed ${plugin}`);
+        const plugin = ADAPTERS[1]!;
+        writeAdapter(plugin.path, plugin.source);
+        console.log(`Registered in ${cfgPath}; installed ${plugin.path}`);
       }
 
       const others = [omp && "omp", opencode && "opencode"].filter(Boolean).join(" or ");
@@ -345,6 +360,39 @@ program
       );
     } finally {
       rl?.close();
+    }
+  });
+
+// ── update ───────────────────────────────────────────────────────────────────
+
+program
+  .command("update")
+  .description("Replace this binary with the latest release")
+  .action(async () => {
+    let tag: string | null;
+    try {
+      tag = await selfUpdate(pkg.version);
+    } catch (e) {
+      console.error(`[grayboard] update failed: ${(e as Error).message}`);
+      process.exit(1);
+    }
+    if (!tag) { console.log(`grayboard ${pkg.version} is the latest release.`); return; }
+    console.log(`Updated grayboard ${pkg.version} → ${tag}. Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
+    // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
+    // command; `setup` reinstalls adapters there.
+    const r = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });
+    if (r.exitCode !== 0) console.log("If you use omp or opencode, run `grayboard setup` to refresh their adapters.");
+  });
+
+program
+  .command("refresh-adapters", { hidden: true })
+  .description("Rewrite installed omp/opencode push adapters from this binary")
+  .action(() => {
+    for (const a of ADAPTERS) {
+      // A symlink means a checkout is installed there on purpose: leave it.
+      if (!existsSync(a.path) || lstatSync(a.path).isSymbolicLink()) continue;
+      writeAdapter(a.path, a.source);
+      console.log(`Refreshed ${a.path}`);
     }
   });
 
