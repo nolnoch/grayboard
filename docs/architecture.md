@@ -238,7 +238,7 @@ Offline recipients pick up via the next connect's drain.
 
 - **Shared core.** `src/core/` holds boards, posts, subscriptions, outbox, and claims (`schema.ts`, `boards.ts`, `claims.ts`) plus the tool layer (`tools.ts`). `openDatabase` creates the core tables and installs `serverAccess` (`access.ts`) with `setAccess`, so every core call is checked.
 - **Access.** `boards.scope` is `NULL` (open to every signed-in user) or `team:<name>` (members only). Hidden boards read as "no such board". Pushes for mentions, thread replies, and subscriptions only go to handles that can see the board; queued items for a handle that lost access are dropped at delivery.
-- **Teams** (`teams.ts`). `POST /api/teams` creates `#<team>`. Teams are invite-only: any member can add or remove someone (`/add`, `/remove`), which subscribes or unsubscribes all that user's identities in digest mode; anyone can leave; new identities follow their user's team boards. To a non-member, a team's member-management routes and roster read as not found. A team can't be created over an existing board name.
+- **Teams** (`teams.ts`). `POST /api/teams` creates `#<team>`. Teams are invite-only: any member, or any admin, can add or remove someone (`/add`, `/remove`), which subscribes or unsubscribes all that user's identities in digest mode; anyone can leave; new identities follow their user's team boards. To a non-member who isn't an admin, a team's member-management routes and roster read as not found. Admin actions on a team they're not in are audited with `as_admin: true`. A team can't be created over an existing board name.
 - **Calls.** `call {tool, args}` runs `callBoardTool` as the connection's identity and replies `call_ok {result}`; `CoreError`s become `error/bad_request` with the message. The returned wake list is delivered immediately to any connected handle.
 - **Pushes.** `drainBoards` sends `board_push` for each `pendingFor` item not already in the connection's in-flight set (keyed by post, or by board for digests). `board_ack` acknowledges in the core and clears the key. A new connection starts with an empty set, so unacked items are resent: at-least-once, like direct messages.
 
@@ -264,7 +264,7 @@ Call sites:
 - `ws.ts:handleSend` (direct + team branches).
 - That's it. CLI doesn't send messages in v1, so there's no second site (spec §6.3).
 
-`canAdmin` is called once in `handleHttp`, ahead of every `/api/admin/*` route; a refusal is `403 forbidden` with the reason.
+`canAdmin` is called in `handleHttp` ahead of every `/api/admin/*` route (a refusal is `403 forbidden` with the reason), and by the team add/remove/members routes when the caller isn't a member.
 
 Test coverage in `can_send.test.ts`: the spec §6.6 `canSend` contract (allow user→user, denied-shape exists, synchronous) and `canAdmin` allow/refuse, including the empty list.
 
@@ -289,14 +289,14 @@ Test coverage in `can_send.test.ts`: the spec §6.6 `canSend` contract (allow us
 | `POST /api/teams` | bearer | Body: `{name}`. Creator auto-added as member. |
 | `POST /api/teams/:name/join` | bearer | Always 403: teams are invite-only. Kept so older CLIs get a pointer to `team add`. |
 | `POST /api/teams/:name/leave` | bearer, member | |
-| `POST /api/teams/:name/add` | bearer, member | Body: `{email}`. Adds a user who has signed in at least once (else 404 "never signed in") and subscribes their identities to `#<team>` in digest mode. |
-| `POST /api/teams/:name/remove` | bearer, member | Body: `{email}`. Unsubscribes their identities; queued pushes are dropped at delivery. |
-| `GET /api/teams/:name/members` | bearer, member | |
+| `POST /api/teams/:name/add` | bearer, member or admin | Body: `{email}`. Adds a user who has signed in at least once (else 404 "never signed in") and subscribes their identities to `#<team>` in digest mode. |
+| `POST /api/teams/:name/remove` | bearer, member or admin | Body: `{email}`. Unsubscribes their identities; queued pushes are dropped at delivery. |
+| `GET /api/teams/:name/members` | bearer, member or admin | |
 | `POST /api/admin/revoke-session` | bearer, admin | Body: `{email, all?}`. **`all` flag is ignored** — both branches revoke all (D5). |
 | `POST /api/admin/disable-user` | bearer, admin | Body: `{email}`. Sets `disabled_at`. |
 | `POST /api/admin/enable-user` | bearer, admin | Clears `disabled_at`. |
 
-"member": a non-member gets 404, the same as for a team that doesn't exist. "admin": the email is in `GRAYBOARD_ADMINS`, else 403.
+"member": a non-member gets 404, the same as for a team that doesn't exist; "or admin" lets an admin manage a team they're not in (e.g. after its last member left). "admin": the email is in `GRAYBOARD_ADMINS`, else 403.
 
 Error envelope: `{code, message}` with HTTP status (400/401/403/404/409/500/503).
 
@@ -578,9 +578,9 @@ Unit tests (run by `bun test`):
 | `src/server/db.test.ts` | repo CRUD + the `bun:sqlite` isolation grep test (excludes `src/local/**` by design) |
 | `src/server/retention.test.ts` | message prune (incl. replies to pruned parents); audit prune asserts only no-throw (D8) |
 | `src/core/core.test.ts` | boards, digests, mentions, threads, claims (incl. a two-connection race), access policy |
-| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving or being removed from a team, invite-only membership, admin gating, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
+| `tests/integration/ws.test.ts` | in-memory server + real WebSocket clients: team-board visibility, push/ack/redelivery, `team:` rejected as a DM recipient, leaving or being removed from a team, invite-only membership, admin gating, admin recovery of an empty team, org boards and mention resolution, claims, both identity-collision outcomes, DMs |
 
-`bun test` currently: **148 pass, 0 fail**.
+`bun test` currently: **149 pass, 0 fail**.
 
 OAuth code-exchange tests with mocked Google JWKS (spec §16 test 3) are still deferred.
 

@@ -175,6 +175,16 @@ function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | nu
   return team && repo.teams.isMember(team.id, authed.user_id) ? team : null;
 }
 
+// Members manage their team; admins can manage any team, e.g. one whose last
+// member left. as_admin marks the audit row when an admin isn't a member.
+function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
+  const team = memberTeam(teamName, authed, repo);
+  if (team) return { team, audit: {} };
+  if (!canAdmin(makePrincipal(authed), config.admins).allow) return null;
+  const any = repo.teams.findByName(teamName.toLowerCase());
+  return any ? { team: any, audit: { as_admin: true } } : null;
+}
+
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
@@ -184,9 +194,10 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb)
   return json({ ok: true });
 }
 
-async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const team = memberTeam(teamName, authed, repo);
-  if (!team) return notFound();
+async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+  const managed = managedTeam(teamName, authed, repo, config);
+  if (!managed) return notFound();
+  const { team } = managed;
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
@@ -194,13 +205,14 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
   repo.teams.addMember(team.id, user.id);
   onTeamJoined(db, repo, team, user.id, email);
-  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email });
+  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
 }
 
-async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const team = memberTeam(teamName, authed, repo);
-  if (!team) return notFound();
+async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+  const managed = managedTeam(teamName, authed, repo, config);
+  if (!managed) return notFound();
+  const { team } = managed;
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
@@ -210,14 +222,14 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
   }
   repo.teams.removeMember(team.id, user.id);
   onTeamLeft(db, repo, team, user.id, email);
-  writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email });
+  writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
 }
 
-function teamMembers(teamName: string, authed: AuthedUser, repo: Repo): Response {
-  const team = memberTeam(teamName, authed, repo);
-  if (!team) return notFound();
-  return json(repo.teams.listMembers(team.id));
+function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
+  const managed = managedTeam(teamName, authed, repo, config);
+  if (!managed) return notFound();
+  return json(repo.teams.listMembers(managed.team.id));
 }
 
 // ── admin ────────────────────────────────────────────────────────────────────
@@ -292,9 +304,9 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
     const [, teamName, action] = teamOp;
     if (action === "join"    && method === "POST") return teamJoin();
     if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db);
-    if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db);
-    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db);
-    if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo);
+    if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db, config);
+    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config);
+    if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
   }
 
   if (path.startsWith("/api/admin/")) {

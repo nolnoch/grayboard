@@ -475,7 +475,7 @@ teamCmd
 
 teamCmd
   .command("add <team> <email>")
-  .description("Add someone to a team you're in (they must have signed in once)")
+  .description("Add someone to a team you're in, or any team if you're an admin (they must have signed in once)")
   .action(async (team: string, email: string) => {
     try { output(await makeClient().post(`/api/teams/${team}/add`, { email }), globalJson()); }
     catch (e) { handleApiError(e); }
@@ -483,7 +483,7 @@ teamCmd
 
 teamCmd
   .command("remove <team> <email>")
-  .description("Remove someone from a team you're in")
+  .description("Remove someone from a team you're in, or any team if you're an admin")
   .action(async (team: string, email: string) => {
     try { output(await makeClient().post(`/api/teams/${team}/remove`, { email }), globalJson()); }
     catch (e) { handleApiError(e); }

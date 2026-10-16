@@ -375,6 +375,34 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
 });
 
+test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const root = await login("root@example.com");
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/leave");
+  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(404);
+
+  expect((await api(root, "GET", "/api/teams/eng/members")).body).toEqual([]);
+  expect((await api(root, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(root, "GET", "/api/teams/nope/members")).status).toBe(404);
+  expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual(["eng"]);
+  // Managing doesn't make the admin a member.
+  expect((await api(root, "GET", "/api/whoami")).body.teams).toEqual([]);
+  expect((await api(root, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
+
+  const audit = app.db
+    .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
+    .all();
+  expect(audit).toEqual([
+    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","as_admin":true}' },
+    { actor: "root@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com","as_admin":true}' },
+  ]);
+});
+
 test("org boards are open to everyone; bare @name prefers the author's own identity", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
