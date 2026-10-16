@@ -7,6 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
+import { explainConnectFailure } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
@@ -96,8 +97,8 @@ const hello: HelloOk = await Promise.race([
   new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error(`no answer from grayboard server at ${serverUrl} within 10s`)), 10_000),
   ),
-]).catch((e: Error) => {
-  console.error(`[grayboard] ${e.message}`);
+]).catch(async (e: Error) => {
+  console.error(`[grayboard] ${await explainConnectFailure(serverUrl, creds.session_token, e.message, !!process.env.GRAYBOARD_TOKEN)}`);
   process.exit(1);
 });
 

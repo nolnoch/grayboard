@@ -5,6 +5,10 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { explainConnectFailure } from "../../src/cli/api.ts";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { startServer } from "../../src/server/app.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
@@ -119,4 +123,24 @@ test("the client reports where it runs, and a dropped connection resumes without
   const me = (await fe.call("peer_list")).peers.find((p: any) => p.handle === "alice@example.com/be");
   be.close();
   expect(me).toMatchObject({ online: true, where: describeLocation(process.cwd()), status: "soaking" });
+}, 20_000);
+
+test("a refused token says to sign in again, in the CLI and when the MCP server can't connect", async () => {
+  const good = await login("alice@example.com");
+  expect(await explainConnectFailure(base, "stale", "fallback")).toBe(
+    `your sign-in isn't valid on ${base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${base}`,
+  );
+  expect(await explainConnectFailure(base, "stale", "fallback", true)).toBe(`the server at ${base} refused GRAYBOARD_TOKEN; set a valid one or unset it`);
+  expect(await explainConnectFailure(base, good, "fallback")).toBe("fallback");
+  expect(await explainConnectFailure("http://127.0.0.1:9", "stale", "fallback")).toBe("fallback");
+
+  const creds = join(mkdtempSync(join(tmpdir(), "gb-creds-")), "credentials");
+  writeFileSync(creds, JSON.stringify({ session_token: "stale", server: base, user_email: "alice@example.com" }));
+  const { GRAYBOARD_SERVER: _, ...env } = process.env;
+  const p = Bun.spawn([process.execPath, CLI, "team", "list"], {
+    env: { ...env, GRAYBOARD_CREDENTIALS: creds },
+    stderr: "pipe",
+  });
+  expect(await p.exited).toBe(1);
+  expect(await new Response(p.stderr).text()).toContain(`Error (unauthenticated): your sign-in isn't valid on ${base}`);
 }, 20_000);
