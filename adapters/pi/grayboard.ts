@@ -100,6 +100,11 @@ export default function grayboard(pi: ExtensionAPI) {
       method: "initialize",
       params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "pi-grayboard", version: "1" } },
     });
+    // E.g. no grayboard on PATH; unhandled, the error event would crash pi.
+    proc.on("error", (e) => {
+      if (child === proc) child = undefined;
+      if (ctx.hasUI) ctx.ui.notify(`grayboard push process failed to start: ${e.message}`, "error");
+    });
     proc.on("exit", (code) => {
       if (child !== proc) return;
       child = undefined;
