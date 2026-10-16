@@ -42,16 +42,19 @@ async function login(email: string): Promise<string> {
 }
 
 // A grayboard MCP session in server mode; collects channel notifications.
+// Like Claude Code, it drops any that arrive before it has sent `initialized`.
 async function session(token: string, identity: string, extraEnv: Record<string, string> = {}) {
   const pushes: { content: string; meta: Record<string, string> }[] = [];
   const c = new Client({ name: "test", version: "0" });
+  let initialized = false;
   c.fallbackNotificationHandler = async (n) => {
-    if (n.method === "notifications/claude/channel") pushes.push(n.params as any);
+    if (initialized && n.method === "notifications/claude/channel") pushes.push(n.params as any);
   };
   const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, ...extraEnv } as Record<string, string>;
   await c.connect(
     new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
   );
+  initialized = true;
   open.push(c);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
     const r = await c.callTool({ name, arguments: args });

@@ -419,7 +419,7 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 | `/mcp` shows grayboard failed: `identity "<name>" is already in use` | Another live session holds that identity; see [below](#one-live-session-per-identity) |
 | `/mcp` or tools fail with `unauthenticated` (401) | The session's token is gone from the server, e.g. after the step 6 database reset; `grayboard login`, then reconnect the session |
 | Tools fail with "signed out" | You ran `grayboard logout`; sign in again, or `grayboard setup --local` |
-| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard`, or isn't on a claude.ai login |
+| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard` (including on `--resume`; grayboard warns the agent when it sees this), or isn't on a claude.ai login |
 
 ### CLI reference
 

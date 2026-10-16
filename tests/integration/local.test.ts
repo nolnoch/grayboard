@@ -2,7 +2,7 @@
 // `grayboard mcp --mode local` driven by an MCP client, sharing a temp database
 // and socket directory. Covers liveness in `who`, which only works across processes.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -37,6 +37,23 @@ async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp"
   );
   open.push(c);
   return c;
+}
+
+// Like start, collecting channel notifications. Like Claude Code, it drops
+// any that arrive before it has sent `initialized`.
+async function startCollecting(identity: string): Promise<{ c: Client; pushes: string[] }> {
+  const pushes: string[] = [];
+  const c = new Client({ name: "test", version: "0" });
+  let initialized = false;
+  c.fallbackNotificationHandler = async (n) => {
+    if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
+  };
+  await c.connect(
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity), stderr: "ignore" }),
+  );
+  initialized = true;
+  open.push(c);
+  return { c, pushes };
 }
 
 async function stop(c: Client): Promise<void> {
@@ -221,4 +238,48 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
   await expect(call(fe, "dm_ack", { id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
+}, 20_000);
+
+test("a message queued while offline is pushed when the session starts", async () => {
+  await stop(await start("be"));
+  const fe = await start("fe");
+  expect((await call(fe, "dm_send", { to: "be", body: "queued dm" })).delivered_now).toBe(false);
+  const be = await startCollecting("be");
+  await Bun.sleep(500);
+  expect(be.pushes).toEqual(["queued dm"]);
+}, 20_000);
+
+test("the reply and recovery tools ask Claude Code to load them upfront", async () => {
+  const c = await start("be");
+  const { tools } = await c.listTools();
+  const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
+  expect(upfront).toEqual(["board_post", "dm_inbox", "dm_send"]);
+}, 20_000);
+
+test("a Claude Code session started without a channels flag is warned that pushes are off", async () => {
+  // Stand-in for Claude Code: a process named `claude` (bun under another
+  // name) that runs grayboard mcp as its child on inherited stdio, with
+  // CLAUDECODE=1 as Claude Code sets. Its own flags come before "::".
+  const fake = join(dir, "claude");
+  symlinkSync(process.execPath, fake);
+  const host = join(dir, "host.ts");
+  writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
+Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
+  const session = async (identity: string, flags: string[]) => {
+    const c = new Client({ name: "test", version: "0" });
+    const env = { ...busEnv(identity), CLAUDECODE: "1" };
+    await c.connect(new StdioClientTransport({ command: fake, args: [host, ...flags, "::", CLI, "mcp", "--mode", "local"], cwd: dir, env, stderr: "ignore" }));
+    open.push(c);
+    return c;
+  };
+  const texts = async (c: Client) => ((await c.callTool({ name: "peer_list", arguments: {} })).content as { text: string }[]).map((t) => t.text);
+
+  const off = await session("be", []);
+  expect(off.getInstructions()).toStartWith("Warning: this Claude Code session was started without");
+  expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(true);
+  expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(false); // first tool result only
+
+  const on = await session("fe", ["--dangerously-load-development-channels", "server:grayboard"]);
+  expect(on.getInstructions()).not.toContain("Warning:");
+  expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
 }, 20_000);

@@ -44,6 +44,7 @@ export const DM_INBOX_INSTRUCTION =
 
 export const DM_INBOX_TOOL = {
   name: "dm_inbox",
+  _meta: { "anthropic/alwaysLoad": true },
   description:
     `dm_inbox(days?): direct messages to you from the last days (default ${INBOX_DAYS}) with no later message from you in their thread and no dm_ack, plus your messages still queued for offline peers. Use after /clear to see what you owe.`,
   inputSchema: {

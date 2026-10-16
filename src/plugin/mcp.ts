@@ -11,7 +11,7 @@ import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
-import { checkArgs, updateNotice } from "../shared/toolguard.ts";
+import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // ── credentials ───────────────────────────────────────────────────────────────
@@ -48,14 +48,25 @@ function loadCredentials(): Credentials {
 const identity = sessionIdentity();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
+// Claude Code started without a channels flag drops pushes silently; say so.
+const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
+if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
 console.error(`[grayboard] server mode (${serverUrl}), identity "${identity}"`);
 
 // ── WS client setup ───────────────────────────────────────────────────────────
 
-const notify = (params: { content: string; meta: Record<string, string> }): Promise<void> =>
-  server.notification({ method: "notifications/claude/channel", params });
+// The server sends what's queued right after hello_ok, before Claude Code has
+// finished the MCP handshake, and Claude Code drops notifications that arrive
+// before it sends `initialized`. Hold pushes until then; they're acked only
+// once sent.
+let markInitialized!: () => void;
+const initialized = new Promise<void>((r) => { markInitialized = r; });
+const notify = async (params: { content: string; meta: Record<string, string> }): Promise<void> => {
+  await initialized;
+  await server.notification({ method: "notifications/claude/channel", params });
+};
 
 const client = new GrayboardClient(
   serverUrl,
@@ -90,8 +101,7 @@ const hello: HelloOk = await Promise.race([
   process.exit(1);
 });
 
-// Built after hello_ok; pushes reach notify only after this runs (each WS
-// message is its own task, and nothing awaits between here and connect).
+// Built after hello_ok; notify waits for `initialized`, which needs it.
 const server = new Server(
   { name: "grayboard", version: pkg.version },
   {
@@ -100,6 +110,7 @@ const server = new Server(
       tools: {},
     },
     instructions: [
+      ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
@@ -111,11 +122,16 @@ const server = new Server(
   },
 );
 
+server.oninitialized = markInitialized;
+
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 
 const TOOLS = [
   {
     name: "dm_send",
+    // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
+    // missed that the reply tool exists. Same for dm_inbox and board_post.
+    _meta: { "anthropic/alwaysLoad": true },
     description:
       `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
@@ -161,12 +177,21 @@ const text = (value: unknown) => ({
 });
 
 const staleNotice = updateNotice();
+// The channels warning also goes in the first tool result, in case the
+// instructions went unread.
+let channelsNoticePending = CHANNELS_OFF;
+const notices = (): string[] => {
+  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  channelsNoticePending = false;
+  const stale = staleNotice();
+  return stale ? [...out, stale] : out;
+};
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   const r = await call(name, args as Record<string, unknown>);
-  const notice = staleNotice();
-  return notice ? { ...r, content: [...r.content, { type: "text" as const, text: notice }] } : r;
+  const extra = notices();
+  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
 });
 
 async function call(name: string, a: Record<string, unknown>) {
