@@ -13,7 +13,7 @@ last-verified: 2026-10-17
 
 - Every session of a user presents that user's token, so the server can't tell a human's session from an agent's. `human` would be the client's word, which is exactly what it must not be.
 - One Slack app's events go to any one of its Socket Mode connections, so one app can't serve several users' bridges.
-- Until this exists, `grayboard bridge slack` refuses server mode.
+- Until this exists, `grayboard bridge slack` refuses server mode (`--mode local` relays the local bus instead).
 
 ## Decisions
 

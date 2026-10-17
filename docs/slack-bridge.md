@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: the local Slack bridge (grayboard bridge slack) and human handles
-invariants: the bridge is an MCP client of its own grayboard mcp child and acts only through public tools; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; human flag is reset on every session start; the bridge refuses server mode
+invariants: the bridge is an MCP client of its own grayboard mcp child and acts only through public tools; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; human flag is reset on every session start; the bridge never joins a server (`--mode local` pins its child to the local bus)
 code-pointers: src/bridge/ (slack.ts wiring, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (isHuman, humanHandles), src/local/mcp.ts (human meta and instruction), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
 companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distributed design, not built)
 ```
@@ -13,7 +13,7 @@ companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distr
 - **The bridge is an MCP client of its own `grayboard mcp` child** (spawned with `BUS_IDENTITY=<handle>`, `BUS_HUMAN=1`), the pattern the pi adapter uses. It sees exactly what an agent session sees and acts only through public tools (`dm_send`, `board_post`, `dm_thread`, `board_read`). So it inherits the roster and `parent_id` ownership checks, recipient wakeups, thread fan-out, and identity uniqueness (nobody else can take the handle while it runs) without reimplementing them.
 - Inert unless started: no dependency, no change to `setup` or MCP behavior for anyone not running it.
 - Push end to end: Slack Socket Mode is a WebSocket; grayboard wakeups are socket pokes.
-- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode needs the org bridge (`future/org-bridge.md`).
+- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode needs the org bridge (`future/org-bridge.md`). `--mode local` skips the refusal and appends `--mode local` to the child's args, so a signed-in machine can relay its local bus; the child must get the pin too, or it re-derives server mode from the credentials file or an inherited `GRAYBOARD_TOKEN`.
 - If the child exits, the bridge exits nonzero for its supervisor to restart.
 
 ## 2. Routing

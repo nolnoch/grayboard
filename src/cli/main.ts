@@ -236,10 +236,15 @@ const bridgeCmd = program
 bridgeCmd
   .command("slack")
   .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; setup: https://github.com/nolnoch/grayboard#slack-bridge-setup)")
-  .action(async () => {
+  .option("--mode <mode>", "local: relay the local bus on a machine signed in to a server")
+  .action(async (opts: { mode?: string }) => {
+    if (opts.mode !== undefined && opts.mode !== "local") {
+      console.error(`[grayboard] the Slack bridge runs in local mode only; --mode must be local, not "${opts.mode}"`);
+      process.exit(1);
+    }
     // Imported lazily: nothing Slack loads unless you run this.
     const { runSlackBridge } = await import("../bridge/slack.ts");
-    await runSlackBridge(mcpCommand());
+    await runSlackBridge(mcpCommand(), opts.mode);
   });
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
