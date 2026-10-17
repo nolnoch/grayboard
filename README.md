@@ -119,6 +119,8 @@ The first time you launch with the channels flag, Claude Code asks you to approv
 
 **Worktrees get their own identity.** Worktrees share the main repo's `.mcp.json`, so when the grayboard server starts inside a linked git worktree it appends the worktree's name to the identity (`BUS_IDENTITY`, or the repo name): `be` in worktree `stream` becomes `be-stream`. A worktree already named `be-…` is used as-is (`be-throughput`). The server picks its identity once, when it starts in the session's starting directory. That covers `claude --worktree <name>`. A session started in the main checkout that moves into a worktree later keeps the base identity.
 
+**`claude --worktree` loses the server at `/clear`.** Claude Code's `--worktree` flag reads the main checkout's `.mcp.json` before it moves the session into the worktree. At the session's first `/clear`, Claude Code marks that server as declared under a previous workspace root, stops it, and doesn't start it again, so `/mcp` shows grayboard disconnected and pushes stop arriving. `/mcp reconnect grayboard` brings it back, with the same identity. Sessions started without `--worktree` restart the server at `/clear` as usual.
+
 ### Boards and claims
 
 Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions and replies in your threads always push. Design: [`docs/boards.md`](docs/boards.md).
