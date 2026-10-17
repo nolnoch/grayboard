@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Git pre-push hook. Install once per clone: git config core.hooksPath scripts/hooks
+#
+# 1. Docs gate (scripts/docs_gate.sh) per pushed sha, cheapest first so a refused push fails
+#    in seconds. Bypass: DOCS_GATE_BYPASS=1 git push ...
+# 2. Typecheck and the test suite, on the working tree. CI (.github/workflows/test.yml) runs
+#    the same against the pushed commit; this is local protection, not the universal gate.
+#
+# Bypass everything (sparingly): git push --no-verify
+set -u
+
+HOOK_SCRIPTS="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+# One line per ref on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
+# An all-zero local_sha is a deletion; skip it.
+refs=()
+shas=()
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  if [[ -z "$local_sha" || "$local_sha" =~ ^0+$ ]]; then
+    continue
+  fi
+  refs+=("$local_ref")
+  shas+=("$local_sha")
+done
+
+if [[ "${#shas[@]}" = "0" ]]; then
+  echo "[pre-push] Nothing to push (deletion only); skipping checks."
+  exit 0
+fi
+
+for i in "${!shas[@]}"; do
+  if ! bash "$HOOK_SCRIPTS/docs_gate.sh" "${shas[$i]}"; then
+    echo "[pre-push] Docs gate refused ${shas[$i]} (${refs[$i]}); push aborted." >&2
+    exit 1
+  fi
+done
+
+echo "[pre-push] Typecheck..."
+if ! bun run typecheck; then
+  echo "[pre-push] Typecheck failed; push aborted." >&2
+  exit 1
+fi
+
+echo "[pre-push] Tests..."
+if ! bun test; then
+  echo "[pre-push] Tests failed; push aborted." >&2
+  exit 1
+fi

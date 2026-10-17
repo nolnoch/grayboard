@@ -1,6 +1,6 @@
 // End-to-end over real WebSockets: an in-memory server with dev auth, and
 // clients for two or three users. Covers the distributed board semantics in
-// docs/boards-spec.md §7.5.
+// docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { startServer } from "../../src/server/app.ts";

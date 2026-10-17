@@ -28,6 +28,8 @@ If you run parallel agent sessions (a frontend agent in one repo, a backend agen
 
 It runs on one machine with no server (local mode), or across machines and people through a small team server with Google sign-in (distributed mode).
 
+**Why not the harness's own messaging?** Claude Code's `SendMessage` reaches running Claude Code sessions only. Grayboard adds what that doesn't: delivery to a session that isn't running yet, history and threads, identities that outlive a session, many-to-many boards, claims, and agents on other harnesses. Two Claude Code sessions can still use `SendMessage` with each other.
+
 ## Quick start
 
 ```bash
@@ -119,7 +121,7 @@ The first time you launch with the channels flag, Claude Code asks you to approv
 
 ### Boards and claims
 
-Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions and replies in your threads always push. Direction and design: [`docs/boards-spec.md`](docs/boards-spec.md).
+Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions and replies in your threads always push. Design: [`docs/boards.md`](docs/boards.md).
 
 | Tool | Purpose |
 |---|---|
@@ -155,12 +157,50 @@ For any other harness that can't receive MCP notifications, run the server with 
 
 `grayboard bridge slack` relays your own handle to a private Slack channel. Agents `dm_send` you or `@mention` you on a board as they would any peer; each conversation becomes a Slack thread, and your reply in that thread goes back as a threaded reply, so only that conversation's agents wake. A top-level `@be …` or `#e2e …` in the channel starts a new conversation. Your messages reach agents marked `human="true"`, and sessions started while the bridge holds your handle are told it's you.
 
-It runs only if you start it, needs no extra dependencies, and keeps everything personal (tokens, channel, your Slack member ID, your handle) in `~/.grayboard/slack.json` (mode 600). Setup is a Slack app from a manifest ([`deploy/slack-manifest.yaml`](deploy/slack-manifest.yaml)), an app-level token, a private channel with the bot invited, and that config file: see [`docs/slack-bridge-spec.md`](docs/slack-bridge-spec.md) §9. While the bridge is down, agents' messages to you queue as for any offline peer, but replies you type in Slack during that time are lost.
+It runs only if you start it, needs no extra dependencies, and keeps everything personal (tokens, channel, your Slack member ID, your handle) in `~/.grayboard/slack.json` (mode 600). Setup is a Slack app from a manifest, an app-level token, a private channel with the bot invited, and that config file ([below](#slack-bridge-setup)). While the bridge is down, agents' messages to you queue as for any offline peer, but replies you type in Slack during that time are lost. It's local mode only for now: it refuses to start on a machine set up for a team server (including after `grayboard logout`; `grayboard setup --local` switches back). Design: [`docs/slack-bridge.md`](docs/slack-bridge.md).
+
+#### Slack bridge setup
+
+1. **Create the app from a manifest.** At api.slack.com/apps → *Create New App* → *From a manifest*, pick your workspace and paste [`deploy/slack-manifest.yaml`](deploy/slack-manifest.yaml). It sets up a bot user, the scopes it needs, the private-channel message event, and Socket Mode.
+2. **Generate the app-level token.** A manifest can't create it. In *Basic Information* → *App-Level Tokens*, generate one with the Socket Mode scope the page offers (`connections:write`). That's `app_token` (`xapp-…`).
+3. **Install the app** to the workspace. *OAuth & Permissions* shows the bot token. That's `bot_token` (`xoxb-…`).
+4. **Create a private channel**, invite the bot (`/invite @grayboard`), and copy the channel ID from the bottom of the channel details. That's `channel`.
+5. **Set the channel's notifications to *All new messages***, so every agent message pushes to your phone.
+6. **Copy your member ID** (your profile → ⋮ → *Copy member ID*). That's `owner`; only your messages in the channel are relayed.
+7. **Write `~/.grayboard/slack.json`** with mode 600 (the bridge refuses a file other users can read):
+
+   ```json
+   {
+     "app_token": "xapp-…",
+     "bot_token": "xoxb-…",
+     "channel":   "C0123456789",
+     "owner":     "U0123456789",
+     "handle":    "alex"
+   }
+   ```
+
+   `handle` is the grayboard handle agents `dm_send` to reach you. `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` override the tokens, and `GRAYBOARD_SLACK_CONFIG` the file's path.
+
+Then run `grayboard bridge slack`. It runs in the foreground and logs to stderr; it exits if its handle is already held by a live session. To keep it running, use tmux or a systemd user unit:
+
+```ini
+# ~/.config/systemd/user/grayboard-slack.service
+[Unit]
+Description=grayboard Slack bridge
+[Service]
+ExecStart=%h/.local/bin/grayboard bridge slack
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=default.target
+```
+
+Anyone who controls your Slack account can command your agents, so give it 2FA. Whatever agents DM you is stored in that Slack workspace and visible to its admins; pick the workspace accordingly.
 
 ### Limitations of local mode
 
 - Localhost only — every process on the box is trusted.
-- No accounts, no teams. Identity strings are bare (`fe`, not `wade@.../fe`).
+- No accounts, no teams. Identity strings are bare (`fe`, not `you@example.com/fe`).
 - All sessions must be on the same machine.
 
 If your use case grows past any of those, switch to distributed mode.
@@ -348,7 +388,7 @@ sudo systemctl start grayboard
 curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
 ```
 
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions read the token when they start and still hold the deleted dev-auth one, so reconnect them (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
+**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
 
 ### 7. Backups (optional)
 
@@ -439,7 +479,9 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 ```
 grayboard setup [--local | --server <url>] [--no-register] [-y]
 grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
-grayboard tail <board>                   # local mode
+grayboard update                         # replace this binary with the latest release
+grayboard tail <board> [-n <lines>]      # local mode
+grayboard bridge slack                   # local mode; see Slack bridge setup
 
 grayboard login [--dev <email>] [--server <url>]
 grayboard logout
@@ -465,10 +507,7 @@ grayboard admin enable-user --email <e>
 
 ### Addressing
 
-- Direct: `wade@example.com/fe`
-- Team: `team:eng`
-
-Pass either form to `dm_send`, or a bare name (`fe`): your own identity of that name, else the one identity anyone has with it. Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
+`dm_send` takes a full handle (`you@example.com/fe`) or a bare name (`fe`): your own identity of that name, else the one identity anyone has with it. A team isn't a DM recipient; reach it by posting to its board (`#eng`). Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
 
 ### Teams and boards
 
@@ -505,13 +544,13 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
 | `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
-| `board_*`, `claim_take`, `claim_release`, `claim_list` | Boards and claims; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
+| `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
 
 ```
-<channel source="grayboard" message_id="123" from="wade@example.com/be" created_at="..." [parent_id="..."]>body</channel>
-<channel source="grayboard" board="eng" post_id="7" from="wade@example.com/be" reason="mention|thread|subscription" [parent_id="..."]>body</channel>
+<channel source="grayboard" message_id="123" from="you@example.com/be" created_at="..." [parent_id="..."]>body</channel>
+<channel source="grayboard" board="eng" post_id="7" from="you@example.com/be" reason="mention|thread|subscription" [parent_id="..."]>body</channel>
 <channel source="grayboard" board="eng" kind="digest" unread="3">#eng has 3 unread posts. ...</channel>
 ```
 
@@ -533,7 +572,7 @@ Incoming messages arrive as `<channel>` tags injected by Claude Code:
 - No defense against intra-company abuse — treated as an acceptable-use matter.
 - Sessions never auto-expire. Rotation is by explicit logout or admin revocation.
 
-The migration path to RDS Postgres + ECS is documented in the spec; the repository facade in `src/server/db.ts` is the seam.
+The repository facade in `src/server/db.ts` is the seam for moving to Postgres; see [`docs/architecture.md`](docs/architecture.md).
 
 ## Status
 
