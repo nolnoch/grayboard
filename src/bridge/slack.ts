@@ -9,6 +9,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { busMode } from "../cli/api.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import { Relay, type Bus, type ChannelParams } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
@@ -29,6 +30,11 @@ export async function startSlackBridge(
   mcp: { command: string; args: string[] },
   env: Record<string, string | undefined> = process.env,
 ): Promise<BridgeHandle> {
+  // On a server, only the server can vouch that a handle is a human; this
+  // bridge would relay fine but its messages would arrive unmarked (spec §11).
+  if (busMode(env) === "server") {
+    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/slack-bridge-spec.md §11)");
+  }
   const cfg = loadConfig(env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
   const app = new SlackWeb(cfg.appToken, cfg.apiUrl);

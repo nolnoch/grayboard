@@ -360,6 +360,11 @@ test("Slack's disconnect warning brings up a new connection", async () => {
   await until(() => be.pushes.find((p) => p.content === "still here"));
 }, 30_000);
 
+test("in server mode the bridge refuses to start", async () => {
+  writeConfig();
+  await expect(startSlackBridge(MCP, { ...env(), GRAYBOARD_TOKEN: "t" })).rejects.toThrow(/local mode only/);
+}, 30_000);
+
 test("a bad app token fails startup instead of hanging, and frees the handle", async () => {
   writeConfig();
   slack.badAppToken = true;

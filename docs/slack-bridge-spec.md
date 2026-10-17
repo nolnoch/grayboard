@@ -1,6 +1,6 @@
 # Grayboard Slack Bridge — Spec
 
-**Status:** v1 built, 2026-10-17 (`src/bridge/`, tests in `src/bridge/bridge.test.ts` and `tests/integration/slack.test.ts`). Not yet run against a real workspace (§13, verify live). Local mode first; distributed mode is §11.
+**Status:** v1 built, 2026-10-17 (`src/bridge/`, tests in `src/bridge/bridge.test.ts` and `tests/integration/slack.test.ts`). Run against a real workspace 2026-10-17 (§13). Local mode only; distributed mode is the org bridge, sketched in §11.
 **Audience:** grayboard users who run several agents and want them to reach a human on their phone; implementers.
 **Companions:** [`boards-spec.md`](boards-spec.md) (boards, threads, mentions), [`architecture.md`](architecture.md) (the distributed server).
 
@@ -32,7 +32,7 @@ Nothing changes for anyone who doesn't run the bridge, with one exception. §6 a
 - Slack edits and deletes. Grayboard posts are append-only; a correction is a new reply.
 - Catching up on Slack messages typed while the bridge was down (§7.2).
 - Block Kit, buttons, slash commands, a channel per agent, DMs from the bot.
-- Server-enforced human identity (§11).
+- Distributed mode. It needs the org bridge (§11), and this bridge refuses to start when signed in to a server.
 
 ---
 
@@ -78,7 +78,6 @@ Nothing changes for anyone who doesn't run the bridge, with one exception. §6 a
 - the roster check on `dm_send(to)` and the ownership check on `parent_id`,
 - wakeups of recipients (`poke`) and thread-author fan-out on boards,
 - identity uniqueness: a second bridge, or an agent, can't take the handle while the bridge holds it,
-- mode-agnosticism: in distributed mode the child is `plugin/mcp.ts` and nothing in the bridge changes (§11).
 
 The C analogue is one event loop with three fds: the child's stdout pipe, the Slack WebSocket, and the HTTPS client. A small SQLite file holds the routing table and an outbox.
 
@@ -292,9 +291,33 @@ At startup it calls `auth.test` (the bot token works and gives its bot user ID),
 
 ---
 
-## 11. Distributed mode (later)
+## 11. Distributed mode: the org bridge (bones, not built)
 
-The bridge doesn't change: its child becomes `plugin/mcp.ts` when signed in. What changes is where `human` comes from. Every session of a user presents that user's token, so the server can't tell a human's session from an agent's on its own. The likely design: the server accepts `human` only for a handle the user registered as human (`grayboard identity create alex --human`), and sets `human="true"` on delivery itself. Other users can't forge it, and the receiving agent's instruction names whose user it is ("alex, the human owner of `be`"). The instruction from §6 changes from "your user" to "your user, if you belong to them," since several people share one server. This gets its own design pass when distributed mode is deployed.
+The local bridge is one person's process on one machine. On a shared server that shape stops working, so distributed mode gets a different one: **one bridge for the org, inside `grayboard-server`**, one Slack app installed once by an admin, and each user linking their own Slack account to a human identity. It gets built when a team asks for it; this section is the skeleton so that work starts from decisions, not questions.
+
+**Why not run the local bridge against the server.** Two reasons. Every session of a user presents that user's token, so the server can't tell a human's session from an agent's; `human` would have to be the client's word, which is the thing it must not be. And a Slack app's events go to one of its Socket Mode connections, not all of them ("each payload may be sent to *any* of the connections"), so one app can't serve several users' bridges. Until the org bridge exists, `grayboard bridge slack` refuses to start when `grayboard mcp` would join a server. On a machine that's signed in to a server but pins some repos to local mode, that refusal is too broad; a `--mode local` flag on the bridge is the fix if it comes up.
+
+**Authority is the load-bearing part.** In local mode, `human="true"` means "your user." On a shared server another user's human can DM your agent, and that's a person, not your principal. So the server stamps two things on delivery: `human="true"` and the human's user (`human_of="alex@example.com"`). Clients can't set either. The server derives them from an `identities.human` flag that only the link flow writes. The server-mode instruction says: a message marked human from *your own user's* human identity carries your user's authority; other humans are peers, like other agents. The server knows each session's user, so it can name the right identity in the instruction ("your user's human identity is `alex@example.com/alex`").
+
+**Where it runs and how it delivers.**
+
+- In the server process, started when `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are set in `/etc/grayboard/env` (like `GRAYBOARD_ADMINS`). One Socket Mode connection; if the server ever runs as more than one process, exactly one holds it. One Slack workspace per server.
+- Each linked human identity is registered in the Hub's connection registry through an adapter, so it is "online" while the Slack connection is up. Drain, at-least-once delivery and cursor-advance-on-ack apply unchanged: the adapter acks a message once `chat.postMessage` succeeds. That replaces the local bridge's outbox; only the thread map remains.
+- Slack → bus: an event from a linked Slack user, in their DM with the bot, acts as that user's human identity through the same paths `ws.ts` uses for `send` and `call`, so `canSend`, board scopes and roster checks apply.
+- Reused from `src/bridge/`: the routing in `relay.ts`, `socket.ts`, `web.ts`, `format`/`fromSlack`. Not reused: `store.ts`. The thread map is a server table behind `Repo` like the rest of the server's data (the Postgres seam), and server-side bridge code lives under `src/server/`, where the db.test.ts guard applies.
+
+**Slack surface.** Each user talks to the bot in their own DM instead of a private channel. Same threading rules as §5: one Slack thread per grayboard conversation, and a top-level `@handle` or `#board` starts one. Slack notifies on DMs by default, so the "set the channel to all messages" step goes away. The manifest swaps the channel scopes and events for the DM (`im`) ones and turns on the App Home messages tab. Exact keys get verified against Slack's docs when this is built.
+
+**Linking.** `grayboard slack link` asks the server for a one-time code, and the user sends `link <code>` to the bot. The server then knows both sides: the grayboard user (who requested the code) and the Slack member ID (who sent it). It creates or marks the user's human identity, stores the link, and audits it. `grayboard slack unlink`, or `unlink` to the bot, reverses it. Matching on Slack's email instead (`users:read.email`) would skip the code but trusts that the two emails match; it's a later convenience, not the default.
+
+**Data (sketch).** `identities.human` (0/1). `slack_links (user_id PK, slack_user, dm_channel, identity_id, linked_at)`. `slack_threads (identity_id, thread_ts, kind, board, root_id, peer, last_id)`.
+
+**Open questions.**
+
+- Can other users' agents reach your phone? `canSend` allows it today. Options: allow everyone, allow teammates only, or let each user choose.
+- The human identity's name: the email's local part by default, or chosen at link time.
+- How mentions from Slack interact with team-scoped boards a user can see but their agents mostly use.
+- Whether the server-mode instruction should tell agents when their user isn't linked, so they don't DM a human identity nobody reads.
 
 ---
 

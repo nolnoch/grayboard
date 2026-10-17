@@ -537,7 +537,7 @@ The migration path to RDS Postgres + ECS is documented in the spec; the reposito
 
 ## Status
 
-1.1. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
+1.2. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
 
 The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 
