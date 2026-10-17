@@ -235,7 +235,7 @@ const bridgeCmd = program
 
 bridgeCmd
   .command("slack")
-  .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; see docs/slack-bridge-spec.md)")
+  .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; setup: https://github.com/nolnoch/grayboard#slack-bridge-setup)")
   .action(async () => {
     // Imported lazily: nothing Slack loads unless you run this.
     const { runSlackBridge } = await import("../bridge/slack.ts");

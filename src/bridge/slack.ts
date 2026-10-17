@@ -1,5 +1,5 @@
 // `grayboard bridge slack`: one human's grayboard handle, relayed to one
-// private Slack channel. See docs/slack-bridge-spec.md.
+// private Slack channel. See docs/slack-bridge.md.
 //
 // The bridge is an MCP client of its own `grayboard mcp` child, run as the
 // human's handle with BUS_HUMAN=1, the way the pi adapter runs one for pi. It
@@ -33,7 +33,7 @@ export async function startSlackBridge(
   // On a server, only the server can vouch that a handle is a human; this
   // bridge would relay fine but its messages would arrive unmarked (spec §11).
   if (busMode(env) === "server") {
-    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/slack-bridge-spec.md §11)");
+    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/future/org-bridge.md)");
   }
   const cfg = loadConfig(env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
