@@ -227,6 +227,21 @@ program
     await runTail(board, Number.parseInt(opts.lines, 10) || 0);
   });
 
+// ── bridge (opt-in) ──────────────────────────────────────────────────────────
+
+const bridgeCmd = program
+  .command("bridge")
+  .description("Relay a human's handle to a chat app, so agents can reach you on your phone");
+
+bridgeCmd
+  .command("slack")
+  .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; see docs/slack-bridge-spec.md)")
+  .action(async () => {
+    // Imported lazily: nothing Slack loads unless you run this.
+    const { runSlackBridge } = await import("../bridge/slack.ts");
+    await runSlackBridge(mcpCommand());
+  });
+
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
 program

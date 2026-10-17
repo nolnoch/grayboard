@@ -101,10 +101,27 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
 }
 
 // A session started: refresh last_seen, record where it runs (null when the
-// mode can't know, e.g. a remote server), and clear the previous session's status.
-export function startSession(db: Database, handle: string, cwd: string | null, now = Date.now()): void {
-  touchHandle(db, handle, now);
-  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL WHERE name = ?`).run(cwd, handle);
+// mode can't know, e.g. a remote server), whether a human holds it, and clear
+// the previous session's status.
+export function startSession(
+  db: Database,
+  handle: string,
+  cwd: string | null,
+  opts: { human?: boolean; now?: number } = {},
+): void {
+  touchHandle(db, handle, opts.now);
+  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL, human = ? WHERE name = ?`)
+    .run(cwd, opts.human ? 1 : 0, handle);
+}
+
+/** Whether a human holds `handle`, as of its last session start. */
+export function isHuman(db: Database, handle: string): boolean {
+  return !!(db.prepare(`SELECT human FROM handles WHERE name = ?`).get(handle) as { human: number | null } | undefined)?.human;
+}
+
+/** Handles a human holds, as of their last session start. */
+export function humanHandles(db: Database): string[] {
+  return (db.prepare(`SELECT name FROM handles WHERE human = 1 ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
 }
 
 // Server mode: where the session runs, as its client described it.
@@ -391,6 +408,7 @@ export type Peer = {
   where?: string;
   status?: string;
   status_age?: string;
+  human?: true;
 };
 // Read-only viewers (`grayboard tail`) subscribe under "~" handles, which no
 // identity can have. They aren't agents: keep them out of the roster.
@@ -407,7 +425,7 @@ export function who(
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
 ): WhoResult {
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null };
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null };
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
@@ -415,7 +433,7 @@ export function who(
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -423,7 +441,7 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
   const now = Date.now();
@@ -437,6 +455,7 @@ export function who(
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
       ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...(r.human ? { human: true as const } : {}),
     };
   });
   if (opts.include_offline) return { you: handle, peers: all };

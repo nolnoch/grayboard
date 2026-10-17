@@ -1,0 +1,386 @@
+// End-to-end Slack bridge: a fake Slack (Web API + Socket Mode over Bun.serve)
+// on one side, a real local-mode bus on the other. The bridge runs in-process
+// with its own `grayboard mcp` child; agents are separate `grayboard mcp`
+// processes driven by MCP clients, as in local.test.ts.
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import type { ServerWebSocket } from "bun";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+import { startSlackBridge, type BridgeHandle } from "../../src/bridge/slack.ts";
+
+const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
+const MCP = { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] };
+const CHANNEL = "G0PRIVATE";
+const OWNER = "U0OWNER";
+
+type Call = { method: string; body: Record<string, any> };
+
+// Just enough Slack: auth.test, apps.connections.open, chat.postMessage,
+// reactions.add, and a Socket Mode WebSocket that says hello and records acks.
+class FakeSlack {
+  calls: Call[] = [];
+  acks: string[] = [];
+  opens = 0;
+  failPosts = 0;
+  badAppToken = false;
+  /** The ts each successful chat.postMessage got. */
+  readonly postTs = new WeakMap<Record<string, any>, string>();
+  private sockets: ServerWebSocket<unknown>[] = [];
+  private ts = 1_700_000_000;
+  private envelope = 0;
+  readonly server = Bun.serve({
+    port: 0,
+    fetch: async (req, srv) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/ws") return srv.upgrade(req) ? undefined : new Response("no", { status: 400 });
+      const method = url.pathname.replace(/^\/api\//, "");
+      const body = (await req.json().catch(() => ({}))) as Record<string, any>;
+      this.calls.push({ method, body });
+      switch (method) {
+        case "auth.test":
+          return Response.json({ ok: true, user_id: "UBOT", bot_id: "BBOT", team: "test" });
+        case "apps.connections.open":
+          if (this.badAppToken) return Response.json({ ok: false, error: "invalid_auth" });
+          this.opens++;
+          return Response.json({ ok: true, url: `ws://localhost:${this.server.port}/ws` });
+        case "chat.postMessage":
+          if (this.failPosts > 0) {
+            this.failPosts--;
+            return new Response("unavailable", { status: 503 });
+          }
+          const ts = `${++this.ts}.000100`;
+          this.postTs.set(body, ts);
+          return Response.json({ ok: true, channel: body.channel, ts });
+        case "reactions.add":
+          return Response.json({ ok: true });
+      }
+      return Response.json({ ok: false, error: "unknown_method" });
+    },
+    websocket: {
+      open: (ws) => {
+        this.sockets.push(ws);
+        ws.send(JSON.stringify({ type: "hello", num_connections: 1, connection_info: { app_id: "A1" } }));
+      },
+      message: (_ws, raw) => {
+        const m = JSON.parse(String(raw));
+        if (m.envelope_id) this.acks.push(m.envelope_id);
+      },
+      close: (ws) => {
+        this.sockets = this.sockets.filter((s) => s !== ws);
+      },
+    },
+  });
+
+  get api(): string {
+    return `http://localhost:${this.server.port}/api/`;
+  }
+
+  posts(): Record<string, any>[] {
+    return this.calls.filter((c) => c.method === "chat.postMessage").map((c) => c.body);
+  }
+
+  reactions(): Record<string, any>[] {
+    return this.calls.filter((c) => c.method === "reactions.add").map((c) => c.body);
+  }
+
+  /** A message event from Slack, as the owner by default. Returns its envelope_id. */
+  say(text: string, opts: { thread_ts?: string; user?: string; event_id?: string; extra?: Record<string, any> } = {}): { envelope: string; ts: string } {
+    const ts = `${++this.ts}.000200`;
+    const envelope = `env-${++this.envelope}`;
+    const event = { type: "message", channel: CHANNEL, channel_type: "group", user: opts.user ?? OWNER, text, ts, ...(opts.thread_ts ? { thread_ts: opts.thread_ts } : {}), ...opts.extra };
+    this.send({ type: "events_api", envelope_id: envelope, accepts_response_payload: false, payload: { type: "event_callback", event_id: opts.event_id ?? `Ev${envelope}`, event } });
+    return { envelope, ts };
+  }
+
+  send(frame: unknown): void {
+    for (const s of this.sockets) s.send(JSON.stringify(frame));
+  }
+
+  stop(): void {
+    this.server.stop(true);
+  }
+}
+
+let dir: string;
+let slack: FakeSlack;
+let bridge: BridgeHandle | null;
+const open: Client[] = [];
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "grayboard-slack-"));
+  slack = new FakeSlack();
+  bridge = null;
+});
+
+afterEach(async () => {
+  await bridge?.stop();
+  await Promise.all(open.splice(0).map((c) => c.close().catch(() => {})));
+  slack.stop();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function env(identity?: string): Record<string, string> {
+  const e: Record<string, string | undefined> = {
+    ...process.env,
+    BUS_DB_PATH: join(dir, "bus.db"),
+    BUS_SOCK_DIR: dir,
+    GRAYBOARD_CREDENTIALS: join(dir, "credentials"),
+    GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
+    GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
+    SLACK_API_URL: slack.api,
+  };
+  delete e.BUS_IDENTITY;
+  delete e.BUS_HUMAN;
+  delete e.GRAYBOARD_TOKEN;
+  delete e.SLACK_APP_TOKEN;
+  delete e.SLACK_BOT_TOKEN;
+  if (identity) e.BUS_IDENTITY = identity;
+  return e as Record<string, string>;
+}
+
+function writeConfig(extra: Record<string, unknown> = {}, mode = 0o600): void {
+  const path = join(dir, "slack.json");
+  writeFileSync(path, JSON.stringify({ app_token: "xapp-1-test", bot_token: "xoxb-test", channel: CHANNEL, owner: OWNER, handle: "alex", ...extra }));
+  chmodSync(path, mode);
+}
+
+async function startBridge(): Promise<BridgeHandle> {
+  writeConfig();
+  bridge = await startSlackBridge(MCP, env());
+  return bridge;
+}
+
+type Agent = { c: Client; pushes: { content: string; meta: Record<string, string> }[] };
+
+async function agent(identity: string): Promise<Agent> {
+  const pushes: Agent["pushes"] = [];
+  const c = new Client({ name: "test", version: "0" });
+  c.fallbackNotificationHandler = async (n) => {
+    if (n.method === "notifications/claude/channel") pushes.push(n.params as Agent["pushes"][number]);
+  };
+  await c.connect(new StdioClientTransport({ ...MCP, cwd: dir, env: env(identity), stderr: "ignore" }));
+  open.push(c);
+  return { c, pushes };
+}
+
+async function stopAgent(a: Agent): Promise<void> {
+  open.splice(open.indexOf(a.c), 1);
+  await a.c.close();
+  await Bun.sleep(200);
+}
+
+async function call(c: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
+  const r = await c.callTool({ name, arguments: args });
+  const body = (r.content as { text: string }[])[0]!.text;
+  if (r.isError) throw new Error(body);
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
+async function until<T>(f: () => T | undefined | null | false, ms = 5000): Promise<T> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = f();
+    if (v) return v;
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await Bun.sleep(20);
+  }
+}
+
+test("an agent's DM becomes a Slack thread; the reply reaches only that agent, marked human", async () => {
+  const be = await agent("be");
+  const fe = await agent("fe");
+  await startBridge();
+
+  const q = await call(be.c, "dm_send", { to: "alex", body: "Return 204 or []?" });
+  expect(q.delivered_now).toBe(true);
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("204")));
+  expect(top).toMatchObject({ channel: CHANNEL, username: "be", markdown_text: "**be** Return 204 or []?" });
+  expect(top.thread_ts).toBeUndefined();
+  const threadTs = slackTsOf(top);
+
+  const { envelope, ts } = slack.say("[] please", { thread_ts: threadTs });
+  const got = await until(() => be.pushes.find((p) => p.content === "[] please"));
+  expect(got.meta).toMatchObject({ from: "alex", parent_id: String(q.message_id), human: "true" });
+  await until(() => slack.acks.includes(envelope));
+  await until(() => slack.reactions().find((r) => r.timestamp === ts && r.name === "white_check_mark"));
+  expect(fe.pushes).toEqual([]);
+
+  // The agent's follow-up lands in the same Slack thread.
+  await call(be.c, "dm_send", { to: "alex", body: "done", parent_id: Number(got.meta.message_id) });
+  const follow = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
+  expect(follow.thread_ts).toBe(threadTs);
+}, 30_000);
+
+test("two agents asking at once get separate threads that don't cross", async () => {
+  const be = await agent("be");
+  const fe = await agent("fe");
+  await startBridge();
+  await call(be.c, "dm_send", { to: "alex", body: "be question" });
+  await call(fe.c, "dm_send", { to: "alex", body: "fe question" });
+  const bePost = await until(() => slack.posts().find((p) => p.markdown_text === "**be** be question"));
+  const fePost = await until(() => slack.posts().find((p) => p.markdown_text === "**fe** fe question"));
+  slack.say("to fe", { thread_ts: slackTsOf(fePost) });
+  slack.say("to be", { thread_ts: slackTsOf(bePost) });
+  await until(() => fe.pushes.find((p) => p.content === "to fe"));
+  await until(() => be.pushes.find((p) => p.content === "to be"));
+  expect(fe.pushes.map((p) => p.content)).toEqual(["to fe"]);
+  expect(be.pushes.map((p) => p.content)).toEqual(["to be"]);
+}, 30_000);
+
+test("board mentions forward with the board's name; a reply posts in the board thread", async () => {
+  const be = await agent("be");
+  const fe = await agent("fe");
+  await startBridge();
+  await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(fe.c, "board_subscribe", { board: "e2e", mode: "quiet" });
+
+  // Mentioned deep in a thread whose root never reached Slack.
+  const root = await call(be.c, "board_post", { board: "e2e", body: "selector ready?" });
+  await call(fe.c, "board_post", { board: "e2e", body: "yes", parent_id: root.post_id });
+  const m1 = await call(be.c, "board_post", { board: "e2e", body: "@alex please review", parent_id: root.post_id });
+  const p1 = await until(() => slack.posts().find((p) => p.markdown_text?.includes("please review")));
+  expect(p1.markdown_text).toBe("**be** · #e2e · @alex please review");
+  const threadTs = slackTsOf(p1);
+
+  slack.say("looks good, merge it", { thread_ts: threadTs });
+  await until(() => be.pushes.find((p) => p.content === "looks good, merge it" && p.meta.reason === "thread"));
+  const thread = await call(be.c, "board_read", { board: "e2e", thread: root.post_id });
+  const mine = thread.posts.find((p: any) => p.author === "alex");
+  expect(mine.parent_id).toBe(m1.post_id);
+  // fe wrote in the thread too, so it's notified; and the post is marked human.
+  const feGot = await until(() => fe.pushes.find((p) => p.content === "looks good, merge it"));
+  expect(feGot.meta.human).toBe("true");
+
+  // Later replies in that board thread come back to the same Slack thread.
+  await call(fe.c, "board_post", { board: "e2e", body: "merged", parent_id: mine.id });
+  const p2 = await until(() => slack.posts().find((p) => p.markdown_text === "**fe** merged"));
+  expect(p2.thread_ts).toBe(threadTs);
+}, 30_000);
+
+test("top-level @handle and #board start conversations; mistakes get an answer", async () => {
+  const be = await agent("be");
+  const sim = await agent("sim");
+  await stopAgent(sim);
+  await startBridge();
+  await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
+
+  const dm = slack.say("@be rerun the soak");
+  const got = await until(() => be.pushes.find((p) => p.content === "rerun the soak"));
+  expect(got.meta.parent_id).toBeUndefined();
+  await until(() => slack.reactions().find((r) => r.timestamp === dm.ts));
+  // be's reply threads under the Slack message that started it.
+  await call(be.c, "dm_send", { to: "alex", body: "on it", parent_id: Number(got.meta.message_id) });
+  expect((await until(() => slack.posts().find((p) => p.markdown_text === "**be** on it"))).thread_ts).toBe(dm.ts);
+
+  const queued = slack.say("@sim are you there");
+  const q = await until(() => slack.posts().find((p) => p.thread_ts === queued.ts));
+  expect(q.markdown_text).toMatch(/^queued: sim is offline \(last seen \d+m ago\); it gets this/);
+
+  const unknown = slack.say("@nobody hi");
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === unknown.ts))).markdown_text).toMatch(/^⚠️ not sent: no agent "nobody" has ever connected/);
+
+  const post = slack.say("#e2e status? @be");
+  await until(() => be.pushes.find((p) => p.content === "status? @be" && p.meta.board === "e2e"));
+  await until(() => slack.reactions().find((r) => r.timestamp === post.ts));
+
+  const hint = slack.say("hello?");
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === hint.ts))).markdown_text).toContain('"@handle"');
+  const stray = slack.say("in a thread nobody knows", { thread_ts: "1.000000" });
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === "1.000000"))).markdown_text).toContain("isn't connected");
+  await until(() => slack.acks.includes(stray.envelope));
+}, 30_000);
+
+test("only the owner's new messages are relayed; duplicates once; every envelope acked", async () => {
+  const be = await agent("be");
+  await startBridge();
+  const envs = [
+    slack.say("@be from someone else", { user: "U0STRANGER" }),
+    slack.say("@be from a bot", { extra: { bot_id: "B0OTHER" } }),
+    slack.say("@be edited", { extra: { subtype: "message_changed" } }),
+    slack.say("@be first", { event_id: "EvSAME" }),
+    slack.say("@be first", { event_id: "EvSAME" }),
+    slack.say("@be last"),
+  ].map((e) => e.envelope);
+  await until(() => be.pushes.find((p) => p.content === "last"));
+  await until(() => envs.every((e) => slack.acks.includes(e)));
+  expect(be.pushes.map((p) => p.content)).toEqual(["first", "last"]);
+}, 30_000);
+
+test("a post Slack can't take stays in the outbox and goes out when it can", async () => {
+  const be = await agent("be");
+  slack.failPosts = 1;
+  await startBridge();
+  await call(be.c, "dm_send", { to: "alex", body: "eventually" });
+  // One 503, then the relay's retry (5s backoff) posts it.
+  const ok = await until(() => slack.posts().find((p) => p.markdown_text === "**be** eventually" && slack.postTs.has(p)), 15_000);
+  expect(slack.posts().filter((p) => p.markdown_text === "**be** eventually")).toHaveLength(2);
+  expect(ok.thread_ts).toBeUndefined();
+}, 30_000);
+
+test("agents learn about the human: instructions, peer_list; digests stay off Slack", async () => {
+  const before = await agent("be");
+  expect(before.c.getInstructions()).not.toContain("Humans on this bus");
+  await startBridge();
+  const after = await agent("fe");
+  expect(after.c.getInstructions()).toContain('Humans on this bus: "alex"');
+  const peers = (await call(after.c, "peer_list")).peers;
+  expect(peers.find((p: any) => p.handle === "alex")).toMatchObject({ online: true, human: true });
+  expect(peers.find((p: any) => p.handle === "be").human).toBeUndefined();
+
+  // A digest-mode board doesn't reach Slack; a mention on it does.
+  await call(before.c, "board_create", { name: "noise", purpose: "chatter" });
+  const n = slack.posts().length;
+  await call(before.c, "board_post", { board: "noise", body: "chatter" });
+  await call(before.c, "board_post", { board: "noise", body: "@alex not chatter" });
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("not chatter")));
+  expect(slack.posts().length).toBe(n + 1);
+}, 30_000);
+
+test("the bridge holds the handle; a second bridge can't start", async () => {
+  await startBridge();
+  await expect(startSlackBridge(MCP, env())).rejects.toThrow(/another session using that handle/);
+}, 30_000);
+
+test("Slack's disconnect warning brings up a new connection", async () => {
+  const be = await agent("be");
+  await startBridge();
+  expect(slack.opens).toBe(1);
+  slack.send({ type: "disconnect", reason: "refresh_requested" });
+  await until(() => slack.opens === 2);
+  await Bun.sleep(200);
+  slack.say("@be still here");
+  await until(() => be.pushes.find((p) => p.content === "still here"));
+}, 30_000);
+
+test("in server mode the bridge refuses to start", async () => {
+  writeConfig();
+  await expect(startSlackBridge(MCP, { ...env(), GRAYBOARD_TOKEN: "t" })).rejects.toThrow(/local mode only/);
+}, 30_000);
+
+test("a bad app token fails startup instead of hanging, and frees the handle", async () => {
+  writeConfig();
+  slack.badAppToken = true;
+  await expect(startSlackBridge(MCP, env())).rejects.toThrow(/invalid_auth/);
+  slack.badAppToken = false;
+  await Bun.sleep(300); // the child exits and drops its socket
+  await startBridge();
+}, 30_000);
+
+test("a config file others can read is refused", async () => {
+  writeConfig({}, 0o644);
+  await expect(startSlackBridge(MCP, env())).rejects.toThrow(/chmod 600/);
+});
+
+function slackTsOf(post: Record<string, any>): string {
+  const ts = slack.postTs.get(post);
+  if (!ts) throw new Error("post not found");
+  return ts;
+}

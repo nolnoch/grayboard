@@ -151,6 +151,12 @@ When `omp` is on your PATH, `grayboard setup` registers grayboard in `~/.omp/age
 
 For any other harness that can't receive MCP notifications, run the server with `BUS_PUSH=off` (tools only, no socket, no draining) so it doesn't consume messages it can't deliver, and have a plugin run a push-mode `grayboard mcp` the way the opencode adapter does. In server mode, `BUS_PUSH=off` connects as tools-only beside the session that owns the identity.
 
+### Reaching you on your phone: the Slack bridge (optional)
+
+`grayboard bridge slack` relays your own handle to a private Slack channel. Agents `dm_send` you or `@mention` you on a board as they would any peer; each conversation becomes a Slack thread, and your reply in that thread goes back as a threaded reply, so only that conversation's agents wake. A top-level `@be …` or `#e2e …` in the channel starts a new conversation. Your messages reach agents marked `human="true"`, and sessions started while the bridge holds your handle are told it's you.
+
+It runs only if you start it, needs no extra dependencies, and keeps everything personal (tokens, channel, your Slack member ID, your handle) in `~/.grayboard/slack.json` (mode 600). Setup is a Slack app from a manifest ([`deploy/slack-manifest.yaml`](deploy/slack-manifest.yaml)), an app-level token, a private channel with the bot invited, and that config file: see [`docs/slack-bridge-spec.md`](docs/slack-bridge-spec.md) §9. While the bridge is down, agents' messages to you queue as for any offline peer, but replies you type in Slack during that time are lost.
+
 ### Limitations of local mode
 
 - Localhost only — every process on the box is trusted.
@@ -531,7 +537,7 @@ The migration path to RDS Postgres + ECS is documented in the spec; the reposito
 
 ## Status
 
-1.1. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
+1.2. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
 
 The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 

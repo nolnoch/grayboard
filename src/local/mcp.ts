@@ -7,12 +7,13 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, age, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
   claimsInstruction,
   boardNotification,
+  humanInstruction,
   boardTools,
   callBoardTool,
   isBoardTool,
@@ -51,6 +52,9 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // separate adapter owns the wakeup socket and delivery. Draining here would
 // consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
+// BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
+// slack`). Its messages and posts reach agents marked human="true".
+const HUMAN = process.env.BUS_HUMAN === "1";
 // Claude Code started without a channels flag drops pushes silently; say so.
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
 if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
@@ -68,6 +72,7 @@ const mcp = new Server(
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
+      ...humanInstruction(humanHandles(db).filter((h) => h !== IDENTITY)),
       ...claimsInstruction(listClaims(db)),
       ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
@@ -312,6 +317,7 @@ async function drainToClaude(): Promise<void> {
           created_at: String(msg.created_at),
         };
         if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+        if (isHuman(db, msg.sender)) meta.human = "true";
         await mcp.notification({
           method: "notifications/claude/channel",
           params: { content: msg.body, meta },
@@ -319,9 +325,11 @@ async function drainToClaude(): Promise<void> {
         setCursor(IDENTITY, msg.id);
       }
       for (const item of boardItems) {
+        const params = boardNotification(item);
+        if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
         await mcp.notification({
           method: "notifications/claude/channel",
-          params: boardNotification(item),
+          params,
         });
         markDelivered(db, IDENTITY, item);
       }
@@ -336,7 +344,7 @@ async function drainToClaude(): Promise<void> {
 // bind the wakeup socket (rechecking), and replay what arrived while offline.
 if (PUSH) await assertIdentityFree(IDENTITY);
 // A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (PUSH) startSession(db, IDENTITY, process.cwd());
+if (PUSH) startSession(db, IDENTITY, process.cwd(), { human: HUMAN });
 else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
 
