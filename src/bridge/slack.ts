@@ -4,8 +4,7 @@
 // The bridge is an MCP client of its own `grayboard mcp` child, run as the
 // human's handle with BUS_HUMAN=1, the way the pi adapter runs one for pi. It
 // gets the same pushes an agent session gets and acts only through the same
-// tools, so roster checks, wakeups, and identity uniqueness come for free, in
-// either bus mode.
+// tools, so roster checks, wakeups, and identity uniqueness come for free.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
