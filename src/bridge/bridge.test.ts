@@ -77,9 +77,9 @@ test("web: waits out a rate limit, then classifies errors", async () => {
     return new Response("down", { status: 502 });
   };
   const web = new SlackWeb("xoxb-t", "http://slack.test/api/", f);
-  const t = Date.now();
+  const t = performance.now(); // monotonic: WSL can step the wall clock back mid-test
   expect((await web.call<{ ts: string }>("chat.postMessage")).ts).toBe("1.2");
-  expect(Date.now() - t).toBeGreaterThanOrEqual(900);
+  expect(performance.now() - t).toBeGreaterThanOrEqual(900);
   const fatal = await web.call("chat.postMessage").catch((e) => e);
   expect(fatal).toBeInstanceOf(SlackError);
   expect(fatal.fatal).toBe(true);
