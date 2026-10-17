@@ -51,7 +51,8 @@ export class SocketMode {
 
   constructor(opts: SocketOptions) {
     // Slack pings about every 10s (measured live), so 30s of silence is three missed pings.
-    this.o = { pingMs: 10_000, deadMs: 30_000, maxBackoffMs: 60_000, log: () => {}, debug: () => {}, ...opts };
+    // ?? rather than spread defaults: callers pass debug: undefined when it's off.
+    this.o = { pingMs: 10_000, deadMs: 30_000, maxBackoffMs: 60_000, ...opts, log: opts.log ?? (() => {}), debug: opts.debug ?? (() => {}) };
   }
 
   /**

@@ -183,6 +183,32 @@ test("socket: a connection that goes silent is replaced", async () => {
   expect(logs.some((l) => l.includes("nothing heard"))).toBe(true);
 });
 
+test("socket: Slack's pings are fine with debug logging off", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req, srv) => (srv.upgrade(req) ? undefined : new Response("no")),
+    websocket: {
+      open(ws) {
+        ws.send(JSON.stringify({ type: "hello" }));
+        setTimeout(() => {
+          ws.ping();
+          ws.send(JSON.stringify({ type: "events_api", envelope_id: "e1", payload: { event_id: "Ev1" } }));
+        }, 20);
+      },
+      message() {},
+    },
+  });
+  let events = 0;
+  // As slack.ts passes them when GRAYBOARD_SLACK_DEBUG is unset.
+  const sm = new SocketMode({ open: async () => `ws://localhost:${server.port}/`, onEvent: async () => void events++, onFatal: () => {}, log: undefined, debug: undefined });
+  await sm.start();
+  const end = Date.now() + 2000;
+  while (!events && Date.now() < end) await Bun.sleep(10);
+  sm.stop();
+  server.stop(true);
+  expect(events).toBe(1);
+});
+
 test("socket: link_disabled is fatal; a bad app token is fatal", async () => {
   const server = Bun.serve({
     port: 0,
