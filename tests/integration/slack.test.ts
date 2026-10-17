@@ -365,6 +365,16 @@ test("in server mode the bridge refuses to start", async () => {
   await expect(startSlackBridge(MCP, { ...env(), GRAYBOARD_TOKEN: "t" })).rejects.toThrow(/local mode only/);
 }, 30_000);
 
+test("--mode local starts the bridge on a signed-in machine, with a local child", async () => {
+  const be = await agent("be");
+  writeConfig();
+  // No --mode in the base invocation: only the bridge's own pin keeps the child off the server.
+  const bare = { command: process.execPath, args: [CLI, "mcp"] };
+  bridge = await startSlackBridge(bare, { ...env(), GRAYBOARD_TOKEN: "t" }, "local");
+  slack.say("@be from a signed-in machine");
+  await until(() => be.pushes.find((p) => p.content === "from a signed-in machine"));
+}, 30_000);
+
 test("a bad app token fails startup instead of hanging, and frees the handle", async () => {
   writeConfig();
   slack.badAppToken = true;

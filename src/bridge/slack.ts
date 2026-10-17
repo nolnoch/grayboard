@@ -25,15 +25,17 @@ export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
 /**
  * Start the bridge. `mcp` is how to run `grayboard mcp`. Resolves once it's
  * connected to both sides; `done` settles with the exit code when it stops.
+ * `mode: "local"` pins the child to the local bus on a signed-in machine.
  */
 export async function startSlackBridge(
   mcp: { command: string; args: string[] },
   env: Record<string, string | undefined> = process.env,
+  mode?: "local",
 ): Promise<BridgeHandle> {
   // On a server, only the server can vouch that a handle is a human; this
-  // bridge would relay fine but its messages would arrive unmarked (spec §11).
-  if (busMode(env) === "server") {
-    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/future/org-bridge.md)");
+  // bridge would relay fine but its messages would arrive unmarked.
+  if (mode !== "local" && busMode(env) === "server") {
+    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/future/org-bridge.md). To relay this machine's local bus instead, pass --mode local");
   }
   const cfg = loadConfig(env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
@@ -90,7 +92,8 @@ export async function startSlackBridge(
   delete childEnv.BUS_PUSH;
   childEnv.BUS_IDENTITY = cfg.handle;
   childEnv.BUS_HUMAN = "1";
-  const transport = new StdioClientTransport({ command: mcp.command, args: mcp.args, env: childEnv, stderr: "inherit" });
+  const args = mode === "local" ? [...mcp.args, "--mode", "local"] : mcp.args;
+  const transport = new StdioClientTransport({ command: mcp.command, args, env: childEnv, stderr: "inherit" });
   try {
     await client.connect(transport);
   } catch (e) {
@@ -120,10 +123,10 @@ export async function startSlackBridge(
 }
 
 /** CLI entry: run until stopped; exit nonzero on failure so a supervisor restarts it. */
-export async function runSlackBridge(mcp: { command: string; args: string[] }): Promise<never> {
+export async function runSlackBridge(mcp: { command: string; args: string[] }, mode?: "local"): Promise<never> {
   let bridge: BridgeHandle;
   try {
-    bridge = await startSlackBridge(mcp);
+    bridge = await startSlackBridge(mcp, process.env, mode);
   } catch (e) {
     if (e instanceof ConfigError || e instanceof SlackError) log(e.message);
     else log(String((e as Error).message ?? e));
