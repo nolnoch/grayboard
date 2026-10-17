@@ -1,0 +1,23 @@
+# Slack app manifest for `grayboard bridge slack`.
+# api.slack.com/apps → Create New App → From a manifest → paste this (YAML tab).
+# Setup steps: docs/slack-bridge-spec.md §9.2.
+display_information:
+  name: grayboard
+features:
+  bot_user:
+    display_name: grayboard
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - groups:history
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.groups
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

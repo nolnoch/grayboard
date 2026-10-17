@@ -8,6 +8,8 @@ import {
   acknowledge,
   createBoard,
   getBoard,
+  humanHandles,
+  isHuman,
   listBoards,
   markDelivered,
   mentionTokens,
@@ -17,12 +19,13 @@ import {
   read,
   refOf,
   setAccess,
+  startSession,
   subscribe,
   touchHandle,
   who,
   type Access,
 } from "./boards.ts";
-import { callBoardTool } from "./tools.ts";
+import { callBoardTool, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -40,6 +43,21 @@ const drain = (h: string) => {
   for (const i of items) markDelivered(db, h, i);
   return items;
 };
+
+test("a human handle lasts only as long as a human session holds it", () => {
+  expect(humanHandles(db)).toEqual([]);
+  expect(humanInstruction(humanHandles(db))).toEqual([]);
+  startSession(db, "alex", null, { human: true });
+  expect(isHuman(db, "alex")).toBe(true);
+  expect(isHuman(db, "be")).toBe(false);
+  expect(humanInstruction(humanHandles(db))[0]).toContain('Humans on this bus: "alex"');
+  const r = who(db, "be", { include_offline: true }, () => true);
+  expect(r.peers.find((p) => p.handle === "alex")?.human).toBe(true);
+  expect(r.peers.find((p) => p.handle === "sim")?.human).toBeUndefined();
+  // An ordinary session taking the handle clears it.
+  startSession(db, "alex", null);
+  expect(humanHandles(db)).toEqual([]);
+});
 
 test("new subscribers start at the tip", () => {
   post(db, "be", "e2e", "old news");

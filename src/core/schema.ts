@@ -60,10 +60,11 @@ export function initCoreSchema(db: Database): void {
     );
   `);
   // Session context, added after the roster: where the session runs (cwd in
-  // local mode; place, as the client described it, in server mode), and a
-  // free-text status it set. All reset when a session starts.
+  // local mode; place, as the client described it, in server mode), a
+  // free-text status it set, and whether a human holds the handle (a bridge
+  // such as `grayboard bridge slack`). All reset when a session starts.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"]]) {
+  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
   }
 
