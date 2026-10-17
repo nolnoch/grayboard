@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: process model and mode selection; the distributed server (auth and sessions, WS protocol, HTTP access rules, server access policy, build and deploy)
-invariants: one CLI entry picks local or server mode from the credentials file's existence; auth lives only on the WS upgrade; Google tokens are never stored; sessions never expire; cursors advance only on ack; one live connection per identity (probe, then refuse); hidden teams and boards read as not found; Repo is the Postgres seam
+invariants: one CLI entry picks local or server mode from the credentials file's existence; WS auth lives only on the upgrade (HTTP authenticates per request); Google tokens are never stored; sessions never expire; cursors advance only on ack; one live connection per identity (probe, then refuse); hidden teams and boards read as not found; Repo is the Postgres seam
 code-pointers: src/cli/main.ts (mcp, setup), src/cli/api.ts (busMode, credentials), src/server/, src/plugin/, src/shared/protocol.ts, src/shared/identity.ts, deploy/
 companions: boards.md (core semantics both modes share), slack-bridge.md (a client of grayboard mcp), ../AGENTS.md (release runbook), ../README.md (operator steps)
 ```
@@ -24,15 +24,15 @@ flowchart LR
 - One CLI binary is every client entry point. `grayboard mcp` loads `src/plugin/mcp.ts` (server mode) or `src/local/mcp.ts` (local mode); `grayboard-server` is the second binary.
 - **Mode selection** (`busMode`, `src/cli/api.ts`): server mode if `GRAYBOARD_TOKEN` is set or the credentials file exists, else local. `--mode local|server` overrides, e.g. per repo in `.mcp.json`. An *empty* credentials file means signed out: server mode fails with "signed out" rather than silently becoming local (why logout truncates instead of deleting).
 - **Local mode is a peer, not a fallback.** Same-machine live push needs no managed server process; Unix sockets are the right primitive. It is excluded from the server's migration seam (§7).
-- Identity: `BUS_IDENTITY`, else the git repo's directory name, plus a worktree suffix (`src/shared/identity.ts`). See `boards.md` §Handles.
+- Identity: `BUS_IDENTITY`, else a pin in the repo's `.mcp.json`, else the git repo's directory name, plus a worktree suffix (`src/shared/identity.ts`). See `boards.md` §3.
 
 ## 2. Server data
 
 - One SQLite file, WAL. Schema is idempotent DDL at open (`src/server/db.ts:initSchema`; board tables from `src/core/schema.ts`). No migration tool; changes are additive.
 - `messages` stores canonical address strings (`email/name`), not identity FKs.
 - **Cursors are per identity**, not per user: each identity advances independently in its DM stream and, via core subscriptions, per board.
-- `users.disabled_at` and `teams.policy` are reserved seams for future `canSend` policy. `teams.policy` is unused: teams are invite-only regardless.
-- Retention (`src/server/retention.ts`): messages, posts and audit rows age out (default 90 days). Pruning clears replies' `parent_id` first, or the FK breaks when a replied-to row ages out. Claims are never pruned, so retention can't swallow an expiry announcement. Monthly VACUUM is a no-op; `auto_vacuum=INCREMENTAL` bounds growth.
+- `users.disabled_at` is enforced at auth: a disabled user's tokens fail `verifySessionToken` (`admin disable-user`). `teams.policy` is an unused seam: teams are invite-only regardless.
+- Retention (`src/server/retention.ts`): messages, posts and audit rows age out (default 90 days). Pruning clears replies' `parent_id` first, or the FK breaks when a replied-to row ages out. Claims are never pruned, so retention can't swallow an expiry announcement. Nothing reclaims free pages: the monthly vacuum hook is empty, and `auto_vacuum=INCREMENTAL` only tracks free pages until something runs `PRAGMA incremental_vacuum` (not exposed through `Repo`).
 
 ## 3. Auth and sessions
 
@@ -80,7 +80,7 @@ Frames: derive from `src/shared/protocol.ts` (validated by hand in `parseClientM
 
 ## 8. Build and deploy
 
-- `bun build --compile` produces self-contained binaries (Bun runtime bundled). All targets cross-compile from one Linux runner; a native dependency that can't cross-compile would break that. Release process: `AGENTS.md` §Releasing.
+- `bun build --compile` produces self-contained binaries (Bun runtime bundled). Every target cross-compiles on Linux runners (no macOS runner); a native dependency that can't cross-compile would break that. Release process: `AGENTS.md` §Releasing.
 - `deploy/grayboard.service` runs `/usr/local/bin/grayboard-server` with `EnvironmentFile=/etc/grayboard/env`. `deploy/Caddyfile` terminates TLS for one host (placeholder `grayboard.example.com`); WS upgrade passes through.
 - `deploy/backup.sh`: `sqlite3 .backup` to S3. Retention is an S3 lifecycle rule, not the script.
 - Operator steps (host, DNS, OAuth client, env file, updates): `README.md` §Distributed mode.

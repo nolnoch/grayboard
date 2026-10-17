@@ -45,8 +45,8 @@ export function gitBranch(cwd: string): string | null {
 }
 
 /**
- * Where a session runs, for peer_list: "doxus-backend on main" or
- * "doxus-backend worktree be-stream on worktree-be-stream". Read live, so the
+ * Where a session runs, for peer_list: "api on main" or
+ * "api worktree be-stream on worktree-be-stream". Read live, so the
  * branch is current. Null if `cwd` is gone.
  */
 export function describeLocation(cwd: string): string | null {

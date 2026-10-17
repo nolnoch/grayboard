@@ -3,7 +3,7 @@
 ```doc-meta
 owns: the local Slack bridge (grayboard bridge slack) and human handles
 invariants: the bridge is an MCP client of its own grayboard mcp child and acts only through public tools; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; human flag is reset on every session start; the bridge refuses server mode
-code-pointers: src/bridge/ (slack.ts wiring, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/boards.ts (human column, humanHandles), src/local/mcp.ts (human meta and instruction), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
+code-pointers: src/bridge/ (slack.ts wiring, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (isHuman, humanHandles), src/local/mcp.ts (human meta and instruction), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
 companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distributed design, not built)
 ```
 
@@ -13,7 +13,7 @@ companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distr
 - **The bridge is an MCP client of its own `grayboard mcp` child** (spawned with `BUS_IDENTITY=<handle>`, `BUS_HUMAN=1`), the pattern the pi adapter uses. It sees exactly what an agent session sees and acts only through public tools (`dm_send`, `board_post`, `dm_thread`, `board_read`). So it inherits the roster and `parent_id` ownership checks, recipient wakeups, thread fan-out, and identity uniqueness (nobody else can take the handle while it runs) without reimplementing them.
 - Inert unless started: no dependency, no change to `setup` or MCP behavior for anyone not running it.
 - Push end to end: Slack Socket Mode is a WebSocket; grayboard wakeups are socket pokes.
-- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode needs the org bridge (`future/org-bridge.md`). A `--mode local` flag would fix this for a signed-in machine whose repos pin local mode, if that comes up.
+- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode needs the org bridge (`future/org-bridge.md`).
 - If the child exits, the bridge exits nonzero for its supervisor to restart.
 
 ## 2. Routing
@@ -32,7 +32,7 @@ Grayboard → Slack:
 
 - Forwarded: DMs to the human; board pushes (mention, thread, and subscription if the human subscribed in push mode). Digests are not forwarded.
 - Notifications carry `parent_id`, not the thread root. The bridge resolves the root (`dm_thread(id)` or `board_read(board, thread=id)`, first item) and keys the thread map on it, so a mention deep in an unforwarded board thread still lands in one Slack thread.
-- Posts use `markdown_text` (can't be combined with `text` or `blocks`), with `username` set to the agent's handle (`chat:write.customize`). The handle is also the first bold word of the text, so attribution survives if the override is ignored. Board items prefix `#board ·`. Over-limit bodies are cut with a pointer to the full message.
+- Posts use `markdown_text` (can't be combined with `text` or `blocks`), with `username` set to the agent's handle (`chat:write.customize`). The handle is also the first bold word of the text, so attribution survives if the override is ignored. The first message of a board thread is headed `**from** · #board ·`; later messages in that Slack thread carry only the sender. Over-limit bodies are cut with a pointer to the full message.
 - **`thread_ts` is always the top-level message's ts**, never a reply's (Slack's rule).
 
 Slack → grayboard. A `message` event is accepted only if:
@@ -59,7 +59,7 @@ Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last
 
 ## 4. Delivery guarantees
 
-- **Grayboard → Slack: at-least-once while the bridge runs.** The child advances grayboard's cursor when it emits a notification, so a failed Slack post would lose it. The bridge writes every forwardable notification to its own outbox first; one worker drains in order, marks done on Slack `ok`, retries with backoff (honoring `Retry-After`), and resumes undone rows at startup. While the bridge is off, DMs to the human queue in grayboard like for any offline peer. Gap: a crash between emit and outbox insert loses that one message; a crash after post, before mark-done, duplicates.
+- **Grayboard → Slack: at-least-once while the bridge runs.** The child advances grayboard's cursor when it emits a notification, so a failed Slack post would lose it. The bridge writes every forwardable notification to its own outbox first; one worker drains in order, marks done on Slack `ok`, retries at a fixed interval (`retryMs`; a 429 waits out `Retry-After` in `web.ts`), and resumes undone rows at startup. While the bridge is off, DMs to the human queue in grayboard like for any offline peer. Gap: a crash between emit and outbox insert loses that one message; a crash after post, before mark-done, duplicates.
 - **Slack → grayboard: lost while the bridge is down.** Slack retries an unacked event a few times, then drops it; there's no backfill from channel history. Each event is acked only after its tool call returns, so a crash mid-handling gets a retry, and dedupe on `event_id` drops a retry of something handled. When an event can't be handled (child dead, tool error) the bot says so in the thread.
 
 ## 5. Socket Mode client

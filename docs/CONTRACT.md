@@ -73,7 +73,7 @@ Placement: server-only mechanics → `architecture.md`; anything both modes shar
 
 - Markdown is soft-wrapped: one line per paragraph or bullet.
 - Code pointers are repo-relative (`src/server/ws.ts`), optionally `file:line` or `file:function`.
-- Every Tier-2 doc opens with a `doc-meta` fence immediately after the H1, so an agent can triage it with one grep (`grep -A5 doc-meta docs/*.md`). Keys are fixed; values are terse:
+- Every Tier-2 doc opens with a `doc-meta` fence immediately after the H1, so an agent can triage it with one grep (`grep -A6 doc-meta docs/*.md docs/future/*.md`). Keys are fixed; values are terse:
 
   ````
   ```doc-meta

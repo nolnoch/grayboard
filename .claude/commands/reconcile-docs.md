@@ -53,7 +53,7 @@ Apply corrections. Re-verify only if a correction was substantive.
 
 1. Show `git diff --stat` and the full diff of the touched docs.
 2. Sanity checks: no new catalog section or hand-maintained count (grep the diff for bare integers in prose); no link to a deleted or renamed doc (`grep -rn '\.md' docs AGENTS.md README.md`); no `meta/` citation; no private names in the staged diff.
-3. On the user's go-ahead, commit with an explicit pathspec (`git commit -- docs AGENTS.md README.md -m "Docs: reconcile <range>"`), never `-a`.
+3. On the user's go-ahead, commit with an explicit pathspec (`git commit -m "Docs: reconcile <range>" -- docs AGENTS.md CLAUDE.md README.md`), never `-a`.
 4. Run `scripts/advance_docs_baseline.sh`. It refuses while doc files have uncommitted changes. Never move the tag by hand.
 
 ## When to run
