@@ -344,6 +344,28 @@ test("agents learn about the human: instructions, peer_list; digests stay off Sl
   expect(slack.posts().length).toBe(n + 1);
 }, 30_000);
 
+test("#announce from Slack reaches every live agent marked human; acks come back to the thread", async () => {
+  const be = await agent("be");
+  const fe = await agent("fe");
+  await startBridge();
+  const a = slack.say("#announce shutting down in 30 min");
+  const got = await until(() => be.pushes.find((p) => p.content === "shutting down in 30 min"));
+  expect(got.meta).toMatchObject({ board: "announce", from: "alex", human: "true" });
+  await until(() => fe.pushes.find((p) => p.content === "shutting down in 30 min"));
+  await call(be.c, "board_post", { board: "announce", body: "be: ack", parent_id: Number(got.meta.post_id) });
+  expect((await until(() => slack.posts().find((p) => p.markdown_text?.includes("be: ack")))).thread_ts).toBe(a.ts);
+  await Bun.sleep(300);
+  expect(fe.pushes.some((p) => p.content === "be: ack")).toBe(false);
+}, 30_000);
+
+test("the bridge declares its handle the human, and refuses if someone else is declared", async () => {
+  await startBridge();
+  await bridge!.stop();
+  bridge = null;
+  writeConfig({ handle: "sam" });
+  await expect(startSlackBridge(MCP, env())).rejects.toThrow(/"alex" is the declared human handle/);
+}, 30_000);
+
 test("the bridge holds the handle; a second bridge can't start", async () => {
   await startBridge();
   await expect(startSlackBridge(MCP, env())).rejects.toThrow(/another session using that handle/);

@@ -31,6 +31,9 @@ export function serverAccess(repo: Repo): Access {
   return {
     canSee,
 
+    // No human handles on a server yet (#24), so no human-only board.
+    announceBoard: null,
+
     checkCreate(handle, scope) {
       if (scope === null) return null;
       const team = teamOf(scope);

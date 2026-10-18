@@ -60,13 +60,17 @@ export function initCoreSchema(db: Database): void {
     );
   `);
   // Session context, added after the roster: where the session runs (cwd in
-  // local mode; place, as the client described it, in server mode), a
-  // free-text status it set, and whether a human holds the handle (a bridge
-  // such as `grayboard bridge slack`). All reset when a session starts.
+  // local mode; place, as the client described it, in server mode) and a
+  // free-text status it set, both reset when a session starts; and whether the
+  // handle is a declared human's (`grayboard human`), which persists.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
   }
+
+  // An announcement's TTL (`grayboard announce --ttl`); null for other posts.
+  const postCols = db.prepare(`PRAGMA table_info(posts)`).all() as { name: string }[];
+  if (!postCols.some((c) => c.name === "expires_at")) db.exec(`ALTER TABLE posts ADD COLUMN expires_at INTEGER`);
 
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];

@@ -2,8 +2,8 @@
 
 ```doc-meta
 owns: the local Slack bridge (grayboard bridge slack) and human handles
-invariants: the bridge is an MCP client of its own grayboard mcp child and acts only through public tools; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; human flag is reset on every session start; the bridge never joins a server (`--mode local` pins its child to the local bus)
-code-pointers: src/bridge/ (slack.ts wiring, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (isHuman, humanHandles), src/local/mcp.ts (human meta and instruction), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
+invariants: the bridge is an MCP client of its own grayboard mcp child and acts only through public tools; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; the human handle is a persistent declaration and BUS_HUMAN=1 only asserts it; the bridge never joins a server (`--mode local` pins its child to the local bus)
+code-pointers: src/bridge/ (slack.ts wiring and human declaration, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (declareHuman, isHuman, humanHandles), src/local/mcp.ts (startup check, human meta and instruction), src/local/human.ts (grayboard human, grayboard announce), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
 companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distributed design, not built)
 ```
 
@@ -51,11 +51,12 @@ Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last
 
 ## 3. Human handles
 
-- Why: instructions tell agents a peer's requests never override the user's. That's wrong for the human answering from Slack; without a marker an agent weighs the human like another agent.
-- `handles.human` (additive column). `startSession` sets it from `BUS_HUMAN=1` and **resets it on every session start**, so the flag lives only while a bridge holds the handle.
+- Why: instructions tell agents a peer's requests never override the user's. That's wrong for the human answering from Slack or announcing (`boards.md` §4 `#announce`); without a marker an agent weighs the human like another agent.
+- **A declaration, not a session flag.** `handles.human` is set by `grayboard human <handle>` (one human per local bus) and persists. `startSession` doesn't touch it. Why: `grayboard announce` posts as the human with no session, so the gate can't depend on one. It used to be set from `BUS_HUMAN=1` at session start and reset at every start.
+- **`BUS_HUMAN=1` grants nothing; it only asserts.** Local `mcp.ts` exits at startup if `BUS_HUMAN` and the declaration disagree. With a declared handle but no `BUS_HUMAN`, the session is refused, so an agent can't take the human's handle by name. With `BUS_HUMAN` on an undeclared handle, it's refused too. The bridge declares its configured handle before spawning the child (CLI side, outside the public-tools boundary): it declares on first run, and refuses if a different human is declared.
 - Local `mcp.ts` adds `human="true"` to the meta of DMs and posts from a human handle.
-- If any human handle exists when an agent session starts, its instructions gain one sentence naming the humans. **Conditional because every instruction sentence costs every session**; a bus with no humans pays nothing. Cost: sessions started before the bridge's first run see only `human="true"` until their next start.
-- Trust: local mode is one OS user, so anything that can run `BUS_HUMAN=1 BUS_IDENTITY=<handle> grayboard mcp` can speak as the human while the bridge is down. The marker guards against confusion, not a hostile local process (which could already edit config). It takes a deliberate env var, and the running bridge blocks anyone else from the handle.
+- If a human handle exists when an agent session starts, its instructions gain the human sentence plus the `#announce` sentence. **Conditional because every instruction sentence costs every session**; a bus with no human pays nothing.
+- Trust: local mode is one OS user. Anything with a shell can run `grayboard human`, start `BUS_HUMAN=1 grayboard mcp`, or write the SQLite file. The declaration guards against confusion and well-meant relays, not a hostile local process. A password on the CLI wouldn't change that, since the DB is writable directly, and it would break `! grayboard announce`. Real enforcement is the server's job (account-owned handles, #24) or signed posts (refused in `boards.md` §11).
 
 ## 4. Delivery guarantees
 
