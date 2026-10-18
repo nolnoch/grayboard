@@ -108,6 +108,21 @@ test("BUS_PUSH=off runs beside the session that owns the identity, for tools onl
   expect(tools.pushes).toEqual([]);
 }, 20_000);
 
+test("dm_ack takes a list in server mode: one frame per id, unknown ids reported", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  const fe = await session(bob, "fe");
+  const ids = [];
+  for (const body of ["a", "b"]) ids.push((await fe.call("dm_send", { to: "alice@example.com/be", body })).message_id);
+  expect(await be.call("dm_ack", { message_id: ids })).toBe("ok");
+  expect((await be.call("dm_inbox")).unanswered).toEqual([]);
+  const mine = (await be.call("dm_send", { to: "bob@example.com/fe", body: "mine" })).message_id;
+  const c = (await fe.call("dm_send", { to: "alice@example.com/be", body: "c" })).message_id;
+  expect(await be.call("dm_ack", { message_id: [c, mine] })).toMatchObject({ acked: [c], not_found: [mine] });
+  await expect(be.call("dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
+}, 20_000);
+
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};
