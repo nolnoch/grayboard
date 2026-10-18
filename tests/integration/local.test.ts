@@ -256,6 +256,31 @@ test("dm_ack takes a list, so one combined reply clears every message it covered
   await expect(call(be, "dm_ack", { message_id: [] })).rejects.toThrow(/list of them/);
 }, 20_000);
 
+test("a send to a long-idle handle says so; dm_retract withdraws it until it's delivered", async () => {
+  await stop(await start("fe"));
+  const be = await start("be");
+  const sim = await start("sim");
+  const first = await call(be, "dm_send", { to: "fe", body: "first" });
+  expect(first.note).toMatch(/^Recipient offline/);
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(join(dir, "bus.db"));
+  db.exec(`UPDATE handles SET last_seen = last_seen - 22 * 3600000 WHERE name = 'fe'`);
+  db.close();
+  const wrong = await call(be, "dm_send", { to: "fe", body: "meant for sim" });
+  expect(wrong.note).toMatch(/^Queued: fe last seen 22h ago\. .*dm_retract/);
+  const followup = await call(be, "dm_send", { to: "fe", body: "also", parent_id: first.message_id });
+
+  await expect(call(sim, "dm_retract", { message_id: wrong.message_id })).rejects.toThrow(/no message \d+ from you/);
+  await expect(call(be, "dm_retract", { message_id: first.message_id })).rejects.toThrow(/has a reply/);
+  expect(await call(be, "dm_retract", { message_id: wrong.message_id })).toBe("ok");
+  expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.body)).toEqual(["first", "also"]);
+
+  const fe = await startCollecting("fe");
+  await Bun.sleep(500);
+  expect(fe.pushes).toEqual(["first", "also"]);
+  await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");

@@ -104,3 +104,31 @@ export function undeliveredInstruction(
     .join("; ");
   return [`Direct messages you sent that still haven't reached the recipient after 24h: ${list}. Don't count them as read.`];
 }
+
+// A queued message to a handle idle this long is likely a misaddress (a live
+// peer under another handle), so the send result says so and names the undo.
+export const STALE_RECIPIENT_MS = 3_600_000;
+
+export function queuedNote(recipient: string, seen: number | null, now = Date.now()): string {
+  if (seen !== null && now - seen < STALE_RECIPIENT_MS) return "Recipient offline; will be delivered on their next session.";
+  const when = seen === null ? "has never connected" : `last seen ${age(now - seen)} ago`;
+  return `Queued: ${recipient} ${when}. If you meant a live peer, check peer_list; dm_retract undoes this.`;
+}
+
+// Not alwaysLoad: queuedNote names it when it's relevant.
+export const DM_RETRACT_TOOL = {
+  name: "dm_retract",
+  description:
+    "dm_retract(message_id): delete a direct message you sent that is still queued (the recipient is offline and hasn't received it). Refused once it has reached them or has a reply.",
+  inputSchema: {
+    type: "object",
+    properties: { message_id: { type: "number", description: "The message_id dm_send returned." } },
+    required: ["message_id"],
+  },
+};
+
+export const retractRefusal = {
+  notYours: (id: number) => `no message ${id} from you`,
+  reached: (id: number, to: string) => `message ${id} already reached ${to}; send a correction instead`,
+  replied: (id: number) => `message ${id} has a reply in its thread; send a correction instead`,
+};

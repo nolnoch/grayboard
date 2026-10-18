@@ -551,11 +551,12 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen` and `undelivered_from_you` (your messages queued for them, this one included). An unknown handle is an error pointing to `peer_list`. |
+| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
-| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
+| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. Takes one id or a list. |
+| `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
 | `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:

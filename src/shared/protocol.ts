@@ -24,13 +24,14 @@ export type AckRequest     = { type: "ack";     req_id: string; message_ids: num
 export type PongMessage    = { type: "pong" };
 export type InboxRequest   = { type: "inbox";   req_id: string; days?: number };
 export type DmAckRequest   = { type: "dm_ack";  req_id: string; message_id: number };
+export type DmRetractRequest = { type: "dm_retract"; req_id: string; message_id: number };
 // Board and claim tools (src/core/tools.ts), run server-side as this identity.
 export type CallRequest    = { type: "call";      req_id: string; tool: string; args: Record<string, unknown> };
 export type BoardAckRequest = { type: "board_ack"; req_id: string; refs: PendingRef[] };
 
 export type ClientMessage =
   | HelloRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
-  | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest;
+  | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest | DmRetractRequest;
 
 // Server -> Client
 export type HelloOk     = {
@@ -43,7 +44,7 @@ export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
-  recipient_last_seen?: string; undelivered_from_you?: number;
+  recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
 };
 // Messages you sent carry delivered: whether they've reached the recipient's session.
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
@@ -110,6 +111,10 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       assertStr(m, "req_id");
       if (typeof m.message_id !== "number") throw new Error("message_id must be number");
       return m as unknown as DmAckRequest;
+    case "dm_retract":
+      assertStr(m, "req_id");
+      if (typeof m.message_id !== "number") throw new Error("message_id must be number");
+      return m as unknown as DmRetractRequest;
     case "call":
       assertStr(m, "req_id"); assertStr(m, "tool");
       if (m.args !== undefined && (typeof m.args !== "object" || m.args === null || Array.isArray(m.args)))

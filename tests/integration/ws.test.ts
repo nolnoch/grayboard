@@ -515,6 +515,35 @@ test("senders see what hasn't reached an offline peer", async () => {
   expect(await delivered()).toEqual([true, true]);
 });
 
+test("dm_retract withdraws a queued message; one the recipient is holding or has acked stays", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const b = new Client(bob, "fe");
+  await b.connect();
+  await closeAndSettle(b);
+  const a = new Client(alice, "be");
+  await a.connect();
+  const fresh = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fresh" });
+  expect(fresh.note).toMatch(/^Recipient offline/);
+  app.db.prepare("UPDATE handles SET last_seen = ? WHERE name = ?").run(Date.now() - 22 * 3_600_000, "bob@example.com/fe");
+  const wrong = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "wrong" });
+  expect(wrong.note).toMatch(/^Queued: bob@example.com\/fe last seen 22h ago\. .*dm_retract/);
+
+  const other = new Client(bob, "sim");
+  await other.connect();
+  expect(await other.request({ type: "dm_retract", message_id: wrong.message_id })).toMatchObject({ type: "error", code: "not_found" });
+  expect(await a.request({ type: "dm_retract", message_id: wrong.message_id })).toMatchObject({ type: "ack_ok" });
+  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.body)).toEqual(["fresh"]);
+
+  // Pushed but not acked: the cursor hasn't moved, but bob is live.
+  const b2 = new Client(bob, "fe");
+  await b2.connect();
+  expect((await b2.next((m) => m.type === "push")).message.body).toBe("fresh");
+  await b2.none((m) => m.type === "push");
+  const held = await a.request({ type: "dm_retract", message_id: fresh.message_id });
+  expect(held).toMatchObject({ type: "error", message: expect.stringContaining("already reached") });
+});
+
 test("hello_ok carries active claims and DMs undelivered after a day", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

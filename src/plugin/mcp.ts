@@ -10,7 +10,7 @@ import { GrayboardClient } from "./client.ts";
 import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
-import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, ackIds, ackResult } from "../shared/inbox.ts";
+import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, ackIds, ackResult } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -180,6 +180,7 @@ const TOOLS = [
   },
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
+  DM_RETRACT_TOOL,
 ...boardTools({ teams: true }),
 ];
 
@@ -244,6 +245,10 @@ async function call(name: string, a: Record<string, unknown>) {
       }
       const r = ackResult(acked, missing);
       return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };
+    }
+    if (name === "dm_retract") {
+      await client.request({ type: "dm_retract", message_id: a.message_id });
+      return text("ok");
     }
     if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);

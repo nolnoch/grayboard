@@ -22,7 +22,7 @@ import {
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
-import { STALE_UNDELIVERED_MS, inboxDays, unanswered, undeliveredInstruction } from "../shared/inbox.ts";
+import { STALE_UNDELIVERED_MS, inboxDays, queuedNote, retractRefusal, unanswered, undeliveredInstruction } from "../shared/inbox.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -189,6 +189,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           send(ws, { type: "ack_ok", req_id: msg.req_id });
           break;
         }
+        case "dm_retract":
+          handleRetract(hub, ws, msg.req_id, msg.message_id);
+          break;
         case "call":
           handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
           expiry.arm();
@@ -409,7 +412,23 @@ function handleSend(
     delivered_now: false,
     ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
     undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
+    note: queuedNote(parsed.full, seen),
   });
+}
+
+// The cursor moves only when the recipient acks, so a live recipient may hold
+// a pushed message past it: liveness counts as reached too.
+function handleRetract(hub: Hub, ws: Ws, reqId: string, id: number): void {
+  const { repo, registry } = hub;
+  const m = repo.messages.getById(id);
+  if (!m || m.recipient_type !== "user" || m.sender !== ws.data.identityFull) {
+    return err(ws, reqId, "not_found", retractRefusal.notYours(id));
+  }
+  if (registry.get(m.recipient)?.data.ready || repo.cursors.directFor(m.recipient) >= m.id) {
+    return err(ws, reqId, "bad_request", retractRefusal.reached(id, m.recipient));
+  }
+  if (!repo.messages.retract(ws.data.identityFull, id)) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
+  send(ws, { type: "ack_ok", req_id: reqId });
 }
 
 function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {

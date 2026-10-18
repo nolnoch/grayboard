@@ -22,11 +22,13 @@ import {
 import {
   ackMessage,
   db,
+  getCursor,
   getHistory,
   getMessage,
   getThread,
   insertMessage,
   receivedUnacked,
+  retractMessage,
   setCursor,
   undeliveredFrom,
   type Message,
@@ -39,10 +41,13 @@ import {
   DM_ACK_TOOL,
   DM_INBOX_INSTRUCTION,
   DM_INBOX_TOOL,
+  DM_RETRACT_TOOL,
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
   inboxDays,
+  queuedNote,
+  retractRefusal,
   unanswered,
   undeliveredInstruction,
 } from "../shared/inbox.ts";
@@ -166,6 +171,7 @@ const TOOLS = [
   },
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
+  DM_RETRACT_TOOL,
 ...boardTools({ teams: false }),
 ];
 
@@ -249,7 +255,7 @@ async function dispatch(name: string, a: Record<string, any>) {
     return text(JSON.stringify({
       message_id: id,
       delivered_now: false,
-      note: "Recipient offline; will be delivered on their next session.",
+      note: queuedNote(recipient, seen),
       ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
       undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === recipient)?.n ?? 1,
     }));
@@ -287,6 +293,18 @@ async function dispatch(name: string, a: Record<string, any>) {
     }
     const r = ackResult(acked, missing);
     return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };
+  }
+
+  if (name === "dm_retract") {
+    const m = getMessage(a.message_id);
+    const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+    if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(a.message_id));
+    // A probe is a wakeup: a live recipient drains the message now.
+    if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
+    if (!retractMessage(IDENTITY, m.id)) {
+      return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
+    }
+    return text("ok");
   }
 
   if (isBoardTool(name)) {

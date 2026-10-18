@@ -56,6 +56,9 @@ export interface Repo {
     // Direct messages to reader since `since` that it hasn't acked, oldest first.
     receivedUnacked(reader: string, since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // Deletes a direct message from sender that's past the recipient's cursor
+    // and has no reply. False if any of that doesn't hold.
+    retract(sender: string, id: number): boolean;
     prune(olderThanMs: number): void;
   };
   cursors: {
@@ -379,6 +382,19 @@ function makeRepo(db: Database): Repo {
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+      },
+      retract(sender, id) {
+        return db.transaction(() => {
+          const { changes } = db.run(
+            `DELETE FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+               AND id > COALESCE((SELECT MAX(last_seen_id) FROM cursors
+                                   WHERE stream_type = 'direct' AND stream_ref = messages.recipient), 0)
+               AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
+            [id, sender],
+          );
+          if (changes) db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
+          return changes > 0;
+        })();
       },
       prune(olderThanMs) {
         // Replies outlive pruned parents as roots; parent_id is a foreign key.

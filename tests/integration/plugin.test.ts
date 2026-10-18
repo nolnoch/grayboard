@@ -123,6 +123,20 @@ test("dm_ack takes a list in server mode: one frame per id, unknown ids reported
   await expect(be.call("dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
 }, 20_000);
 
+test("dm_retract in server mode: withdraws a queued message, errors on a delivered one", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  const fe = await session(bob, "fe");
+  const live = (await be.call("dm_send", { to: "bob@example.com/fe", body: "live" })).message_id;
+  await expect(be.call("dm_retract", { message_id: live })).rejects.toThrow(/already reached/);
+  await fe.c.close();
+  open.splice(open.indexOf(fe.c), 1);
+  await Bun.sleep(200);
+  const queued = (await be.call("dm_send", { to: "bob@example.com/fe", body: "queued" })).message_id;
+  expect(await be.call("dm_retract", { message_id: queued })).toBe("ok");
+}, 20_000);
+
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};
