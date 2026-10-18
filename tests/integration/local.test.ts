@@ -240,6 +240,22 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect(be.getInstructions()).toContain("dm_inbox()");
 }, 20_000);
 
+test("dm_ack takes a list, so one combined reply clears every message it covered", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const ids = [];
+  for (const body of ["a", "b", "c"]) ids.push((await call(fe, "dm_send", { to: "be", body })).message_id);
+  await call(be, "dm_send", { to: "fe", body: "re a, b, c", parent_id: ids[0] });
+  expect(await call(be, "dm_ack", { message_id: [ids[1], ids[2]] })).toBe("ok");
+  expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
+  // Partial: acks what it can and names the rest; all-bad is an error.
+  const d = (await call(fe, "dm_send", { to: "be", body: "d" })).message_id;
+  const mine = (await call(be, "dm_send", { to: "fe", body: "mine" })).message_id;
+  expect(await call(be, "dm_ack", { message_id: [d, mine] })).toMatchObject({ acked: [d], not_found: [mine] });
+  await expect(call(be, "dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
+  await expect(call(be, "dm_ack", { message_id: [] })).rejects.toThrow(/list of them/);
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");

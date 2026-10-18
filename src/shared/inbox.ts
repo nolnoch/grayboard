@@ -56,13 +56,35 @@ export const DM_INBOX_TOOL = {
 export const DM_ACK_TOOL = {
   name: "dm_ack",
   _meta: { "anthropic/alwaysLoad": true },
-  description: "dm_ack(message_id): mark a direct message to you handled without replying (an FYI), so dm_inbox drops it.",
+  description: "dm_ack(message_id): mark direct messages to you handled without a reply in their thread (an FYI, or ones a combined reply covered), so dm_inbox drops them.",
   inputSchema: {
     type: "object",
-    properties: { message_id: { type: "number", description: "The message's message_id." } },
+    properties: {
+      message_id: {
+        anyOf: [{ type: "number" }, { type: "array", items: { type: "number" } }],
+        description: "A message_id, or a list of them.",
+      },
+    },
     required: ["message_id"],
   },
 };
+
+// dm_ack's message_id as a list of ids, or null if it isn't a number or a
+// non-empty list of numbers.
+export function ackIds(arg: unknown): number[] | null {
+  const ids = Array.isArray(arg) ? arg : [arg];
+  return ids.length && ids.every((x) => typeof x === "number") ? [...new Set(ids as number[])] : null;
+}
+
+// One message is "ok" or the error; a list reports what it couldn't ack,
+// failing only when nothing was.
+export function ackResult(acked: number[], missing: number[]): { text: string; isError: boolean } {
+  if (!missing.length) return { text: "ok", isError: false };
+  const why = `no message ${missing.join(", ")} to you; dm_inbox lists them`;
+  return acked.length
+    ? { text: JSON.stringify({ acked, not_found: missing, note: why }), isError: false }
+    : { text: `error: ${why}`, isError: true };
+}
 
 // Sent direct messages still queued a day later, so a stale "told them" in a
 // handoff gets caught when the session starts.

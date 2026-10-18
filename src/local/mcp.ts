@@ -40,6 +40,8 @@ import {
   DM_INBOX_INSTRUCTION,
   DM_INBOX_TOOL,
   STALE_UNDELIVERED_MS,
+  ackIds,
+  ackResult,
   inboxDays,
   unanswered,
   undeliveredInstruction,
@@ -276,12 +278,15 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_ack") {
-    const m = typeof a.message_id === "number" ? getMessage(a.message_id) : undefined;
-    if (!m || m.recipient !== IDENTITY) {
-      return { ...text(`error: no message ${a.message_id} to you; dm_inbox lists them`), isError: true };
+    const ids = ackIds(a.message_id);
+    if (!ids) return { ...text("error: message_id must be a message_id or a list of them"), isError: true };
+    const acked: number[] = [], missing: number[] = [];
+    for (const id of ids) {
+      const m = getMessage(id);
+      if (m && m.recipient === IDENTITY) { ackMessage(IDENTITY, id); acked.push(id); } else missing.push(id);
     }
-    ackMessage(IDENTITY, m.id);
-    return text("ok");
+    const r = ackResult(acked, missing);
+    return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };
   }
 
   if (isBoardTool(name)) {
