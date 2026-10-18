@@ -50,6 +50,15 @@ export function initCoreSchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(handle, delivered_at);
 
+    -- Threads a handle muted (board_subscribe with thread, mode off), keyed
+    -- by root post: their replies no longer push to it, except @mentions.
+    CREATE TABLE IF NOT EXISTS thread_mutes (
+      handle   TEXT NOT NULL,
+      root_id  INTEGER NOT NULL,
+      PRIMARY KEY (handle, root_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_thread_mutes_root ON thread_mutes(root_id);
+
     CREATE TABLE IF NOT EXISTS claims (
       key          TEXT PRIMARY KEY,
       holder       TEXT NOT NULL,

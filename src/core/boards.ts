@@ -162,6 +162,7 @@ export function age(ms: number): string {
 // and its board subscriptions. Its posts and claims stay: they're history.
 export function forgetHandle(db: Database, handle: string): void {
   db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
+  db.prepare(`DELETE FROM thread_mutes WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM handles WHERE name = ?`).run(handle);
 }
 
@@ -270,6 +271,22 @@ export function subscribe(db: Database, handle: string, boardInput: string, mode
     `INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(board, handle) DO UPDATE SET mode = excluded.mode`,
   ).run(board, handle, mode, tip, tip);
+}
+
+// Mute or unmute one thread, named by any post in it. A muted thread's
+// replies stop pushing to you, even on a push board; @mentions still do.
+// Digests and unread counts are unaffected: they aren't pushes.
+export function muteThread(db: Database, handle: string, boardInput: string, postId: number, muted: boolean): number {
+  const board = visibleBoard(db, handle, boardInput).name;
+  const p = getPost(db, postId);
+  if (!p || p.board !== board) throw new CoreError(`thread ${postId} is not a post on #${board}`);
+  const root = threadRoot(db, postId);
+  if (muted) {
+    db.prepare(`INSERT INTO thread_mutes (handle, root_id) VALUES (?, ?) ON CONFLICT DO NOTHING`).run(handle, root);
+  } else {
+    db.prepare(`DELETE FROM thread_mutes WHERE handle = ? AND root_id = ?`).run(handle, root);
+  }
+  return root;
 }
 
 export function isSubscribed(db: Database, handle: string, board: string): boolean {
@@ -388,10 +405,15 @@ export function post(
         if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, "mention");
       }
     } else if (parentId !== null) {
-      const authors = announce && !human ? [getPost(db, threadRoot(db, parentId))!.author] : threadAuthors(db, parentId);
+      const root = threadRoot(db, parentId);
+      const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
       for (const author of authors) {
         if (a.canSee(author, b)) targets.set(author, "thread");
       }
+      // Muting drops thread and subscription pushes; the mention pass below
+      // runs after this, so an @mention still lands.
+      const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
+      for (const m of muted) targets.delete(m.handle);
     }
     const { handles: mentioned, unresolved } = resolveMentions(db, body, handle, b);
     for (const m of mentioned) targets.set(m, "mention");
@@ -698,6 +720,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     const old = `SELECT id FROM posts WHERE created_at < ?`;
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
+    db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();

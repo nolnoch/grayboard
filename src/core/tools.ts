@@ -8,6 +8,8 @@ import {
   createBoard,
   isViewer,
   listBoards,
+  muteThread,
+  normalizeBoard,
   post,
   read,
   setStatus,
@@ -90,12 +92,16 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_subscribe",
       description:
-        'board_subscribe(board, mode): how a board reaches you. "push" = every post in full; "digest" = one notice while there\'s unread; "quiet" = only @mentions and replies to your threads, plus unread counts in board_list; "off" = unsubscribe. Mentions and thread replies reach you in every mode.',
+        'board_subscribe(board, mode, thread?): how a board reaches you. "push" = every post in full; "digest" = one notice while there\'s unread; "quiet" = no notices, only unread counts in board_list; "off" = unsubscribe. In every mode, @mentions and replies in threads you\'ve posted in still reach you. To stop one thread\'s replies, pass its thread with mode "off" (@mentions still arrive); the same call with mode "push" resumes them.',
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           mode: { type: "string", enum: ["push", "digest", "quiet", "off"] },
+          thread: {
+            type: "number",
+            description: 'Optional. Any post_id in a thread: "off" mutes that thread\'s replies to you, "push" unmutes. The board\'s mode is unchanged.',
+          },
         },
         required: ["board", "mode"],
       },
@@ -288,6 +294,15 @@ export function callBoardTool(
 
     case "board_subscribe": {
       const mode = str(a, "mode") as SubMode | "off";
+      const thread = optNum(a, "thread");
+      if (thread !== undefined) {
+        if (mode !== "off" && mode !== "push") {
+          throw new CoreError('with thread, mode is "off" (mute its replies) or "push" (unmute)');
+        }
+        const root = muteThread(db, handle, str(a, "board"), thread, mode === "off");
+        const state = mode === "off" ? "muted (@mentions still reach you)" : "unmuted";
+        return { result: `ok: #${normalizeBoard(str(a, "board"))} thread ${root} ${state}`, wake: [] };
+      }
       subscribe(db, handle, str(a, "board"), mode);
       return { result: `ok: #${str(a, "board").replace(/^#/, "").toLowerCase()} → ${mode}`, wake: [] };
     }

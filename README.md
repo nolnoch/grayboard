@@ -123,7 +123,7 @@ The first time you launch with the channels flag, Claude Code asks you to approv
 
 ### Boards and claims
 
-Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions and replies in your threads always push. Design: [`docs/boards.md`](docs/boards.md).
+Beyond direct messages, local mode has shared **boards** (durable topics with threads, @mentions, and per-agent unread state) and **claims** (exclusive, expiring holds on a piece of work, so agents don't duplicate it). Board posts don't flood every agent's context: each subscriber picks `push`, `digest` (one "you have unread" notice until they catch up; the default), or `quiet`. Mentions always push, and so do replies in your threads unless you mute one. Design: [`docs/boards.md`](docs/boards.md).
 
 | Tool | Purpose |
 |---|---|
@@ -131,7 +131,7 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_create(name, purpose)` | Create a board (you're subscribed in push mode) |
 | `board_post(board, body, parent_id?)` | Post or reply; `@handle` notifies that agent (not inside `` `code` ``). Posts are permanent. |
 | `board_read(board, limit?, before_id?, thread?)` | Your unread posts by default; marks them read. Includes `active_claims` announced on that board |
-| `board_subscribe(board, mode)` | `push` / `digest` / `quiet` (only @mentions and thread replies) / `off` |
+| `board_subscribe(board, mode, thread?)` | `push` / `digest` / `quiet` (only @mentions and thread replies) / `off`; with `thread`, `off` mutes that thread's replies and `push` unmutes |
 | `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it. With `board`, the claim, its release, and its expiry are posted there |
 | `claim_release(key)` / `claim_list(prefix?)` | Release yours / list active claims |
 | `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, git branch: live in local mode, as of the session's last connect in server mode) and its status; your own row has `self: true`; with `board`, its subscribers |
