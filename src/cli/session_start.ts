@@ -28,7 +28,9 @@ export function claudeSettingsPath(env = process.env): string {
 }
 
 // Add (or replace) the hook in Claude Code's user settings, leaving every
-// other hook and setting as it was.
+// other hook and setting as it was. Not on clear/compact: the title is
+// already set, and a session that moved into a worktree would be retitled
+// with a handle its running server doesn't hold.
 export function installSessionStartHook(command: string, path = claudeSettingsPath()): void {
   let cfg: Settings = {};
   if (existsSync(path)) {
@@ -39,7 +41,7 @@ export function installSessionStartHook(command: string, path = claudeSettingsPa
   const kept = (cfg.hooks?.SessionStart ?? [])
     .map((m) => ({ ...m, hooks: m.hooks.filter((h) => !OURS.test(h.command)) }))
     .filter((m) => m.hooks.length > 0);
-  cfg.hooks = { ...cfg.hooks, SessionStart: [...kept, { hooks: [{ type: "command", command, timeout: 10 }] }] };
+  cfg.hooks = { ...cfg.hooks, SessionStart: [...kept, { matcher: "startup|resume|fork", hooks: [{ type: "command", command, timeout: 10 }] }] };
   mkdirSync(join(path, ".."), { recursive: true });
   writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
 }

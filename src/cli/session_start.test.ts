@@ -39,7 +39,7 @@ test("install replaces its own hook and keeps everyone else's", () => {
   expect(cfg.hooks.Stop).toEqual([]);
   expect(cfg.hooks.SessionStart).toEqual([
     other,
-    { hooks: [{ type: "command", command: "/usr/local/bin/grayboard session-start", timeout: 10 }] },
+    { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/usr/local/bin/grayboard session-start", timeout: 10 }] },
   ]);
 });
 
