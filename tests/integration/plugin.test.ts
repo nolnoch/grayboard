@@ -137,6 +137,32 @@ test("dm_retract in server mode: withdraws a queued message, errors on a deliver
   expect(await be.call("dm_retract", { message_id: queued })).toBe("ok");
 }, 20_000);
 
+test("grayboard claims in server mode reads /api/claims and leaves out boards", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await be.call("claim_take", { key: "dev:env", board: "e2e", note: "migrating" });
+  const r = await fetch(`${base}/api/claims?prefix=dev:`, { headers: { Authorization: `Bearer ${bob}` } });
+  expect(await r.json()).toEqual([expect.not.objectContaining({ board: expect.anything() })]);
+
+  const dir = mkdtempSync(join(tmpdir(), "grayboard-claims-"));
+  const claims = async (token: string, email: string, identity: string) => {
+    const creds = join(dir, `${identity}-${email}`);
+    writeFileSync(creds, JSON.stringify({ session_token: token, server: base, user_email: email }));
+    const env = { ...process.env, GRAYBOARD_CREDENTIALS: creds, BUS_IDENTITY: identity } as Record<string, string>;
+    delete env.GRAYBOARD_TOKEN;
+    delete env.GRAYBOARD_SERVER;
+    const p = Bun.spawn([process.execPath, CLI, "claims", "--prefix", "dev:"], { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, err: await new Response(p.stderr).text() };
+  };
+  const held = await claims(bob, "bob@example.com", "fe");
+  expect(held.code).toBe(2);
+  expect(held.err).toContain("dev:env held by alice@example.com/be until");
+  expect((await claims(alice, "alice@example.com", "be")).code).toBe(0);
+  expect((await claims("bogus", "bob@example.com", "fe")).code).toBe(1);
+}, 20_000);
+
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};

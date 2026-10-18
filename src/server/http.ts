@@ -8,6 +8,7 @@ import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { listClaims } from "../core/claims.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -110,6 +111,15 @@ function whoami(authed: AuthedUser, repo: Repo): Response {
   const identities = repo.identities.listForUser(authed.user_id).map(i => i.name);
   const teams      = repo.teams.listForUser(authed.user_id).map(t => t.name);
   return json({ email: authed.user_email, identities, teams });
+}
+
+// ── claims ────────────────────────────────────────────────────────────────────
+
+// For `grayboard claims`. Signed in as a user, not one handle, so a claim's
+// board, which a handle may not be able to see, is left out.
+function claimList(url: URL, db: CoreDb): Response {
+  const prefix = url.searchParams.get("prefix") ?? undefined;
+  return json(listClaims(db, prefix).map(({ board: _b, ...c }) => c));
 }
 
 // ── identities ────────────────────────────────────────────────────────────────
@@ -289,6 +299,8 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
+
+  if (path === "/api/claims" && method === "GET") return claimList(url, db);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);

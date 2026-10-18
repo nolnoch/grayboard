@@ -137,7 +137,27 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, git branch: live in local mode, as of the session's last connect in server mode) and its status; your own row has `self: true`; with `board`, its subscribers |
 | `peer_status(text)` | Set a one-line status shown in `peer_list` with its age; empty clears; a session restart clears it |
 
-Active claims are also listed in each session's instructions when it starts, so a fresh or `/clear`-ed session sees a merge freeze without knowing to look. A claim taken after a session started reaches it only as the board announcement.
+Active claims are also listed in each session's instructions when it starts, so a fresh or `/clear`-ed session sees a merge freeze without knowing to look. A claim taken after a session started reaches it only as the board announcement, or through a hook.
+
+**Guarding a merge or deploy with a hook.** `grayboard claims [--prefix <p>] [--include-self] [--json]` lists active claims held by other sessions (this session's own are left out unless `--include-self`; it's named as `grayboard mcp` would name it from that directory). It exits 2 when any match, printing them on stderr; 0 when none; 1 on its own error (e.g. the server is unreachable). That matches Claude Code's [hook exit codes](https://code.claude.com/docs/en/hooks): 2 blocks the tool call and shows Claude the claims, 1 is a non-blocking error, so a broken bus never blocks work. In `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "if": "Bash(gh pr merge *)", "command": "grayboard claims --prefix merge:" },
+          { "type": "command", "if": "Bash(git push * main*)", "command": "grayboard claims --prefix merge:" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
 
 To update an installed binary to the latest release, run `grayboard update`; it also refreshes the omp, opencode, and pi adapters it installed. After `grayboard` is updated or reinstalled, sessions still running the old binary say so in their tool results until you reconnect them (`/mcp` → grayboard → reconnect). A wrong or missing argument gets an error naming the expected call, e.g. `dm_send(to, body, parent_id?): missing to; unknown recipient.`
 
@@ -490,6 +510,7 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 grayboard setup [--local | --server <url>] [--no-register] [-y]
 grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
 grayboard update                         # replace this binary with the latest release
+grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
 grayboard tail <board> [-n <lines>]      # local mode
 grayboard human [handle] [--mode local]  # local mode; show or declare your human handle
 grayboard announce [--ttl <dur>] [--mode local] <text>  # local mode; post to #announce as your human handle

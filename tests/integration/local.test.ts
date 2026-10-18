@@ -281,6 +281,26 @@ test("a send to a long-idle handle says so; dm_retract withdraws it until it's d
   await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
 }, 20_000);
 
+test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {
+  const claims = async (identity: string, ...args: string[]) => {
+    const p = Bun.spawn([process.execPath, CLI, "claims", ...args], { cwd: dir, env: busEnv(identity), stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() };
+  };
+  expect((await claims("fe")).code).toBe(0); // no bus yet
+  const be = await start("be");
+  await call(be, "claim_take", { key: "dev:env", note: "migrating", ttl_minutes: 60 });
+
+  const held = await claims("fe");
+  expect(held.code).toBe(2);
+  expect(held.err).toMatch(/dev:env held by be until \d{4}-\d\d-\d\dT\d\d:\d\dZ: migrating/);
+  expect((await claims("fe", "--prefix", "prod:")).code).toBe(0);
+  expect((await claims("be")).code).toBe(0);
+  expect((await claims("be", "--include-self")).code).toBe(2);
+  const json = await claims("fe", "--json");
+  expect(JSON.parse(json.out)).toEqual([expect.objectContaining({ key: "dev:env", holder: "be", note: "migrating" })]);
+  expect(JSON.parse(json.out)[0].board).toBeUndefined();
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");

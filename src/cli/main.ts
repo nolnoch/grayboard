@@ -232,6 +232,18 @@ program
     await runTail(board, Number.parseInt(opts.lines, 10) || 0);
   });
 
+// ── claims ───────────────────────────────────────────────────────────────────
+
+program
+  .command("claims")
+  .description("List active claims held by other sessions; exits 2 if any match, for merge or deploy hooks (--json for JSON)")
+  .option("--prefix <prefix>", "Only claims whose key starts with this, e.g. dev:")
+  .option("--include-self", "Count this session's own claims too")
+  .action(async (opts: { prefix?: string; includeSelf?: boolean }) => {
+    const { runClaims } = await import("./claims.ts");
+    process.exitCode = await runClaims({ ...opts, json: globalJson() });
+  });
+
 // ── human (local mode) ───────────────────────────────────────────────────────
 
 // Server mode has no human handles yet (#24); --mode local reaches the local
