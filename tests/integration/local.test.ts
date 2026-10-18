@@ -176,7 +176,7 @@ test("active claims show in board_read and in a new session's instructions", asy
   const r = await call(be, "board_read", { board: "dev-deploys" });
   expect(r.active_claims).toMatchObject([{ key: "dev:freeze", holder: "be", note: "24h soak" }]);
   const fe = await start("fe");
-  expect(fe.getInstructions()).toContain("dev:freeze (held by be until");
+  expect(fe.getInstructions()).toContain("Others': dev:freeze (be, until");
 }, 20_000);
 
 test("a wrong argument name gets an error naming the expected call", async () => {

@@ -92,7 +92,7 @@ test("queued messages and posts are pushed at session start; instructions list c
   const again = await session(alice, "be");
   await Bun.sleep(500);
   expect(again.pushes.map((p) => p.content).sort()).toEqual(["queued dm", "queued post"]);
-  expect(again.c.getInstructions()).toContain("ticket:ENG-3 (held by bob@example.com/fe");
+  expect(again.c.getInstructions()).toMatch(/Others': ticket:ENG-3 \(bob@example.com\/fe, until .*claim_list shows the current state\.$/);
 }, 20_000);
 
 test("BUS_PUSH=off runs beside the session that owns the identity, for tools only", async () => {

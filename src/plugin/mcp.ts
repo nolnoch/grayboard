@@ -127,9 +127,10 @@ const server = new Server(
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...(hello.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
-      ...(hello.notices ?? []),
       `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
+      // Last: variable length, so a client cut loses these, not fixed text.
+      ...(hello.notices ?? []),
     ].join(" "),
   },
 );

@@ -29,7 +29,7 @@ import {
   who,
   type Access,
 } from "./boards.ts";
-import { announcementsInstruction, callBoardTool, humanInstruction } from "./tools.ts";
+import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -325,6 +325,32 @@ test("the expiry timer fires at the next lapse without anyone asking", async () 
   timer.stop();
   expect(woken).toEqual([["sim"]]);
   expect(listClaims(db)).toEqual([]);
+});
+
+test("the session-start claims list puts the session's own first and stays bounded", () => {
+  const at = Date.parse("2026-10-21T21:00:00Z");
+  const c = (key: string, holder: string, note: string | null = null) =>
+    ({ key, holder, note, board: null, acquired_at: 0, expires_at: at });
+  expect(claimsInstruction([], "be")).toEqual([]);
+
+  const [few] = claimsInstruction([c("a", "fe", "theirs"), c("b", "be", "mine")], "be");
+  expect(few).toBe(
+    "Active claims when this session started. Yours: b (until 2026-10-21T21:00Z: mine). Others': a (fe, until 2026-10-21T21:00Z). Respect them; claim_list shows the current state.",
+  );
+
+  // Worst case: long notes on the session's own, and far too many others.
+  const many = [
+    ...Array.from({ length: 50 }, (_, i) => c(`ticket:ENG-${1000 + i}`, "be-throughput")),
+    ...Array.from({ length: 3 }, (_, i) => c(`ticket:ENG-${i}`, "be", "x".repeat(400))),
+  ];
+  const [big] = claimsInstruction(many, "be");
+  expect(big!.length).toBeLessThan(1400);
+  expect(big).toStartWith("Active claims when this session started. Yours: ticket:ENG-0 ");
+  expect(big).toContain(`(until 2026-10-21T21:00Z: ${"x".repeat(150)}…)`);
+  expect(big).toContain("ticket:ENG-1000 (be-throughput, until");
+  expect(big).toMatch(/ \d+ more; claim_list\(\)\. Respect them/);
+  const listed = (big!.match(/ticket:ENG-\d+ \(/g) ?? []).length;
+  expect(Number(big!.match(/(\d+) more/)![1]) + listed).toBe(53);
 });
 
 test("claim prefix filter escapes LIKE wildcards", () => {

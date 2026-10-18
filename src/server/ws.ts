@@ -301,8 +301,9 @@ async function handleHello(
     teams,
   };
   const notices = [
-    ...claimsInstruction(listClaims(db, undefined, full)),
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    // Last, as the plugin appends notices: the longest, so the one a cut takes.
+    ...claimsInstruction(listClaims(db, undefined, full), full),
   ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);

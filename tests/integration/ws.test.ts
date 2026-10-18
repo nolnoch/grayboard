@@ -560,8 +560,9 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
 
   const notices: string[] = (await new Client(alice, "be").connect()).notices;
   expect(notices).toHaveLength(2);
-  expect(notices[0]).toContain("ticket:ENG-2 (held by alice@example.com/be until");
-  expect(notices[1]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
+  expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
+  expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
+  expect((await new Client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2 (alice@example.com/be, until");
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {

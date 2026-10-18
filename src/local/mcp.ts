@@ -92,10 +92,11 @@ const mcp = new Server(
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...humanInstruction(humanHandles(db).filter((h) => h !== IDENTITY)),
-      ...claimsInstruction(listClaims(db)),
       ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
       ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
+      // Last: the longest, and the one to lose if the client cuts the text.
+      ...claimsInstruction(listClaims(db), IDENTITY),
     ].join(" "),
   },
 );
