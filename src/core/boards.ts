@@ -29,6 +29,8 @@ export type Post = {
   body: string;
   parent_id: number | null;
   created_at: number;
+  // An announcement's TTL; null (or absent, from older peers) otherwise.
+  expires_at?: number | null;
 };
 
 export type Pending =
@@ -52,10 +54,15 @@ export type Access = {
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
   resolveMention(token: string, author: string, board: Board): string | null;
+  // The board only a human handle can start posts on, or null for none.
+  announceBoard: string | null;
 };
+
+export const ANNOUNCE_BOARD = "announce";
 
 // Local mode: one trusted machine, every board open, bare handles only.
 export const openAccess = (db: Database): Access => ({
+  announceBoard: ANNOUNCE_BOARD,
   canSee: () => true,
   checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
   resolveMention: (token) => {
@@ -101,25 +108,28 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
 }
 
 // A session started: refresh last_seen, record where it runs (null when the
-// mode can't know, e.g. a remote server), whether a human holds it, and clear
-// the previous session's status.
-export function startSession(
-  db: Database,
-  handle: string,
-  cwd: string | null,
-  opts: { human?: boolean; now?: number } = {},
-): void {
-  touchHandle(db, handle, opts.now);
-  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL, human = ? WHERE name = ?`)
-    .run(cwd, opts.human ? 1 : 0, handle);
+// mode can't know, e.g. a remote server), and clear the previous session's
+// status.
+export function startSession(db: Database, handle: string, cwd: string | null, now?: number): void {
+  touchHandle(db, handle, now);
+  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL WHERE name = ?`)
+    .run(cwd, handle);
 }
 
-/** Whether a human holds `handle`, as of its last session start. */
+/** Make `handle` the one declared human handle (`grayboard human`). */
+export function declareHuman(db: Database, handle: string): void {
+  db.transaction(() => {
+    touchHandle(db, handle);
+    db.prepare(`UPDATE handles SET human = (name = ?)`).run(handle);
+  })();
+}
+
+/** Whether `handle` is a declared human's. */
 export function isHuman(db: Database, handle: string): boolean {
   return !!(db.prepare(`SELECT human FROM handles WHERE name = ?`).get(handle) as { human: number | null } | undefined)?.human;
 }
 
-/** Handles a human holds, as of their last session start. */
+/** Declared human handles. */
 export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT name FROM handles WHERE human = 1 ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
 }
@@ -308,6 +318,11 @@ function resolveMentions(
 
 export type PostResult = { post: Post; wake: string[]; unresolved: string[] };
 
+// online: which handles have a live session (the mode knows); a human's
+// announcement needs it. ttl_ms: how long an announcement stays in new
+// sessions' instructions.
+export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number };
+
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns every handle that should be woken (outbox targets plus digest
 // subscribers); delivery is the caller's job. `unresolved` lists @tokens that
@@ -318,6 +333,7 @@ export function post(
   boardInput: string,
   body: string,
   parentId: number | null = null,
+  opts: PostOpts = {},
 ): PostResult {
   const b = visibleBoard(db, handle, boardInput);
   const board = b.name;
@@ -332,26 +348,48 @@ export function post(
     }
   }
   const a = access(db);
+  const announce = board === a.announceBoard;
+  const human = isHuman(db, handle);
+  const announcement = announce && parentId === null;
+  if (announcement && !human) {
+    throw new CoreError(
+      `only your user starts posts on #${board}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
+    );
+  }
+  if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
+  if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
+    throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
+  }
 
   return db.transaction((): PostResult => {
+    const now = Date.now();
     const p = db
       .prepare(
-        `INSERT INTO posts (board, author, body, parent_id, created_at)
-         VALUES (?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
-      .get(board, handle, body, parentId, Date.now()) as Post;
+      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     const targets = new Map<string, "mention" | "thread" | "subscription">();
+    // The announce board ignores agents' subscriptions (viewers like `tail`
+    // still get it): an announcement reaches the sessions live now, as a
+    // mention so it doesn't read as subscribed traffic, and an agent's ack
+    // reaches only the announcer, not every earlier acker.
     const subs = (
       db.prepare(`SELECT handle, mode FROM subscriptions WHERE board = ?`).all(board) as {
         handle: string;
         mode: SubMode;
       }[]
-    ).filter((s) => a.canSee(s.handle, b));
+    ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
     for (const s of subs) if (s.mode === "push") targets.set(s.handle, "subscription");
-    if (parentId !== null) {
-      for (const author of threadAuthors(db, parentId)) {
+    if (announcement) {
+      for (const h of rosterHandles(db)) {
+        if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, "mention");
+      }
+    } else if (parentId !== null) {
+      const authors = announce && !human ? [getPost(db, threadRoot(db, parentId))!.author] : threadAuthors(db, parentId);
+      for (const author of authors) {
         if (a.canSee(author, b)) targets.set(author, "thread");
       }
     }
@@ -473,6 +511,15 @@ export function lastSeen(db: Database, handle: string): number | null {
 /** Every handle in the roster, for a mode that must check liveness up front. */
 export function rosterHandles(db: Database): string[] {
   return (db.prepare(`SELECT name FROM handles`).all() as { name: string }[]).map((r) => r.name);
+}
+
+// A human's announcements still inside their TTL, oldest first.
+export function activeAnnouncements(db: Database, now = Date.now()): Post[] {
+  const board = access(db).announceBoard;
+  if (!board) return [];
+  return db
+    .prepare(`SELECT * FROM posts WHERE board = ? AND parent_id IS NULL AND expires_at > ? ORDER BY id ASC`)
+    .all(board, now) as Post[];
 }
 
 export function getPost(db: Database, id: number): Post | undefined {

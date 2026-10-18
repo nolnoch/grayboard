@@ -227,6 +227,53 @@ program
     await runTail(board, Number.parseInt(opts.lines, 10) || 0);
   });
 
+// ── human (local mode) ───────────────────────────────────────────────────────
+
+// Server mode has no human handles yet (#24); --mode local reaches the local
+// bus on a machine signed in to a server, as for the bridge.
+function requireLocalBus(mode: string | undefined): void {
+  if (mode !== undefined && mode !== "local") {
+    console.error(`[grayboard] --mode must be local, not "${mode}"`);
+    process.exit(1);
+  }
+  if (mode === undefined && busMode() === "server") {
+    console.error("[grayboard] human handles and announcements are local-mode only for now (#24); --mode local uses this machine's local bus");
+    process.exit(1);
+  }
+}
+
+async function humanCommand(run: (m: typeof import("../local/human.ts")) => void | Promise<void>): Promise<void> {
+  // Imported lazily: opening the local bus creates ~/.claude-bus.
+  const m = await import("../local/human.ts");
+  const { CoreError } = await import("../core/boards.ts");
+  try {
+    await run(m);
+  } catch (e) {
+    if (!(e instanceof CoreError)) throw e;
+    console.error(`[grayboard] ${e.message}`);
+    process.exit(1);
+  }
+}
+
+program
+  .command("human [handle]")
+  .description("Show the local human handle, or declare yours (agent sessions can't use it; announce and the Slack bridge speak as it)")
+  .option("--mode <mode>", "local: the local bus on a machine signed in to a server")
+  .action(async (handle: string | undefined, opts: { mode?: string }) => {
+    requireLocalBus(opts.mode);
+    await humanCommand((m) => m.runHuman(handle));
+  });
+
+program
+  .command("announce <text...>")
+  .description("Post to #announce as your human handle; it reaches every live agent session with your authority")
+  .option("--ttl <duration>", "Also show it to sessions that start within this time, e.g. 45m, 2h, 3d (default: live sessions only)")
+  .option("--mode <mode>", "local: the local bus on a machine signed in to a server")
+  .action(async (text: string[], opts: { ttl?: string; mode?: string }) => {
+    requireLocalBus(opts.mode);
+    await humanCommand((m) => m.runAnnounce(text.join(" "), opts.ttl));
+  });
+
 // ── bridge (opt-in) ──────────────────────────────────────────────────────────
 
 const bridgeCmd = program

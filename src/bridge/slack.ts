@@ -9,7 +9,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import { busMode } from "../cli/api.ts";
-import { ConfigError, loadConfig } from "./config.ts";
+import { declareHuman, humanHandles } from "../core/boards.ts";
+import { localDbPath, openLocalDb } from "../local/open.ts";
+import { ConfigError, configPath, loadConfig } from "./config.ts";
 import { Relay, type Bus, type ChannelParams } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
 import { Store } from "./store.ts";
@@ -20,6 +22,22 @@ const log = (msg: string) => console.error(`[grayboard slack] ${msg}`);
 const debug = process.env.GRAYBOARD_SLACK_DEBUG ? (msg: string) => log(`debug: ${msg}`) : undefined;
 
 export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
+
+// The child's BUS_HUMAN=1 only asserts that its handle is the declared human,
+// so declare it here, on the human's side of the tool boundary: on first run
+// if nobody is declared, refused if someone else is.
+function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): void {
+  const db = openLocalDb(localDbPath(env));
+  try {
+    const humans = humanHandles(db);
+    if (humans.length === 0) declareHuman(db, handle);
+    else if (!humans.includes(handle)) {
+      throw new ConfigError(`"${humans[0]}" is the declared human handle, but ${configPath(env)} says "${handle}"; fix one (grayboard human <handle>)`);
+    }
+  } finally {
+    db.close();
+  }
+}
 
 /**
  * Start the bridge. `mcp` is how to run `grayboard mcp`. Resolves once it's
@@ -37,6 +55,7 @@ export async function startSlackBridge(
     throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/future/org-bridge.md). To relay this machine's local bus instead, pass --mode local");
   }
   const cfg = loadConfig(env);
+  declareBridgeHuman(cfg.handle, env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
   const app = new SlackWeb(cfg.appToken, cfg.apiUrl);
 

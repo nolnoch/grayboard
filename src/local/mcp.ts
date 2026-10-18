@@ -7,10 +7,11 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError, activeAnnouncements, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
+  announcementsInstruction,
   claimsInstruction,
   boardNotification,
   humanInstruction,
@@ -53,8 +54,19 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
-// slack`). Its messages and posts reach agents marked human="true".
+// slack`). It grants nothing: the handle must already be the declared human
+// (`grayboard human`), whose messages and posts reach agents marked
+// human="true". Without it, the human's handle is refused, so an agent can't
+// take it by name.
 const HUMAN = process.env.BUS_HUMAN === "1";
+if (HUMAN !== isHuman(db, IDENTITY)) {
+  console.error(
+    HUMAN
+      ? `[grayboard] BUS_HUMAN=1, but "${IDENTITY}" isn't the declared human handle; declare it with: grayboard human ${IDENTITY}`
+      : `[grayboard] "${IDENTITY}" is your user's handle; an agent session can't use it. Pick another BUS_IDENTITY.`,
+  );
+  process.exit(1);
+}
 // Claude Code started without a channels flag drops pushes silently; say so.
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
 if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
@@ -74,6 +86,7 @@ const mcp = new Server(
       ...BOARD_INSTRUCTIONS,
       ...humanInstruction(humanHandles(db).filter((h) => h !== IDENTITY)),
       ...claimsInstruction(listClaims(db)),
+      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
       ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
     ].join(" "),
@@ -271,7 +284,8 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (isBoardTool(name)) {
-    const ctx = name === "peer_list" ? { online: await liveHandles() } : {};
+    // Only a human can start an announcement, which reaches the sessions live now.
+    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {};
     const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
     await wakeAll(wake);
     return text(result);
@@ -344,7 +358,7 @@ async function drainToClaude(): Promise<void> {
 // bind the wakeup socket (rechecking), and replay what arrived while offline.
 if (PUSH) await assertIdentityFree(IDENTITY);
 // A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (PUSH) startSession(db, IDENTITY, process.cwd(), { human: HUMAN });
+if (PUSH) startSession(db, IDENTITY, process.cwd());
 else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
 

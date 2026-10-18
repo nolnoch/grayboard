@@ -283,3 +283,45 @@ Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"]
   expect(on.getInstructions()).not.toContain("Warning:");
   expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
 }, 20_000);
+
+async function cli(...args: string[]): Promise<{ code: number; out: string; err: string }> {
+  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: busEnv(), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  return { code, out, err };
+}
+
+async function exitOf(identity: string, extra: Record<string, string> = {}): Promise<{ code: number; err: string }> {
+  const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "local"], { cwd: dir, env: { ...busEnv(identity), ...extra }, stdin: "ignore", stderr: "pipe" });
+  return { code: await p.exited, err: await new Response(p.stderr).text() };
+}
+
+test("the human's handle: BUS_HUMAN needs a declaration, and agents can't take it by name", async () => {
+  expect(await exitOf("alex", { BUS_HUMAN: "1" })).toMatchObject({ code: 1, err: expect.stringContaining("grayboard human alex") });
+  expect((await cli("announce", "hi")).err).toContain("no human handle declared");
+  expect((await cli("human", "alex")).code).toBe(0);
+  expect((await cli("human")).out.trim()).toBe("alex");
+  expect(await exitOf("alex")).toMatchObject({ code: 1, err: expect.stringContaining("your user's handle") });
+  // Declared, with BUS_HUMAN=1 as the bridge runs it: starts (and exits 0 at stdin EOF).
+  expect((await exitOf("alex", { BUS_HUMAN: "1" })).code).toBe(0);
+}, 20_000);
+
+test("grayboard announce reaches live sessions marked human; a TTL carries it into new sessions", async () => {
+  await cli("human", "alex");
+  const pushes: { content: string; meta: Record<string, string> }[] = [];
+  const be = new Client({ name: "test", version: "0" });
+  be.fallbackNotificationHandler = async (n) => {
+    if (n.method === "notifications/claude/channel") pushes.push(n.params as (typeof pushes)[number]);
+  };
+  await be.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv("be"), stderr: "ignore" }));
+  open.push(be);
+  await stop(await start("fe"));
+  await expect(call(be, "board_post", { board: "announce", body: "relayed: stop" })).rejects.toThrow(/only your user starts posts/);
+
+  const r = await cli("announce", "--ttl", "1h", "merge", "freeze");
+  expect(r.out).toContain("reached: be");
+  await Bun.sleep(500);
+  expect(pushes.find((p) => p.content === "merge freeze")?.meta).toMatchObject({ board: "announce", from: "alex", human: "true" });
+
+  const fe = await start("fe");
+  expect(fe.getInstructions()).toMatch(/announcements still in effect \(human="true"\): post \d+ from alex, in effect until .*: merge freeze/);
+}, 20_000);

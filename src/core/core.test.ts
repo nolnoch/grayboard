@@ -6,13 +6,17 @@ import { join } from "node:path";
 
 import {
   acknowledge,
+  activeAnnouncements,
   createBoard,
+  declareHuman,
+  ensureBoard,
   getBoard,
   humanHandles,
   isHuman,
   listBoards,
   markDelivered,
   mentionTokens,
+  openAccess,
   pendingFor,
   post,
   prunePosts,
@@ -25,7 +29,7 @@ import {
   who,
   type Access,
 } from "./boards.ts";
-import { callBoardTool, humanInstruction } from "./tools.ts";
+import { announcementsInstruction, callBoardTool, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -44,19 +48,67 @@ const drain = (h: string) => {
   return items;
 };
 
-test("a human handle lasts only as long as a human session holds it", () => {
+test("a declared human handle persists across sessions; declaring another moves it", () => {
   expect(humanHandles(db)).toEqual([]);
   expect(humanInstruction(humanHandles(db))).toEqual([]);
-  startSession(db, "alex", null, { human: true });
+  declareHuman(db, "alex");
   expect(isHuman(db, "alex")).toBe(true);
   expect(isHuman(db, "be")).toBe(false);
   expect(humanInstruction(humanHandles(db))[0]).toContain('Humans on this bus: "alex"');
+  expect(humanInstruction(humanHandles(db))[1]).toContain("#announce");
   const r = who(db, "be", { include_offline: true }, () => true);
   expect(r.peers.find((p) => p.handle === "alex")?.human).toBe(true);
   expect(r.peers.find((p) => p.handle === "sim")?.human).toBeUndefined();
-  // An ordinary session taking the handle clears it.
   startSession(db, "alex", null);
-  expect(humanHandles(db)).toEqual([]);
+  expect(humanHandles(db)).toEqual(["alex"]);
+  declareHuman(db, "sam");
+  expect(humanHandles(db)).toEqual(["sam"]);
+});
+
+describe("#announce", () => {
+  const live = new Set(["be", "sim"]); // fe is offline
+  const online = (h: string) => live.has(h);
+  beforeEach(() => {
+    ensureBoard(db, "announce", "Announcements", null, "grayboard");
+    // Subscriptions don't count here: a push subscriber gets nothing extra.
+    subscribe(db, "fe", "announce", "push");
+    declareHuman(db, "alex");
+  });
+
+  test("only a human starts a post; agents are told to reply instead", () => {
+    expect(() => post(db, "be", "announce", "everyone stop", null, { online })).toThrow(/only your user starts posts/);
+  });
+
+  test("a human's announcement reaches only live sessions, as a mention marked by its board", () => {
+    const r = post(db, "alex", "announce", "shutting down in 30 min", null, { online });
+    expect(r.wake.sort()).toEqual(["be", "sim"]);
+    expect(drain("be")).toMatchObject([{ kind: "push", reason: "mention", post: { board: "announce", author: "alex" } }]);
+    expect(drain("fe")).toEqual([]);
+  });
+
+  test("an agent's ack reaches only the announcer; the human's reply reaches the thread", () => {
+    const root = post(db, "alex", "announce", "stop", null, { online }).post.id;
+    drain("be");
+    drain("sim");
+    expect(post(db, "be", "announce", "be: ack", root).wake).toEqual(["alex"]);
+    expect(post(db, "sim", "announce", "sim: ack", root).wake).toEqual(["alex"]);
+    expect(post(db, "alex", "announce", "thanks", root).wake.sort()).toEqual(["be", "sim"]);
+  });
+
+  test("a TTL keeps an announcement in new sessions' instructions until it expires", () => {
+    expect(() => post(db, "be", "e2e", "x", null, { ttl_ms: 60_000 })).toThrow(/TTL/);
+    post(db, "alex", "announce", "instant", null, { online });
+    const kept = post(db, "alex", "announce", "merge freeze until noon", null, { online, ttl_ms: 60_000 }).post;
+    expect(activeAnnouncements(db).map((p) => p.id)).toEqual([kept.id]);
+    expect(announcementsInstruction(activeAnnouncements(db))[0]).toContain("merge freeze until noon");
+    expect(activeAnnouncements(db, kept.expires_at! + 1)).toEqual([]);
+    expect(announcementsInstruction([])).toEqual([]);
+  });
+
+  test("a mode without an announce board treats the name as an ordinary board", () => {
+    setAccess(db, { ...openAccess(db), announceBoard: null });
+    expect(post(db, "be", "announce", "just a board").wake).toEqual(["fe"]);
+  });
 });
 
 test("new subscribers start at the tip", () => {
@@ -323,6 +375,7 @@ describe("with a scoped access policy", () => {
     canSee: (h, b) => b.scope === null || members.has(h),
     checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
     resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+    announceBoard: null,
   };
   beforeEach(() => {
     setAccess(db, policy);
