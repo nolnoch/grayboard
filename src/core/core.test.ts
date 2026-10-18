@@ -191,6 +191,35 @@ test("thread participants are pushed on replies", () => {
   expect(read(db, "fe", "e2e", { thread: reply.post.id }).posts).toHaveLength(3);
 });
 
+test("a muted thread stops pushing replies, but @mentions still land", () => {
+  const root = post(db, "sim", "e2e", "question").post;
+  const mine = post(db, "fe", "e2e", "one-off flag", root.id).post;
+  subscribe(db, "sim", "e2e", "push");
+  drain("be");
+  drain("sim");
+  // Any post in the thread names it; be is the board's push-mode creator.
+  for (const h of ["fe", "be"]) callBoardTool(db, h, "board_subscribe", { board: "e2e", mode: "off", thread: mine.id });
+  expect(post(db, "sim", "e2e", "routine", mine.id).wake).toEqual([]);
+  expect(drain("fe")).toEqual([]);
+  expect(post(db, "sim", "e2e", "@fe one for you", root.id).wake).toEqual(["fe"]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
+  // Posting again doesn't unmute; mode push does.
+  post(db, "fe", "e2e", "still here", root.id);
+  expect(post(db, "sim", "e2e", "routine 2", root.id).wake).toEqual([]);
+  callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "push", thread: root.id });
+  expect(post(db, "sim", "e2e", "routine 3", root.id).wake).toEqual(["fe"]);
+  // The board's own mode is untouched, and other threads still push.
+  expect(listBoards(db, "be").find((b) => b.name === "e2e")?.mode).toBe("push");
+  expect(post(db, "sim", "e2e", "new topic").wake).toEqual(["be"]);
+});
+
+test("a thread mute rejects digest/quiet and posts on other boards", () => {
+  createBoard(db, "be", "other", "Elsewhere");
+  const p = post(db, "be", "other", "x").post;
+  expect(() => callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "quiet", thread: p.id })).toThrow(/"off".*"push"/);
+  expect(() => callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "off", thread: p.id })).toThrow(/not a post on #e2e/);
+});
+
 test("reading clears pending pushes for posts already seen", () => {
   post(db, "be", "e2e", "@fe look");
   subscribe(db, "fe", "e2e", "quiet");
