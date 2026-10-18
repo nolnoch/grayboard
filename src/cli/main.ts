@@ -10,6 +10,7 @@ import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate } from "./update.ts";
+import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
 
 const CREDS_DIR  = join(homedir(), ".grayboard");
 const CREDS_FILE = join(CREDS_DIR, "credentials");
@@ -60,6 +61,10 @@ function writeAdapter(path: string, source: string): void {
 type McpInvocation = { command: string; args: string[] };
 
 /** How Claude Code should start grayboard's MCP server: this CLI, `mcp` subcommand. */
+function shellQuote(s: string): string {
+  return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function mcpCommand(): McpInvocation {
   // In a `bun build --compile` binary, execPath is the binary itself; from
   // source it's bun, and import.meta.path is this script.
@@ -380,6 +385,11 @@ program
         Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
         const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
         if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
+        // Title each session with its handle, so Claude Code's name for it is
+        // the one dm_send takes.
+        const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
+        installSessionStartHook(hook);
+        console.log(`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`);
       } else if (opts.register && !claude) {
         console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
       }
@@ -470,6 +480,14 @@ program
     // command; `setup` reinstalls adapters there.
     const r = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });
     if (r.exitCode !== 0) console.log("If you use omp, opencode, or pi, run `grayboard setup` to refresh their adapters.");
+  });
+
+program
+  .command("session-start", { hidden: true })
+  .description("Claude Code SessionStart hook: title the session with its grayboard handle")
+  .action(async () => {
+    const out = sessionStartOutput(await Bun.stdin.text());
+    if (out) console.log(out);
   });
 
 program

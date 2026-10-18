@@ -148,6 +148,7 @@ const TOOLS = [
   },
   {
     name: "dm_thread",
+    _meta: { "anthropic/alwaysLoad": true },
     description:
       "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {

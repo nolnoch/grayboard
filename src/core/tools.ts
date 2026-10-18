@@ -120,6 +120,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     },
     {
       name: "peer_status",
+      _meta: { "anthropic/alwaysLoad": true },
       description:
         'peer_status(text): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
       inputSchema: {
@@ -158,6 +159,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     },
     {
       name: "claim_list",
+      _meta: { "anthropic/alwaysLoad": true },
       description: "claim_list(prefix?): active claims with key, holder, note, board, and expires_at. Check before starting work others might be doing.",
       inputSchema: {
         type: "object",
