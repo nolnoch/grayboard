@@ -253,7 +253,7 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   const c = await start("be");
   const { tools } = await c.listTools();
   const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
-  expect(upfront).toEqual(["board_post", "dm_ack", "dm_inbox", "dm_send"]);
+  expect(upfront).toEqual(["board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
 test("a Claude Code session started without a channels flag is warned that pushes are off", async () => {
