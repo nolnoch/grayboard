@@ -19,7 +19,7 @@ import {
   type Post,
   type SubMode,
 } from "./boards.ts";
-import { claim, listClaims, release, type Claim } from "./claims.ts";
+import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 
 export type ToolDef = {
   name: string;
@@ -150,10 +150,26 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     },
     {
       name: "claim_release",
-      description: "claim_release(key): release a claim you hold, so others can take it. Announced on the claim's board, if it had one.",
+      description: "claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. \"done\" or \"abandoned\").",
       inputSchema: {
         type: "object",
-        properties: { key: { type: "string" } },
+        properties: {
+          key: { type: "string" },
+          note: { type: "string", description: "Optional. How it ended, for whoever was waiting." },
+        },
+        required: ["key"],
+      },
+    },
+    {
+      name: "claim_watch",
+      description:
+        "claim_watch(key, off?): be @mentioned when someone else's claim is released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string" },
+          off: { type: "boolean", description: "Optional. true stops watching." },
+        },
         required: ["key"],
       },
     },
@@ -175,14 +191,28 @@ export function isBoardTool(name: string): boolean {
   return NAMES.has(name);
 }
 
+// Claude Code cuts server instructions at 4096 chars; ~1700 precede this.
+const MAX_CLAIMS_CHARS = 1200;
+const MAX_CLAIM_NOTE_CHARS = 150;
+
 // Active claims as of session start, for the server instructions: the one
-// place a fresh or /clear-ed session is sure to see them.
-export function claimsInstruction(claims: Claim[]): string[] {
+// place a fresh or /clear-ed session is sure to see them. The session's own
+// come first, with notes; others fill what's left of the budget, and the
+// rest are counted so a cut is explicit.
+export function claimsInstruction(claims: Claim[], self: string): string[] {
   if (claims.length === 0) return [];
-  const list = claims
-    .map((c) => `${c.key} (held by ${c.holder} until ${new Date(c.expires_at).toISOString()}${c.note ? `: ${c.note}` : ""})`)
-    .join("; ");
-  return [`Active claims when this session started: ${list}. Respect them; claim_list shows the current state.`];
+  const until = (c: Claim) => `${new Date(c.expires_at).toISOString().slice(0, 16)}Z`;
+  const note = (n: string) => (n.length > MAX_CLAIM_NOTE_CHARS ? `${n.slice(0, MAX_CLAIM_NOTE_CHARS)}…` : n);
+  const mine = claims.filter((c) => c.holder === self).map((c) => `${c.key} (until ${until(c)}${c.note ? `: ${note(c.note)}` : ""})`);
+  const others = claims.filter((c) => c.holder !== self).map((c) => `${c.key} (${c.holder}, until ${until(c)})`);
+  const all = [...mine, ...others];
+  let shown = 0;
+  for (let room = MAX_CLAIMS_CHARS; shown < all.length && (room -= all[shown]!.length + 2) >= 0; shown++);
+  const parts = [];
+  if (shown > 0 && mine.length > 0) parts.push(`Yours: ${mine.slice(0, shown).join("; ")}.`);
+  if (shown > mine.length) parts.push(`Others': ${others.slice(0, shown - mine.length).join("; ")}.`);
+  if (shown < claims.length) parts.push(`${claims.length - shown} more; claim_list().`);
+  return [`Active claims when this session started. ${parts.join(" ")} Respect them; claim_list shows the current state.`];
 }
 
 // Only when the bus has a declared human handle (`grayboard human`), so buses
@@ -329,9 +359,12 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake } = release(db, handle, key);
+      const { wake } = release(db, handle, key, optStr(a, "note"));
       return { result: `released ${key}`, wake };
     }
+
+    case "claim_watch":
+      return { result: watch(db, handle, str(a, "key"), optBool(a, "off")), wake: [] };
 
     case "claim_list":
       return { result: listClaims(db, optStr(a, "prefix"), handle), wake: [] };

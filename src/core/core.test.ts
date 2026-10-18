@@ -29,8 +29,8 @@ import {
   who,
   type Access,
 } from "./boards.ts";
-import { announcementsInstruction, callBoardTool, humanInstruction } from "./tools.ts";
-import { claim, claimExpiryTimer, listClaims, release, sweepExpired } from "./claims.ts";
+import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
+import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -285,6 +285,36 @@ test("a lapsed claim is announced on its board once, by the first sweep or takeo
   expect(bodies().slice(-1)).toEqual(["[expired] dev:freeze: not released by be; check with them before relying on it"]);
 });
 
+test("a claim's watchers are mentioned on its release or expiry, in any mode, once", () => {
+  subscribe(db, "sim", "e2e", "quiet"); // fe has no subscription at all
+  claim(db, "be", "dev:env", { board: "e2e" });
+  drain("sim");
+  expect(watch(db, "sim", "dev:env")).toMatch(/watching dev:env/);
+  watch(db, "fe", "dev:env");
+  expect(() => watch(db, "be", "dev:env")).toThrow(/you hold/);
+  expect(() => watch(db, "sim", "nope")).toThrow(/no active claim/);
+  claim(db, "be", "boardless");
+  expect(() => watch(db, "sim", "boardless")).toThrow(/renew it with board=/);
+
+  expect(release(db, "be", "dev:env", "done, reset complete").wake.sort()).toEqual(["fe", "sim"]);
+  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @sim @fe" } }]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
+
+  // Watches end with the claim; a later one on the key starts without them.
+  claim(db, "be", "dev:env", { board: "e2e" });
+  release(db, "be", "dev:env");
+  expect(drain("sim")).toEqual([]);
+
+  claim(db, "be", "dev:env", { board: "e2e" });
+  watch(db, "sim", "dev:env");
+  watch(db, "fe", "dev:env");
+  watch(db, "fe", "dev:env", true);
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  expect(sweepExpired(db).wake).toEqual(["sim"]);
+  expect(drain("sim")[0]).toMatchObject({ reason: "mention", post: { body: expect.stringMatching(/^\[expired\] dev:env: .* cc @sim$/) } });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_watches`).get()).toEqual({ n: 0 });
+});
+
 test("the expiry timer fires at the next lapse without anyone asking", async () => {
   subscribe(db, "sim", "e2e", "push");
   const woken: string[][] = [];
@@ -295,6 +325,32 @@ test("the expiry timer fires at the next lapse without anyone asking", async () 
   timer.stop();
   expect(woken).toEqual([["sim"]]);
   expect(listClaims(db)).toEqual([]);
+});
+
+test("the session-start claims list puts the session's own first and stays bounded", () => {
+  const at = Date.parse("2026-10-21T21:00:00Z");
+  const c = (key: string, holder: string, note: string | null = null) =>
+    ({ key, holder, note, board: null, acquired_at: 0, expires_at: at });
+  expect(claimsInstruction([], "be")).toEqual([]);
+
+  const [few] = claimsInstruction([c("a", "fe", "theirs"), c("b", "be", "mine")], "be");
+  expect(few).toBe(
+    "Active claims when this session started. Yours: b (until 2026-10-21T21:00Z: mine). Others': a (fe, until 2026-10-21T21:00Z). Respect them; claim_list shows the current state.",
+  );
+
+  // Worst case: long notes on the session's own, and far too many others.
+  const many = [
+    ...Array.from({ length: 50 }, (_, i) => c(`ticket:ENG-${1000 + i}`, "be-throughput")),
+    ...Array.from({ length: 3 }, (_, i) => c(`ticket:ENG-${i}`, "be", "x".repeat(400))),
+  ];
+  const [big] = claimsInstruction(many, "be");
+  expect(big!.length).toBeLessThan(1400);
+  expect(big).toStartWith("Active claims when this session started. Yours: ticket:ENG-0 ");
+  expect(big).toContain(`(until 2026-10-21T21:00Z: ${"x".repeat(150)}…)`);
+  expect(big).toContain("ticket:ENG-1000 (be-throughput, until");
+  expect(big).toMatch(/ \d+ more; claim_list\(\)\. Respect them/);
+  const listed = (big!.match(/ticket:ENG-\d+ \(/g) ?? []).length;
+  expect(Number(big!.match(/(\d+) more/)![1]) + listed).toBe(53);
 });
 
 test("claim prefix filter escapes LIKE wildcards", () => {

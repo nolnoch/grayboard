@@ -176,7 +176,7 @@ test("active claims show in board_read and in a new session's instructions", asy
   const r = await call(be, "board_read", { board: "dev-deploys" });
   expect(r.active_claims).toMatchObject([{ key: "dev:freeze", holder: "be", note: "24h soak" }]);
   const fe = await start("fe");
-  expect(fe.getInstructions()).toContain("dev:freeze (held by be until");
+  expect(fe.getInstructions()).toContain("Others': dev:freeze (be, until");
 }, 20_000);
 
 test("a wrong argument name gets an error naming the expected call", async () => {
@@ -238,6 +238,79 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
   await expect(call(fe, "dm_ack", { message_id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
+}, 20_000);
+
+test("dm_ack takes a list, so one combined reply clears every message it covered", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const ids = [];
+  for (const body of ["a", "b", "c"]) ids.push((await call(fe, "dm_send", { to: "be", body })).message_id);
+  await call(be, "dm_send", { to: "fe", body: "re a, b, c", parent_id: ids[0] });
+  expect(await call(be, "dm_ack", { message_id: [ids[1], ids[2]] })).toBe("ok");
+  expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
+  // Partial: acks what it can and names the rest; all-bad is an error.
+  const d = (await call(fe, "dm_send", { to: "be", body: "d" })).message_id;
+  const mine = (await call(be, "dm_send", { to: "fe", body: "mine" })).message_id;
+  expect(await call(be, "dm_ack", { message_id: [d, mine] })).toMatchObject({ acked: [d], not_found: [mine] });
+  await expect(call(be, "dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
+  await expect(call(be, "dm_ack", { message_id: [] })).rejects.toThrow(/list of them/);
+}, 20_000);
+
+test("a send to a long-idle handle says so; dm_retract withdraws it until it's delivered", async () => {
+  await stop(await start("fe"));
+  const be = await start("be");
+  const sim = await start("sim");
+  const first = await call(be, "dm_send", { to: "fe", body: "first" });
+  expect(first.note).toMatch(/^Recipient offline/);
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(join(dir, "bus.db"));
+  db.exec(`UPDATE handles SET last_seen = last_seen - 22 * 3600000 WHERE name = 'fe'`);
+  db.close();
+  const wrong = await call(be, "dm_send", { to: "fe", body: "meant for sim" });
+  expect(wrong.note).toMatch(/^Queued: fe last seen 22h ago\. .*dm_retract/);
+  const followup = await call(be, "dm_send", { to: "fe", body: "also", parent_id: first.message_id });
+
+  await expect(call(sim, "dm_retract", { message_id: wrong.message_id })).rejects.toThrow(/no message \d+ from you/);
+  await expect(call(be, "dm_retract", { message_id: first.message_id })).rejects.toThrow(/has a reply/);
+  expect(await call(be, "dm_retract", { message_id: wrong.message_id })).toBe("ok");
+  expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.body)).toEqual(["first", "also"]);
+
+  const fe = await startCollecting("fe");
+  await Bun.sleep(500);
+  expect(fe.pushes).toEqual(["first", "also"]);
+  await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
+}, 20_000);
+
+test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {
+  const claims = async (identity: string, ...args: string[]) => {
+    const p = Bun.spawn([process.execPath, CLI, "claims", ...args], { cwd: dir, env: busEnv(identity), stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() };
+  };
+  expect((await claims("fe")).code).toBe(0); // no bus yet
+  const be = await start("be");
+  await call(be, "claim_take", { key: "dev:env", note: "migrating", ttl_minutes: 60 });
+
+  const held = await claims("fe");
+  expect(held.code).toBe(2);
+  expect(held.err).toMatch(/dev:env held by be until \d{4}-\d\d-\d\dT\d\d:\d\dZ: migrating/);
+  expect((await claims("fe", "--prefix", "prod:")).code).toBe(0);
+  expect((await claims("be")).code).toBe(0);
+  expect((await claims("be", "--include-self")).code).toBe(2);
+  const json = await claims("fe", "--json");
+  expect(JSON.parse(json.out)).toEqual([expect.objectContaining({ key: "dev:env", holder: "be", note: "migrating" })]);
+  expect(JSON.parse(json.out)[0].board).toBeUndefined();
+}, 20_000);
+
+test("claim_watch: a quiet subscriber is pushed the release of the claim it waits on", async () => {
+  const be = await start("be");
+  const sim = await startCollecting("sim");
+  await call(be, "board_create", { name: "dev-deploys", purpose: "x" });
+  await call(sim.c, "board_subscribe", { board: "dev-deploys", mode: "quiet" });
+  await call(be, "claim_take", { key: "dev:env", board: "dev-deploys" });
+  await call(sim.c, "claim_watch", { key: "dev:env" });
+  await call(be, "claim_release", { key: "dev:env", note: "done" });
+  await Bun.sleep(300);
+  expect(sim.pushes).toEqual(["[release] dev:env — done cc @sim"]);
 }, 20_000);
 
 test("a message queued while offline is pushed when the session starts", async () => {

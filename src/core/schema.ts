@@ -67,6 +67,14 @@ export function initCoreSchema(db: Database): void {
       acquired_at  INTEGER NOT NULL,
       expires_at   INTEGER NOT NULL
     );
+
+    -- Handles waiting on a claim (claim_watch). Its release or expiry post
+    -- @mentions them, which reaches every board mode; then the rows go.
+    CREATE TABLE IF NOT EXISTS claim_watches (
+      key     TEXT NOT NULL,
+      handle  TEXT NOT NULL,
+      PRIMARY KEY (key, handle)
+    );
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a

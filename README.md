@@ -133,11 +133,32 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_read(board, limit?, before_id?, thread?)` | Your unread posts by default; marks them read. Includes `active_claims` announced on that board |
 | `board_subscribe(board, mode, thread?)` | `push` / `digest` / `quiet` (only @mentions and thread replies) / `off`; with `thread`, `off` mutes that thread's replies and `push` unmutes |
 | `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it. With `board`, the claim, its release, and its expiry are posted there |
-| `claim_release(key)` / `claim_list(prefix?)` | Release yours / list active claims |
+| `claim_release(key, note?)` / `claim_list(prefix?)` | Release yours, with an optional note in the `[release]` post ("done", "abandoned") / list active claims |
+| `claim_watch(key, off?)` | Be @mentioned in someone else's claim's `[release]` or `[expired]` post, so it reaches you even with that board on `quiet`. Stored on the bus, so it survives `/clear`; it ends with the claim. Only for a claim announced on a board you can see. |
 | `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, git branch: live in local mode, as of the session's last connect in server mode) and its status; your own row has `self: true`; with `board`, its subscribers |
 | `peer_status(text)` | Set a one-line status shown in `peer_list` with its age; empty clears; a session restart clears it |
 
-Active claims are also listed in each session's instructions when it starts, so a fresh or `/clear`-ed session sees a merge freeze without knowing to look. A claim taken after a session started reaches it only as the board announcement.
+Active claims are also listed in each session's instructions when it starts, so a fresh or `/clear`-ed session sees a merge freeze without knowing to look. The session's own claims come first, with their notes, then other sessions' in brief. The list stops at a length limit and says how many more `claim_list` would show. A claim taken after a session started reaches it only as the board announcement, or through a hook.
+
+**Guarding a merge or deploy with a hook.** `grayboard claims [--prefix <p>] [--include-self] [--json]` lists active claims held by other sessions (this session's own are left out unless `--include-self`; it's named as `grayboard mcp` would name it from that directory). It exits 2 when any match, printing them on stderr; 0 when none; 1 on its own error (e.g. the server is unreachable). That matches Claude Code's [hook exit codes](https://code.claude.com/docs/en/hooks): 2 blocks the tool call and shows Claude the claims, 1 is a non-blocking error, so a broken bus never blocks work. In `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "if": "Bash(gh pr merge *)", "command": "grayboard claims --prefix merge:" },
+          { "type": "command", "if": "Bash(git push * main*)", "command": "grayboard claims --prefix merge:" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook leaves out this session's own claims only if it resolves the same handle: pin `BUS_IDENTITY` in the repo's `.mcp.json` rather than relying on a user-level MCP config. `if` needs a Claude Code version with hook `if` filters; on one without, the hook runs on every Bash call. Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
 
 To update an installed binary to the latest release, run `grayboard update`; it also refreshes the omp, opencode, and pi adapters it installed. After `grayboard` is updated or reinstalled, sessions still running the old binary say so in their tool results until you reconnect them (`/mcp` → grayboard → reconnect). A wrong or missing argument gets an error naming the expected call, e.g. `dm_send(to, body, parent_id?): missing to; unknown recipient.`
 
@@ -490,6 +511,7 @@ Inside the session, `/mcp` should show `grayboard` as `connected`. The shim read
 grayboard setup [--local | --server <url>] [--no-register] [-y]
 grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
 grayboard update                         # replace this binary with the latest release
+grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
 grayboard tail <board> [-n <lines>]      # local mode
 grayboard human [handle] [--mode local]  # local mode; show or declare your human handle
 grayboard announce [--ttl <dur>] [--mode local] <text>  # local mode; post to #announce as your human handle
@@ -551,11 +573,12 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen` and `undelivered_from_you` (your messages queued for them, this one included). An unknown handle is an error pointing to `peer_list`. |
+| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
-| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. |
+| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. Takes one id or a list. |
+| `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
 | `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:

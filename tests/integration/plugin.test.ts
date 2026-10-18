@@ -92,7 +92,7 @@ test("queued messages and posts are pushed at session start; instructions list c
   const again = await session(alice, "be");
   await Bun.sleep(500);
   expect(again.pushes.map((p) => p.content).sort()).toEqual(["queued dm", "queued post"]);
-  expect(again.c.getInstructions()).toContain("ticket:ENG-3 (held by bob@example.com/fe");
+  expect(again.c.getInstructions()).toMatch(/Others': ticket:ENG-3 \(bob@example.com\/fe, until .*claim_list shows the current state\.$/);
 }, 20_000);
 
 test("BUS_PUSH=off runs beside the session that owns the identity, for tools only", async () => {
@@ -106,6 +106,61 @@ test("BUS_PUSH=off runs beside the session that owns the identity, for tools onl
   await Bun.sleep(300);
   expect(owner.pushes.map((p) => p.content)).toEqual(["hi"]);
   expect(tools.pushes).toEqual([]);
+}, 20_000);
+
+test("dm_ack takes a list in server mode: one frame per id, unknown ids reported", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  const fe = await session(bob, "fe");
+  const ids = [];
+  for (const body of ["a", "b"]) ids.push((await fe.call("dm_send", { to: "alice@example.com/be", body })).message_id);
+  expect(await be.call("dm_ack", { message_id: ids })).toBe("ok");
+  expect((await be.call("dm_inbox")).unanswered).toEqual([]);
+  const mine = (await be.call("dm_send", { to: "bob@example.com/fe", body: "mine" })).message_id;
+  const c = (await fe.call("dm_send", { to: "alice@example.com/be", body: "c" })).message_id;
+  expect(await be.call("dm_ack", { message_id: [c, mine] })).toMatchObject({ acked: [c], not_found: [mine] });
+  await expect(be.call("dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
+}, 20_000);
+
+test("dm_retract in server mode: withdraws a queued message, errors on a delivered one", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  const fe = await session(bob, "fe");
+  const live = (await be.call("dm_send", { to: "bob@example.com/fe", body: "live" })).message_id;
+  await expect(be.call("dm_retract", { message_id: live })).rejects.toThrow(/already reached/);
+  await fe.c.close();
+  open.splice(open.indexOf(fe.c), 1);
+  await Bun.sleep(200);
+  const queued = (await be.call("dm_send", { to: "bob@example.com/fe", body: "queued" })).message_id;
+  expect(await be.call("dm_retract", { message_id: queued })).toBe("ok");
+}, 20_000);
+
+test("grayboard claims in server mode reads /api/claims and leaves out boards", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await be.call("claim_take", { key: "dev:env", board: "e2e", note: "migrating" });
+  const r = await fetch(`${base}/api/claims?prefix=dev:`, { headers: { Authorization: `Bearer ${bob}` } });
+  expect(await r.json()).toEqual([expect.not.objectContaining({ board: expect.anything() })]);
+
+  const dir = mkdtempSync(join(tmpdir(), "grayboard-claims-"));
+  const claims = async (token: string, email: string, identity: string) => {
+    const creds = join(dir, `${identity}-${email}`);
+    writeFileSync(creds, JSON.stringify({ session_token: token, server: base, user_email: email }));
+    const env = { ...process.env, GRAYBOARD_CREDENTIALS: creds, BUS_IDENTITY: identity } as Record<string, string>;
+    delete env.GRAYBOARD_TOKEN;
+    delete env.GRAYBOARD_SERVER;
+    const p = Bun.spawn([process.execPath, CLI, "claims", "--prefix", "dev:"], { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, err: await new Response(p.stderr).text() };
+  };
+  const held = await claims(bob, "bob@example.com", "fe");
+  expect(held.code).toBe(2);
+  expect(held.err).toContain("dev:env held by alice@example.com/be until");
+  expect((await claims(alice, "alice@example.com", "be")).code).toBe(0);
+  expect((await claims("bogus", "bob@example.com", "fe")).code).toBe(1);
 }, 20_000);
 
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {

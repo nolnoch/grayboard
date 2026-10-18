@@ -154,3 +154,20 @@ export function receivedUnacked(reader: string, since: number): Message[] {
     )
     .all(reader, since) as Message[];
 }
+
+// Deletes a message `sender` sent that the recipient's session hasn't received
+// (it's past their cursor) and that has no reply, which would still point at
+// it. False if any of that doesn't hold.
+export function retractMessage(sender: string, id: number): boolean {
+  return db.transaction(() => {
+    const { changes } = db
+      .prepare(
+        `DELETE FROM messages WHERE id = ? AND sender = ?
+           AND id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = messages.recipient), 0)
+           AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
+      )
+      .run(id, sender);
+    if (changes) db.prepare(`DELETE FROM dm_acks WHERE message_id = ?`).run(id);
+    return changes > 0;
+  })();
+}
