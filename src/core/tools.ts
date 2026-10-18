@@ -19,7 +19,7 @@ import {
   type Post,
   type SubMode,
 } from "./boards.ts";
-import { claim, listClaims, release, type Claim } from "./claims.ts";
+import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 
 export type ToolDef = {
   name: string;
@@ -150,10 +150,26 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     },
     {
       name: "claim_release",
-      description: "claim_release(key): release a claim you hold, so others can take it. Announced on the claim's board, if it had one.",
+      description: "claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. \"done\" or \"abandoned\").",
       inputSchema: {
         type: "object",
-        properties: { key: { type: "string" } },
+        properties: {
+          key: { type: "string" },
+          note: { type: "string", description: "Optional. How it ended, for whoever was waiting." },
+        },
+        required: ["key"],
+      },
+    },
+    {
+      name: "claim_watch",
+      description:
+        "claim_watch(key, off?): be @mentioned when someone else's claim is released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string" },
+          off: { type: "boolean", description: "Optional. true stops watching." },
+        },
         required: ["key"],
       },
     },
@@ -329,9 +345,12 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake } = release(db, handle, key);
+      const { wake } = release(db, handle, key, optStr(a, "note"));
       return { result: `released ${key}`, wake };
     }
+
+    case "claim_watch":
+      return { result: watch(db, handle, str(a, "key"), optBool(a, "off")), wake: [] };
 
     case "claim_list":
       return { result: listClaims(db, optStr(a, "prefix"), handle), wake: [] };

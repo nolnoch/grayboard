@@ -30,7 +30,7 @@ import {
   type Access,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, humanInstruction } from "./tools.ts";
-import { claim, claimExpiryTimer, listClaims, release, sweepExpired } from "./claims.ts";
+import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -283,6 +283,36 @@ test("a lapsed claim is announced on its board once, by the first sweep or takeo
   const taken = claim(db, "fe", "dev:freeze");
   expect(taken.ok && taken.wake).toContain("sim");
   expect(bodies().slice(-1)).toEqual(["[expired] dev:freeze: not released by be; check with them before relying on it"]);
+});
+
+test("a claim's watchers are mentioned on its release or expiry, in any mode, once", () => {
+  subscribe(db, "sim", "e2e", "quiet"); // fe has no subscription at all
+  claim(db, "be", "dev:env", { board: "e2e" });
+  drain("sim");
+  expect(watch(db, "sim", "dev:env")).toMatch(/watching dev:env/);
+  watch(db, "fe", "dev:env");
+  expect(() => watch(db, "be", "dev:env")).toThrow(/you hold/);
+  expect(() => watch(db, "sim", "nope")).toThrow(/no active claim/);
+  claim(db, "be", "boardless");
+  expect(() => watch(db, "sim", "boardless")).toThrow(/renew it with board=/);
+
+  expect(release(db, "be", "dev:env", "done, reset complete").wake.sort()).toEqual(["fe", "sim"]);
+  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @sim @fe" } }]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
+
+  // Watches end with the claim; a later one on the key starts without them.
+  claim(db, "be", "dev:env", { board: "e2e" });
+  release(db, "be", "dev:env");
+  expect(drain("sim")).toEqual([]);
+
+  claim(db, "be", "dev:env", { board: "e2e" });
+  watch(db, "sim", "dev:env");
+  watch(db, "fe", "dev:env");
+  watch(db, "fe", "dev:env", true);
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  expect(sweepExpired(db).wake).toEqual(["sim"]);
+  expect(drain("sim")[0]).toMatchObject({ reason: "mention", post: { body: expect.stringMatching(/^\[expired\] dev:env: .* cc @sim$/) } });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_watches`).get()).toEqual({ n: 0 });
 });
 
 test("the expiry timer fires at the next lapse without anyone asking", async () => {

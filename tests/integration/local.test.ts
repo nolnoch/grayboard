@@ -301,6 +301,18 @@ test("grayboard claims: exits 2 when another session holds a match, 0 otherwise"
   expect(JSON.parse(json.out)[0].board).toBeUndefined();
 }, 20_000);
 
+test("claim_watch: a quiet subscriber is pushed the release of the claim it waits on", async () => {
+  const be = await start("be");
+  const sim = await startCollecting("sim");
+  await call(be, "board_create", { name: "dev-deploys", purpose: "x" });
+  await call(sim.c, "board_subscribe", { board: "dev-deploys", mode: "quiet" });
+  await call(be, "claim_take", { key: "dev:env", board: "dev-deploys" });
+  await call(sim.c, "claim_watch", { key: "dev:env" });
+  await call(be, "claim_release", { key: "dev:env", note: "done" });
+  await Bun.sleep(300);
+  expect(sim.pushes).toEqual(["[release] dev:env — done cc @sim"]);
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");

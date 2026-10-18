@@ -163,6 +163,7 @@ export function age(ms: number): string {
 export function forgetHandle(db: Database, handle: string): void {
   db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM thread_mutes WHERE handle = ?`).run(handle);
+  db.prepare(`DELETE FROM claim_watches WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM handles WHERE name = ?`).run(handle);
 }
 
