@@ -75,6 +75,22 @@ export function initCoreSchema(db: Database): void {
       handle  TEXT NOT NULL,
       PRIMARY KEY (key, handle)
     );
+
+    -- Claim history, since release and expiry delete the claims row. Append-
+    -- only, written in the claim's own transaction; pruned with posts.
+    -- event: take, renew, refused (held_by has it), release, expire.
+    CREATE TABLE IF NOT EXISTS claim_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      key         TEXT    NOT NULL,
+      handle      TEXT    NOT NULL,
+      event       TEXT    NOT NULL,
+      note        TEXT,
+      board       TEXT,
+      expires_at  INTEGER,
+      held_by     TEXT,
+      at          INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a

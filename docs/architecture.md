@@ -32,7 +32,7 @@ flowchart LR
 - `messages` stores canonical address strings (`email/name`), not identity FKs.
 - **Cursors are per identity**, not per user: each identity advances independently in its DM stream and, via core subscriptions, per board.
 - `users.disabled_at` is enforced at auth: a disabled user's tokens fail `verifySessionToken` (`admin disable-user`). `teams.policy` is an unused seam: teams are invite-only regardless.
-- Retention (`src/server/retention.ts`): messages, posts and audit rows age out (default 90 days). Pruning clears replies' `parent_id` first, or the FK breaks when a replied-to row ages out. Claims are never pruned, so retention can't swallow an expiry announcement. Nothing reclaims free pages: the monthly vacuum hook is empty, and `auto_vacuum=INCREMENTAL` only tracks free pages until something runs `PRAGMA incremental_vacuum` (not exposed through `Repo`).
+- Retention (`src/server/retention.ts`): messages, posts and audit rows age out (default 90 days). Pruning clears replies' `parent_id` first, or the FK breaks when a replied-to row ages out. Claims are never pruned, so retention can't swallow an expiry announcement; their history (`claim_events`) is, with posts. Nothing reclaims free pages: the monthly vacuum hook is empty, and `auto_vacuum=INCREMENTAL` only tracks free pages until something runs `PRAGMA incremental_vacuum` (not exposed through `Repo`).
 
 ## 3. Auth and sessions
 

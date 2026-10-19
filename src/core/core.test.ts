@@ -242,6 +242,27 @@ test("claims are exclusive, renewable, and expire", () => {
   expect(claim(db, "sim", "ticket:ENG-142")).toMatchObject({ ok: true, renewed: false });
 });
 
+test("claim_events keeps each claim's history after the row is gone", () => {
+  claim(db, "be", "ticket:ENG-142", { note: "signature work", board: "e2e" });
+  claim(db, "sim", "ticket:ENG-142", { note: "me too" });
+  claim(db, "be", "ticket:ENG-142", { note: "step 2" });
+  release(db, "be", "ticket:ENG-142", "merged");
+  claim(db, "fe", "dev:env");
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  sweepExpired(db);
+
+  const rows = db.prepare(`SELECT key, handle, event, note, board, held_by FROM claim_events ORDER BY id`).all();
+  expect(rows).toEqual([
+    { key: "ticket:ENG-142", handle: "be", event: "take", note: "signature work", board: "e2e", held_by: null },
+    { key: "ticket:ENG-142", handle: "sim", event: "refused", note: "me too", board: null, held_by: "be" },
+    { key: "ticket:ENG-142", handle: "be", event: "renew", note: "step 2", board: "e2e", held_by: null },
+    { key: "ticket:ENG-142", handle: "be", event: "release", note: "merged", board: "e2e", held_by: null },
+    { key: "dev:env", handle: "fe", event: "take", note: null, board: null, held_by: null },
+    { key: "dev:env", handle: "fe", event: "expire", note: null, board: null, held_by: null },
+  ]);
+  expect(listClaims(db)).toEqual([]);
+});
+
 test("claims take a stop time or a multi-day ttl, but not both", () => {
   const until = new Date(Date.now() + 36 * 3600_000).toISOString();
   const a = claim(db, "be", "soak:24h", { until });
@@ -425,6 +446,14 @@ test("prune keeps replies whose parent is pruned, and clears the outbox", () => 
   prunePosts(db, 1);
   expect(pendingFor(db, "be").map((i) => i.kind === "push" && i.post.id)).toEqual([reply.id]);
   expect(read(db, "be", "e2e", { before_id: 999 }).posts.map((p) => p.id)).toEqual([reply.id]);
+});
+
+test("prune drops claim history older than the cutoff", () => {
+  claim(db, "be", "old");
+  db.prepare(`UPDATE claim_events SET at = 0`).run();
+  claim(db, "be", "new");
+  prunePosts(db, 1);
+  expect(db.prepare(`SELECT key FROM claim_events`).all()).toEqual([{ key: "new" }]);
 });
 
 // ── access policy (the distributed server installs one like this) ────────────
