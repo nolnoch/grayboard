@@ -45,14 +45,15 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
   const deliver = (params: ChannelParams) => {
     queue = queue.then(async () => {
       if (!target) return;
-      const digest = params.meta?.kind === "digest";
+      const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
       // Direct messages, mentions, thread replies: act on them (starts a turn,
-      // or joins a running one at its next step). Digests: context only. The
+      // or joins a running one at its next step). Digests and deferred thread
+      // replies: context only. The
       // tools-only server's instructions, which opencode puts in the system
       // prompt, tell the model what a <channel> message is.
       const r = await client.session.promptAsync({
         path: { id: target },
-        body: { parts: [{ type: "text", text: render(params) }], ...(digest ? { noReply: true } : {}) },
+        body: { parts: [{ type: "text", text: render(params) }], ...(contextOnly ? { noReply: true } : {}) },
       });
       if (r.error) log("error", `delivery failed: ${JSON.stringify(r.error)}`);
     });

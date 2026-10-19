@@ -34,7 +34,7 @@ export type Post = {
 };
 
 export type Pending =
-  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post }
+  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
 // Enough to acknowledge a Pending item after it crossed a wire.
@@ -237,6 +237,10 @@ function tipOf(db: Database, board: string): number {
 // Unread = after your cursor, not yours, and not already pushed to you in
 // full (a mention or thread reply), so one post never notifies twice.
 const NOT_PUSHED = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.post_id = p.id)`;
+// For counts and board_read, a deferred push still waiting is unread, so
+// reading the board picks it up early (and marks it delivered).
+const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.post_id = p.id
+  AND (o.wake = 1 OR o.delivered_at IS NOT NULL))`;
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
@@ -247,7 +251,7 @@ export function listBoards(db: Database, handle: string): BoardSummary[] {
               (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
               CASE WHEN s.handle IS NULL THEN 0 ELSE
                 (SELECT COUNT(*) FROM posts p
-                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED}) END AS unread
+                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
          FROM boards b
          LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
         ORDER BY b.name`,
@@ -334,7 +338,9 @@ function resolveMentions(
   return { handles: [...handles], unresolved };
 }
 
-export type PostResult = { post: Post; wake: string[]; unresolved: string[] };
+// wake: handles to wake now. deferred: thread participants whose push waits
+// for their next wake.
+export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
@@ -342,8 +348,9 @@ export type PostResult = { post: Post; wake: string[]; unresolved: string[] };
 export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number };
 
 // Inserts the post and queues pushes for handles that can see the board.
-// Returns every handle that should be woken (outbox targets plus digest
-// subscribers); delivery is the caller's job. `unresolved` lists @tokens that
+// Returns the handles that should be woken; delivery is the caller's job. A
+// reply wakes the author of the post it answers and the thread's starter;
+// other participants' pushes are deferred to their next wake. `unresolved` lists @tokens that
 // matched nobody (or nobody who can see this board).
 export function post(
   db: Database,
@@ -389,7 +396,8 @@ export function post(
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
-    const targets = new Map<string, "mention" | "thread" | "subscription">();
+    type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
+    const targets = new Map<string, Target>();
     // The announce board ignores agents' subscriptions (viewers like `tail`
     // still get it): an announcement reaches the sessions live now, as a
     // mention so it doesn't read as subscribed traffic, and an agent's ack
@@ -400,16 +408,21 @@ export function post(
         mode: SubMode;
       }[]
     ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
-    for (const s of subs) if (s.mode === "push") targets.set(s.handle, "subscription");
+    for (const s of subs) if (s.mode === "push") targets.set(s.handle, { reason: "subscription", wake: true });
     if (announcement) {
       for (const h of rosterHandles(db)) {
-        if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, "mention");
+        if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
       }
     } else if (parentId !== null) {
       const root = threadRoot(db, parentId);
       const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
+      const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
       for (const author of authors) {
-        if (a.canSee(author, b)) targets.set(author, "thread");
+        if (!a.canSee(author, b)) continue;
+        // Your user's replies wake the whole thread; a push-mode subscriber
+        // still gets every post as it lands.
+        const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
+        targets.set(author, { reason: "thread", wake });
       }
       // Muting drops thread and subscription pushes; the mention pass below
       // runs after this, so an @mention still lands.
@@ -417,18 +430,22 @@ export function post(
       for (const m of muted) targets.delete(m.handle);
     }
     const { handles: mentioned, unresolved } = resolveMentions(db, body, handle, b);
-    for (const m of mentioned) targets.set(m, "mention");
+    for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     targets.delete(handle);
 
     const ins = db.prepare(
-      `INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+      `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
     );
-    for (const [h, reason] of targets) ins.run(h, p.id, reason);
+    for (const [h, t] of targets) ins.run(h, p.id, t.reason, t.wake ? 1 : 0);
 
-    const wake = new Set(targets.keys());
-    for (const s of subs) if (s.mode === "digest" && s.handle !== handle) wake.add(s.handle);
-
-    return { post: p, wake: [...wake], unresolved };
+    // Digest subscribers aren't woken: their notice rides with their next wake.
+    const all = [...targets];
+    return {
+      post: p,
+      wake: all.filter(([, t]) => t.wake).map(([h]) => h),
+      deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
+      unresolved,
+    };
   })();
 }
 
@@ -551,7 +568,9 @@ export function getPost(db: Database, id: number): Post | undefined {
 
 export type ReadResult = { board: string; posts: Post[]; unread_remaining: number };
 
-// Default: your unread posts (oldest first); if none, the latest `limit`.
+// Default: your unread posts (oldest first); if none, the latest `limit`
+// (default 10: a reader with nothing unread is orienting, and a full page sits
+// in its context for the rest of the session).
 // With before_id: page back through history. With thread: the whole thread.
 // Advances your cursor to the newest post returned.
 export function read(
@@ -588,7 +607,7 @@ export function read(
     posts = sub
       ? (db
           .prepare(
-            `SELECT * FROM posts p WHERE board = ? AND id > ? AND author != ? AND ${NOT_PUSHED}
+            `SELECT * FROM posts p WHERE board = ? AND id > ? AND author != ? AND ${NOT_PUSHED_YET}
               ORDER BY id ASC LIMIT ?`,
           )
           .all(board, sub.cursor, handle, handle, limit) as Post[])
@@ -597,7 +616,7 @@ export function read(
       posts = (
         db
           .prepare(`SELECT * FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`)
-          .all(board, limit) as Post[]
+          .all(board, opts.limit === undefined ? 10 : limit) as Post[]
       ).reverse();
     }
   }
@@ -618,7 +637,7 @@ export function read(
     .prepare(
       `SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s
          ON s.board = p.board AND s.handle = ?
-        WHERE p.board = ? AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED}`,
+        WHERE p.board = ? AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}`,
     )
     .get(handle, board, handle, handle) as { n: number };
 
@@ -630,7 +649,12 @@ export function read(
 // Everything this handle should be told about now. Call markDelivered (or
 // acknowledge) for each item after it's handed to the agent (at-least-once).
 // Items for boards the handle can no longer see are dropped here.
-export function pendingFor(db: Database, handle: string): Pending[] {
+//
+// Deferred pushes and digests never wake an agent on their own: they come
+// back only alongside a waking push, or with `all` (a session's first drain,
+// a drain that's delivering direct messages, or a human's session). Any
+// notification wakes an idle agent, and drains also run on liveness probes.
+export function pendingFor(db: Database, handle: string, opts: { all?: boolean } = {}): Pending[] {
   const a = access(db);
   const seen = new Map<string, boolean>();
   const visible = (name: string) => {
@@ -646,14 +670,15 @@ export function pendingFor(db: Database, handle: string): Pending[] {
   const out: Pending[] = [];
   const pushes = db
     .prepare(
-      `SELECT o.reason, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
+      `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
         WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
     )
-    .all(handle) as (Post & { reason: "mention" | "thread" | "subscription" })[];
-  for (const { reason, ...p } of pushes) {
-    if (visible(p.board)) out.push({ kind: "push", reason, post: p });
+    .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[];
+  for (const { reason, wake, ...p } of pushes) {
+    if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
     else acknowledge(db, handle, { kind: "push", post_id: p.id });
   }
+  if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 
   // Digest: unread exists and nothing has been sent since the last catch-up.
   const digests = db

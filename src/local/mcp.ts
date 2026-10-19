@@ -347,6 +347,9 @@ async function liveHandles(): Promise<(h: string) => boolean> {
 // single query still get picked up. Re-entry is guarded; crashed drains
 // re-deliver (at-least-once).
 let draining = false;
+// The first drain also brings deferred thread replies and digests: a new
+// session is the natural time to see them.
+let firstDrain = true;
 
 // Claude Code drops notifications that arrive before it sends `initialized`,
 // so the startup drain (and any early wakeup) waits for it.
@@ -361,7 +364,9 @@ async function drainToClaude(): Promise<void> {
   try {
     while (true) {
       const batch = unreadFor(IDENTITY);
-      const boardItems = pendingFor(db, IDENTITY);
+      // A human's session has no tokens to save; a DM is already waking the agent.
+      const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || batch.length > 0 });
+      firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
       for (const msg of batch) {
         const meta: Record<string, string> = {

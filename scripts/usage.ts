@@ -86,6 +86,8 @@ function originOf(d: any): string | null {
   if (og.kind === "channel" && s) {
     if (og.server !== "grayboard") return `channel:${og.server}`;
     if (s.includes('human="true"')) return "gb:human-relay";
+    // A deferred push only rides along with the one that woke the session.
+    if (/^<channel[^>]*\bdeferred="true"/.test(s)) return "gb:deferred";
     if (s.includes('kind="digest"')) return "gb:digest";
     if (/^<channel[^>]*\bboard="/.test(s)) return "gb:board";
     return "gb:dm";
@@ -108,8 +110,12 @@ function originOf(d: any): string | null {
 const totals = { calls: 0, tokens: zero() };
 const byModel = new Map<string, Bucket>();
 const byOrigin = new Map<string, Bucket>(); // "gb:board:coord", "human", …
-const byBoard = new Map<string, { coord: Bucket; work: Bucket }>();
-const byReason = new Map<string, { coord: Bucket; work: Bucket }>();
+// silent: the subset of coord turns that changed nothing on the bus (no post,
+// DM, ack, claim or subscription): a wake that bought only reading.
+type Sides = { coord: Bucket; work: Bucket; silent: Bucket };
+const byBoard = new Map<string, Sides>();
+const byReason = new Map<string, Sides>();
+const GB_WRITES = new Set(["board_post", "dm_send", "dm_ack", "dm_retract", "claim_take", "claim_release", "claim_watch", "board_subscribe", "board_create", "peer_status"].map((t) => `mcp__grayboard__${t}`));
 const byLane = new Map<string, { tokens: Tok; gb_push_tokens: Tok; gb_coord_tokens: Tok; sessions: number }>();
 const wakes: { ctx: number; cold: boolean; origin: string }[] = [];
 const tools = new Map<string, { calls: number; input_chars: number; result_chars: number; results: number }>();
@@ -118,7 +124,7 @@ const instrDeltas: number[] = [];
 const seenMsg = new Set<string>();
 const seenTool = new Set<string>();
 const gbToolIds = new Map<string, string>();
-let files = 0, sessions = 0, compactions = 0;
+let files = 0, sessions = 0, compactions = 0, deferred = 0;
 
 // Always-load tool schemas sit in every call's prompt but never in transcripts:
 // measure them by asking a scratch local-mode server for its tool list.
@@ -203,11 +209,13 @@ function scan(path: string, lane: string, subagent: boolean, schemaTok: number) 
       key += coord ? ":coord" : ":work";
       add(L.gb_push_tokens, turn.tok);
       if (coord) add(L.gb_coord_tokens, turn.tok);
-      const side = coord ? "coord" : "work";
+      const silent = coord && ![...turn.tools].some((t) => GB_WRITES.has(t));
       for (const [m, k] of [[byBoard, board], [byReason, reason]] as const) {
         if (!k) continue;
-        const b = get(m, k, () => ({ coord: bucket(), work: bucket() }))[side];
-        b.turns++; b.calls += turn.calls; add(b.tokens, turn.tok);
+        const sides = get(m, k, () => ({ coord: bucket(), work: bucket(), silent: bucket() }));
+        for (const b of [sides[coord ? "coord" : "work"], ...(silent ? [sides.silent] : [])]) {
+          b.turns++; b.calls += turn.calls; add(b.tokens, turn.tok);
+        }
       }
     }
     const b = get(byOrigin, key, bucket);
@@ -230,7 +238,10 @@ function scan(path: string, lane: string, subagent: boolean, schemaTok: number) 
     const m = d.message ?? {};
     const c = m.content;
     if (d.type === "user") {
-      const o = subagent ? null : originOf(d);
+      let o = subagent ? null : originOf(d);
+      if (o === "gb:deferred") { deferred++; o = null; }
+      // A digest after a push in the same drain rode along; the push woke the session.
+      if (o === "gb:digest" && turn && turn.calls === 0 && origin.startsWith("gb:")) { deferred++; o = null; }
       if (o) {
         closeTurn();
         origin = o; turn = { tok: zero(), calls: 0, tools: new Set() };
@@ -352,6 +363,8 @@ const out = {
       "tokens are API-reported per call, deduplicated by message id (transcripts repeat on resume)",
       "total = input + cache_write + cache_read + output",
       "gb:*:coord = push-started turns whose only tool calls were grayboard tools or ToolSearch (or none)",
+      "push_by_*.silent = the coord turns with no grayboard write (post, DM, ack, claim, subscription)",
+      "deferred pushes (and digests right after a push) ride along with the push that woke the session, so they start no turn of their own",
       "context/fixed overhead are estimates from character counts / chars_per_token, capped at each call's context size",
       "overhead components overlap: coord turns already include their context and fixed tokens",
     ],
@@ -369,11 +382,11 @@ const out = {
     routed_work_tokens: workTok, routed_work_pct: pct(workTok),
   },
   wakes: {
-    count: wakes.length, cold: wakes.filter((w) => w.cold).length,
+    count: wakes.length, cold: wakes.filter((w) => w.cold).length, ride_along: deferred,
     context_tokens: { p50: pctile(wakeCtx, 0.5), p90: pctile(wakeCtx, 0.9), max: wakeCtx.at(-1) ?? 0 },
   },
-  push_by_board: Object.fromEntries([...byBoard].map(([k, v]) => [k, { coord: withPct(v.coord), work: withPct(v.work) }])),
-  push_by_reason: Object.fromEntries([...byReason].map(([k, v]) => [k, { coord: withPct(v.coord), work: withPct(v.work) }])),
+  push_by_board: Object.fromEntries([...byBoard].map(([k, v]) => [k, { coord: withPct(v.coord), work: withPct(v.work), silent: withPct(v.silent) }])),
+  push_by_reason: Object.fromEntries([...byReason].map(([k, v]) => [k, { coord: withPct(v.coord), work: withPct(v.work), silent: withPct(v.silent) }])),
   by_lane: laneNames.map(([k, v]) => ({
     lane: aliasLane.get(k), sessions: v.sessions, total: total(v.tokens), pct: pct(total(v.tokens)),
     gb_push_total: total(v.gb_push_tokens), gb_coord_total: total(v.gb_coord_tokens),
@@ -394,7 +407,7 @@ function toRows() {
     since: out.meta.window.since, until: out.meta.window.until, generated_at: out.meta.generated_at,
     files, sessions: sessions - list.filter((f) => f.subagent).length, subagent_files: list.filter((f) => f.subagent).length,
     calls: totals.calls, ...totals.tokens, total: all,
-    wakes: out.wakes.count, wakes_cold: out.wakes.cold, wake_ctx_p50: out.wakes.context_tokens.p50, wake_ctx_p90: out.wakes.context_tokens.p90,
+    wakes: out.wakes.count, wakes_cold: out.wakes.cold, ride_along: deferred, wake_ctx_p50: out.wakes.context_tokens.p50, wake_ctx_p90: out.wakes.context_tokens.p90,
     unanswered_root_dms: out.bus?.unanswered_root_dms ?? null,
   });
   for (const [k, b] of Object.entries(out.by_origin)) row("origin", k, bk(b));
@@ -411,6 +424,7 @@ function toRows() {
       row(table, k, {
         coord_turns: v.coord.turns, coord_total: v.coord.total, coord_pct: v.coord.pct,
         work_turns: v.work.turns, work_total: v.work.total, work_pct: v.work.pct,
+        silent_turns: v.silent.turns, silent_total: v.silent.total, silent_pct: v.silent.pct,
       });
   for (const l of out.by_lane) row("lane", l.lane!, l);
   for (const [k, t] of Object.entries(out.tools)) row("tool", k, t);

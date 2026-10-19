@@ -176,7 +176,7 @@ function startPi(modelPort: number): Pi {
   return new Pi(proc);
 }
 
-test("pi: a DM wakes the session, which replies with dm_send; a digest is context only", async () => {
+test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", async () => {
   // pi's identity follows #ops in digest mode (a tools-only session may share it).
   const { c: setup } = await peer("pi", { BUS_PUSH: "off" });
   const { c: p, pushes } = await peer("peer");
@@ -189,16 +189,19 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest is contex
   await pi.command({ type: "get_state" });
   await until(async () => (await call(p, "peer_list")).peers.some((x: any) => x.handle === "pi") || undefined, "pi online");
 
-  // Digest: added to the session, no model call.
+  // Digest: no model call. It reaches the session with the next wake, or with
+  // the first drain if the adapter's MCP handshake finishes after this post.
   await call(p, "board_post", { board: "ops", body: "deploy at 5" });
   const messages = async () => (await pi.command({ type: "get_messages" })).messages as { role: string; content: unknown }[];
-  await until(async () => (await messages()).some((m) => JSON.stringify(m).includes('kind=\\"digest\\"')) || undefined, "digest in session");
+  const hasDigest = async () => (await messages()).some((m) => JSON.stringify(m).includes('kind=\\"digest\\"'));
   await Bun.sleep(300);
   expect(requests).toHaveLength(0);
 
-  // DM: starts a turn; the model sees the <channel> tag and grayboard's
-  // instructions, and its dm_send reply reaches the peer in the same thread.
+  // DM: starts a turn, and the digest comes with it; the model sees the
+  // <channel> tag and grayboard's instructions, and its dm_send reply reaches
+  // the peer in the same thread.
   const sent = await call(p, "dm_send", { to: "pi", body: "ping" });
+  await until(async () => (await hasDigest()) || undefined, "digest in session");
   const reply = await until(() => pushes.find((x) => x.includes("pong")), "pong at peer", 30_000);
   expect(reply).toBeDefined();
   const thread = await call(p, "dm_thread", { thread: sent.message_id });

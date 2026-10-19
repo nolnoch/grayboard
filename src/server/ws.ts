@@ -75,9 +75,10 @@ function refKey(r: PendingRef): string {
 }
 
 // Send this connection everything pending on boards that it hasn't been sent.
-function drainBoards(ws: Ws, db: CoreDb): void {
+// all: also deferred pushes and digests (at hello; see pendingFor).
+function drainBoards(ws: Ws, db: CoreDb, all = false): void {
   const inflight = (ws.data.inflight ??= new Set());
-  for (const item of pendingFor(db, ws.data.identityFull)) {
+  for (const item of pendingFor(db, ws.data.identityFull, { all })) {
     const key = refKey(refOf(item));
     if (inflight.has(key)) continue;
     inflight.add(key);
@@ -317,7 +318,7 @@ async function handleHello(
   for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
     send(ws, { type: "push", message: showPending(message) });
   }
-  drainBoards(ws, db);
+  drainBoards(ws, db, true);
 }
 
 function handleSend(

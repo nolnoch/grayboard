@@ -52,11 +52,12 @@ export default function grayboard(pi: ExtensionAPI) {
 
   const deliver = (params: ChannelParams) => {
     // Direct messages, mentions, thread replies: act on them (starts a turn
-    // when idle; mid-run, steers in at the next step). Digests: context only.
-    const digest = params.meta?.kind === "digest";
+    // when idle; mid-run, steers in at the next step). Digests and deferred
+    // thread replies: context only.
+    const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
     pi.sendMessage(
       { customType: "grayboard", content: render(params), display: true },
-      digest ? undefined : { triggerTurn: true },
+      contextOnly ? undefined : { triggerTurn: true },
     );
   };
 

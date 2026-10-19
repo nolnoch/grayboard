@@ -266,15 +266,20 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
     type: "error",
     code: "bad_request",
   });
+  // A digest never wakes a session by itself; it arrives with the next hello.
   await a.call("board_post", { board: "eng", body: "standup in 5" });
-  const digest = await c.next(boardPush);
+  await c.none(boardPush);
+  await closeAndSettle(c);
+  const c2 = new Client(carol, "sim");
+  await c2.connect();
+  const digest = await c2.next(boardPush);
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
 
   await a.call("board_post", { board: "eng", body: "make that 10" });
-  await c.none(boardPush); // one digest until carol catches up
+  await c2.none(boardPush); // one digest until carol catches up
 
-  await c.request({ type: "board_ack", refs: [{ kind: "digest", board: "eng", latest_id: digest.item.latest.id }] });
-  const r = await c.call("board_read", { board: "eng" });
+  await c2.request({ type: "board_ack", refs: [{ kind: "digest", board: "eng", latest_id: digest.item.latest.id }] });
+  const r = await c2.call("board_read", { board: "eng" });
   expect(r.result.posts.map((p: any) => p.body)).toEqual(["standup in 5", "make that 10"]);
 
   const bob = await login("bob@example.com");
@@ -576,7 +581,7 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   expect(notices).toHaveLength(2);
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
-  expect((await new Client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2 (alice@example.com/be, until");
+  expect((await new Client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
