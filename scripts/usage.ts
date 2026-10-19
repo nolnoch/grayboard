@@ -5,9 +5,10 @@
 //
 //   bun scripts/usage.ts [--since YYYY-MM-DD] [--until YYYY-MM-DD]
 //                        [--projects DIR] [--db PATH | --no-db]
-//                        [--chars-per-token N] [--schema-chars N] [--raw-lanes]
+//                        [--chars-per-token N] [--schema-chars N] [--raw-lanes] [--rows]
 //
-// Writes one JSON document to stdout. Inputs: Claude Code transcripts
+// Writes one JSON document to stdout; --rows flattens it to {rows: [...]}, one
+// row per slice keyed by `id` ("<table>:<key>"), for charting tools. Inputs: Claude Code transcripts
 // (~/.claude/projects/*/*.jsonl and their subagents/) and, optionally, the local
 // bus database opened read-only. Counts are raw tokens as the API reports them;
 // no prices. Project directory names are aliased (lane-1, lane-2, …) unless
@@ -28,6 +29,7 @@ const { values: args } = parseArgs({
     "chars-per-token": { type: "string", default: "3.7" },
     "schema-chars": { type: "string" },
     "raw-lanes": { type: "boolean", default: false },
+    rows: { type: "boolean", default: false },
   },
 });
 
@@ -381,4 +383,36 @@ const out = {
   }])),
   bus: !args["no-db"] && existsSync(args.db!) ? busStats(args.db!) : null,
 };
-console.log(JSON.stringify(out, null, 2));
+
+// One flat table: every row has `table` and `key`; columns vary by table.
+function toRows() {
+  const rows: Record<string, unknown>[] = [];
+  const row = (table: string, key: string, cols: Record<string, unknown>) => rows.push({ id: `${table}:${key}`, table, key, ...cols });
+  const bk = (b: ReturnType<typeof withPct>) => ({ turns: b.turns, calls: b.calls, ...b.tokens, total: b.total, pct: b.pct });
+  row("summary", "all", {
+    since: out.meta.window.since, until: out.meta.window.until, generated_at: out.meta.generated_at,
+    files, sessions: sessions - list.filter((f) => f.subagent).length, subagent_files: list.filter((f) => f.subagent).length,
+    calls: totals.calls, ...totals.tokens, total: all,
+    wakes: out.wakes.count, wakes_cold: out.wakes.cold, wake_ctx_p50: out.wakes.context_tokens.p50, wake_ctx_p90: out.wakes.context_tokens.p90,
+    unanswered_root_dms: out.bus?.unanswered_root_dms ?? null,
+  });
+  for (const [k, b] of Object.entries(out.by_origin)) row("origin", k, bk(b));
+  for (const [k, b] of Object.entries(out.by_model)) row("model", k, bk(b));
+  const o = out.overhead;
+  row("overhead", "coord_turns", { total: o.coord_turn_tokens, pct: o.coord_turn_pct });
+  row("overhead", "context", { total: o.context_tokens, pct: o.context_pct });
+  row("overhead", "fixed_instructions", { total: o.fixed_instructions_tokens, pct: pct(o.fixed_instructions_tokens) });
+  row("overhead", "fixed_schemas", { total: o.fixed_schema_tokens, pct: pct(o.fixed_schema_tokens) });
+  row("overhead", "upper_bound", { total: Math.round(o.coord_turn_tokens + o.context_tokens + o.fixed_instructions_tokens + o.fixed_schema_tokens), pct: o.upper_bound_pct });
+  row("overhead", "routed_work", { total: o.routed_work_tokens, pct: o.routed_work_pct });
+  for (const [table, src] of [["push_reason", out.push_by_reason], ["push_board", out.push_by_board]] as const)
+    for (const [k, v] of Object.entries(src))
+      row(table, k, {
+        coord_turns: v.coord.turns, coord_total: v.coord.total, coord_pct: v.coord.pct,
+        work_turns: v.work.turns, work_total: v.work.total, work_pct: v.work.pct,
+      });
+  for (const l of out.by_lane) row("lane", l.lane!, l);
+  for (const [k, t] of Object.entries(out.tools)) row("tool", k, t);
+  return { rows };
+}
+console.log(JSON.stringify(args.rows ? toRows() : out, null, 2));
