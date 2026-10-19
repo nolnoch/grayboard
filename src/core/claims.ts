@@ -116,8 +116,8 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
   }).immediate();
 }
 
-// Be told when someone else's claim ends, whatever your mode on its board:
-// the release or expiry post @mentions you. Needs a claim with a board, which
+// Be told when someone else's claim is updated or ends, whatever your mode on
+// its board: the update, release or expiry post @mentions you. Needs a claim with a board, which
 // is where that post goes. off: stop watching.
 export function watch(db: Database, handle: string, keyInput: string, off = false): string {
   const key = validKey(keyInput);
@@ -134,7 +134,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
     );
   }
   db.prepare(`INSERT OR IGNORE INTO claim_watches (key, handle) VALUES (?, ?)`).run(key, handle);
-  return `ok: watching ${key}; its release or expiry on #${cur.board} will mention you`;
+  return `ok: watching ${key}; its updates, release or expiry on #${cur.board} will mention you`;
 }
 
 // Claims are visible to everyone on the bus. The announcing board's name is
