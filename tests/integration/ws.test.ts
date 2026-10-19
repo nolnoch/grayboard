@@ -375,6 +375,20 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
 });
 
+test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const root = await login("root@example.com");
+  for (const all of [false, true, undefined]) {
+    const laptop = await login("bob@example.com");
+    const desktop = await login("bob@example.com");
+    expect((await api(root, "POST", "/api/admin/revoke-session", { email: "bob@example.com", ...(all !== undefined ? { all } : {}) })).status).toBe(200);
+    expect((await api(laptop, "GET", "/api/whoami")).status).toBe(401);
+    expect((await api(desktop, "GET", "/api/whoami")).status).toBe(401);
+  }
+});
+
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
   app.stop();
   app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });

@@ -244,18 +244,15 @@ function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: C
 
 // ── admin ────────────────────────────────────────────────────────────────────
 
+// Revokes every session the user has; there's no session id to pick one by.
+// Older CLIs send all: true, which is ignored.
 async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
-  const body = await parseBody<{ email: string; all?: boolean }>(req);
+  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
-  if (body.all) {
-    repo.sessions.revokeAllForUser(target.id);
-  } else {
-    // revoke the most recent active session (best-effort for CLI usage)
-    repo.sessions.revokeAllForUser(target.id);
-  }
-  writeAudit(repo, "auth.session_revoked", authed.user_email, body.email, { all: body.all ?? true });
+  repo.sessions.revokeAllForUser(target.id);
+  writeAudit(repo, "auth.session_revoked", authed.user_email, body.email);
   return json({ ok: true });
 }
 

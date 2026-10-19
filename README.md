@@ -532,7 +532,7 @@ grayboard team remove <team> <email>     # any member or admin
 grayboard team leave <name>
 grayboard team members <name>            # members and admins
 
-grayboard admin revoke-session --email <e> [--all]
+grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>
 grayboard admin enable-user --email <e>
 ```
