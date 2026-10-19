@@ -198,7 +198,8 @@ function scan(path: string, lane: string, subagent: boolean, schemaTok: number) 
     if (!turn || !turn.calls) return;
     let key = origin;
     if (origin.startsWith("gb:")) {
-      const coord = [...turn.tools].every((t) => t.startsWith("mcp__grayboard__"));
+      // ToolSearch only loads deferred tool schemas, so it counts as coordination too.
+      const coord = [...turn.tools].every((t) => t.startsWith("mcp__grayboard__") || t === "ToolSearch");
       key += coord ? ":coord" : ":work";
       add(L.gb_push_tokens, turn.tok);
       if (coord) add(L.gb_coord_tokens, turn.tok);
@@ -350,7 +351,7 @@ const out = {
     notes: [
       "tokens are API-reported per call, deduplicated by message id (transcripts repeat on resume)",
       "total = input + cache_write + cache_read + output",
-      "gb:*:coord = push-started turns whose only tool calls were grayboard tools (or none)",
+      "gb:*:coord = push-started turns whose only tool calls were grayboard tools or ToolSearch (or none)",
       "context/fixed overhead are estimates from character counts / chars_per_token, capped at each call's context size",
       "overhead components overlap: coord turns already include their context and fixed tokens",
     ],
