@@ -240,6 +240,8 @@ function scan(path: string, lane: string, subagent: boolean, schemaTok: number) 
     if (d.type === "user") {
       let o = subagent ? null : originOf(d);
       if (o === "gb:deferred") { deferred++; o = null; }
+      // A digest after a push in the same drain rode along; the push woke the session.
+      if (o === "gb:digest" && turn && turn.calls === 0 && origin.startsWith("gb:")) { deferred++; o = null; }
       if (o) {
         closeTurn();
         origin = o; turn = { tok: zero(), calls: 0, tools: new Set() };
@@ -362,7 +364,7 @@ const out = {
       "total = input + cache_write + cache_read + output",
       "gb:*:coord = push-started turns whose only tool calls were grayboard tools or ToolSearch (or none)",
       "push_by_*.silent = the coord turns with no grayboard write (post, DM, ack, claim, subscription)",
-      "deferred pushes ride along with the push that woke the session, so they start no turn of their own",
+      "deferred pushes (and digests right after a push) ride along with the push that woke the session, so they start no turn of their own",
       "context/fixed overhead are estimates from character counts / chars_per_token, capped at each call's context size",
       "overhead components overlap: coord turns already include their context and fixed tokens",
     ],
@@ -380,7 +382,7 @@ const out = {
     routed_work_tokens: workTok, routed_work_pct: pct(workTok),
   },
   wakes: {
-    count: wakes.length, cold: wakes.filter((w) => w.cold).length, deferred_pushes: deferred,
+    count: wakes.length, cold: wakes.filter((w) => w.cold).length, ride_along: deferred,
     context_tokens: { p50: pctile(wakeCtx, 0.5), p90: pctile(wakeCtx, 0.9), max: wakeCtx.at(-1) ?? 0 },
   },
   push_by_board: Object.fromEntries([...byBoard].map(([k, v]) => [k, { coord: withPct(v.coord), work: withPct(v.work), silent: withPct(v.silent) }])),
@@ -405,7 +407,7 @@ function toRows() {
     since: out.meta.window.since, until: out.meta.window.until, generated_at: out.meta.generated_at,
     files, sessions: sessions - list.filter((f) => f.subagent).length, subagent_files: list.filter((f) => f.subagent).length,
     calls: totals.calls, ...totals.tokens, total: all,
-    wakes: out.wakes.count, wakes_cold: out.wakes.cold, deferred_pushes: deferred, wake_ctx_p50: out.wakes.context_tokens.p50, wake_ctx_p90: out.wakes.context_tokens.p90,
+    wakes: out.wakes.count, wakes_cold: out.wakes.cold, ride_along: deferred, wake_ctx_p50: out.wakes.context_tokens.p50, wake_ctx_p90: out.wakes.context_tokens.p90,
     unanswered_root_dms: out.bus?.unanswered_root_dms ?? null,
   });
   for (const [k, b] of Object.entries(out.by_origin)) row("origin", k, bk(b));
