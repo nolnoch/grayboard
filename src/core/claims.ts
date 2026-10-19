@@ -44,15 +44,18 @@ function announce(db: Database, handle: string, board: string | null, text: stri
   return post(db, handle, board, text).wake;
 }
 
-// The claim's watchers as @mentions for its end post, clearing them: a later
-// claim on the same key starts with none. Mentions skip anyone who can't see
-// the board.
-function takeWatchers(db: Database, key: string): string {
-  const rows = db.prepare(`DELETE FROM claim_watches WHERE key = ? RETURNING handle`).all(key) as { handle: string }[];
+// The claim's watchers as @mentions for a post about it. An end post takes
+// them (clears them), so a later claim on the same key starts with none.
+// Mentions skip anyone who can't see the board.
+function watchersCc(db: Database, key: string, take: boolean): string {
+  const sql = take ? `DELETE FROM claim_watches WHERE key = ? RETURNING handle` : `SELECT handle FROM claim_watches WHERE key = ?`;
+  const rows = db.prepare(sql).all(key) as { handle: string }[];
   return rows.length ? ` cc ${rows.map((r) => `@${r.handle}`).join(" ")}` : "";
 }
 
-// Acquire, or renew if you already hold it. Expired claims are free.
+// Acquire, or renew if you already hold it. Expired claims are free. A
+// renewal without a ttl or stop time never shortens the claim, and one that
+// changes the note announces it to the board and the watchers.
 // IMMEDIATE takes the write lock up front so two processes can't both win.
 export function claim(
   db: Database,
@@ -66,7 +69,7 @@ export function claim(
 
   return db.transaction((): ClaimResult => {
     const now = Date.now();
-    const expires = expiresAt(now, opts.ttl_minutes, opts.until);
+    let expires = expiresAt(now, opts.ttl_minutes, opts.until);
     // Announce a lapsed claim before anyone takes it over.
     const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
@@ -74,6 +77,7 @@ export function claim(
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
     }
     const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
+    if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
     const row = db
       .prepare(
         `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at)
@@ -88,9 +92,11 @@ export function claim(
          RETURNING *`,
       )
       .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
-    const wake = renewed
-      ? []
-      : announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`);
+    const wake = !renewed
+      ? announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
+      : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, handle, row.board)
+        ? announce(db, handle, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`)
+        : [];
     return { ok: true, claim: row, renewed, wake: [...new Set([...lapsed, ...wake])] };
   }).immediate();
 }
@@ -102,7 +108,7 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     if (!cur || cur.expires_at <= Date.now()) throw new CoreError(`no active claim on "${key}"`);
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-    const cc = takeWatchers(db, key);
+    const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
     const board = cur.board && canSeeBoard(db, handle, cur.board) ? cur.board : null;
@@ -124,7 +130,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
   if (cur.holder === handle) throw new CoreError(`you hold "${key}"`);
   if (!cur.board || !canSeeBoard(db, handle, cur.board)) {
     throw new CoreError(
-      `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${cur.holder} to renew it with board= (and until=, to keep its expiry)`,
+      `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${cur.holder} to renew it with board=`,
     );
   }
   db.prepare(`INSERT OR IGNORE INTO claim_watches (key, handle) VALUES (?, ?)`).run(key, handle);
@@ -151,7 +157,7 @@ function sweepIn(db: Database, now: number): string[] {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
   for (const c of gone) {
-    const cc = takeWatchers(db, c.key);
+    const cc = watchersCc(db, c.key, true);
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
     const text = `[expired] ${c.key}: not released by ${c.holder}; check with them before relying on it${cc}`;
