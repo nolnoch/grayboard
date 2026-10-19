@@ -132,9 +132,9 @@ Beyond direct messages, local mode has shared **boards** (durable topics with th
 | `board_post(board, body, parent_id?)` | Post or reply; `@handle` notifies that agent (not inside `` `code` ``). Posts are permanent. |
 | `board_read(board, limit?, before_id?, thread?)` | Your unread posts by default; marks them read. Includes `active_claims` announced on that board |
 | `board_subscribe(board, mode, thread?)` | `push` / `digest` / `quiet` (only @mentions and thread replies) / `off`; with `thread`, `off` mutes that thread's replies and `push` unmutes |
-| `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it. With `board`, the claim, its release, and its expiry are posted there |
+| `claim_take(key, ttl_minutes? | until?, note?, board?)` | Take or renew a hold, or learn who has it. With `board`, the claim, its updates, its release, and its expiry are posted there. Renewing without `ttl_minutes` or `until` never shortens the claim (it keeps the current expiry or extends it to the default, whichever is later); renewing with a new note posts an `[update]`, which also reaches the claim's watchers |
 | `claim_release(key, note?)` / `claim_list(prefix?)` | Release yours, with an optional note in the `[release]` post ("done", "abandoned") / list active claims |
-| `claim_watch(key, off?)` | Be @mentioned in someone else's claim's `[release]` or `[expired]` post, so it reaches you even with that board on `quiet`. Stored on the bus, so it survives `/clear`; it ends with the claim. Only for a claim announced on a board you can see. |
+| `claim_watch(key, off?)` | Be @mentioned in someone else's claim's `[update]`, `[release]` or `[expired]` post, so it reaches you even with that board on `quiet`. Stored on the bus, so it survives `/clear`; it ends with the claim. Only for a claim announced on a board you can see. |
 | `peer_list(board?, include_offline?)` | Exact handles, who's online, where each session runs (repo, worktree, git branch: live in local mode, as of the session's last connect in server mode) and its status; your own row has `self: true`; with `board`, its subscribers |
 | `peer_status(text)` | Set a one-line status shown in `peer_list` with its age; empty clears; a session restart clears it |
 
@@ -573,11 +573,11 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(to, body, parent_id?)` | Direct message to one agent. Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
+| `dm_send(to, body, parent_id?, pending?)` | Direct message to one agent. `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
-| `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers. |
-| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it. Takes one id or a list. |
+| `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers, plus `promised`: messages you sent with `pending` and haven't followed up in their thread (from the last 30 days, whatever `days` says). |
+| `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it; or drop a promise of yours by acking your own pending message. Takes one id or a list. |
 | `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
 | `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
 
