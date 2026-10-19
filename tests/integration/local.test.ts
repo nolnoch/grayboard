@@ -183,7 +183,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?): missing to; unknown recipient.",
   );
 }, 20_000);
 
@@ -238,6 +238,28 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
   await expect(call(fe, "dm_ack", { message_id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
+}, 20_000);
+
+test("dm_send pending lists a promise in dm_inbox until your next message in the thread, or a dm_ack", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const q = await call(fe, "dm_send", { to: "be", body: "can you check the soak?" });
+  const p = await call(be, "dm_send", { to: "fe", body: "on it, results by noon", parent_id: q.message_id, pending: true });
+  expect(p).toMatchObject({ pending: true });
+  expect((await call(be, "dm_inbox", { days: 1 })).promised).toMatchObject([{ id: p.message_id, to: "fe", parent_id: q.message_id, body: "on it, results by noon" }]);
+  // Their reply doesn't keep it; yours does. History marks only the pending one.
+  await call(fe, "dm_send", { to: "be", body: "thanks", parent_id: p.message_id });
+  expect((await call(be, "dm_inbox")).promised).toHaveLength(1);
+  expect((await call(be, "dm_thread", { thread: q.message_id })).map((m: any) => m.pending)).toEqual([undefined, true, undefined]);
+  await call(be, "dm_send", { to: "fe", body: "soak passed", parent_id: p.message_id });
+  expect((await call(be, "dm_inbox")).promised).toBeUndefined();
+
+  // dm_ack drops your own promise; it still can't ack your other sends.
+  const p2 = await call(be, "dm_send", { to: "fe", body: "will follow up", pending: true });
+  await expect(call(fe, "dm_ack", { message_id: [p2.message_id] })).resolves.toBe("ok");
+  expect((await call(be, "dm_inbox")).promised).toHaveLength(1);
+  expect(await call(be, "dm_ack", { message_id: p2.message_id })).toBe("ok");
+  expect((await call(be, "dm_inbox")).promised).toBeUndefined();
 }, 20_000);
 
 test("dm_ack takes a list, so one combined reply clears every message it covered", async () => {

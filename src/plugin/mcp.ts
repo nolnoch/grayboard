@@ -10,7 +10,7 @@ import { GrayboardClient } from "./client.ts";
 import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
-import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, ackIds, ackResult } from "../shared/inbox.ts";
+import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -146,13 +146,14 @@ const TOOLS = [
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description:
-      `dm_send(to, body, parent_id?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?, pending?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
         to:        { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
         body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
         parent_id: { type: "number", description: "Optional. message_id to reply to." },
+        pending:   PENDING_PARAM,
       },
       required: ["to", "body"],
     },
@@ -222,7 +223,12 @@ async function call(name: string, a: Record<string, unknown>) {
         recipient: a.to,
         body: a.body,
         ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
+        ...(a.pending === true ? { pending: true } : {}),
       });
+      // A server from before pending ignores the field, which would lose the promise silently.
+      if (a.pending === true && !rest.pending) {
+        rest.note = `${rest.note ? `${rest.note} ` : ""}Sent, but this server doesn't record pending, so dm_inbox won't list the promise; the server needs updating.`;
+      }
       return text(rest);
     }
     if (name === "dm_history") {

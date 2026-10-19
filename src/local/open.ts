@@ -43,6 +43,9 @@ export function openLocalDb(path = localDbPath()): Database {
       PRIMARY KEY (reader, message_id)
     );
   `);
+  // dm_send pending: the sender owes a follow-up in the thread.
+  const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
+  if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
   initCoreSchema(db);
   // The handles roster arrived after the bus did. Backfill identities that have
   // run a session (sent, read, posted, or subscribed) so peer_list shows them

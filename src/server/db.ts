@@ -11,7 +11,7 @@ export type User     = { id: number; email: string; display_name: string | null;
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number };
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 
 export interface Repo {
@@ -46,7 +46,7 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null): MessageRow;
+    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean): MessageRow;
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
@@ -55,6 +55,8 @@ export interface Repo {
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
     // Direct messages to reader since `since` that it hasn't acked, oldest first.
     receivedUnacked(reader: string, since: number): MessageRow[];
+    // Direct messages from sender since `since` sent pending and not acked by it, oldest first.
+    sentPending(sender: string, since: number): MessageRow[];
     ack(reader: string, id: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
     // and has no reply. False if any of that doesn't hold.
@@ -168,6 +170,9 @@ function initSchema(db: Database): void {
       PRIMARY KEY (reader, message_id)
     );
   `);
+  // dm_send pending: the sender owes a follow-up in the thread.
+  const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
+  if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
 }
 
 function makeRepo(db: Database): Repo {
@@ -292,11 +297,11 @@ function makeRepo(db: Database): Repo {
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false) {
         const r = db.run(
-          `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [sender, recipientType, recipient, body, parentId, Date.now()],
+          `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0],
         );
         return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(Number(r.lastInsertRowid))!;
       },
@@ -379,6 +384,14 @@ function makeRepo(db: Database): Repo {
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
         ).all(reader, since);
+      },
+      sentPending(sender, since) {
+        return db.query<MessageRow, [string, number]>(
+          `SELECT * FROM messages m
+            WHERE m.recipient_type = 'user' AND m.sender = ? AND m.pending = 1 AND m.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+            ORDER BY m.id ASC`,
+        ).all(sender, since);
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);

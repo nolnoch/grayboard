@@ -583,6 +583,35 @@ test("dm_inbox: replied and acked messages drop out; only the recipient can ack"
   expect(await inbox()).toEqual([]);
 });
 
+test("a pending send is echoed, listed as promised until the sender's next message, and ackable by the sender", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  await a.connect();
+  await b.connect();
+  const p = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "results by noon", pending: true });
+  expect(p).toMatchObject({ type: "send_ok", pending: true });
+  const plain = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fyi" });
+  expect(plain.pending).toBeUndefined();
+  const promises = async () => (await a.request({ type: "inbox", days: 1 })).promised?.map((m: any) => m.id);
+  expect(await promises()).toEqual([p.message_id]);
+  // History is newest first; only the pending row says so.
+  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([undefined, true]);
+
+  // Bob's reply doesn't keep it, and his ack (as its recipient) doesn't drop it.
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "thanks", parent_id: p.message_id });
+  expect(await b.request({ type: "dm_ack", message_id: p.message_id })).toMatchObject({ type: "ack_ok" });
+  expect(await promises()).toEqual([p.message_id]);
+  await a.request({ type: "send", recipient: "bob@example.com/fe", body: "done", parent_id: p.message_id });
+  expect(await promises()).toBeUndefined();
+
+  const p2 = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "later", pending: true });
+  expect(await a.request({ type: "dm_ack", message_id: plain.message_id })).toMatchObject({ type: "error", code: "not_found" });
+  expect(await a.request({ type: "dm_ack", message_id: p2.message_id })).toMatchObject({ type: "ack_ok" });
+  expect(await promises()).toBeUndefined();
+});
+
 test("only a message's sender and recipient can read its thread or reply to it", async () => {
   const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
   const a = new Client(alice!, "be");
