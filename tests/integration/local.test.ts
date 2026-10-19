@@ -303,6 +303,17 @@ test("a send to a long-idle handle says so; dm_retract withdraws it until it's d
   await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
 }, 20_000);
 
+test("identity create --mcp names a missing directory instead of failing with ENOENT", async () => {
+  const create = async (path: string) => {
+    const p = Bun.spawn([process.execPath, CLI, "identity", "create", "be", "--mcp", path], { cwd: dir, env: busEnv(), stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, err: await new Response(p.stderr).text() };
+  };
+  const bad = await create("nope/.mcp.json");
+  expect(bad.code).toBe(1);
+  expect(bad.err).toMatch(/directory \S*\/nope doesn't exist/);
+  expect((await create(".mcp.json")).code).toBe(0);
+}, 20_000);
+
 test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {
   const claims = async (identity: string, ...args: string[]) => {
     const p = Bun.spawn([process.execPath, CLI, "claims", ...args], { cwd: dir, env: busEnv(identity), stdout: "pipe", stderr: "pipe" });

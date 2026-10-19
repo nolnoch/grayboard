@@ -534,6 +534,11 @@ identityCmd
   .option("--force",       "Overwrite entire .mcp.json instead of merging")
   .action(async (name: string, opts: { mcp?: string | boolean; force?: boolean }) => {
     const mcpPath = opts.mcp === undefined ? null : opts.mcp === true ? "./.mcp.json" : opts.mcp;
+    // Before anything is created, so a typo'd path isn't an ENOENT after the fact.
+    if (mcpPath && !existsSync(dirname(resolve(mcpPath)))) {
+      console.error(`--mcp ${mcpPath}: directory ${dirname(resolve(mcpPath))} doesn't exist`);
+      process.exit(1);
+    }
     if (busMode() === "local") {
       if (!mcpPath) {
         console.error("Local mode has no identities to reserve. Use --mcp to name this repo's sessions.");
