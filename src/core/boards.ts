@@ -723,6 +723,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
+    db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();
 }

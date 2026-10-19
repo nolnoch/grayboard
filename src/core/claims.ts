@@ -39,6 +39,15 @@ function validKey(key: string): string {
   return k;
 }
 
+type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
+
+// One claim_events row; callers are inside the claim's transaction.
+function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
+  db.prepare(
+    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
+}
+
 function announce(db: Database, handle: string, board: string | null, text: string): string[] {
   if (!board) return [];
   return post(db, handle, board, text).wake;
@@ -74,6 +83,7 @@ export function claim(
     const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
+      logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
     }
     const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
@@ -92,6 +102,7 @@ export function claim(
          RETURNING *`,
       )
       .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
+    logEvent(db, renewed ? "renew" : "take", handle, row, now);
     const wake = !renewed
       ? announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, handle, row.board)
@@ -108,6 +119,7 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     if (!cur || cur.expires_at <= Date.now()) throw new CoreError(`no active claim on "${key}"`);
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
+    logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
@@ -157,6 +169,7 @@ function sweepIn(db: Database, now: number): string[] {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
   for (const c of gone) {
+    logEvent(db, "expire", c.holder, c, now);
     const cc = watchersCc(db, c.key, true);
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
