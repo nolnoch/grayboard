@@ -29,7 +29,7 @@ export default function grayboard(pi: ExtensionAPI) {
   pi.on("mcp_notification", (event) => {
     if (event.server !== SERVER || event.method !== "notifications/claude/channel") return;
     const params = event.params as ChannelParams;
-    const digest = params.meta?.kind === "digest";
+    const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
     pi.sendMessage(
       {
         customType: "grayboard",
@@ -38,8 +38,9 @@ export default function grayboard(pi: ExtensionAPI) {
         attribution: "agent",
       },
       // Direct messages, mentions, thread replies: act on them (wakes an idle
-      // agent; mid-run, lands at the next step boundary). Digests: context only.
-      digest ? { deliverAs: "nextTurn" } : { deliverAs: "aside", triggerTurn: true },
+      // agent; mid-run, lands at the next step boundary). Digests and deferred
+      // thread replies: context only.
+      contextOnly ? { deliverAs: "nextTurn" } : { deliverAs: "aside", triggerTurn: true },
     );
   });
 }

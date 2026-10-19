@@ -176,7 +176,7 @@ test("active claims show in board_read and in a new session's instructions", asy
   const r = await call(be, "board_read", { board: "dev-deploys" });
   expect(r.active_claims).toMatchObject([{ key: "dev:freeze", holder: "be", note: "24h soak" }]);
   const fe = await start("fe");
-  expect(fe.getInstructions()).toContain("Others': dev:freeze (be, until");
+  expect(fe.getInstructions()).toContain("Others': dev:freeze.");
 }, 20_000);
 
 test("a wrong argument name gets an error naming the expected call", async () => {
@@ -344,6 +344,24 @@ test("claim_watch: a quiet subscriber is pushed the release of the claim it wait
   await call(be, "claim_release", { key: "dev:env", note: "done" });
   await Bun.sleep(300);
   expect(sim.pushes).toEqual(["[release] dev:env — done cc @sim"]);
+}, 20_000);
+
+test("a thread reply to a bystander waits for its next wake, here a DM", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const sim = await startCollecting("sim");
+  await call(be, "board_create", { name: "ops", purpose: "x" });
+  await call(be, "board_subscribe", { board: "ops", mode: "off" });
+  const root = await call(be, "board_post", { board: "ops", body: "root" });
+  await call(sim.c, "board_post", { board: "ops", body: "sim chimes in", parent_id: root.post_id });
+  const mid = await call(fe, "board_post", { board: "ops", body: "fe asks", parent_id: root.post_id });
+  const reply = await call(be, "board_post", { board: "ops", body: "answer for fe", parent_id: mid.post_id });
+  expect(reply).toMatchObject({ notified: ["fe"], deferred: ["sim"] });
+  await Bun.sleep(300);
+  expect(sim.pushes).toEqual([]); // both replies to the thread are deferred for sim
+  await call(fe, "dm_send", { to: "sim", body: "ping" });
+  await Bun.sleep(300);
+  expect(sim.pushes).toEqual(["ping", "fe asks", "answer for fe"]);
 }, 20_000);
 
 test("a message queued while offline is pushed when the session starts", async () => {

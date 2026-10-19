@@ -63,7 +63,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?): post, or reply in a thread. @handle notifies that agent (not inside `code`); mentions that match nobody come back in unresolved. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
@@ -77,12 +77,12 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_read",
       description:
-        "board_read(board, thread?, before_id?, limit?): your unread posts by default, else the latest. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
+        "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), else the latest 10. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
-          limit: { type: "number", description: "Max posts (default 20, max 200)." },
+          limit: { type: "number", description: "Max posts (default 20 unread or 10 latest, max 200)." },
           before_id: { type: "number", description: "Return posts older than this post_id." },
           thread: { type: "number", description: "Any post_id in the thread to expand." },
         },
@@ -92,7 +92,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_subscribe",
       description:
-        'board_subscribe(board, mode, thread?): how a board reaches you. "push" = every post in full; "digest" = one notice while there\'s unread; "quiet" = no notices, only unread counts in board_list; "off" = unsubscribe. In every mode, @mentions and replies in threads you\'ve posted in still reach you. To stop one thread\'s replies, pass its thread with mode "off" (@mentions still arrive); the same call with mode "push" resumes them.',
+        'board_subscribe(board, mode, thread?): how a board reaches you. "push" = every post in full, as it lands; "digest" = one notice while there\'s unread, arriving with your next other notification or session start (it never wakes you by itself); "quiet" = no notices, only unread counts in board_list; "off" = unsubscribe. In every mode, @mentions and replies to your posts or threads you started wake you, and other replies in threads you\'ve posted in arrive with your next notification. To stop one thread\'s replies, pass its thread with mode "off" (@mentions still arrive); the same call with mode "push" resumes them.',
       inputSchema: {
         type: "object",
         properties: {
@@ -197,22 +197,23 @@ const MAX_CLAIM_NOTE_CHARS = 150;
 
 // Active claims as of session start, for the server instructions: the one
 // place a fresh or /clear-ed session is sure to see them. The session's own
-// come first, with notes; others fill what's left of the budget, and the
-// rest are counted so a cut is explicit.
+// come first, with notes; others' are keys only (claim_list has holder and
+// expiry), since every session pays for this text on every call. Keys still
+// show signals nobody would claim_take, like "dev:freeze". A cut is counted.
 export function claimsInstruction(claims: Claim[], self: string): string[] {
   if (claims.length === 0) return [];
   const until = (c: Claim) => `${new Date(c.expires_at).toISOString().slice(0, 16)}Z`;
   const note = (n: string) => (n.length > MAX_CLAIM_NOTE_CHARS ? `${n.slice(0, MAX_CLAIM_NOTE_CHARS)}…` : n);
   const mine = claims.filter((c) => c.holder === self).map((c) => `${c.key} (until ${until(c)}${c.note ? `: ${note(c.note)}` : ""})`);
-  const others = claims.filter((c) => c.holder !== self).map((c) => `${c.key} (${c.holder}, until ${until(c)})`);
+  const others = claims.filter((c) => c.holder !== self).map((c) => c.key);
   const all = [...mine, ...others];
   let shown = 0;
   for (let room = MAX_CLAIMS_CHARS; shown < all.length && (room -= all[shown]!.length + 2) >= 0; shown++);
   const parts = [];
   if (shown > 0 && mine.length > 0) parts.push(`Yours: ${mine.slice(0, shown).join("; ")}.`);
-  if (shown > mine.length) parts.push(`Others': ${others.slice(0, shown - mine.length).join("; ")}.`);
-  if (shown < claims.length) parts.push(`${claims.length - shown} more; claim_list().`);
-  return [`Active claims when this session started. ${parts.join(" ")} Respect them; claim_list shows the current state.`];
+  if (shown > mine.length) parts.push(`Others': ${others.slice(0, shown - mine.length).join(", ")}.`);
+  if (shown < claims.length) parts.push(`${claims.length - shown} more.`);
+  return [`Active claims when this session started. ${parts.join(" ")} Respect them; claim_list shows holders and the current state.`];
 }
 
 // Only when the bus has a declared human handle (`grayboard human`), so buses
@@ -295,7 +296,7 @@ export function callBoardTool(
     }
 
     case "board_post": {
-      const { post: p, wake, unresolved } = post(
+      const { post: p, wake, deferred, unresolved } = post(
         db,
         handle,
         str(a, "board"),
@@ -304,7 +305,13 @@ export function callBoardTool(
         { online: ctx.online },
       );
       return {
-        result: { post_id: p.id, board: p.board, notified: wake.filter((h) => !isViewer(h)), ...(unresolved.length ? { unresolved } : {}) },
+        result: {
+          post_id: p.id,
+          board: p.board,
+          notified: wake.filter((h) => !isViewer(h)),
+          ...(deferred.length ? { deferred } : {}),
+          ...(unresolved.length ? { unresolved } : {}),
+        },
         wake,
       };
     }
@@ -384,6 +391,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       created_at: String(p.created_at),
     };
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
+    if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);

@@ -42,8 +42,9 @@ beforeEach(() => {
   createBoard(db, "be", "#e2e", "End-to-end fixtures and runs");
 });
 
-const drain = (h: string) => {
-  const items = pendingFor(db, h);
+// all: as a session's first drain does, bringing deferred pushes and digests.
+const drain = (h: string, all = false) => {
+  const items = pendingFor(db, h, { all });
   for (const i of items) markDelivered(db, h, i);
   return items;
 };
@@ -132,19 +133,19 @@ test("digest coalesces until the reader catches up", () => {
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "one");
   post(db, "be", "e2e", "two");
-  const first = drain("sim");
+  const first = drain("sim", true);
   expect(first).toHaveLength(1);
   expect(first[0]).toMatchObject({ kind: "digest", unread: 2 });
 
   post(db, "be", "e2e", "three");
-  expect(drain("sim")).toEqual([]); // suppressed: not caught up yet
+  expect(drain("sim", true)).toEqual([]); // suppressed: not caught up yet
 
   const r = read(db, "sim", "e2e");
   expect(r.posts.map((p) => p.body)).toEqual(["one", "two", "three"]);
   expect(r.unread_remaining).toBe(0);
 
   post(db, "be", "e2e", "four");
-  expect(drain("sim")).toMatchObject([{ kind: "digest", unread: 1 }]); // re-armed
+  expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1 }]); // re-armed
 });
 
 test("posting does not mark others' unread posts as read", () => {
@@ -153,7 +154,7 @@ test("posting does not mark others' unread posts as read", () => {
   post(db, "be", "e2e", "two");
   post(db, "sim", "e2e", "reply without reading");
   expect(listBoards(db, "sim")[0]!.unread).toBe(2);
-  expect(drain("sim")).toMatchObject([{ kind: "digest", unread: 2 }]);
+  expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 2 }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
 
@@ -163,7 +164,7 @@ test("a mention doesn't also count toward the mentioned subscriber's digest", ()
   expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention" }]);
   expect(listBoards(db, "sim")[0]!.unread).toBe(0);
   post(db, "be", "e2e", "unrelated");
-  expect(drain("sim")).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
+  expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
 });
 
@@ -180,15 +181,57 @@ test("mentions push to known handles even without a subscription", () => {
   expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
 });
 
-test("thread participants are pushed on replies", () => {
+test("a reply wakes the post's author and the thread's starter; other participants wait", () => {
   const root = post(db, "sim", "e2e", "question").post;
-  post(db, "fe", "e2e", "me too", root.id);
+  const mid = post(db, "fe", "e2e", "me too", root.id).post;
+  subscribe(db, "be", "e2e", "off"); // be created the board, so it's push-subscribed
+  post(db, "be", "e2e", "noted", mid.id);
   drain("be");
   drain("sim");
-  const reply = post(db, "be", "e2e", "answer", root.id);
-  expect(reply.wake.sort()).toEqual(["fe", "sim"]);
-  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "thread" }]);
-  expect(read(db, "fe", "e2e", { thread: reply.post.id }).posts).toHaveLength(3);
+  drain("fe");
+  const reply = post(db, "sim", "e2e", "answer", mid.id);
+  expect(reply.wake).toEqual(["fe"]);
+  expect(reply.deferred).toEqual(["be"]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "thread" }]);
+  // The deferred push never wakes be alone, but rides along with one that does.
+  expect(drain("be")).toEqual([]);
+  post(db, "fe", "e2e", "@be ping");
+  const items = drain("be");
+  expect(items.map((i) => i.kind === "push" && [i.post.body, i.deferred ?? false])).toEqual([
+    ["answer", true],
+    ["@be ping", false],
+  ]);
+  expect(drain("be")).toEqual([]);
+  expect(read(db, "fe", "e2e", { thread: reply.post.id }).posts).toHaveLength(4);
+});
+
+test("a deferred push shows as unread, and reading the board delivers it", () => {
+  const root = post(db, "sim", "e2e", "question").post;
+  const mid = post(db, "fe", "e2e", "me too", root.id).post;
+  subscribe(db, "be", "e2e", "quiet"); // from push: be created the board
+  post(db, "be", "e2e", "noted", root.id);
+  drain("sim");
+  drain("fe");
+  expect(post(db, "fe", "e2e", "answer", mid.id).deferred).toEqual(["be"]);
+  expect(listBoards(db, "be")[0]!.unread).toBe(1);
+  expect(read(db, "be", "e2e").posts.map((p) => p.body)).toEqual(["answer"]);
+  expect(drain("be", true)).toEqual([]);
+});
+
+test("digest subscribers aren't woken; the notice rides with the next wake", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  expect(post(db, "be", "e2e", "one").wake).not.toContain("sim");
+  expect(drain("sim")).toEqual([]);
+  post(db, "be", "e2e", "@sim look");
+  expect(drain("sim").map((i) => i.kind)).toEqual(["push", "digest"]);
+});
+
+test("your user's reply in a thread wakes every participant", () => {
+  declareHuman(db, "alex");
+  const root = post(db, "sim", "e2e", "question").post;
+  const mid = post(db, "fe", "e2e", "me too", root.id).post;
+  post(db, "be", "e2e", "same", mid.id);
+  expect(post(db, "alex", "e2e", "decision: ship it", mid.id).wake.sort()).toEqual(["be", "fe", "sim"]);
 });
 
 test("a muted thread stops pushing replies, but @mentions still land", () => {
@@ -207,7 +250,7 @@ test("a muted thread stops pushing replies, but @mentions still land", () => {
   post(db, "fe", "e2e", "still here", root.id);
   expect(post(db, "sim", "e2e", "routine 2", root.id).wake).toEqual([]);
   callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "push", thread: root.id });
-  expect(post(db, "sim", "e2e", "routine 3", root.id).wake).toEqual(["fe"]);
+  expect(post(db, "sim", "e2e", "routine 3", root.id).deferred).toEqual(["fe"]);
   // The board's own mode is untouched, and other threads still push.
   expect(listBoards(db, "be").find((b) => b.name === "e2e")?.mode).toBe("push");
   expect(post(db, "sim", "e2e", "new topic").wake).toEqual(["be"]);
@@ -379,7 +422,7 @@ test("the session-start claims list puts the session's own first and stays bound
 
   const [few] = claimsInstruction([c("a", "fe", "theirs"), c("b", "be", "mine")], "be");
   expect(few).toBe(
-    "Active claims when this session started. Yours: b (until 2026-10-21T21:00Z: mine). Others': a (fe, until 2026-10-21T21:00Z). Respect them; claim_list shows the current state.",
+    "Active claims when this session started. Yours: b (until 2026-10-21T21:00Z: mine). Others': a. Respect them; claim_list shows holders and the current state.",
   );
 
   // Worst case: long notes on the session's own, and far too many others.
@@ -389,11 +432,12 @@ test("the session-start claims list puts the session's own first and stays bound
   ];
   const [big] = claimsInstruction(many, "be");
   expect(big!.length).toBeLessThan(1400);
+  expect(big).not.toContain("be-throughput");
   expect(big).toStartWith("Active claims when this session started. Yours: ticket:ENG-0 ");
   expect(big).toContain(`(until 2026-10-21T21:00Z: ${"x".repeat(150)}…)`);
-  expect(big).toContain("ticket:ENG-1000 (be-throughput, until");
-  expect(big).toMatch(/ \d+ more; claim_list\(\)\. Respect them/);
-  const listed = (big!.match(/ticket:ENG-\d+ \(/g) ?? []).length;
+  expect(big).toContain("Others': ticket:ENG-1000, ticket:ENG-1001,");
+  expect(big).toMatch(/ \d+ more\. Respect them/);
+  const listed = (big!.match(/ticket:ENG-\d+/g) ?? []).length;
   expect(Number(big!.match(/(\d+) more/)![1]) + listed).toBe(53);
 });
 
@@ -544,7 +588,7 @@ describe("with a scoped access policy", () => {
       expect(pendingFor(db, "sim")).toEqual([]);
       members.add("sim");
       // The push was acknowledged while hidden; only the digest remains.
-      expect(pendingFor(db, "sim").map((i) => i.kind)).toEqual(["digest"]);
+      expect(pendingFor(db, "sim", { all: true }).map((i) => i.kind)).toEqual(["digest"]);
     } finally {
       members.add("sim");
     }

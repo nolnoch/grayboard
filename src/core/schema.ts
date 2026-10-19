@@ -105,6 +105,11 @@ export function initCoreSchema(db: Database): void {
   const postCols = db.prepare(`PRAGMA table_info(posts)`).all() as { name: string }[];
   if (!postCols.some((c) => c.name === "expires_at")) db.exec(`ALTER TABLE posts ADD COLUMN expires_at INTEGER`);
 
+  // Whether a push wakes its recipient (1), or waits to ride along with the
+  // next push that does (0): a thread reply to a bystander.
+  const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
+  if (!outboxCols.some((c) => c.name === "wake")) db.exec(`ALTER TABLE outbox ADD COLUMN wake INTEGER NOT NULL DEFAULT 1`);
+
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === "scope")) db.exec(`ALTER TABLE boards ADD COLUMN scope TEXT`);
