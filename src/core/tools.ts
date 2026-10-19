@@ -132,12 +132,12 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "claim_take",
       description:
-        'claim_take(key, ttl_minutes? | until?, note?, board?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead.',
+        'claim_take(key, ttl_minutes? | until?, note?, board?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
       inputSchema: {
         type: "object",
         properties: {
           key: { type: "string" },
-          ttl_minutes: { type: "number", description: "Default 30, max 10080 (7 days). Renew before it lapses." },
+          ttl_minutes: { type: "number", description: "Default 30, max 10080 (7 days); a renewal without it or until keeps the current expiry if later. Renew before it lapses." },
           until: {
             type: "string",
             description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.',
@@ -163,7 +163,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "claim_watch",
       description:
-        "claim_watch(key, off?): be @mentioned when someone else's claim is released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+        "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
       inputSchema: {
         type: "object",
         properties: {

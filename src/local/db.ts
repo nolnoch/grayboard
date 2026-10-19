@@ -9,6 +9,7 @@ export type Message = {
   body: string;
   parent_id: number | null;
   created_at: number;
+  pending: number;
 };
 
 export function insertMessage(
@@ -16,14 +17,15 @@ export function insertMessage(
   recipient: string,
   body: string,
   parent_id: number | null,
+  pending = false,
 ): number {
   const now = Date.now();
   const { lastInsertRowid } = db
     .prepare(
-      `INSERT INTO messages (sender, recipient, body, parent_id, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     )
-    .run(sender, recipient, body, parent_id, now);
+    .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
   return Number(lastInsertRowid);
 }
 
@@ -153,6 +155,18 @@ export function receivedUnacked(reader: string, since: number): Message[] {
         ORDER BY m.id ASC`,
     )
     .all(reader, since) as Message[];
+}
+
+// Messages `sender` sent pending since `since` that it hasn't acked, oldest first.
+export function sentPending(sender: string, since: number): Message[] {
+  return db
+    .prepare(
+      `SELECT * FROM messages m
+        WHERE m.sender = ? AND m.pending = 1 AND m.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+        ORDER BY m.id ASC`,
+    )
+    .all(sender, since) as Message[];
 }
 
 // Deletes a message `sender` sent that the recipient's session hasn't received

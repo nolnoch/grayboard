@@ -29,6 +29,7 @@ import {
   insertMessage,
   receivedUnacked,
   retractMessage,
+  sentPending,
   setCursor,
   undeliveredFrom,
   type Message,
@@ -42,12 +43,16 @@ import {
   DM_INBOX_INSTRUCTION,
   DM_INBOX_TOOL,
   DM_RETRACT_TOOL,
+  PENDING_PARAM,
+  PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
   inboxDays,
+  promised,
   queuedNote,
   retractRefusal,
+  showPending,
   unanswered,
   undeliveredInstruction,
 } from "../shared/inbox.ts";
@@ -109,7 +114,7 @@ const TOOLS = [
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
-    description: `dm_send(to, body, parent_id?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+    description: `dm_send(to, body, parent_id?, pending?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -126,6 +131,7 @@ const TOOLS = [
           description:
             "Optional. message_id this is replying to; sets the thread parent.",
         },
+        pending: PENDING_PARAM,
       },
       required: ["to", "body"],
     },
@@ -232,10 +238,11 @@ const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDEN
 
 async function dispatch(name: string, a: Record<string, any>) {
   if (name === "dm_send") {
-    const { to: recipient, body, parent_id } = a as {
+    const { to: recipient, body, parent_id, pending } = a as {
       to: string;
       body: string;
       parent_id?: number;
+      pending?: boolean;
     };
     if (!rosterHandles(db).includes(recipient)) {
       return {
@@ -249,13 +256,15 @@ async function dispatch(name: string, a: Record<string, any>) {
         isError: true,
       };
     }
-    const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null);
+    const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
+    const p = pending ? { pending: true } : {};
     const delivered = await poke(recipient);
-    if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, note: "Recipient was online; pushed." }));
+    if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
     return text(JSON.stringify({
       message_id: id,
       delivered_now: false,
+      ...p,
       note: queuedNote(recipient, seen),
       ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
       undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === recipient)?.n ?? 1,
@@ -264,24 +273,29 @@ async function dispatch(name: string, a: Record<string, any>) {
 
   if (name === "dm_history") {
     const lim = Math.min(Math.max(a.limit ?? 20, 1), 200);
-    return text(getHistory(IDENTITY, a.peer, lim, a.before_id));
+    return text(getHistory(IDENTITY, a.peer, lim, a.before_id).map(showPending));
   }
 
   if (name === "dm_thread") {
     if (!mine(getMessage(a.thread))) {
       return { ...text(`error: message ${a.thread} not found`), isError: true };
     }
-    return text(getThread(a.thread).filter(mine));
+    return text(getThread(a.thread).filter(mine).map(showPending));
   }
 
   if (name === "dm_inbox") {
     const since = Date.now() - inboxDays(a.days) * 86_400_000;
     const owed = unanswered(IDENTITY, receivedUnacked(IDENTITY, since), getThread);
+    const promises = promised(IDENTITY, sentPending(IDENTITY, Date.now() - PROMISE_DAYS * 86_400_000), getThread);
     const queued = undeliveredFrom(IDENTITY).map((u) => {
       const seen = lastSeen(db, u.recipient);
       return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
     });
-    return text({ unanswered: owed, ...(queued.length ? { undelivered_from_you: queued } : {}) });
+    return text({
+      unanswered: owed,
+      ...(promises.length ? { promised: promises } : {}),
+      ...(queued.length ? { undelivered_from_you: queued } : {}),
+    });
   }
 
   if (name === "dm_ack") {
@@ -290,7 +304,7 @@ async function dispatch(name: string, a: Record<string, any>) {
     const acked: number[] = [], missing: number[] = [];
     for (const id of ids) {
       const m = getMessage(id);
-      if (m && m.recipient === IDENTITY) { ackMessage(IDENTITY, id); acked.push(id); } else missing.push(id);
+      if (m && (m.recipient === IDENTITY || (m.sender === IDENTITY && m.pending))) { ackMessage(IDENTITY, id); acked.push(id); } else missing.push(id);
     }
     const r = ackResult(acked, missing);
     return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };

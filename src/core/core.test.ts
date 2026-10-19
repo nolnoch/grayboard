@@ -315,6 +315,29 @@ test("a claim's watchers are mentioned on its release or expiry, in any mode, on
   expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_watches`).get()).toEqual({ n: 0 });
 });
 
+test("a renewal keeps a long claim's expiry and pushes a changed note to watchers", () => {
+  subscribe(db, "sim", "e2e", "quiet"); // fe has no subscription at all
+  const until = new Date(Date.now() + 3 * 24 * 3600_000).toISOString();
+  claim(db, "be", "rollout", { until, note: "step 1", board: "e2e" });
+  watch(db, "fe", "rollout");
+  drain("sim");
+
+  const r = claim(db, "be", "rollout", { note: "step 2: canary up" });
+  expect(r.ok && r.claim.expires_at).toBe(Date.parse(until));
+  expect(r.wake).toEqual(["fe"]);
+  expect(drain("fe")).toMatchObject([{ reason: "mention", post: { body: "[update] rollout — step 2: canary up cc @fe" } }]);
+  expect(drain("sim")).toEqual([]);
+
+  // The same note again is a plain renewal: silent. Watchers stay for the end.
+  expect(claim(db, "be", "rollout", { note: "step 2: canary up" }).wake).toEqual([]);
+  expect(release(db, "be", "rollout").wake).toContain("fe");
+
+  // An explicit ttl still sets the expiry, shorter or not.
+  claim(db, "be", "short", { until });
+  const s = claim(db, "be", "short", { ttl_minutes: 10 });
+  expect(s.ok && s.claim.expires_at - Date.now()).toBeLessThan(11 * 60_000);
+});
+
 test("the expiry timer fires at the next lapse without anyone asking", async () => {
   subscribe(db, "sim", "e2e", "push");
   const woken: string[][] = [];

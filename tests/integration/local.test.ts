@@ -183,7 +183,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?): missing to; unknown recipient.",
   );
 }, 20_000);
 
@@ -240,6 +240,28 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
   expect(be.getInstructions()).toContain("dm_inbox()");
 }, 20_000);
 
+test("dm_send pending lists a promise in dm_inbox until your next message in the thread, or a dm_ack", async () => {
+  const be = await start("be");
+  const fe = await start("fe");
+  const q = await call(fe, "dm_send", { to: "be", body: "can you check the soak?" });
+  const p = await call(be, "dm_send", { to: "fe", body: "on it, results by noon", parent_id: q.message_id, pending: true });
+  expect(p).toMatchObject({ pending: true });
+  expect((await call(be, "dm_inbox", { days: 1 })).promised).toMatchObject([{ id: p.message_id, to: "fe", parent_id: q.message_id, body: "on it, results by noon" }]);
+  // Their reply doesn't keep it; yours does. History marks only the pending one.
+  await call(fe, "dm_send", { to: "be", body: "thanks", parent_id: p.message_id });
+  expect((await call(be, "dm_inbox")).promised).toHaveLength(1);
+  expect((await call(be, "dm_thread", { thread: q.message_id })).map((m: any) => m.pending)).toEqual([undefined, true, undefined]);
+  await call(be, "dm_send", { to: "fe", body: "soak passed", parent_id: p.message_id });
+  expect((await call(be, "dm_inbox")).promised).toBeUndefined();
+
+  // dm_ack drops your own promise; it still can't ack your other sends.
+  const p2 = await call(be, "dm_send", { to: "fe", body: "will follow up", pending: true });
+  await expect(call(fe, "dm_ack", { message_id: [p2.message_id] })).resolves.toBe("ok");
+  expect((await call(be, "dm_inbox")).promised).toHaveLength(1);
+  expect(await call(be, "dm_ack", { message_id: p2.message_id })).toBe("ok");
+  expect((await call(be, "dm_inbox")).promised).toBeUndefined();
+}, 20_000);
+
 test("dm_ack takes a list, so one combined reply clears every message it covered", async () => {
   const be = await start("be");
   const fe = await start("fe");
@@ -279,6 +301,17 @@ test("a send to a long-idle handle says so; dm_retract withdraws it until it's d
   await Bun.sleep(500);
   expect(fe.pushes).toEqual(["first", "also"]);
   await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
+}, 20_000);
+
+test("identity create --mcp names a missing directory instead of failing with ENOENT", async () => {
+  const create = async (path: string) => {
+    const p = Bun.spawn([process.execPath, CLI, "identity", "create", "be", "--mcp", path], { cwd: dir, env: busEnv(), stdout: "pipe", stderr: "pipe" });
+    return { code: await p.exited, err: await new Response(p.stderr).text() };
+  };
+  const bad = await create("nope/.mcp.json");
+  expect(bad.code).toBe(1);
+  expect(bad.err).toMatch(/directory \S*\/nope doesn't exist/);
+  expect((await create(".mcp.json")).code).toBe(0);
 }, 20_000);
 
 test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {

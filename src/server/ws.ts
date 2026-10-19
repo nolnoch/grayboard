@@ -22,7 +22,9 @@ import {
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
-import { STALE_UNDELIVERED_MS, inboxDays, queuedNote, retractRefusal, unanswered, undeliveredInstruction } from "../shared/inbox.ts";
+import {
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+} from "../shared/inbox.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -165,7 +167,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           err(ws, msg.req_id, "bad_request", "already authenticated");
           break;
         case "send":
-          handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null);
+          handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
           break;
         case "history":
           handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -181,8 +183,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           break;
         case "dm_ack": {
           const m = repo.messages.getById(msg.message_id);
-          if (!m || m.recipient_type !== "user" || m.recipient !== ws.data.identityFull) {
-            err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you; dm_inbox lists them`);
+          const me = ws.data.identityFull;
+          if (!m || m.recipient_type !== "user" || !(m.recipient === me || (m.sender === me && m.pending))) {
+            err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you or pending from you; dm_inbox lists them`);
             break;
           }
           repo.messages.ack(ws.data.identityFull, m.id);
@@ -312,7 +315,7 @@ async function handleHello(
   // Direct messages since the cursor (unacked ones are resent), then boards.
   const since = repo.cursors.get(identity.id, "direct", full);
   for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
-    send(ws, { type: "push", message });
+    send(ws, { type: "push", message: showPending(message) });
   }
   drainBoards(ws, db);
 }
@@ -324,6 +327,7 @@ function handleSend(
   recipientStr: string,
   body: string,
   parentId: number | null,
+  pending: boolean,
 ): void {
   const { repo, db, registry } = hub;
   if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
@@ -392,17 +396,18 @@ function handleSend(
     return;
   }
 
-  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId);
+  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending);
+  const p = pending ? { pending: true as const } : {};
 
   let deliveredNow = false;
   const recipientWs = registry.get(parsed.full);
   if (recipientWs?.data.ready) {
-    send(recipientWs, { type: "push", message: msg });
+    send(recipientWs, { type: "push", message: showPending(msg) });
     deliveredNow = true;
   }
 
   if (deliveredNow) {
-    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true });
+    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p });
     return;
   }
   const seen = lastSeen(db, parsed.full);
@@ -411,6 +416,7 @@ function handleSend(
     req_id: reqId,
     message_id: msg.id,
     delivered_now: false,
+    ...p,
     ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
     undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
     note: queuedNote(parsed.full, seen),
@@ -475,7 +481,7 @@ function handleHistory(
   const messages = repo.messages.history(me, peer, limit, beforeId).map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
-  send(ws, { type: "history_ok", req_id: reqId, messages });
+  send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showPending) });
 }
 
 function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined): void {
@@ -488,11 +494,18 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
   const owed = unanswered(me, repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
+  const promises = promised(me, repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(me).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
   });
-  send(ws, { type: "inbox_ok", req_id: reqId, unanswered: owed, ...(queued.length ? { undelivered_from_you: queued } : {}) });
+  send(ws, {
+    type: "inbox_ok",
+    req_id: reqId,
+    unanswered: owed,
+    ...(promises.length ? { promised: promises } : {}),
+    ...(queued.length ? { undelivered_from_you: queued } : {}),
+  });
 }
 
 // Only a message's sender and recipient can see it, or thread from it. A
@@ -508,7 +521,7 @@ function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): voi
     return;
   }
   const messages = repo.messages.thread(messageId).filter((m) => participant(m, me));
-  send(ws, { type: "thread_ok", req_id: reqId, messages });
+  send(ws, { type: "thread_ok", req_id: reqId, messages: messages.map(showPending) });
 }
 
 function handleAck(ws: Ws, reqId: string, messageIds: number[], repo: Repo): void {

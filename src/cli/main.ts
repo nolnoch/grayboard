@@ -534,6 +534,11 @@ identityCmd
   .option("--force",       "Overwrite entire .mcp.json instead of merging")
   .action(async (name: string, opts: { mcp?: string | boolean; force?: boolean }) => {
     const mcpPath = opts.mcp === undefined ? null : opts.mcp === true ? "./.mcp.json" : opts.mcp;
+    // Before anything is created, so a typo'd path isn't an ENOENT after the fact.
+    if (mcpPath && !existsSync(dirname(resolve(mcpPath)))) {
+      console.error(`--mcp ${mcpPath}: directory ${dirname(resolve(mcpPath))} doesn't exist`);
+      process.exit(1);
+    }
     if (busMode() === "local") {
       if (!mcpPath) {
         console.error("Local mode has no identities to reserve. Use --mcp to name this repo's sessions.");
@@ -630,11 +635,10 @@ const adminCmd = program
 
 adminCmd
   .command("revoke-session")
-  .description("Revoke session(s) for a user")
+  .description("Revoke every session a user has, signing them out everywhere")
   .requiredOption("--email <email>", "Target user email")
-  .option("--all", "Revoke all sessions (default: true for v1)")
-  .action(async (opts: { email: string; all?: boolean }) => {
-    try { output(await makeClient().post("/api/admin/revoke-session", { email: opts.email, all: true }), globalJson()); }
+  .action(async (opts: { email: string }) => {
+    try { output(await makeClient().post("/api/admin/revoke-session", { email: opts.email }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 

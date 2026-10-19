@@ -1,34 +1,55 @@
 import { CoreError, age } from "../core/boards.ts";
 
-type Msg = { id: number; sender: string; body: string; parent_id: number | null; created_at: number };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number };
 
 export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string };
+export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
+// Promises don't age out with the days argument; they stay until kept or acked.
+export const PROMISE_DAYS = MAX_INBOX_DAYS;
 const SNIPPET = 300;
 
-// Received messages still owed an answer: no later message from `me` in the
-// same thread. Candidates are already windowed and filtered of acks.
-export function unanswered(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
+// Candidates with no later message from `me` in the same thread.
+function lastWord<M extends Msg>(me: string, candidates: M[], threadOf: (id: number) => Msg[]): M[] {
   const threadById = new Map<number, Msg[]>();
-  const out: InboxItem[] = [];
-  for (const m of candidates) {
+  return candidates.filter((m) => {
     let t = threadById.get(m.id);
     if (!t) {
       t = threadOf(m.id);
       for (const x of t) threadById.set(x.id, t);
     }
-    if (t.some((x) => x.sender === me && x.id > m.id)) continue;
-    out.push({
-      id: m.id,
-      from: m.sender,
-      ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
-      age: age(now - m.created_at),
-      body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
-    });
-  }
-  return out;
+    return !t.some((x) => x.sender === me && x.id > m.id);
+  });
+}
+
+function item(m: Msg, now: number) {
+  return {
+    ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
+    age: age(now - m.created_at),
+    body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
+  };
+}
+
+// Received messages still owed an answer: no later message from `me` in the
+// same thread. Candidates are already windowed and filtered of acks.
+export function unanswered(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
+  return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, from: m.sender, ...item(m, now) }));
+}
+
+// Messages `me` sent pending that are still its latest in their thread: a
+// follow-up it promised. Candidates are `me`'s pending sends, windowed by
+// PROMISE_DAYS and filtered of its own acks.
+export function promised(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): PromiseItem[] {
+  return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, to: m.recipient, ...item(m, now) }));
+}
+
+// pending is stored as 0/1; rows show it only when set, so history and
+// threads don't pay for it on every message.
+export function showPending<M extends { pending: number | boolean }>(m: M): Omit<M, "pending"> & { pending?: true } {
+  const { pending, ...rest } = m;
+  return pending ? { ...rest, pending: true } : rest;
 }
 
 export function inboxDays(days: unknown): number {
@@ -40,23 +61,29 @@ export function inboxDays(days: unknown): number {
 }
 
 export const DM_INBOX_INSTRUCTION =
-  `Pushes don't survive /clear: after one, or a restart, dm_inbox() lists direct messages you haven't answered or acked.`;
+  `Pushes don't survive /clear: after one, or a restart, dm_inbox() lists direct messages you haven't answered or acked, and follow-ups you promised.`;
 
 export const DM_INBOX_TOOL = {
   name: "dm_inbox",
   _meta: { "anthropic/alwaysLoad": true },
   description:
-    `dm_inbox(days?): direct messages to you from the last days (default ${INBOX_DAYS}) with no later message from you in their thread and no dm_ack, plus your messages still queued for offline peers. Use after /clear to see what you owe.`,
+    `dm_inbox(days?): direct messages to you from the last days (default ${INBOX_DAYS}) with no later message from you in their thread and no dm_ack, plus your messages still queued for offline peers, plus follow-ups you promised (sent pending; from the last ${PROMISE_DAYS} days, ignoring days). Use after /clear to see what you owe.`,
   inputSchema: {
     type: "object",
     properties: { days: { type: "number", description: `Look back this many days (default ${INBOX_DAYS}, max ${MAX_INBOX_DAYS}).` } },
   },
 };
 
+// dm_send's pending parameter, the same in both modes.
+export const PENDING_PARAM = {
+  type: "boolean",
+  description: "Optional. true: you owe them a follow-up. dm_inbox lists it under promised until your next message in the thread.",
+};
+
 export const DM_ACK_TOOL = {
   name: "dm_ack",
   _meta: { "anthropic/alwaysLoad": true },
-  description: "dm_ack(message_id): mark direct messages to you handled without a reply in their thread (an FYI, or ones a combined reply covered), so dm_inbox drops them.",
+  description: "dm_ack(message_id): mark direct messages to you handled without a reply in their thread (an FYI, or ones a combined reply covered), so dm_inbox drops them; or a pending message you sent, to drop that promise.",
   inputSchema: {
     type: "object",
     properties: {
@@ -80,7 +107,7 @@ export function ackIds(arg: unknown): number[] | null {
 // failing only when nothing was.
 export function ackResult(acked: number[], missing: number[]): { text: string; isError: boolean } {
   if (!missing.length) return { text: "ok", isError: false };
-  const why = `no message ${missing.join(", ")} to you; dm_inbox lists them`;
+  const why = `no message ${missing.join(", ")} to you or pending from you; dm_inbox lists them`;
   return acked.length
     ? { text: JSON.stringify({ acked, not_found: missing, note: why }), isError: false }
     : { text: `error: ${why}`, isError: true };

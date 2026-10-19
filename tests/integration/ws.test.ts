@@ -375,6 +375,20 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
 });
 
+test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const root = await login("root@example.com");
+  for (const all of [false, true, undefined]) {
+    const laptop = await login("bob@example.com");
+    const desktop = await login("bob@example.com");
+    expect((await api(root, "POST", "/api/admin/revoke-session", { email: "bob@example.com", ...(all !== undefined ? { all } : {}) })).status).toBe(200);
+    expect((await api(laptop, "GET", "/api/whoami")).status).toBe(401);
+    expect((await api(desktop, "GET", "/api/whoami")).status).toBe(401);
+  }
+});
+
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
   app.stop();
   app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
@@ -581,6 +595,35 @@ test("dm_inbox: replied and acked messages drop out; only the recipient can ack"
   expect(await b.request({ type: "dm_ack", message_id: fyi.message_id })).toMatchObject({ type: "error", code: "not_found" });
   expect(await a.request({ type: "dm_ack", message_id: fyi.message_id })).toMatchObject({ type: "ack_ok" });
   expect(await inbox()).toEqual([]);
+});
+
+test("a pending send is echoed, listed as promised until the sender's next message, and ackable by the sender", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  await a.connect();
+  await b.connect();
+  const p = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "results by noon", pending: true });
+  expect(p).toMatchObject({ type: "send_ok", pending: true });
+  const plain = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fyi" });
+  expect(plain.pending).toBeUndefined();
+  const promises = async () => (await a.request({ type: "inbox", days: 1 })).promised?.map((m: any) => m.id);
+  expect(await promises()).toEqual([p.message_id]);
+  // History is newest first; only the pending row says so.
+  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([undefined, true]);
+
+  // Bob's reply doesn't keep it, and his ack (as its recipient) doesn't drop it.
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "thanks", parent_id: p.message_id });
+  expect(await b.request({ type: "dm_ack", message_id: p.message_id })).toMatchObject({ type: "ack_ok" });
+  expect(await promises()).toEqual([p.message_id]);
+  await a.request({ type: "send", recipient: "bob@example.com/fe", body: "done", parent_id: p.message_id });
+  expect(await promises()).toBeUndefined();
+
+  const p2 = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "later", pending: true });
+  expect(await a.request({ type: "dm_ack", message_id: plain.message_id })).toMatchObject({ type: "error", code: "not_found" });
+  expect(await a.request({ type: "dm_ack", message_id: p2.message_id })).toMatchObject({ type: "ack_ok" });
+  expect(await promises()).toBeUndefined();
 });
 
 test("only a message's sender and recipient can read its thread or reply to it", async () => {
