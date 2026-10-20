@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { startServer } from "../../src/server/app.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
+import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -214,6 +215,16 @@ test("a refused token says to sign in again: at startup, in a running session's 
   expect(await new Response(p.stderr).text()).toContain(
     `Error (unauthenticated): your sign-in isn't valid on ${base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${base}`,
   );
+}, 20_000);
+
+test("a hello the server refuses exits at once with its reason, not a timeout (#74)", async () => {
+  const token = await login("alice@example.com");
+  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: "human" } as Record<string, string>;
+  const t0 = Date.now();
+  const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], { env, stdin: "pipe", stdout: "ignore", stderr: "pipe" });
+  expect(await p.exited).toBe(1);
+  expect(Date.now() - t0).toBeLessThan(5000);
+  expect(await new Response(p.stderr).text()).toContain(HUMAN_RESERVED);
 }, 20_000);
 
 test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () => {

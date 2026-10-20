@@ -21,6 +21,7 @@ export class GrayboardClient {
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
   private wasReady  = false; // a later hello is a reconnect, not a new session
+  private helloId   = "";    // the req_id of this connection's hello
   private readyResolvers: Array<(err?: Error) => void> = [];
 
   constructor(
@@ -61,8 +62,9 @@ export class GrayboardClient {
       this.backoffMs = 1000; // reset backoff on success
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
+      this.helloId = this.nextId();
       this.send({
-        type: "hello", req_id: this.nextId(), identity: this.identity,
+        type: "hello", req_id: this.helloId, identity: this.identity,
         ...(this.push ? {} : { push: false }),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : {}),
@@ -139,14 +141,17 @@ export class GrayboardClient {
           console.error("[grayboard] connection superseded by a newer session — exiting");
           process.exit(1);
         }
-        if (msg.code === "identity_in_use") {
-          // Another live session holds this identity. Don't retry.
+        // The server refused the hello itself (e.g. a reserved or invalid
+        // name): retrying gets the same answer, so give up with its reason (#74).
+        const helloRefused = !this.helloData && msg.req_id === this.helloId && msg.code === "bad_request";
+        if (msg.code === "identity_in_use" || helloRefused) {
+          // Another live session holds this identity, or can't have it. Don't retry.
           this.dead = true;
           if (this.readyResolvers.length) {
             const err = new Error(msg.message);
             for (const r of this.readyResolvers.splice(0)) r(err);
           } else {
-            // Lost it while reconnecting: the other session owns it now.
+            // Refused while reconnecting: e.g. another session owns it now.
             console.error(`[grayboard] ${msg.message} — exiting`);
             process.exit(1);
           }
