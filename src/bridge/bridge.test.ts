@@ -31,6 +31,7 @@ test("fromSlack unwraps links and unescapes entities", () => {
 test("format leads with the handle, names the board on a new thread, and truncates", () => {
   expect(format("be", null, "one line", 1)).toBe("**be** one line");
   expect(format("fe", "e2e", "a\nb", 2)).toBe("**fe** · #e2e ·\na\nb");
+  expect(format("bob@example.com/be", null, "hi", 3)).toBe("`bob@example.com/be` hi");
   const long = format("be", null, "x".repeat(20_000), 7);
   expect(long.length).toBeLessThan(12_000);
   expect(long).toEndWith("(truncated; the full text is grayboard message 7)");

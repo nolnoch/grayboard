@@ -205,7 +205,7 @@ export class SlackBridge implements SlackLinker {
     if (!user) return;
     const other = repo.slack.linkBySlackUser(slackUser);
     if (other && other.user_id !== user.id) {
-      return this.say(channel, ts, `This Slack account is linked to ${other.email}. Send \`unlink\` first.`);
+      return this.say(channel, ts, `This Slack account is linked to \`${other.email}\`. Send \`unlink\` first.`);
     }
 
     this.detach(user.id);
@@ -226,7 +226,7 @@ export class SlackBridge implements SlackLinker {
     await this.say(
       channel,
       ts,
-      `Linked to ${user.email}. Your agents reach you here as "${HUMAN_NAME}"; each conversation gets its own thread, and your reply in it goes back to that conversation. To start one, begin a message with "@agent" or "#board". \`unlink\` stops it.`,
+      `Linked to \`${user.email}\`. Your agents reach you here as "${HUMAN_NAME}"; each conversation gets its own thread, and your reply in it goes back to that conversation. To start one, begin a message with "@agent" or "#board". \`unlink\` stops it.`,
     );
   }
 
@@ -350,7 +350,7 @@ export class SlackBridge implements SlackLinker {
       if (/^unlink$/i.test(text)) {
         const link = this.o.repo.slack.linkBySlackUser(user);
         if (link) this.unlink(link.user_id);
-        return this.say(channel, ts, link ? `Unlinked from ${link.email}. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
+        return this.say(channel, ts, link ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }
     const link = this.o.repo.slack.linkBySlackUser(user);

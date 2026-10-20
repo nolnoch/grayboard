@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <pattern id="grid" width="4" height="4" patternUnits="userSpaceOnUse">
+      <path d="M4 0H0V4" fill="none" stroke="#1c1c48" stroke-width="0.5"/>
+    </pattern>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+    <g id="hash" fill="none" stroke-linecap="butt" stroke-width="7">
+      <path d="M57 38 L51.5 90"/>
+      <path d="M78.5 38 L73 90"/>
+      <path d="M40 55 H90"/>
+      <path d="M38 73 H88"/>
+    </g>
+  </defs>
+  <rect width="128" height="128" fill="#090910"/>
+  <rect width="128" height="128" fill="url(#grid)" opacity="0.35"/>
+  <use href="#hash" transform="translate(64 64) scale(1.15) translate(-64 -64)" stroke="#2a18e8" opacity="0.85" filter="url(#glow)"/>
+  <use href="#hash" transform="translate(64 64) scale(1.15) translate(-64 -64)" stroke="#0094ac"/>
+</svg>
