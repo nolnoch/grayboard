@@ -111,7 +111,7 @@ async function link(token: string): Promise<void> {
   expect(r.status).toBe(200);
   expect(r.body).toMatchObject({ expires_in_s: 600, linked: false });
   slack.say(`link ${r.body.code}`);
-  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to alice@example.com")));
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 }
 
 test("link, then an agent's DM to human is a Slack thread whose reply comes back marked human", async () => {
@@ -202,7 +202,7 @@ test("unlink in Slack removes the human; the HTTP unlink then has nothing to rem
   const be = await session(alice, "be");
 
   slack.say("unlink");
-  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from alice@example.com")));
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from `alice@example.com`")));
   const me = await api(alice, "GET", "/api/whoami");
   expect(me.body.identities).not.toContain("human");
   await expect(be.call("dm_send", { to: "human", body: "still there?" })).rejects.toThrow(/hasn't linked Slack/);

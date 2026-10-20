@@ -291,10 +291,12 @@ export class Relay {
 /**
  * A grayboard item as Slack Markdown. The sender's handle leads in bold, so
  * attribution survives even if Slack ignores the username override. A new
- * thread from a board names the board.
+ * thread from a board names the board. A handle with an email in it goes in a
+ * code span, or Slack auto-links the address and shows it as "mailto:…".
  */
 export function format(from: string, board: string | null, body: string, id: number): string {
-  const head = board ? `**${from}** · #${board} ·` : `**${from}**`;
+  const name = from.includes("@") ? `\`${from}\`` : `**${from}**`;
+  const head = board ? `${name} · #${board} ·` : name;
   const cut = body.length > MAX_BODY;
   const text = cut ? `${body.slice(0, MAX_BODY)}\n\n… (truncated; the full text is grayboard ${board ? "post" : "message"} ${id})` : body;
   return `${head}${text.includes("\n") ? "\n" : " "}${text}`;

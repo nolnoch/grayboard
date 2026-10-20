@@ -196,7 +196,7 @@ It runs only if you start it, needs no extra dependencies, and keeps everything 
 
 #### Slack bridge setup
 
-1. **Create the app from a manifest.** At api.slack.com/apps → *Create New App* → *From a manifest*, pick your workspace and paste [`deploy/slack-manifest.yaml`](deploy/slack-manifest.yaml). It sets up a bot user, the scopes it needs, the private-channel message event, and Socket Mode.
+1. **Create the app from a manifest.** At api.slack.com/apps → *Create New App* → *From a manifest*, pick your workspace and paste [`deploy/slack-manifest.yaml`](deploy/slack-manifest.yaml). It sets up a bot user, the scopes it needs, the private-channel message event, and Socket Mode. For the app icon, upload [`assets/icon-square-512.png`](assets/icon-square-512.png) in *Basic Information* → *Display Information*; Slack shows a transparent icon on a white square.
 2. **Generate the app-level token.** A manifest can't create it. In *Basic Information* → *App-Level Tokens*, generate one with the Socket Mode scope the page offers (`connections:write`). That's `app_token` (`xapp-…`).
 3. **Install the app** to the workspace. *OAuth & Permissions* shows the bot token. That's `bot_token` (`xoxb-…`).
 4. **Create a private channel**, invite the bot (`/invite @grayboard`), and copy the channel ID from the bottom of the channel details. That's `channel`.
@@ -509,7 +509,7 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 
 **Admin, once per server:**
 
-1. At api.slack.com/apps → *Create New App* → *From a manifest*, pick the workspace and paste [`deploy/slack-org-manifest.yaml`](deploy/slack-org-manifest.yaml). It sets up a bot, DM scopes and events, the App Home messages tab, and Socket Mode. (Not yet checked against a real workspace: if the app's *Messages* tab says sending messages is turned off, enable it in the app's *App Home* settings.)
+1. At api.slack.com/apps → *Create New App* → *From a manifest*, pick the workspace and paste [`deploy/slack-org-manifest.yaml`](deploy/slack-org-manifest.yaml). It sets up a bot, DM scopes and events, the App Home messages tab, and Socket Mode. For the app icon, upload [`assets/icon-square-512.png`](assets/icon-square-512.png) in *Basic Information* → *Display Information*; Slack shows a transparent icon on a white square. (Not yet checked against a real workspace: if the app's *Messages* tab says sending messages is turned off, enable it in the app's *App Home* settings.)
 2. In *Basic Information* → *App-Level Tokens*, generate a token with `connections:write` (`xapp-…`). A manifest can't create it.
 3. Install the app to the workspace; *OAuth & Permissions* shows the bot token (`xoxb-…`).
 4. Add both to `/etc/grayboard/env` and restart (`sudo systemctl restart grayboard`):
