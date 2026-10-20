@@ -12,6 +12,7 @@ const principal: SendPrincipal = {
 const ctx: SendContext = {
   db:  {} as SendContext["db"],
   now: Date.now(),
+  humanReach: "team",
 };
 
 describe("canSend — v1 contract", () => {

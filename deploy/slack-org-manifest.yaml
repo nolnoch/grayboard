@@ -1,0 +1,29 @@
+# Slack app manifest for the org bridge inside grayboard-server (one app per
+# server; each user talks to it in their own DM). The local bridge
+# (`grayboard bridge slack`) uses slack-manifest.yaml instead.
+# api.slack.com/apps → Create New App → From a manifest → paste this (YAML tab).
+# Setup steps: https://github.com/nolnoch/grayboard#slack-for-a-team-server-optional
+display_information:
+  name: grayboard
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: grayboard
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - im:history
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

@@ -295,7 +295,7 @@ claimCmd
 
 // ── human (local mode) ───────────────────────────────────────────────────────
 
-// Server mode has no human handles yet (#24); --mode local reaches the local
+// Server mode has no announcements or human board create yet (#24); --mode local reaches the local
 // bus on a machine signed in to a server, as for the bridge.
 function requireLocalBus(mode: string | undefined): void {
   if (mode !== undefined && mode !== "local") {
@@ -303,7 +303,7 @@ function requireLocalBus(mode: string | undefined): void {
     process.exit(1);
   }
   if (mode === undefined && busMode() === "server") {
-    console.error("[grayboard] human handles, announcements and board create are local-mode only for now (#24); --mode local uses this machine's local bus");
+    console.error("[grayboard] these commands are local-mode only for now (#24; on a server, your human is grayboard slack link); --mode local uses this machine's local bus");
     process.exit(1);
   }
 }
@@ -369,6 +369,31 @@ bridgeCmd
     // Imported lazily: nothing Slack loads unless you run this.
     const { runSlackBridge } = await import("../bridge/slack.ts");
     await runSlackBridge(mcpCommand(), opts.mode);
+  });
+
+// ── slack (server mode) ──────────────────────────────────────────────────────
+
+const slackCmd = program
+  .command("slack")
+  .description("Reach your agents from a DM with your server's grayboard Slack app, as \"human\"");
+
+slackCmd
+  .command("link")
+  .description("Get a one-time code to send to the grayboard app in Slack")
+  .action(async () => {
+    let res: { code: string; expires_in_s: number; linked: boolean };
+    try { res = await makeClient().post("/api/slack/link") as typeof res; }
+    catch (e) { handleApiError(e); }
+    if (globalJson()) return output(res!, true);
+    console.log(`In Slack, open a DM with the grayboard app and send:\n\n  link ${res!.code}\n\nThe code works once, for ${Math.round(res!.expires_in_s / 60)} minutes.${res!.linked ? " You're already linked; this moves the link to the Slack account that sends it." : ""}`);
+  });
+
+slackCmd
+  .command("unlink")
+  .description("Stop relaying to Slack; your agents' messages to \"human\" no longer reach you there")
+  .action(async () => {
+    try { output(await makeClient().post("/api/slack/unlink"), globalJson()); }
+    catch (e) { handleApiError(e); }
   });
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────

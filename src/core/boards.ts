@@ -124,6 +124,12 @@ export function declareHuman(db: Database, handle: string): void {
   })();
 }
 
+/** Server mode: one handle per linked user is a human; set or clear one. */
+export function markHuman(db: Database, handle: string, human: boolean): void {
+  touchHandle(db, handle);
+  db.prepare(`UPDATE handles SET human = ? WHERE name = ?`).run(human ? 1 : null, handle);
+}
+
 /** Whether `handle` is a declared human's. */
 export function isHuman(db: Database, handle: string): boolean {
   return !!(db.prepare(`SELECT human FROM handles WHERE name = ?`).get(handle) as { human: number | null } | undefined)?.human;

@@ -1,0 +1,215 @@
+// The org Slack bridge (src/server/slack.ts) end to end: an in-memory server
+// with a fake Slack, and agents as server-mode `grayboard mcp` children.
+// Linking, the human identity's round trip, who may reach it, and unlinking.
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+import { startServer } from "../../src/server/app.ts";
+import { FakeSlack } from "./fake_slack.ts";
+
+const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
+const DM = "D0ALICE";
+const ALICE_SLACK = "U0ALICE";
+
+let app: ReturnType<typeof startServer>;
+let base: string;
+let slack: FakeSlack;
+const open: (Client | WebSocket)[] = [];
+
+beforeEach(async () => {
+  slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
+  app = startServer(
+    {
+      dbPath: ":memory:",
+      httpPort: 0,
+      googleClientId: "dev",
+      googleClientSecret: "",
+      orgDomain: "example.com",
+      publicUrl: "http://localhost",
+      messageRetentionDays: 90,
+      auditRetentionDays: 90,
+      devAuth: true,
+      admins: [],
+      slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api },
+    },
+    { background: false },
+  );
+  base = `http://localhost:${app.server.port}`;
+  await app.slackReady;
+});
+
+afterEach(async () => {
+  await Promise.all(open.splice(0).map((c) => (c instanceof WebSocket ? c.close() : c.close().catch(() => {}))));
+  app.stop();
+  slack.stop();
+});
+
+async function login(email: string): Promise<string> {
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  return ((await r.json()) as { session_token: string }).session_token;
+}
+
+async function api(token: string, method: string, path: string, body?: unknown) {
+  const r = await fetch(`${base}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}` },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return { status: r.status, body: (await r.json()) as any };
+}
+
+async function session(token: string, identity: string) {
+  const pushes: { content: string; meta: Record<string, string> }[] = [];
+  const c = new Client({ name: "test", version: "0" });
+  c.fallbackNotificationHandler = async (n) => {
+    if (n.method === "notifications/claude/channel") pushes.push(n.params as any);
+  };
+  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity } as Record<string, string>;
+  delete env.BUS_HUMAN;
+  await c.connect(
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
+  );
+  open.push(c);
+  const call = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = await c.callTool({ name, arguments: args });
+    const body = (r.content as { text: string }[])[0]!.text;
+    if (r.isError) throw new Error(body);
+    try {
+      return JSON.parse(body);
+    } catch {
+      return body;
+    }
+  };
+  return { c, pushes, call };
+}
+
+async function until<T>(f: () => T | undefined | null | false, ms = 5000): Promise<T> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = f();
+    if (v) return v;
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await Bun.sleep(20);
+  }
+}
+
+function tsOf(post: Record<string, any>): string {
+  const ts = slack.postTs.get(post);
+  if (!ts) throw new Error("post not found");
+  return ts;
+}
+
+// alice runs `grayboard slack link` and sends the code to the app in her DM.
+async function link(token: string): Promise<void> {
+  const r = await api(token, "POST", "/api/slack/link");
+  expect(r.status).toBe(200);
+  expect(r.body).toMatchObject({ expires_in_s: 600, linked: false });
+  slack.say(`link ${r.body.code}`);
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to alice@example.com")));
+}
+
+test("link, then an agent's DM to human is a Slack thread whose reply comes back marked human", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const me = await api(alice, "GET", "/api/whoami");
+  expect(me.body.identities).toContain("human");
+
+  const be = await session(alice, "be");
+  expect(be.c.getInstructions()).toContain('"human"');
+  const q = await be.call("dm_send", { to: "human", body: "Return 204 or []?" });
+  expect(q.delivered_now).toBe(true);
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("204")));
+  expect(top).toMatchObject({ channel: DM, username: "be", markdown_text: "**be** Return 204 or []?" });
+  expect(top.thread_ts).toBeUndefined();
+
+  const { envelope } = slack.say("[] please", { thread_ts: tsOf(top) });
+  const got = await until(() => be.pushes.find((p) => p.content === "[] please"));
+  expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
+  await until(() => slack.acks.includes(envelope));
+
+  const follow = await be.call("dm_send", { to: "human", body: "done", parent_id: Number(got.meta.message_id) });
+  expect(follow.delivered_now).toBe(true);
+  const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
+  expect(post.thread_ts).toBe(tsOf(top));
+}, 30_000);
+
+test("a post Slack refuses is retried and lands once", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  slack.failPosts = 1;
+  await be.call("dm_send", { to: "human", body: "flaky" });
+  // The relay retries after 5s; the refused attempt is in posts() but got no ts.
+  const landed = () => slack.posts().filter((p) => p.markdown_text === "**be** flaky" && slack.postTs.has(p));
+  await until(() => landed().length > 0, 10_000);
+  await Bun.sleep(300);
+  expect(landed()).toHaveLength(1);
+  expect(slack.posts().filter((p) => p.markdown_text === "**be** flaky")).toHaveLength(2);
+}, 30_000);
+
+test("only the bridge may hello as human", async () => {
+  const alice = await login("alice@example.com");
+  const ws = new (WebSocket as any)(`${base.replace("http", "ws")}/ws`, { headers: { Authorization: `Bearer ${alice}` } }) as WebSocket;
+  open.push(ws);
+  const reply = await new Promise<any>((res) => {
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data as string);
+      if (m.req_id === "h") res(m);
+    };
+    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: "human" }));
+  });
+  expect(reply).toMatchObject({ type: "error", code: "bad_request" });
+  // And not over HTTP either.
+  expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
+}, 30_000);
+
+test("another user's agents reach a human only as teammates", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await link(alice);
+  const fe = await session(bob, "fe");
+  // bob hasn't linked, so his sessions pay nothing for the human sentence.
+  expect(fe.c.getInstructions()).not.toContain('dm_send(to="human")');
+
+  await expect(fe.call("dm_send", { to: "alice@example.com/human", body: "hi" })).rejects.toThrow(/reachable only by their teammates/);
+  // A bare "human" is your own, and bob hasn't linked.
+  await expect(fe.call("dm_send", { to: "human", body: "hi" })).rejects.toThrow(/hasn't linked Slack/);
+  await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const blocked = await fe.call("board_post", { board: "e2e", body: "@alice/human look" });
+  expect(blocked.unresolved).toEqual(["alice/human"]);
+
+  expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+
+  expect((await fe.call("dm_send", { to: "alice@example.com/human", body: "hi alice" })).delivered_now).toBe(true);
+  const dm = await until(() => slack.posts().find((p) => p.markdown_text?.endsWith("hi alice")));
+  expect(dm.username).toBe("bob@example.com/fe");
+  const ok = await fe.call("board_post", { board: "e2e", body: "@alice/human look again" });
+  expect(ok.unresolved ?? []).toEqual([]);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("look again")));
+  expect(slack.posts().some((p) => p.markdown_text?.endsWith("@alice/human look"))).toBe(false);
+}, 30_000);
+
+test("unlink in Slack removes the human; the HTTP unlink then has nothing to remove", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+
+  slack.say("unlink");
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from alice@example.com")));
+  const me = await api(alice, "GET", "/api/whoami");
+  expect(me.body.identities).not.toContain("human");
+  await expect(be.call("dm_send", { to: "human", body: "still there?" })).rejects.toThrow(/hasn't linked Slack/);
+  expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(404);
+
+  // Messages sent while unlinked don't reach the phone; Slack says who it isn't.
+  slack.say("hello?");
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("This Slack account isn't linked")));
+
+  // Relinking works and starts fresh.
+  await link(alice);
+  expect((await be.call("dm_send", { to: "human", body: "back" })).delivered_now).toBe(true);
+  await until(() => slack.posts().find((p) => p.markdown_text === "**be** back"));
+}, 30_000);

@@ -1,3 +1,5 @@
+import type { HumanReach } from "./can_send.ts";
+
 export type Config = {
   dbPath: string;
   httpPort: number;
@@ -10,6 +12,10 @@ export type Config = {
   devAuth: boolean;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
+  // Who can reach another user's human; default "team".
+  humanReach?: HumanReach;
+  // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
+  slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
 
 export function loadConfig(): Config {
@@ -39,7 +45,26 @@ export function loadConfig(): Config {
     auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
+    humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
+    ...slackConfig(),
   };
+}
+
+function parseReach(raw: string | undefined): HumanReach {
+  if (raw === undefined || raw === "" || raw === "team") return "team";
+  if (raw === "all") return "all";
+  throw new Error(`GRAYBOARD_SLACK_REACH must be "team" or "all", not "${raw}"`);
+}
+
+// Half a configuration is a mistake, not "off".
+function slackConfig(): { slack?: Config["slack"] } {
+  const appToken = process.env.SLACK_APP_TOKEN;
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!appToken && !botToken) return {};
+  if (!appToken || !botToken) throw new Error("set both SLACK_APP_TOKEN and SLACK_BOT_TOKEN to run the Slack bridge, or neither");
+  if (!appToken.startsWith("xapp-")) throw new Error("SLACK_APP_TOKEN should be an app-level token (xapp-…)");
+  if (!botToken.startsWith("xoxb-")) throw new Error("SLACK_BOT_TOKEN should be a bot token (xoxb-…)");
+  return { slack: { appToken, botToken, ...(process.env.SLACK_API_URL ? { apiUrl: process.env.SLACK_API_URL } : {}) } };
 }
 
 function parseList(raw: string | undefined): string[] {

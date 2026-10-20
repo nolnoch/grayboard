@@ -8,6 +8,9 @@
 // replies (dm_send / board_post with parent_id), so only that conversation's
 // agents wake. A top-level "@handle …" or "#board …" starts a new one.
 import type { Store, ThreadRow } from "./store.ts";
+
+/** The thread map and outbox: store.ts locally, the server's tables and acks in server mode. */
+export type RelayStore = Pick<Store, "thread" | "byTs" | "addThread" | "advance" | "enqueue" | "pending" | "done">;
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
 export type ChannelParams = { content: string; meta: Record<string, string> };
@@ -27,6 +30,8 @@ export type RelayOptions = {
   onFatal: (reason: string) => void;
   /** Backoff between retries of a post Slack couldn't take. */
   retryMs?: number;
+  /** How a handle reads in Slack; on a server, your own agents go by bare name. */
+  label?: (handle: string) => string;
 };
 
 // Slack's markdown_text limit is 12,000 chars; leave room for the header.
@@ -45,7 +50,7 @@ export class Relay {
   private readonly retryMs: number;
 
   constructor(
-    private readonly store: Store,
+    private readonly store: RelayStore,
     private readonly bus: Bus,
     private readonly slack: SlackWeb,
     private readonly o: RelayOptions,
@@ -141,11 +146,12 @@ export class Relay {
     body: string;
   }): Promise<void> {
     const row = this.store.thread(x.kind, x.board, x.root);
-    const text = format(x.from, row ? null : x.board, x.body, x.id);
+    const name = this.o.label?.(x.from) ?? x.from;
+    const text = format(name, row ? null : x.board, x.body, x.id);
     const r = await this.slack.call<{ ts: string; message?: Record<string, any> }>("chat.postMessage", {
       channel: this.o.channel,
       markdown_text: text,
-      username: x.from,
+      username: name,
       ...(row ? { thread_ts: row.thread_ts } : {}),
     });
     this.debug(`posted ${r.ts} as username=${JSON.stringify(r.message?.username)} (asked ${JSON.stringify(x.from)})`);
@@ -207,7 +213,8 @@ export class Relay {
   }
 
   private async start(ts: string, text: string): Promise<void> {
-    const dm = /^@([a-z0-9_-]{1,32})[\s:,]+(\S[\s\S]*)$/i.exec(text);
+    // A bare handle, or on a server user@org/name for someone else's agent.
+    const dm = /^@((?:[a-z0-9._%+-]+@[a-z0-9.-]+\/)?[a-z0-9_-]{1,32})[\s:,]+(\S[\s\S]*)$/i.exec(text);
     if (dm) return this.sendDm(dm[1]!.toLowerCase(), dm[2]!, undefined, ts, null);
     const nb = /^new\s+#([a-z0-9_-]{1,32})(?:[\s:,]+(\S[\s\S]*))?$/i.exec(text);
     if (nb) return this.createBoard(nb[1]!.toLowerCase(), nb[2], ts);
