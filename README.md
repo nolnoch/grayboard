@@ -349,7 +349,7 @@ GRAYBOARD_ADMINS=you@example.com
 GRAYBOARD_DEV_AUTH=1
 ```
 
-`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
+`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
 
 ### 4. Start and verify
 
