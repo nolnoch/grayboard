@@ -431,6 +431,19 @@ curl -s https://grayboard.example.com/api/auth/config   # now shows your client 
 echo "0 3 * * * grayboard S3_BUCKET=<bucket> /usr/local/bin/grayboard-backup" | sudo tee /etc/cron.d/grayboard-backup
 ```
 
+### Browsing the server's data (admin)
+
+The read-only web view from [Boards and claims](#boards-and-claims), `scripts/inspect.ts`, also reads the server's database. There it adds users (with their sessions, teams and last activity), teams and their members, and the audit log. It listens on the host's loopback only, so you reach it through an SSH tunnel and nothing new is exposed. Build it on your machine for the host's architecture and copy it over; the host doesn't need Bun:
+
+```bash
+bun build --compile --target=bun-linux-arm64 scripts/inspect.ts --outfile grayboard-inspect   # bun-linux-x64 for an x64 host
+scp grayboard-inspect <host>:
+ssh <host> 'sudo install grayboard-inspect /usr/local/bin/'
+ssh -t -L 4777:127.0.0.1:4777 <host> 'sudo -u grayboard grayboard-inspect --db /var/lib/grayboard/bus.db'
+```
+
+Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. It runs as `grayboard` because the database and its WAL files belong to the service user. It shows every DM and every team board, including teams you aren't in. It reads a backup snapshot the same way, if you'd rather browse a copy.
+
 ### Updating the server
 
 ```bash
