@@ -7,8 +7,9 @@ import {
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
-import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
+import { callBoardTool } from "../core/tools.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -120,6 +121,27 @@ function whoami(authed: AuthedUser, repo: Repo): Response {
 function claimList(url: URL, db: CoreDb): Response {
   const prefix = url.searchParams.get("prefix") ?? undefined;
   return json(listClaims(db, prefix).map(({ board: _b, ...c }) => c));
+}
+
+// For `grayboard claim`: a claim tool run as one of the caller's identities.
+// One no session has created is refused, so a wrong name can't hold claims.
+const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
+
+async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void): Promise<Response> {
+  const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
+  if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
+  const name = body.identity.toLowerCase();
+  if (!repo.identities.findByUserAndName(authed.user_id, name)) {
+    return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
+  }
+  try {
+    const outcome = callBoardTool(db, `${authed.user_email}/${name}`, body.tool, body.args ?? {});
+    wake(outcome.wake);
+    return json(outcome.result);
+  } catch (e) {
+    if (e instanceof CoreError) return badRequest(e.message);
+    throw e;
+  }
 }
 
 // ── identities ────────────────────────────────────────────────────────────────
@@ -278,7 +300,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo): Pr
 
 // ── main router ──────────────────────────────────────────────────────────────
 
-export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
   const method = req.method;
@@ -298,6 +320,7 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
+  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);

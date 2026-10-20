@@ -229,7 +229,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       }
     }, 30_000);
 
-  return { handlers, startPing, stopExpiry: expiry.stop };
+  return { handlers, startPing, stopExpiry: expiry.stop, wake: (handles: string[]) => wake(hub, handles) };
 }
 
 async function handleHello(

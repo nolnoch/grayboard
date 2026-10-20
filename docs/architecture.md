@@ -66,6 +66,7 @@ Frames: derive from `src/shared/protocol.ts` (validated by hand in `parseClientM
 - **Non-members get 404, not 403**, for a team's member routes and roster, so a private team's existence doesn't leak. Admins acting on a team they're not in are audited with `as_admin: true` (the path for an empty team). `POST /api/teams/:name/join` is always 403, kept so older CLIs get a pointer to `team add`.
 - Distributed mentions: `@email/name` exact; `@local/name` by email local part; `@name` means the poster's own identity first, then a unique match among board viewers. Anything unresolved, ambiguous, or unable to see the board isn't pushed and returns in `unresolved`.
 - Claims are org-wide: key, holder and note are visible to anyone signed in; `claim_list` hides the board name of an announcement on a board you can't see. `GET /api/claims` (for `grayboard claims`) authenticates a user, not a handle, so it omits board names entirely.
+- `POST /api/claims/call` (for `grayboard claim`) runs a claim tool as one of the caller's own identities and passes the core's wake list to the same `wake` the WS tool path uses, so a CLI claim change is delivered like a tool call's. It refuses an identity the user doesn't have (`unknown_identity`, 404) instead of creating it lazily as hello does, so a mistyped name in a script can't hold claims. No human-handle check: the server has none (#24).
 
 ## 6. Plugin (`src/plugin/`)
 

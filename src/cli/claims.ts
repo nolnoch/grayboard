@@ -3,8 +3,8 @@
 // PreToolUse hook blocks the tool call and shows Claude why; 0 when none; 1 on
 // grayboard's own error, which a hook treats as non-blocking (fails open).
 import { existsSync } from "node:fs";
-import { busMode, loadCredentials, makeClient } from "./api.ts";
-import { sessionIdentity } from "../shared/identity.ts";
+import { busMode, makeClient } from "./api.ts";
+import { actingIdentity, busHandle } from "./claim.ts";
 
 export type ListedClaim = { key: string; holder: string; note: string | null; acquired_at: number; expires_at: number };
 
@@ -27,12 +27,9 @@ async function serverClaims(prefix: string | undefined): Promise<ListedClaim[]> 
 }
 
 // This session's handle, as the bus names it, or undefined if it can't be told.
-function self(mode: "local" | "server"): string | undefined {
+function self(mode: "local" | "server", as?: string): string | undefined {
   try {
-    const name = sessionIdentity();
-    if (mode === "local") return name;
-    const email = loadCredentials()?.user_email;
-    return email ? `${email}/${name.toLowerCase()}` : undefined;
+    return busHandle(actingIdentity(as).name, mode);
   } catch {
     return undefined;
   }
@@ -43,7 +40,7 @@ export function formatClaim(c: ListedClaim): string {
   return `${c.key} held by ${c.holder} until ${until}Z${c.note ? `: ${c.note}` : ""}`;
 }
 
-export async function runClaims(opts: { prefix?: string; json?: boolean; includeSelf?: boolean }): Promise<number> {
+export async function runClaims(opts: { prefix?: string; json?: boolean; includeSelf?: boolean; as?: string }): Promise<number> {
   const mode = busMode();
   let claims: ListedClaim[];
   try {
@@ -52,7 +49,7 @@ export async function runClaims(opts: { prefix?: string; json?: boolean; include
     console.error(`[grayboard] claims: ${(e as Error).message}`);
     return 1;
   }
-  const me = opts.includeSelf ? undefined : self(mode);
+  const me = opts.includeSelf ? undefined : self(mode, opts.as);
   const held = me ? claims.filter((c) => c.holder !== me) : claims;
   if (opts.json) console.log(JSON.stringify(held, null, 2));
   else if (held.length) console.error(["Active claims; check with the holder before going ahead:", ...held.map(formatClaim)].join("\n"));

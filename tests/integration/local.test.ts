@@ -334,6 +334,64 @@ test("grayboard claims: exits 2 when another session holds a match, 0 otherwise"
   expect(JSON.parse(json.out)[0].board).toBeUndefined();
 }, 20_000);
 
+// The CLI as a lane's shell runs it: env and cwd decide the handle.
+async function gb(identity: string | undefined, cwd: string, ...args: string[]): Promise<{ code: number; out: string; err: string }> {
+  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd, env: busEnv(identity), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  return { code, out, err };
+}
+
+test("grayboard claim take/release acts as the directory's session; held exits 2", async () => {
+  const repo = join(dir, "api");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const api = await start(undefined, repo, [CLI, "mcp"]);
+  const be = await start("be");
+
+  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the directory name)\n" });
+  expect(JSON.parse((await gb("be", dir, "--json", "whoami")).out)).toEqual({ handle: "be", source: "BUS_IDENTITY" });
+
+  const took = await gb(undefined, repo, "claim", "take", "sandbox:sbx-1", "--ttl", "2h", "--note", "smoke");
+  expect(took.code).toBe(0);
+  expect(JSON.parse(took.out)).toMatchObject({ ok: true, claim: { key: "sandbox:sbx-1", holder: "api", note: "smoke" } });
+  const listed = await call(be, "claim_list");
+  expect(listed).toMatchObject([{ key: "sandbox:sbx-1", holder: "api" }]);
+  expect(listed[0].expires_at - Date.now()).toBeGreaterThan(110 * 60_000);
+
+  const held = await gb("be", dir, "claim", "take", "sandbox:sbx-1");
+  expect(held.code).toBe(2);
+  expect(JSON.parse(held.out)).toMatchObject({ ok: false, held_by: "api", note: "smoke" });
+  expect((await gb("be", dir, "claim", "take", "sandbox:sbx-2")).code).toBe(0);
+
+  expect((await gb(undefined, dir, "--as", "api", "claim", "release", "sandbox:sbx-1")).code).toBe(0);
+  expect((await call(api, "claim_list")).map((c: any) => c.key)).toEqual(["sandbox:sbx-2"]);
+  expect((await gb(undefined, dir, "--as", "be", "claims")).code).toBe(0); // --as counts as self
+}, 20_000);
+
+test("grayboard claim refuses a handle no session has used, and the human's handle", async () => {
+  await start("be");
+  const unknown = await gb(undefined, dir, "--as", "nobody", "claim", "take", "k");
+  expect(unknown.code).toBe(1);
+  expect(unknown.err).toMatch(/no session has used handle "nobody".*whoami/);
+  expect((await cli("human", "alex")).code).toBe(0);
+  const human = await gb(undefined, dir, "--as", "alex", "claim", "take", "k");
+  expect(human.code).toBe(1);
+  expect(human.err).toContain(`"alex" is the human handle`);
+  expect((await gb(undefined, dir, "--as", "Bad Name", "claim", "take", "k")).err).toContain("invalid --as");
+}, 20_000);
+
+test("grayboard claim watch: the session is pushed the release", async () => {
+  const be = await start("be");
+  const sim = await startCollecting("sim");
+  await call(be, "board_create", { name: "e2e", purpose: "x" });
+  await call(sim.c, "board_subscribe", { board: "e2e", mode: "quiet" });
+  await call(be, "claim_take", { key: "sandbox:sbx-1", board: "e2e" });
+  const w = await gb("sim", dir, "claim", "watch", "sandbox:sbx-1");
+  expect(w.code, w.err).toBe(0);
+  await call(be, "claim_release", { key: "sandbox:sbx-1", note: "done" });
+  await Bun.sleep(300);
+  expect(sim.pushes).toEqual(["[release] sandbox:sbx-1 — done cc @sim"]);
+}, 20_000);
+
 test("claim_watch: a quiet subscriber is pushed the release of the claim it waits on", async () => {
   const be = await start("be");
   const sim = await startCollecting("sim");

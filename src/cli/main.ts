@@ -124,9 +124,11 @@ program
   .name("grayboard")
   .description("Grayboard CLI — manage identities, teams, and sessions")
   .option("--json", "output JSON")
+  .option("--as <handle>", "Act as this handle (literal, no worktree suffix) instead of the one this directory's session uses")
   .version(pkg.version);
 
 const globalJson = () => !!(program.opts() as { json?: boolean }).json;
+const globalAs = () => (program.opts() as { as?: string }).as;
 
 // ── login / logout / whoami ───────────────────────────────────────────────────
 
@@ -210,11 +212,21 @@ program
 
 program
   .command("whoami")
-  .description("Show current user and identities")
+  .description("Show the handle this shell acts as; in server mode, also your user and identities")
   .action(async () => {
+    const { actingIdentity, busHandle } = await import("./claim.ts");
+    let acting;
     try {
-      const res = await makeClient().get("/api/whoami");
-      output(res, globalJson());
+      const { name, source } = actingIdentity(globalAs());
+      acting = { handle: busHandle(name), source };
+    } catch (e) { console.error(`[grayboard] whoami: ${(e as Error).message}`); process.exit(1); }
+    if (busMode() === "local") {
+      output(globalJson() ? acting : `${acting.handle} (from ${acting.source})`, globalJson());
+      return;
+    }
+    try {
+      const res = await makeClient().get("/api/whoami") as Record<string, unknown>;
+      output({ ...acting, ...res }, globalJson());
     } catch (e) { handleApiError(e); }
   });
 
@@ -239,7 +251,46 @@ program
   .option("--include-self", "Count this session's own claims too")
   .action(async (opts: { prefix?: string; includeSelf?: boolean }) => {
     const { runClaims } = await import("./claims.ts");
-    process.exitCode = await runClaims({ ...opts, json: globalJson() });
+    process.exitCode = await runClaims({ ...opts, json: globalJson(), as: globalAs() });
+  });
+
+// ── claim (both modes) ───────────────────────────────────────────────────────
+
+const claimCmd = program.command("claim").description("Take, release or watch a claim as this directory's session (see whoami; --as overrides)");
+
+claimCmd
+  .command("take <key>")
+  .description("Take or renew a claim; exits 2 if someone else holds it")
+  .option("--ttl <duration>", "How long, like 45m, 2h or 3d (default 30m, max 7d)")
+  .option("--until <time>", "ISO 8601 stop time instead of --ttl")
+  .option("--note <text>", "What you're doing with it")
+  .option("--board <board>", "Board to announce it on")
+  .action(async (key: string, opts: { ttl?: string; until?: string; note?: string; board?: string }) => {
+    const { runClaimTool } = await import("./claim.ts");
+    let ttl_minutes: number | undefined;
+    if (opts.ttl !== undefined) {
+      const { parseTtl } = await import("../shared/ttl.ts");
+      try { ttl_minutes = parseTtl(opts.ttl) / 60_000; } catch (e) { console.error(`[grayboard] claim take: ${(e as Error).message}`); process.exit(1); }
+    }
+    process.exitCode = await runClaimTool("claim_take", { key, ttl_minutes, until: opts.until, note: opts.note, board: opts.board }, { as: globalAs(), json: globalJson() });
+  });
+
+claimCmd
+  .command("release <key>")
+  .description("Release a claim you hold")
+  .option("--note <text>", "How it ended")
+  .action(async (key: string, opts: { note?: string }) => {
+    const { runClaimTool } = await import("./claim.ts");
+    process.exitCode = await runClaimTool("claim_release", { key, note: opts.note }, { as: globalAs(), json: globalJson() });
+  });
+
+claimCmd
+  .command("watch <key>")
+  .description("Have this directory's session @mentioned when someone else's claim changes; returns at once")
+  .option("--off", "Stop watching")
+  .action(async (key: string, opts: { off?: boolean }) => {
+    const { runClaimTool } = await import("./claim.ts");
+    process.exitCode = await runClaimTool("claim_watch", { key, off: opts.off }, { as: globalAs(), json: globalJson() });
   });
 
 // ── human (local mode) ───────────────────────────────────────────────────────
