@@ -6,7 +6,7 @@ import {
 } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
-import { HUMAN_NAME, HUMAN_RESERVED, isValidIdentityName } from "../shared/addressing.ts";
+import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
@@ -81,6 +81,7 @@ async function authExchange(req: Request, repo: Repo, config: Config): Promise<R
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
+  if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
   const user = repo.users.upsertByEmail(email, displayName ?? null);
   const raw  = mintToken();
   const ua   = req.headers.get("user-agent")?.slice(0, 120) ?? null;
@@ -96,6 +97,7 @@ async function devLogin(req: Request, repo: Repo): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
+  if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   const user  = repo.users.upsertByEmail(email, null);
   const raw   = mintToken();
   repo.sessions.create(user.id, hashToken(raw), "dev");

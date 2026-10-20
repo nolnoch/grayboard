@@ -490,6 +490,24 @@ test("direct messages still deliver live", async () => {
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
 });
 
+test("a handler that throws answers the call with an internal error and keeps the socket", async () => {
+  const alice = await login("alice@example.com");
+  const be = new Client(alice, "be");
+  const fe = new Client(alice, "fe");
+  await Promise.all([be.connect(), fe.connect()]);
+  await be.request({ type: "send", recipient: "fe", body: "hi" });
+  const id = (await fe.next((m) => m.type === "push")).message.id;
+  // Deleting the identity under its live connection makes the ack's cursor write fail.
+  expect((await api(alice, "DELETE", "/api/identities/fe")).status).toBe(200);
+  expect(await fe.request({ type: "ack", message_ids: [id] })).toMatchObject({ type: "error", code: "internal" });
+  expect((await fe.call("board_list")).type).toBe("call_ok");
+});
+
+test("login refuses an email no direct address can carry", async () => {
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "o'brien@example.com" }) });
+  expect(r.status).toBe(400);
+});
+
 test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
   const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
   const a = new Client(alice, "be");

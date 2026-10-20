@@ -32,6 +32,12 @@ export function formatTeamAddress(name: string): string {
   return full;
 }
 
+// An email a direct address can carry: a user whose email isn't one could
+// sign in but never be addressed (#72).
+export function isValidEmail(email: string): boolean {
+  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
+}
+
 export function isValidIdentityName(name: string): boolean {
   return NAME_RE.test(name.toLowerCase());
 }

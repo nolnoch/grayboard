@@ -187,50 +187,57 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
         return;
       }
 
-      switch (msg.type) {
-        case "hello":
-          err(ws, msg.req_id, "bad_request", "already authenticated");
-          break;
-        case "send":
-          handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
-          break;
-        case "history":
-          handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
-          break;
-        case "thread":
-          handleThread(ws, msg.req_id, msg.message_id, repo);
-          break;
-        case "ack":
-          handleAck(ws, msg.req_id, msg.message_ids, repo);
-          break;
-        case "inbox":
-          handleInbox(hub, ws, msg.req_id, msg.days);
-          break;
-        case "dm_ack": {
-          const m = repo.messages.getById(msg.message_id);
-          const me = ws.data.identityFull;
-          if (!m || m.recipient_type !== "user" || !(m.recipient === me || (m.sender === me && m.pending))) {
-            err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you or pending from you; dm_inbox lists them`);
+      // The handlers are synchronous: a throw (a bug, or a row deleted under
+      // the connection) answers the call instead of leaving it to time out.
+      try {
+        switch (msg.type) {
+          case "hello":
+            err(ws, msg.req_id, "bad_request", "already authenticated");
+            break;
+          case "send":
+            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
+            break;
+          case "history":
+            handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
+            break;
+          case "thread":
+            handleThread(ws, msg.req_id, msg.message_id, repo);
+            break;
+          case "ack":
+            handleAck(ws, msg.req_id, msg.message_ids, repo);
+            break;
+          case "inbox":
+            handleInbox(hub, ws, msg.req_id, msg.days);
+            break;
+          case "dm_ack": {
+            const m = repo.messages.getById(msg.message_id);
+            const me = ws.data.identityFull;
+            if (!m || m.recipient_type !== "user" || !(m.recipient === me || (m.sender === me && m.pending))) {
+              err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you or pending from you; dm_inbox lists them`);
+              break;
+            }
+            repo.messages.ack(ws.data.identityFull, m.id);
+            send(ws, { type: "ack_ok", req_id: msg.req_id });
             break;
           }
-          repo.messages.ack(ws.data.identityFull, m.id);
-          send(ws, { type: "ack_ok", req_id: msg.req_id });
-          break;
+          case "dm_retract":
+            handleRetract(hub, ws, msg.req_id, msg.message_id);
+            break;
+          case "call":
+            handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
+            expiry.arm();
+            break;
+          case "board_ack":
+            for (const r of msg.refs) {
+              acknowledge(db, ws.data.identityFull, r);
+              ws.data.inflight?.delete(refKey(r));
+            }
+            send(ws, { type: "ack_ok", req_id: msg.req_id });
+            break;
         }
-        case "dm_retract":
-          handleRetract(hub, ws, msg.req_id, msg.message_id);
-          break;
-        case "call":
-          handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
-          expiry.arm();
-          break;
-        case "board_ack":
-          for (const r of msg.refs) {
-            acknowledge(db, ws.data.identityFull, r);
-            ws.data.inflight?.delete(refKey(r));
-          }
-          send(ws, { type: "ack_ok", req_id: msg.req_id });
-          break;
+      } catch (e) {
+        console.error(`[grayboard] ${msg.type} failed:`, e);
+        err(ws, msg.req_id, "internal", `${msg.type} failed`);
       }
     },
 
