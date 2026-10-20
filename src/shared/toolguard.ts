@@ -50,7 +50,7 @@ export function updateNotice(): () => string | null {
 }
 
 export const CHANNELS_OFF_NOTICE =
-  "Warning: this Claude Code session was started without --dangerously-load-development-channels, so grayboard messages and board posts can't reach you as pushes; tools still work. Tell the user to restart the session with `claude --dangerously-load-development-channels server:grayboard` (add --resume to keep this conversation). Until then, check dm_inbox and board_read yourself.";
+  "Warning: this Claude Code session was started without --dangerously-load-development-channels, so it's tools-only: grayboard can't push messages or board posts to it, and peers see it as offline. Tell the user to restart the session with `claude --dangerously-load-development-channels server:grayboard` (add --resume to keep this conversation); what's pending arrives then. Until then, check dm_inbox and board_read yourself.";
 
 /**
  * True when the MCP client is a Claude Code session started without a

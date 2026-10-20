@@ -438,7 +438,7 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   expect(upfront).toEqual(["board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
-test("a Claude Code session started without a channels flag is warned that pushes are off", async () => {
+test("a Claude Code session started without a channels flag runs tools-only and is warned", async () => {
   // Stand-in for Claude Code: a process named `claude` (bun under another
   // name) that runs grayboard mcp as its child on inherited stdio, with
   // CLAUDECODE=1 as Claude Code sets. Its own flags come before "::".
@@ -464,6 +464,13 @@ Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"]
   const on = await session("fe", ["--dangerously-load-development-channels", "server:grayboard"]);
   expect(on.getInstructions()).not.toContain("Warning:");
   expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
+
+  // The flagless session would drop pushes yet mark them delivered: it takes
+  // none, so peers see it offline and a session with channels gets them later.
+  expect((await call(on, "dm_send", { to: "be", body: "waits" })).delivered_now).toBe(false);
+  const be = await startCollecting("be");
+  await Bun.sleep(500);
+  expect(be.pushes).toEqual(["waits"]);
 }, 20_000);
 
 async function cli(...args: string[]): Promise<{ code: number; out: string; err: string }> {
