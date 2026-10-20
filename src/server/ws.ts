@@ -1,6 +1,8 @@
 import type { MessageRow, Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
-import { HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
+import {
+  HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
+} from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -22,10 +24,8 @@ import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts"
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, dmBody, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
-
-const MAX_BODY_BYTES = 64 * 1024;
 
 export type WsData = {
   authed: AuthedUser;
@@ -66,8 +66,8 @@ export type WsOptions = {
 type Hub = {
   // identity_full -> open WebSocket
   registry: Map<string, Ws>;
-  // identity_full values with a hello currently probing the existing holder
-  probing: Set<string>;
+  // identity_full -> the probe a hello is running against its holder
+  probing: Map<string, Promise<boolean>>;
   // Tools-only connections (hello push: false): pinged, never pushed to.
   toolsOnly: Set<Ws>;
   repo: Repo;
@@ -135,7 +135,7 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
-    registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db,
+    registry: new Map(), probing: new Map(), toolsOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
   };
@@ -187,50 +187,57 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
         return;
       }
 
-      switch (msg.type) {
-        case "hello":
-          err(ws, msg.req_id, "bad_request", "already authenticated");
-          break;
-        case "send":
-          handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
-          break;
-        case "history":
-          handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
-          break;
-        case "thread":
-          handleThread(ws, msg.req_id, msg.message_id, repo);
-          break;
-        case "ack":
-          handleAck(ws, msg.req_id, msg.message_ids, repo);
-          break;
-        case "inbox":
-          handleInbox(hub, ws, msg.req_id, msg.days);
-          break;
-        case "dm_ack": {
-          const m = repo.messages.getById(msg.message_id);
-          const me = ws.data.identityFull;
-          if (!m || m.recipient_type !== "user" || !(m.recipient === me || (m.sender === me && m.pending))) {
-            err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you or pending from you; dm_inbox lists them`);
+      // The handlers are synchronous: a throw (a bug, or a row deleted under
+      // the connection) answers the call instead of leaving it to time out.
+      try {
+        switch (msg.type) {
+          case "hello":
+            err(ws, msg.req_id, "bad_request", "already authenticated");
+            break;
+          case "send":
+            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
+            break;
+          case "history":
+            handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
+            break;
+          case "thread":
+            handleThread(ws, msg.req_id, msg.message_id, repo);
+            break;
+          case "ack":
+            handleAck(ws, msg.req_id, msg.message_ids, repo);
+            break;
+          case "inbox":
+            handleInbox(hub, ws, msg.req_id, msg.days);
+            break;
+          case "dm_ack": {
+            const m = repo.messages.getById(msg.message_id);
+            const me = ws.data.identityFull;
+            if (!m || m.recipient_type !== "user" || !(m.recipient === me || (m.sender === me && m.pending))) {
+              err(ws, msg.req_id, "not_found", `no message ${msg.message_id} to you or pending from you; dm_inbox lists them`);
+              break;
+            }
+            repo.messages.ack(ws.data.identityFull, m.id);
+            send(ws, { type: "ack_ok", req_id: msg.req_id });
             break;
           }
-          repo.messages.ack(ws.data.identityFull, m.id);
-          send(ws, { type: "ack_ok", req_id: msg.req_id });
-          break;
+          case "dm_retract":
+            handleRetract(hub, ws, msg.req_id, msg.message_id);
+            break;
+          case "call":
+            handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
+            expiry.arm();
+            break;
+          case "board_ack":
+            for (const r of msg.refs) {
+              acknowledge(db, ws.data.identityFull, r);
+              ws.data.inflight?.delete(refKey(r));
+            }
+            send(ws, { type: "ack_ok", req_id: msg.req_id });
+            break;
         }
-        case "dm_retract":
-          handleRetract(hub, ws, msg.req_id, msg.message_id);
-          break;
-        case "call":
-          handleCall(hub, ws, msg.req_id, msg.tool, msg.args);
-          expiry.arm();
-          break;
-        case "board_ack":
-          for (const r of msg.refs) {
-            acknowledge(db, ws.data.identityFull, r);
-            ws.data.inflight?.delete(refKey(r));
-          }
-          send(ws, { type: "ack_ok", req_id: msg.req_id });
-          break;
+      } catch (e) {
+        console.error(`[grayboard] ${msg.type} failed:`, e);
+        err(ws, msg.req_id, "internal", `${msg.type} failed`);
       }
     },
 
@@ -245,15 +252,37 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     },
   };
 
+  // Auth is checked at the upgrade only. When an admin revokes or disables a
+  // user, close their connections (#70): reconnecting then fails auth. The
+  // Slack bridge's humans have their own path (SlackBridge.userChanged).
+  const conns = () => [...hub.registry.values(), ...hub.toolsOnly].filter((ws) => !ws.data.human);
+  const disconnectUser = (userId: number) => {
+    for (const ws of conns()) {
+      if (ws.data.authed.user_id !== userId) continue;
+      err(ws, undefined, "unauthenticated", "an admin signed this user out");
+      ws.close();
+    }
+  };
+  // Catches a user disabled while one of their hellos was in flight.
+  const revalidate = () => {
+    for (const id of new Set(conns().map((ws) => ws.data.authed.user_id))) {
+      if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
+    }
+  };
+
   // Heartbeat: keeps idle connections open through proxies.
   const startPing = () =>
     setInterval(() => {
+      revalidate();
       for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
     }, 30_000);
 
-  return { handlers, startPing, stopExpiry: expiry.stop, wake: (handles: string[]) => wake(hub, handles) };
+  return {
+    handlers, startPing, revalidate, disconnectUser, stopExpiry: expiry.stop,
+    wake: (handles: string[]) => wake(hub, handles),
+  };
 }
 
 async function handleHello(
@@ -278,27 +307,34 @@ async function handleHello(
   // One live connection per identity. If the current holder still answers,
   // refuse the newcomer: taking over would let a stray second session (e.g.
   // a worktree that inherited .mcp.json) silently steal this identity's
-  // deliveries. A holder that doesn't answer is dead; replace it.
-  const existing = push ? registry.get(full) : undefined;
-  if (existing && existing !== ws) {
-    const refuse = () => {
+  // deliveries. A holder that doesn't answer is dead; replace it. Each await
+  // can change the registry (a close, another hello), so after one, check
+  // again from the top; between the last check and registry.set below
+  // nothing awaits (#69).
+  while (push) {
+    const inFlight = hub.probing.get(full);
+    if (inFlight) {
+      // Another hello is probing the holder: whoever wins, it's settled after.
+      await inFlight;
+      if (ws.readyState !== 1 /* OPEN */) return;
+      continue;
+    }
+    const holder = registry.get(full);
+    if (!holder || holder === ws) break;
+    const probing = probe(holder, hub.probeMs).finally(() => {
+      if (hub.probing.get(full) === probing) hub.probing.delete(full);
+    });
+    hub.probing.set(full, probing);
+    if (await probing) {
       err(ws, reqId, "identity_in_use",
         `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
       ws.close();
-    };
-    if (hub.probing.has(full)) return refuse();
-    hub.probing.add(full);
-    let alive: boolean;
-    try {
-      alive = await probe(existing, hub.probeMs);
-    } finally {
-      hub.probing.delete(full);
+      return;
     }
-    if (alive) return refuse();
     if (ws.readyState !== 1 /* OPEN */) return;
-    if (registry.get(full) === existing) {
-      err(existing, undefined, "superseded", "a newer session connected with this identity");
-      existing.close();
+    if (registry.get(full) === holder) {
+      err(holder, undefined, "superseded", "a newer session connected with this identity");
+      holder.close();
       registry.delete(full);
     }
   }
@@ -351,6 +387,37 @@ async function handleHello(
   drainBoards(ws, db, true);
 }
 
+// A bare name means your own identity of that name, else the one identity
+// anyone has with it (as @name does in a post). Null once it has answered
+// the request with why not.
+function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
+  const { authed } = ws.data;
+  if (isValidIdentityName(input)) {
+    const name = input.toLowerCase();
+    if (repo.identities.findByUserAndName(authed.user_id, name)) {
+      input = formatDirectAddress(authed.user_email, name);
+    } else if (name === HUMAN_NAME) {
+      // Every linked user has one; listing them would only leak who linked.
+      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
+      return null;
+    } else {
+      const all = repo.identities.findAllByName(name);
+      if (all.length !== 1) {
+        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
+        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
+        return null;
+      }
+      input = formatDirectAddress(all[0]!.email, name);
+    }
+  }
+  try {
+    return parseAddress(input);
+  } catch (e) {
+    err(ws, reqId, "bad_request", String(e));
+    return null;
+  }
+}
+
 function handleSend(
   hub: Hub,
   ws: Ws,
@@ -361,41 +428,15 @@ function handleSend(
   pending: boolean,
 ): void {
   const { repo, db, registry } = hub;
-  if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
-    err(ws, reqId, "bad_request", "body exceeds 64 KiB limit");
-    return;
+  try {
+    dmBody(body);
+  } catch (e) {
+    return err(ws, reqId, "bad_request", (e as Error).message);
   }
 
   const { authed } = ws.data;
-
-  // A bare name means your own identity of that name, else the one identity
-  // anyone has with it (as @name does in a post).
-  if (isValidIdentityName(recipientStr)) {
-    const name = recipientStr.toLowerCase();
-    if (repo.identities.findByUserAndName(authed.user_id, name)) {
-      recipientStr = formatDirectAddress(authed.user_email, name);
-    } else if (name === HUMAN_NAME) {
-      // Every linked user has one; listing them would only leak who linked.
-      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
-      return;
-    } else {
-      const all = repo.identities.findAllByName(name);
-      if (all.length !== 1) {
-        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
-        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
-        return;
-      }
-      recipientStr = formatDirectAddress(all[0]!.email, name);
-    }
-  }
-
-  let parsed;
-  try {
-    parsed = parseAddress(recipientStr);
-  } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
-    return;
-  }
+  const parsed = resolvePeer(repo, ws, reqId, recipientStr);
+  if (!parsed) return;
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
@@ -501,11 +542,17 @@ function handleHistory(
   beforeId: number | undefined,
   repo: Repo,
 ): void {
+  let lim: number;
   try {
-    if (peer) parseAddress(peer); // validate
+    lim = historyLimit(limit);
   } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
-    return;
+    return err(ws, reqId, "bad_request", (e as Error).message);
+  }
+  let peerFull: string | undefined;
+  if (peer) {
+    const parsed = resolvePeer(repo, ws, reqId, peer);
+    if (!parsed) return;
+    peerFull = parsed.full;
   }
   const me = ws.data.identityFull;
   const cursors = new Map<string, number>();
@@ -513,7 +560,8 @@ function handleHistory(
     if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(to));
     return cursors.get(to)!;
   };
-  const messages = repo.messages.history(me, peer, limit, beforeId).map((m) =>
+  // Newest `lim` before beforeId, shown oldest first as in local mode.
+  const messages = repo.messages.history(me, peerFull, lim, beforeId).reverse().map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
   send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showPending) });

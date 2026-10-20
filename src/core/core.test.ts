@@ -215,7 +215,8 @@ test("a deferred push shows as unread, and reading the board delivers it", () =>
   expect(post(db, "fe", "e2e", "answer", mid.id).deferred).toEqual(["be"]);
   expect(listBoards(db, "be")[0]!.unread).toBe(1);
   expect(read(db, "be", "e2e").posts.map((p) => p.body)).toEqual(["answer"]);
-  expect(drain("be", true)).toEqual([]);
+  // Delivered by the read; the earlier pushes (be was push-subscribed) it didn't show still come.
+  expect(drain("be", true).map((i) => i.kind === "push" && i.post.body)).toEqual(["question", "me too"]);
 });
 
 test("digest subscribers aren't woken; the notice rides with the next wake", () => {
@@ -261,6 +262,20 @@ test("a thread mute rejects digest/quiet and posts on other boards", () => {
   const p = post(db, "be", "other", "x").post;
   expect(() => callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "quiet", thread: p.id })).toThrow(/"off".*"push"/);
   expect(() => callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "off", thread: p.id })).toThrow(/not a post on #e2e/);
+});
+
+test("reading delivers only the pushes it returns", () => {
+  subscribe(db, "fe", "e2e", "digest");
+  post(db, "be", "e2e", "one");
+  const mention = post(db, "be", "e2e", "@fe look").post;
+  const root = post(db, "sim", "e2e", "question").post;
+  post(db, "be", "e2e", "two");
+  // The unread read skips the pending mention; it must still push.
+  expect(read(db, "fe", "e2e").posts.map((p) => p.body)).toEqual(["one", "question", "two"]);
+  expect(pendingFor(db, "fe").map((i) => i.kind === "push" && i.post.id)).toEqual([mention.id]);
+  // Reading another thread doesn't deliver it either.
+  read(db, "fe", "e2e", { thread: root.id });
+  expect(pendingFor(db, "fe").map((i) => i.kind === "push" && i.post.id)).toEqual([mention.id]);
 });
 
 test("reading clears pending pushes for posts already seen", () => {

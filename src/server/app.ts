@@ -14,7 +14,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, humanReach);
-  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, {
+  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
 
@@ -55,7 +55,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake, slack);
+      return handleHttp(req, repo, db, config, wake, slack, disconnectUser);
     },
 
     websocket: handlers,
@@ -71,6 +71,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     server,
     repo,
     db,
+    // The heartbeat's auth re-check, for tests that run without it.
+    revalidate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
     stop() {

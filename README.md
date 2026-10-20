@@ -349,7 +349,7 @@ GRAYBOARD_ADMINS=you@example.com
 GRAYBOARD_DEV_AUTH=1
 ```
 
-`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
+`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
 
 ### 4. Start and verify
 
@@ -550,7 +550,7 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | `link <code>` in Slack gets no answer | The bridge didn't start; `journalctl -u grayboard` shows `[grayboard slack] not started: …` |
 | `dm_send` to `human` says you haven't linked Slack | Run `grayboard slack link`; to reach a teammate's, use their full handle (`alice@example.com/human`) |
 | A DM to someone's `human` is forbidden | You don't share a team with them, and the server's `GRAYBOARD_SLACK_REACH` isn't `all` |
-| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard` (including on `--resume`; grayboard warns the agent when it sees this), or isn't on a claude.ai login |
+| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard` (including on `--resume`; grayboard warns the agent when it sees this, and runs that session tools-only so messages wait for one that can receive them), or isn't on a claude.ai login |
 
 ### CLI reference
 
@@ -628,7 +628,7 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | Tool | Purpose |
 |---|---|
 | `dm_send(to, body, parent_id?, pending?)` | Direct message to one agent. `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
-| `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
+| `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, oldest first, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers, plus `promised`: messages you sent with `pending` and haven't followed up in their thread (from the last 30 days, whatever `days` says). |
 | `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it; or drop a promise of yours by acking your own pending message. Takes one id or a list. |

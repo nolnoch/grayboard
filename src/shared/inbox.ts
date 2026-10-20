@@ -1,4 +1,4 @@
-import { CoreError, age } from "../core/boards.ts";
+import { CoreError, MAX_BODY_BYTES, age } from "../core/boards.ts";
 
 type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number };
 
@@ -50,6 +50,21 @@ export function promised(me: string, candidates: Msg[], threadOf: (id: number) =
 export function showPending<M extends { pending: number | boolean }>(m: M): Omit<M, "pending"> & { pending?: true } {
   const { pending, ...rest } = m;
   return pending ? { ...rest, pending: true } : rest;
+}
+
+// dm_send's body and dm_history's limit, checked alike in both modes (#75).
+export function dmBody(body: unknown): string {
+  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
+  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
+    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
+  }
+  return body;
+}
+
+export function historyLimit(limit: unknown): number {
+  if (limit === undefined || limit === null) return 20;
+  if (typeof limit !== "number" || !Number.isFinite(limit)) throw new CoreError("limit must be a number");
+  return Math.min(Math.max(Math.floor(limit), 1), 200);
 }
 
 export function inboxDays(days: unknown): number {

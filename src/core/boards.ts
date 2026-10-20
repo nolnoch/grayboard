@@ -636,11 +636,12 @@ export function read(
     db.prepare(
       `UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE board = ? AND handle = ?`,
     ).run(maxId, board, handle);
-    // Anything you've now read no longer needs pushing.
+    // What you've now read no longer needs pushing; what this read skipped
+    // (a pending push it filters out, a post outside the thread) still does.
     db.prepare(
       `UPDATE outbox SET delivered_at = ? WHERE handle = ? AND delivered_at IS NULL
-         AND post_id IN (SELECT id FROM posts WHERE board = ? AND id <= ?)`,
-    ).run(Date.now(), handle, board, maxId);
+         AND post_id IN (SELECT value FROM json_each(?))`,
+    ).run(Date.now(), handle, JSON.stringify(posts.map((p) => p.id)));
   }
 
   const remaining = db

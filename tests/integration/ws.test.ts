@@ -394,6 +394,39 @@ test("admin revoke-session signs a user out of every session, ignoring an old CL
   }
 });
 
+test("revoking or disabling a user closes their open connections; the heartbeat catches a disable it missed", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const [root, alice] = await Promise.all([login("root@example.com"), login("alice@example.com")]);
+  const a = new Client(alice, "be");
+  await a.connect();
+  const closed = (c: Client) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
+
+  for (const path of ["/api/admin/revoke-session", "/api/admin/disable-user"]) {
+    await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
+    const bob = await login("bob@example.com");
+    const live = new Client(bob, "be");
+    const tools = new Client(bob, "fe", { push: false });
+    await Promise.all([live.connect(), tools.connect()]);
+    const gone = Promise.all([closed(live), closed(tools)]);
+    expect((await api(root, "POST", path, { email: "bob@example.com" })).status).toBe(200);
+    expect(await live.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
+    await gone;
+  }
+  expect((await a.call("board_list")).type).toBe("call_ok");
+
+  // Disabled behind the server's back (no admin route): the next tick closes it.
+  await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
+  const late = new Client(await login("bob@example.com"), "be");
+  await late.connect();
+  const gone = closed(late);
+  app.repo.users.setDisabled(app.repo.users.findByEmail("bob@example.com")!.id, true);
+  app.revalidate();
+  await gone;
+  expect((await a.call("board_list")).type).toBe("call_ok");
+});
+
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
   app.stop();
   app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
@@ -478,6 +511,26 @@ test("a connection that doesn't answer the probe is replaced", async () => {
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
 });
 
+test("a hello arriving while another probes the holder waits for it, so only one wins", async () => {
+  const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
+  const dead = new Client(alice, "be", { pong: false });
+  await dead.connect();
+  const n1 = new Client(alice, "be");
+  const first = n1.connect(); // probes the dead holder (150 ms)
+  await Bun.sleep(40);
+  dead.close(); // the holder goes away mid-probe
+  await Bun.sleep(40);
+  const n2 = new Client(alice, "be");
+  const [r1, r2] = await Promise.all([first, n2.connect()]);
+  expect(r1.type).toBe("hello_ok");
+  expect(r2).toMatchObject({ type: "error", code: "identity_in_use" });
+
+  const b = new Client(bob, "fe");
+  await b.connect();
+  expect(await b.request({ type: "send", recipient: "alice@example.com/be", body: "who?" })).toMatchObject({ delivered_now: true });
+  expect((await n1.next((m) => m.type === "push")).message.body).toBe("who?");
+});
+
 test("direct messages still deliver live", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -488,6 +541,24 @@ test("direct messages still deliver live", async () => {
   const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "hi" });
   expect(sent).toMatchObject({ type: "send_ok", delivered_now: true });
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
+});
+
+test("a handler that throws answers the call with an internal error and keeps the socket", async () => {
+  const alice = await login("alice@example.com");
+  const be = new Client(alice, "be");
+  const fe = new Client(alice, "fe");
+  await Promise.all([be.connect(), fe.connect()]);
+  await be.request({ type: "send", recipient: "fe", body: "hi" });
+  const id = (await fe.next((m) => m.type === "push")).message.id;
+  // Deleting the identity under its live connection makes the ack's cursor write fail.
+  expect((await api(alice, "DELETE", "/api/identities/fe")).status).toBe(200);
+  expect(await fe.request({ type: "ack", message_ids: [id] })).toMatchObject({ type: "error", code: "internal" });
+  expect((await fe.call("board_list")).type).toBe("call_ok");
+});
+
+test("login refuses an email no direct address can carry", async () => {
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "o'brien@example.com" }) });
+  expect(r.status).toBe(400);
 });
 
 test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
@@ -510,6 +581,23 @@ test("a bare DM recipient is your own identity of that name, else the only one w
   expect(amb).toMatchObject({ type: "error", code: "not_found" });
   expect(amb.message).toContain("bob@example.com/fe, carol@example.com/fe");
   expect(await a.request({ type: "send", recipient: "nobody", body: "?" })).toMatchObject({ type: "error", code: "not_found" });
+});
+
+test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
+  const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  await Promise.all([a.connect(), b.connect()]);
+  for (const body of ["one", "two", "three"]) await a.request({ type: "send", recipient: "fe", body });
+  expect(await a.request({ type: "send", recipient: "fe", body: "  " })).toMatchObject({ type: "error", code: "bad_request" });
+
+  const bodies = async (peer: string, limit?: number) =>
+    (await a.request({ type: "history", peer, ...(limit !== undefined ? { limit } : {}) })).messages.map((m: any) => m.body);
+  expect(await bodies("fe")).toEqual(["one", "two", "three"]);
+  expect(await bodies("Bob@Example.com/FE")).toEqual(["one", "two", "three"]);
+  expect(await bodies("fe", 2)).toEqual(["two", "three"]);
+  expect(await bodies("fe", 0)).toEqual(["three"]);
+  expect(await a.request({ type: "history", peer: "nobody" })).toMatchObject({ type: "error", code: "not_found" });
 });
 
 test("senders see what hasn't reached an offline peer", async () => {
@@ -615,8 +703,8 @@ test("a pending send is echoed, listed as promised until the sender's next messa
   expect(plain.pending).toBeUndefined();
   const promises = async () => (await a.request({ type: "inbox", days: 1 })).promised?.map((m: any) => m.id);
   expect(await promises()).toEqual([p.message_id]);
-  // History is newest first; only the pending row says so.
-  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([undefined, true]);
+  // History is oldest first; only the pending row says so.
+  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([true, undefined]);
 
   // Bob's reply doesn't keep it, and his ack (as its recipient) doesn't drop it.
   await b.request({ type: "send", recipient: "alice@example.com/be", body: "thanks", parent_id: p.message_id });

@@ -422,6 +422,18 @@ test("a thread reply to a bystander waits for its next wake, here a DM", async (
   expect(sim.pushes).toEqual(["ping", "fe asks", "answer for fe"]);
 }, 20_000);
 
+test("dm_send and dm_history check body and limit as server mode does", async () => {
+  await stop(await start("fe"));
+  const be = await start("be");
+  await expect(call(be, "dm_send", { to: "fe", body: " " })).rejects.toThrow("body is required");
+  await expect(call(be, "dm_send", { to: "fe", body: "x".repeat(64 * 1024 + 1) })).rejects.toThrow("body exceeds");
+  for (const body of ["one", "two", "three"]) await call(be, "dm_send", { to: "fe", body });
+  const bodies = async (limit: unknown) => (await call(be, "dm_history", { peer: "fe", limit })).map((m: any) => m.body);
+  expect(await bodies(2)).toEqual(["two", "three"]);
+  expect(await bodies(0)).toEqual(["three"]);
+  await expect(bodies("lots")).rejects.toThrow("limit must be a number");
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");
@@ -438,7 +450,7 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   expect(upfront).toEqual(["board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
-test("a Claude Code session started without a channels flag is warned that pushes are off", async () => {
+test("a Claude Code session started without a channels flag runs tools-only and is warned", async () => {
   // Stand-in for Claude Code: a process named `claude` (bun under another
   // name) that runs grayboard mcp as its child on inherited stdio, with
   // CLAUDECODE=1 as Claude Code sets. Its own flags come before "::".
@@ -464,6 +476,13 @@ Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"]
   const on = await session("fe", ["--dangerously-load-development-channels", "server:grayboard"]);
   expect(on.getInstructions()).not.toContain("Warning:");
   expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
+
+  // The flagless session would drop pushes yet mark them delivered: it takes
+  // none, so peers see it offline and a session with channels gets them later.
+  expect((await call(on, "dm_send", { to: "be", body: "waits" })).delivered_now).toBe(false);
+  const be = await startCollecting("be");
+  await Bun.sleep(500);
+  expect(be.pushes).toEqual(["waits"]);
 }, 20_000);
 
 async function cli(...args: string[]): Promise<{ code: number; out: string; err: string }> {

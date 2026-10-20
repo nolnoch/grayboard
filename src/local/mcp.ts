@@ -48,6 +48,8 @@ import {
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
+  dmBody,
+  historyLimit,
   inboxDays,
   promised,
   queuedNote,
@@ -81,7 +83,10 @@ if (HUMAN !== isHuman(db, IDENTITY)) {
 }
 // Claude Code started without a channels flag drops pushes silently; say so.
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
-if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: pushes are off");
+if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
+// Notifications such a session drops would still count as delivered, so it
+// runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
+const DELIVER = PUSH && !CHANNELS_OFF;
 
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
@@ -244,6 +249,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       parent_id?: number;
       pending?: boolean;
     };
+    dmBody(body);
     if (!rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
@@ -272,8 +278,7 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_history") {
-    const lim = Math.min(Math.max(a.limit ?? 20, 1), 200);
-    return text(getHistory(IDENTITY, a.peer, lim, a.before_id).map(showPending));
+    return text(getHistory(IDENTITY, a.peer, historyLimit(a.limit), a.before_id).map(showPending));
   }
 
   if (name === "dm_thread") {
@@ -400,9 +405,9 @@ async function drainToClaude(): Promise<void> {
 // Startup: refuse a duplicate identity before the MCP handshake so the client
 // shows the server as failed. Then connect MCP so notifications are accepted,
 // bind the wakeup socket (rechecking), and replay what arrived while offline.
-if (PUSH) await assertIdentityFree(IDENTITY);
+if (DELIVER) await assertIdentityFree(IDENTITY);
 // A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (PUSH) startSession(db, IDENTITY, process.cwd());
+if (DELIVER) startSession(db, IDENTITY, process.cwd());
 else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
 
@@ -421,7 +426,7 @@ process.on("SIGTERM", shutdown);
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
-if (PUSH) {
+if (DELIVER) {
   cleanup = await listenForWakeup(IDENTITY, () => {
     // A wakeup may follow another session's claim_take.
     expiry.arm();

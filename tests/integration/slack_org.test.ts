@@ -286,12 +286,14 @@ test("relinking from another Slack account starts new threads there", async () =
 }, 30_000);
 
 test("disabling a user takes their human offline; enabling brings it back", async () => {
-  const alice = await login("alice@example.com");
-  const root = await login("root@example.com");
+  const [alice, bob, root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
   await link(alice);
-  const be = await session(alice, "be");
+  // A teammate's agent, since disabling alice also closes her own agents' connections.
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+  const fe = await session(bob, "fe");
   expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
-  await be.call("dm_send", { to: "human", body: "while disabled" }).catch(() => {});
+  expect(await fe.call("dm_send", { to: "alice@example.com/human", body: "while disabled" })).toMatchObject({ delivered_now: false });
   await Bun.sleep(500);
   expect(posted("while disabled")).toBe(false);
   expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
