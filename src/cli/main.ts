@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync } from "node:fs";
-import { createInterface } from "node:readline/promises";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
@@ -344,26 +343,39 @@ program
   .option("-y, --yes", "Accept the defaults without asking")
   .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
     const interactive = !opts.yes && !!process.stdin.isTTY;
-    const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+    // Blocking reads from fd 0: Bun's stream stdin fails with EINVAL (kqueue) on macOS when stdin is /dev/tty, as in install.sh.
+    const question = (q: string): string => {
+      process.stdout.write(q);
+      const buf = Buffer.alloc(1);
+      let line = "";
+      for (;;) {
+        let n = 0;
+        try { n = readSync(0, buf, 0, 1, null); } catch (e) { if ((e as NodeJS.ErrnoException).code === "EAGAIN") continue; throw e; }
+        if (n === 0) throw new Error("stdin closed before setup finished");
+        const c = buf.toString();
+        if (c === "\n") return line;
+        line += c;
+      }
+    };
     const ask = async (q: string, dflt = ""): Promise<string> => {
-      if (!rl) return dflt;
-      const a = (await rl.question(dflt ? `${q} [${dflt}] ` : `${q} `)).trim() || dflt;
+      if (!interactive) return dflt;
+      const a = question(dflt ? `${q} [${dflt}] ` : `${q} `).trim() || dflt;
       return a || ask(q, dflt);
     };
     const confirm = async (q: string, dflt: boolean): Promise<boolean> => {
-      if (!rl) return dflt;
-      const a = (await rl.question(`${q} [${dflt ? "Y/n" : "y/N"}] `)).trim();
+      if (!interactive) return dflt;
+      const a = question(`${q} [${dflt ? "Y/n" : "y/N"}] `).trim();
       return a ? /^y/i.test(a) : dflt;
     };
 
-    try {
+    {
       const creds = loadCredentials();
 
       // 1. Mode
       let server = opts.server;
       if (!opts.local && !server) {
         const signedIn = busMode() === "server";
-        if (rl) console.log("How will your agents talk?\n  1) On this machine only (no account needed)\n  2) Through a team server");
+        if (interactive) console.log("How will your agents talk?\n  1) On this machine only (no account needed)\n  2) Through a team server");
         const pick = await ask("Choose", signedIn ? "2" : "1");
         if (pick === "2") {
           server = await ask("Server URL:", creds?.server ?? process.env.GRAYBOARD_SERVER);
@@ -468,8 +480,6 @@ program
         `Each session is named after its repo (in ~/code/api you're "api"). ` +
         `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
       );
-    } finally {
-      rl?.close();
     }
   });
 
