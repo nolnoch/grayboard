@@ -1,8 +1,7 @@
-import type { ServerWebSocket } from "bun";
 import type { MessageRow, Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
-import { formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
-import { canSend, type SendPrincipal } from "./can_send.ts";
+import { HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
+import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
@@ -39,13 +38,28 @@ export type WsData = {
   inflight?: Set<string>;
   // Set while a collision probe is waiting for this connection's pong.
   onPong?: () => void;
+  // The server's Slack bridge holding a user's human identity: the only
+  // connection allowed the reserved name, and drained like a human's session.
+  human?: true;
 };
 
-type Ws = ServerWebSocket<WsData>;
+// What the hub needs of a connection: a client's WebSocket, or an in-process
+// one (the Slack bridge's humans, src/server/slack.ts).
+export type Conn = {
+  data: WsData;
+  readonly readyState: number;
+  send(data: string): unknown;
+  close(): void;
+};
+
+type Ws = Conn;
 
 export type WsOptions = {
   // How long a live connection has to answer a collision probe.
   probeMs?: number;
+  humanReach?: HumanReach;
+  // Whether the Slack bridge is up; a linked human is reachable only then.
+  slackRunning?: () => boolean;
 };
 
 // Per server instance.
@@ -59,6 +73,8 @@ type Hub = {
   repo: Repo;
   db: CoreDb;
   probeMs: number;
+  humanReach: HumanReach;
+  slackRunning: () => boolean;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -86,10 +102,12 @@ function drainBoards(ws: Ws, db: CoreDb, all = false): void {
   }
 }
 
+// A human's session has no wakes to save: it gets deferred pushes and
+// digests at once.
 function wake(hub: Hub, handles: string[]): void {
   for (const h of handles) {
     const ws = hub.registry.get(h);
-    if (ws?.data.ready) drainBoards(ws, hub.db);
+    if (ws?.data.ready) drainBoards(ws, hub.db, ws.data.human === true);
   }
 }
 
@@ -116,7 +134,11 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 }
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
-  const hub: Hub = { registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db, probeMs: opts.probeMs ?? 2000 };
+  const hub: Hub = {
+    registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db,
+    probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
+    slackRunning: opts.slackRunning ?? (() => false),
+  };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
 
@@ -244,6 +266,11 @@ async function handleHello(
     ws.close();
     return;
   }
+  if ((name === HUMAN_NAME) !== (ws.data.human === true)) {
+    err(ws, reqId, "bad_request", name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities");
+    ws.close();
+    return;
+  }
 
   const { authed } = ws.data;
   const full = `${authed.user_email}/${name}`;
@@ -305,6 +332,7 @@ async function handleHello(
     identity_full: full,
     user_email: authed.user_email,
     teams,
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -346,6 +374,10 @@ function handleSend(
     const name = recipientStr.toLowerCase();
     if (repo.identities.findByUserAndName(authed.user_id, name)) {
       recipientStr = formatDirectAddress(authed.user_email, name);
+    } else if (name === HUMAN_NAME) {
+      // Every linked user has one; listing them would only leak who linked.
+      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
+      return;
     } else {
       const all = repo.identities.findAllByName(name);
       if (all.length !== 1) {
@@ -388,7 +420,7 @@ function handleSend(
     err(ws, reqId, "not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
     return;
   }
-  const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now() });
+  const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) {
     err(ws, reqId, decision.code, decision.reason);
     return;

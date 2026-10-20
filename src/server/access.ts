@@ -3,6 +3,8 @@
 // boards only to that team's members. Installed on the database by
 // openDatabase, so every core call is checked.
 import type { Access, Board } from "../core/boards.ts";
+import { HUMAN_NAME } from "../shared/addressing.ts";
+import { reachesHuman, type HumanReach } from "./can_send.ts";
 import type { Repo } from "./db.ts";
 
 function emailOf(handle: string): string | null {
@@ -14,7 +16,7 @@ function teamOf(scope: string | null): string | null {
   return scope?.startsWith("team:") ? scope.slice(5) : null;
 }
 
-export function serverAccess(repo: Repo): Access {
+export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Access {
   const isMember = (handle: string, teamName: string): boolean => {
     const email = emailOf(handle);
     const user = email ? repo.users.findByEmail(email) : undefined;
@@ -31,7 +33,7 @@ export function serverAccess(repo: Repo): Access {
   return {
     canSee,
 
-    // No human handles on a server yet (#24), so no human-only board.
+    // No server #announce yet (#24): a team board named announce stays ordinary.
     announceBoard: null,
 
     checkCreate(handle, scope) {
@@ -59,9 +61,14 @@ export function serverAccess(repo: Repo): Access {
       if (prefix === null) {
         const own = `${emailOf(author)}/${name}`;
         if (candidates.includes(own)) return own;
+        // A bare @human is only ever your own.
+        if (name === HUMAN_NAME) return null;
       }
-      const visible = candidates.filter((h) => canSee(h, board));
+      const visible = candidates.filter((h) => canSee(h, board) && reachesHuman(repo, humanReach, emailOf(author)!, h));
       return visible.length === 1 ? visible[0]! : null;
     },
+
+    // A thread reply reaches a human only as far as a DM could.
+    mayReach: (from, to) => reachesHuman(repo, humanReach, emailOf(from) ?? "", to),
   };
 }

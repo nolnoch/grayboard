@@ -8,6 +8,8 @@ export type AuditAction =
   | "auth.user_enabled"
   | "identity.created"
   | "identity.deleted"
+  | "slack.linked"
+  | "slack.unlinked"
   | "team.created"
   | "team.member_added"
   | "team.member_removed";

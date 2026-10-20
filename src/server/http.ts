@@ -6,11 +6,12 @@ import {
 } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
-import { isValidIdentityName } from "../shared/addressing.ts";
+import { HUMAN_NAME, HUMAN_RESERVED, isValidIdentityName } from "../shared/addressing.ts";
 import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
+import type { SlackLinker } from "./slack.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -131,6 +132,7 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreD
   const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
   const name = body.identity.toLowerCase();
+  if (name === HUMAN_NAME) return badRequest(`claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (!repo.identities.findByUserAndName(authed.user_id, name)) {
     return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
@@ -155,6 +157,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid identity name");
+  if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
   const existing = repo.identities.findByUserAndName(authed.user_id, name);
   if (existing) return conflict(`identity "${name}" already exists`);
   const identity = repo.identities.create(authed.user_id, name);
@@ -165,6 +168,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
 
 function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   name = name.toLowerCase();
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   const existing = repo.identities.findByUserAndName(authed.user_id, name);
   if (!existing) return notFound();
   repo.identities.remove(authed.user_id, name);
@@ -278,29 +282,33 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo):
   return json({ ok: true });
 }
 
-async function adminDisableUser(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function adminDisableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.users.setDisabled(target.id, true);
   writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
+  await slack?.userChanged(target.id);
   return json({ ok: true });
 }
 
-async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.users.setDisabled(target.id, false);
   writeAudit(repo, "auth.user_enabled", authed.user_email, body.email);
+  await slack?.userChanged(target.id);
   return json({ ok: true });
 }
 
 // ── main router ──────────────────────────────────────────────────────────────
 
-export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}): Promise<Response> {
+export async function handleHttp(
+  req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
+): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
   const method = req.method;
@@ -328,6 +336,18 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
     return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
   }
 
+  if (path.startsWith("/api/slack/") && !slack) {
+    return jsonErr("not_found", "this server has no Slack bridge (its admin sets SLACK_APP_TOKEN and SLACK_BOT_TOKEN)", 404);
+  }
+  // Unlinking still works: it's only database rows.
+  if (path === "/api/slack/link" && !slack!.running) {
+    return jsonErr("not_found", "this server's Slack bridge isn't running (its admin checks the server log)", 404);
+  }
+  if (path === "/api/slack/link" && method === "POST") return json(slack!.newCode(authed));
+  if (path === "/api/slack/unlink" && method === "POST") {
+    return slack!.unlink(authed.user_id) ? json({ ok: true }) : jsonErr("not_found", "you have no Slack link", 404);
+  }
+
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);
   if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo, db);
 
@@ -346,8 +366,8 @@ export async function handleHttp(req: Request, repo: Repo, db: CoreDb, config: C
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo);
-  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo);
-  if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo);
+  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, slack);
+  if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
 
   return notFound();
 }

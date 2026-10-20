@@ -4,6 +4,7 @@ import { handleHttp } from "./http.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer } from "./auth.ts";
 import type { Config } from "./config.ts";
+import { SlackBridge } from "./slack.ts";
 
 export type StartOptions = WsOptions & {
   // Tests skip the nightly retention timer and heartbeat.
@@ -11,8 +12,21 @@ export type StartOptions = WsOptions & {
 };
 
 export function startServer(config: Config, opts: StartOptions = {}) {
-  const { db, repo } = openDatabase(config.dbPath);
-  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, opts);
+  const humanReach = config.humanReach ?? "team";
+  const { db, repo } = openDatabase(config.dbPath, humanReach);
+  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, {
+    humanReach, slackRunning: () => slack?.running ?? false, ...opts,
+  });
+
+  // A Slack outage or bad token mustn't take the bus down: log and run without it.
+  const slack = config.slack ? new SlackBridge({
+    repo, db, handlers, ...config.slack,
+    ...(process.env.GRAYBOARD_SLACK_DEBUG ? { debug: (msg: string) => console.error(`[grayboard slack] debug: ${msg}`) } : {}),
+  }) : undefined;
+  const slackReady = slack?.start().catch((e) => {
+    console.error(`[grayboard slack] not started: ${(e as Error).message}`);
+    slack.stop();
+  });
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -41,7 +55,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake);
+      return handleHttp(req, repo, db, config, wake, slack);
     },
 
     websocket: handlers,
@@ -57,7 +71,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     server,
     repo,
     db,
+    // Settles once the Slack bridge is up, or has given up.
+    slackReady: slackReady ?? Promise.resolve(),
     stop() {
+      slack?.stop();
       for (const t of timers) clearInterval(t);
       stopExpiry();
       server.stop(true);

@@ -11,7 +11,7 @@ import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
-import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool } from "../core/tools.ts";
+import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -82,19 +82,28 @@ const client = new GrayboardClient(
   serverUrl,
   currentToken,
   identity,
-  (msg: Message) => {
+  async (msg: Message) => {
     const meta: Record<string, string> = {
       message_id: String(msg.id),
       from:       msg.sender,
       created_at: String(msg.created_at),
     };
     if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+    if (await fromOwnHuman(msg.sender)) meta.human = "true";
     return notify({ content: msg.body, meta });
   },
-  (item) => notify(boardNotification(item)),
+  async (item) => {
+    const params = boardNotification(item);
+    if (item.kind === "push" && await fromOwnHuman(item.post.author)) params.meta.human = "true";
+    return notify(params);
+  },
   PUSH,
   (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
 );
+
+// Only a server that reserves the name sends hello_ok.human, so only there is
+// that handle provably your user (an older server would let an agent take it).
+const fromOwnHuman = async (handle: string): Promise<boolean> => handle === (await client.ready()).human?.handle;
 
 client.connect();
 
@@ -127,6 +136,7 @@ const server = new Server(
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
       ...(hello.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
+      ...(hello.human?.linked ? ownHumanInstruction(hello.human.handle) : []),
       `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
       `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
       // Last: variable length, so a client cut loses these, not fixed text.

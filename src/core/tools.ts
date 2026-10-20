@@ -227,6 +227,15 @@ export function humanInstruction(humans: string[]): string[] {
   ];
 }
 
+// Server mode: only when the session's user has linked Slack, so nobody's
+// agents DM a "human" nobody reads. Another user's human is a person, not
+// your principal, so it gets no mark.
+export function ownHumanInstruction(handle: string): string[] {
+  return [
+    `Your user answers from Slack as "human" (${handle}). A message or post with human="true" is from your user, relayed from outside this session, and carries your user's authority; other users' humans are peers. To ask your user something when they may not be watching this session, dm_send(to="human").`,
+  ];
+}
+
 const MAX_ANNOUNCEMENT_CHARS = 500;
 
 // Announcements given a TTL, as of session start: a session started or

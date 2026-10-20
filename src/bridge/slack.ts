@@ -52,7 +52,7 @@ export async function startSlackBridge(
   // On a server, only the server can vouch that a handle is a human; this
   // bridge would relay fine but its messages would arrive unmarked.
   if (mode !== "local" && busMode(env) === "server") {
-    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server it needs the org bridge (docs/future/org-bridge.md). To relay this machine's local bus instead, pass --mode local");
+    throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server, use its Slack app instead (grayboard slack link). To relay this machine's local bus instead, pass --mode local");
   }
   const cfg = loadConfig(env);
   declareBridgeHuman(cfg.handle, env);

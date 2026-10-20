@@ -41,6 +41,10 @@ export type HelloOk     = {
   // Sentences for the session's MCP instructions: active claims, and direct
   // messages you sent that still haven't arrived a day later.
   notices?: string[];
+  // Your user's human identity. Sent by servers that reserve its name for the
+  // Slack bridge, so a message from that handle can only be your user's.
+  // linked: whether anyone reads it (the user has linked Slack).
+  human?: { handle: string; linked: boolean };
 };
 export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;

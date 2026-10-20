@@ -35,3 +35,11 @@ export function formatTeamAddress(name: string): string {
 export function isValidIdentityName(name: string): boolean {
   return NAME_RE.test(name.toLowerCase());
 }
+
+// On a server, every user's human identity has this name, and only the
+// server's Slack bridge can hold it: so "<email>/human" is that user's person,
+// and a bare "human" means your own.
+export const HUMAN_NAME = "human";
+
+export const HUMAN_RESERVED =
+  `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;

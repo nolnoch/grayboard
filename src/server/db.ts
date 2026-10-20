@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { setAccess } from "../core/boards.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { serverAccess } from "./access.ts";
+import type { HumanReach } from "./can_send.ts";
 
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
@@ -12,6 +13,12 @@ export type Session  = { id: number; user_id: number; token_hash: string; create
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
+// A user's Slack link: their member ID and their DM with the bridge's app.
+export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
+// thread_ts: the Slack top-level message. root_id: the grayboard thread's root
+// (message id for dm, post id for board). peer: the other party in a dm.
+// last_id: the newest grayboard id in the thread, the parent for a reply.
+export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 
 export interface Repo {
@@ -73,9 +80,23 @@ export interface Repo {
     write(row: AccessLogRow): void;
     prune(olderThanMs: number): void;
   };
+  slack: {
+    links(): SlackLink[];
+    linkFor(userId: number): SlackLink | undefined;
+    linkBySlackUser(slackUser: string): SlackLink | undefined;
+    // Replaces the user's earlier link, if any.
+    link(userId: number, slackUser: string, dmChannel: string): void;
+    // Also forgets the user's thread map.
+    unlink(userId: number): void;
+    thread(userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
+    threadByTs(userId: number, threadTs: string): SlackThread | undefined;
+    addThread(userId: number, t: SlackThread): void;
+    // Moves a thread's reply target forward, never back.
+    advanceThread(userId: number, threadTs: string, id: number): void;
+  };
 }
 
-export function openDatabase(path: string): { db: Database; repo: Repo } {
+export function openDatabase(path: string, humanReach: HumanReach = "team"): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.exec(
@@ -84,7 +105,7 @@ export function openDatabase(path: string): { db: Database; repo: Repo } {
   initSchema(db);
   initCoreSchema(db);
   const repo = makeRepo(db);
-  setAccess(db, serverAccess(repo));
+  setAccess(db, serverAccess(repo, humanReach));
   return { db, repo };
 }
 
@@ -161,6 +182,27 @@ function initSchema(db: Database): void {
       detail TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_at ON access_log(at);
+
+    -- The Slack bridge (src/server/slack.ts): who is linked, and which Slack
+    -- thread holds which grayboard thread. board is '' for a dm, so the
+    -- UNIQUE constraint holds (NULLs never collide).
+    CREATE TABLE IF NOT EXISTS slack_links (
+      user_id    INTEGER PRIMARY KEY REFERENCES users(id),
+      slack_user TEXT NOT NULL UNIQUE,
+      dm_channel TEXT NOT NULL,
+      linked_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS slack_threads (
+      user_id   INTEGER NOT NULL REFERENCES users(id),
+      thread_ts TEXT NOT NULL,
+      kind      TEXT NOT NULL CHECK (kind IN ('dm','board')),
+      board     TEXT NOT NULL DEFAULT '',
+      root_id   INTEGER NOT NULL,
+      peer      TEXT,
+      last_id   INTEGER NOT NULL,
+      PRIMARY KEY (user_id, thread_ts),
+      UNIQUE (user_id, kind, board, root_id)
+    );
 
     -- Received direct messages marked handled without a reply (dm_ack).
     CREATE TABLE IF NOT EXISTS dm_acks (
@@ -457,6 +499,66 @@ function makeRepo(db: Database): Repo {
       },
       prune(olderThanMs) {
         db.run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
+      },
+    },
+
+    slack: {
+      links() {
+        return db.query<SlackLink, []>(
+          "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id ORDER BY l.user_id",
+        ).all();
+      },
+      linkFor(userId) {
+        return db.query<SlackLink, [number]>(
+          "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.user_id = ?",
+        ).get(userId) ?? undefined;
+      },
+      linkBySlackUser(slackUser) {
+        return db.query<SlackLink, [string]>(
+          "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.slack_user = ?",
+        ).get(slackUser) ?? undefined;
+      },
+      link(userId, slackUser, dmChannel) {
+        db.transaction(() => {
+          // Threads live in the old account's DM; a new account starts fresh.
+          db.run(
+            `DELETE FROM slack_threads WHERE user_id = ?
+               AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
+            [userId, userId, slackUser, dmChannel],
+          );
+          db.run(
+            `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
+            [userId, slackUser, dmChannel, Date.now()],
+          );
+        })();
+      },
+      unlink(userId) {
+        db.transaction(() => {
+          db.run("DELETE FROM slack_threads WHERE user_id = ?", [userId]);
+          db.run("DELETE FROM slack_links WHERE user_id = ?", [userId]);
+        })();
+      },
+      thread(userId, kind, board, rootId) {
+        const r = db.query<SlackThread, [number, string, string, number]>(
+          "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND kind = ? AND board = ? AND root_id = ?",
+        ).get(userId, kind, board ?? "", rootId);
+        return r ? { ...r, board: r.board || null } : undefined;
+      },
+      threadByTs(userId, threadTs) {
+        const r = db.query<SlackThread, [number, string]>(
+          "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND thread_ts = ?",
+        ).get(userId, threadTs);
+        return r ? { ...r, board: r.board || null } : undefined;
+      },
+      addThread(userId, t) {
+        db.run(
+          `INSERT OR IGNORE INTO slack_threads (user_id, thread_ts, kind, board, root_id, peer, last_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [userId, t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id],
+        );
+      },
+      advanceThread(userId, threadTs, id) {
+        db.run("UPDATE slack_threads SET last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?", [id, userId, threadTs]);
       },
     },
   };
