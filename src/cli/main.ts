@@ -291,6 +291,17 @@ program
     await humanCommand((m) => m.runAnnounce(text.join(" "), opts.ttl));
   });
 
+const boardCmd = program.command("board").description("Boards, as your human handle");
+
+boardCmd
+  .command("create <name> <purpose...>")
+  .description("Create a board as your human handle (agents create theirs with board_create)")
+  .option("--mode <mode>", "local: the local bus on a machine signed in to a server")
+  .action(async (name: string, purpose: string[], opts: { mode?: string }) => {
+    requireLocalBus(opts.mode);
+    await humanCommand((m) => m.runBoardCreate(name, purpose.join(" ")));
+  });
+
 // ── bridge (opt-in) ──────────────────────────────────────────────────────────
 
 const bridgeCmd = program

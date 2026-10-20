@@ -136,6 +136,57 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
   store.close();
 });
 
+// A relay whose bus answers from `results` and records calls, and whose Slack
+// records what the bridge says.
+function owned(results: Record<string, { ok: true; value: any } | { ok: false; error: string }>) {
+  const calls: [string, Record<string, unknown>][] = [];
+  const said: string[] = [];
+  const reacted: string[] = [];
+  const bus: Bus = {
+    call: async (name, args) => {
+      calls.push([name, args]);
+      return results[name] ?? { ok: true, value: {} };
+    },
+  };
+  const f: Fetch = async (url, init) => {
+    const body = JSON.parse(String(init.body));
+    if (String(url).endsWith("reactions.add")) reacted.push(body.timestamp);
+    else said.push(body.markdown_text);
+    return Response.json({ ok: true, ts: "9.0" });
+  };
+  const store = new Store(join(dir, "b.db"));
+  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: () => {} });
+  const send = (text: string) => relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text, ts: "1.0" } });
+  return { calls, said, reacted, send, close: () => store.close() };
+}
+
+test("slack: new #board creates it, quiet for the owner; without a purpose it asks for one", async () => {
+  const r = owned({ board_create: { ok: true, value: { name: "workspace" } } });
+  await r.send("new #Workspace: lane count and naming");
+  expect(r.calls).toEqual([
+    ["board_create", { name: "workspace", purpose: "lane count and naming" }],
+    ["board_subscribe", { board: "workspace", mode: "quiet" }],
+  ]);
+  expect(r.reacted).toEqual(["1.0"]);
+  expect(r.said[0]).toContain("created #workspace");
+
+  r.calls.length = 0;
+  await r.send("new #workspace");
+  expect(r.calls).toEqual([]);
+  expect(r.said[1]).toContain("not created: say what #workspace is for");
+  r.close();
+});
+
+test("slack: posting to a missing board lists the boards and how to make it", async () => {
+  const r = owned({
+    board_post: { ok: false, error: "no such board #workspce; see board_list" },
+    board_list: { ok: true, value: [{ name: "ops" }, { name: "workspace" }] },
+  });
+  await r.send("#workspce how many lanes?");
+  expect(r.said).toEqual([`⚠️ not posted: no board #workspce (boards: #ops, #workspace). To make it: "new #workspce what it's for"`]);
+  r.close();
+});
+
 // ── socket ───────────────────────────────────────────────────────────────────
 
 // A WebSocket server that completes the handshake, says hello, and then goes

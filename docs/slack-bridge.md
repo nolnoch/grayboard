@@ -3,7 +3,7 @@
 ```doc-meta
 owns: the local Slack bridge (grayboard bridge slack) and human handles
 invariants: the bridge is an MCP client of its own grayboard mcp child and acts on the bus only through public tools, except the human declaration it writes before the child starts; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; the human handle is a persistent declaration and BUS_HUMAN=1 only asserts it; the bridge never joins a server (`--mode local` pins its child to the local bus)
-code-pointers: src/bridge/ (slack.ts wiring and human declaration, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (declareHuman, isHuman, humanHandles), src/local/mcp.ts (startup check, human meta and instruction), src/local/human.ts (grayboard human, grayboard announce), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
+code-pointers: src/bridge/ (slack.ts wiring and human declaration, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (declareHuman, isHuman, humanHandles), src/local/mcp.ts (startup check, human meta and instruction), src/local/human.ts (grayboard human, grayboard announce, grayboard board create), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
 companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distributed design, not built)
 ```
 
@@ -41,9 +41,10 @@ Slack → grayboard. A `message` event is accepted only if:
 - `user` is the configured owner (anyone else in the channel is ignored, so adding a person to the channel never lets them command agents),
 - no `subtype` and no `bot_id` (drops edits, deletes, joins, bot posts).
 
-Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last_id`; top-level `@handle text` → new DM; top-level `#board text` → new post; anything else → a usage hint in the thread. A new top-level conversation maps the human's own message ts, so the agent's reply lands under it.
+Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last_id`; top-level `@handle text` → new DM; top-level `#board text` → new post; top-level `new #board purpose` → `board_create`; anything else → a usage hint in the thread. A new top-level conversation maps the human's own message ts, so the agent's reply lands under it.
 
-- Feedback: ✅ reaction when delivered now (DM) or posted (board); a thread reply with last-seen time for a queued DM; tool errors relayed verbatim. On a phone, silence is indistinguishable from failure.
+- Feedback: ✅ reaction when delivered now (DM) or posted (board); a thread reply with last-seen time for a queued DM; tool errors relayed verbatim, except "no such board", which names the existing boards and the create form, since the bus's own pointer (`board_list`) is a tool the human can't call. On a phone, silence is indistinguishable from failure.
+- **`#board text` never creates a board.** A typo (`#dev-deploy` for `#dev-deploys`) would start a stray board that no agent follows; creating is a separate, explicit form. A board the human creates (here or `grayboard board create`) subscribes them `quiet`, not `push` as for agents: replies to their posts and @mentions reach them in every mode, while push would relay every post on the board to their phone.
 - Text cleanup: Slack's `&amp;`/`&lt;`/`&gt;` are unescaped and `<url|label>` becomes `label (url)`. `@be` typed by the human isn't a Slack user, so it arrives as plain text.
 - A board thread may have many agents; a Slack reply posts to the board thread and grayboard's fan-out wakes its unmuted authors. A DM thread always has exactly two parties.
 
