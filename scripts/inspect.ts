@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
-// Local, read-only web view of a local-mode bus database: boards and their
-// threads, DM conversations, handles, claims and their history, and search.
+// Local, read-only web view of a bus database: boards and their threads, DM
+// conversations, handles, claims and their history, and search. On a team
+// server's database it adds users, teams and the audit log.
 //
 //   bun scripts/inspect.ts [--db PATH] [--port N]
 //
@@ -26,6 +27,9 @@ db.exec("PRAGMA busy_timeout = 5000");
 
 const all = (sql: string, ...p: (string | number)[]) => db.prepare(sql).all(...p);
 const DAY = 86_400_000;
+// A team server's messages carry recipient_type; only 'user' rows are DMs.
+const SERVER = (all(`PRAGMA table_info(messages)`) as { name: string }[]).some((c) => c.name === "recipient_type");
+const DM = SERVER ? "recipient_type = 'user'" : "1";
 
 // ── API ─────────────────────────────────────────────────────────────────────
 
@@ -36,7 +40,7 @@ function overview() {
     totals: db.prepare(`SELECT
         (SELECT COUNT(*) FROM boards)   AS boards,
         (SELECT COUNT(*) FROM posts)    AS posts,
-        (SELECT COUNT(*) FROM messages) AS dms,
+        (SELECT COUNT(*) FROM messages WHERE ${DM}) AS dms,
         (SELECT COUNT(*) FROM handles)  AS handles,
         (SELECT COUNT(*) FROM claims)   AS claims`).get(),
     boards: all(`SELECT b.name, b.purpose, b.scope, b.created_by, b.created_at,
@@ -47,14 +51,14 @@ function overview() {
       GROUP BY b.name ORDER BY last_post DESC`),
     handles: all(`SELECT h.name, h.first_seen, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human,
         (SELECT COUNT(*) FROM posts WHERE author = h.name)       AS posts,
-        (SELECT COUNT(*) FROM messages WHERE sender = h.name)    AS dms_sent,
-        (SELECT COUNT(*) FROM messages WHERE recipient = h.name) AS dms_recv
+        (SELECT COUNT(*) FROM messages WHERE ${DM} AND sender = h.name)    AS dms_sent,
+        (SELECT COUNT(*) FROM messages WHERE ${DM} AND recipient = h.name) AS dms_recv
       FROM handles h ORDER BY h.last_seen DESC`),
     // Per-day activity for the last 30 days, local time.
     daily: all(`SELECT day, SUM(kind = 'post') AS posts, SUM(kind = 'dm') AS dms FROM (
         SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day, 'post' AS kind FROM posts WHERE created_at >= ?1
         UNION ALL
-        SELECT date(created_at / 1000, 'unixepoch', 'localtime'), 'dm' FROM messages WHERE created_at >= ?1
+        SELECT date(created_at / 1000, 'unixepoch', 'localtime'), 'dm' FROM messages WHERE ${DM} AND created_at >= ?1
       ) GROUP BY day ORDER BY day`, since),
   };
 }
@@ -71,14 +75,14 @@ function board(name: string) {
 function conversations() {
   return all(`SELECT MIN(sender, recipient) AS a, MAX(sender, recipient) AS b,
       COUNT(*) AS messages, MAX(created_at) AS last_at, SUM(pending) AS pending
-    FROM messages GROUP BY a, b ORDER BY last_at DESC`);
+    FROM messages WHERE ${DM} GROUP BY a, b ORDER BY last_at DESC`);
 }
 
 function conversation(a: string, b: string) {
   return all(`SELECT m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending,
       k.acked_at
     FROM messages m LEFT JOIN dm_acks k ON k.message_id = m.id AND k.reader = m.recipient
-    WHERE (m.sender = ?1 AND m.recipient = ?2) OR (m.sender = ?2 AND m.recipient = ?1)
+    WHERE ${DM} AND ((m.sender = ?1 AND m.recipient = ?2) OR (m.sender = ?2 AND m.recipient = ?1))
     ORDER BY m.id`, a, b);
 }
 
@@ -95,8 +99,32 @@ function search(q: string) {
     posts: all(`SELECT id, board, author, body, parent_id, created_at FROM posts
       WHERE body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 200`, like),
     dms: all(`SELECT id, sender, recipient, body, created_at FROM messages
-      WHERE body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 200`, like),
+      WHERE ${DM} AND body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 200`, like),
   };
+}
+
+// Server only. A handle is "<email>/<identity>", so a user owns the handles
+// that start with their email and a slash.
+const OWNS = (col: string) => `substr(${col}, 1, length(u.email) + 1) = u.email || '/'`;
+function users() {
+  return {
+    users: all(`SELECT u.email, u.display_name, u.created_at, u.disabled_at,
+        (SELECT COUNT(*) FROM identities WHERE user_id = u.id) AS identities,
+        (SELECT COUNT(*) FROM sessions WHERE user_id = u.id AND revoked_at IS NULL) AS sessions,
+        (SELECT MAX(last_used_at) FROM sessions WHERE user_id = u.id) AS last_used,
+        (SELECT MAX(last_seen) FROM handles WHERE ${OWNS("name")}) AS last_seen,
+        (SELECT COUNT(*) FROM posts WHERE ${OWNS("author")}) AS posts,
+        (SELECT COUNT(*) FROM messages WHERE ${DM} AND ${OWNS("sender")}) AS dms_sent,
+        (SELECT GROUP_CONCAT(t.name, ' ') FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = u.id) AS teams
+      FROM users u ORDER BY last_seen DESC, last_used DESC`),
+    teams: all(`SELECT t.name, t.created_at, c.email AS created_by,
+        (SELECT GROUP_CONCAT(u.email, ' ') FROM team_members m JOIN users u ON u.id = m.user_id WHERE m.team_id = t.id) AS members
+      FROM teams t JOIN users c ON c.id = t.created_by ORDER BY t.name`),
+  };
+}
+
+function audit() {
+  return all(`SELECT id, at, actor, action, target, detail FROM access_log ORDER BY id DESC LIMIT 500`);
 }
 
 function api(url: URL): unknown {
@@ -108,6 +136,11 @@ function api(url: URL): unknown {
     case "/api/conversation":  return conversation(q("a"), q("b"));
     case "/api/claims":        return claims();
     case "/api/search":        return search(q("q"));
+    case "/api/meta":          return { server: SERVER };
+  }
+  if (SERVER) switch (url.pathname) {
+    case "/api/users":         return users();
+    case "/api/audit":         return audit();
   }
   return undefined;
 }
@@ -122,7 +155,7 @@ const server = Bun.serve({
     return body === undefined ? new Response("not found", { status: 404 }) : Response.json(body);
   },
 });
-console.log(`grayboard inspect: ${server.url} (${args.db}, read-only)`);
+console.log(`grayboard inspect: ${server.url} (${args.db}, ${SERVER ? "team server, " : ""}read-only)`);
 
 // ── page ────────────────────────────────────────────────────────────────────
 
@@ -183,7 +216,7 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 </style></head>
 <body>
 <header><b>grayboard</b>
-<nav><a href="#/">Overview</a><a href="#/dms">DMs</a><a href="#/claims">Claims</a></nav>
+<nav id="nav"><a href="#/">Overview</a><a href="#/dms">DMs</a><a href="#/claims">Claims</a></nav>
 <form id="sf"><input type="search" id="sq" placeholder="Search posts and DMs"></form>
 </header>
 <main id="app"></main>
@@ -333,6 +366,34 @@ async function claimsView() {
     ], c.events) : h("p", { class: "muted" }, "None."));
 }
 
+async function usersView() {
+  const d = await get("/api/users");
+  render(h("h2", {}, "Users"),
+    table([
+      ["Email", (u) => [u.email, u.disabled_at ? [" ", chip("disabled " + fmt(u.disabled_at), "warn")] : null]],
+      ["Name", (u) => u.display_name || ""],
+      ["Teams", (u) => (u.teams || "").split(" ").filter(Boolean).map((t) => [link("#/board/" + enc(t), "#" + t), " "])],
+      ["Identities", (u) => u.identities, 1], ["Sessions", (u) => u.sessions, 1],
+      ["Posts", (u) => u.posts, 1], ["DMs out", (u) => u.dms_sent, 1],
+      ["Last seen", (u) => ago(u.last_seen)], ["Token used", (u) => ago(u.last_used)], ["Joined", (u) => fmt(u.created_at)],
+    ], d.users),
+    h("h2", {}, "Teams"),
+    d.teams.length ? table([
+      ["Team", (t) => link("#/board/" + enc(t.name), "#" + t.name)],
+      ["Members", (t) => (t.members || "").split(" ").filter(Boolean).map((m) => [chip(m), " "])],
+      ["Created", (t) => [t.created_by, " · ", fmt(t.created_at)]],
+    ], d.teams) : h("p", { class: "muted" }, "None."));
+}
+
+async function auditView() {
+  const rows = await get("/api/audit");
+  render(h("h2", {}, "Audit log"),
+    rows.length ? table([
+      ["When", (r) => fmt(r.at)], ["Action", (r) => chip(r.action)], ["Actor", (r) => r.actor || ""],
+      ["Target", (r) => r.target || ""], ["Detail", (r) => h("span", { class: "muted" }, r.detail || "")],
+    ], rows) : h("p", { class: "muted" }, "None."));
+}
+
 async function searchView(q) {
   const r = await get("/api/search?q=" + enc(q));
   render(h("h2", {}, "Search: " + q),
@@ -351,6 +412,7 @@ function route() {
   const views = {
     "": overview, board: () => boardView(parts[1]), dms: dmsView, dm: () => conversationView(parts[1], parts[2]),
     handle: () => handleView(parts[1]), claims: claimsView, search: () => searchView(parts.slice(1).join("/")),
+    users: usersView, audit: auditView,
   };
   (views[parts[0]] || overview)().catch((e) => render(h("p", { class: "chip warn" }, String(e))));
 }
@@ -360,5 +422,7 @@ document.getElementById("sf").addEventListener("submit", (e) => {
   if (q) location.hash = "#/search/" + enc(q);
 });
 addEventListener("hashchange", route);
-route();
+get("/api/meta").then((m) => {
+  if (m.server) document.getElementById("nav").append(link("#/users", "Users"), link("#/audit", "Audit"));
+}).finally(route);
 </script></body></html>`;
