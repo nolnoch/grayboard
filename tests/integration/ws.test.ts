@@ -478,6 +478,26 @@ test("a connection that doesn't answer the probe is replaced", async () => {
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
 });
 
+test("a hello arriving while another probes the holder waits for it, so only one wins", async () => {
+  const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
+  const dead = new Client(alice, "be", { pong: false });
+  await dead.connect();
+  const n1 = new Client(alice, "be");
+  const first = n1.connect(); // probes the dead holder (150 ms)
+  await Bun.sleep(40);
+  dead.close(); // the holder goes away mid-probe
+  await Bun.sleep(40);
+  const n2 = new Client(alice, "be");
+  const [r1, r2] = await Promise.all([first, n2.connect()]);
+  expect(r1.type).toBe("hello_ok");
+  expect(r2).toMatchObject({ type: "error", code: "identity_in_use" });
+
+  const b = new Client(bob, "fe");
+  await b.connect();
+  expect(await b.request({ type: "send", recipient: "alice@example.com/be", body: "who?" })).toMatchObject({ delivered_now: true });
+  expect((await n1.next((m) => m.type === "push")).message.body).toBe("who?");
+});
+
 test("direct messages still deliver live", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

@@ -66,8 +66,8 @@ export type WsOptions = {
 type Hub = {
   // identity_full -> open WebSocket
   registry: Map<string, Ws>;
-  // identity_full values with a hello currently probing the existing holder
-  probing: Set<string>;
+  // identity_full -> the probe a hello is running against its holder
+  probing: Map<string, Promise<boolean>>;
   // Tools-only connections (hello push: false): pinged, never pushed to.
   toolsOnly: Set<Ws>;
   repo: Repo;
@@ -135,7 +135,7 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
-    registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db,
+    registry: new Map(), probing: new Map(), toolsOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
   };
@@ -285,27 +285,34 @@ async function handleHello(
   // One live connection per identity. If the current holder still answers,
   // refuse the newcomer: taking over would let a stray second session (e.g.
   // a worktree that inherited .mcp.json) silently steal this identity's
-  // deliveries. A holder that doesn't answer is dead; replace it.
-  const existing = push ? registry.get(full) : undefined;
-  if (existing && existing !== ws) {
-    const refuse = () => {
+  // deliveries. A holder that doesn't answer is dead; replace it. Each await
+  // can change the registry (a close, another hello), so after one, check
+  // again from the top; between the last check and registry.set below
+  // nothing awaits (#69).
+  while (push) {
+    const inFlight = hub.probing.get(full);
+    if (inFlight) {
+      // Another hello is probing the holder: whoever wins, it's settled after.
+      await inFlight;
+      if (ws.readyState !== 1 /* OPEN */) return;
+      continue;
+    }
+    const holder = registry.get(full);
+    if (!holder || holder === ws) break;
+    const probing = probe(holder, hub.probeMs).finally(() => {
+      if (hub.probing.get(full) === probing) hub.probing.delete(full);
+    });
+    hub.probing.set(full, probing);
+    if (await probing) {
       err(ws, reqId, "identity_in_use",
         `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
       ws.close();
-    };
-    if (hub.probing.has(full)) return refuse();
-    hub.probing.add(full);
-    let alive: boolean;
-    try {
-      alive = await probe(existing, hub.probeMs);
-    } finally {
-      hub.probing.delete(full);
+      return;
     }
-    if (alive) return refuse();
     if (ws.readyState !== 1 /* OPEN */) return;
-    if (registry.get(full) === existing) {
-      err(existing, undefined, "superseded", "a newer session connected with this identity");
-      existing.close();
+    if (registry.get(full) === holder) {
+      err(holder, undefined, "superseded", "a newer session connected with this identity");
+      holder.close();
       registry.delete(full);
     }
   }
