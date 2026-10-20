@@ -273,3 +273,13 @@ test("grayboard claim in server mode acts as one of your identities; its session
   expect(unknown.code).toBe(1);
   expect(unknown.err).toContain(`no session has used identity "nope"`);
 }, 20_000);
+
+test("a frame the server can't parse is answered with its req_id, so the call fails instead of hanging (#40)", async () => {
+  const noop = async () => {};
+  const token = await login("alice@example.com");
+  const be = new GrayboardClient(base, () => token, "be", noop, noop);
+  be.connect();
+  await be.ready();
+  await expect(be.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: "5" })).rejects.toThrow(/bad_request: .*parent_id/);
+  be.close();
+}, 20_000);

@@ -73,6 +73,7 @@ Frames: derive from `src/shared/protocol.ts` (validated by hand in `parseClientM
 - Waits at most 10s for `hello_ok` before the MCP handshake, and exits with the reason on refusal or no answer, so `/mcp` shows an error instead of hitting Claude Code's own 30s startup timeout. The MCP server is built after `hello_ok`, so its instructions include the notices.
 - Holds pushes until Claude Code sends `initialized` (earlier notifications are dropped by Claude Code) and acks only after sending.
 - Push format: `notifications/claude/channel` with `{content: body, meta}`; Claude Code renders the `<channel source="grayboard" …>` tag from `meta`.
+- Every request settles by `req_id`, so the server answers a frame it can't parse with the frame's `req_id` when it has one; a 30s client timeout (`REQUEST_TIMEOUT_MS`) backstops any answer that still never names it (#40).
 - `identity_in_use` fails startup (or exits on reconnect); `superseded` exits. Neither retries. Otherwise reconnect with backoff 1s → 30s cap.
 
 ## 7. Postgres seam

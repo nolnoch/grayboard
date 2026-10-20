@@ -140,7 +140,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       try {
         msg = parseClientMessage(parsed);
       } catch (e) {
-        err(ws, undefined, "bad_request", String(e));
+        // Echo the req_id when there is one, or the client's call waits forever (#40).
+        const reqId = (parsed as { req_id?: unknown } | null)?.req_id;
+        err(ws, typeof reqId === "string" ? reqId : undefined, "bad_request", String(e));
         return;
       }
 

@@ -2,6 +2,9 @@ import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/p
 import { refOf, type Pending } from "../core/boards.ts";
 import { describeLocation } from "../shared/identity.ts";
 
+// Server tool calls are single DB transactions; one unanswered this long never will be.
+const REQUEST_TIMEOUT_MS = 30_000;
+
 // Both resolve once the item has been handed to the agent; it's acked after
 // that, so a failed handoff is resent on the next connection.
 export type PushCallback = (msg: Message) => Promise<void>;
@@ -208,7 +211,14 @@ export class GrayboardClient {
       }
       const req_id = this.nextId();
       const full = { ...msg, req_id } as ClientMessage;
-      this.pending.set(req_id, { resolve: resolve as (m: ServerMessage) => void, reject });
+      // Backstop for an answer that never names this req_id (#40): fail the tool call instead of hanging it.
+      const timer = setTimeout(() => {
+        if (this.pending.delete(req_id)) reject(new Error(`no answer from the grayboard server after ${REQUEST_TIMEOUT_MS / 1000}s`));
+      }, REQUEST_TIMEOUT_MS);
+      this.pending.set(req_id, {
+        resolve: (m) => { clearTimeout(timer); resolve(m as T); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
       this.ws.send(JSON.stringify(full));
     });
   }
