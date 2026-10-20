@@ -98,17 +98,20 @@ function sse(delta: Record<string, unknown>, finish: string): Response {
   return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
-// Answers a <channel> direct message by calling dm_send back, then stops.
+// Answers the latest <channel> direct message by calling dm_send back, unless
+// the model already acted after it. A context-only message (a digest) can land
+// after the tool result, mid-turn; that isn't a new DM to answer. A DM
+// delivered twice still gets two replies.
+const DM = /<channel source="grayboard" message_id="(\d+)" from="peer"/;
 function startModel(requests: ChatRequest[]) {
   model = Bun.serve({
     port: 0,
     async fetch(req) {
       const body = (await req.json()) as ChatRequest;
       requests.push(body);
-      if (body.messages.at(-1)?.role === "tool") return sse({ content: "replied" }, "stop");
-      const all = body.messages.map(text).join("\n");
-      const id = [...all.matchAll(/<channel source="grayboard" message_id="(\d+)" from="peer"/g)].at(-1)?.[1];
-      if (!id) return sse({ content: "nothing to do" }, "stop");
+      const at = body.messages.findLastIndex((m) => DM.test(text(m)));
+      if (at < 0 || body.messages.slice(at + 1).some((m) => m.role === "assistant")) return sse({ content: "nothing to do" }, "stop");
+      const id = DM.exec(text(body.messages[at]!))![1];
       const args = { to: "peer", body: "pong", parent_id: Number(id) };
       return sse(
         { content: null, tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "mcp__grayboard__dm_send", arguments: JSON.stringify(args) } }] },
@@ -216,6 +219,11 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest rides alo
   expect(system).toContain('You are identity "pi" on the grayboard bus');
   expect(first.messages.map(text).join("\n")).toContain(`<channel source="grayboard" message_id="${sent.message_id}" from="peer"`);
   await until(() => pi.events.some((e) => e.type === "agent_settled") || undefined, "agent_settled");
+
+  // One delivery, one reply: a DM pushed twice would wake the session twice.
+  const copies = (await messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${sent.message_id}\\"`));
+  expect(copies).toHaveLength(1);
+  expect((await call(p, "dm_thread", { thread: sent.message_id })).length).toBe(2);
 
   // Quitting pi stops the push process and frees the identity.
   await pi.quit();
