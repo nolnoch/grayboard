@@ -254,7 +254,7 @@ function requireLocalBus(mode: string | undefined): void {
     process.exit(1);
   }
   if (mode === undefined && busMode() === "server") {
-    console.error("[grayboard] human handles and announcements are local-mode only for now (#24); --mode local uses this machine's local bus");
+    console.error("[grayboard] human handles, announcements and board create are local-mode only for now (#24); --mode local uses this machine's local bus");
     process.exit(1);
   }
 }
