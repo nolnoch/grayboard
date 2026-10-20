@@ -173,7 +173,7 @@ const TOOLS = [
   },
   {
     name: "dm_history",
-    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
     inputSchema: {
       type: "object",
       properties: {

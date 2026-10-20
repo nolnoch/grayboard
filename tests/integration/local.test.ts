@@ -422,6 +422,18 @@ test("a thread reply to a bystander waits for its next wake, here a DM", async (
   expect(sim.pushes).toEqual(["ping", "fe asks", "answer for fe"]);
 }, 20_000);
 
+test("dm_send and dm_history check body and limit as server mode does", async () => {
+  await stop(await start("fe"));
+  const be = await start("be");
+  await expect(call(be, "dm_send", { to: "fe", body: " " })).rejects.toThrow("body is required");
+  await expect(call(be, "dm_send", { to: "fe", body: "x".repeat(64 * 1024 + 1) })).rejects.toThrow("body exceeds");
+  for (const body of ["one", "two", "three"]) await call(be, "dm_send", { to: "fe", body });
+  const bodies = async (limit: unknown) => (await call(be, "dm_history", { peer: "fe", limit })).map((m: any) => m.body);
+  expect(await bodies(2)).toEqual(["two", "three"]);
+  expect(await bodies(0)).toEqual(["three"]);
+  await expect(bodies("lots")).rejects.toThrow("limit must be a number");
+}, 20_000);
+
 test("a message queued while offline is pushed when the session starts", async () => {
   await stop(await start("be"));
   const fe = await start("fe");

@@ -583,6 +583,23 @@ test("a bare DM recipient is your own identity of that name, else the only one w
   expect(await a.request({ type: "send", recipient: "nobody", body: "?" })).toMatchObject({ type: "error", code: "not_found" });
 });
 
+test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
+  const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  await Promise.all([a.connect(), b.connect()]);
+  for (const body of ["one", "two", "three"]) await a.request({ type: "send", recipient: "fe", body });
+  expect(await a.request({ type: "send", recipient: "fe", body: "  " })).toMatchObject({ type: "error", code: "bad_request" });
+
+  const bodies = async (peer: string, limit?: number) =>
+    (await a.request({ type: "history", peer, ...(limit !== undefined ? { limit } : {}) })).messages.map((m: any) => m.body);
+  expect(await bodies("fe")).toEqual(["one", "two", "three"]);
+  expect(await bodies("Bob@Example.com/FE")).toEqual(["one", "two", "three"]);
+  expect(await bodies("fe", 2)).toEqual(["two", "three"]);
+  expect(await bodies("fe", 0)).toEqual(["three"]);
+  expect(await a.request({ type: "history", peer: "nobody" })).toMatchObject({ type: "error", code: "not_found" });
+});
+
 test("senders see what hasn't reached an offline peer", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -686,8 +703,8 @@ test("a pending send is echoed, listed as promised until the sender's next messa
   expect(plain.pending).toBeUndefined();
   const promises = async () => (await a.request({ type: "inbox", days: 1 })).promised?.map((m: any) => m.id);
   expect(await promises()).toEqual([p.message_id]);
-  // History is newest first; only the pending row says so.
-  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([undefined, true]);
+  // History is oldest first; only the pending row says so.
+  expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.pending)).toEqual([true, undefined]);
 
   // Bob's reply doesn't keep it, and his ack (as its recipient) doesn't drop it.
   await b.request({ type: "send", recipient: "alice@example.com/be", body: "thanks", parent_id: p.message_id });

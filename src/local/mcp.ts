@@ -48,6 +48,8 @@ import {
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
+  dmBody,
+  historyLimit,
   inboxDays,
   promised,
   queuedNote,
@@ -247,6 +249,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       parent_id?: number;
       pending?: boolean;
     };
+    dmBody(body);
     if (!rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
@@ -275,8 +278,7 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_history") {
-    const lim = Math.min(Math.max(a.limit ?? 20, 1), 200);
-    return text(getHistory(IDENTITY, a.peer, lim, a.before_id).map(showPending));
+    return text(getHistory(IDENTITY, a.peer, historyLimit(a.limit), a.before_id).map(showPending));
   }
 
   if (name === "dm_thread") {

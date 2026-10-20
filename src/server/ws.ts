@@ -1,6 +1,8 @@
 import type { MessageRow, Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
-import { HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress } from "../shared/addressing.ts";
+import {
+  HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
+} from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -22,10 +24,8 @@ import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts"
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, dmBody, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
-
-const MAX_BODY_BYTES = 64 * 1024;
 
 export type WsData = {
   authed: AuthedUser;
@@ -387,6 +387,37 @@ async function handleHello(
   drainBoards(ws, db, true);
 }
 
+// A bare name means your own identity of that name, else the one identity
+// anyone has with it (as @name does in a post). Null once it has answered
+// the request with why not.
+function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
+  const { authed } = ws.data;
+  if (isValidIdentityName(input)) {
+    const name = input.toLowerCase();
+    if (repo.identities.findByUserAndName(authed.user_id, name)) {
+      input = formatDirectAddress(authed.user_email, name);
+    } else if (name === HUMAN_NAME) {
+      // Every linked user has one; listing them would only leak who linked.
+      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
+      return null;
+    } else {
+      const all = repo.identities.findAllByName(name);
+      if (all.length !== 1) {
+        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
+        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
+        return null;
+      }
+      input = formatDirectAddress(all[0]!.email, name);
+    }
+  }
+  try {
+    return parseAddress(input);
+  } catch (e) {
+    err(ws, reqId, "bad_request", String(e));
+    return null;
+  }
+}
+
 function handleSend(
   hub: Hub,
   ws: Ws,
@@ -397,41 +428,15 @@ function handleSend(
   pending: boolean,
 ): void {
   const { repo, db, registry } = hub;
-  if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
-    err(ws, reqId, "bad_request", "body exceeds 64 KiB limit");
-    return;
+  try {
+    dmBody(body);
+  } catch (e) {
+    return err(ws, reqId, "bad_request", (e as Error).message);
   }
 
   const { authed } = ws.data;
-
-  // A bare name means your own identity of that name, else the one identity
-  // anyone has with it (as @name does in a post).
-  if (isValidIdentityName(recipientStr)) {
-    const name = recipientStr.toLowerCase();
-    if (repo.identities.findByUserAndName(authed.user_id, name)) {
-      recipientStr = formatDirectAddress(authed.user_email, name);
-    } else if (name === HUMAN_NAME) {
-      // Every linked user has one; listing them would only leak who linked.
-      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
-      return;
-    } else {
-      const all = repo.identities.findAllByName(name);
-      if (all.length !== 1) {
-        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
-        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
-        return;
-      }
-      recipientStr = formatDirectAddress(all[0]!.email, name);
-    }
-  }
-
-  let parsed;
-  try {
-    parsed = parseAddress(recipientStr);
-  } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
-    return;
-  }
+  const parsed = resolvePeer(repo, ws, reqId, recipientStr);
+  if (!parsed) return;
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
@@ -537,11 +542,17 @@ function handleHistory(
   beforeId: number | undefined,
   repo: Repo,
 ): void {
+  let lim: number;
   try {
-    if (peer) parseAddress(peer); // validate
+    lim = historyLimit(limit);
   } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
-    return;
+    return err(ws, reqId, "bad_request", (e as Error).message);
+  }
+  let peerFull: string | undefined;
+  if (peer) {
+    const parsed = resolvePeer(repo, ws, reqId, peer);
+    if (!parsed) return;
+    peerFull = parsed.full;
   }
   const me = ws.data.identityFull;
   const cursors = new Map<string, number>();
@@ -549,7 +560,8 @@ function handleHistory(
     if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(to));
     return cursors.get(to)!;
   };
-  const messages = repo.messages.history(me, peer, limit, beforeId).map((m) =>
+  // Newest `lim` before beforeId, shown oldest first as in local mode.
+  const messages = repo.messages.history(me, peerFull, lim, beforeId).reverse().map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
   send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showPending) });
