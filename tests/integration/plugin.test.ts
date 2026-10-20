@@ -233,3 +233,43 @@ test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () =>
   expect(readFileSync(creds, "utf8")).toBe("");
   expect(existsSync(join(home, ".grayboard"))).toBe(false);
 });
+
+test("grayboard claim in server mode acts as one of your identities; its sessions are woken", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const be = await session(alice, "be");
+  await session(bob, "fe");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+
+  const dir = mkdtempSync(join(tmpdir(), "grayboard-claim-"));
+  const gb = async (token: string, email: string, identity: string, ...args: string[]) => {
+    const creds = join(dir, `${identity}-${email}`);
+    writeFileSync(creds, JSON.stringify({ session_token: token, server: base, user_email: email }));
+    const env = { ...process.env, HOME: dir, GRAYBOARD_CREDENTIALS: creds, BUS_IDENTITY: identity } as Record<string, string>;
+    delete env.GRAYBOARD_TOKEN;
+    delete env.GRAYBOARD_SERVER;
+    const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+    return { code, out, err };
+  };
+
+  const who = JSON.parse((await gb(bob, "bob@example.com", "FE", "--json", "whoami")).out);
+  expect(who).toMatchObject({ handle: "bob@example.com/fe", source: "BUS_IDENTITY", email: "bob@example.com" });
+
+  const took = await gb(bob, "bob@example.com", "fe", "claim", "take", "sandbox:sbx-1", "--board", "e2e", "--note", "smoke");
+  expect(took.code, took.err).toBe(0);
+  expect((await be.call("claim_list"))).toMatchObject([{ key: "sandbox:sbx-1", holder: "bob@example.com/fe", note: "smoke" }]);
+
+  const held = await gb(alice, "alice@example.com", "be", "claim", "take", "sandbox:sbx-1");
+  expect(held.code).toBe(2);
+  expect(JSON.parse(held.out)).toMatchObject({ ok: false, held_by: "bob@example.com/fe" });
+
+  await be.call("claim_watch", { key: "sandbox:sbx-1" });
+  expect((await gb(bob, "bob@example.com", "fe", "claim", "release", "sandbox:sbx-1", "--note", "done")).code).toBe(0);
+  await Bun.sleep(300);
+  expect(be.pushes.map((p) => p.content)).toContain("[release] sandbox:sbx-1 — done cc @alice@example.com/be");
+
+  const unknown = await gb(alice, "alice@example.com", "nope", "claim", "take", "k");
+  expect(unknown.code).toBe(1);
+  expect(unknown.err).toContain(`no session has used identity "nope"`);
+}, 20_000);

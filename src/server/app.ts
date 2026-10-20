@@ -12,7 +12,7 @@ export type StartOptions = WsOptions & {
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const { db, repo } = openDatabase(config.dbPath);
-  const { handlers, startPing, stopExpiry } = createWsHandlers(repo, db, opts);
+  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, opts);
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -41,7 +41,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config);
+      return handleHttp(req, repo, db, config, wake);
     },
 
     websocket: handlers,
