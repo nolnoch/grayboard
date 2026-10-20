@@ -251,7 +251,7 @@ export class Relay {
     if (!r.ok) return this.say(ts, `⚠️ not created: ${r.error}`);
     await this.bus.call("board_subscribe", { board, mode: "quiet" });
     await this.react(ts);
-    await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since a new board has no subscribers.`);
+    await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since no one else is subscribed yet.`);
   }
 
   // The bus's "no such board" points agents at board_list; the owner gets the

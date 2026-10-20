@@ -1,4 +1,4 @@
-// `grayboard human` and `grayboard announce`: the human's own commands on the
+// `grayboard human`, `grayboard announce` and `grayboard board create`: the human's own commands on the
 // local bus. They run in the human's terminal (or as `! grayboard announce …`
 // inside a session), never through an agent's tools.
 import { db } from "./db.ts";
