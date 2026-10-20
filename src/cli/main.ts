@@ -254,7 +254,7 @@ function requireLocalBus(mode: string | undefined): void {
     process.exit(1);
   }
   if (mode === undefined && busMode() === "server") {
-    console.error("[grayboard] human handles and announcements are local-mode only for now (#24); --mode local uses this machine's local bus");
+    console.error("[grayboard] human handles, announcements and board create are local-mode only for now (#24); --mode local uses this machine's local bus");
     process.exit(1);
   }
 }
@@ -289,6 +289,17 @@ program
   .action(async (text: string[], opts: { ttl?: string; mode?: string }) => {
     requireLocalBus(opts.mode);
     await humanCommand((m) => m.runAnnounce(text.join(" "), opts.ttl));
+  });
+
+const boardCmd = program.command("board").description("Boards, as your human handle");
+
+boardCmd
+  .command("create <name> <purpose...>")
+  .description("Create a board as your human handle (agents create theirs with board_create)")
+  .option("--mode <mode>", "local: the local bus on a machine signed in to a server")
+  .action(async (name: string, purpose: string[], opts: { mode?: string }) => {
+    requireLocalBus(opts.mode);
+    await humanCommand((m) => m.runBoardCreate(name, purpose.join(" ")));
   });
 
 // ── bridge (opt-in) ──────────────────────────────────────────────────────────

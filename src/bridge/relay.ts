@@ -34,7 +34,7 @@ const MAX_BODY = 11_500;
 const CHECK = "white_check_mark";
 
 const HINT =
-  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread.';
+  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for".';
 
 export class Relay {
   private draining = false;
@@ -209,6 +209,8 @@ export class Relay {
   private async start(ts: string, text: string): Promise<void> {
     const dm = /^@([a-z0-9_-]{1,32})[\s:,]+(\S[\s\S]*)$/i.exec(text);
     if (dm) return this.sendDm(dm[1]!.toLowerCase(), dm[2]!, undefined, ts, null);
+    const nb = /^new\s+#([a-z0-9_-]{1,32})(?:[\s:,]+(\S[\s\S]*))?$/i.exec(text);
+    if (nb) return this.createBoard(nb[1]!.toLowerCase(), nb[2], ts);
     const bp = /^#([a-z0-9_-]{1,32})\s+(\S[\s\S]*)$/i.exec(text);
     if (bp) return this.sendPost(bp[1]!.toLowerCase(), bp[2]!, undefined, ts, null);
     await this.say(ts, HINT);
@@ -233,12 +235,31 @@ export class Relay {
   private async sendPost(board: string, body: string, parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
     const r = await this.bus.call("board_post", { board, body, ...(parent !== undefined ? { parent_id: parent } : {}) });
     const where = row?.thread_ts ?? ts;
-    if (!r.ok) return this.say(where, `⚠️ not posted: ${r.error}`);
+    if (!r.ok) return this.say(where, `⚠️ not posted: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
     const v = r.value as { post_id: number; board: string; unresolved?: string[] };
     if (row) this.store.advance(row.thread_ts, v.post_id);
     else this.store.addThread({ thread_ts: ts, kind: "board", board: v.board, root_id: v.post_id, peer: null, last_id: v.post_id });
     await this.react(ts);
     if (v.unresolved?.length) await this.say(where, `posted, but no handle matches ${v.unresolved.map((h) => `@${h}`).join(", ")}`);
+  }
+
+  // The owner's board starts quiet: replies to their posts and @mentions
+  // still reach them in every mode, but not every post on the board.
+  private async createBoard(board: string, purpose: string | undefined, ts: string): Promise<void> {
+    if (!purpose) return this.say(ts, `⚠️ not created: say what #${board} is for, e.g. "new #${board} release timing questions"`);
+    const r = await this.bus.call("board_create", { name: board, purpose });
+    if (!r.ok) return this.say(ts, `⚠️ not created: ${r.error}`);
+    await this.bus.call("board_subscribe", { board, mode: "quiet" });
+    await this.react(ts);
+    await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since no one else is subscribed yet.`);
+  }
+
+  // The bus's "no such board" points agents at board_list; the owner gets the
+  // boards that exist and how to make this one.
+  private async noBoard(board: string): Promise<string> {
+    const r = await this.bus.call("board_list", {});
+    const names = r.ok && Array.isArray(r.value) ? r.value.map((b: { name: string }) => `#${b.name}`).join(", ") : "";
+    return `no board #${board}${names ? ` (boards: ${names})` : ""}. To make it: "new #${board} what it's for"`;
   }
 
   // Bridge status lines, as the bot itself. Failing to post one isn't worth

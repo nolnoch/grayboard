@@ -429,6 +429,18 @@ test("the human's handle: BUS_HUMAN needs a declaration, and agents can't take i
   expect((await exitOf("alex", { BUS_HUMAN: "1" })).code).toBe(0);
 }, 20_000);
 
+test("grayboard board create makes a board as the human; agents see it", async () => {
+  expect((await cli("board", "create", "workspace", "lanes")).err).toContain("no human handle declared");
+  await cli("human", "alex");
+  const r = await cli("board", "create", "#Workspace", "lane", "count", "and", "naming");
+  expect(r.code).toBe(0);
+  expect(r.out).toContain("Created #workspace");
+  expect((await cli("board", "create", "workspace", "again")).err).toContain("already exists");
+  const be = await start("be");
+  const b = (await call(be, "board_list")).find((x: any) => x.name === "workspace");
+  expect(b).toMatchObject({ purpose: "lane count and naming", created_by: "alex" });
+}, 20_000);
+
 test("grayboard announce reaches live sessions marked human; a TTL carries it into new sessions", async () => {
   await cli("human", "alex");
   const pushes: { content: string; meta: Record<string, string> }[] = [];

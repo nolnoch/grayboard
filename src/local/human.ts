@@ -1,9 +1,9 @@
-// `grayboard human` and `grayboard announce`: the human's own commands on the
+// `grayboard human`, `grayboard announce` and `grayboard board create`: the human's own commands on the
 // local bus. They run in the human's terminal (or as `! grayboard announce …`
 // inside a session), never through an agent's tools.
 import { db } from "./db.ts";
 import { poke } from "./wakeup.ts";
-import { ANNOUNCE_BOARD, CoreError, declareHuman, humanHandles, isViewer, post, rosterHandles } from "../core/boards.ts";
+import { ANNOUNCE_BOARD, CoreError, createBoard, declareHuman, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 
 const MAX_TTL_MS = 7 * 86_400_000;
@@ -53,4 +53,13 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
       : `#${ANNOUNCE_BOARD} post ${r.post.id}: no live sessions to reach`,
   );
   if (r.post.expires_at) console.log(`New sessions see it until ${new Date(r.post.expires_at).toLocaleString()}.`);
+}
+
+/** Create a board as the human. It starts quiet for them: replies to their
+ * posts and @mentions still arrive, every other post doesn't. */
+export function runBoardCreate(name: string, purpose: string): void {
+  const human = declaredHuman();
+  const b = createBoard(db, human, name, purpose);
+  subscribe(db, human, b.name, "quiet");
+  console.log(`Created #${b.name}. No one else is subscribed; @mention the agents you want to hear from.`);
 }
