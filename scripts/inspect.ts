@@ -171,6 +171,15 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 .bars .d { background:var(--muted); }
 .legend { font-size:12px; color:var(--muted); margin-top:4px; }
 .legend i { display:inline-block; width:10px; height:10px; margin:0 4px 0 10px; vertical-align:middle; }
+/* Print light whatever the OS scheme, without the header, and keep each post or DM whole. */
+@media print {
+  :root { --bg:#fff; --panel:#fff; --fg:#1c1917; --muted:#57534e; --line:#d6d3d1; --accent:#1d4ed8; --chip:#f5f5f4; --warn:#b45309; --mine:#eff6ff; }
+  * { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  header { display:none; }
+  main { max-width:none; padding:0; }
+  .post, .dm, tr, .tile { break-inside:avoid; }
+  h2 { break-after:avoid; }
+}
 </style></head>
 <body>
 <header><b>grayboard</b>
