@@ -1,10 +1,10 @@
 # Slack bridge
 
 ```doc-meta
-owns: the local Slack bridge (grayboard bridge slack) and human handles
-invariants: the bridge is an MCP client of its own grayboard mcp child and acts on the bus only through public tools, except the human declaration it writes before the child starts; one bot, one channel, one bridge process per Slack app; thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel; outbox before posting; the human handle is a persistent declaration and BUS_HUMAN=1 only asserts it; the bridge never joins a server (`--mode local` pins its child to the local bus)
-code-pointers: src/bridge/ (slack.ts wiring and human declaration, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (declareHuman, isHuman, humanHandles), src/local/mcp.ts (startup check, human meta and instruction), src/local/human.ts (grayboard human, grayboard announce, grayboard board create), deploy/slack-manifest.yaml, tests/integration/slack.test.ts
-companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distributed design, not built)
+owns: the Slack bridges (local `grayboard bridge slack`, and the org bridge inside grayboard-server) and human handles
+invariants: the local bridge is an MCP client of its own grayboard mcp child and acts on the bus only through public tools, except the human declaration it writes before the child starts; one process holds a Slack app's Socket Mode connection (local: one bot, one channel); thread_ts is always the top-level message's ts; inbound is accepted only from the owner in the configured channel (local) or a linked user in their own DM (org); outbox before posting; the local human handle is a persistent declaration and BUS_HUMAN=1 only asserts it; the local bridge never joins a server (`--mode local` pins its child to the local bus); on a server the name `human` is reserved for the org bridge's in-process connections, so `<email>/human` is provably that user's person; only your own user's human carries authority
+code-pointers: src/bridge/ (slack.ts wiring and human declaration, relay.ts routing and format, socket.ts Socket Mode client, web.ts Web API, store.ts thread map and outbox, config.ts), src/core/schema.ts (human column), src/core/boards.ts (declareHuman, markHuman, isHuman, humanHandles), src/local/mcp.ts (startup check, human meta and instruction), src/local/human.ts (grayboard human, grayboard announce, grayboard board create), src/server/slack.ts (org bridge), src/server/can_send.ts (reachesHuman), src/plugin/mcp.ts (own-human meta and instruction), deploy/slack-manifest.yaml, deploy/slack-org-manifest.yaml, tests/integration/slack.test.ts, tests/integration/slack_org.test.ts
+companions: boards.md (threads, mentions, delivery), architecture.md (WS hello and canSend, which the org bridge rides on)
 ```
 
 ## 1. Shape
@@ -13,7 +13,7 @@ companions: boards.md (threads, mentions, delivery), future/org-bridge.md (distr
 - **The bridge is an MCP client of its own `grayboard mcp` child** (spawned with `BUS_IDENTITY=<handle>`, `BUS_HUMAN=1`), the pattern the pi adapter uses. It sees what an agent session sees (digests and deferred pushes immediately, since a human's session has no wakes to save) and acts only through public tools (`dm_send`, `board_post`, `dm_thread`, `board_read`); the one exception is the human declaration (§3). So it inherits the roster and `parent_id` ownership checks, recipient wakeups, thread fan-out, and identity uniqueness (nobody else can take the handle while it runs) without reimplementing them.
 - Inert unless started: no dependency, no change to `setup` or MCP behavior for anyone not running it.
 - Push end to end: Slack Socket Mode is a WebSocket; grayboard wakeups are socket pokes.
-- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode needs the org bridge (`future/org-bridge.md`). `--mode local` skips the refusal and appends `--mode local` to the child's args, so a signed-in machine can relay its local bus; the child must get the pin too, or it re-derives server mode from the credentials file or an inherited `GRAYBOARD_TOKEN`.
+- **Refuses to start when `grayboard mcp` would join a server** (`busMode`). Server mode has the org bridge (§8) instead: only the server can vouch that a handle is a person. `--mode local` skips the refusal and appends `--mode local` to the child's args, so a signed-in machine can relay its local bus; the child must get the pin too, or it re-derives server mode from the credentials file or an inherited `GRAYBOARD_TOKEN`.
 - If the child exits, the bridge exits nonzero for its supervisor to restart.
 
 ## 2. Routing
@@ -84,11 +84,28 @@ Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last
 - Outbound: whatever agents DM the human is stored on Slack under that workspace's retention and visible to its admins.
 - Text from other Slack users never enters the bus.
 
-## 8. Unverified
+## 8. Org bridge (server mode)
+
+One Slack app per server, inside `grayboard-server`, enabled by `SLACK_APP_TOKEN` + `SLACK_BOT_TOKEN` (`src/server/config.ts`). Each linked user talks to the app in their own DM with it; routing, threading and text rules are §2's, via the same `Relay`. Manifest: `deploy/slack-org-manifest.yaml`. Human steps: `README.md` §Slack for a team server (#66).
+
+- **Why not the local bridge against a server:** every session of a user presents the same token, so the server can't tell a human's session from an agent's; `human` would be the client's word.
+- **The human identity is `<email>/human` for every user**, a fixed name rather than one chosen at link time: agents of any user can address it without knowing how that person likes to be called, and a bare `human` means your own (as `dm_send` and `@human` resolve it). `hello` refuses the name from any client connection, and the bridge's connections hold nothing else (`ws.ts`); HTTP refuses it for identity create/delete and `claims/call`. So the reservation is server-enforced, not declared, unlike §3.
+- **In-process connections.** Each linked user's human is a `HumanConn` (`src/server/slack.ts`) registered in the hub like a client WebSocket (the hub's `Conn` type), speaking the same frames. So delivery, drain, cursors, `canSend`, board scopes and mention access are the paths agents take, not reimplementations. Like the local bridge's child, it drains deferred pushes and digests at once; digests are acked without posting.
+- **Authority is your own user's human only.** `hello_ok.human` names the session user's human handle and whether it's linked. The plugin stamps `human="true"` only on DMs and posts from that handle, and adds the own-human instruction only when linked, so nobody's agents DM a `human` nobody reads and a user without Slack pays no tokens. Another user's human is a peer. The plugin trusts `hello_ok.human` only because a server that sends it also reserves the name; an older server would let an agent take `human`.
+- **Reach (`reachesHuman`, `src/server/can_send.ts`):** another user's agents may DM or @mention your human only if you share a team, by default; `GRAYBOARD_SLACK_REACH=all` lifts that. Your own agents always can. Mentions go through the same check (`access.ts`), so an @mention can't reach a phone a DM can't. A bare `human` sent by an unlinked user is `not_found` without listing who has linked.
+- **Linking proves both sides.** `grayboard slack link` (`POST /api/slack/link`, a signed-in user) returns a one-time code (memory only, so a restart voids them; TTL and wrong-try limit in `src/server/slack.ts`); only the Slack account that DMs `link <code>` gets linked, and its DM channel becomes the link's. Linking creates the identity if needed, subscribes it like any new identity (team boards), marks it human (`markHuman`) and audits. A new identity's DM cursor starts at the newest message, so messages to an earlier link's identity don't flood the phone. A Slack account linked to another user must `unlink` first.
+- **Unlink** (`unlink` in the DM, or `grayboard slack unlink`) deletes the link, its threads, the `human` identity and its handle row, so sends fail ("hasn't linked" for your own bare `human`, not found for a full handle) instead of queueing into nothing.
+- **Delivery.** The outbox is memory: an item is acked to the hub only once Slack accepts or permanently refuses the post (e.g. `msg_too_long`), so one that never made it is redelivered by the hub at the next start (at-least-once; a crash after post, before ack, duplicates). The thread map is server tables behind `Repo` (`slack_links`, `slack_threads`), not `store.ts`, so it rides the Postgres seam. A fatal Slack error for one user (e.g. they left the workspace) takes only that human offline, so senders see it queue.
+- **One Socket Mode connection per server.** If the server ever runs as several processes, exactly one may hold the app tokens (§2 One bot, one bridge).
+- Inbound: only new messages from a person in a DM with the app (`channel_type: im`; no subtype or bot). A top-level `link <code>` or `unlink` is handled by the bridge; anything from an unlinked account gets the link instructions; a linked account whose human is offline is told so.
+
+## 9. Unverified
 
 - Whether a post pushes to the phone, and whether `markdown_text` drives the iOS notification preview.
 - The ack window: the bridge acks after the tool call and its ✅ or reply, so a slow Slack API could cause retries (dedupe absorbs them).
 - That killing the child mid-run makes the bridge exit nonzero (`client.onclose`); no test covers it.
 - Whether the human-handle sentence makes agents ask both in the terminal and on the phone.
 
-Deferred: catch-up after downtime (`conversations.history` at start; `groups:history` is already granted), several humans or channels per bridge, subscribing from Slack, Block Kit/buttons/slash commands. Refused: edits and deletes (append-only).
+Org bridge, unverified against real Slack: the manifest's `im` keys and App Home messages tab; whether a DM from the app notifies by default.
+
+Deferred: catch-up after downtime (`conversations.history` at start; `groups:history` is already granted), several humans or channels per local bridge, subscribing from Slack, Block Kit/buttons/slash commands. Refused: edits and deletes (append-only).

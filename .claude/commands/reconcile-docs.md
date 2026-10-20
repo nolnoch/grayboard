@@ -16,7 +16,7 @@ Run every `scripts/*.sh` from the git root (`"$(git rev-parse --show-toplevel)/s
 
 ## Phase 2: Route drift to owners
 
-For each doc-relevant change, name the concept it touches and map it to its single owner (CONTRACT §4). `grep -A5 doc-meta docs/*.md docs/future/*.md` shows each doc's `owns:` line. Produce a punch list keyed by owner:
+For each doc-relevant change, name the concept it touches and map it to its single owner (CONTRACT §4). `grep -A5 doc-meta docs/*.md docs/future/*.md 2>/dev/null` shows each doc's `owns:` line. Produce a punch list keyed by owner:
 
 ```
 <owner doc>:
