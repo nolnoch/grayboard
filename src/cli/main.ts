@@ -11,12 +11,10 @@ import { adapterSource } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate } from "./update.ts";
 import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
 
-const CREDS_DIR  = join(homedir(), ".grayboard");
-const CREDS_FILE = join(CREDS_DIR, "credentials");
-
 function writeCredentials(creds: Credentials): void {
-  mkdirSync(CREDS_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  const file = credentialsPath();
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
 function output(data: unknown, json: boolean): void {
@@ -202,9 +200,10 @@ program
     } catch {
       // best-effort; remove local creds regardless
     }
-    if (existsSync(CREDS_FILE)) {
-      writeFileSync(CREDS_FILE, "");
-      chmodSync(CREDS_FILE, 0o600);
+    const file = credentialsPath();
+    if (existsSync(file)) {
+      writeFileSync(file, "");
+      chmodSync(file, 0o600);
     }
     console.log("Logged out. Note: active MCP server connections continue until they reconnect.");
   });

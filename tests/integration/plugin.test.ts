@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
@@ -215,3 +215,21 @@ test("a refused token says to sign in again: at startup, in a running session's 
     `Error (unauthenticated): your sign-in isn't valid on ${base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${base}`,
   );
 }, 20_000);
+
+test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () => {
+  const home = mkdtempSync(join(tmpdir(), "gb-home-"));
+  const creds = join(mkdtempSync(join(tmpdir(), "gb-creds-")), "sub", "credentials");
+  const { GRAYBOARD_SERVER: _, ...env } = process.env;
+  const run = async (...args: string[]) => {
+    const p = Bun.spawn([process.execPath, CLI, ...args], { env: { ...env, HOME: home, GRAYBOARD_CREDENTIALS: creds }, stdout: "ignore", stderr: "pipe" });
+    expect(await p.exited, await new Response(p.stderr).text()).toBe(0);
+  };
+
+  await run("login", "--dev", "alice@example.com", "--server", base);
+  expect(JSON.parse(readFileSync(creds, "utf8"))).toMatchObject({ server: base, user_email: "alice@example.com" });
+  expect(existsSync(join(home, ".grayboard"))).toBe(false);
+
+  await run("logout");
+  expect(readFileSync(creds, "utf8")).toBe("");
+  expect(existsSync(join(home, ".grayboard"))).toBe(false);
+});
