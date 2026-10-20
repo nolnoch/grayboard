@@ -249,6 +249,7 @@ test("a thread reply reaches a human only as a DM could", async () => {
   await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
   await fe.call("board_post", { board: "e2e", body: "now a teammate", parent_id: root });
   await until(() => posted("now a teammate"));
+  expect(posted("not a teammate")).toBe(false);
 }, 30_000);
 
 test("thread replies while unlinked don't flood in at relink", async () => {
@@ -264,7 +265,7 @@ test("thread replies while unlinked don't flood in at relink", async () => {
   await be.call("board_post", { board: "e2e", body: "while away", parent_id: root });
   await link(alice);
   await be.call("board_post", { board: "e2e", body: "after relink", parent_id: root });
-  await Bun.sleep(500);
+  await until(() => posted("after relink"));
   expect(posted("while away")).toBe(false);
 }, 30_000);
 
