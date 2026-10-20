@@ -252,15 +252,37 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     },
   };
 
+  // Auth is checked at the upgrade only. When an admin revokes or disables a
+  // user, close their connections (#70): reconnecting then fails auth. The
+  // Slack bridge's humans have their own path (SlackBridge.userChanged).
+  const conns = () => [...hub.registry.values(), ...hub.toolsOnly].filter((ws) => !ws.data.human);
+  const disconnectUser = (userId: number) => {
+    for (const ws of conns()) {
+      if (ws.data.authed.user_id !== userId) continue;
+      err(ws, undefined, "unauthenticated", "an admin signed this user out");
+      ws.close();
+    }
+  };
+  // Catches a user disabled while one of their hellos was in flight.
+  const revalidate = () => {
+    for (const id of new Set(conns().map((ws) => ws.data.authed.user_id))) {
+      if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
+    }
+  };
+
   // Heartbeat: keeps idle connections open through proxies.
   const startPing = () =>
     setInterval(() => {
+      revalidate();
       for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
     }, 30_000);
 
-  return { handlers, startPing, stopExpiry: expiry.stop, wake: (handles: string[]) => wake(hub, handles) };
+  return {
+    handlers, startPing, revalidate, disconnectUser, stopExpiry: expiry.stop,
+    wake: (handles: string[]) => wake(hub, handles),
+  };
 }
 
 async function handleHello(

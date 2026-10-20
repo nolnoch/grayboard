@@ -394,6 +394,39 @@ test("admin revoke-session signs a user out of every session, ignoring an old CL
   }
 });
 
+test("revoking or disabling a user closes their open connections; the heartbeat catches a disable it missed", async () => {
+  app.stop();
+  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const [root, alice] = await Promise.all([login("root@example.com"), login("alice@example.com")]);
+  const a = new Client(alice, "be");
+  await a.connect();
+  const closed = (c: Client) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
+
+  for (const path of ["/api/admin/revoke-session", "/api/admin/disable-user"]) {
+    await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
+    const bob = await login("bob@example.com");
+    const live = new Client(bob, "be");
+    const tools = new Client(bob, "fe", { push: false });
+    await Promise.all([live.connect(), tools.connect()]);
+    const gone = Promise.all([closed(live), closed(tools)]);
+    expect((await api(root, "POST", path, { email: "bob@example.com" })).status).toBe(200);
+    expect(await live.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
+    await gone;
+  }
+  expect((await a.call("board_list")).type).toBe("call_ok");
+
+  // Disabled behind the server's back (no admin route): the next tick closes it.
+  await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
+  const late = new Client(await login("bob@example.com"), "be");
+  await late.connect();
+  const gone = closed(late);
+  app.repo.users.setDisabled(app.repo.users.findByEmail("bob@example.com")!.id, true);
+  app.revalidate();
+  await gone;
+  expect((await a.call("board_list")).type).toBe("call_ok");
+});
+
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
   app.stop();
   app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });

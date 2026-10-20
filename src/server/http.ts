@@ -274,22 +274,26 @@ function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: C
 
 // Revokes every session the user has; there's no session id to pick one by.
 // Older CLIs send all: true, which is ignored.
-async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, disconnectUser: (userId: number) => void): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.sessions.revokeAllForUser(target.id);
+  disconnectUser(target.id);
   writeAudit(repo, "auth.session_revoked", authed.user_email, body.email);
   return json({ ok: true });
 }
 
-async function adminDisableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
+async function adminDisableUser(
+  req: Request, authed: AuthedUser, repo: Repo, disconnectUser: (userId: number) => void, slack?: SlackLinker,
+): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.users.setDisabled(target.id, true);
+  disconnectUser(target.id);
   writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
   await slack?.userChanged(target.id);
   return json({ ok: true });
@@ -310,6 +314,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 
 export async function handleHttp(
   req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
+  disconnectUser: (userId: number) => void = () => {},
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -367,8 +372,8 @@ export async function handleHttp(
     const decision = canAdmin(makePrincipal(authed), config.admins);
     if (!decision.allow) return forbidden(decision.reason);
   }
-  if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo);
-  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, slack);
+  if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, disconnectUser);
+  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
 
   return notFound();
