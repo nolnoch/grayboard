@@ -347,14 +347,18 @@ program
     const question = (q: string): string => {
       process.stdout.write(q);
       const buf = Buffer.alloc(1);
-      let line = "";
+      const bytes: number[] = [];
       for (;;) {
         let n = 0;
-        try { n = readSync(0, buf, 0, 1, null); } catch (e) { if ((e as NodeJS.ErrnoException).code === "EAGAIN") continue; throw e; }
+        try { n = readSync(0, buf, 0, 1, null); } catch (e) {
+          // A non-blocking fd 0 would otherwise spin a core while the user types.
+          if ((e as NodeJS.ErrnoException).code === "EAGAIN") { Bun.sleepSync(20); continue; }
+          throw e;
+        }
         if (n === 0) throw new Error("stdin closed before setup finished");
-        const c = buf.toString();
-        if (c === "\n") return line;
-        line += c;
+        // Decode the whole line at once so multi-byte UTF-8 characters survive.
+        if (buf[0] === 0x0a) return Buffer.from(bytes).toString("utf8");
+        bytes.push(buf[0]!);
       }
     };
     const ask = async (q: string, dflt = ""): Promise<string> => {
@@ -368,119 +372,117 @@ program
       return a ? /^y/i.test(a) : dflt;
     };
 
-    {
-      const creds = loadCredentials();
+    const creds = loadCredentials();
 
-      // 1. Mode
-      let server = opts.server;
-      if (!opts.local && !server) {
-        const signedIn = busMode() === "server";
-        if (interactive) console.log("How will your agents talk?\n  1) On this machine only (no account needed)\n  2) Through a team server");
-        const pick = await ask("Choose", signedIn ? "2" : "1");
-        if (pick === "2") {
-          server = await ask("Server URL:", creds?.server ?? process.env.GRAYBOARD_SERVER);
-          if (!server) { console.error("Server URL required: pass --server <url>"); process.exit(1); }
-        }
+    // 1. Mode
+    let server = opts.server;
+    if (!opts.local && !server) {
+      const signedIn = busMode() === "server";
+      if (interactive) console.log("How will your agents talk?\n  1) On this machine only (no account needed)\n  2) Through a team server");
+      const pick = await ask("Choose", signedIn ? "2" : "1");
+      if (pick === "2") {
+        server = await ask("Server URL:", creds?.server ?? process.env.GRAYBOARD_SERVER);
+        if (!server) { console.error("Server URL required: pass --server <url>"); process.exit(1); }
       }
-
-      if (server) {
-        if (creds?.session_token && creds.server === server) {
-          console.log(`Signed in to ${server} as ${creds.user_email}.`);
-        } else {
-          await login(server);
-        }
-      } else if (existsSync(credentialsPath())) {
-        const where = creds?.server ? ` from ${creds.server}` : "";
-        if (!(await confirm(`Local mode signs you out${where}. Continue?`, true))) process.exit(1);
-        if (creds?.session_token) {
-          try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch {}
-        }
-        rmSync(credentialsPath(), { force: true });
-        console.log("Using local mode.");
-      } else {
-        console.log("Using local mode.");
-      }
-
-      // 2. Register with Claude Code, for every project (user scope)
-      const { command, args } = mcpCommand();
-      const addArgs = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
-      const claude = Bun.which("claude");
-      if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
-        Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
-        const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
-        if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
-        // Title each session with its handle, so Claude Code's name for it is
-        // the one dm_send takes.
-        const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
-        installSessionStartHook(hook);
-        console.log(`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`);
-      } else if (opts.register && !claude) {
-        console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
-      }
-
-      // 3. omp: register for every project (it ignores Claude Code's user
-      // registration), and install the push adapter that wakes the session.
-      // The user entry outranks a repo's .mcp.json in omp, so it carries no
-      // BUS_IDENTITY; grayboard reads the repo's pin itself.
-      const omp = !!Bun.which("omp");
-      if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
-        const cfgPath = join(OMP_DIR, "mcp.json");
-        let cfg: { mcpServers?: Record<string, unknown> } = {};
-        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-        }
-        cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
-        mkdirSync(OMP_DIR, { recursive: true });
-        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-        const ext = ADAPTERS[0]!;
-        writeAdapter(ext.path, ext.source);
-        console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
-      }
-
-      // 4. opencode: it drops MCP notifications, so its entry is tools only
-      // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
-      // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
-      const opencode = !!Bun.which("opencode");
-      if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
-        const cfgPath = join(OC_DIR, "opencode.json");
-        let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
-        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-        }
-        cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
-        mkdirSync(OC_DIR, { recursive: true });
-        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-        const plugin = ADAPTERS[1]!;
-        writeAdapter(plugin.path, plugin.source);
-        console.log(`Registered in ${cfgPath}; installed ${plugin.path}`);
-      }
-
-      // 5. pi: its MCP client drops notifications and, for direct tools, the
-      // server's instructions, so like opencode its entry is tools only and
-      // the extension runs the push side and supplies the instructions.
-      const piCli = !!Bun.which("pi");
-      if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
-        const cfgPath = join(PI_DIR, "mcp.json");
-        let cfg: { mcpServers?: Record<string, unknown> } = {};
-        try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-          if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-        }
-        cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args, env: { BUS_PUSH: "off" }, exposure: "direct" } };
-        mkdirSync(PI_DIR, { recursive: true });
-        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-        const ext = ADAPTERS[2]!;
-        writeAdapter(ext.path, ext.source);
-        console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
-      }
-
-      const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
-      console.log(
-        `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
-        (others ? `or ${others} as usual.\n\n` : `\n`) +
-        `Each session is named after its repo (in ~/code/api you're "api"). ` +
-        `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
-      );
     }
+
+    if (server) {
+      if (creds?.session_token && creds.server === server) {
+        console.log(`Signed in to ${server} as ${creds.user_email}.`);
+      } else {
+        await login(server);
+      }
+    } else if (existsSync(credentialsPath())) {
+      const where = creds?.server ? ` from ${creds.server}` : "";
+      if (!(await confirm(`Local mode signs you out${where}. Continue?`, true))) process.exit(1);
+      if (creds?.session_token) {
+        try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch {}
+      }
+      rmSync(credentialsPath(), { force: true });
+      console.log("Using local mode.");
+    } else {
+      console.log("Using local mode.");
+    }
+
+    // 2. Register with Claude Code, for every project (user scope)
+    const { command, args } = mcpCommand();
+    const addArgs = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
+    const claude = Bun.which("claude");
+    if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
+      Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
+      const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
+      if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
+      // Title each session with its handle, so Claude Code's name for it is
+      // the one dm_send takes.
+      const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
+      installSessionStartHook(hook);
+      console.log(`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`);
+    } else if (opts.register && !claude) {
+      console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+    }
+
+    // 3. omp: register for every project (it ignores Claude Code's user
+    // registration), and install the push adapter that wakes the session.
+    // The user entry outranks a repo's .mcp.json in omp, so it carries no
+    // BUS_IDENTITY; grayboard reads the repo's pin itself.
+    const omp = !!Bun.which("omp");
+    if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
+      const cfgPath = join(OMP_DIR, "mcp.json");
+      let cfg: { mcpServers?: Record<string, unknown> } = {};
+      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+      }
+      cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
+      mkdirSync(OMP_DIR, { recursive: true });
+      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      const ext = ADAPTERS[0]!;
+      writeAdapter(ext.path, ext.source);
+      console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
+    }
+
+    // 4. opencode: it drops MCP notifications, so its entry is tools only
+    // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
+    // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
+    const opencode = !!Bun.which("opencode");
+    if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
+      const cfgPath = join(OC_DIR, "opencode.json");
+      let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
+      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+      }
+      cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
+      mkdirSync(OC_DIR, { recursive: true });
+      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      const plugin = ADAPTERS[1]!;
+      writeAdapter(plugin.path, plugin.source);
+      console.log(`Registered in ${cfgPath}; installed ${plugin.path}`);
+    }
+
+    // 5. pi: its MCP client drops notifications and, for direct tools, the
+    // server's instructions, so like opencode its entry is tools only and
+    // the extension runs the push side and supplies the instructions.
+    const piCli = !!Bun.which("pi");
+    if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
+      const cfgPath = join(PI_DIR, "mcp.json");
+      let cfg: { mcpServers?: Record<string, unknown> } = {};
+      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
+        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
+      }
+      cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args, env: { BUS_PUSH: "off" }, exposure: "direct" } };
+      mkdirSync(PI_DIR, { recursive: true });
+      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      const ext = ADAPTERS[2]!;
+      writeAdapter(ext.path, ext.source);
+      console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
+    }
+
+    const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
+    console.log(
+      `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
+      (others ? `or ${others} as usual.\n\n` : `\n`) +
+      `Each session is named after its repo (in ~/code/api you're "api"). ` +
+      `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
+    );
   });
 
 // ── update ───────────────────────────────────────────────────────────────────
