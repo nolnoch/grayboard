@@ -54,6 +54,8 @@ export type Access = {
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
   resolveMention(token: string, author: string, board: Board): string | null;
+  // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
+  mayReach?(from: string, to: string): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
 };
@@ -165,8 +167,10 @@ export function age(ms: number): string {
 }
 
 // A handle that no longer exists (e.g. a deleted identity) leaves the roster
-// and its board subscriptions. Its posts and claims stay: they're history.
+// and its board subscriptions and queued pushes. Its posts and claims stay:
+// they're history.
 export function forgetHandle(db: Database, handle: string): void {
+  db.prepare(`DELETE FROM outbox WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM thread_mutes WHERE handle = ?`).run(handle);
   db.prepare(`DELETE FROM claim_watches WHERE handle = ?`).run(handle);
@@ -424,7 +428,7 @@ export function post(
       const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
       const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
       for (const author of authors) {
-        if (!a.canSee(author, b)) continue;
+        if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
         // Your user's replies wake the whole thread; a push-mode subscriber
         // still gets every post as it lands.
         const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;

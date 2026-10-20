@@ -67,5 +67,8 @@ export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Acces
       const visible = candidates.filter((h) => canSee(h, board) && reachesHuman(repo, humanReach, emailOf(author)!, h));
       return visible.length === 1 ? visible[0]! : null;
     },
+
+    // A thread reply reaches a human only as far as a DM could.
+    mayReach: (from, to) => reachesHuman(repo, humanReach, emailOf(from) ?? "", to),
   };
 }

@@ -52,8 +52,12 @@ export type SlackBridgeOptions = {
 
 /** What the HTTP routes need. */
 export type SlackLinker = {
+  // False once the bridge has stopped (failed to start, or Slack ended it).
+  readonly running: boolean;
   newCode(authed: AuthedUser): { code: string; expires_in_s: number; linked: boolean };
   unlink(userId: number): boolean;
+  // A user was disabled or enabled: take their human offline, or back.
+  userChanged(userId: number): Promise<void>;
 };
 
 /**
@@ -141,6 +145,10 @@ export class SlackBridge implements SlackLinker {
     this.log(`Slack bridge up as bot ${me.user_id}${me.team ? ` (${me.team})` : ""}; ${this.linked.size} linked`);
   }
 
+  get running(): boolean {
+    return !this.stopped;
+  }
+
   stop(): void {
     this.stopped = true;
     this.socket?.stop();
@@ -173,6 +181,12 @@ export class SlackBridge implements SlackLinker {
     return true;
   }
 
+  async userChanged(userId: number): Promise<void> {
+    this.detach(userId);
+    const link = this.o.repo.slack.linkFor(userId);
+    if (link) await this.attach(link);
+  }
+
   private async linkUser(slackUser: string, channel: string, ts: string, code: string): Promise<void> {
     const { repo, db } = this.o;
     const now = Date.now();
@@ -198,10 +212,11 @@ export class SlackBridge implements SlackLinker {
     repo.slack.link(user.id, slackUser, channel);
     const handle = `${user.email}/${HUMAN_NAME}`;
     if (!repo.identities.findByUserAndName(user.id, HUMAN_NAME)) {
+      // Start from now: drop what queued for an earlier link's identity.
+      forgetHandle(db, handle);
       const identity = repo.identities.create(user.id, HUMAN_NAME);
       writeAudit(repo, "identity.created", user.email, HUMAN_NAME, { slack: true });
       onIdentityCreated(db, repo, user.id, handle);
-      // Start from now: messages to an earlier link's identity were for then.
       const newest = repo.messages.history(handle, undefined, 1)[0];
       if (newest) repo.cursors.advance(identity.id, "direct", handle, newest.id);
     }

@@ -282,23 +282,25 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo):
   return json({ ok: true });
 }
 
-async function adminDisableUser(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function adminDisableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.users.setDisabled(target.id, true);
   writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
+  await slack?.userChanged(target.id);
   return json({ ok: true });
 }
 
-async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = repo.users.findByEmail(body.email.toLowerCase());
   if (!target) return notFound();
   repo.users.setDisabled(target.id, false);
   writeAudit(repo, "auth.user_enabled", authed.user_email, body.email);
+  await slack?.userChanged(target.id);
   return json({ ok: true });
 }
 
@@ -337,6 +339,10 @@ export async function handleHttp(
   if (path.startsWith("/api/slack/") && !slack) {
     return jsonErr("not_found", "this server has no Slack bridge (its admin sets SLACK_APP_TOKEN and SLACK_BOT_TOKEN)", 404);
   }
+  // Unlinking still works: it's only database rows.
+  if (path === "/api/slack/link" && !slack!.running) {
+    return jsonErr("not_found", "this server's Slack bridge isn't running (its admin checks the server log)", 404);
+  }
   if (path === "/api/slack/link" && method === "POST") return json(slack!.newCode(authed));
   if (path === "/api/slack/unlink" && method === "POST") {
     return slack!.unlink(authed.user_id) ? json({ ok: true }) : jsonErr("not_found", "you have no Slack link", 404);
@@ -360,8 +366,8 @@ export async function handleHttp(
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo);
-  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo);
-  if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo);
+  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, slack);
+  if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
 
   return notFound();
 }

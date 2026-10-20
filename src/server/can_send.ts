@@ -39,8 +39,8 @@ export function canSend(
 }
 
 // Whether a handle owned by fromEmail may wake `to` when `to` is a human. Your
-// own human is always reachable. Board mentions go through this too
-// (access.ts), so an @mention can't reach a phone a DM can't.
+// own human is always reachable. Board mentions and thread replies go through
+// this too (access.ts), so a post can't reach a phone a DM can't.
 export function reachesHuman(repo: Repo, reach: HumanReach, fromEmail: string, to: string): boolean {
   const slash = to.lastIndexOf("/");
   if (to.slice(slash + 1) !== HUMAN_NAME) return true;

@@ -58,6 +58,8 @@ export type WsOptions = {
   // How long a live connection has to answer a collision probe.
   probeMs?: number;
   humanReach?: HumanReach;
+  // Whether the Slack bridge is up; a linked human is reachable only then.
+  slackRunning?: () => boolean;
 };
 
 // Per server instance.
@@ -72,6 +74,7 @@ type Hub = {
   db: CoreDb;
   probeMs: number;
   humanReach: HumanReach;
+  slackRunning: () => boolean;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -134,6 +137,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
     registry: new Map(), probing: new Set(), toolsOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
+    slackRunning: opts.slackRunning ?? (() => false),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -328,7 +332,7 @@ async function handleHello(
     identity_full: full,
     user_email: authed.user_email,
     teams,
-    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: !!repo.slack.linkFor(authed.user_id) },
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),

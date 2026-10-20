@@ -519,11 +519,19 @@ function makeRepo(db: Database): Repo {
         ).get(slackUser) ?? undefined;
       },
       link(userId, slackUser, dmChannel) {
-        db.run(
-          `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
-          [userId, slackUser, dmChannel, Date.now()],
-        );
+        db.transaction(() => {
+          // Threads live in the old account's DM; a new account starts fresh.
+          db.run(
+            `DELETE FROM slack_threads WHERE user_id = ?
+               AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
+            [userId, userId, slackUser, dmChannel],
+          );
+          db.run(
+            `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
+            [userId, slackUser, dmChannel, Date.now()],
+          );
+        })();
       },
       unlink(userId) {
         db.transaction(() => {

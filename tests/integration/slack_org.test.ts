@@ -18,9 +18,8 @@ let base: string;
 let slack: FakeSlack;
 const open: (Client | WebSocket)[] = [];
 
-beforeEach(async () => {
-  slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
-  app = startServer(
+function serve(apiUrl: string): ReturnType<typeof startServer> {
+  return startServer(
     {
       dbPath: ":memory:",
       httpPort: 0,
@@ -31,11 +30,16 @@ beforeEach(async () => {
       messageRetentionDays: 90,
       auditRetentionDays: 90,
       devAuth: true,
-      admins: [],
-      slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api },
+      admins: ["root@example.com"],
+      slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl },
     },
     { background: false },
   );
+}
+
+beforeEach(async () => {
+  slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
+  app = serve(slack.api);
   base = `http://localhost:${app.server.port}`;
   await app.slackReady;
 });
@@ -212,4 +216,97 @@ test("unlink in Slack removes the human; the HTTP unlink then has nothing to rem
   await link(alice);
   expect((await be.call("dm_send", { to: "human", body: "back" })).delivered_now).toBe(true);
   await until(() => slack.posts().find((p) => p.markdown_text === "**be** back"));
+}, 30_000);
+
+// The id of the post on #e2e with this body, once it's there.
+async function postId(s: Awaited<ReturnType<typeof session>>, body: string): Promise<number> {
+  const end = Date.now() + 5000;
+  for (;;) {
+    const r = await s.call("board_read", { board: "e2e" });
+    const p = (r.posts as { id: number; body: string }[]).find((p) => p.body === body);
+    if (p) return p.id;
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await Bun.sleep(50);
+  }
+}
+
+const posted = (text: string) => slack.posts().some((p) => p.markdown_text?.includes(text));
+
+test("a thread reply reaches a human only as a DM could", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await link(alice);
+  const fe = await session(bob, "fe");
+  await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
+  slack.say("#e2e which fixture?");
+  const root = await postId(fe, "which fixture?");
+
+  await fe.call("board_post", { board: "e2e", body: "not a teammate", parent_id: root });
+  await Bun.sleep(500);
+  expect(posted("not a teammate")).toBe(false);
+
+  expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+  await fe.call("board_post", { board: "e2e", body: "now a teammate", parent_id: root });
+  await until(() => posted("now a teammate"));
+}, 30_000);
+
+test("thread replies while unlinked don't flood in at relink", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  slack.say("#e2e which fixture?");
+  const root = await postId(be, "which fixture?");
+
+  slack.say("unlink");
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from")));
+  await be.call("board_post", { board: "e2e", body: "while away", parent_id: root });
+  await link(alice);
+  await be.call("board_post", { board: "e2e", body: "after relink", parent_id: root });
+  await Bun.sleep(500);
+  expect(posted("while away")).toBe(false);
+}, 30_000);
+
+test("relinking from another Slack account starts new threads there", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  const q = await be.call("dm_send", { to: "human", body: "first" });
+  await until(() => posted("first"));
+
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`, { user: "U0OTHER", channel: "D0OTHER" });
+  await until(() => slack.posts().find((p) => p.channel === "D0OTHER" && p.markdown_text?.startsWith("Linked to")));
+  await be.call("dm_send", { to: "human", body: "second", parent_id: q.message_id });
+  const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** second"));
+  expect(post.channel).toBe("D0OTHER");
+  expect(post.thread_ts).toBeUndefined();
+}, 30_000);
+
+test("disabling a user takes their human offline; enabling brings it back", async () => {
+  const alice = await login("alice@example.com");
+  const root = await login("root@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
+  await be.call("dm_send", { to: "human", body: "while disabled" }).catch(() => {});
+  await Bun.sleep(500);
+  expect(posted("while disabled")).toBe(false);
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
+  await until(() => posted("while disabled"));
+}, 30_000);
+
+test("a bridge that failed to start issues no codes", async () => {
+  const down = serve("http://127.0.0.1:1/api/");
+  await down.slackReady;
+  try {
+    const url = `http://localhost:${down.server.port}`;
+    const t = ((await (await fetch(`${url}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) })).json()) as any).session_token;
+    const r = await fetch(`${url}/api/slack/link`, { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+    expect(r.status).toBe(404);
+    expect(((await r.json()) as any).message).toMatch(/isn't running/);
+  } finally {
+    down.stop();
+  }
 }, 30_000);

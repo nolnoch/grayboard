@@ -14,7 +14,9 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, humanReach);
-  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, { humanReach, ...opts });
+  const { handlers, startPing, stopExpiry, wake } = createWsHandlers(repo, db, {
+    humanReach, slackRunning: () => slack?.running ?? false, ...opts,
+  });
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
