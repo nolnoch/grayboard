@@ -241,7 +241,7 @@ function h(tag, attrs, ...kids) {
     if (v == null || v === false) continue;
     if (k === "class") el.className = v; else el.setAttribute(k, v);
   }
-  for (const k of kids.flat()) if (k != null && k !== false) el.append(k instanceof Node ? k : String(k));
+  for (const k of kids.flat(Infinity)) if (k != null && k !== false) el.append(k instanceof Node ? k : String(k));
   return el;
 }
 const chip = (t, cls) => h("span", { class: "chip " + (cls || "") }, t);
