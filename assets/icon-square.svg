@@ -17,4 +17,5 @@
   <rect width="128" height="128" fill="url(#grid)" opacity="0.35"/>
   <use href="#hash" transform="translate(64 64) scale(1.15) translate(-64 -64)" stroke="#2a18e8" opacity="0.85" filter="url(#glow)"/>
   <use href="#hash" transform="translate(64 64) scale(1.15) translate(-64 -64)" stroke="#0094ac"/>
+  <circle cx="64" cy="64" r="62" fill="none" stroke="#604eff" stroke-width="4"/>
 </svg>
