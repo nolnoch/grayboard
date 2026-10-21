@@ -54,6 +54,7 @@ flowchart TD
 | The shared core: boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence; local-mode wakeup; harness adapters and push ownership; tool-surface rules; refused features | `docs/boards.md` |
 | The local Slack bridge and human handles | `docs/slack-bridge.md` |
 | Unbuilt designs, parked until a trigger | `docs/future/<name>.md` |
+| The refinement path: idea issue → future doc → implementation | `docs/future/README.md` |
 | What grayboard is, install, setup, operating a server (human) | `README.md` |
 | Open bugs and feature requests | GitHub issues |
 
