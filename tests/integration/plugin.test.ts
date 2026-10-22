@@ -360,3 +360,73 @@ test("a true identity_in_use refusal still exits the client (N1: only lost owner
   holder.kill();
   await holder.exited;
 }, 20_000);
+
+// The close-code taxonomy, pinned from the client's side: only LOST
+// OWNERSHIP reconnects. A newer session taking over the SAME lane key is
+// terminal — otherwise two clients on one lane reconnect-supersede each
+// other forever. The displaced client exits ONCE and never re-enters.
+test("a same-lane takeover is terminal: the displaced client exits once, no reconnect flap", async () => {
+  const local = startServer(
+    { dbPath: ":memory:", httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] },
+    { background: false, probeMs: 300 },
+  );
+  const base2 = `http://localhost:${local.server.port}`;
+  try {
+    const token = ((await (await fetch(`${base2}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) })).json()) as { session_token: string }).session_token;
+    const spawnBe = () => Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], {
+      env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base2, BUS_IDENTITY: "be" } as Record<string, string>,
+      stdin: "pipe", stdout: "ignore", stderr: "pipe",
+    });
+    const fleet = async () => {
+      const rows = await (await fetch(`${base2}/api/fleet?identity=be`, { headers: { Authorization: `Bearer ${token}` } })).json();
+      // Before the first hello creates the identity, the route answers
+      // not_found — poll as zero lanes until then.
+      return Array.isArray(rows) ? (rows as { live: boolean }[]) : [];
+    };
+    const liveCount = async () => (await fleet()).filter((l) => l.live).length;
+
+    // The older session hangs (SIGSTOP); the newer probes it, gets no
+    // answer, and takes the lane — the classic same-lane takeover.
+    const first = spawnBe();
+    const lines: string[] = [];
+    void (async () => { const r = first.stderr.getReader(); const d = new TextDecoder(); let buf = ""; for (;;) { const { done, value } = await r.read(); if (done) break; buf += d.decode(value); const nl = buf.split("\n"); lines.push(...nl.slice(0, -1)); buf = nl.at(-1)!; } })();
+    for (let i = 0; i < 50 && (await liveCount()) !== 1; i++) await Bun.sleep(100);
+    expect(await liveCount()).toBe(1);
+    process.kill(first.pid!, "SIGSTOP");
+
+    // The newer session probes the stopped holder, gets no answer, and
+    // supersedes it. Wait for the TAKEOVER, not just "one live lane": the
+    // stopped owner's row already counts as live, and a SIGCONT that lands
+    // while the probe is still in flight lets the owner answer it and win
+    // its lane back — the taker is (correctly) refused instead. The row's
+    // first_seen changes only when the supersede ends the old row and the
+    // taker's join writes a fresh one.
+    const seenBefore = (await fleet()).find((r) => r.lane === "main")?.first_seen;
+    const second = spawnBe();
+    let taken = false;
+    for (let i = 0; i < 50 && !taken; i++) {
+      const main = (await fleet()).find((r) => r.lane === "main");
+      taken = !!main && main.live && main.first_seen !== seenBefore;
+      if (!taken) await Bun.sleep(100);
+    }
+    expect(taken).toBe(true); // the newer session holds the lane
+
+    // The displaced client wakes to the terminal code: exits once, no
+    // reconnect (bounded race so a never-exiting client fails the pin
+    // instead of hanging it).
+    process.kill(first.pid!, "SIGCONT");
+    const exited = await Promise.race([first.exited, Bun.sleep(5_000).then(() => null)]);
+    expect(exited).toBe(1);
+    const err1 = lines.join("\n");
+    expect(err1.match(/superseded by a newer session — exiting/g)).toHaveLength(1);
+
+    // No flap: past the reconnect backoff (1s), the lane still holds
+    // exactly one live connection — the newer session's.
+    await Bun.sleep(2_500);
+    expect(await liveCount()).toBe(1);
+    second.kill();
+    await second.exited;
+  } finally {
+    local.stop();
+  }
+}, 20_000);

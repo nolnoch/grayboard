@@ -814,6 +814,33 @@ test("a half-open owner on another lane is probed before demotion and replaced w
   expect(await owner.next((m) => m.type === "error")).toMatchObject({ code: "lost_ownership" });
 });
 
+test("a reconnecting ex-owner attaches as a tool lane under the new owner (no starvation)", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  // The half-open-owner scenario up to the takeover: lane b now owns push.
+  const owner = new Client(alice, "be", { hello: { lane: "research" }, pong: false });
+  await owner.connect();
+  const taker = new Client(alice, "be", { hello: { lane: "b" } });
+  expect((await taker.connect()).type).toBe("hello_ok");
+
+  // The ex-owner, woken after its lost_ownership close, reconnects on its
+  // own lane: the lane key is free, the delivery slot is held by a live
+  // owner on another lane — it attaches as a TOOL lane (push_granted false),
+  // and is not closed again: the reconnect path can't starve.
+  const back = new Client(alice, "be", { hello: { lane: "research" } });
+  const hello = await back.connect();
+  expect(hello).toMatchObject({ type: "hello_ok", push_granted: false, owner_lane: "b" });
+  await back.none((m) => m.type === "error", 500);
+  expect((await back.call("claim_list")).type).toBe("call_ok");
+
+  // Pushes still route to the owner, not the reattached ex-owner.
+  const fe = new Client(bob, "fe");
+  await fe.connect();
+  await fe.request({ type: "send", recipient: "alice@example.com/be", body: "still mine?" });
+  expect((await taker.next((m) => m.type === "push")).message.body).toBe("still mine?");
+  await back.none((m) => m.type === "push", 300);
+});
+
 test("the heartbeat closes a socket that stops answering pings", async () => {
   const alice = await login("alice@example.com");
   const local = startServer(config(), { probeMs: 150, pingIntervalMs: 20, pingMissLimit: 2 });
