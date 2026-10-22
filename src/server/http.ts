@@ -1,9 +1,10 @@
 import type { Repo, Team } from "./db.ts";
 import type { Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode,
-  mintToken, hashToken, type AuthedUser,
+  verifySessionToken, extractBearer, mintToken, hashToken, IdpError, LoginRefused,
+  PROVIDER_NAMES, type AuthedUser, type ProviderName, type Providers,
 } from "./auth.ts";
+import { resolveLogin } from "./accounts.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
@@ -58,39 +59,54 @@ async function healthz(repo: Repo): Promise<Response> {
   }
 }
 
-function authConfig(config: Config): Response {
-  // Public bootstrap endpoint. Returns only non-secret values the CLI needs to
-  // start the PKCE loopback flow against Google. The client_secret never appears here.
+function authConfig(config: Config, providers: Providers): Response {
+  // Public bootstrap endpoint: only the non-secret values the CLI needs to
+  // start a PKCE loopback flow. Client secrets never appear here.
+  // google_client_id and org_domain are what CLIs before 1.10 read; they
+  // send org_domain as hd, so it follows the same allowlist rule.
+  const google = providers.google;
+  const entra  = providers.entra;
   return json({
-    google_client_id: config.googleClientId,
-    org_domain:       config.orgDomain,
+    providers: PROVIDER_NAMES.filter(p => providers[p]),
+    dev_auth: config.devAuth,
+    ...(google ? {
+      google_client_id: google.clientId,
+      ...(google.hd ? { org_domain: google.hd } : {}),
+      google: { client_id: google.clientId, authorize_url: google.authorizeUrl, ...(google.hd ? { hd: google.hd } : {}) },
+    } : {}),
+    ...(entra ? { entra: { client_id: entra.clientId, authorize_url: entra.authorizeUrl } } : {}),
   });
 }
 
-async function authExchange(req: Request, repo: Repo, config: Config): Promise<Response> {
-  const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
+async function authExchange(req: Request, repo: Repo, providers: Providers): Promise<Response> {
+  const body = await parseBody<{ provider?: string; code: string; code_verifier: string; redirect_uri: string }>(req);
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
   }
-  let email: string, displayName: string | null;
+  // CLIs before 1.10 send no provider; they only knew Google.
+  const name = (body.provider ?? "google") as ProviderName;
+  const provider = providers[name];
+  if (!provider) return badRequest(`this server doesn't offer "${name}" sign-in`);
+  const ip = req.headers.get("x-forwarded-for") ?? undefined;
+  const ua = req.headers.get("user-agent")?.slice(0, 120) ?? null;
+  const refuse = (status: number, e: Error, claimed?: string): Response => {
+    writeAudit(repo, "auth.refused", null, claimed ?? null, { provider: name, reason: e.message, ip, ua: ua ?? undefined });
+    return jsonErr(status === 502 ? "idp_error" : "forbidden", e.message, status);
+  };
+  let user, event;
   try {
-    ({ email, displayName } = await exchangeGoogleCode(
-      body.code, body.code_verifier, body.redirect_uri,
-      config.googleClientId, config.googleClientSecret, config.orgDomain,
-    ));
+    const verified = await provider.exchange(body.code, body.code_verifier, body.redirect_uri);
+    if (!isValidEmail(verified.email)) throw new LoginRefused(`grayboard can't address "${verified.email}"`, verified.email);
+    ({ user, event } = resolveLogin(repo, verified));
   } catch (e) {
-    return jsonErr("forbidden", String(e), 403);
+    if (e instanceof LoginRefused) return refuse(403, e, e.claimedEmail);
+    if (e instanceof IdpError) return refuse(502, e);
+    throw e;
   }
-  if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
-  const user = repo.users.upsertByEmail(email, displayName ?? null);
-  const raw  = mintToken();
-  const ua   = req.headers.get("user-agent")?.slice(0, 120) ?? null;
+  const raw = mintToken();
   repo.sessions.create(user.id, hashToken(raw), ua);
-  writeAudit(repo, "auth.login", email, null, {
-    ip: req.headers.get("x-forwarded-for") ?? undefined,
-    ua: ua ?? undefined,
-  });
-  return json({ session_token: raw, user_email: email, expires_at: null });
+  writeAudit(repo, "auth.login", user.email, null, { provider: name, event, ip, ua: ua ?? undefined });
+  return json({ session_token: raw, user_email: user.email, expires_at: null });
 }
 
 async function devLogin(req: Request, repo: Repo): Promise<Response> {
@@ -310,10 +326,24 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   return json({ ok: true });
 }
 
+// Clears a user's sign-in links so their next login binds afresh.
+async function adminUnlink(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ email: string; provider?: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  if (body.provider !== undefined && !PROVIDER_NAMES.includes(body.provider as ProviderName)) {
+    return badRequest(`provider must be one of ${PROVIDER_NAMES.join(", ")}`);
+  }
+  const target = repo.users.findByEmail(body.email.toLowerCase());
+  if (!target) return notFound();
+  const removed = repo.links.unlink(target.id, body.provider);
+  writeAudit(repo, "auth.unlinked", authed.user_email, target.email, { provider: body.provider ?? "all", removed });
+  return json({ ok: true, removed });
+}
+
 // ── main router ──────────────────────────────────────────────────────────────
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
+  req: Request, repo: Repo, db: CoreDb, config: Config, providers: Providers, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
 ): Promise<Response> {
   const url    = new URL(req.url);
@@ -321,8 +351,8 @@ export async function handleHttp(
   const method = req.method;
 
   if (path === "/healthz" && method === "GET") return healthz(repo);
-  if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
-  if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, config);
+  if (path === "/api/auth/config"    && method === "GET")  return authConfig(config, providers);
+  if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, providers);
   if (path === "/api/auth/dev-login" && method === "POST") {
     if (!config.devAuth) return notFound();
     return devLogin(req, repo);
@@ -375,6 +405,7 @@ export async function handleHttp(
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
+  if (path === "/api/admin/unlink"         && method === "POST") return adminUnlink(req, authed, repo);
 
   return notFound();
 }

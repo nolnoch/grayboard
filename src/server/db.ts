@@ -19,6 +19,9 @@ export type SlackLink = { user_id: number; email: string; slack_user: string; dm
 // (message id for dm, post id for board). peer: the other party in a dm.
 // last_id: the newest grayboard id in the thread, the parent for a reply.
 export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
+// A sign-in account bound to a user: provider plus its stable subject (Google
+// sub; Entra tid:oid). email is the address the IdP gave when it was linked.
+export type AuthLink = { provider: string; subject: string; user_id: number; email: string; linked_at: number; last_login_at: number };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 
 export interface Repo {
@@ -27,6 +30,15 @@ export interface Repo {
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
     setDisabled(userId: number, disabled: boolean): void;
+  };
+  links: {
+    find(provider: string, subject: string): AuthLink | undefined;
+    forUser(userId: number): AuthLink[];
+    // Replaces the user's earlier link for this provider, if any.
+    link(userId: number, provider: string, subject: string, email: string): void;
+    touch(provider: string, subject: string, now: number): void;
+    // Removes the user's links, or only this provider's; returns how many.
+    unlink(userId: number, provider?: string): number;
   };
   sessions: {
     create(userId: number, tokenHash: string, label: string | null): Session;
@@ -117,6 +129,19 @@ function initSchema(db: Database): void {
       display_name TEXT,
       created_at   INTEGER NOT NULL,
       disabled_at  INTEGER
+    );
+
+    -- Sign-in accounts (src/server/accounts.ts): the login key, so one IdP's
+    -- email claim can't sign in as another provider's user.
+    CREATE TABLE IF NOT EXISTS auth_links (
+      provider      TEXT NOT NULL,
+      subject       TEXT NOT NULL,
+      user_id       INTEGER NOT NULL REFERENCES users(id),
+      email         TEXT NOT NULL,
+      linked_at     INTEGER NOT NULL,
+      last_login_at INTEGER NOT NULL,
+      PRIMARY KEY (provider, subject),
+      UNIQUE (user_id, provider)
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
@@ -237,6 +262,34 @@ function makeRepo(db: Database): Repo {
       },
       setDisabled(userId, disabled) {
         db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? Date.now() : null, userId]);
+      },
+    },
+
+    links: {
+      find(provider, subject) {
+        return db.query<AuthLink, [string, string]>("SELECT * FROM auth_links WHERE provider = ? AND subject = ?").get(provider, subject) ?? undefined;
+      },
+      forUser(userId) {
+        return db.query<AuthLink, [number]>("SELECT * FROM auth_links WHERE user_id = ? ORDER BY provider").all(userId);
+      },
+      link(userId, provider, subject, email) {
+        const now = Date.now();
+        db.transaction(() => {
+          db.run("DELETE FROM auth_links WHERE user_id = ? AND provider = ?", [userId, provider]);
+          db.run(
+            `INSERT INTO auth_links (provider, subject, user_id, email, linked_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?)`,
+            [provider, subject, userId, email, now, now],
+          );
+        })();
+      },
+      touch(provider, subject, now) {
+        db.run("UPDATE auth_links SET last_login_at = ? WHERE provider = ? AND subject = ?", [now, provider, subject]);
+      },
+      unlink(userId, provider) {
+        const r = provider === undefined
+          ? db.run("DELETE FROM auth_links WHERE user_id = ?", [userId])
+          : db.run("DELETE FROM auth_links WHERE user_id = ? AND provider = ?", [userId, provider]);
+        return r.changes;
       },
     },
 

@@ -10,9 +10,6 @@ import type { ServerMessage } from "../../src/shared/protocol.ts";
 const config = (overrides: Partial<Config> = {}): Config => ({
   dbPath: ":memory:",
   httpPort: 0,
-  googleClientId: "dev",
-  googleClientSecret: "",
-  orgDomain: "example.com",
   publicUrl: "http://localhost",
   messageRetentionDays: 90,
   auditRetentionDays: 90,

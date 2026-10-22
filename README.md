@@ -26,7 +26,7 @@ If you run parallel agent sessions (a frontend agent in one repo, a backend agen
   <img alt="Six agent sessions in four repos coordinate through grayboard. The web agent posts on the #e2e board mentioning @api, which wakes the api agent. The api-throughput worktree (running omp) holds the claim merge:api during a soak test, and the api-stream worktree sees it when it starts. api-stream messages sim, which is offline, so the message waits and arrives when sim reconnects. The docs agent (opencode) follows the busy #dev board as a digest and gets one notice instead of twelve posts. The web agent just ran /clear and dm_inbox shows it still owes docs an answer." src="assets/scenario-light.svg" width="900">
 </picture>
 
-It runs on one machine with no server (local mode), or across machines and people through a small team server with Google sign-in (distributed mode).
+It runs on one machine with no server (local mode), or across machines and people through a small team server with Google or Microsoft sign-in (distributed mode).
 
 **Why not the harness's own messaging?** Claude Code's `SendMessage` reaches running Claude Code sessions only. Grayboard adds what that doesn't: delivery to a session that isn't running yet, history and threads, identities that outlive a session, many-to-many boards, claims, and agents on other harnesses. Two Claude Code sessions can still use `SendMessage` with each other.
 
@@ -58,7 +58,7 @@ Re-run `grayboard setup` any time to switch modes.
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/identity` namespaces | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
+| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/identity` namespaces | Google or Microsoft Entra ID OIDC (domain, allowlist or tenant) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
 
 Both modes expose the same tools. Claude Code runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
 
@@ -244,19 +244,19 @@ If your use case grows past any of those, switch to distributed mode.
 
 ## Distributed mode
 
-A central server on one host, a per-session MCP shim on each developer's machine, and Google sign-in. This is what makes cross-machine and team coordination work.
+A central server on one host, a per-session MCP shim on each developer's machine, and sign-in through Google, Microsoft Entra ID, or both. This is what makes cross-machine and team coordination work.
 
 **How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it terminates WSS, owns SQLite, and handles sign-in. Each Claude Code session spawns a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects over WSS with the session token in `~/.grayboard/credentials`. Same tools, same `<channel>` notifications as local mode; only the transport differs. Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
-The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no Google), so the server and transport are proven before OAuth is involved.
+The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no identity provider), so the server and transport are proven before OAuth is involved.
 
 ### Before you start
 
-- **A Google Workspace domain.** Sign-in accepts only Google accounts whose Workspace domain (the ID token's `hd` claim) equals `GRAYBOARD_ORG_DOMAIN`. Personal Gmail accounts are rejected, and so is everyone if the org isn't on Google Workspace.
-- **A Google Cloud project you can create an OAuth client in** (step 6). Any project works.
+- **Who signs in, and through which provider.** Google admits the accounts of a Google Workspace domain (the ID token's `hd` claim equals `GRAYBOARD_ORG_DOMAIN`), the individual Google accounts listed in `GRAYBOARD_ALLOWED_EMAILS` (personal Gmail included), or both. Microsoft Entra ID admits the members, not guests, of the directory tenants listed in `ENTRA_TENANT_IDS`. A server can offer both; step 6 sets them up.
+- **Somewhere to create the OAuth client:** for Google, a Google Cloud project (any project works); for Entra, an app registration in your tenant, which needs the right to register apps there.
 - **A Linux host you can SSH into.** A t4g.small on Ubuntu 24.04 LTS (arm64) is plenty. Release binaries exist for linux-arm64 and linux-x64.
 - **A stable public IP and a hostname that resolves to it.** Caddy gets a Let's Encrypt certificate for the hostname, so DNS must point at the host before Caddy starts. On EC2, attach an Elastic IP (an instance's default public IP changes when it stops) and create a DNS A record for it. Without access to DNS, a wildcard-DNS name such as `203-0-113-10.sslip.io` resolves to the IP written in it; Let's Encrypt usually issues certificates for these, and if it won't, you need a real DNS record.
-- **Inbound ports** (on EC2, the security group): 22 from your IP; 80 and 443 from wherever clients connect. Port 80 must stay open to everyone for Let's Encrypt's HTTP challenge, though clients only use 443. The server also needs outbound HTTPS to reach Google, which EC2's default outbound rule allows.
+- **Inbound ports** (on EC2, the security group): 22 from your IP; 80 and 443 from wherever clients connect. Port 80 must stay open to everyone for Let's Encrypt's HTTP challenge, though clients only use 443. The server also needs outbound HTTPS to reach Google's or Microsoft's sign-in endpoints, which EC2's default outbound rule allows.
 - **On each developer machine:** Claude Code ≥ 2.1.80, signed in with a claude.ai account (`/status` shows the login method). Channels don't work with console or API-key auth.
 
 ### 1. Check what's on the host
@@ -344,12 +344,11 @@ sudoedit /etc/grayboard/env
 GRAYBOARD_DB_PATH=/var/lib/grayboard/bus.db
 GRAYBOARD_HTTP_PORT=8080
 GRAYBOARD_PUBLIC_URL=https://grayboard.example.com
-GRAYBOARD_ORG_DOMAIN=example.com
 GRAYBOARD_ADMINS=you@example.com
 GRAYBOARD_DEV_AUTH=1
 ```
 
-`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
+`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the provider variables yet: the server refuses to start with dev auth alongside `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3) or `ENTRA_CLIENT_SECRET`, and with `GRAYBOARD_ORG_DOMAIN` or `GRAYBOARD_ALLOWED_EMAILS` but no Google client.
 
 ### 4. Start and verify
 
@@ -365,7 +364,7 @@ From your laptop:
 
 ```bash
 curl -s https://grayboard.example.com/healthz           # {"ok":true}
-curl -s https://grayboard.example.com/api/auth/config   # {"google_client_id":"dev","org_domain":"example.com"}
+curl -s https://grayboard.example.com/api/auth/config   # {"providers":[],"dev_auth":true}
 ```
 
 If the HTTPS check fails, `journalctl -u caddy -n 50 --no-pager` shows the certificate attempt. The usual causes are a hostname that doesn't resolve to this host yet, or port 80 closed.
@@ -397,19 +396,55 @@ cd ~/gb-test/api && claude --dangerously-load-development-channels server:graybo
 
 The same checks across two machines, or with a teammate's account, prove the rest; a teammate's identities appear as `them@example.com/<name>`.
 
-### 6. Switch to Google sign-in
+### 6. Switch to real sign-in
 
-**Create the OAuth client.** In Google Cloud Console, open *Google Auth Platform* (APIs & Services → OAuth consent screen in older layouts):
+The server offers Google, Microsoft Entra ID, or both: each provider is on when its client ID is set. Create the client for each one you want, then reconfigure the server once.
 
-1. **Audience.** *Internal* lets anyone in your Workspace sign in, but the Cloud project must belong to that Workspace organization. *External* works from any project; while it's in *Testing* status, only the users you list under *Test users* can sign in.
+#### Google
+
+In Google Cloud Console, open *Google Auth Platform* (APIs & Services → OAuth consent screen in older layouts):
+
+1. **Audience.** *Internal* lets anyone in your Workspace sign in, but the Cloud project must belong to that Workspace organization, and it admits no one outside it. *External* works from any project and is the one to use for allowlisted accounts outside your Workspace; while it's in *Testing* status, only the users you list under *Test users* can sign in.
 2. **Client.** Create an OAuth client of type **Desktop app**, not *Web application*. `grayboard login` listens on `http://127.0.0.1:<random port>/cb`, and only Desktop clients accept a loopback redirect without registering each port; a Web client fails with `redirect_uri_mismatch`. Scopes are `openid email profile`, which need no verification.
 3. Copy the client ID and client secret. The secret goes only in the server's env file. It's sent in the server-side token exchange and never to clients.
-
-**Reconfigure the server.** In `/etc/grayboard/env`, delete the `GRAYBOARD_DEV_AUTH` line, set `GRAYBOARD_ORG_DOMAIN` to your Workspace domain and `GRAYBOARD_ADMINS` to your Workspace email, and add:
 
 ```
 GOOGLE_OAUTH_CLIENT_ID=<client id>.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_SECRET=<client secret>
+GRAYBOARD_ORG_DOMAIN=example.com
+GRAYBOARD_ALLOWED_EMAILS=alice@gmail.com,bob@partner.example
+```
+
+A Google sign-in passes when Google has verified the account's email and either its Workspace domain (`hd`) is `GRAYBOARD_ORG_DOMAIN` or its email is in the comma-separated `GRAYBOARD_ALLOWED_EMAILS`. Set either or both. With only a domain, Google's account chooser shows only that domain's accounts; with an allowlist, it shows every account in the browser.
+
+#### Microsoft Entra ID
+
+In the Microsoft Entra admin center (entra.microsoft.com), open *Entra ID → App registrations → New registration*:
+
+1. **Account types.** *Single tenant* when only your tenant signs in. *Multitenant* when `ENTRA_TENANT_IDS` will list several; each other tenant must then consent to the app (its admin, or each user if that tenant allows user consent). Leave the redirect URI empty for now.
+2. **Redirect URI.** The server redeems the sign-in code with a client secret, so the app's platform is **Web**. `grayboard login` listens on `http://127.0.0.1:<random port>/cb`; Entra ignores the port of a loopback redirect, but the portal won't take an `http://` Web URI. Add it in *Manifest* (Microsoft Graph format) instead: set `"redirectUris": ["http://127.0.0.1/cb"]` under `"web"`, and save. Don't add it under *Mobile and desktop applications*: that makes the app a public client, and Microsoft then refuses the secret (`AADSTS700025`).
+3. **Client secret.** *Certificates & secrets → New client secret*; copy its *Value*, not its *Secret ID*. Secrets expire (24 months at most), so note when to rotate it.
+4. **ID token claims.** *Token configuration → Add optional claim → ID*: tick `email`, `acct` and `xms_edov`, and accept the Microsoft Graph `email` permission if offered. The server refuses a token without them. `acct` tells members (0) from guests, and `xms_edov` says whether the tenant has verified the email's domain, because Entra lets a user's email be any address.
+5. **Hardening (optional).** To admit only some of the tenant's users, open *Enterprise applications* → the app → *Properties*, set *Assignment required* to Yes, and assign users or groups under *Users and groups*. To have Entra drop unverified emails from tokens too (the server already refuses them), set the app's `removeUnverifiedEmailClaim` through Microsoft Graph's beta API, for example with the Azure CLI, using the app's *Object ID* (not its client ID):
+
+   ```bash
+   az rest --method PATCH --url https://graph.microsoft.com/beta/applications/<object id> \
+     --body '{"authenticationBehaviors":{"removeUnverifiedEmailClaim":true}}'
+   ```
+
+```
+ENTRA_CLIENT_ID=<application (client) id>
+ENTRA_CLIENT_SECRET=<client secret value>
+ENTRA_TENANT_IDS=<directory (tenant) id>
+```
+
+`ENTRA_TENANT_IDS` takes the *Directory (tenant) ID* GUIDs from each tenant's overview page, comma-separated, not domain names. With one tenant, sign-in goes to that tenant's own endpoint; with several, to Microsoft's multi-organization endpoint, and the server accepts only tokens issued by the tenants listed. A user's grayboard email is the token's `email` claim, which is usually the mailbox address and need not be the sign-in name.
+
+#### Reconfigure the server
+
+In `/etc/grayboard/env`, delete the `GRAYBOARD_DEV_AUTH` line, set `GRAYBOARD_ADMINS` to your real email, and add the provider lines from above plus:
+
+```
 GRAYBOARD_MESSAGE_RETENTION_DAYS=90
 GRAYBOARD_AUDIT_RETENTION_DAYS=90
 ```
@@ -420,10 +455,18 @@ Sessions never expire, so the dev-auth sessions would stay valid after the switc
 sudo systemctl stop grayboard
 sudo rm -f /var/lib/grayboard/bus.db /var/lib/grayboard/bus.db-wal /var/lib/grayboard/bus.db-shm
 sudo systemctl start grayboard
-curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
+curl -s https://grayboard.example.com/api/auth/config   # now lists your providers and their client IDs
 ```
 
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
+**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes the provider's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). When the server offers both providers, `login` asks which; `--provider google` or `--provider entra` answers up front. Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
+
+**How sign-ins map to users.** A user is their email, which is also the first half of every handle. The server remembers which provider account signed in as each user (Google's account ID; Entra's tenant and object IDs), so a sign-in always comes from a known provider account, never from an email alone:
+
+- A provider that owns the email's domain (a Workspace domain or gmail.com for Google, a tenant-verified domain for Entra) can sign in as an existing user with that email. That's how one person uses both providers, and how an account its domain's owner deleted and recreated gets back in.
+- An allowlisted Google address outside Workspace and Gmail binds only on the user's first sign-in with any provider. A different Google account claiming the same email is refused, and so is a Google sign-in for someone who signed in with Microsoft first.
+- A known account whose email has changed is refused, since a new email would rename every handle.
+
+Each of these refusals names the fix: an admin runs `grayboard admin unlink --email <email>` and the next sign-in binds afresh. After an unlink, a changed email signs in as a new user with new handles; the old user's boards and messages stay under the old email. Every link, relink, unlink and refusal writes an audit row.
 
 ### 7. Backups (optional)
 
@@ -456,16 +499,18 @@ sudo systemctl restart grayboard
 
 To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds.
 
+Update the server before developers update their CLIs: a 1.10 or later CLI stops with "This server is older than this CLI" against an older server, while CLIs before 1.10 keep signing in with Google against a server that offers it. On the first start of a server with account links, existing users have none; each user's next sign-in binds their account, with nothing to migrate by hand.
+
 ### Per-developer setup (one-time)
 
-With the server running on Google sign-in, each developer runs the [quick start](#quick-start) and chooses "a team server", or:
+With the server running on Google or Microsoft sign-in, each developer runs the [quick start](#quick-start) and chooses "a team server", or:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | GRAYBOARD_NO_SETUP=1 bash
 grayboard setup --server https://grayboard.example.com
 ```
 
-`setup` signs you in through your browser and registers grayboard with Claude Code (and omp, opencode, and pi, if they're installed). The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
+`setup` signs you in through your browser and registers grayboard with Claude Code (and omp, opencode, and pi, if they're installed). The CLI gets each provider's client ID from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. When the server offers both Google and Microsoft, `setup` asks which you sign in with; `--provider google` or `--provider entra` answers up front. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
 
 `install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.1.3`.
 
@@ -534,10 +579,16 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | Symptom | Likely cause |
 |---|---|
 | HTTPS to the host fails or has a certificate error | DNS doesn't point at the host, or port 80 is closed; see `journalctl -u caddy` |
-| `grayboard-server` won't start | A required env var is missing, or dev auth is set alongside the client secret; see `journalctl -u grayboard` |
+| `grayboard-server` won't start | A required env var is missing, no provider is configured and dev auth is off, a provider is half-configured (an ID without its secret, Entra without `ENTRA_TENANT_IDS`), or dev auth is set alongside a client secret; `journalctl -u grayboard` names it |
 | Google shows `redirect_uri_mismatch` | The OAuth client is *Web application*; create a *Desktop app* client |
 | Google shows "access blocked" or the app isn't available | *External* audience in *Testing* without you listed as a test user, or *Internal* with the Cloud project outside your Workspace org |
-| `login` returns 403 after Google succeeds | The account isn't on `GRAYBOARD_ORG_DOMAIN` (`hd` mismatch), or its email isn't verified |
+| `login` returns 403 after Google succeeds | The account is outside `GRAYBOARD_ORG_DOMAIN` and not in `GRAYBOARD_ALLOWED_EMAILS`, or Google hasn't verified its email; the message says which |
+| Microsoft shows `AADSTS50011` (redirect URI mismatch) | `http://127.0.0.1/cb` isn't in the app's `web.redirectUris`; add it in *Manifest* ([step 6](#microsoft-entra-id)) |
+| `login` returns 502 with `AADSTS700025` | The redirect URI is registered under *Mobile and desktop applications*; move it to `web.redirectUris` |
+| `login` returns 403 after Microsoft succeeds | The message says which: the tenant isn't in `ENTRA_TENANT_IDS`; the account is a guest there; an optional claim (`email`, `acct`, `xms_edov`) is missing from the app; or the tenant hasn't verified the email's domain |
+| `login` returns 502 (`idp_error`) | The server couldn't redeem the code or fetch the provider's signing keys: a client secret that's wrong, expired or belongs to another app, or no outbound HTTPS; the message carries the provider's reply |
+| `login` says the account "already signs in with a different … account", "now reports" another email, or that Google "doesn't own" the email's domain | The provider account was recreated, its email changed, or an allowlisted Google address already signs in another way; an admin runs `grayboard admin unlink --email <e>` ([how sign-ins map to users](#6-switch-to-real-sign-in)) |
+| `login` says "This server is older than this CLI" | Update the server ([Updating the server](#updating-the-server)) |
 | `login --dev` returns 404 | Dev auth is off (`GRAYBOARD_DEV_AUTH=1` not set) |
 | `grayboard admin …` returns 403 | Your email isn't in the server's `GRAYBOARD_ADMINS`, or it's unset; edit `/etc/grayboard/env` and restart |
 | `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); a member runs `grayboard team add <team> <your email>` |
@@ -555,7 +606,7 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 ### CLI reference
 
 ```
-grayboard setup [--local | --server <url>] [--no-register] [-y]
+grayboard setup [--local | --server <url>] [--provider google|entra] [--no-register] [-y]
 grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
 grayboard update                         # replace this binary with the latest release
 grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
@@ -568,7 +619,7 @@ grayboard announce [--ttl <dur>] [--mode local] <text>  # local mode; post to #a
 grayboard board create [--mode local] <name> <purpose>  # local mode; create a board as your human handle
 grayboard bridge slack [--mode local]    # local mode; see Slack bridge setup
 
-grayboard login [--dev <email>] [--server <url>]
+grayboard login [--dev <email>] [--server <url>] [--provider google|entra]
 grayboard logout
 grayboard whoami                         # the handle this shell acts as; in server mode, also your user, identities and teams
 
@@ -589,6 +640,7 @@ grayboard team members <name>            # members and admins
 grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>
 grayboard admin enable-user --email <e>
+grayboard admin unlink --email <e> [--provider google|entra]   # the next sign-in binds a new provider account
 ```
 
 > Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.
