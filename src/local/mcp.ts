@@ -28,6 +28,7 @@ import {
   getMessage,
   getThread,
   insertMessage,
+  lanesReadPast,
   receivedUnacked,
   retractMessage,
   sentPending,
@@ -36,7 +37,7 @@ import {
   type Message,
   unreadFor,
 } from "./db.ts";
-import { assertLaneFree, laneAlive, listenForWakeup, poke } from "./wakeup.ts";
+import { assertLaneFree, laneAlive, listenForWakeup, poke, pokeLanes } from "./wakeup.ts";
 import { sessionIdentity, sessionLane } from "../shared/identity.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
@@ -273,13 +274,24 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     }
     const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
     const p = pending ? { pending: true } : {};
-    const delivered = await poke(recipient);
-    if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
+    // Fleet delivery truth, like the server's send_ok: how many of the
+    // recipient's lanes are live, and which had read past this point.
+    // Surfaced only when it says more than the default, so single-session
+    // results stay unchanged.
+    const { live, any: delivered } = await pokeLanes(recipient);
+    const fleet: Record<string, unknown> = {};
+    if (recipient === IDENTITY || live > 1) {
+      const read = lanesReadPast(recipient, Math.max(1, id - 1));
+      if (live > 1) fleet.live_lanes = live;
+      if (read.length > 0) fleet.read_lanes = read;
+    }
+    if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, ...fleet, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
     return text(JSON.stringify({
       message_id: id,
       delivered_now: false,
       ...p,
+      ...fleet,
       note: queuedNote(recipient, seen),
       ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
       undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === recipient)?.n ?? 1,
@@ -385,10 +397,17 @@ async function drainToClaude(): Promise<void> {
   draining = true;
   try {
     // Lazy sweep first (ruling 3): local sockets have no close event, so any
-    // draining reader ends lanes whose session crashed — role "session"
+    // draining reader ends lanes whose session crashed — kind "session"
     // rows, past a grace window, whose lane socket no longer answers.
     await sweepStaleLanes();
     touchLane(db, IDENTITY, LANE);
+    // A sibling lane may have handled messages this lane never saw: sync to
+    // the identity's read point before draining (any lane's ack counts), so
+    // one DM wakes one agent of the fleet, not every lane (the first drain
+    // wins; two lanes reading concurrently can still both hold a message
+    // briefly — at-least-once, duplicates are the safe direction).
+    const readPoint = anyCursorFor(IDENTITY);
+    if (readPoint > getCursor(READER)) setCursor(READER, readPoint);
     while (true) {
       const batch = unreadFor(READER);
       // A human's session has no tokens to save; a DM is already waking the agent.
@@ -425,14 +444,14 @@ async function drainToClaude(): Promise<void> {
 }
 
 // A crashed local session writes nothing (no close event), so its lane row
-// lingers until any draining session sweeps it: role "session", last_seen
+// lingers until any draining session sweeps it: kind "session", last_seen
 // past the grace window (a live lane touches it on every drain), and a lane
 // socket that no longer answers after the full retry window. Bridge lanes
-// (role "bridge") are sticky: exempt, the human's reachability rides on them.
+// (kind "bridge") are sticky: exempt, the human's reachability rides on them.
 const STALE_LANE_MS = 60_000;
 
 async function sweepStaleLanes(): Promise<void> {
-  const rows = db.prepare(`SELECT handle, lane, last_seen FROM lanes WHERE role = 'session'`).all() as {
+  const rows = db.prepare(`SELECT handle, lane, last_seen FROM lanes WHERE kind = 'session'`).all() as {
     handle: string; lane: string; last_seen: number;
   }[];
   const now = Date.now();
@@ -452,11 +471,14 @@ async function sweepStaleLanes(): Promise<void> {
 // joining a fleet doesn't replay the identity's history.
 if (DELIVER) await assertLaneFree(IDENTITY, LANE);
 // A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (DELIVER) startSession(db, IDENTITY, process.cwd(), LANE, { role: HUMAN ? "bridge" : "session", push_capable: true });
+if (DELIVER) startSession(db, IDENTITY, process.cwd(), LANE, { kind: HUMAN ? "bridge" : "session", push_capable: true });
 else touchHandle(db, IDENTITY);
-if (LANE !== MAIN_LANE) {
-  const mainCursor = getCursor(IDENTITY);
-  if (mainCursor > 0 && getCursor(READER) === 0) setCursor(READER, mainCursor);
+// Seed this lane's cursor to the identity's read point (the MAX across its
+// lanes): a fresh or rejoining lane must not replay what a sibling already
+// handled — including an identity that only ever ran on non-main lanes.
+{
+  const readPoint = anyCursorFor(IDENTITY);
+  if (readPoint > 0) setCursor(READER, readPoint);
 }
 await mcp.connect(new StdioServerTransport());
 

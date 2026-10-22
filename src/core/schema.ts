@@ -97,13 +97,16 @@ export function initCoreSchema(db: Database): void {
     -- cwd/place/status replace the shared handle columns, which stay as the
     -- pre-lanes display fallback for offline handles. push_capable: the
     -- session asked for push; ownership itself is the server's registry slot.
-    -- role: "session", or "bridge" for a bridge's lane (exempt from
-    -- local stale sweeps). Attribution stays the identity handle; lanes are
+    -- kind: "session", or "bridge" for a bridge's lane (exempt from
+    -- local stale sweeps). Named "kind", not "role": role is the #104
+    -- vocabulary (a coat granted to a binding), which this is not. No CHECK:
+    -- additive-only schema can never tighten it, and new kinds shouldn't
+    -- need a table rebuild. Attribution stays the identity handle; lanes are
     -- roster truth, never authority.
     CREATE TABLE IF NOT EXISTS lanes (
       handle       TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
       lane         TEXT NOT NULL,
-      role         TEXT NOT NULL CHECK (role IN ('session','bridge')) DEFAULT 'session',
+      kind         TEXT NOT NULL DEFAULT 'session',
       cwd          TEXT,
       place        TEXT,
       status       TEXT,

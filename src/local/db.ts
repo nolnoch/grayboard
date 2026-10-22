@@ -1,4 +1,5 @@
 import { openLocalDb } from "./open.ts";
+import { MAIN_LANE } from "../core/boards.ts";
 
 export const db = openLocalDb();
 
@@ -55,15 +56,28 @@ export function getCursor(reader: string): number {
 // How far an identity has received its DMs across every lane of its fleet
 // (a lane reading is the identity reading). Lanes keep their own cursors
 // (`identity` for the default lane, `identity#<lane>` for the rest); the
-// pre-lanes rows are the default lane's, unchanged.
+// pre-lanes rows are the default lane's, unchanged. The range predicate
+// (`>= id#` and `< id$`, '#' < '$') matches every `identity#…` row and can
+// use an index, unlike a substr prefix compare.
 export function anyCursorFor(identity: string): number {
   const row = db
     .prepare(
       `SELECT MAX(last_seen_id) AS id FROM cursors
-        WHERE reader = ? OR substr(reader, 1, length(?) + 1) = ? || '#'`,
+        WHERE reader = ? OR (reader >= ? || '#' AND reader < ? || '$')`,
     )
     .get(identity, identity, identity) as { id: number | null } | undefined;
   return row?.id ?? 0;
+}
+
+/** Which lanes of an identity have read (acked) past `messageId`. */
+export function lanesReadPast(identity: string, messageId: number): string[] {
+  const rows = db
+    .prepare(
+      `SELECT reader FROM cursors
+        WHERE last_seen_id >= ? AND (reader = ? OR (reader >= ? || '#' AND reader < ? || '$'))`,
+    )
+    .all(messageId, identity, identity, identity) as { reader: string }[];
+  return rows.map((r) => (r.reader === identity ? MAIN_LANE : r.reader.slice(identity.length + 1)));
 }
 
 export function setCursor(reader: string, last_seen_id: number): void {
@@ -113,7 +127,7 @@ export function undeliveredFrom(
         WHERE m.sender = ? AND m.recipient != m.sender
           AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
                                 WHERE c.reader = m.recipient
-                                   OR substr(c.reader, 1, length(m.recipient) + 1) = m.recipient || '#'), 0)
+                                   OR (c.reader >= m.recipient || '#' AND c.reader < m.recipient || '$')), 0)
           AND m.created_at < ?
         GROUP BY m.recipient ORDER BY m.recipient`,
     )

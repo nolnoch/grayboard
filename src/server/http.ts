@@ -305,7 +305,7 @@ function fleetList(authed: AuthedUser, repo: Repo, db: CoreDb, identity: string 
       out.push({
         identity: i.name,
         lane: row.lane,
-        role: row.role,
+        kind: row.kind,
         push_capable: !!row.push_capable,
         live: l?.live ?? false,
         push_owner: l?.push_owner ?? false,

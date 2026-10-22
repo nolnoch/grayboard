@@ -3,6 +3,7 @@ import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer } from "./auth.ts";
+import { endAllLanes } from "../core/boards.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
@@ -19,9 +20,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
 
   // Lane rows mirror live sessions; at boot none are connected, so they all
-  // date from before this process (a crash or restart left them). Wipe them —
-  // the roster's ghosts — rather than let them render as offline lanes.
-  db.exec("DELETE FROM lanes");
+  // date from before this process (a crash or restart left them). End them
+  // through the core (each row's state snapshotted onto its handle, so a
+  // reconnecting lane seeds from real state) rather than raw SQL — the
+  // roster's ghosts — rather than let them render as offline lanes.
+  endAllLanes(db);
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -70,8 +73,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
 
   const timers: ReturnType<typeof setInterval>[] = [];
+  // The heartbeat always runs: half-open sockets must not hold a delivery
+  // slot whether or not background jobs do. Its interval (30s) never fires
+  // during a test; tests that need it pass pingIntervalMs.
+  timers.push(startPing());
   if (opts.background !== false) {
-    timers.push(startPing());
     startRetentionJobs(repo, db, config);
   }
 

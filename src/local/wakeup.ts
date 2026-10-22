@@ -88,11 +88,18 @@ export async function assertLaneFree(identity: string, lane: string): Promise<vo
 // on open, so a probe also nudges them, which is harmless (drain is
 // idempotent). True when any lane answered.
 export async function poke(identity: string): Promise<boolean> {
-  let any = false;
+  return (await pokeLanes(identity)).any;
+}
+
+// The counted form of poke: how many of the identity's lanes answered (the
+// local-mode counterpart of the server's live_lanes). Probing is still a
+// wakeup for each lane it reaches.
+export async function pokeLanes(identity: string): Promise<{ live: number; any: boolean }> {
+  let live = 0;
   for (const path of laneSocketPaths(identity)) {
-    if (await canConnect(path)) any = true;
+    if (await canConnect(path)) live++;
   }
-  return any;
+  return { live, any: live > 0 };
 }
 
 // Every socket path of the identity's lanes. "sock.<identity>." can't bleed

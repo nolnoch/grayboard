@@ -132,7 +132,7 @@ export function laneOfStreamRef(handle: string, ref: string): string {
 }
 
 export type LaneRow = {
-  handle: string; lane: string; role: string;
+  handle: string; lane: string; kind: string;
   cwd: string | null; place: string | null;
   status: string | null; status_at: number | null;
   push_capable: number; first_seen: number; last_seen: number;
@@ -147,11 +147,11 @@ export function startSession(
   handle: string,
   cwd: string | null,
   lane = MAIN_LANE,
-  opts: { role?: "session" | "bridge"; push_capable?: boolean; resume?: boolean } = {},
+  opts: { kind?: "session" | "bridge"; push_capable?: boolean; resume?: boolean } = {},
   now = Date.now(),
 ): void {
   touchHandle(db, handle, now);
-  const role = opts.role ?? "session";
+  const kind = opts.kind ?? "session";
   const push = opts.push_capable ? 1 : 0;
   if (opts.resume) {
     // A reconnect within one session keeps its lane's status and place. The
@@ -159,24 +159,24 @@ export function startSession(
     // the handle), so a recreated row seeds from that snapshot; a row that
     // survived keeps its own.
     db.prepare(
-      `INSERT INTO lanes (handle, lane, role, cwd, place, status, status_at, push_capable, first_seen, last_seen)
+      `INSERT INTO lanes (handle, lane, kind, cwd, place, status, status_at, push_capable, first_seen, last_seen)
        SELECT ?, ?, ?, ?, h.place, h.status, h.status_at, ?, ?, ?
          FROM handles h WHERE h.name = ?
        ON CONFLICT(handle, lane) DO UPDATE SET
          cwd = excluded.cwd,
          push_capable = MAX(lanes.push_capable, excluded.push_capable),
          last_seen = excluded.last_seen`,
-    ).run(handle, lane, role, cwd, push, now, now, handle);
+    ).run(handle, lane, kind, cwd, push, now, now, handle);
     return;
   }
   db.prepare(
-    `INSERT INTO lanes (handle, lane, role, cwd, push_capable, first_seen, last_seen)
+    `INSERT INTO lanes (handle, lane, kind, cwd, push_capable, first_seen, last_seen)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(handle, lane) DO UPDATE SET
        cwd = excluded.cwd, place = NULL, status = NULL, status_at = NULL,
        push_capable = MAX(lanes.push_capable, excluded.push_capable),
        last_seen = excluded.last_seen`,
-  ).run(handle, lane, role, cwd, push, now, now);
+  ).run(handle, lane, kind, cwd, push, now, now);
 }
 
 // Refresh a lane's liveness (every drain), without touching its state.
@@ -194,6 +194,17 @@ export function endLane(db: Database, handle: string, lane: string, now = Date.n
     .run(row.cwd, row.place, row.status, row.status_at, handle);
   db.prepare(`DELETE FROM lanes WHERE handle = ? AND lane = ?`).run(handle, lane);
   touchHandleIfExists(db, handle, now);
+}
+
+/**
+ * Every lane row ends (a server restart: none are connected at boot). Each
+ * row's last state is snapshotted onto its handle first, so the roster's
+ * fallback columns hold the best last state — then the rows go, and no lane
+ * renders as live from before the boot.
+ */
+export function endAllLanes(db: Database): void {
+  const rows = db.prepare(`SELECT handle, lane FROM lanes`).all() as { handle: string; lane: string }[];
+  for (const r of rows) endLane(db, r.handle, r.lane);
 }
 
 /** A handle's live lane rows (empty for pre-lanes or all-offline handles). */
@@ -635,7 +646,7 @@ export function who(
   const laneRows = new Map<string, LaneRow[]>();
   if (rows.length) {
     const lanes = db
-      .prepare(`SELECT handle, lane, role, cwd, place, status, status_at, push_capable, first_seen, last_seen FROM lanes WHERE handle IN (SELECT value FROM json_each(?)) ORDER BY handle, lane`)
+      .prepare(`SELECT handle, lane, kind, cwd, place, status, status_at, push_capable, first_seen, last_seen FROM lanes WHERE handle IN (SELECT value FROM json_each(?)) ORDER BY handle, lane`)
       .all(JSON.stringify(rows.map((r) => r.handle))) as LaneRow[];
     for (const lr of lanes) {
       if (!laneRows.has(lr.handle)) laneRows.set(lr.handle, []);

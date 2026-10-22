@@ -414,13 +414,16 @@ function makeRepo(db: Database): Repo {
         return all;
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
+        // The range predicate (>= recipient# and < recipient$, '#' < '$')
+        // matches every `recipient#lane` cursor row and can use an index,
+        // unlike a substr prefix compare.
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
                                     WHERE c.stream_type = 'direct'
                                       AND (c.stream_ref = m.recipient
-                                           OR substr(c.stream_ref, 1, length(m.recipient) + 1) = m.recipient || '#')), 0)
+                                           OR (c.stream_ref >= m.recipient || '#' AND c.stream_ref < m.recipient || '$'))), 0)
               AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`,
         ).all(sender, olderThan);
@@ -485,14 +488,14 @@ function makeRepo(db: Database): Repo {
       directFor(identityFull) {
         const row = db.query<{ id: number | null }, [string, string, string]>(
           `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
-             AND (stream_ref = ? OR substr(stream_ref, 1, length(?) + 1) = ? || '#')`,
+             AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
         ).get(identityFull, identityFull, identityFull);
         return row?.id ?? 0;
       },
       lanesRead(identityFull, messageId) {
         const rows = db.query<{ stream_ref: string }, [number, string, string, string]>(
           `SELECT stream_ref FROM cursors WHERE stream_type = 'direct' AND last_seen_id >= ?
-             AND (stream_ref = ? OR substr(stream_ref, 1, length(?) + 1) = ? || '#')`,
+             AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
         ).all(messageId, identityFull, identityFull, identityFull);
         return rows.map((r) => (r.stream_ref === identityFull ? "main" : r.stream_ref.slice(identityFull.length + 1)));
       },

@@ -114,21 +114,32 @@ test("a session with an explicit identity in a linked worktree joins that identi
   expect(rows.map((p: any) => p.lane)).toEqual([undefined, "stream"]);
 }, 20_000);
 
-test("lanes of one identity run side by side; a DM reaches every live lane", async () => {
+test("lanes of one identity run side by side; a DM is handled once by the fleet, not fanned out to every lane", async () => {
   const a = await startCollecting("be", "research");
-  const b = await startCollecting("be", "scratch");
   const sim = await start("sim");
-  await call(sim, "dm_send", { to: "be", body: "fleet, assemble" });
+  await call(sim, "dm_send", { to: "be", body: "first" });
   await Bun.sleep(300);
-  expect(a.pushes).toContain("fleet, assemble");
-  expect(b.pushes).toContain("fleet, assemble");
-  // Each lane keeps its own read stream: one acking doesn't consume the
-  // other's pending delivery.
-  const sent = await call(sim, "dm_history", { peer: "be" });
-  expect((await call(a.c, "dm_ack", { message_id: sent[sent.length - 1].id })).ok ?? true).toBe(true);
-  await call(sim, "dm_send", { to: "be", body: "still there?" });
+  expect(a.pushes).toEqual(["first"]);
+  // A lane that joins (or drains) after a sibling handled the message starts
+  // from the identity's read point: one DM, one agent acting on it.
+  const b = await startCollecting("be", "scratch");
   await Bun.sleep(300);
-  expect(b.pushes).toContain("still there?");
+  expect(b.pushes).toEqual([]);
+  // A later drain of the fleet (peer_list probes — and so wakes — every
+  // socket) re-delivers nothing the identity has already read.
+  await call(sim, "peer_list");
+  await Bun.sleep(300);
+  expect(a.pushes).toEqual(["first"]);
+  expect(b.pushes).toEqual([]);
+  // A new message goes to whichever lane drains first, and once handled it
+  // is never re-delivered to the other.
+  await call(sim, "dm_send", { to: "be", body: "second" });
+  await Bun.sleep(300);
+  const deliveredTo = [a.pushes, b.pushes].flatMap((p) => p.filter((x) => x === "second"));
+  expect(deliveredTo.length).toBeGreaterThanOrEqual(1);
+  await call(sim, "peer_list");
+  await Bun.sleep(300);
+  expect([a.pushes, b.pushes].flatMap((p) => p.filter((x) => x === "second"))).toHaveLength(deliveredTo.length);
 }, 20_000);
 
 test("a second session on a live lane fails loudly instead of shadowing it", async () => {
@@ -151,7 +162,7 @@ test("a crashed lane's row is swept lazily by the next draining session", async 
   const db = openLocalDb(join(dir, "bus.db"));
   const stale = Date.now() - 120_000;
   db.prepare(
-    `INSERT INTO lanes (handle, lane, role, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'crashed', 'session', NULL, 1, ?, ?)`,
+    `INSERT INTO lanes (handle, lane, kind, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'crashed', 'session', NULL, 1, ?, ?)`,
   ).run(stale, stale);
   db.close();
   writeFileSync(join(dir, "sock.be.crashed"), "");
@@ -170,12 +181,12 @@ test("a bridge lane's row is sticky: the lazy sweep leaves it alone", async () =
   const be = await start("be");
   const sim = await start("sim");
   // A bridge lane (the human's reachability rides on it) whose process died
-  // long ago: role "bridge" is exempt from the sweep, unlike "session" rows.
+  // long ago: kind "bridge" is exempt from the sweep, unlike "session" rows.
   const { openLocalDb } = await import("../../src/local/open.ts");
   const db = openLocalDb(join(dir, "bus.db"));
   const stale = Date.now() - 120_000;
   db.prepare(
-    `INSERT INTO lanes (handle, lane, role, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'slackbridge', 'bridge', NULL, 1, ?, ?)`,
+    `INSERT INTO lanes (handle, lane, kind, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'slackbridge', 'bridge', NULL, 1, ?, ?)`,
   ).run(stale, stale);
   db.close();
   writeFileSync(join(dir, "sock.be.slackbridge"), "");
@@ -184,11 +195,11 @@ test("a bridge lane's row is sticky: the lazy sweep leaves it alone", async () =
   await call(sim, "dm_send", { to: "be", body: "nudge" });
   await Bun.sleep(400);
   const db2 = openLocalDb(join(dir, "bus.db"));
-  const rows2 = db2.prepare(`SELECT lane, role FROM lanes WHERE handle = 'be' ORDER BY lane`).all() as { lane: string; role: string }[];
+  const rows2 = db2.prepare(`SELECT lane, kind FROM lanes WHERE handle = 'be' ORDER BY lane`).all() as { lane: string; kind: string }[];
   db2.close();
   expect(rows2).toEqual([
-    { lane: "main", role: "session" },
-    { lane: "slackbridge", role: "bridge" },
+    { lane: "main", kind: "session" },
+    { lane: "slackbridge", kind: "bridge" },
   ]);
   void be;
 }, 20_000);

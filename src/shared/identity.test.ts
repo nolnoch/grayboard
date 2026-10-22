@@ -71,11 +71,29 @@ describe("describeLocation", () => {
 });
 
 describe("sessionIdentity", () => {
-  test("BUS_IDENTITY wins, literal: no worktree suffix", () => {
+  test("a true explicit BUS_IDENTITY wins, literal: no worktree suffix", () => {
     expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be");
     // The wrong-fleet bug: an explicit identity launched from a worktree
     // joins that identity's fleet instead of forking a look-alike.
     expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be");
+    // BUS_LANE makes it explicit even when it matches the pin: the user
+    // named the fleet they're joining.
+    expect(sessionIdentity({ BUS_IDENTITY: "be", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("be");
+  });
+  test("a BUS_IDENTITY that re-delivers the repo's pin is derived: the suffix composes (be-stream keeps its mail and claims)", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      // Harnesses load the pin into BUS_IDENTITY: treating it as literal
+      // would silently migrate every worktree identity (be-stream → be),
+      // orphaning its queued mail and claims. Equal to the pin = derived.
+      expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be-stream");
+      expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be");
+      // And its lane is the default (the suffix is in the name).
+      expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeNull();
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
   });
   test("a pin keeps the worktree suffix (derived identities unchanged)", () => {
     const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
@@ -122,5 +140,13 @@ describe("sessionLane", () => {
   test("a derived identity carries the suffix in the name; its lane is the default", () => {
     expect(sessionLane({}, at("repo", ".wt", "stream"))).toBeNull();
     expect(sessionLane({}, at("repo"))).toBeNull();
+    // A pin re-delivered as BUS_IDENTITY is derived too (see sessionIdentity).
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeNull();
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
   });
 });

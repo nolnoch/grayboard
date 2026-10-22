@@ -119,25 +119,41 @@ export function pinnedIdentity(cwd = process.cwd()): string | undefined {
 }
 
 /**
- * The identity this session claims. With an explicit BUS_IDENTITY the name
- * is literal — no worktree suffix — so a session launched from a worktree
- * joins that identity's fleet instead of forking a look-alike; the worktree
- * becomes the lane key instead (sessionLane). Derived identities (pin or
- * directory name) keep the suffix in the name, as they always have.
+ * Whether BUS_IDENTITY is a true explicit override, not a harness
+ * re-delivering the repo's .mcp.json pin as env (README: harnesses load the
+ * pin into BUS_IDENTITY). Literal — no worktree suffix, the worktree becomes
+ * the lane — only when it differs from the pin, or BUS_LANE is set. When it
+ * equals the pin the identity is derived like the pin itself, so existing
+ * worktree identities (`be-stream`) keep their name, mail and claims.
+ */
+export function isExplicitIdentity(env = process.env, cwd = process.cwd()): boolean {
+  if (!env.BUS_IDENTITY) return false;
+  return !!env.BUS_LANE || env.BUS_IDENTITY !== pinnedIdentity(cwd);
+}
+
+/**
+ * The identity this session claims. A true explicit BUS_IDENTITY (differs
+ * from the repo's pin, or BUS_LANE is set) is literal — no worktree suffix —
+ * so a session launched from a worktree joins that identity's fleet instead
+ * of forking a look-alike; the worktree becomes the lane key (sessionLane).
+ * Everything else — no BUS_IDENTITY, or one that merely re-delivers the pin —
+ * is derived and keeps the suffix in the name, as worktree sessions always
+ * have.
  */
 export function sessionIdentity(env = process.env, cwd = process.cwd()): string {
-  if (env.BUS_IDENTITY) return env.BUS_IDENTITY;
-  return resolveIdentity(pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+  if (isExplicitIdentity(env, cwd)) return env.BUS_IDENTITY!;
+  return resolveIdentity((env.BUS_IDENTITY ?? pinnedIdentity(cwd)) || defaultIdentity(cwd), cwd);
 }
 
 const LANE_RE = /^[a-z0-9_-]{1,32}$/;
 
 /**
  * This session's lane key within its identity's fleet, or null for the
- * default. BUS_LANE wins; else an explicit BUS_IDENTITY launched inside a
- * linked worktree uses the worktree's name as the implicit lane (the free
- * migration path for worktree users); derived identities already carry the
- * suffix in the name, so their lane is the default.
+ * default. BUS_LANE wins; else a true explicit BUS_IDENTITY (see
+ * isExplicitIdentity) launched inside a linked worktree uses the worktree's
+ * name as the implicit lane (the free migration path for worktree users);
+ * derived identities carry the suffix in the name, so their lane is the
+ * default.
  */
 export function sessionLane(env = process.env, cwd = process.cwd()): string | null {
   const raw = env.BUS_LANE;
@@ -146,7 +162,7 @@ export function sessionLane(env = process.env, cwd = process.cwd()): string | nu
     if (!LANE_RE.test(lane)) throw new Error(`invalid BUS_LANE "${raw}": 1–32 chars, a-z 0-9 _ -`);
     return lane;
   }
-  if (env.BUS_IDENTITY) {
+  if (isExplicitIdentity(env, cwd)) {
     const wt = linkedWorktreeName(cwd);
     return wt ? sanitizeIdentity(wt) || null : null;
   }

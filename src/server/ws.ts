@@ -48,6 +48,9 @@ export type WsData = {
   inflight?: Set<string>;
   // Set while a collision probe is waiting for this connection's pong.
   onPong?: () => void;
+  // Heartbeat: pings sent without a pong since the last answer. A socket
+  // past the miss limit is half-open and is closed.
+  missedPings?: number;
   // The server's Slack bridge holding a user's human identity: the only
   // connection allowed the reserved name, and drained like a human's session.
   human?: true;
@@ -70,6 +73,10 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
+  // Heartbeat tuning (tests): the ping interval, and how many unanswered
+  // pings close a half-open socket.
+  pingIntervalMs?: number;
+  pingMissLimit?: number;
 };
 
 // Per server instance.
@@ -90,6 +97,8 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  pingIntervalMs: number;
+  pingMissLimit: number;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -164,6 +173,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), probing: new Map(), toolsOnly: new Set(), laneHolders: new Map(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    pingIntervalMs: opts.pingIntervalMs ?? 30_000, pingMissLimit: opts.pingMissLimit ?? 3,
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -181,10 +191,15 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     hub.registry.set(full, promote);
     hub.toolsOnly.delete(promote);
     send(promote, { type: "fleet", event: "owner_rotated", lane: promote.data.lane });
-    // Its own DM stream since its cursor (routing key is the identity; the
-    // lane's cursor row is the stream), then everything pending on boards:
-    // at-least-once, duplicates are the safe direction.
+    // Its DM stream starts at the identity's read point (the MAX across its
+    // lanes — any lane's ack counts), not the promoted lane's own stale
+    // cursor: a demoted lane never received the pushes the owner already
+    // handled, and a real client acks only what it received. Per-lane cursors
+    // still matter for what was pushed but never acked: anything past the
+    // read point is at-least-once, then everything pending on boards.
     const ref = laneStreamRef(full, promote.data.lane);
+    const readPoint = repo.cursors.directFor(full);
+    if (readPoint > 0) repo.cursors.advance(promote.data.identityId, "direct", ref, readPoint);
     const since = repo.cursors.get(promote.data.identityId, "direct", ref);
     for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
       send(promote, { type: "push", message: showPending(message) });
@@ -221,6 +236,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 
       if (msg.type === "pong") {
         ws.data.onPong?.();
+        ws.data.missedPings = 0;
         return;
       }
 
@@ -299,8 +315,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
         const key = laneKeyOf(full, ws.data.lane);
         if (hub.laneHolders.get(key) === ws) {
           // Auto-drop: a lane's row goes with its connection (a dead lane
-          // cannot ghost). Sticky bridge lanes keep theirs (their handle is
-          // the human's, and the local sweep exempts them there).
+          // cannot ghost), its last state snapshotted onto the handle first
+          // (endLane). Every server lane is kind "session" — bridge-sticky
+          // rows are a local concept (the local sweep exempts them there).
           hub.laneHolders.delete(key);
           endLane(hub.db, full, ws.data.lane);
           writeAudit(hub.repo, "lane.dropped", null, ws.data.identityName, { lane: ws.data.lane, cause: "close" });
@@ -335,14 +352,24 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     }
   };
 
-  // Heartbeat: keeps idle connections open through proxies.
+  // Heartbeat: keeps idle connections open through proxies, and closes the
+  // half-open ones (a machine asleep with a session open answers nothing).
+  // The Slack bridge's humans are in-process and can't drop: exempt. A close
+  // here runs the ordinary close path — rotation, lane cleanup — instead of
+  // leaving a dead owner holding delivery.
   const startPing = () =>
     setInterval(() => {
       revalidate();
       for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
-        if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
+        if (ws.data.human || ws.readyState !== 1 /* OPEN */) continue;
+        send(ws, { type: "ping" });
+        ws.data.missedPings = (ws.data.missedPings ?? 0) + 1;
+        if (ws.data.missedPings >= hub.pingMissLimit) {
+          err(ws, undefined, "superseded", "this session stopped answering pings");
+          ws.close();
+        }
       }
-    }, 30_000);
+    }, hub.pingIntervalMs);
 
   return {
     handlers, startPing, revalidate, disconnectUser, stopExpiry: expiry.stop,
@@ -415,11 +442,13 @@ async function handleHello(
   // One push session per lane key. If its holder still answers, refuse the
   // newcomer: taking over would let a stray second session silently steal
   // that lane's deliveries. A holder that doesn't answer is dead; replace it.
-  // A live owner on ANOTHER lane means a fleet: the newcomer joins as a tool
-  // lane instead (demotion, below) — the single-session refusal is gone for
-  // same-user sessions on distinct lanes. Each await can change the holders
-  // (a close, another hello), so after one, check again from the top; between
-  // the last check and the writes below nothing awaits (#69).
+  // The registry owner on ANOTHER lane is probed too before demoting under
+  // it: a live owner means a fleet (the newcomer demotes, below), while one
+  // that doesn't answer is half-open (a laptop asleep with a session open) —
+  // superseded, and the newcomer takes over, as a pre-fleet newcomer did.
+  // Each await can change the holders (a close, another hello), so after
+  // one, check again from the top; between the last check and the writes
+  // below nothing awaits (#69).
   const key = laneKeyOf(full, lane);
   while (push) {
     const inFlight = hub.probing.get(key);
@@ -430,27 +459,55 @@ async function handleHello(
       continue;
     }
     const holder = hub.laneHolders.get(key);
-    if (!holder || holder === ws) break;
-    const probing = probe(holder, hub.probeMs).finally(() => {
-      if (hub.probing.get(key) === probing) hub.probing.delete(key);
-    });
-    hub.probing.set(key, probing);
-    if (await probing) {
-      err(ws, reqId, "identity_in_use",
-        `identity "${name}" is already in use by a live session on lane "${lane}". Give this session a different BUS_IDENTITY or BUS_LANE.`);
-      ws.close();
-      return;
+    if (holder && holder !== ws) {
+      const probing = probe(holder, hub.probeMs).finally(() => {
+        if (hub.probing.get(key) === probing) hub.probing.delete(key);
+      });
+      hub.probing.set(key, probing);
+      if (await probing) {
+        err(ws, reqId, "identity_in_use",
+          `identity "${name}" is already in use by a live session on lane "${lane}". Give this session a different BUS_IDENTITY or BUS_LANE.`);
+        ws.close();
+        return;
+      }
+      if (ws.readyState !== 1 /* OPEN */) return;
+      if (hub.laneHolders.get(key) === holder) {
+        err(holder, undefined, "superseded", "a newer session connected with this identity and lane");
+        holder.close();
+        // Its close handler may not have run yet; take its places now, so the
+        // writes below don't race it.
+        hub.toolsOnly.delete(holder);
+        if (hub.registry.get(full) === holder) hub.registry.delete(full);
+        hub.laneHolders.delete(key);
+      }
+      continue;
     }
-    if (ws.readyState !== 1 /* OPEN */) return;
-    if (hub.laneHolders.get(key) === holder) {
-      err(holder, undefined, "superseded", "a newer session connected with this identity and lane");
-      holder.close();
-      // Its close handler may not have run yet; take its places now, so the
-      // writes below don't race it.
-      hub.toolsOnly.delete(holder);
-      if (hub.registry.get(full) === holder) hub.registry.delete(full);
-      hub.laneHolders.delete(key);
+    const owner = registry.get(full);
+    if (owner && owner !== ws && owner.data.lane !== lane) {
+      const ownerKey = laneKeyOf(full, owner.data.lane);
+      const inFlightOwner = hub.probing.get(ownerKey);
+      if (inFlightOwner) {
+        await inFlightOwner;
+        if (ws.readyState !== 1 /* OPEN */) return;
+        continue;
+      }
+      const probing = probe(owner, hub.probeMs).finally(() => {
+        if (hub.probing.get(ownerKey) === probing) hub.probing.delete(ownerKey);
+      });
+      hub.probing.set(ownerKey, probing);
+      const answers = await probing;
+      if (ws.readyState !== 1 /* OPEN */) return;
+      if (answers) break; // a live owner: demote below
+      if (registry.get(full) === owner) {
+        err(owner, undefined, "superseded", "a newer session is taking over this identity's delivery");
+        owner.close();
+        // The registry slot only: the owner's close handler still runs its
+        // lane cleanup (a different lane key than ours, so no race below).
+        registry.delete(full);
+      }
+      continue;
     }
+    break;
   }
 
   let identity = repo.identities.findByUserAndName(authed.user_id, name);
@@ -467,7 +524,8 @@ async function handleHello(
       const mine = repo.identities.listForUser(authed.user_id).filter((i) => i.name !== HUMAN_NAME);
       if (mine.length > 0) {
         err(ws, reqId, "not_found",
-          `no identity "${name}" for your account; your identities: ${mine.map((i) => `${authed.user_email}/${i.name}`).join(", ")}`);
+          `no identity "${name}" for your account; your identities: ${mine.map((i) => `${authed.user_email}/${i.name}`).join(", ")}` +
+          ` — create it first: grayboard identity create ${name}`);
         ws.close();
         return;
       }
@@ -541,17 +599,19 @@ async function handleHello(
   }
   if (!push) return;
 
-  // This lane's direct messages since its own cursor (the cursor row is the
-  // lane's stream; the messages themselves route by the identity). A fresh
-  // non-main lane seeds from main's so joining doesn't replay the history.
+  // This lane's direct messages since the identity's read point — the MAX
+  // across its lanes (any lane's ack counts: a lane reading is the identity
+  // reading). A fresh lane joins without replaying the identity's history
+  // (including when only non-main lanes ever ran), and a promoted or
+  // rejoined lane starts past what a sibling already handled. Per-lane
+  // cursors still matter for pushed-but-unacked messages: anything past the
+  // read point is at-least-once.
   const laneRef = laneStreamRef(full, lane);
   let since = repo.cursors.get(identity.id, "direct", laneRef);
-  if (lane !== MAIN_LANE && since === 0) {
-    const mainSince = repo.cursors.get(identity.id, "direct", full);
-    if (mainSince > 0) {
-      repo.cursors.advance(identity.id, "direct", laneRef, mainSince);
-      since = mainSince;
-    }
+  const readPoint = repo.cursors.directFor(full);
+  if (readPoint > since) {
+    repo.cursors.advance(identity.id, "direct", laneRef, readPoint);
+    since = readPoint;
   }
   for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
     send(ws, { type: "push", message: showPending(message) });
