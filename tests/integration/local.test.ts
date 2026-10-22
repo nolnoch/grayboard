@@ -114,7 +114,7 @@ test("a session with an explicit identity in a linked worktree joins that identi
   expect(rows.map((p: any) => p.lane)).toEqual([undefined, "stream"]);
 }, 20_000);
 
-test("lanes of one identity run side by side; a DM is handled once by the fleet, not fanned out to every lane", async () => {
+test("lanes of one identity run side by side; each DM is delivered exactly once across the fleet, never fanned out", async () => {
   const a = await startCollecting("be", "research");
   const sim = await start("sim");
   await call(sim, "dm_send", { to: "be", body: "first" });
@@ -131,15 +131,61 @@ test("lanes of one identity run side by side; a DM is handled once by the fleet,
   await Bun.sleep(300);
   expect(a.pushes).toEqual(["first"]);
   expect(b.pushes).toEqual([]);
-  // A new message goes to whichever lane drains first, and once handled it
-  // is never re-delivered to the other.
-  await call(sim, "dm_send", { to: "be", body: "second" });
-  await Bun.sleep(300);
-  const deliveredTo = [a.pushes, b.pushes].flatMap((p) => p.filter((x) => x === "second"));
-  expect(deliveredTo.length).toBeGreaterThanOrEqual(1);
+  // New messages with both lanes live and racing on the same poke: the
+  // delivery claim is atomic (dm_claims), so every message is delivered
+  // EXACTLY once — toBe(1), not toBeGreaterThanOrEqual(1).
+  {
+    // The first send is the deterministic fleet-truth case: both lanes are
+    // caught up past the pair's previous message (a because it read it, b
+    // because its startup seeding synced to the read point).
+    const r = await call(sim, "dm_send", { to: "be", body: "second" });
+    expect(r.live_lanes).toBe(2);
+    expect(r.read_lanes.sort()).toEqual(["research", "scratch"]);
+    await Bun.sleep(250);
+  }
+  // Later sends: whoever claimed the previous message is the lane caught up
+  // past it — membership is claim-race-dependent, so pin the invariants:
+  // two live lanes, and at least the previous claimer caught up.
+  for (const body of ["third", "fourth"]) {
+    const r = await call(sim, "dm_send", { to: "be", body });
+    expect(r.live_lanes).toBe(2);
+    expect(r.read_lanes.length).toBeGreaterThanOrEqual(1);
+    await Bun.sleep(250);
+  }
+  const count = (x: string) => [...a.pushes, ...b.pushes].filter((p) => p === x).length;
+  expect(count("second")).toBe(1);
+  expect(count("third")).toBe(1);
+  expect(count("fourth")).toBe(1);
+  // And a later fleet-wide drain re-delivers nothing.
   await call(sim, "peer_list");
   await Bun.sleep(300);
-  expect([a.pushes, b.pushes].flatMap((p) => p.filter((x) => x === "second"))).toHaveLength(deliveredTo.length);
+  expect(count("second")).toBe(1);
+  expect(count("third")).toBe(1);
+  expect(count("fourth")).toBe(1);
+}, 20_000);
+
+test("a DM claim stuck by a crashed lane is taken over once it expires", async () => {
+  const sim = await start("sim");
+  // be connected once (so the roster accepts it) and left; its mail queues.
+  const be = await start("be");
+  await stop(be);
+  const r = await call(sim, "dm_send", { to: "be", body: "stuck" });
+  expect(r.delivered_now).toBe(false);
+  // A claim from a lane that crashed between claiming and delivering, held
+  // past the TTL: the row says someone owns it, but nobody is coming.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  db.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(r.message_id, Date.now() - DM_CLAIM_TTL_MS - 1_000);
+  db.close();
+
+  // The next session's startup drain takes the expired claim over and
+  // delivers the message (at-least-once at the claim level: a message a
+  // dead claimer held is never lost).
+  const again = await startCollecting("be", "research");
+  await Bun.sleep(300);
+  expect(again.pushes).toEqual(["stuck"]);
 }, 20_000);
 
 test("a second session on a live lane fails loudly instead of shadowing it", async () => {

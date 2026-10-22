@@ -25,7 +25,8 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
   }
   if (isExplicitIdentity(env, cwd)) return { name: env.BUS_IDENTITY!, source: "BUS_IDENTITY", lane };
   const pin = pinnedIdentity(cwd);
-  const base = (env.BUS_IDENTITY ?? pin) || defaultIdentity(cwd);
+  // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin (N3).
+  const base = env.BUS_IDENTITY || pin || defaultIdentity(cwd);
   const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
   const name = resolveIdentity(base, cwd);
   return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"`, lane };

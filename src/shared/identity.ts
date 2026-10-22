@@ -103,19 +103,23 @@ export function resolveIdentity(base: string, cwd = process.cwd()): string {
 }
 
 /**
- * The name pinned in the repo's .mcp.json (mcpServers.grayboard.env.BUS_IDENTITY).
- * Harnesses disagree on whether a repo's .mcp.json beats a user-level entry
+ * The name pinned in the repo's `.mcp.json` (mcpServers.grayboard.env.BUS_IDENTITY),
+ * or in omp's `.omp/mcp.json` (same shape) when a repo pins one there.
+ * Harnesses disagree on whether a repo's `.mcp.json` beats a user-level entry
  * (omp's user config wins), so grayboard reads the pin itself. Worktrees use
- * the main checkout's file, since .mcp.json is usually untracked.
+ * the main checkout's files, since both are usually untracked.
  */
 export function pinnedIdentity(cwd = process.cwd()): string | undefined {
-  try {
-    const file = join(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
-    const pin = JSON.parse(readFileSync(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
-    return typeof pin === "string" && pin ? pin : undefined;
-  } catch {
-    return undefined;
+  for (const file of [".mcp.json", ".omp/mcp.json"]) {
+    try {
+      const full = join(gitLocation(cwd)?.repo ?? cwd, file);
+      const pin = JSON.parse(readFileSync(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+      if (typeof pin === "string" && pin) return pin;
+    } catch {
+      // No such file, or unparseable: try the next source.
+    }
   }
+  return undefined;
 }
 
 /**
@@ -142,7 +146,10 @@ export function isExplicitIdentity(env = process.env, cwd = process.cwd()): bool
  */
 export function sessionIdentity(env = process.env, cwd = process.cwd()): string {
   if (isExplicitIdentity(env, cwd)) return env.BUS_IDENTITY!;
-  return resolveIdentity((env.BUS_IDENTITY ?? pinnedIdentity(cwd)) || defaultIdentity(cwd), cwd);
+  // `||`, not `??`: an EMPTY BUS_IDENTITY (a cleared or mistyped value) falls
+  // through to the pin and then the default, as it always did — with `??` it
+  // skipped the pin and silently changed the handle.
+  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
 }
 
 const LANE_RE = /^[a-z0-9_-]{1,32}$/;

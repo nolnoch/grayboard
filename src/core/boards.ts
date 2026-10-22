@@ -198,12 +198,15 @@ export function endLane(db: Database, handle: string, lane: string, now = Date.n
 
 /**
  * Every lane row ends (a server restart: none are connected at boot). Each
- * row's last state is snapshotted onto its handle first, so the roster's
- * fallback columns hold the best last state — then the rows go, and no lane
- * renders as live from before the boot.
+ * row's last state is snapshotted onto its handle first — oldest first, so
+ * when several lanes of one handle end, the FRESHEST row's snapshot lands
+ * last and survives on the handle's fallback columns — then the rows go, and
+ * no lane renders as live from before the boot.
  */
 export function endAllLanes(db: Database): void {
-  const rows = db.prepare(`SELECT handle, lane FROM lanes`).all() as { handle: string; lane: string }[];
+  const rows = db
+    .prepare(`SELECT handle, lane FROM lanes ORDER BY handle, last_seen ASC`)
+    .all() as { handle: string; lane: string }[];
   for (const r of rows) endLane(db, r.handle, r.lane);
 }
 

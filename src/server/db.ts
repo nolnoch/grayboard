@@ -57,6 +57,11 @@ export interface Repo {
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
+    // The newest message before `beforeId` between `a` and `b` (either
+    // direction), or 0 when this is their first. Ids are global, so "caught
+    // up to just before this message" must compare against the pair's own
+    // previous id, not beforeId - 1.
+    previousBetween(a: string, b: string, beforeId: number): number;
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     // Direct messages from sender still past each recipient's cursor, per recipient.
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
@@ -175,6 +180,11 @@ function initSchema(db: Database): void {
       last_seen_id  INTEGER NOT NULL,
       PRIMARY KEY (identity_id, stream_type, stream_ref)
     );
+    -- The PK leads with identity_id, which the lane queries (directFor,
+    -- lanesRead, undeliveredFrom's subquery) don't know: they filter on
+    -- stream_type + stream_ref (the range over the hash-suffixed lane refs),
+    -- so without this index each was a full cursors scan on every hello.
+    CREATE INDEX IF NOT EXISTS idx_cursors_stream ON cursors(stream_type, stream_ref);
 
     CREATE TABLE IF NOT EXISTS access_log (
       id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -399,6 +409,14 @@ function makeRepo(db: Database): Repo {
           )
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
         `).all(id);
+      },
+      previousBetween(a, b, beforeId) {
+        const row = db.query<{ id: number | null }, [number, string, string, string, string]>(
+          `SELECT MAX(id) AS id FROM messages
+            WHERE recipient_type = 'user' AND id < ?
+              AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))`,
+        ).get(beforeId, a, b, b, a);
+        return row?.id ?? 0;
       },
       unreadSince(streams) {
         if (streams.length === 0) return [];

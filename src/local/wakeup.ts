@@ -10,6 +10,20 @@ function sockPath(identity: string, lane = "main"): string {
   return `${SOCK_DIR}/sock.${identity}.${lane}`;
 }
 
+// The pre-lanes shape was sock.<identity> (no lane). A session still on the
+// old binary binds that path, and this code never looks at it: its pokes and
+// its lane guard pass the old session by until it restarts onto the new
+// binary. Cheap detection: the old file exists → say so once.
+function warnOldSocketShape(identity: string): void {
+  const old = `${SOCK_DIR}/sock.${identity}`;
+  if (existsSync(old)) {
+    console.error(
+      `[grayboard] ${old} exists: a session on an older grayboard is running this identity. ` +
+        `It is invisible to this version's pokes and lane guard until it restarts.`,
+    );
+  }
+}
+
 export type WakeupHandler = () => void;
 
 export async function listenForWakeup(
@@ -18,6 +32,7 @@ export async function listenForWakeup(
   onWake: WakeupHandler,
 ): Promise<() => void> {
   if (!existsSync(SOCK_DIR)) mkdirSync(SOCK_DIR, { recursive: true });
+  warnOldSocketShape(identity);
   const path = sockPath(identity, lane);
   await assertLaneFree(identity, lane);
   const server = await bindWakeupSocket(path, identity, lane, onWake);
@@ -85,8 +100,9 @@ export async function assertLaneFree(identity: string, lane: string): Promise<vo
 }
 
 // Connecting is the wakeup: every live lane listener of the identity drains
-// on open, so a probe also nudges them, which is harmless (drain is
-// idempotent). True when any lane answered.
+// on open, so a probe also nudges them — each lane claims what it delivers
+// (dm_claims), so a probe-woken sibling competes for messages, never
+// duplicates one. True when any lane answered.
 export async function poke(identity: string): Promise<boolean> {
   return (await pokeLanes(identity)).any;
 }
@@ -121,7 +137,8 @@ export async function laneAlive(identity: string, lane: string): Promise<boolean
 }
 
 // Connecting is the wakeup: the listener drains on open, so a probe also
-// nudges the owner, which is harmless (drain is idempotent).
+// nudges the owner — which competes for claims, never duplicates a message
+// (dm_claims).
 //
 // A refused connect doesn't prove the owner is gone: a live listener whose
 // process is busy can refuse too. Treating that as "dead" would let a second

@@ -107,6 +107,37 @@ describe("sessionIdentity", () => {
   test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
   test("empty BUS_IDENTITY falls back", () => expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("repo"));
 
+  test("an EMPTY BUS_IDENTITY falls through to the pin (N3: ?? skipped it)", () => {
+    // `BUS_IDENTITY=` is how a caller clears an inherited value; the pin —
+    // not the directory name — is what it must fall back to, as master did.
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("fe");
+      expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo", ".wt", "stream"))).toBe("fe-stream");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
+
+  test("a BUS_IDENTITY equal to the repo's .omp/mcp.json pin is derived: the suffix composes", () => {
+    // omp pins per-repo identities in .omp/mcp.json, not .mcp.json; a
+    // harness re-delivering THAT pin must be derived too, or every existing
+    // omp worktree identity (fe-omp-stream) silently becomes fe-omp on lane
+    // stream, orphaning its mail and claims.
+    mkdirSync(at("repo", ".omp"), { recursive: true });
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe-omp" } } } };
+    writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp" }, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      // A name no pin source knows is still a true explicit join.
+      expect(sessionIdentity({ BUS_IDENTITY: "scratch" }, at("repo", ".wt", "stream"))).toBe("scratch");
+    } finally {
+      rmSync(at("repo", ".omp"), { recursive: true });
+    }
+  });
+
   test("unset BUS_IDENTITY uses the repo's .mcp.json pin, worktrees included", () => {
     const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
     writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));

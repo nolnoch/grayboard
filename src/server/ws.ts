@@ -15,7 +15,6 @@ import {
   lastSeen,
   MAIN_LANE,
   pendingFor,
-  post,
   refOf,
   setPlace,
   startSession,
@@ -365,7 +364,11 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
         send(ws, { type: "ping" });
         ws.data.missedPings = (ws.data.missedPings ?? 0) + 1;
         if (ws.data.missedPings >= hub.pingMissLimit) {
-          err(ws, undefined, "superseded", "this session stopped answering pings");
+          // lost_ownership, not superseded: the client reconnects on it. A
+          // paused session (a laptop asleep, a SIGSTOP) that answers nothing
+          // looks half-open from here, but on wake it must re-attach — demote
+          // under whoever took the slot — not exit for good.
+          err(ws, undefined, "lost_ownership", "this session stopped answering pings; reconnecting re-attaches");
           ws.close();
         }
       }
@@ -499,7 +502,12 @@ async function handleHello(
       if (ws.readyState !== 1 /* OPEN */) return;
       if (answers) break; // a live owner: demote below
       if (registry.get(full) === owner) {
-        err(owner, undefined, "superseded", "a newer session is taking over this identity's delivery");
+        // lost_ownership: the owner was half-open (it didn't answer the
+        // probe), not replaced by a live session on its lane — on wake it
+        // reconnects and joins as a tool lane under the new owner. A real
+        // newer session on the SAME lane closes with terminal `superseded`
+        // (above).
+        err(owner, undefined, "lost_ownership", "a newer session took over this identity's delivery; reconnecting re-attaches as a tool lane");
         owner.close();
         // The registry slot only: the owner's close handler still runs its
         // lane cleanup (a different lane key than ours, so no race below).
@@ -720,7 +728,7 @@ function handleSend(
   // lanes have read this message (only when it has more than the default,
   // so single-session results stay unchanged).
   const truth = (parsed.full === ws.data.identityFull || fleetConns(hub, parsed.full).length > 1)
-    ? fleetTruth(hub, repo, parsed.full, msg.id)
+    ? fleetTruth(hub, repo, ws.data.identityFull, parsed.full, msg.id)
     : undefined;
   const fleet = truth && (truth.live_lanes > 1 || truth.read_lanes.length > 0)
     ? { live_lanes: truth.live_lanes, ...(truth.read_lanes.length ? { read_lanes: truth.read_lanes } : {}) }
@@ -745,13 +753,15 @@ function handleSend(
 }
 
 // Fleet delivery truth for send_ok: how many of the recipient identity's
-// lanes are live, and which lanes are caught up to just before this message
-// (per-lane cursors: a lane's ack is its own reading; any lane's ack is the
-// identity reading). A fresh message can't have been read by anyone yet;
-// "caught up before it" is the honest sender-side marker.
-function fleetTruth(hub: Hub, repo: Repo, recipientFull: string, messageId: number): { live_lanes: number; read_lanes: string[] } {
+// lanes are live, and which lanes are caught up to just before this message.
+// "Just before" is the PAIR's own previous message, not messageId - 1: ids
+// are global, and an unrelated pair may hold the id in between (N4). A fresh
+// message can't have been read by anyone yet; "caught up before it" is the
+// honest sender-side marker — empty when this is the pair's first message.
+function fleetTruth(hub: Hub, repo: Repo, senderFull: string, recipientFull: string, messageId: number): { live_lanes: number; read_lanes: string[] } {
   const live = fleetConns(hub, recipientFull).filter((ws) => ws.data.ready).length;
-  const read = repo.cursors.lanesRead(recipientFull, Math.max(1, messageId - 1));
+  const prev = repo.messages.previousBetween(senderFull, recipientFull, messageId);
+  const read = prev > 0 ? repo.cursors.lanesRead(recipientFull, prev) : [];
   return { live_lanes: live, read_lanes: read };
 }
 

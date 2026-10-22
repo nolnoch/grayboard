@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, age, endLane, humanHandles, isHuman, lastSeen, lanesFor, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef } from "../core/boards.ts";
+import { CoreError, activeAnnouncements, age, endLane, humanHandles, isHuman, lastSeen, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
@@ -22,6 +22,7 @@ import {
 import {
   ackMessage,
   anyCursorFor,
+  claimMessage,
   db,
   getCursor,
   getHistory,
@@ -29,6 +30,8 @@ import {
   getThread,
   insertMessage,
   lanesReadPast,
+  previousBetween,
+  pruneDmClaims,
   receivedUnacked,
   retractMessage,
   sentPending,
@@ -275,13 +278,15 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
     const p = pending ? { pending: true } : {};
     // Fleet delivery truth, like the server's send_ok: how many of the
-    // recipient's lanes are live, and which had read past this point.
-    // Surfaced only when it says more than the default, so single-session
-    // results stay unchanged.
+    // recipient's lanes are live, and which had read past this point — the
+    // pair's own previous message, not `id - 1`: ids are global, and an
+    // unrelated pair may hold the id in between. Surfaced only when it says
+    // more than the default, so single-session results stay unchanged.
     const { live, any: delivered } = await pokeLanes(recipient);
     const fleet: Record<string, unknown> = {};
     if (recipient === IDENTITY || live > 1) {
-      const read = lanesReadPast(recipient, Math.max(1, id - 1));
+      const prev = previousBetween(IDENTITY, recipient, id);
+      const read = prev > 0 ? lanesReadPast(recipient, prev) : [];
       if (live > 1) fleet.live_lanes = live;
       if (read.length > 0) fleet.read_lanes = read;
     }
@@ -403,9 +408,7 @@ async function drainToClaude(): Promise<void> {
     touchLane(db, IDENTITY, LANE);
     // A sibling lane may have handled messages this lane never saw: sync to
     // the identity's read point before draining (any lane's ack counts), so
-    // one DM wakes one agent of the fleet, not every lane (the first drain
-    // wins; two lanes reading concurrently can still both hold a message
-    // briefly — at-least-once, duplicates are the safe direction).
+    // this lane never replays what a sibling already delivered.
     const readPoint = anyCursorFor(IDENTITY);
     if (readPoint > getCursor(READER)) setCursor(READER, readPoint);
     while (true) {
@@ -414,7 +417,20 @@ async function drainToClaude(): Promise<void> {
       const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || batch.length > 0 });
       firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
+      let acted = false;
       for (const msg of batch) {
+        // Exactly one lane delivers each DM, ever: the claim is atomic and
+        // its row PERSISTS after delivery as the marker that keeps a slower
+        // sibling (whose scan predates the winner's ack) from re-delivering —
+        // releasing on delivery would reopen that window. A claim held by a
+        // live sibling is skipped WITHOUT advancing this cursor — the read
+        // point must not move past a message no agent has received; this
+        // lane's next drain syncs past it once the sibling acks. A claim
+        // stuck past its TTL (the claimer crashed mid-handle) is taken over:
+        // delivery is at-least-once at the claim level, exactly-once per
+        // attempt.
+        if (!claimMessage(msg.id, READER)) continue;
+        acted = true;
         const meta: Record<string, string> = {
           message_id: String(msg.id),
           from: msg.sender,
@@ -436,7 +452,12 @@ async function drainToClaude(): Promise<void> {
           params,
         });
         markDelivered(db, IDENTITY, item);
+        acted = true;
       }
+      // Every DM in the batch is claimed by a sibling (and nothing else to
+      // do): nothing more for this lane — the siblings' acks move the read
+      // point, and this lane's next drain syncs past them.
+      if (!acted) break;
     }
   } finally {
     draining = false;
@@ -451,6 +472,8 @@ async function drainToClaude(): Promise<void> {
 const STALE_LANE_MS = 60_000;
 
 async function sweepStaleLanes(): Promise<void> {
+  // Delivery-marker claims outlive any concurrent scan by a day; then go.
+  pruneDmClaims();
   const rows = db.prepare(`SELECT handle, lane, last_seen FROM lanes WHERE kind = 'session'`).all() as {
     handle: string; lane: string; last_seen: number;
   }[];

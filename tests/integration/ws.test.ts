@@ -673,6 +673,32 @@ test("a fresh lane joins an identity that only ever ran non-main lanes without r
   await fresh.none((x) => x.type === "push");
 });
 
+test("read_lanes compares against the pair's own previous message, not the global id below (N4)", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  const fe = new Client(alice, "fe");
+  await fe.connect();
+  // Two live lanes of the recipient, so send_ok carries fleet truth.
+  const be = new Client(bob, "be", { hello: { lane: "research" } });
+  await be.connect();
+  const be2 = new Client(bob, "be", { hello: { lane: "scratch" }, push: false });
+  await be2.connect();
+  const sim = new Client(carol, "sim");
+  await sim.connect();
+
+  // fe↔be exchange, then an UNRELATED pair's message takes the very next
+  // global id, then fe↔be again. "Caught up before this message" must mean
+  // the pair's previous message — with the old `id - 1` compare, the noise
+  // message's id hid the recipient's read state.
+  const one = await fe.request({ type: "send", recipient: "bob@example.com/be", body: "one" });
+  await be.next((x) => x.type === "push");
+  await be.request({ type: "ack", message_ids: [one.message_id] });
+  await sim.request({ type: "send", recipient: "alice@example.com/fe", body: "noise" });
+  const two = await fe.request({ type: "send", recipient: "bob@example.com/be", body: "two" });
+  expect(two).toMatchObject({ type: "send_ok", live_lanes: 2, read_lanes: ["research"] });
+});
+
 test("auto-drop: a closed lane's row goes; the roster keeps no ghost lane", async () => {
   const alice = await login("alice@example.com");
   const owner = new Client(alice, "be");
@@ -764,7 +790,7 @@ test("a connection that doesn't answer the probe is replaced", async () => {
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
 });
 
-test("a half-open owner on another lane is probed before demotion and superseded: the newcomer takes over", async () => {
+test("a half-open owner on another lane is probed before demotion and replaced with a reconnectable close: the newcomer takes over", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   // The owner holds the push slot but never answers pings (a machine asleep
@@ -775,15 +801,17 @@ test("a half-open owner on another lane is probed before demotion and superseded
   await b.connect();
   // A newcomer on ANOTHER lane: before this PR's demotion path it would
   // have joined tools-only under a ghost that never delivers. Instead the
-  // owner is probed like a pre-fleet holder, found dead, and superseded.
+  // owner is probed like a pre-fleet holder, found dead, and replaced.
   const lane = new Client(alice, "be", { hello: { lane: "b" } });
   const hello = await lane.connect();
   expect(hello.type).toBe("hello_ok");
   expect(hello.push_granted).toBeUndefined(); // not demoted: it took over
   await b.request({ type: "send", recipient: "alice@example.com/be", body: "anyone?" });
   expect((await lane.next((m) => m.type === "push")).message.body).toBe("anyone?");
-  // The old owner's socket death is handled: superseded error on its side.
-  expect(await owner.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
+  // The old owner's socket death is handled, with the reconnectable code: a
+  // paused session resumed later re-attaches (as a tool lane under the new
+  // owner) instead of exiting for good (N1).
+  expect(await owner.next((m) => m.type === "error")).toMatchObject({ code: "lost_ownership" });
 });
 
 test("the heartbeat closes a socket that stops answering pings", async () => {
@@ -808,8 +836,10 @@ test("the heartbeat closes a socket that stops answering pings", async () => {
     pong = false; // the machine went to sleep
     const close = new Promise<void>((r) => { ws.onclose = () => r(); });
     await close;
-    // The close is explained server-side, not silent.
-    expect(got.filter((m) => m.type === "error" && m.code === "superseded").length).toBe(1);
+    // The close is explained server-side, not silent — with the
+    // reconnectable code (N1): a paused client resumed later re-attaches
+    // instead of exiting for good.
+    expect(got.filter((m) => m.type === "error" && m.code === "lost_ownership").length).toBe(1);
     expect(got.at(-1)!.type).not.toBe("hello_ok");
   } finally {
     local.stop();

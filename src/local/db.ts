@@ -180,6 +180,69 @@ export function ackMessage(reader: string, id: number): void {
   db.prepare(`INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)`).run(reader, id, Date.now());
 }
 
+// How long an in-flight DM claim holds before another lane may take the
+// message over (the claimer crashed mid-handle). Generous against a claimer
+// that is merely slow or briefly SIGSTOPped; a takeover past it re-delivers,
+// which is the safe direction.
+export const DM_CLAIM_TTL_MS = 30_000;
+
+// A delivered message's claim row stays as its delivery marker (it is never
+// released on delivery: a sibling whose scan predates the winner's ack must
+// still see "claimed" or it re-delivers). Rows outlive any conceivable
+// concurrent scan by this much, then go — a lane this far behind has synced
+// from the read point long since.
+export const DM_CLAIM_RETENTION_MS = 24 * 3_600_000;
+
+/**
+ * Atomically claim DM `id` for `claimer` (a lane's stream key). True when
+ * this caller now owns the delivery: the message was unclaimed, or its
+ * previous claim is past the TTL (the claimer died mid-handle). False when a
+ * live claim holds it — a sibling lane is delivering, skip without touching
+ * the cursor (advancing past it would move the identity's read point before
+ * the message has reached an agent). The row persists after delivery as the
+ * marker that keeps slower siblings from re-delivering; see RETENTION.
+ */
+export function claimMessage(id: number, claimer: string, ttlMs = DM_CLAIM_TTL_MS): boolean {
+  const now = Date.now();
+  return db.transaction(() => {
+    const r = db
+      .prepare(`INSERT OR IGNORE INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, ?, ?)`)
+      .run(id, claimer, now);
+    if (r.changes > 0) return true;
+    const row = db.prepare(`SELECT claimer, claimed_at FROM dm_claims WHERE message_id = ?`).get(id) as
+      | { claimer: string; claimed_at: number }
+      | undefined;
+    if (!row || now - row.claimed_at < ttlMs) return false;
+    // Expired: take it over, compare-and-set on the row we read.
+    const t = db
+      .prepare(`UPDATE dm_claims SET claimer = ?, claimed_at = ? WHERE message_id = ? AND claimer = ? AND claimed_at = ?`)
+      .run(claimer, now, id, row.claimer, row.claimed_at);
+    return t.changes > 0;
+  })();
+}
+
+/** Delivery-marker rows old enough that no live scan can still hold their message. */
+export function pruneDmClaims(now = Date.now()): void {
+  db.prepare(`DELETE FROM dm_claims WHERE claimed_at < ?`).run(now - DM_CLAIM_RETENTION_MS);
+}
+
+/**
+ * The newest message before `beforeId` between `a` and `b` (either
+ * direction), or 0 when this is their first. Message ids are global, so
+ * "caught up to just before this message" must compare against the pair's
+ * own previous id, not `beforeId - 1` (an unrelated pair may hold that one).
+ */
+export function previousBetween(a: string, b: string, beforeId: number): number {
+  const row = db
+    .prepare(
+      `SELECT MAX(id) AS id FROM messages
+        WHERE id < ?
+          AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))`,
+    )
+    .get(beforeId, a, b, b, a) as { id: number | null } | undefined;
+  return row?.id ?? 0;
+}
+
 // Messages to `reader` since `since` that it hasn't acked, oldest first.
 export function receivedUnacked(reader: string, since: number): Message[] {
   return db

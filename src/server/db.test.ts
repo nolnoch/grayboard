@@ -140,6 +140,42 @@ describe("Repo", () => {
     expect(repo.messages.undeliveredFrom(sender)).toEqual([{ recipient: "be@example.com/be", n: 2, oldest_id: 4 }]);
   });
 
+  test("the lane cursor queries use the stream index, not a table scan", () => {
+    // directFor runs on every hello; lanesRead and undeliveredFrom's
+    // subquery carry the same predicate. The PK leads with identity_id,
+    // which these don't know — without idx_cursors_stream each was a full
+    // cursors scan (EXPLAIN said "SCAN cursors").
+    const beUser = repo.users.upsertByEmail("be@example.com", null);
+    repo.identities.create(beUser.id, "be");
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN SELECT MAX(last_seen_id) AS id FROM cursors
+          WHERE stream_type = 'direct'
+            AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
+      )
+      .all("be@example.com/be", "be@example.com/be", "be@example.com/be") as { detail: string }[];
+    const detail = plan.map((p) => p.detail).join(" ");
+    expect(detail).toContain("USING INDEX idx_cursors_stream");
+    expect(detail).not.toContain("SCAN cursors");
+  });
+
+  test("previousBetween is the pair's own previous message, not the global id below", () => {
+    // Message ids are global: an unrelated pair can hold the id just below
+    // this one, so "caught up to just before it" must compare against the
+    // pair's own previous message (N4). The pair is bidirectional, like
+    // history — a reply counts as the pair's previous message too.
+    const u = repo.users.upsertByEmail("you@example.com", null);
+    repo.identities.create(u.id, "fe");
+    repo.identities.create(u.id, "sim");
+    repo.identities.create(u.id, "be");
+    const fe = "you@example.com/fe", sim = "you@example.com/sim", other = "you@example.com/be";
+    const one = repo.messages.insert(fe, "user", sim, "one", null);
+    repo.messages.insert(fe, "user", other, "noise", null); // takes the id between, another pair
+    const two = repo.messages.insert(fe, "user", sim, "two", null);
+    expect(repo.messages.previousBetween(fe, sim, two.id)).toBe(one.id); // not two.id - 1
+    expect(repo.messages.previousBetween(fe, sim, one.id)).toBe(0); // their first
+  });
+
   test("cursors: advance is idempotent and takes MAX", () => {
     const u = repo.users.upsertByEmail("wade@example.com", null);
     const i = repo.identities.create(u.id, "fe");

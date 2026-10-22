@@ -9,6 +9,7 @@ import {
   activeAnnouncements,
   createBoard,
   declareHuman,
+  endAllLanes,
   endLane,
   ensureBoard,
   getBoard,
@@ -554,6 +555,23 @@ describe("lanes", () => {
     const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
     expect(gone?.status).toBe("soaking");
     expect(gone?.online).toBe(false);
+  });
+
+  test("endAllLanes leaves the freshest lane's snapshot on the handle", () => {
+    // A restart ends every lane at once; each snapshots onto the same handle
+    // columns, so the order decides what survives. Oldest first: the lane
+    // that was touched LAST lands last, and the roster's fallback holds the
+    // freshest state, not whichever row the scan happened to return last.
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "stale status", "main");
+    setStatus(db, "be", "freshest status", "stream");
+    // main last-seen older than stream's (the sweep order keys on it).
+    db.prepare(`UPDATE lanes SET last_seen = last_seen - 1000 WHERE handle = 'be' AND lane = 'main'`).run();
+    endAllLanes(db);
+    expect(lanesFor(db, "be")).toEqual([]);
+    const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
+    expect(gone?.status).toBe("freshest status");
   });
 
   test("who renders one row per live lane, the default lane unmarked", () => {

@@ -16,7 +16,7 @@ export class GrayboardClient {
   private backoffMs = 1000;
   private counter   = 0;
   private pending   = new Map<string, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
-  private dead      = false; // set on superseded; do not reconnect
+  private dead      = false; // set on a terminal close; do not reconnect
 
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
@@ -152,6 +152,15 @@ export class GrayboardClient {
         break;
 
       case "error":
+        if (msg.code === "lost_ownership") {
+          // The heartbeat found this connection half-open (a sleep, a
+          // SIGSTOP) or a newer lane took over delivery. Not terminal: the
+          // server closes the socket right after this, and onclose
+          // reconnects; the re-hello then re-attaches — demoted under a live
+          // owner, or owning again if the slot is free.
+          console.error(`[grayboard] ${msg.message} — reconnecting`);
+          break;
+        }
         if (msg.code === "superseded") {
           this.dead = true;
           console.error("[grayboard] connection superseded by a newer session — exiting");

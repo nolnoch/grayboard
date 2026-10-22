@@ -96,6 +96,12 @@ export type ServerMessage =
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
   | "rate_limited" | "internal" | "superseded"
+  // lost_ownership: this connection lost push delivery (a heartbeat found it
+  // half-open, or a newer lane took over) and is being closed. Unlike
+  // `superseded`, the client reconnects and re-hellos: a session paused past
+  // the ping-miss window (a sleep, a SIGSTOP) resumes by re-attaching —
+  // demoted under a live owner, or owning again if nobody took the slot.
+  | "lost_ownership"
   // hello refused: another live connection holds this identity
   | "identity_in_use";
 

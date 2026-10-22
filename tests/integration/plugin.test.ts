@@ -294,3 +294,69 @@ test("a frame the server can't parse is answered with its req_id, so the call fa
   await expect(be.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: "5" })).rejects.toThrow(/bad_request: .*parent_id/);
   be.close();
 }, 20_000);
+
+// A session paused past the heartbeat's miss window (a sleep, a SIGSTOP)
+// is closed as half-open. The close code decides what happens on resume:
+// lost_ownership reconnects and re-attaches; the pre-fix superseded made
+// the client exit for good (N1, Wade's repro: 300ms pings, miss limit 2,
+// 2s SIGSTOP).
+test("a session paused past the ping-miss window resumes by reconnecting, not exiting (N1)", async () => {
+  const local = startServer(
+    { dbPath: ":memory:", httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] },
+    { background: false, pingIntervalMs: 300, pingMissLimit: 2 },
+  );
+  const base2 = `http://localhost:${local.server.port}`;
+  try {
+    const token = ((await (await fetch(`${base2}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) })).json()) as { session_token: string }).session_token;
+    const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], {
+      env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base2, BUS_IDENTITY: "be" } as Record<string, string>,
+      stdin: "pipe", stdout: "ignore", stderr: "pipe",
+    });
+    const fleetLive = async () => {
+      const rows = await (await fetch(`${base2}/api/fleet?identity=be`, { headers: { Authorization: `Bearer ${token}` } })).json() as { live: boolean }[];
+      return Array.isArray(rows) && rows.some((l) => l.live);
+    };
+    for (let i = 0; i < 50 && !(await fleetLive()); i++) await Bun.sleep(100);
+    expect(await fleetLive()).toBe(true); // connected
+
+    process.kill(p.pid!, "SIGSTOP"); // the machine went to sleep
+    await Bun.sleep(2_000);           // past the miss window: closed meanwhile
+    process.kill(p.pid!, "SIGCONT");  // wake: must reconnect, not exit
+
+    let reconnected = false;
+    for (let i = 0; i < 60 && !reconnected; i++) {
+      await Bun.sleep(100);
+      reconnected = await fleetLive();
+    }
+    expect(reconnected).toBe(true);
+    expect(p.exitCode).toBe(null); // never exited
+    p.kill();
+    await p.exited;
+  } finally {
+    local.stop();
+  }
+}, 20_000);
+
+test("a true identity_in_use refusal still exits the client (N1: only lost ownership reconnects)", async () => {
+  const token = await login("alice@example.com");
+  const holder = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], {
+    env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: "be" } as Record<string, string>,
+    stdin: "pipe", stdout: "ignore", stderr: "pipe",
+  });
+  const fleetLive = async () => {
+    const rows = await (await fetch(`${base}/api/fleet?identity=be`, { headers: { Authorization: `Bearer ${token}` } })).json() as { live: boolean }[];
+    return Array.isArray(rows) && rows.some((l) => l.live);
+  };
+  for (let i = 0; i < 50 && !(await fleetLive()); i++) await Bun.sleep(100);
+  expect(await fleetLive()).toBe(true);
+
+  // A second session, same identity and lane: the holder answers the
+  // probe, so this is a genuine refusal — the client must exit, not retry.
+  const second = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], {
+    env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: "be" } as Record<string, string>,
+    stdin: "pipe", stdout: "ignore", stderr: "pipe",
+  });
+  expect(await second.exited).toBe(1);
+  holder.kill();
+  await holder.exited;
+}, 20_000);
