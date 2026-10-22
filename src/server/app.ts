@@ -2,7 +2,7 @@ import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
 import { startRetentionJobs } from "./retention.ts";
-import { verifySessionToken, extractBearer } from "./auth.ts";
+import { verifySessionToken, extractBearer, makeProviders } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
@@ -14,6 +14,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, humanReach);
+  const providers = makeProviders(config);
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
@@ -55,7 +56,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, providers, wake, slack, disconnectUser);
     },
 
     websocket: handlers,

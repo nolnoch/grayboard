@@ -1,9 +1,13 @@
 import type { Repo } from "./db.ts";
 
 export type AuditAction =
+  | "auth.linked"
   | "auth.login"
   | "auth.logout"
+  | "auth.refused"
+  | "auth.relinked"
   | "auth.session_revoked"
+  | "auth.unlinked"
   | "auth.user_disabled"
   | "auth.user_enabled"
   | "identity.created"

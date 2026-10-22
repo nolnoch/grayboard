@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
-import { runOAuthFlow } from "./oauth_flow.ts";
+import { runOAuthFlow, type AuthorizeTarget } from "./oauth_flow.ts";
+import { question } from "./prompt.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -132,7 +133,59 @@ const globalAs = () => (program.opts() as { as?: string }).as;
 
 // ── login / logout / whoami ───────────────────────────────────────────────────
 
-async function login(serverUrl: string, devEmail?: string): Promise<void> {
+type ProviderName = "google" | "entra";
+const PROVIDER_LABEL: Record<ProviderName, string> = { google: "Google", entra: "Microsoft" };
+
+// GET /api/auth/config (src/server/http.ts authConfig).
+type AuthConfig = {
+  providers?: ProviderName[];
+  dev_auth?: boolean;
+  google?: { client_id: string; authorize_url: string; hd?: string };
+  entra?: { client_id: string; authorize_url: string };
+};
+
+function pickProvider(cfg: AuthConfig, asked: string | undefined, interactive: boolean): ProviderName {
+  const offered = cfg.providers;
+  if (!offered) {
+    console.error("This server is older than this CLI; ask its admin to update it (README §Updating the server).");
+    process.exit(1);
+  }
+  if (!offered.length) {
+    console.error(cfg.dev_auth ? "This server uses dev sign-in: grayboard login --dev <email>" : "This server offers no sign-in provider.");
+    process.exit(1);
+  }
+  const names = offered.map(p => `${p} (${PROVIDER_LABEL[p]})`).join(", ");
+  if (asked) {
+    if (!offered.includes(asked as ProviderName)) {
+      console.error(`This server doesn't offer "${asked}" sign-in; it offers ${names}.`);
+      process.exit(1);
+    }
+    return asked as ProviderName;
+  }
+  if (offered.length === 1) return offered[0]!;
+  if (!interactive) {
+    console.error(`This server offers ${names}: pass --provider ${offered.join("|")}.`);
+    process.exit(1);
+  }
+  console.log("Sign in with:");
+  offered.forEach((p, i) => console.log(`  ${i + 1}) ${PROVIDER_LABEL[p]}`));
+  for (;;) {
+    const pick = Number(question("Choose: ").trim());
+    if (offered[pick - 1]) return offered[pick - 1]!;
+  }
+}
+
+function authorizeTarget(cfg: AuthConfig, name: ProviderName): AuthorizeTarget {
+  const p = cfg[name]!;
+  return {
+    label: PROVIDER_LABEL[name],
+    clientId: p.client_id,
+    authorizeUrl: p.authorize_url,
+    ...(name === "google" && cfg.google?.hd ? { params: { hd: cfg.google.hd } } : {}),
+  };
+}
+
+async function login(serverUrl: string, devEmail?: string, provider?: string, interactive = !!process.stdin.isTTY): Promise<void> {
   const client = makeUnauthClient(serverUrl);
 
   if (devEmail) {
@@ -144,32 +197,19 @@ async function login(serverUrl: string, devEmail?: string): Promise<void> {
     return;
   }
 
-  // Bootstrap: fetch the public OAuth config from the server. Env vars override
-  // for unusual setups (e.g. pointing the loopback flow at a different OAuth app
-  // than the server's own).
-  let googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  let orgDomain      = process.env.GRAYBOARD_ORG_DOMAIN;
-  if (!googleClientId || !orgDomain) {
-    try {
-      const cfg = await client.get("/api/auth/config") as { google_client_id: string; org_domain: string };
-      googleClientId ??= cfg.google_client_id;
-      orgDomain      ??= cfg.org_domain;
-    } catch (e) {
-      handleApiError(e);
-    }
-  }
-  if (!googleClientId) {
-    console.error("Server did not return a google_client_id and GOOGLE_OAUTH_CLIENT_ID is not set.");
-    process.exit(1);
-  }
+  // Bootstrap: the server's public sign-in config (no secrets).
+  let cfg: AuthConfig;
+  try { cfg = await client.get("/api/auth/config") as AuthConfig; }
+  catch (e) { handleApiError(e); }
+  const name = pickProvider(cfg, provider, interactive);
 
   let oauthResult;
-  try {
-    oauthResult = await runOAuthFlow(googleClientId, serverUrl, orgDomain);
-  } catch (e) { handleApiError(e); }
+  try { oauthResult = await runOAuthFlow(authorizeTarget(cfg, name)); }
+  catch (e) { handleApiError(e); }
 
   try {
     const res = await client.post("/api/auth/exchange", {
+      provider:      name,
       code:          oauthResult.code,
       code_verifier: oauthResult.codeVerifier,
       redirect_uri:  oauthResult.redirectUri,
@@ -181,16 +221,17 @@ async function login(serverUrl: string, devEmail?: string): Promise<void> {
 
 program
   .command("login")
-  .description("Authenticate with Google and store credentials")
+  .description("Sign in with the server's identity provider (Google or Microsoft) and store credentials")
+  .option("--provider <name>", "google or entra, when the server offers both (asks on a terminal)")
   .option("--dev <email>", "Dev-mode login (only works if server has GRAYBOARD_DEV_AUTH=1)")
   .option("--server <url>", "Server URL (or set GRAYBOARD_SERVER env var)")
-  .action(async (opts: { dev?: string; server?: string }) => {
+  .action(async (opts: { provider?: string; dev?: string; server?: string }) => {
     const serverUrl = opts.server ?? process.env.GRAYBOARD_SERVER;
     if (!serverUrl) {
       console.error("Server URL required: use --server <url> or set GRAYBOARD_SERVER");
       process.exit(1);
     }
-    await login(serverUrl, opts.dev);
+    await login(serverUrl, opts.dev, opts.provider);
   });
 
 program
@@ -425,28 +466,11 @@ program
   .description("Choose local or team-server mode and register grayboard with Claude Code, omp, opencode, and pi")
   .option("--local", "Agents talk on this machine only")
   .option("--server <url>", "Agents talk through this team server")
+  .option("--provider <name>", "Sign in with google or entra, when the server offers both")
   .option("--no-register", "Don't register grayboard with Claude Code, omp, opencode, or pi")
   .option("-y, --yes", "Accept the defaults without asking")
-  .action(async (opts: { local?: boolean; server?: string; register: boolean; yes?: boolean }) => {
+  .action(async (opts: { local?: boolean; server?: string; provider?: string; register: boolean; yes?: boolean }) => {
     const interactive = !opts.yes && !!process.stdin.isTTY;
-    // Blocking reads from fd 0: Bun's stream stdin fails with EINVAL (kqueue) on macOS when stdin is /dev/tty, as in install.sh.
-    const question = (q: string): string => {
-      process.stdout.write(q);
-      const buf = Buffer.alloc(1);
-      const bytes: number[] = [];
-      for (;;) {
-        let n = 0;
-        try { n = readSync(0, buf, 0, 1, null); } catch (e) {
-          // A non-blocking fd 0 would otherwise spin a core while the user types.
-          if ((e as NodeJS.ErrnoException).code === "EAGAIN") { Bun.sleepSync(20); continue; }
-          throw e;
-        }
-        if (n === 0) throw new Error("stdin closed before setup finished");
-        // Decode the whole line at once so multi-byte UTF-8 characters survive.
-        if (buf[0] === 0x0a) return Buffer.from(bytes).toString("utf8");
-        bytes.push(buf[0]!);
-      }
-    };
     const ask = async (q: string, dflt = ""): Promise<string> => {
       if (!interactive) return dflt;
       const a = question(dflt ? `${q} [${dflt}] ` : `${q} `).trim() || dflt;
@@ -476,7 +500,7 @@ program
       if (creds?.session_token && creds.server === server) {
         console.log(`Signed in to ${server} as ${creds.user_email}.`);
       } else {
-        await login(server);
+        await login(server, undefined, opts.provider, interactive);
       }
     } else if (existsSync(credentialsPath())) {
       const where = creds?.server ? ` from ${creds.server}` : "";
@@ -755,6 +779,16 @@ adminCmd
   .requiredOption("--email <email>", "Target user email")
   .action(async (opts: { email: string }) => {
     try { output(await makeClient().post("/api/admin/enable-user", { email: opts.email }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+adminCmd
+  .command("unlink")
+  .description("Clear a user's sign-in links so their next login binds a new account (after an account was recreated, or its email changed)")
+  .requiredOption("--email <email>", "Target user email")
+  .option("--provider <name>", "Only this provider's link: google or entra")
+  .action(async (opts: { email: string; provider?: string }) => {
+    try { output(await makeClient().post("/api/admin/unlink", { email: opts.email, ...(opts.provider ? { provider: opts.provider } : {}) }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 

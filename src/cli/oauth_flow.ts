@@ -30,8 +30,12 @@ export type OAuthResult = {
   redirectUri: string;
 };
 
+// One provider's authorize step, from the server's /api/auth/config.
+// params are provider-specific extras, such as Google's hd hint.
+export type AuthorizeTarget = { label: string; clientId: string; authorizeUrl: string; params?: Record<string, string> };
+
 /** Runs a PKCE loopback OAuth flow. Resolves with the authorization code. */
-export function runOAuthFlow(googleClientId: string, serverPublicUrl: string, orgDomain?: string): Promise<OAuthResult> {
+export function runOAuthFlow(target: AuthorizeTarget): Promise<OAuthResult> {
   return new Promise((resolve, reject) => {
     const codeVerifier   = generateCodeVerifier();
     const codeChallenge  = computeCodeChallenge(codeVerifier);
@@ -87,18 +91,18 @@ export function runOAuthFlow(googleClientId: string, serverPublicUrl: string, or
     });
 
     const redirectUri = `http://127.0.0.1:${httpServer.port}/cb`;
-    const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-    authUrl.searchParams.set("client_id",             googleClientId);
+    const authUrl = new URL(target.authorizeUrl);
+    authUrl.searchParams.set("client_id",             target.clientId);
     authUrl.searchParams.set("redirect_uri",          redirectUri);
     authUrl.searchParams.set("response_type",         "code");
     authUrl.searchParams.set("scope",                 "openid email profile");
-    if (orgDomain) authUrl.searchParams.set("hd", orgDomain);
+    for (const [k, v] of Object.entries(target.params ?? {})) authUrl.searchParams.set(k, v);
     authUrl.searchParams.set("code_challenge",        codeChallenge);
     authUrl.searchParams.set("code_challenge_method", "S256");
     authUrl.searchParams.set("state",                 state);
     authUrl.searchParams.set("prompt",                "select_account");
 
-    console.log(`\nOpening browser for Google login...`);
+    console.log(`\nOpening browser for ${target.label} login...`);
     console.log(`If the browser did not open, visit:\n${authUrl.toString()}\n`);
     openBrowser(authUrl.toString());
   });
