@@ -374,7 +374,11 @@ test("a same-lane takeover is terminal: the displaced client exits once, no reco
   try {
     const token = ((await (await fetch(`${base2}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) })).json()) as { session_token: string }).session_token;
     const spawnBe = () => Bun.spawn([process.execPath, CLI, "mcp", "--mode", "server"], {
-      env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base2, BUS_IDENTITY: "be" } as Record<string, string>,
+      // BUS_LANE pins the lane: from a linked worktree (this test suite's
+      // own cwd during a worktree run), an explicit BUS_IDENTITY would
+      // otherwise take the worktree's name as its lane and the lane
+      // assertions below would fail — and the pre-push hook with them.
+      env: { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base2, BUS_IDENTITY: "be", BUS_LANE: "main" } as Record<string, string>,
       stdin: "pipe", stdout: "ignore", stderr: "pipe",
     });
     const fleet = async () => {
@@ -413,7 +417,11 @@ test("a same-lane takeover is terminal: the displaced client exits once, no reco
 
     // The displaced client wakes to the terminal code: exits once, no
     // reconnect (bounded race so a never-exiting client fails the pin
-    // instead of hanging it).
+    // instead of hanging it). Note on the guard's shape: this pins the
+    // exit-once contract via the client's own stderr line — a mutant that
+    // reconnects AND flaps would show repeated lines and fail, but a mutant
+    // whose reconnect is refused by identity_in_use doesn't flap either;
+    // the no-starve test pins the reconnect path itself.
     process.kill(first.pid!, "SIGCONT");
     const exited = await Promise.race([first.exited, Bun.sleep(5_000).then(() => null)]);
     expect(exited).toBe(1);

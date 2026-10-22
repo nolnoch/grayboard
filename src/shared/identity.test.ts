@@ -138,6 +138,29 @@ describe("sessionIdentity", () => {
     }
   });
 
+  test("with BOTH pins present, a BUS_IDENTITY matching EITHER pin is derived", () => {
+    // README's omp recipe: .mcp.json pins the Claude Code identity (fe),
+    // omp's .omp/mcp.json pins its own (fe-omp). omp re-delivers ITS pin as
+    // env; comparing against only the first pin (.mcp.json's fe) would call
+    // fe-omp explicit, drop the worktree suffix, and orphan fe-omp-stream's
+    // mail and claims.
+    const pinA = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+    const pinB = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe-omp" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pinA));
+    mkdirSync(at("repo", ".omp"), { recursive: true });
+    writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(pinB));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp" }, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      expect(sessionIdentity({ BUS_IDENTITY: "fe" }, at("repo", ".wt", "stream"))).toBe("fe-stream");
+      // Still explicit: a name no pin source knows, or a named lane.
+      expect(sessionIdentity({ BUS_IDENTITY: "other" }, at("repo", ".wt", "stream"))).toBe("other");
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("fe-omp");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+      rmSync(at("repo", ".omp"), { recursive: true });
+    }
+  });
+
   test("unset BUS_IDENTITY uses the repo's .mcp.json pin, worktrees included", () => {
     const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
     writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));

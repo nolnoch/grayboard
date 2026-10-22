@@ -117,6 +117,22 @@ export function initCoreSchema(db: Database): void {
       PRIMARY KEY (handle, lane)
     );
     CREATE INDEX IF NOT EXISTS idx_lanes_handle ON lanes(handle, last_seen);
+
+    -- A lane's own last state at its end. Resume seeds each lane from its
+    -- own snapshot, not the handle's (freshest-wins) columns — a two-lane
+    -- restart must not leave every lane showing the freshest sibling's
+    -- status. The handle columns stay as the pre-lanes display fallback for
+    -- the whole identity.
+    CREATE TABLE IF NOT EXISTS lane_snapshots (
+      handle     TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
+      lane       TEXT NOT NULL,
+      cwd        TEXT,
+      place      TEXT,
+      status     TEXT,
+      status_at  INTEGER,
+      ended_at   INTEGER NOT NULL,
+      PRIMARY KEY (handle, lane)
+    );
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a

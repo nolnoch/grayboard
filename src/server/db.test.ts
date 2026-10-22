@@ -144,26 +144,34 @@ describe("Repo", () => {
     // directFor runs on every hello; lanesRead and undeliveredFrom's
     // subquery carry the same predicate. The PK leads with identity_id,
     // which these don't know — without idx_cursors_stream each was a full
-    // cursors scan (EXPLAIN said "SCAN cursors").
+    // cursors scan (EXPLAIN said "SCAN cursors"). A single range predicate
+    // (`>= x AND < x || '$'`) keeps stream_ref INSIDE the index bounds; the
+    // old `= x OR range` form left stream_ref out of the index constraints.
     const beUser = repo.users.upsertByEmail("be@example.com", null);
     repo.identities.create(beUser.id, "be");
     const plan = db
       .prepare(
         `EXPLAIN QUERY PLAN SELECT MAX(last_seen_id) AS id FROM cursors
           WHERE stream_type = 'direct'
-            AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
+            AND (stream_ref >= ? AND stream_ref < ? || '$')`,
       )
-      .all("be@example.com/be", "be@example.com/be", "be@example.com/be") as { detail: string }[];
+      .all("be@example.com/be", "be@example.com/be") as { detail: string }[];
     const detail = plan.map((p) => p.detail).join(" ");
     expect(detail).toContain("USING INDEX idx_cursors_stream");
+    // The range must actually constrain the index: "SEARCH cursors USING
+    // INDEX ... (stream_type=? AND stream_ref>? AND stream_ref<?)" — a
+    // bare index mention with an unconstrained stream_ref is the old bug.
+    expect(detail).toContain("stream_ref>");
     expect(detail).not.toContain("SCAN cursors");
   });
 
   test("previousBetween is the pair's own previous message, not the global id below", () => {
     // Message ids are global: an unrelated pair can hold the id just below
     // this one, so "caught up to just before it" must compare against the
-    // pair's own previous message (N4). The pair is bidirectional, like
-    // history — a reply counts as the pair's previous message too.
+    // pair's own previous message (N4). Directional — only messages ADDRESSED
+    // TO the recipient: the recipient's own reply sits above its receive
+    // cursor forever, so a bidirectional compare would hide the read state
+    // after the first back-and-forth.
     const u = repo.users.upsertByEmail("you@example.com", null);
     repo.identities.create(u.id, "fe");
     repo.identities.create(u.id, "sim");
@@ -174,6 +182,12 @@ describe("Repo", () => {
     const two = repo.messages.insert(fe, "user", sim, "two", null);
     expect(repo.messages.previousBetween(fe, sim, two.id)).toBe(one.id); // not two.id - 1
     expect(repo.messages.previousBetween(fe, sim, one.id)).toBe(0); // their first
+    // The recipient's reply never counts as "the previous message": it
+    // isn't addressed to it.
+    const reply = repo.messages.insert(sim, "user", fe, "sim replies", null);
+    const three = repo.messages.insert(fe, "user", sim, "three", null);
+    expect(reply.id).toBeGreaterThan(two.id); // the reply sits above two
+    expect(repo.messages.previousBetween(fe, sim, three.id)).toBe(two.id); // not the reply's id
   });
 
   test("cursors: advance is idempotent and takes MAX", () => {

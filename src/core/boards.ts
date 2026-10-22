@@ -154,19 +154,25 @@ export function startSession(
   const kind = opts.kind ?? "session";
   const push = opts.push_capable ? 1 : 0;
   if (opts.resume) {
-    // A reconnect within one session keeps its lane's status and place. The
-    // lane row ended with its connection (endLane snapshots its state onto
-    // the handle), so a recreated row seeds from that snapshot; a row that
-    // survived keeps its own.
+    // A reconnect within one session keeps its lane's status and place.
+    // The lane row ended with its connection (endLane snapshots its state
+    // onto the handle AND onto its own lane_snapshots row), so a recreated
+    // row seeds from ITS OWN snapshot — not the handle's freshest-wins
+    // columns, which would show every resumed lane the freshest sibling's
+    // state; a row that survived keeps its own; a lane with no snapshot of
+    // its own (pre-snapshots DB) falls back to the handle's.
     db.prepare(
       `INSERT INTO lanes (handle, lane, kind, cwd, place, status, status_at, push_capable, first_seen, last_seen)
-       SELECT ?, ?, ?, ?, h.place, h.status, h.status_at, ?, ?, ?
-         FROM handles h WHERE h.name = ?
+       SELECT ?, ?, ?, ?, COALESCE(ls.place, h.place), COALESCE(ls.status, h.status),
+              COALESCE(ls.status_at, h.status_at), ?, ?, ?
+         FROM handles h
+         LEFT JOIN lane_snapshots ls ON ls.handle = h.name AND ls.lane = ?
+        WHERE h.name = ?
        ON CONFLICT(handle, lane) DO UPDATE SET
          cwd = excluded.cwd,
          push_capable = MAX(lanes.push_capable, excluded.push_capable),
          last_seen = excluded.last_seen`,
-    ).run(handle, lane, kind, cwd, push, now, now, handle);
+    ).run(handle, lane, kind, cwd, push, now, now, lane, handle);
     return;
   }
   db.prepare(
@@ -185,13 +191,21 @@ export function touchLane(db: Database, handle: string, lane: string, now = Date
 }
 
 // A lane's session ended: its row goes — a dead lane cannot ghost — with its
-// last state snapshotted onto the handle's legacy columns, which pre-lanes
-// rosters (and offline display) still read.
+// last state snapshotted onto BOTH the handle's legacy columns (pre-lanes
+// rosters and offline display still read them) and its own lane_snapshots
+// row (resume seeds from its own state, not the freshest sibling's).
 export function endLane(db: Database, handle: string, lane: string, now = Date.now()): void {
   const row = db.prepare(`SELECT * FROM lanes WHERE handle = ? AND lane = ?`).get(handle, lane) as LaneRow | undefined;
   if (!row) return;
   db.prepare(`UPDATE handles SET cwd = ?, place = ?, status = ?, status_at = ? WHERE name = ?`)
     .run(row.cwd, row.place, row.status, row.status_at, handle);
+  db.prepare(
+    `INSERT INTO lane_snapshots (handle, lane, cwd, place, status, status_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(handle, lane) DO UPDATE SET
+       cwd = excluded.cwd, place = excluded.place, status = excluded.status,
+       status_at = excluded.status_at, ended_at = excluded.ended_at`,
+  ).run(handle, lane, row.cwd, row.place, row.status, row.status_at, now);
   db.prepare(`DELETE FROM lanes WHERE handle = ? AND lane = ?`).run(handle, lane);
   touchHandleIfExists(db, handle, now);
 }

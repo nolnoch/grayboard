@@ -697,6 +697,17 @@ test("read_lanes compares against the pair's own previous message, not the globa
   await sim.request({ type: "send", recipient: "alice@example.com/fe", body: "noise" });
   const two = await fe.request({ type: "send", recipient: "bob@example.com/be", body: "two" });
   expect(two).toMatchObject({ type: "send_ok", live_lanes: 2, read_lanes: ["research"] });
+  // A REPLY from the recipient no longer hides its read state: "the pair's
+  // previous message" is the previous one ADDRESSED TO the recipient, not
+  // any message in the pair — the recipient's own reply sits above its
+  // receive cursor forever, so a bidirectional compare always hid read_lanes
+  // after the first back-and-forth (the common case).
+  await be.next((x) => x.type === "push" && x.message.body === "two");
+  await be.request({ type: "ack", message_ids: [two.message_id] });
+  await be.request({ type: "send", recipient: "alice@example.com/fe", body: "be replies" });
+  await fe.next((x) => x.type === "push");
+  const three = await fe.request({ type: "send", recipient: "bob@example.com/be", body: "three" });
+  expect(three).toMatchObject({ type: "send_ok", live_lanes: 2, read_lanes: ["research"] });
 });
 
 test("auto-drop: a closed lane's row goes; the roster keeps no ghost lane", async () => {
@@ -823,22 +834,26 @@ test("a reconnecting ex-owner attaches as a tool lane under the new owner (no st
   const taker = new Client(alice, "be", { hello: { lane: "b" } });
   expect((await taker.connect()).type).toBe("hello_ok");
 
-  // The ex-owner, woken after its lost_ownership close, reconnects on its
-  // own lane: the lane key is free, the delivery slot is held by a live
-  // owner on another lane — it attaches as a TOOL lane (push_granted false),
-  // and is not closed again: the reconnect path can't starve.
-  const back = new Client(alice, "be", { hello: { lane: "research" } });
-  const hello = await back.connect();
+  // The REAL reconnecting ex-owner: the client the takeover closed
+  // reconnects ITSELF (a fresh client that never held the slot pins nothing
+  // — the close code and the reconnect path are the point). lost_ownership
+  // is reconnectable, so it re-hellos instead of exiting for good: the lane
+  // key is free, the delivery slot is held by a live owner on another lane —
+  // it attaches as a TOOL lane (push_granted false), and is not closed
+  // again: the reconnect path can't starve.
+  const closed = await owner.next((m) => m.type === "error");
+  expect(closed).toMatchObject({ code: "lost_ownership" });
+  const hello = await owner.connect(); // the same client, new socket
   expect(hello).toMatchObject({ type: "hello_ok", push_granted: false, owner_lane: "b" });
-  await back.none((m) => m.type === "error", 500);
-  expect((await back.call("claim_list")).type).toBe("call_ok");
+  await owner.none((m) => m.type === "error", 500);
+  expect((await owner.call("claim_list")).type).toBe("call_ok");
 
   // Pushes still route to the owner, not the reattached ex-owner.
   const fe = new Client(bob, "fe");
   await fe.connect();
   await fe.request({ type: "send", recipient: "alice@example.com/be", body: "still mine?" });
   expect((await taker.next((m) => m.type === "push")).message.body).toBe("still mine?");
-  await back.none((m) => m.type === "push", 300);
+  await owner.none((m) => m.type === "push", 300);
 });
 
 test("the heartbeat closes a socket that stops answering pings", async () => {

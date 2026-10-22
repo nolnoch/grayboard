@@ -103,36 +103,49 @@ export function resolveIdentity(base: string, cwd = process.cwd()): string {
 }
 
 /**
- * The name pinned in the repo's `.mcp.json` (mcpServers.grayboard.env.BUS_IDENTITY),
- * or in omp's `.omp/mcp.json` (same shape) when a repo pins one there.
- * Harnesses disagree on whether a repo's `.mcp.json` beats a user-level entry
- * (omp's user config wins), so grayboard reads the pin itself. Worktrees use
- * the main checkout's files, since both are usually untracked.
+ * Every identity the repo pins for grayboard: `.mcp.json` first, then omp's
+ * `.omp/mcp.json` (same shape). Harnesses disagree on whether a repo's
+ * `.mcp.json` beats a user-level entry (omp's user config wins), so
+ * grayboard reads the pins itself. Worktrees use the main checkout's files,
+ * since both are usually untracked. A BUS_IDENTITY equal to ANY of these is
+ * a harness re-delivering that pin, not an explicit override — comparing
+ * against the first pin alone would treat omp's own pin as explicit and
+ * drop its worktree suffix, orphaning that handle's mail and claims.
  */
-export function pinnedIdentity(cwd = process.cwd()): string | undefined {
+export function pinnedIdentities(cwd = process.cwd()): string[] {
+  const pins: string[] = [];
   for (const file of [".mcp.json", ".omp/mcp.json"]) {
     try {
       const full = join(gitLocation(cwd)?.repo ?? cwd, file);
       const pin = JSON.parse(readFileSync(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
-      if (typeof pin === "string" && pin) return pin;
+      if (typeof pin === "string" && pin) pins.push(pin);
     } catch {
       // No such file, or unparseable: try the next source.
     }
   }
-  return undefined;
+  return pins;
+}
+
+/**
+ * The identity this session claims, when BUS_IDENTITY isn't set: the first
+ * pin (`.mcp.json`, then `.omp/mcp.json`), or the directory-derived default.
+ */
+export function pinnedIdentity(cwd = process.cwd()): string | undefined {
+  return pinnedIdentities(cwd)[0];
 }
 
 /**
  * Whether BUS_IDENTITY is a true explicit override, not a harness
- * re-delivering the repo's .mcp.json pin as env (README: harnesses load the
- * pin into BUS_IDENTITY). Literal — no worktree suffix, the worktree becomes
- * the lane — only when it differs from the pin, or BUS_LANE is set. When it
- * equals the pin the identity is derived like the pin itself, so existing
- * worktree identities (`be-stream`) keep their name, mail and claims.
+ * re-delivering one of the repo's pins as env (README: harnesses load pins
+ * into BUS_IDENTITY). Literal — no worktree suffix, the worktree becomes
+ * the lane — only when it differs from EVERY pin source, or BUS_LANE is
+ * set. When it equals any pin the identity is derived like the pin itself,
+ * so existing worktree identities (`be-stream`) keep their name, mail and
+ * claims.
  */
 export function isExplicitIdentity(env = process.env, cwd = process.cwd()): boolean {
   if (!env.BUS_IDENTITY) return false;
-  return !!env.BUS_LANE || env.BUS_IDENTITY !== pinnedIdentity(cwd);
+  return !!env.BUS_LANE || !pinnedIdentities(cwd).includes(env.BUS_IDENTITY);
 }
 
 /**

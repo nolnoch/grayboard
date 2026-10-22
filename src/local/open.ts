@@ -44,18 +44,26 @@ export function openLocalDb(path = localDbPath()): Database {
     );
     -- Local DM delivery claims: the first lane to drain a message inserts
     -- its row and is the one that delivers it; siblings see the row and skip.
-    -- The row persists after delivery as the marker that keeps a slower
-    -- sibling's scan from re-delivering (it is never released on success —
-    -- releasing would reopen the duplicate window); a row past its TTL (the
-    -- claimer crashed mid-handle) is taken over by another lane, and rows
-    -- outlive any concurrent scan by a day before being pruned. Delivery is
-    -- at-least-once at the claim level, exactly-once per attempt.
+    -- delivered_at marks the message reached an agent — the unit of truth:
+    -- the claim only reserves, the marker decides. The row persists after
+    -- delivery as the marker that keeps a slower sibling's scan from
+    -- re-delivering (it is never released on success — releasing would
+    -- reopen the duplicate window); a row past its TTL (the claimer crashed
+    -- mid-handle) is taken over by another lane, DELIVERED rows are pruned
+    -- after a day, and an undelivered row is never pruned — it holds the
+    -- identity's read point until some lane takes it over and delivers it.
+    -- Delivery is at-least-once at the claim level, exactly-once per attempt.
     CREATE TABLE IF NOT EXISTS dm_claims (
       message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       claimer    TEXT NOT NULL,
-      claimed_at INTEGER NOT NULL
+      claimed_at INTEGER NOT NULL,
+      delivered_at INTEGER
     );
   `);
+  // dm_claims.delivered_at, added after the claims themselves (D1: the
+  // marker that keeps a crashed claimer's message from being lost).
+  const claimCols = db.prepare(`PRAGMA table_info(dm_claims)`).all() as { name: string }[];
+  if (!claimCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE dm_claims ADD COLUMN delivered_at INTEGER`);
   // dm_send pending: the sender owes a follow-up in the thread.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);

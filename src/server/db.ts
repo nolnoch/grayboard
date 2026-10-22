@@ -411,11 +411,14 @@ function makeRepo(db: Database): Repo {
         `).all(id);
       },
       previousBetween(a, b, beforeId) {
-        const row = db.query<{ id: number | null }, [number, string, string, string, string]>(
+        // The previous message ADDRESSED TO the recipient: a reply from the
+        // recipient sits above its receive cursor forever, so a
+        // bidirectional compare hides read state after the first
+        // back-and-forth (N4).
+        const row = db.query<{ id: number | null }, [number, string, string]>(
           `SELECT MAX(id) AS id FROM messages
-            WHERE recipient_type = 'user' AND id < ?
-              AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))`,
-        ).get(beforeId, a, b, b, a);
+            WHERE recipient_type = 'user' AND id < ? AND sender = ? AND recipient = ?`,
+        ).get(beforeId, a, b);
         return row?.id ?? 0;
       },
       unreadSince(streams) {
@@ -432,16 +435,16 @@ function makeRepo(db: Database): Repo {
         return all;
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
-        // The range predicate (>= recipient# and < recipient$, '#' < '$')
-        // matches every `recipient#lane` cursor row and can use an index,
-        // unlike a substr prefix compare.
+        // A single range predicate (>= recipient and < recipient$, every
+        // identity char sorts above '$') matches the recipient's own row and
+        // every `recipient#lane` cursor row and can use the index, unlike a
+        // substr prefix compare or an OR of equality and range.
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
                                     WHERE c.stream_type = 'direct'
-                                      AND (c.stream_ref = m.recipient
-                                           OR (c.stream_ref >= m.recipient || '#' AND c.stream_ref < m.recipient || '$'))), 0)
+                                      AND (c.stream_ref >= m.recipient AND c.stream_ref < m.recipient || '$')), 0)
               AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`,
         ).all(sender, olderThan);
@@ -504,17 +507,17 @@ function makeRepo(db: Database): Repo {
         return row?.last_seen_id ?? 0;
       },
       directFor(identityFull) {
-        const row = db.query<{ id: number | null }, [string, string, string]>(
+        const row = db.query<{ id: number | null }, [string, string]>(
           `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
-             AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
-        ).get(identityFull, identityFull, identityFull);
+             AND (stream_ref >= ? AND stream_ref < ? || '$')`,
+        ).get(identityFull, identityFull);
         return row?.id ?? 0;
       },
       lanesRead(identityFull, messageId) {
-        const rows = db.query<{ stream_ref: string }, [number, string, string, string]>(
+        const rows = db.query<{ stream_ref: string }, [number, string, string]>(
           `SELECT stream_ref FROM cursors WHERE stream_type = 'direct' AND last_seen_id >= ?
-             AND (stream_ref = ? OR (stream_ref >= ? || '#' AND stream_ref < ? || '$'))`,
-        ).all(messageId, identityFull, identityFull, identityFull);
+             AND (stream_ref >= ? AND stream_ref < ? || '$')`,
+        ).all(messageId, identityFull, identityFull);
         return rows.map((r) => (r.stream_ref === identityFull ? "main" : r.stream_ref.slice(identityFull.length + 1)));
       },
       advance(identityId, streamType, streamRef, messageId) {

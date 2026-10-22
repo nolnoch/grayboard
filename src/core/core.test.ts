@@ -562,16 +562,42 @@ describe("lanes", () => {
     // columns, so the order decides what survives. Oldest first: the lane
     // that was touched LAST lands last, and the roster's fallback holds the
     // freshest state, not whichever row the scan happened to return last.
+    // Discriminating: main is INSERTED first but FRESHER — the default scan
+    // (rowid) order would end stream last and leave its stale status, so
+    // only the last_seen ordering picks main's.
     startSession(db, "be", "/repo", "main");
     startSession(db, "be", "/repo/.wt/stream", "stream");
-    setStatus(db, "be", "stale status", "main");
-    setStatus(db, "be", "freshest status", "stream");
-    // main last-seen older than stream's (the sweep order keys on it).
-    db.prepare(`UPDATE lanes SET last_seen = last_seen - 1000 WHERE handle = 'be' AND lane = 'main'`).run();
+    setStatus(db, "be", "freshest status", "main");
+    setStatus(db, "be", "stale status", "stream");
+    // stream last-seen older than main's (the sweep order keys on it).
+    db.prepare(`UPDATE lanes SET last_seen = last_seen - 1000 WHERE handle = 'be' AND lane = 'stream'`).run();
     endAllLanes(db);
     expect(lanesFor(db, "be")).toEqual([]);
     const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
     expect(gone?.status).toBe("freshest status");
+  });
+
+  test("a resumed lane seeds from its own snapshot, not the freshest sibling's", () => {
+    // A two-lane laptop reconnects after a restart (N1's common case: a
+    // heartbeat close resumes both lanes). Each lane must show ITS OWN last
+    // state: seeding every resumed lane from the one handle snapshot would
+    // show them all the freshest sibling's status.
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "fixing bug", "stream");
+    setStatus(db, "be", "reviewing pr", "main");
+    endAllLanes(db);
+    startSession(db, "be", "/repo", "main", { resume: true });
+    startSession(db, "be", "/repo/.wt/stream", "stream", { resume: true });
+    expect(lanesFor(db, "be").map((l) => [l.lane, l.status])).toEqual([
+      ["main", "reviewing pr"],
+      ["stream", "fixing bug"],
+    ]);
+    // A lane with no snapshot of its own (never ended, or a pre-snapshots
+    // DB) falls back to the handle's columns — which hold the LAST lane to
+    // end (stream: last_seen newer than main's, so it ended last).
+    startSession(db, "be", "/repo", "scratch", { resume: true });
+    expect(lanesFor(db, "be").find((l) => l.lane === "scratch")?.status).toBe("fixing bug");
   });
 
   test("who renders one row per live lane, the default lane unmarked", () => {

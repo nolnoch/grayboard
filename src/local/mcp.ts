@@ -21,21 +21,25 @@ import {
 } from "../core/tools.ts";
 import {
   ackMessage,
-  anyCursorFor,
-  claimMessage,
+  claimDm,
   db,
   getCursor,
   getHistory,
   getMessage,
   getThread,
+  hasDeliveredClaim,
+  hasUndeliveredClaim,
   insertMessage,
   lanesReadPast,
+  markClaimDelivered,
   previousBetween,
   pruneDmClaims,
+  readPointFor,
   receivedUnacked,
   retractMessage,
   sentPending,
   setCursor,
+  undeliveredClaimBelow,
   undeliveredFrom,
   type Message,
   unreadFor,
@@ -347,10 +351,14 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
     if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(id));
     // A probe is a wakeup: a live recipient drains the message now. Reached
-    // is any lane's cursor (a lane reading is the identity reading).
-    if (anyCursorFor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(id, m.recipient));
+    // is any lane's cursor (a lane reading is the identity reading), held
+    // back by undelivered claims (D1) — and a delivered claim counts even
+    // when the winner's cursor is still held back.
+    const reached = (mid: number, recipient: string) =>
+      (readPointFor(recipient) >= mid || hasDeliveredClaim(mid)) && !hasUndeliveredClaim(mid);
+    if (reached(m.id, m.recipient) || (await poke(m.recipient))) return refuse(retractRefusal.reached(id, m.recipient));
     if (!retractMessage(IDENTITY, m.id)) {
-      return refuse(anyCursorFor(m.recipient) >= m.id ? retractRefusal.reached(id, m.recipient) : retractRefusal.replied(id));
+      return refuse(reached(m.id, m.recipient) ? retractRefusal.reached(id, m.recipient) : retractRefusal.replied(id));
     }
     return text("ok");
   }
@@ -407,43 +415,52 @@ async function drainToClaude(): Promise<void> {
     await sweepStaleLanes();
     touchLane(db, IDENTITY, LANE);
     // A sibling lane may have handled messages this lane never saw: sync to
-    // the identity's read point before draining (any lane's ack counts), so
-    // this lane never replays what a sibling already delivered.
-    const readPoint = anyCursorFor(IDENTITY);
+    // the identity's read point before draining (any lane's reading is the
+    // identity reading), so this lane never replays what a sibling already
+    // delivered. The read point is held back by undelivered claims (D1): a
+    // message no agent received stays ahead of the cursor, visible to a
+    // takeover, never synced past.
+    const readPoint = readPointFor(IDENTITY);
     if (readPoint > getCursor(READER)) setCursor(READER, readPoint);
     while (true) {
       const batch = unreadFor(READER);
-      // A human's session has no tokens to save; a DM is already waking the agent.
-      const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || batch.length > 0 });
+      // Deliver DMs first, then decide the board wake: a deferred item may
+      // only ride along with a DM THIS lane claimed and delivered — a
+      // sibling's claim is not this lane's wake (D2; deferred pushes and
+      // digests never wake a session on their own).
+      let deliveredDm = false;
+      for (const msg of batch) {
+        // Exactly one lane delivers each DM, ever: the claim is atomic, the
+        // delivered marker is the truth. "delivered": an agent already got
+        // it (a winner whose cursor is still held back) — catch the cursor
+        // up, never re-notify. "skip": a live sibling claim — leave the
+        // cursor alone; the read point holds until the sibling delivers or
+        // the claim expires and any lane takes it over (at-least-once at the
+        // claim level, exactly-once per attempt).
+        const outcome = claimDm(msg.id, READER);
+        if (outcome === "skip") continue;
+        if (outcome === "claimed") {
+          const meta: Record<string, string> = {
+            message_id: String(msg.id),
+            from: msg.sender,
+            created_at: String(msg.created_at),
+          };
+          if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+          if (isHuman(db, msg.sender)) meta.human = "true";
+          await mcp.notification({
+            method: "notifications/claude/channel",
+            params: { content: msg.body, meta },
+          });
+          markClaimDelivered(msg.id);
+          deliveredDm = true;
+        }
+        // The marker says an agent received it; the cursor may only move
+        // when no earlier undelivered claim holds the read point back (D1).
+        if (!undeliveredClaimBelow(IDENTITY, msg.id)) setCursor(READER, msg.id);
+      }
+      const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || deliveredDm });
       firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
-      let acted = false;
-      for (const msg of batch) {
-        // Exactly one lane delivers each DM, ever: the claim is atomic and
-        // its row PERSISTS after delivery as the marker that keeps a slower
-        // sibling (whose scan predates the winner's ack) from re-delivering —
-        // releasing on delivery would reopen that window. A claim held by a
-        // live sibling is skipped WITHOUT advancing this cursor — the read
-        // point must not move past a message no agent has received; this
-        // lane's next drain syncs past it once the sibling acks. A claim
-        // stuck past its TTL (the claimer crashed mid-handle) is taken over:
-        // delivery is at-least-once at the claim level, exactly-once per
-        // attempt.
-        if (!claimMessage(msg.id, READER)) continue;
-        acted = true;
-        const meta: Record<string, string> = {
-          message_id: String(msg.id),
-          from: msg.sender,
-          created_at: String(msg.created_at),
-        };
-        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-        if (isHuman(db, msg.sender)) meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: { content: msg.body, meta },
-        });
-        setCursor(READER, msg.id);
-      }
       for (const item of boardItems) {
         const params = boardNotification(item);
         if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
@@ -452,12 +469,11 @@ async function drainToClaude(): Promise<void> {
           params,
         });
         markDelivered(db, IDENTITY, item);
-        acted = true;
       }
       // Every DM in the batch is claimed by a sibling (and nothing else to
-      // do): nothing more for this lane — the siblings' acks move the read
-      // point, and this lane's next drain syncs past them.
-      if (!acted) break;
+      // do): nothing more for this lane — the siblings' deliveries move the
+      // read point, and this lane's next drain syncs past them.
+      if (!deliveredDm && boardItems.length === 0) break;
     }
   } finally {
     draining = false;
@@ -497,10 +513,12 @@ if (DELIVER) await assertLaneFree(IDENTITY, LANE);
 if (DELIVER) startSession(db, IDENTITY, process.cwd(), LANE, { kind: HUMAN ? "bridge" : "session", push_capable: true });
 else touchHandle(db, IDENTITY);
 // Seed this lane's cursor to the identity's read point (the MAX across its
-// lanes): a fresh or rejoining lane must not replay what a sibling already
-// handled — including an identity that only ever ran on non-main lanes.
+// lanes, held back by undelivered claims — D1): a fresh or rejoining lane
+// must not replay what a sibling already handled — including an identity
+// that only ever ran on non-main lanes — and must not sync past a message
+// still claimed and undelivered, which would strand it.
 {
-  const readPoint = anyCursorFor(IDENTITY);
+  const readPoint = readPointFor(IDENTITY);
   if (readPoint > 0) setCursor(READER, readPoint);
 }
 await mcp.connect(new StdioServerTransport());

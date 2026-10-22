@@ -162,6 +162,16 @@ test("lanes of one identity run side by side; each DM is delivered exactly once 
   expect(count("second")).toBe(1);
   expect(count("third")).toBe(1);
   expect(count("fourth")).toBe(1);
+  // A reply from the fleet no longer hides the sender's read state (N4):
+  // "the pair's previous message" is the previous one ADDRESSED TO the
+  // recipient — the recipient's own reply sits above its receive cursor
+  // forever, so a bidirectional compare would always hide read_lanes after
+  // the first back-and-forth (the common case).
+  await call(a.c, "dm_send", { to: "sim", body: "be replies" });
+  await Bun.sleep(250);
+  const fifth = await call(sim, "dm_send", { to: "be", body: "fifth" });
+  expect(fifth.live_lanes).toBe(2);
+  expect((fifth.read_lanes ?? []).length).toBeGreaterThanOrEqual(1);
 }, 20_000);
 
 test("a DM claim stuck by a crashed lane is taken over once it expires", async () => {
@@ -187,6 +197,98 @@ test("a DM claim stuck by a crashed lane is taken over once it expires", async (
   await Bun.sleep(300);
   expect(again.pushes).toEqual(["stuck"]);
 }, 20_000);
+
+test("a claimer that dies mid-handle never loses the DM: the read point holds until takeover (D1)", async () => {
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const stuck = await call(sim, "dm_send", { to: "be", body: "stuck" });
+  expect(stuck.delivered_now).toBe(false);
+  // A FRESH claim (well inside the TTL) by a lane that dies between claiming
+  // and delivering — the reviewer's crash window.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const db1 = openLocalDb(join(dir, "bus.db"));
+  db1.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(stuck.message_id, Date.now());
+  db1.close();
+
+  // A live sibling lane delivers a LATER message: the loser of the old
+  // world synced past the stuck claim and lost it; the read point must hold.
+  const live = await startCollecting("be", "live");
+  await Bun.sleep(300); // startup drain: "stuck" is skipped (a live claim holds it)
+  expect(live.pushes).toEqual([]);
+  await call(sim, "dm_send", { to: "be", body: "later" });
+  await Bun.sleep(300);
+  expect(live.pushes).toEqual(["later"]);
+  // Sender truth: "stuck" is undelivered (no agent received it), "later" is
+  // delivered (its marker), even while the live lane's cursor is held back.
+  const hist = await call(sim, "dm_history", { peer: "be", limit: 10 });
+  const byBody = Object.fromEntries(hist.filter((m: any) => m.delivered !== undefined).map((m: any) => [m.body, m.delivered]));
+  expect(byBody).toMatchObject({ stuck: false, later: true });
+
+  // The claim ages past its TTL (injected); the next poke's drain takes it
+  // over: "stuck" is delivered exactly once — never lost, never duplicated.
+  const db2 = openLocalDb(join(dir, "bus.db"));
+  db2.prepare(`UPDATE dm_claims SET claimed_at = ? WHERE message_id = ?`)
+    .run(Date.now() - DM_CLAIM_TTL_MS - 1_000, stuck.message_id);
+  db2.close();
+  await call(sim, "dm_send", { to: "be", body: "after-ttl" });
+  await Bun.sleep(300);
+  expect(live.pushes).toEqual(["later", "stuck", "after-ttl"]);
+
+  // A same-lane restart reclaims its OWN stuck claim immediately: its own
+  // message is not stranded behind a sibling's TTL window.
+  await stop(live.c);
+  const own = await call(sim, "dm_send", { to: "be", body: "own" });
+  expect(own.delivered_now).toBe(false);
+  const db3 = openLocalDb(join(dir, "bus.db"));
+  db3.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#restarted', ?)`)
+    .run(own.message_id, Date.now()); // fresh, well inside the TTL
+  db3.close();
+  const restarted = await startCollecting("be", "restarted");
+  await Bun.sleep(300);
+  expect(restarted.pushes).toEqual(["own"]);
+}, 30_000);
+
+test("the lane that loses the claim race is not woken by deferred items alone (D2)", async () => {
+  // 24 trials: a fresh deferred thread reply, then a DM that pokes both
+  // lanes. The DM's claim race has exactly one winner; the LOSER must not
+  // deliver the deferred board item — deferred pushes and digests never
+  // wake a session on their own, and a sibling's claim is not this lane's
+  // wake. (Race-dependent, hence the loop: the bug fired in 3 of the
+  // reviewer's 12 trials; the aggregate count below catches double-pushes
+  // the per-trial checks can miss.)
+  const a = await startCollecting("sim", "research");
+  const b = await startCollecting("sim", "scratch");
+  const be = await start("be");
+  const fe = await start("fe");
+  await call(be, "board_create", { name: "ops-race", purpose: "x" });
+  const root = await call(be, "board_post", { board: "ops-race", body: "root" });
+  await call(a.c, "board_post", { board: "ops-race", body: "sim chimes in", parent_id: root.post_id });
+  const mid = await call(fe, "board_post", { board: "ops-race", body: "fe asks", parent_id: root.post_id });
+  for (let i = 0; i < 24; i++) {
+    const aBefore = a.pushes.length, bBefore = b.pushes.length;
+    const reply = await call(be, "board_post", { board: "ops-race", body: `answer ${i}`, parent_id: mid.post_id });
+    expect(reply.deferred).toContain("sim");
+    await call(fe, "dm_send", { to: "sim", body: `dm ${i}` });
+    await Bun.sleep(300);
+    const aDelta = a.pushes.slice(aBefore), bDelta = b.pushes.slice(bBefore);
+    // Exactly one lane delivers the DM.
+    const dmCount = (d: string[]) => d.includes(`dm ${i}`);
+    expect((dmCount(aDelta) ? 1 : 0) + (dmCount(bDelta) ? 1 : 0)).toBe(1);
+    // The deferred reply rides along with the WINNER's drain only: a lane
+    // that pushed the board item must be the lane that pushed the DM. The
+    // loser delivering it alone was the round-4 bug (3 of 12 trials).
+    for (const d of [aDelta, bDelta]) {
+      if (d.includes(`answer ${i}`)) expect(d.includes(`dm ${i}`)).toBe(true);
+    }
+  }
+  // Aggregate: every answer pushed at most once across the fleet — a
+  // double-push (both lanes fetched it before either marked it delivered)
+  // is the same bug in its other shape.
+  expect([...a.pushes, ...b.pushes].filter((p) => p.startsWith("answer")).length).toBeLessThanOrEqual(24);
+}, 45_000);
 
 test("a second session on a live lane fails loudly instead of shadowing it", async () => {
   const first = await start("be", dir, [CLI, "mcp", "--mode", "local"], "research");
