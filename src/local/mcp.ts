@@ -407,8 +407,10 @@ let draining = false;
 // rerun to deliver at once.
 let rerunDrain = false;
 // Test seam (BUS_TEST_DRAIN_TAIL_MS): delays the tail between the last
-// scan and the expiry check, widening the window the rerun flag exists for
-// so a test can hit it deterministically. Zero in production.
+// scan and the expiry check, widening the window in which a skipped claim
+// can expire mid-drain — so the post-tail expiry check (claimed row as the
+// pending signal) and the immediate-retry arming can be hit
+// deterministically. Zero in production.
 const DRAIN_TAIL_TEST_MS = Math.max(Number(process.env.BUS_TEST_DRAIN_TAIL_MS ?? 0) || 0, 0);
 // The first drain also brings deferred thread replies and digests: a new
 // session is the natural time to see them.

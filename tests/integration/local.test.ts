@@ -42,7 +42,7 @@ async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp"
 
 // Like start, collecting channel notifications. Like Claude Code, it drops
 // any that arrive before it has sent `initialized`.
-async function startCollecting(identity: string, lane?: string, stderr: "ignore" | "inherit" = "ignore"): Promise<{ c: Client; pushes: string[] }> {
+async function startCollecting(identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> {
   const pushes: string[] = [];
   const c = new Client({ name: "test", version: "0" });
   let initialized = false;
@@ -50,7 +50,7 @@ async function startCollecting(identity: string, lane?: string, stderr: "ignore"
     if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
   };
   await c.connect(
-    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr }),
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr: "ignore" }),
   );
   initialized = true;
   open.push(c);
