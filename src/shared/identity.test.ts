@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity, sessionLane } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -71,7 +71,21 @@ describe("describeLocation", () => {
 });
 
 describe("sessionIdentity", () => {
-  test("BUS_IDENTITY wins", () => expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be"));
+  test("BUS_IDENTITY wins, literal: no worktree suffix", () => {
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be");
+    // The wrong-fleet bug: an explicit identity launched from a worktree
+    // joins that identity's fleet instead of forking a look-alike.
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be");
+  });
+  test("a pin keeps the worktree suffix (derived identities unchanged)", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("be-stream");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
   test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
   test("empty BUS_IDENTITY falls back", () => expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("repo"));
 
@@ -87,5 +101,26 @@ describe("sessionIdentity", () => {
     } finally {
       rmSync(at("repo", ".mcp.json"));
     }
+  });
+});
+
+describe("sessionLane", () => {
+  test("BUS_LANE wins", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be", BUS_LANE: "research-3" }, at("repo"))).toBe("research-3");
+    expect(sessionLane({ BUS_LANE: "Research-3" }, at("repo"))).toBe("research-3");
+  });
+  test("invalid BUS_LANE fails loudly", () => {
+    expect(() => sessionLane({ BUS_LANE: "Bad Lane!" }, at("repo"))).toThrow(/invalid BUS_LANE/);
+  });
+  test("an explicit identity in a worktree: the worktree name is the implicit lane", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("stream");
+    expect(sessionLane({ BUS_IDENTITY: "be", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("x");
+  });
+  test("an explicit identity outside a worktree: no lane of its own", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo"))).toBeNull();
+  });
+  test("a derived identity carries the suffix in the name; its lane is the default", () => {
+    expect(sessionLane({}, at("repo", ".wt", "stream"))).toBeNull();
+    expect(sessionLane({}, at("repo"))).toBeNull();
   });
 });

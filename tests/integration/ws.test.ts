@@ -119,7 +119,7 @@ class Client {
   close() {
     try {
       this.ws.close();
-    } catch {}
+    } catch { /* the socket may already be dead; that's the point */ }
   }
 }
 
@@ -502,6 +502,164 @@ test("a live identity refuses a second connection", async () => {
   expect((await first.call("board_list")).type).toBe("call_ok");
 });
 
+test("a second push session on another lane joins as a tool lane; the owner is told", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const owner = new Client(alice, "be");
+  await owner.connect();
+  const lane = new Client(alice, "be", { hello: { lane: "research-3" } });
+  const hello = await lane.connect();
+  expect(hello).toMatchObject({ type: "hello_ok", lane: "research-3", push_granted: false, owner_lane: "main" });
+  expect(hello.notices.some((n: string) => n.includes('owned by lane "main"'))).toBe(true);
+  // The owner learns its fleet grew.
+  const evt = await owner.next((m) => m.type === "fleet");
+  expect(evt).toMatchObject({ event: "lane_joined", lane: "research-3" });
+  // The lane is tools-only: it can call tools, but a DM is delivered to the owner.
+  const b = new Client(bob, "fe");
+  await b.connect();
+  expect((await lane.call("board_list")).type).toBe("call_ok");
+  const sent = await b.request({ type: "send", recipient: "alice@example.com/be", body: "who's driving?" });
+  expect(sent).toMatchObject({ delivered_now: true, live_lanes: 2 });
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("who's driving?");
+  await lane.none((m) => m.type === "push");
+  // The roster shows one row per live lane, the default lane unmarked.
+  const peers = (await b.call("peer_list")).result.peers.filter((p: any) => p.handle === "alice@example.com/be");
+  expect(peers.map((p: any) => p.lane)).toEqual([undefined, "research-3"]);
+});
+
+test("owner close rotates push to the lane: fleet event, its own DM stream, unacked boards redelivered", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const owner = new Client(alice, "be");
+  await owner.connect();
+  const lane = new Client(alice, "be", { hello: { lane: "b" } });
+  await lane.connect(); // demoted: tools-only, holds lane key "b"
+
+  // A DM arrives while the lane is demoted: pushed to the owner only.
+  const b = new Client(bob, "fe");
+  await b.connect();
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "one" });
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("one");
+  // An unacked board push sits in the outbox for the identity.
+  await b.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await b.call("board_post", { board: "e2e", body: "@alice/be look" });
+  const item = await owner.next((m) => m.type === "board_push");
+  expect(item.item.post.body).toContain("look"); // received, never acked
+
+  await closeAndSettle(owner);
+  // Rotation: the lane is told, gets the DM its stream never saw, and the
+  // unacked board item redelivers (at-least-once).
+  expect(await lane.next((m) => m.type === "fleet")).toMatchObject({ event: "owner_rotated", lane: "b" });
+  expect((await lane.next((m) => m.type === "push")).message.body).toBe("one");
+  const redelivered = await lane.next((m) => m.type === "board_push");
+  expect(redelivered.item.post.id).toBe(item.item.post.id);
+
+  // It owns delivery now: a new DM arrives live.
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "two" });
+  expect((await lane.next((m) => m.type === "push")).message.body).toBe("two");
+  const audit = app.db.prepare(`SELECT action FROM access_log WHERE action = 'lane.owner_rotated'`).all() as { action: string }[];
+  expect(audit.length).toBe(1);
+});
+
+test("per-lane DM cursors: a lane's ack never suppresses a sibling's pending delivery", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const b = new Client(bob, "fe");
+  await b.connect();
+  const owner = new Client(alice, "be");
+  await owner.connect();
+
+  const m1 = await b.request({ type: "send", recipient: "alice@example.com/be", body: "first" });
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("first");
+  // A lane joins, is demoted, and acks the message from its own stream: its
+  // cursor moves, the owner's doesn't.
+  const lane = new Client(alice, "be", { hello: { lane: "b" } });
+  await lane.connect();
+  await lane.request({ type: "ack", message_ids: [m1.message_id] });
+  const sent = await b.request({ type: "send", recipient: "alice@example.com/be", body: "second" });
+  // Read markers are "caught up to just before this message": the lane had
+  // read "first", the owner (live but unacked) hadn't.
+  expect(sent).toMatchObject({ live_lanes: 2, read_lanes: ["b"] });
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("second");
+  await owner.request({ type: "ack", message_ids: [sent.message_id] });
+  const both = await b.request({ type: "send", recipient: "alice@example.com/be", body: "third" });
+  expect(both.read_lanes).toEqual(["main"]); // the owner is caught up; the lane stopped at "first"
+
+  // A lane offline at send time still drains its own stream when it rejoins:
+  // the owner acked on, but the lane's cursor hasn't seen "second" or "third".
+  await closeAndSettle(lane);
+  await owner.request({ type: "ack", message_ids: [both.message_id] });
+  const rejoined = new Client(alice, "be", { hello: { lane: "b", resume: true } });
+  await rejoined.connect();
+  expect((await rejoined.next((m) => m.type === "push")).message.body).toBe("second");
+  expect((await rejoined.next((m) => m.type === "push")).message.body).toBe("third");
+});
+
+test("auto-drop: a closed lane's row goes; the roster keeps no ghost lane", async () => {
+  const alice = await login("alice@example.com");
+  const owner = new Client(alice, "be");
+  await owner.connect();
+  const lane = new Client(alice, "be", { hello: { lane: "gone" } });
+  await lane.connect();
+  const fleet = await api(alice, "GET", "/api/fleet?identity=be");
+  expect(fleet.body.map((l: any) => l.lane).sort()).toEqual(["gone", "main"]);
+
+  await closeAndSettle(lane);
+  const after = await api(alice, "GET", "/api/fleet?identity=be");
+  expect(after.body.map((l: any) => l.lane)).toEqual(["main"]);
+  const peers = (await owner.call("peer_list", { include_offline: true })).result.peers.filter((p: any) => p.handle === "alice@example.com/be");
+  expect(peers.map((p: any) => p.lane)).toEqual([undefined]);
+});
+
+test("fleet disconnect is owner-ordered, audited, and never invents lanes", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const owner = new Client(alice, "be");
+  await owner.connect();
+  const lane = new Client(alice, "be", { hello: { lane: "b" } });
+  await lane.connect();
+
+  // Not the identity's user: nothing to disconnect (and no existence leak).
+  expect((await api(bob, "POST", "/api/fleet/disconnect", { identity: "be", lane: "b" })).status).toBe(404);
+  // Unknown identity names what the caller has.
+  expect((await api(alice, "POST", "/api/fleet/disconnect", { identity: "voic", lane: "b" })).status).toBe(404);
+  // Unknown lane names the live ones.
+  expect((await api(alice, "POST", "/api/fleet/disconnect", { identity: "be", lane: "nope" })).status).toBe(404);
+
+  expect((await api(alice, "POST", "/api/fleet/disconnect", { identity: "be", lane: "b" })).status).toBe(200);
+  expect(await lane.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
+  const audit = app.db.prepare(`SELECT action, target, detail FROM access_log WHERE action = 'lane.disconnected'`).all() as { action: string; target: string; detail: string }[];
+  expect(audit).toHaveLength(1);
+  expect(JSON.parse(audit[0]!.detail)).toMatchObject({ lane: "b" });
+  // The owner stays live and keeps delivery.
+  expect((await owner.call("board_list")).type).toBe("call_ok");
+});
+
+test("simultaneous push joins on distinct lanes: exactly one owner, the rest demoted", async () => {
+  const alice = await login("alice@example.com");
+  const a = new Client(alice, "be", { hello: { lane: "a" } });
+  const b = new Client(alice, "be", { hello: { lane: "b" } });
+  const [ra, rb] = await Promise.all([a.connect(), b.connect()]);
+  const results = [ra, rb];
+  expect(results.filter((r) => r.type === "hello_ok" && r.push_granted !== false)).toHaveLength(1);
+  expect(results.filter((r) => r.type === "hello_ok" && r.push_granted === false)).toHaveLength(1);
+  for (const c of [a, b]) expect((await c.call("board_list")).type).toBe("call_ok");
+  const fleet = await api(alice, "GET", "/api/fleet?identity=be");
+  expect(fleet.body.filter((l: any) => l.push_owner).length).toBe(1);
+});
+
+test("a fleet of many lanes: one owner, the rest tools-only, all usable", async () => {
+  const alice = await login("alice@example.com");
+  const conns = [new Client(alice, "be")];
+  for (const lane of ["b", "c", "d", "e"]) conns.push(new Client(alice, "be", { hello: { lane } }));
+  const results = await Promise.all(conns.map((c) => c.connect()));
+  expect(results.filter((r) => r.type === "hello_ok" && r.push_granted !== false)).toHaveLength(1);
+  for (const c of conns) expect((await c.call("claim_list")).type).toBe("call_ok");
+  const fleet = await api(alice, "GET", "/api/fleet?identity=be");
+  expect(fleet.body.filter((l: any) => l.live).length).toBe(5);
+  expect(fleet.body.filter((l: any) => l.push_owner).length).toBe(1);
+});
+
 test("a connection that doesn't answer the probe is replaced", async () => {
   const alice = await login("alice@example.com");
   const stale = new Client(alice, "be", { pong: false });
@@ -543,17 +701,21 @@ test("direct messages still deliver live", async () => {
   expect((await b.next((m) => m.type === "push")).message.body).toBe("hi");
 });
 
-test("a handler that throws answers the call with an internal error and keeps the socket", async () => {
+test("deleting an identity closes its live connections superseded-style, and no roster ghost follows", async () => {
   const alice = await login("alice@example.com");
   const be = new Client(alice, "be");
   const fe = new Client(alice, "fe");
   await Promise.all([be.connect(), fe.connect()]);
   await be.request({ type: "send", recipient: "fe", body: "hi" });
   const id = (await fe.next((m) => m.type === "push")).message.id;
-  // Deleting the identity under its live connection makes the ack's cursor write fail.
+  // Deleting the identity under its live connection closes it (#73's fix
+  // shape): the close path can't re-insert a deleted handle as a ghost, and
+  // the connection's pending ack dies with it instead of throwing.
   expect((await api(alice, "DELETE", "/api/identities/fe")).status).toBe(200);
-  expect(await fe.request({ type: "ack", message_ids: [id] })).toMatchObject({ type: "error", code: "internal" });
-  expect((await fe.call("board_list")).type).toBe("call_ok");
+  expect(await fe.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
+  expect((await be.call("peer_list", { include_offline: true })).result.peers.find((p: any) => p.handle === "alice@example.com/fe")).toBeUndefined();
+  // The ack frame never ran: the DM is still unread for the (now gone) identity.
+  void id;
 });
 
 test("login refuses an email no direct address can carry", async () => {
@@ -657,6 +819,8 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   const b = new Client(bob, "fe");
   await b.connect();
   await closeAndSettle(b);
+  // Created up front, so the first hello carries no "new identity" notice.
+  await api(alice, "POST", "/api/identities", { name: "be" });
   const a = new Client(alice, "be");
   expect((await a.connect()).notices).toBeUndefined();
   await a.call("claim_take", { key: "ticket:ENG-2", note: "on it" });
@@ -669,7 +833,7 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   expect(notices).toHaveLength(2);
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
-  expect((await new Client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
+  expect((await new Client(alice, "sim").connect()).notices.some((n: string) => n.includes("Others': ticket:ENG-2."))).toBe(true);
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {

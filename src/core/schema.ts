@@ -91,6 +91,29 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+
+    -- A live session (lane) of an identity's fleet. Rows exist while the
+    -- lane is live (auto-drop deletes them on connection close); per-lane
+    -- cwd/place/status replace the shared handle columns, which stay as the
+    -- pre-lanes display fallback for offline handles. push_capable: the
+    -- session asked for push; ownership itself is the server's registry slot.
+    -- role: "session", or "bridge" for a bridge's sticky lane (exempt from
+    -- local stale sweeps). Attribution stays the identity handle; lanes are
+    -- roster truth, never authority.
+    CREATE TABLE IF NOT EXISTS lanes (
+      handle       TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
+      lane         TEXT NOT NULL,
+      role         TEXT NOT NULL CHECK (role IN ('session','sticky','bridge')) DEFAULT 'session',
+      cwd          TEXT,
+      place        TEXT,
+      status       TEXT,
+      status_at    INTEGER,
+      push_capable INTEGER NOT NULL DEFAULT 0,
+      first_seen   INTEGER NOT NULL,
+      last_seen    INTEGER NOT NULL,
+      PRIMARY KEY (handle, lane)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lanes_handle ON lanes(handle, last_seen);
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a
@@ -113,4 +136,9 @@ export function initCoreSchema(db: Database): void {
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === "scope")) db.exec(`ALTER TABLE boards ADD COLUMN scope TEXT`);
+
+  // Which lane of the identity's fleet took or released a claim (audit only;
+  // the holder stays the identity handle).
+  const claimCols = db.prepare(`PRAGMA table_info(claim_events)`).all() as { name: string }[];
+  if (!claimCols.some((c) => c.name === "lane")) db.exec(`ALTER TABLE claim_events ADD COLUMN lane TEXT`);
 }

@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError, activeAnnouncements, age, endLane, humanHandles, isHuman, lastSeen, lanesFor, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import {
   BOARD_INSTRUCTIONS,
@@ -21,6 +21,7 @@ import {
 } from "../core/tools.ts";
 import {
   ackMessage,
+  anyCursorFor,
   db,
   getCursor,
   getHistory,
@@ -35,8 +36,8 @@ import {
   type Message,
   unreadFor,
 } from "./db.ts";
-import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
-import { sessionIdentity } from "../shared/identity.ts";
+import { assertLaneFree, laneAlive, listenForWakeup, poke } from "./wakeup.ts";
+import { sessionIdentity, sessionLane } from "../shared/identity.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -61,7 +62,15 @@ import {
 import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
-console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
+// This session's lane within the identity's fleet: BUS_LANE, else the
+// worktree's name when the identity was explicit, else the default. Several
+// sessions of one identity run side by side, one per lane.
+const LANE: string = sessionLane() ?? MAIN_LANE;
+// This lane's DM-cursor stream: the identity's own row for the default lane
+// (pre-lanes rows unchanged), `identity#<lane>` for the rest, so lanes never
+// ack away each other's pending messages.
+const READER: string = laneStreamRef(IDENTITY, LANE);
+console.error(`[grayboard] local mode, identity "${IDENTITY}", lane "${LANE}"`);
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
@@ -97,7 +106,7 @@ const mcp = new Server(
     },
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
+      `You are identity "${IDENTITY}"${LANE !== MAIN_LANE ? `, lane "${LANE}"` : ""} on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,
@@ -219,13 +228,13 @@ const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   touchHandle(db, IDENTITY);
-  const r = await call(name, args as Record<string, any>);
+  const r = await call(name, args as Record<string, unknown>);
   expiry.arm();
   const extra = notices();
   return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
 });
 
-async function call(name: string, args: Record<string, any>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+async function call(name: string, args: Record<string, unknown>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
   const bad = checkArgs(TOOLS, name, args);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
@@ -241,7 +250,7 @@ async function call(name: string, args: Record<string, any>): Promise<{ content:
 // Only a message's sender and recipient can see it or thread from it.
 const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
 
-async function dispatch(name: string, a: Record<string, any>) {
+async function dispatch(name: string, a: Record<string, unknown>) {
   if (name === "dm_send") {
     const { to: recipient, body, parent_id, pending } = a as {
       to: string;
@@ -278,14 +287,14 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_history") {
-    return text(getHistory(IDENTITY, a.peer, historyLimit(a.limit), a.before_id).map(showPending));
+    return text(getHistory(IDENTITY, a.peer as string | undefined, historyLimit(a.limit), a.before_id as number | undefined).map(showPending));
   }
 
   if (name === "dm_thread") {
-    if (!mine(getMessage(a.thread))) {
+    if (!mine(getMessage(a.thread as number))) {
       return { ...text(`error: message ${a.thread} not found`), isError: true };
     }
-    return text(getThread(a.thread).filter(mine).map(showPending));
+    return text(getThread(a.thread as number).filter(mine).map(showPending));
   }
 
   if (name === "dm_inbox") {
@@ -316,20 +325,22 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "dm_retract") {
-    const m = getMessage(a.message_id);
+    const id = a.message_id as number;
+    const m = getMessage(id);
     const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-    if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(a.message_id));
-    // A probe is a wakeup: a live recipient drains the message now.
-    if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
+    if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(id));
+    // A probe is a wakeup: a live recipient drains the message now. Reached
+    // is any lane's cursor (a lane reading is the identity reading).
+    if (anyCursorFor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(id, m.recipient));
     if (!retractMessage(IDENTITY, m.id)) {
-      return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
+      return refuse(anyCursorFor(m.recipient) >= m.id ? retractRefusal.reached(id, m.recipient) : retractRefusal.replied(id));
     }
     return text("ok");
   }
 
   if (isBoardTool(name)) {
     // Only a human can start an announcement, which reaches the sessions live now.
-    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {};
+    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles(), lane: LANE } : { lane: LANE };
     const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
     await wakeAll(wake);
     return text(result);
@@ -367,8 +378,13 @@ async function drainToClaude(): Promise<void> {
   if (draining) return;
   draining = true;
   try {
+    // Lazy sweep first (ruling 3): local sockets have no close event, so any
+    // draining reader ends lanes whose session crashed — role "session"
+    // rows, past a grace window, whose lane socket no longer answers.
+    await sweepStaleLanes();
+    touchLane(db, IDENTITY, LANE);
     while (true) {
-      const batch = unreadFor(IDENTITY);
+      const batch = unreadFor(READER);
       // A human's session has no tokens to save; a DM is already waking the agent.
       const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || batch.length > 0 });
       firstDrain = false;
@@ -385,7 +401,7 @@ async function drainToClaude(): Promise<void> {
           method: "notifications/claude/channel",
           params: { content: msg.body, meta },
         });
-        setCursor(IDENTITY, msg.id);
+        setCursor(READER, msg.id);
       }
       for (const item of boardItems) {
         const params = boardNotification(item);
@@ -402,32 +418,62 @@ async function drainToClaude(): Promise<void> {
   }
 }
 
-// Startup: refuse a duplicate identity before the MCP handshake so the client
+// A crashed local session writes nothing (no close event), so its lane row
+// lingers until any draining session sweeps it: role "session", last_seen
+// past the grace window (a live lane touches it on every drain), and a lane
+// socket that no longer answers after the full retry window. Bridge lanes
+// (role "bridge") are sticky: exempt, the human's reachability rides on them.
+const STALE_LANE_MS = 60_000;
+
+async function sweepStaleLanes(): Promise<void> {
+  const rows = db.prepare(`SELECT handle, lane, last_seen FROM lanes WHERE role = 'session'`).all() as {
+    handle: string; lane: string; last_seen: number;
+  }[];
+  const now = Date.now();
+  for (const r of rows) {
+    if (now - r.last_seen < STALE_LANE_MS) continue;
+    if (r.handle === IDENTITY && r.lane === LANE) continue; // ours: alive by construction
+    if (await laneAlive(r.handle, r.lane)) continue;
+    endLane(db, r.handle, r.lane);
+    console.error(`[grayboard] swept stale lane ${r.handle}#${r.lane}`);
+  }
+}
+
+// Startup: refuse a duplicate lane before the MCP handshake so the client
 // shows the server as failed. Then connect MCP so notifications are accepted,
-// bind the wakeup socket (rechecking), and replay what arrived while offline.
-if (DELIVER) await assertIdentityFree(IDENTITY);
+// bind the lane's wakeup socket (bind-first), and replay what arrived while
+// offline — this lane's own stream, seeded from the default lane's cursor so
+// joining a fleet doesn't replay the identity's history.
+if (DELIVER) await assertLaneFree(IDENTITY, LANE);
 // A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (DELIVER) startSession(db, IDENTITY, process.cwd());
+if (DELIVER) startSession(db, IDENTITY, process.cwd(), LANE, { role: HUMAN ? "bridge" : "session", push_capable: true });
 else touchHandle(db, IDENTITY);
+if (LANE !== MAIN_LANE) {
+  const mainCursor = getCursor(IDENTITY);
+  if (mainCursor > 0 && getCursor(READER) === 0) setCursor(READER, mainCursor);
+}
 await mcp.connect(new StdioServerTransport());
 
 let cleanup = () => {};
 const shutdown = () => {
+  // Clean exits drop their own lane now; a crash leaves it for the sweep.
   try {
-    touchHandle(db, IDENTITY);
-  } catch {}
+    endLane(db, IDENTITY, LANE);
+  } catch (err) {
+    console.error("grayboard lane cleanup failed:", err);
+  }
   cleanup();
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 // Exit when the client goes away. Otherwise the wakeup listener keeps an
-// orphan alive that holds the identity and blocks the next session.
+// orphan alive that holds the lane and blocks the next session on it.
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
 if (DELIVER) {
-  cleanup = await listenForWakeup(IDENTITY, () => {
+  cleanup = await listenForWakeup(IDENTITY, LANE, () => {
     // A wakeup may follow another session's claim_take.
     expiry.arm();
     drainToClaude().catch((err) => {

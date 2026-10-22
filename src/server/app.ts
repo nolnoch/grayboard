@@ -14,9 +14,14 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, humanReach);
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
+  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, fleetState, disconnectLane, disconnectIdentity } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
+
+  // Lane rows mirror live sessions; at boot none are connected, so they all
+  // date from before this process (a crash or restart left them). Wipe them —
+  // the roster's ghosts — rather than let them render as offline lanes.
+  db.exec("DELETE FROM lanes");
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -48,6 +53,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
             identityId: 0,
             identityName: "",
             identityFull: "",
+            lane: "main",
+            pushWanted: false,
+            joinedAt: 0,
             ready: false,
           },
         });
@@ -55,7 +63,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, wake, slack, disconnectUser, { fleetState, disconnectLane, disconnectIdentity });
     },
 
     websocket: handlers,

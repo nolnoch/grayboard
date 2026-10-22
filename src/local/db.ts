@@ -29,7 +29,12 @@ export function insertMessage(
   return Number(lastInsertRowid);
 }
 
+// Messages for the reader's identity past ITS cursor. `reader` is the lane's
+// stream key (the identity for the default lane, `identity#lane` otherwise:
+// identities are [a-z0-9_-], so the first `#` splits them); the messages
+// themselves route by the identity.
 export function unreadFor(reader: string): Message[] {
+  const identity = reader.split("#")[0]!;
   const cursor = getCursor(reader);
   return db
     .prepare(
@@ -37,7 +42,7 @@ export function unreadFor(reader: string): Message[] {
        WHERE recipient = ? AND id > ?
        ORDER BY id ASC`,
     )
-    .all(reader, cursor) as Message[];
+    .all(identity, cursor) as Message[];
 }
 
 export function getCursor(reader: string): number {
@@ -45,6 +50,20 @@ export function getCursor(reader: string): number {
     .prepare(`SELECT last_seen_id FROM cursors WHERE reader = ?`)
     .get(reader) as { last_seen_id: number } | undefined;
   return row?.last_seen_id ?? 0;
+}
+
+// How far an identity has received its DMs across every lane of its fleet
+// (a lane reading is the identity reading). Lanes keep their own cursors
+// (`identity` for the default lane, `identity#<lane>` for the rest); the
+// pre-lanes rows are the default lane's, unchanged.
+export function anyCursorFor(identity: string): number {
+  const row = db
+    .prepare(
+      `SELECT MAX(last_seen_id) AS id FROM cursors
+        WHERE reader = ? OR substr(reader, 1, length(?) + 1) = ? || '#'`,
+    )
+    .get(identity, identity, identity) as { id: number | null } | undefined;
+  return row?.id ?? 0;
 }
 
 export function setCursor(reader: string, last_seen_id: number): void {
@@ -91,9 +110,11 @@ export function undeliveredFrom(
   return db
     .prepare(
       `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-         LEFT JOIN cursors c ON c.reader = m.recipient
         WHERE m.sender = ? AND m.recipient != m.sender
-          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+          AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
+                                WHERE c.reader = m.recipient
+                                   OR substr(c.reader, 1, length(m.recipient) + 1) = m.recipient || '#'), 0)
+          AND m.created_at < ?
         GROUP BY m.recipient ORDER BY m.recipient`,
     )
     .all(sender, Number.isFinite(olderThan) ? olderThan : Number.MAX_SAFE_INTEGER) as {
@@ -137,7 +158,7 @@ export function getHistory(
   args.push(limit);
   const rows = db.prepare(sql).all(...args) as Message[];
   return rows.reverse().map((m) =>
-    m.sender === identity && m.recipient !== identity ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
+    m.sender === identity && m.recipient !== identity ? { ...m, delivered: anyCursorFor(m.recipient) >= m.id } : m,
   );
 }
 

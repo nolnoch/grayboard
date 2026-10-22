@@ -23,17 +23,18 @@ afterEach(async () => {
 });
 
 // Local-mode env for a session in `dir`; no credentials file, so `grayboard mcp` picks local.
-function busEnv(identity?: string): Record<string, string> {
+function busEnv(identity?: string, lane?: string): Record<string, string> {
   const env = { ...process.env, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir, GRAYBOARD_CREDENTIALS: join(dir, "credentials") };
   delete env.BUS_IDENTITY;
+  delete env.BUS_LANE;
   delete env.GRAYBOARD_TOKEN;
-  return (identity ? { ...env, BUS_IDENTITY: identity } : env) as Record<string, string>;
+  return { ...env, ...(identity ? { BUS_IDENTITY: identity } : {}), ...(lane ? { BUS_LANE: lane } : {}) } as Record<string, string>;
 }
 
-async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp", "--mode", "local"]): Promise<Client> {
+async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp", "--mode", "local"], lane?: string): Promise<Client> {
   const c = new Client({ name: "test", version: "0" });
   await c.connect(
-    new StdioClientTransport({ command: process.execPath, args, cwd, env: busEnv(identity), stderr: "ignore" }),
+    new StdioClientTransport({ command: process.execPath, args, cwd, env: busEnv(identity, lane), stderr: "ignore" }),
   );
   open.push(c);
   return c;
@@ -41,7 +42,7 @@ async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp"
 
 // Like start, collecting channel notifications. Like Claude Code, it drops
 // any that arrive before it has sent `initialized`.
-async function startCollecting(identity: string): Promise<{ c: Client; pushes: string[] }> {
+async function startCollecting(identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> {
   const pushes: string[] = [];
   const c = new Client({ name: "test", version: "0" });
   let initialized = false;
@@ -49,7 +50,7 @@ async function startCollecting(identity: string): Promise<{ c: Client; pushes: s
     if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
   };
   await c.connect(
-    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity), stderr: "ignore" }),
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr: "ignore" }),
   );
   initialized = true;
   open.push(c);
@@ -98,16 +99,71 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   ]);
 }, 20_000);
 
-test("a session started in a linked worktree gets a suffixed handle", async () => {
+test("a session with an explicit identity in a linked worktree joins that identity's fleet, lane per worktree", async () => {
   const wt = join(dir, "repo", ".wt", "stream");
   mkdirSync(join(dir, "repo", ".git", "worktrees"), { recursive: true });
   mkdirSync(wt, { recursive: true });
   writeFileSync(join(wt, ".git"), `gitdir: ${join(dir, "repo", ".git", "worktrees", "stream")}\n`);
 
+  // Both sessions share the identity "be" — the worktree is a lane now, not
+  // a look-alike handle — and run side by side, which the old guard refused.
   const main = await start("be", join(dir, "repo"));
   const stream = await start("be", wt);
-  expect((await call(stream, "peer_list")).you).toBe("be-stream");
-  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
+  expect((await call(stream, "peer_list")).you).toBe("be");
+  const rows = (await call(main, "peer_list")).peers.filter((p: any) => p.handle === "be");
+  expect(rows.map((p: any) => p.lane)).toEqual([undefined, "stream"]);
+}, 20_000);
+
+test("lanes of one identity run side by side; a DM reaches every live lane", async () => {
+  const a = await startCollecting("be", "research");
+  const b = await startCollecting("be", "scratch");
+  const sim = await start("sim");
+  await call(sim, "dm_send", { to: "be", body: "fleet, assemble" });
+  await Bun.sleep(300);
+  expect(a.pushes).toContain("fleet, assemble");
+  expect(b.pushes).toContain("fleet, assemble");
+  // Each lane keeps its own read stream: one acking doesn't consume the
+  // other's pending delivery.
+  const sent = await call(sim, "dm_history", { peer: "be" });
+  expect((await call(a.c, "dm_ack", { message_id: sent[sent.length - 1].id })).ok ?? true).toBe(true);
+  await call(sim, "dm_send", { to: "be", body: "still there?" });
+  await Bun.sleep(300);
+  expect(b.pushes).toContain("still there?");
+}, 20_000);
+
+test("a second session on a live lane fails loudly instead of shadowing it", async () => {
+  const first = await start("be", dir, [CLI, "mcp", "--mode", "local"], "research");
+  const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "local"], {
+    cwd: dir, env: busEnv("be", "research"), stdin: "ignore", stderr: "pipe",
+  });
+  expect(await p.exited).toBe(1);
+  expect(await new Response(p.stderr).text()).toContain("already in use");
+  // The first session keeps its lane.
+  expect((await call(first, "peer_list")).you).toBe("be");
+}, 20_000);
+
+test("a crashed lane's row is swept lazily by the next draining session", async () => {
+  const be = await start("be");
+  const sim = await start("sim");
+  // A lane row past its grace window, with a socket file nothing answers: a
+  // session that crashed and left both behind (local mode has no close event).
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  const stale = Date.now() - 120_000;
+  db.prepare(
+    `INSERT INTO lanes (handle, lane, role, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'crashed', 'session', NULL, 1, ?, ?)`,
+  ).run(stale, stale);
+  db.close();
+  writeFileSync(join(dir, "sock.be.crashed"), "");
+
+  // Any drain — this DM wakes be's session — sweeps the dead lane's row.
+  await call(sim, "dm_send", { to: "be", body: "nudge" });
+  await Bun.sleep(400);
+  const db2 = openLocalDb(join(dir, "bus.db"));
+  const rows = db2.prepare(`SELECT lane FROM lanes WHERE handle = 'be' ORDER BY lane`).all() as { lane: string }[];
+  db2.close();
+  expect(rows.map((r) => r.lane)).toEqual(["main"]);
+  void be;
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {

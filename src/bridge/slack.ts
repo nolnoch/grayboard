@@ -110,6 +110,10 @@ export async function startSlackBridge(
   delete childEnv.BUS_PUSH;
   childEnv.BUS_IDENTITY = cfg.handle;
   childEnv.BUS_HUMAN = "1";
+  // The bridge's own lane: sticky (its row is exempt from local stale sweeps,
+  // since the human's reachability rides on it) and distinct from any agent
+  // session of the same handle name.
+  childEnv.BUS_LANE = "bridge";
   const args = mode === "local" ? [...mcp.args, "--mode", "local"] : mcp.args;
   const transport = new StdioClientTransport({ command: mcp.command, args, env: childEnv, stderr: "inherit" });
   try {

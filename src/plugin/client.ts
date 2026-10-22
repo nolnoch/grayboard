@@ -36,6 +36,10 @@ export class GrayboardClient {
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
+    // This session's lane key within the identity's fleet, when not the
+    // default. Sent in hello; a server predating lanes ignores it (and its
+    // one-session refusal still applies).
+    private readonly lane: string | null = null,
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -68,6 +72,7 @@ export class GrayboardClient {
         ...(this.push ? {} : { push: false }),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : {}),
+        ...(this.lane && this.lane !== "main" ? { lane: this.lane } : {}),
       });
     };
 
@@ -133,6 +138,12 @@ export class GrayboardClient {
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.send({ type: "pong" });
         }
+        break;
+
+      case "fleet":
+        // Lane joined the identity's fleet, or push rotated to this lane.
+        // Informational; the roster (peer_list) is the truth to consult.
+        console.error(`[grayboard] fleet: ${msg.event} lane "${msg.lane}"`);
         break;
 
       case "error":

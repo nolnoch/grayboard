@@ -1,6 +1,10 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { Glob } from "bun";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
+import { startSession } from "../core/boards.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -25,6 +29,27 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
     if (importPattern.test(text)) offenders.push(file);
   }
   expect(offenders).toEqual([]);
+});
+
+test("a pre-lanes database opens under the new code, lanes recreated additively", () => {
+  // Simulate a database from before this feature: no lanes table, no
+  // claim_events.lane column. Deployed databases must open under new code,
+  // so reopen the same FILE and assert both come back and data survives.
+  const path = join(mkdtempSync(join(tmpdir(), "gb-db-")), "bus.db");
+  const { db, repo } = openDatabase(path);
+  const user = repo.users.upsertByEmail("you@example.com", null);
+  const identity = repo.identities.create(user.id, "be");
+  db.exec("DROP TABLE lanes");
+  db.exec("ALTER TABLE claim_events DROP COLUMN lane");
+  db.close();
+
+  const { db: db2, repo: repo2 } = openDatabase(path);
+  const kept = repo2.identities.findByUserAndName(user.id, "be");
+  expect(kept?.id).toBe(identity.id);
+  // The re-created tables take writes through the real APIs.
+  startSession(db2, `you@example.com/be`, null);
+  db2.prepare(`INSERT INTO claim_events (key, handle, event, at, lane) VALUES ('k', 'you@example.com/be', 'take', ?, 'main')`).run(Date.now());
+  db2.close();
 });
 
 // ── basic CRUD ────────────────────────────────────────────────────────────────

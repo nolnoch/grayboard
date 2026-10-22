@@ -9,10 +9,12 @@ import {
   activeAnnouncements,
   createBoard,
   declareHuman,
+  endLane,
   ensureBoard,
   getBoard,
   humanHandles,
   isHuman,
+  lanesFor,
   listBoards,
   markDelivered,
   mentionTokens,
@@ -23,6 +25,7 @@ import {
   read,
   refOf,
   setAccess,
+  setStatus,
   startSession,
   subscribe,
   touchHandle,
@@ -516,6 +519,68 @@ test("prune drops claim history older than the cutoff", () => {
 });
 
 // ── access policy (the distributed server installs one like this) ────────────
+
+describe("lanes", () => {
+  test("a session writes its own lane row; a sibling join never wipes it", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "soaking", "main");
+    // The joining sibling leaves the first lane's state alone (the old
+    // shared-row last-joiner-wins is what this pins away).
+    startSession(db, "be", "/elsewhere", "scratch");
+    expect(lanesFor(db, "be").map((l) => [l.lane, l.status])).toEqual([
+      ["main", "soaking"],
+      ["scratch", null],
+      ["stream", null],
+    ]);
+  });
+
+  test("peer_status routes to the calling lane's row; no row falls back to the handle", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo", "stream");
+    setStatus(db, "be", "compiling", "stream");
+    expect(lanesFor(db, "be").find((l) => l.lane === "stream")?.status).toBe("compiling");
+    expect(lanesFor(db, "be").find((l) => l.lane === "main")?.status).toBeNull();
+    // A script with no session (no lane row) still sets a status.
+    setStatus(db, "sim", "from cli", "main");
+    expect(who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "sim")?.status).toBe("from cli");
+  });
+
+  test("endLane deletes the row and snapshots its state for the offline roster", () => {
+    startSession(db, "be", "/repo", "main");
+    setStatus(db, "be", "soaking", "main");
+    endLane(db, "be", "main");
+    expect(lanesFor(db, "be")).toEqual([]);
+    const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
+    expect(gone?.status).toBe("soaking");
+    expect(gone?.online).toBe(false);
+  });
+
+  test("who renders one row per live lane, the default lane unmarked", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    const rows = who(db, "fe", {}, () => true).peers.filter((p) => p.handle === "be");
+    expect(rows.map((p) => p.lane)).toEqual([undefined, "stream"]);
+    expect(rows.every((p) => p.online)).toBe(true);
+    // A handle with no lane rows renders as before, from its own columns.
+    startSession(db, "sim", "/api");
+    const sim = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "sim");
+    expect(sim?.where).toBe("api");
+    expect(sim?.lane).toBeUndefined();
+  });
+
+  test("claims stay held by the identity; the lane lands in events only", () => {
+    startSession(db, "be", "/repo", "research");
+    claim(db, "be", "path:src/api/", { board: "e2e", lane: "research" });
+    expect(listClaims(db)[0]!.holder).toBe("be");
+    const ev = db.prepare(`SELECT handle, lane FROM claim_events WHERE event = 'take'`).get() as { handle: string; lane: string };
+    expect(ev).toMatchObject({ handle: "be", lane: "research" });
+    // A sibling lane renews (same holder) and releases for the identity.
+    claim(db, "be", "path:src/api/", { lane: "main" });
+    release(db, "be", "path:src/api/", "done", "main");
+    expect(listClaims(db)).toEqual([]);
+  });
+});
 
 describe("who", () => {
   const online = (h: string) => h === "sim";

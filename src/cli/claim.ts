@@ -5,21 +5,28 @@
 import { existsSync } from "node:fs";
 import { ApiError, busMode, loadCredentials, makeClient, signInHint } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
-import { defaultIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
+import { defaultIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity, sessionLane } from "../shared/identity.ts";
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
 
-/** The identity this shell acts as, and which rule chose it. `as` is literal: no worktree suffix. */
-export function actingIdentity(as?: string, env = process.env, cwd = process.cwd()): { name: string; source: string } {
+/**
+ * The identity this shell acts as, and which rule chose it. `as` is literal: no
+ * worktree suffix. An explicit BUS_IDENTITY is literal too (a worktree session
+ * joins that identity's fleet instead of forking a look-alike); derived
+ * identities (pin or directory) keep the worktree suffix, as sessions do.
+ */
+export function actingIdentity(as?: string, env = process.env, cwd = process.cwd()): { name: string; source: string; lane: string | null } {
+  const lane = (() => { try { return sessionLane(env, cwd); } catch { return null; } })();
   if (as !== undefined) {
     if (!isValidIdentityName(as.toLowerCase())) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -`);
-    return { name: as, source: "--as" };
+    return { name: as, source: "--as", lane };
   }
+  if (env.BUS_IDENTITY) return { name: env.BUS_IDENTITY, source: "BUS_IDENTITY", lane };
   const pin = pinnedIdentity(cwd);
-  const base = env.BUS_IDENTITY || pin || defaultIdentity(cwd);
-  const rule = env.BUS_IDENTITY ? "BUS_IDENTITY" : pin ? "the repo's .mcp.json pin" : "the directory name";
+  const base = pin || defaultIdentity(cwd);
+  const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
   const name = resolveIdentity(base, cwd);
-  return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"` };
+  return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"`, lane };
 }
 
 /** The bus handle for `name`: as-is in local mode, `<email>/<name>` (lowercased, as the server stores it) in server mode. */

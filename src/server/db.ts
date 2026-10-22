@@ -72,8 +72,11 @@ export interface Repo {
   };
   cursors: {
     get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
-    // How far an identity (by full address) has received its direct messages.
+    // How far an identity (by full address) has received its direct messages:
+    // any lane's ack counts (a lane reading is the identity reading).
     directFor(identityFull: string): number;
+    // Which lanes of an identity have read (acked past) a message.
+    lanesRead(identityFull: string, messageId: number): string[];
     advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
@@ -468,6 +471,8 @@ function makeRepo(db: Database): Repo {
     },
 
     cursors: {
+      // Any stream ref of an identity: its own address (the default lane's,
+      // unchanged from pre-lanes rows) or `<address>#<lane>`.
       get(identityId, streamType, streamRef) {
         const row = db.query<{ last_seen_id: number }, [number, string, string]>(
           "SELECT last_seen_id FROM cursors WHERE identity_id = ? AND stream_type = ? AND stream_ref = ?",
@@ -475,10 +480,18 @@ function makeRepo(db: Database): Repo {
         return row?.last_seen_id ?? 0;
       },
       directFor(identityFull) {
-        const row = db.query<{ id: number | null }, [string]>(
-          "SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?",
-        ).get(identityFull);
+        const row = db.query<{ id: number | null }, [string, string, string]>(
+          `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
+             AND (stream_ref = ? OR substr(stream_ref, 1, length(?) + 1) = ? || '#')`,
+        ).get(identityFull, identityFull, identityFull);
         return row?.id ?? 0;
+      },
+      lanesRead(identityFull, messageId) {
+        const rows = db.query<{ stream_ref: string }, [number, string, string, string]>(
+          `SELECT stream_ref FROM cursors WHERE stream_type = 'direct' AND last_seen_id >= ?
+             AND (stream_ref = ? OR substr(stream_ref, 1, length(?) + 1) = ? || '#')`,
+        ).all(messageId, identityFull, identityFull, identityFull);
+        return rows.map((r) => (r.stream_ref === identityFull ? "main" : r.stream_ref.slice(identityFull.length + 1)));
       },
       advance(identityId, streamType, streamRef, messageId) {
         db.run(

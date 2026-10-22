@@ -18,7 +18,10 @@ export type Message = {
 // identity (a harness that can't show pushes): no pushes, not "online".
 // where: the client's describeLocation (the server can't see its files).
 // resume: a reconnect within one session, so its peer_status stays.
-export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean };
+// lane: this session's lane key within the identity's fleet ([a-z0-9_-],
+// 1-32; default "main"). A second push session on the same lane is refused
+// or supersedes; on another lane it joins as a tool lane (push_granted false).
+export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean; lane?: string };
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
@@ -41,6 +44,13 @@ export type HelloOk     = {
   // Sentences for the session's MCP instructions: active claims, and direct
   // messages you sent that still haven't arrived a day later.
   notices?: string[];
+  // The lane this session joined, when not the default "main".
+  lane?: string;
+  // A push session that found the identity's delivery already owned: it
+  // joined as a tool lane instead, first in line when the owner ends.
+  // Absent on servers predating lanes (or when push was granted).
+  push_granted?: boolean;
+  owner_lane?: string;
   // Your user's human identity. Sent by servers that reserve its name for the
   // Slack bridge, so a message from that handle can only be your user's.
   // linked: whether anyone reads it (the user has linked Slack).
@@ -53,6 +63,10 @@ export type SendOk      = {
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
+  // Fleet delivery truth: how many of the recipient identity's lanes are
+  // live, and which lanes have read (acked) this message.
+  live_lanes?: number;
+  read_lanes?: string[];
 };
 // Messages you sent carry delivered: whether they've reached the recipient's session.
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
@@ -66,11 +80,14 @@ export type PushMessage = { type: "push"; message: Message };
 export type PingMessage = { type: "ping" };
 export type CallOk      = { type: "call_ok";    req_id: string; result: unknown };
 export type BoardPush   = { type: "board_push"; item: Pending };
+// Fleet events: another lane joined this identity, or push ownership
+// rotated to this lane. Informational; no ack.
+export type FleetMessage = { type: "fleet"; event: "lane_joined" | "owner_rotated"; lane: string };
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string };
 
 export type ServerMessage =
   | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
-  | CallOk | BoardPush | InboxOk;
+  | CallOk | BoardPush | InboxOk | FleetMessage;
 
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
@@ -88,6 +105,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.push !== undefined && typeof m.push !== "boolean") throw new Error("push must be boolean");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");
+      if (m.lane !== undefined && typeof m.lane !== "string") throw new Error("lane must be a string");
       return m as unknown as HelloRequest;
     case "send":
       assertStr(m, "req_id"); assertStr(m, "recipient"); assertStr(m, "body");

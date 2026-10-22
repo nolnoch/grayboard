@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -117,7 +118,37 @@ export function pinnedIdentity(cwd = process.cwd()): string | undefined {
   }
 }
 
-/** BUS_IDENTITY if set, else the repo's pin, else the default; then the worktree suffix. */
+/**
+ * The identity this session claims. With an explicit BUS_IDENTITY the name
+ * is literal — no worktree suffix — so a session launched from a worktree
+ * joins that identity's fleet instead of forking a look-alike; the worktree
+ * becomes the lane key instead (sessionLane). Derived identities (pin or
+ * directory name) keep the suffix in the name, as they always have.
+ */
 export function sessionIdentity(env = process.env, cwd = process.cwd()): string {
-  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+  if (env.BUS_IDENTITY) return env.BUS_IDENTITY;
+  return resolveIdentity(pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+}
+
+const LANE_RE = /^[a-z0-9_-]{1,32}$/;
+
+/**
+ * This session's lane key within its identity's fleet, or null for the
+ * default. BUS_LANE wins; else an explicit BUS_IDENTITY launched inside a
+ * linked worktree uses the worktree's name as the implicit lane (the free
+ * migration path for worktree users); derived identities already carry the
+ * suffix in the name, so their lane is the default.
+ */
+export function sessionLane(env = process.env, cwd = process.cwd()): string | null {
+  const raw = env.BUS_LANE;
+  if (raw) {
+    const lane = raw.toLowerCase();
+    if (!LANE_RE.test(lane)) throw new Error(`invalid BUS_LANE "${raw}": 1–32 chars, a-z 0-9 _ -`);
+    return lane;
+  }
+  if (env.BUS_IDENTITY) {
+    const wt = linkedWorktreeName(cwd);
+    return wt ? sanitizeIdentity(wt) || null : null;
+  }
+  return null;
 }
