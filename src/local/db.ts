@@ -317,6 +317,15 @@ export function pruneDmClaims(now = Date.now()): void {
 export const NEXT_EXPIRY_SQL = `SELECT MIN(cl.claimed_at) AS t FROM dm_claims cl CROSS JOIN messages m ON m.id = cl.message_id
   WHERE cl.delivered_at IS NULL AND m.recipient = ?`;
 
+// The join carries the no-re-arm-loop invariant the dropped ttl filter used
+// to: an expired undelivered claim this drain can't take over would arm a
+// 0 ms retry forever — but every path resolves instead. A claim orphaned by
+// dm_retract (which deletes the message) drops out of the join; a lost
+// takeover CAS means the winner renewed claimed_at — a live claim, future
+// expiry; and the scan always reaches the claim (unreadFor has no LIMIT and
+// the cursor holds below undelivered claims), so the armed retry's drain
+// takes it over rather than re-arming.
+
 /**
  * The expiry moment of the identity's oldest undelivered claim — when a
  * drain that skipped the claim may take it over. The claimed row itself is

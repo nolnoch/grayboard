@@ -370,33 +370,34 @@ test("a first skip whose tail spans the claim's expiry still arms the takeover: 
   const sim = await start("sim");
   const be = await start("be");
   await stop(be);
-  const stuck = await call(sim, "dm_send", { to: "be", body: "tail-span-silent" });
+  const stuck = await call(sim, "dm_send", { to: "be", body: "first-skip" });
   expect(stuck.delivered_now).toBe(false);
-  // A ghost claim with ~1 s of remaining TTL. The live lane's startup drain
-  // skips it for the FIRST time — nothing is armed yet — and its
-  // test-injected tail spans the expiry. No poke arrives (the round-7 pin
-  // had one: the poke's drain request set the rerun flag and its pass took
-  // the claim over). Here nobody requests anything: the drain's own expiry
-  // check is the only chance to arm. With nextClaimExpiry filtering
-  // expired claims it reads null and arms nothing — the reviewer's
-  // reproduced residual: the message waits forever. The fix drops the
-  // filter, so the expired claim arms an immediate retry.
+  // The maintainer's repro from the round-7 review, merged with an early
+  // no-premature-delivery assert: a ghost claim with ~1.5 s of remaining
+  // TTL; the live lane's startup drain skips it for the FIRST time —
+  // nothing is armed yet — and its 3 s test-injected tail spans the expiry
+  // (~1.5 s). No poke arrives (the round-7 pin had one: the poke's drain
+  // request set the rerun flag and its pass took the claim over). Here
+  // nobody requests anything: the drain's own expiry check is the only
+  // chance to arm. With nextClaimExpiry filtering expired claims it read
+  // null and armed nothing — at 5aa346d this repro failed with [] after
+  // 8 s. The fix drops the filter, so the expired claim arms an immediate
+  // retry and the message delivers with zero external requests.
   const { openLocalDb } = await import("../../src/local/open.ts");
   const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
   const db = openLocalDb(join(dir, "bus.db"));
   db.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
-    .run(stuck.message_id, Date.now() - DM_CLAIM_TTL_MS + 1_000);
+    .run(stuck.message_id, Date.now() - DM_CLAIM_TTL_MS + 1_500);
   db.close();
-  process.env.BUS_TEST_DRAIN_TAIL_MS = "1500";
+  process.env.BUS_TEST_DRAIN_TAIL_MS = "3000";
   try {
-    const live = await startCollecting("be", "research", "inherit");
-    // The startup drain: skip (batch empty), 1.5 s tail past the ~1 s
-    // remaining TTL, then the expiry check. No traffic of any kind after
-    // this point — only an armed timer can deliver the message.
+    const live = await startCollecting("be", "research");
+    // The startup drain: skip (batch empty), then the 3 s tail. No traffic
+    // of any kind after this point — only an armed timer can deliver.
     await Bun.sleep(500);
     expect(live.pushes).toEqual([]);
-    await Bun.sleep(4_000);
-    expect(live.pushes).toEqual(["tail-span-silent"]);
+    await Bun.sleep(7_500);
+    expect(live.pushes).toEqual(["first-skip"]);
   } finally {
     delete process.env.BUS_TEST_DRAIN_TAIL_MS;
   }
