@@ -42,10 +42,10 @@ function validKey(key: string): string {
 type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 
 // One claim_events row; callers are inside the claim's transaction.
-function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
+function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string, lane?: string): void {
   db.prepare(
-    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
+    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, lane) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at, lane ?? null);
 }
 
 function announce(db: Database, handle: string, board: string | null, text: string): string[] {
@@ -70,7 +70,7 @@ export function claim(
   db: Database,
   handle: string,
   keyInput: string,
-  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } = {},
+  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string; lane?: string } = {},
 ): ClaimResult {
   const key = validKey(keyInput);
   expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
@@ -83,7 +83,7 @@ export function claim(
     const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
-      logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
+      logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder, opts.lane);
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
     }
     const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
@@ -102,7 +102,7 @@ export function claim(
          RETURNING *`,
       )
       .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
-    logEvent(db, renewed ? "renew" : "take", handle, row, now);
+    logEvent(db, renewed ? "renew" : "take", handle, row, now, undefined, opts.lane);
     const wake = !renewed
       ? announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, handle, row.board)
@@ -112,14 +112,14 @@ export function claim(
   }).immediate();
 }
 
-export function release(db: Database, handle: string, keyInput: string, note?: string): { wake: string[] } {
+export function release(db: Database, handle: string, keyInput: string, note?: string, lane?: string): { wake: string[] } {
   const key = validKey(keyInput);
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (!cur || cur.expires_at <= Date.now()) throw new CoreError(`no active claim on "${key}"`);
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-    logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
+    logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now(), undefined, lane);
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.

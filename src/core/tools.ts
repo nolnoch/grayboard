@@ -284,7 +284,9 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
 export type ToolOutcome = { result: unknown; wake: string[] };
 
 // What only the mode knows. online: does this handle have a live session?
-export type ToolContext = { online?: (handle: string) => boolean };
+// lane: the acting session's lane key, when it has one (peer_status routes
+// to its own lane; claim events record it for audit).
+export type ToolContext = { online?: (handle: string) => boolean; lane?: string };
 
 export function callBoardTool(
   db: Database,
@@ -337,7 +339,7 @@ export function callBoardTool(
     }
 
     case "peer_status":
-      setStatus(db, handle, str(a, "text"));
+      setStatus(db, handle, str(a, "text"), ctx.lane);
       return { result: "ok", wake: [] };
 
     case "board_subscribe": {
@@ -368,6 +370,7 @@ export function callBoardTool(
         until: optStr(a, "until"),
         note: optStr(a, "note"),
         board: optStr(a, "board"),
+        lane: ctx.lane,
       });
       const { wake, ...rest } = r;
       return { result: rest, wake };
@@ -375,7 +378,7 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake } = release(db, handle, key, optStr(a, "note"));
+      const { wake } = release(db, handle, key, optStr(a, "note"), ctx.lane);
       return { result: `released ${key}`, wake };
     }
 

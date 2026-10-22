@@ -7,7 +7,7 @@ import {
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { CoreError, forgetHandle, getBoard, isHuman, lanesFor, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -168,11 +168,14 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   return json({ name: identity.name, created_at: identity.created_at }, 201);
 }
 
-function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb, disconnectIdentity: (full: string) => void): Response {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   const existing = repo.identities.findByUserAndName(authed.user_id, name);
   if (!existing) return notFound();
+  // Close its live connections first, so their close handlers can't re-insert
+  // the handle after the delete (#73's fix shape).
+  disconnectIdentity(`${authed.user_email}/${name}`);
   repo.identities.remove(authed.user_id, name);
   forgetHandle(db, `${authed.user_email}/${name}`);
   writeAudit(repo, "identity.deleted", authed.user_email, name);
@@ -270,6 +273,74 @@ function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: C
   return json(repo.teams.listMembers(managed.team.id));
 }
 
+// ── fleet (lanes) ────────────────────────────────────────────────────────────
+
+type FleetHooks = {
+  // Live lane truth from the WS hub (see createWsHandlers.fleetState).
+  fleetState: () => { identity_full: string; lane: string; live: boolean; push_owner: boolean }[];
+  // Close one lane's connections, superseded-style (its user ordered it).
+  disconnectLane: (full: string, lane: string) => boolean;
+  // Close every live connection of an identity (identity delete).
+  disconnectIdentity: (full: string) => void;
+};
+
+// `grayboard fleet list [identity]`: the caller's identities' lanes, from the
+// lanes table (rows exist while a lane is live) with the hub's liveness.
+function fleetList(authed: AuthedUser, repo: Repo, db: CoreDb, identity: string | undefined, hooks: FleetHooks): Response {
+  const mine = repo.identities.listForUser(authed.user_id);
+  const wanted = identity?.toLowerCase();
+  if (wanted && !mine.some((i) => i.name === wanted)) {
+    const names = mine.map((i) => i.name);
+    return jsonErr("not_found",
+      wanted === HUMAN_NAME ? `"${HUMAN_NAME}" is your Slack link, not a fleet` :
+      `no identity "${wanted}" of yours; your identities: ${names.length ? names.join(", ") : "none"}`, 404);
+  }
+  const live = new Map(hooks.fleetState().map((s) => [`${s.identity_full}\u0000${s.lane}`, s]));
+  const out: Record<string, unknown>[] = [];
+  for (const i of mine) {
+    if (wanted && i.name !== wanted) continue;
+    const full = `${authed.user_email}/${i.name}`;
+    for (const row of lanesFor(db, full)) {
+      const l = live.get(`${full}\u0000${row.lane}`);
+      out.push({
+        identity: i.name,
+        lane: row.lane,
+        kind: row.kind,
+        push_capable: !!row.push_capable,
+        live: l?.live ?? false,
+        push_owner: l?.push_owner ?? false,
+        first_seen: row.first_seen,
+        last_seen: row.last_seen,
+      });
+    }
+  }
+  return json(out);
+}
+
+// `grayboard fleet disconnect <identity> <lane>`: the identity's owner (its
+// user — every disconnect here is owner-ordered; a lane leaves on its own by
+// exiting). Never reaches a human handle's sessions (slack-bridge §3).
+async function fleetDisconnect(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, hooks: FleetHooks): Promise<Response> {
+  const body = await parseBody<{ identity?: string; lane?: string }>(req);
+  if (!body?.identity || !body.lane) return badRequest("identity and lane required");
+  const name = body.identity.toLowerCase();
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is your Slack link; its sessions aren't a fleet to disconnect`);
+  const identity = repo.identities.findByUserAndName(authed.user_id, name);
+  if (!identity) {
+    const names = repo.identities.listForUser(authed.user_id).map((i) => i.name);
+    return jsonErr("not_found", `no identity "${name}" of yours; your identities: ${names.length ? names.join(", ") : "none"}`, 404);
+  }
+  const full = `${authed.user_email}/${name}`;
+  if (isHuman(db, full)) return forbidden(`"${full}" is a human handle; disconnect never reaches human sessions`);
+  const lanes = lanesFor(db, full).map((r) => r.lane);
+  if (!lanes.includes(body.lane)) {
+    return jsonErr("not_found", `no lane "${body.lane}" on "${name}"; live lanes: ${lanes.length ? lanes.join(", ") : "none"}`, 404);
+  }
+  hooks.disconnectLane(full, body.lane);
+  writeAudit(repo, "lane.disconnected", authed.user_email, name, { lane: body.lane });
+  return json({ ok: true });
+}
+
 // ── admin ────────────────────────────────────────────────────────────────────
 
 // Revokes every session the user has; there's no session id to pick one by.
@@ -315,6 +386,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 export async function handleHttp(
   req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
+  fleet: FleetHooks = { fleetState: () => [], disconnectLane: () => false, disconnectIdentity: () => {} },
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -340,8 +412,13 @@ export async function handleHttp(
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
-    return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
+    return identityDelete(path.slice("/api/identities/".length), authed, repo, db, fleet.disconnectIdentity);
   }
+
+  if (path === "/api/fleet" && method === "GET") {
+    return fleetList(authed, repo, db, url.searchParams.get("identity") ?? undefined, fleet);
+  }
+  if (path === "/api/fleet/disconnect" && method === "POST") return fleetDisconnect(req, authed, repo, db, fleet);
 
   if (path.startsWith("/api/slack/") && !slack) {
     return jsonErr("not_found", "this server has no Slack bridge (its admin sets SLACK_APP_TOKEN and SLACK_BOT_TOKEN)", 404);

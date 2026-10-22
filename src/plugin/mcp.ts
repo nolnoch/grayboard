@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
 import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
-import { sessionIdentity } from "../shared/identity.ts";
+import { sessionIdentity, sessionLane, isExplicitIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
@@ -52,6 +52,17 @@ function loadCredentials(): Credentials {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const identity = sessionIdentity();
+// This session's lane within the identity's fleet (BUS_LANE, else the
+// worktree's name for an explicit identity, else the default). A second push
+// session of the identity joins as a tool lane; a server predating lanes
+// keeps its one-session refusal.
+const lane = sessionLane() ?? "main";
+// A true explicit BUS_IDENTITY (differs from the repo's pin, or BUS_LANE is
+// set) is an explicit join: a lanes-aware server refuses the name if it
+// doesn't exist (attach, never a lazy fork on a typo). A harness re-delivering
+// the pin as env is derived, not explicit — it lazy-creates as pins always
+// have, and keeps the worktree suffix in the name.
+const EXPLICIT = isExplicitIdentity();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
 // Claude Code started without a channels flag drops pushes silently; say so.
@@ -102,6 +113,8 @@ const client = new GrayboardClient(
   },
   DELIVER,
   (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
+  lane,
+  EXPLICIT,
 );
 
 // Only a server that reserves the name sends hello_ok.human, so only there is
@@ -134,7 +147,7 @@ const server = new Server(
     },
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      `You are identity "${identity}" on the grayboard bus, which coordinates between agents.`,
+      `You are identity "${identity}"${lane !== "main" ? `, lane "${lane}"` : ""} on the grayboard bus, which coordinates between agents.`,
       `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
       DM_INBOX_INSTRUCTION,
       ...BOARD_INSTRUCTIONS,

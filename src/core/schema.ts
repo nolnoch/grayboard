@@ -91,6 +91,48 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+
+    -- A live session (lane) of an identity's fleet. Rows exist while the
+    -- lane is live (auto-drop deletes them on connection close); per-lane
+    -- cwd/place/status replace the shared handle columns, which stay as the
+    -- pre-lanes display fallback for offline handles. push_capable: the
+    -- session asked for push; ownership itself is the server's registry slot.
+    -- kind: "session", or "bridge" for a bridge's lane (exempt from
+    -- local stale sweeps). Named "kind", not "role": role is the #104
+    -- vocabulary (a coat granted to a binding), which this is not. No CHECK:
+    -- additive-only schema can never tighten it, and new kinds shouldn't
+    -- need a table rebuild. Attribution stays the identity handle; lanes are
+    -- roster truth, never authority.
+    CREATE TABLE IF NOT EXISTS lanes (
+      handle       TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
+      lane         TEXT NOT NULL,
+      kind         TEXT NOT NULL DEFAULT 'session',
+      cwd          TEXT,
+      place        TEXT,
+      status       TEXT,
+      status_at    INTEGER,
+      push_capable INTEGER NOT NULL DEFAULT 0,
+      first_seen   INTEGER NOT NULL,
+      last_seen    INTEGER NOT NULL,
+      PRIMARY KEY (handle, lane)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lanes_handle ON lanes(handle, last_seen);
+
+    -- A lane's own last state at its end. Resume seeds each lane from its
+    -- own snapshot, not the handle's (freshest-wins) columns — a two-lane
+    -- restart must not leave every lane showing the freshest sibling's
+    -- status. The handle columns stay as the pre-lanes display fallback for
+    -- the whole identity.
+    CREATE TABLE IF NOT EXISTS lane_snapshots (
+      handle     TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
+      lane       TEXT NOT NULL,
+      cwd        TEXT,
+      place      TEXT,
+      status     TEXT,
+      status_at  INTEGER,
+      ended_at   INTEGER NOT NULL,
+      PRIMARY KEY (handle, lane)
+    );
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a
@@ -113,4 +155,9 @@ export function initCoreSchema(db: Database): void {
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === "scope")) db.exec(`ALTER TABLE boards ADD COLUMN scope TEXT`);
+
+  // Which lane of the identity's fleet took or released a claim (audit only;
+  // the holder stays the identity handle).
+  const claimCols = db.prepare(`PRAGMA table_info(claim_events)`).all() as { name: string }[];
+  if (!claimCols.some((c) => c.name === "lane")) db.exec(`ALTER TABLE claim_events ADD COLUMN lane TEXT`);
 }

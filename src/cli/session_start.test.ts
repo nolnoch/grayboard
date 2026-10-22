@@ -15,13 +15,19 @@ test("the title is the handle grayboard mcp would claim for the hook's cwd", () 
   expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), {}))).toBe("fe");
 });
 
-test("a linked worktree gets the suffixed handle", () => {
+test("a linked worktree with an explicit identity joins that identity, unsuffixed, the worktree as its lane", () => {
   const root = mkdtempSync(join(tmpdir(), "gb-ss-"));
   mkdirSync(join(root, "api", ".git", "worktrees", "stream"), { recursive: true });
   const wt = join(root, "stream");
   mkdirSync(wt);
   writeFileSync(join(wt, ".git"), `gitdir: ${join(root, "api", ".git", "worktrees", "stream")}\n`);
-  expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "be" }))).toBe("be-stream");
+  // The handle is what dm_send takes, and both sessions of the fleet share
+  // it; the worktree distinguishes itself as a lane, not a second handle —
+  // and the title carries the lane, so fleet lanes are told apart in the
+  // agent list.
+  expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "be" }))).toBe("be · stream");
+  // The main checkout keeps the plain handle (no lane to distinguish).
+  expect(title(sessionStartOutput(JSON.stringify({ cwd: join(root, "api") }), { BUS_IDENTITY: "be" }))).toBe("be");
 });
 
 test("bad input prints nothing rather than failing the session", () => {

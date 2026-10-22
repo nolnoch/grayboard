@@ -109,13 +109,124 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
   ).run(handle, now, now);
 }
 
-// A session started: refresh last_seen, record where it runs (null when the
-// mode can't know, e.g. a remote server), and clear the previous session's
-// status.
-export function startSession(db: Database, handle: string, cwd: string | null, now?: number): void {
+// Like touchHandle, but never (re-)inserts: for a closing connection, so a
+// deleted identity's handle doesn't reappear in the roster (#73).
+export function touchHandleIfExists(db: Database, handle: string, now = Date.now()): void {
+  db.prepare(`UPDATE handles SET last_seen = ? WHERE name = ?`).run(now, handle);
+}
+
+// ── lanes ────────────────────────────────────────────────────────────────────
+
+export const MAIN_LANE = "main";
+
+// The DM-cursor stream key for one lane of an identity: the identity's own
+// address for the default lane (so pre-lanes rows are main's, unchanged),
+// `<handle>#<lane>` for any other.
+export function laneStreamRef(handle: string, lane: string): string {
+  return lane === MAIN_LANE ? handle : `${handle}#${lane}`;
+}
+
+// A lane's key from its DM stream ref (the inverse of laneStreamRef).
+export function laneOfStreamRef(handle: string, ref: string): string {
+  return ref === handle ? MAIN_LANE : ref.slice(handle.length + 1);
+}
+
+export type LaneRow = {
+  handle: string; lane: string; kind: string;
+  cwd: string | null; place: string | null;
+  status: string | null; status_at: number | null;
+  push_capable: number; first_seen: number; last_seen: number;
+};
+
+// A session started on a lane: refresh the handle's last_seen, record where
+// the session runs on that lane's row, and clear that lane's previous status.
+// Sibling lanes' rows are their own — a join no longer wipes the fleet's
+// status (the old shared-row last-joiner-wins).
+export function startSession(
+  db: Database,
+  handle: string,
+  cwd: string | null,
+  lane = MAIN_LANE,
+  opts: { kind?: "session" | "bridge"; push_capable?: boolean; resume?: boolean } = {},
+  now = Date.now(),
+): void {
   touchHandle(db, handle, now);
-  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL WHERE name = ?`)
-    .run(cwd, handle);
+  const kind = opts.kind ?? "session";
+  const push = opts.push_capable ? 1 : 0;
+  if (opts.resume) {
+    // A reconnect within one session keeps its lane's status and place.
+    // The lane row ended with its connection (endLane snapshots its state
+    // onto the handle AND onto its own lane_snapshots row), so a recreated
+    // row seeds from ITS OWN snapshot — not the handle's freshest-wins
+    // columns, which would show every resumed lane the freshest sibling's
+    // state; a row that survived keeps its own; a lane with no snapshot of
+    // its own (pre-snapshots DB) falls back to the handle's.
+    db.prepare(
+      `INSERT INTO lanes (handle, lane, kind, cwd, place, status, status_at, push_capable, first_seen, last_seen)
+       SELECT ?, ?, ?, ?, COALESCE(ls.place, h.place), COALESCE(ls.status, h.status),
+              COALESCE(ls.status_at, h.status_at), ?, ?, ?
+         FROM handles h
+         LEFT JOIN lane_snapshots ls ON ls.handle = h.name AND ls.lane = ?
+        WHERE h.name = ?
+       ON CONFLICT(handle, lane) DO UPDATE SET
+         cwd = excluded.cwd,
+         push_capable = MAX(lanes.push_capable, excluded.push_capable),
+         last_seen = excluded.last_seen`,
+    ).run(handle, lane, kind, cwd, push, now, now, lane, handle);
+    return;
+  }
+  db.prepare(
+    `INSERT INTO lanes (handle, lane, kind, cwd, push_capable, first_seen, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(handle, lane) DO UPDATE SET
+       cwd = excluded.cwd, place = NULL, status = NULL, status_at = NULL,
+       push_capable = MAX(lanes.push_capable, excluded.push_capable),
+       last_seen = excluded.last_seen`,
+  ).run(handle, lane, kind, cwd, push, now, now);
+}
+
+// Refresh a lane's liveness (every drain), without touching its state.
+export function touchLane(db: Database, handle: string, lane: string, now = Date.now()): void {
+  db.prepare(`UPDATE lanes SET last_seen = ? WHERE handle = ? AND lane = ?`).run(now, handle, lane);
+}
+
+// A lane's session ended: its row goes — a dead lane cannot ghost — with its
+// last state snapshotted onto BOTH the handle's legacy columns (pre-lanes
+// rosters and offline display still read them) and its own lane_snapshots
+// row (resume seeds from its own state, not the freshest sibling's).
+export function endLane(db: Database, handle: string, lane: string, now = Date.now()): void {
+  const row = db.prepare(`SELECT * FROM lanes WHERE handle = ? AND lane = ?`).get(handle, lane) as LaneRow | undefined;
+  if (!row) return;
+  db.prepare(`UPDATE handles SET cwd = ?, place = ?, status = ?, status_at = ? WHERE name = ?`)
+    .run(row.cwd, row.place, row.status, row.status_at, handle);
+  db.prepare(
+    `INSERT INTO lane_snapshots (handle, lane, cwd, place, status, status_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(handle, lane) DO UPDATE SET
+       cwd = excluded.cwd, place = excluded.place, status = excluded.status,
+       status_at = excluded.status_at, ended_at = excluded.ended_at`,
+  ).run(handle, lane, row.cwd, row.place, row.status, row.status_at, now);
+  db.prepare(`DELETE FROM lanes WHERE handle = ? AND lane = ?`).run(handle, lane);
+  touchHandleIfExists(db, handle, now);
+}
+
+/**
+ * Every lane row ends (a server restart: none are connected at boot). Each
+ * row's last state is snapshotted onto its handle first — oldest first, so
+ * when several lanes of one handle end, the FRESHEST row's snapshot lands
+ * last and survives on the handle's fallback columns — then the rows go, and
+ * no lane renders as live from before the boot.
+ */
+export function endAllLanes(db: Database): void {
+  const rows = db
+    .prepare(`SELECT handle, lane FROM lanes ORDER BY handle, last_seen ASC`)
+    .all() as { handle: string; lane: string }[];
+  for (const r of rows) endLane(db, r.handle, r.lane);
+}
+
+/** A handle's live lane rows (empty for pre-lanes or all-offline handles). */
+export function lanesFor(db: Database, handle: string): LaneRow[] {
+  return db.prepare(`SELECT * FROM lanes WHERE handle = ? ORDER BY lane`).all(handle) as LaneRow[];
 }
 
 /** Make `handle` the one declared human handle (`grayboard human`). */
@@ -142,19 +253,30 @@ export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT name FROM handles WHERE human = 1 ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
 }
 
-// Server mode: where the session runs, as its client described it.
-export function setPlace(db: Database, handle: string, place: string | null): void {
+// Server mode: where the session runs, as its client described it. Per-lane;
+// the handle's own columns are the pre-lanes fallback.
+export function setPlace(db: Database, handle: string, place: string | null, lane = MAIN_LANE): void {
   const p = place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
-  db.prepare(`UPDATE handles SET place = ? WHERE name = ?`).run(p, handle);
+  db.prepare(`UPDATE lanes SET place = ? WHERE handle = ? AND lane = ?`).run(p, handle, lane);
 }
 
 const MAX_STATUS = 200;
 
-// One line saying what this session is doing; empty clears it.
-export function setStatus(db: Database, handle: string, text: string, now = Date.now()): void {
+// One line saying what this session is doing; empty clears it. Per-lane
+// when the acting session's lane has a row; the handle's legacy columns
+// otherwise (e.g. a claim from a script with no session).
+export function setStatus(db: Database, handle: string, text: string, lane?: string | null, now = Date.now()): void {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
   touchHandle(db, handle, now);
+  if (lane) {
+    const row = db.prepare(`SELECT 1 FROM lanes WHERE handle = ? AND lane = ?`).get(handle, lane);
+    if (row) {
+      db.prepare(`UPDATE lanes SET status = ?, status_at = ? WHERE handle = ? AND lane = ?`)
+        .run(t || null, t ? now : null, handle, lane);
+      return;
+    }
+  }
   db.prepare(`UPDATE handles SET status = ?, status_at = ? WHERE name = ?`).run(t || null, t ? now : null, handle);
 }
 
@@ -493,6 +615,9 @@ export type Peer = {
   last_seen: number;
   self?: true;
   mode?: SubMode;
+  // This row's lane, when the identity has several live lanes and this
+  // isn't the default ("main") one.
+  lane?: string;
   where?: string;
   status?: string;
   status_age?: string;
@@ -532,20 +657,44 @@ export function who(
       .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
+  // Live lanes render one row each (`lane` shown only when not the default);
+  // a handle with no lane rows (pre-lanes DB, or every lane ended) renders
+  // from its own columns as before, with endLane's snapshot as its last state.
+  const laneRows = new Map<string, LaneRow[]>();
+  if (rows.length) {
+    const lanes = db
+      .prepare(`SELECT handle, lane, kind, cwd, place, status, status_at, push_capable, first_seen, last_seen FROM lanes WHERE handle IN (SELECT value FROM json_each(?)) ORDER BY handle, lane`)
+      .all(JSON.stringify(rows.map((r) => r.handle))) as LaneRow[];
+    for (const lr of lanes) {
+      if (!laneRows.has(lr.handle)) laneRows.set(lr.handle, []);
+      laneRows.get(lr.handle)!.push(lr);
+    }
+  }
   const now = Date.now();
-  const all: Peer[] = rows.filter((r) => !isViewer(r.handle)).map((r) => {
-    const where = r.cwd ? describeLocation(r.cwd) : r.place;
+  const render = (h: string, base: Row, lr: LaneRow | null): Peer => {
+    const cwd = lr ? lr.cwd : base.cwd;
+    const place = lr ? lr.place : base.place;
+    const status = lr ? lr.status : base.status;
+    const status_at = lr ? lr.status_at : base.status_at;
+    const where = cwd ? describeLocation(cwd) : place;
     return {
-      handle: r.handle,
-      online: r.handle === handle || online(r.handle),
-      last_seen: r.last_seen ?? 0,
-      ...(r.handle === handle ? { self: true as const } : {}),
-      ...(r.mode ? { mode: r.mode } : {}),
+      handle: h,
+      online: h === handle || online(h),
+      last_seen: base.last_seen ?? 0,
+      ...(h === handle ? { self: true as const } : {}),
+      ...(base.mode ? { mode: base.mode } : {}),
+      ...(lr && lr.lane !== MAIN_LANE ? { lane: lr.lane } : {}),
       ...(where ? { where } : {}),
-      ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
-      ...(r.human ? { human: true as const } : {}),
+      ...(status ? { status, status_age: age(now - (status_at ?? now)) } : {}),
+      ...(base.human ? { human: true as const } : {}),
     };
-  });
+  };
+  const all: Peer[] = [];
+  for (const r of rows.filter((r) => !isViewer(r.handle))) {
+    const lanes = laneRows.get(r.handle);
+    if (lanes?.length) for (const lr of lanes) all.push(render(r.handle, r, lr));
+    else all.push(render(r.handle, r, null));
+  }
   if (opts.include_offline) return { you: handle, peers: all };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;

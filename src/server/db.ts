@@ -13,6 +13,13 @@ export type Session  = { id: number; user_id: number; token_hash: string; create
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
+
+// The statement `cursors.directFor` executes, exported so the EXPLAIN pin
+// (db.test.ts) runs the SQL the code runs — a hand-copied query in the test
+// can drift back to the old `= x OR range` form while the code keeps the
+// index-shaped range (round-6 item 4).
+export const DIRECT_FOR_SQL = `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
+  AND (stream_ref >= ? AND stream_ref < ? || '$')`;
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
 // thread_ts: the Slack top-level message. root_id: the grayboard thread's root
@@ -57,6 +64,11 @@ export interface Repo {
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
+    // The newest message before `beforeId` between `a` and `b` (either
+    // direction), or 0 when this is their first. Ids are global, so "caught
+    // up to just before this message" must compare against the pair's own
+    // previous id, not beforeId - 1.
+    previousBetween(a: string, b: string, beforeId: number): number;
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     // Direct messages from sender still past each recipient's cursor, per recipient.
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
@@ -72,8 +84,11 @@ export interface Repo {
   };
   cursors: {
     get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
-    // How far an identity (by full address) has received its direct messages.
+    // How far an identity (by full address) has received its direct messages:
+    // any lane's ack counts (a lane reading is the identity reading).
     directFor(identityFull: string): number;
+    // Which lanes of an identity have read (acked past) a message.
+    lanesRead(identityFull: string, messageId: number): string[];
     advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
@@ -172,6 +187,11 @@ function initSchema(db: Database): void {
       last_seen_id  INTEGER NOT NULL,
       PRIMARY KEY (identity_id, stream_type, stream_ref)
     );
+    -- The PK leads with identity_id, which the lane queries (directFor,
+    -- lanesRead, undeliveredFrom's subquery) don't know: they filter on
+    -- stream_type + stream_ref (the range over the hash-suffixed lane refs),
+    -- so without this index each was a full cursors scan on every hello.
+    CREATE INDEX IF NOT EXISTS idx_cursors_stream ON cursors(stream_type, stream_ref);
 
     CREATE TABLE IF NOT EXISTS access_log (
       id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,6 +417,17 @@ function makeRepo(db: Database): Repo {
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
         `).all(id);
       },
+      previousBetween(a, b, beforeId) {
+        // The previous message ADDRESSED TO the recipient: a reply from the
+        // recipient sits above its receive cursor forever, so a
+        // bidirectional compare hides read state after the first
+        // back-and-forth (N4).
+        const row = db.query<{ id: number | null }, [number, string, string]>(
+          `SELECT MAX(id) AS id FROM messages
+            WHERE recipient_type = 'user' AND id < ? AND sender = ? AND recipient = ?`,
+        ).get(beforeId, a, b);
+        return row?.id ?? 0;
+      },
       unreadSince(streams) {
         if (streams.length === 0) return [];
         const all: MessageRow[] = [];
@@ -411,11 +442,17 @@ function makeRepo(db: Database): Repo {
         return all;
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
+        // A single range predicate (>= recipient and < recipient$, every
+        // identity char sorts above '$') matches the recipient's own row and
+        // every `recipient#lane` cursor row and can use the index, unlike a
+        // substr prefix compare or an OR of equality and range.
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
+                                    WHERE c.stream_type = 'direct'
+                                      AND (c.stream_ref >= m.recipient AND c.stream_ref < m.recipient || '$')), 0)
+              AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`,
         ).all(sender, olderThan);
       },
@@ -468,6 +505,8 @@ function makeRepo(db: Database): Repo {
     },
 
     cursors: {
+      // Any stream ref of an identity: its own address (the default lane's,
+      // unchanged from pre-lanes rows) or `<address>#<lane>`.
       get(identityId, streamType, streamRef) {
         const row = db.query<{ last_seen_id: number }, [number, string, string]>(
           "SELECT last_seen_id FROM cursors WHERE identity_id = ? AND stream_type = ? AND stream_ref = ?",
@@ -475,10 +514,15 @@ function makeRepo(db: Database): Repo {
         return row?.last_seen_id ?? 0;
       },
       directFor(identityFull) {
-        const row = db.query<{ id: number | null }, [string]>(
-          "SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?",
-        ).get(identityFull);
+        const row = db.query<{ id: number | null }, [string, string]>(DIRECT_FOR_SQL).get(identityFull, identityFull);
         return row?.id ?? 0;
+      },
+      lanesRead(identityFull, messageId) {
+        const rows = db.query<{ stream_ref: string }, [number, string, string]>(
+          `SELECT stream_ref FROM cursors WHERE stream_type = 'direct' AND last_seen_id >= ?
+             AND (stream_ref >= ? AND stream_ref < ? || '$')`,
+        ).all(messageId, identityFull, identityFull);
+        return rows.map((r) => (r.stream_ref === identityFull ? "main" : r.stream_ref.slice(identityFull.length + 1)));
       },
       advance(identityId, streamType, streamRef, messageId) {
         db.run(

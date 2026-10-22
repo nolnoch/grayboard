@@ -9,10 +9,13 @@ import {
   activeAnnouncements,
   createBoard,
   declareHuman,
+  endAllLanes,
+  endLane,
   ensureBoard,
   getBoard,
   humanHandles,
   isHuman,
+  lanesFor,
   listBoards,
   markDelivered,
   mentionTokens,
@@ -23,6 +26,7 @@ import {
   read,
   refOf,
   setAccess,
+  setStatus,
   startSession,
   subscribe,
   touchHandle,
@@ -516,6 +520,111 @@ test("prune drops claim history older than the cutoff", () => {
 });
 
 // ── access policy (the distributed server installs one like this) ────────────
+
+describe("lanes", () => {
+  test("a session writes its own lane row; a sibling join never wipes it", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "soaking", "main");
+    // The joining sibling leaves the first lane's state alone (the old
+    // shared-row last-joiner-wins is what this pins away).
+    startSession(db, "be", "/elsewhere", "scratch");
+    expect(lanesFor(db, "be").map((l) => [l.lane, l.status])).toEqual([
+      ["main", "soaking"],
+      ["scratch", null],
+      ["stream", null],
+    ]);
+  });
+
+  test("peer_status routes to the calling lane's row; no row falls back to the handle", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo", "stream");
+    setStatus(db, "be", "compiling", "stream");
+    expect(lanesFor(db, "be").find((l) => l.lane === "stream")?.status).toBe("compiling");
+    expect(lanesFor(db, "be").find((l) => l.lane === "main")?.status).toBeNull();
+    // A script with no session (no lane row) still sets a status.
+    setStatus(db, "sim", "from cli", "main");
+    expect(who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "sim")?.status).toBe("from cli");
+  });
+
+  test("endLane deletes the row and snapshots its state for the offline roster", () => {
+    startSession(db, "be", "/repo", "main");
+    setStatus(db, "be", "soaking", "main");
+    endLane(db, "be", "main");
+    expect(lanesFor(db, "be")).toEqual([]);
+    const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
+    expect(gone?.status).toBe("soaking");
+    expect(gone?.online).toBe(false);
+  });
+
+  test("endAllLanes leaves the freshest lane's snapshot on the handle", () => {
+    // A restart ends every lane at once; each snapshots onto the same handle
+    // columns, so the order decides what survives. Oldest first: the lane
+    // that was touched LAST lands last, and the roster's fallback holds the
+    // freshest state, not whichever row the scan happened to return last.
+    // Discriminating: main is INSERTED first but FRESHER — the default scan
+    // (rowid) order would end stream last and leave its stale status, so
+    // only the last_seen ordering picks main's.
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "freshest status", "main");
+    setStatus(db, "be", "stale status", "stream");
+    // stream last-seen older than main's (the sweep order keys on it).
+    db.prepare(`UPDATE lanes SET last_seen = last_seen - 1000 WHERE handle = 'be' AND lane = 'stream'`).run();
+    endAllLanes(db);
+    expect(lanesFor(db, "be")).toEqual([]);
+    const gone = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "be");
+    expect(gone?.status).toBe("freshest status");
+  });
+
+  test("a resumed lane seeds from its own snapshot, not the freshest sibling's", () => {
+    // A two-lane laptop reconnects after a restart (N1's common case: a
+    // heartbeat close resumes both lanes). Each lane must show ITS OWN last
+    // state: seeding every resumed lane from the one handle snapshot would
+    // show them all the freshest sibling's status.
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    setStatus(db, "be", "fixing bug", "stream");
+    setStatus(db, "be", "reviewing pr", "main");
+    endAllLanes(db);
+    startSession(db, "be", "/repo", "main", { resume: true });
+    startSession(db, "be", "/repo/.wt/stream", "stream", { resume: true });
+    expect(lanesFor(db, "be").map((l) => [l.lane, l.status])).toEqual([
+      ["main", "reviewing pr"],
+      ["stream", "fixing bug"],
+    ]);
+    // A lane with no snapshot of its own (never ended, or a pre-snapshots
+    // DB) falls back to the handle's columns — which hold the LAST lane to
+    // end (stream: last_seen newer than main's, so it ended last).
+    startSession(db, "be", "/repo", "scratch", { resume: true });
+    expect(lanesFor(db, "be").find((l) => l.lane === "scratch")?.status).toBe("fixing bug");
+  });
+
+  test("who renders one row per live lane, the default lane unmarked", () => {
+    startSession(db, "be", "/repo", "main");
+    startSession(db, "be", "/repo/.wt/stream", "stream");
+    const rows = who(db, "fe", {}, () => true).peers.filter((p) => p.handle === "be");
+    expect(rows.map((p) => p.lane)).toEqual([undefined, "stream"]);
+    expect(rows.every((p) => p.online)).toBe(true);
+    // A handle with no lane rows renders as before, from its own columns.
+    startSession(db, "sim", "/api");
+    const sim = who(db, "fe", { include_offline: true }, () => false).peers.find((p) => p.handle === "sim");
+    expect(sim?.where).toBe("api");
+    expect(sim?.lane).toBeUndefined();
+  });
+
+  test("claims stay held by the identity; the lane lands in events only", () => {
+    startSession(db, "be", "/repo", "research");
+    claim(db, "be", "path:src/api/", { board: "e2e", lane: "research" });
+    expect(listClaims(db)[0]!.holder).toBe("be");
+    const ev = db.prepare(`SELECT handle, lane FROM claim_events WHERE event = 'take'`).get() as { handle: string; lane: string };
+    expect(ev).toMatchObject({ handle: "be", lane: "research" });
+    // A sibling lane renews (same holder) and releases for the identity.
+    claim(db, "be", "path:src/api/", { lane: "main" });
+    release(db, "be", "path:src/api/", "done", "main");
+    expect(listClaims(db)).toEqual([]);
+  });
+});
 
 describe("who", () => {
   const online = (h: string) => h === "sim";

@@ -16,7 +16,7 @@ export class GrayboardClient {
   private backoffMs = 1000;
   private counter   = 0;
   private pending   = new Map<string, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
-  private dead      = false; // set on superseded; do not reconnect
+  private dead      = false; // set on a terminal close; do not reconnect
 
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
@@ -36,6 +36,14 @@ export class GrayboardClient {
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
+    // This session's lane key within the identity's fleet. Sent in hello
+    // even when "main", so a server can tell a lane-aware client from an
+    // older one; a server predating lanes ignores it (and its one-session
+    // refusal still applies).
+    private readonly lane: string | null = null,
+    // True when the identity came from BUS_IDENTITY: an explicit join, which
+    // a lanes-aware server treats as attach-or-refuse (never a lazy create).
+    private readonly explicit = false,
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -68,6 +76,8 @@ export class GrayboardClient {
         ...(this.push ? {} : { push: false }),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : {}),
+        ...(this.lane ? { lane: this.lane } : {}),
+        ...(this.explicit ? { explicit: true } : {}),
       });
     };
 
@@ -135,7 +145,22 @@ export class GrayboardClient {
         }
         break;
 
+      case "fleet":
+        // Lane joined the identity's fleet, or push rotated to this lane.
+        // Informational; the roster (peer_list) is the truth to consult.
+        console.error(`[grayboard] fleet: ${msg.event} lane "${msg.lane}"`);
+        break;
+
       case "error":
+        if (msg.code === "lost_ownership") {
+          // The heartbeat found this connection half-open (a sleep, a
+          // SIGSTOP) or a newer lane took over delivery. Not terminal: the
+          // server closes the socket right after this, and onclose
+          // reconnects; the re-hello then re-attaches — demoted under a live
+          // owner, or owning again if the slot is free.
+          console.error(`[grayboard] ${msg.message} — reconnecting`);
+          break;
+        }
         if (msg.code === "superseded") {
           this.dead = true;
           console.error("[grayboard] connection superseded by a newer session — exiting");

@@ -1,6 +1,10 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { Glob } from "bun";
-import { openDatabase, type Repo } from "./db.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openDatabase, DIRECT_FOR_SQL, type Repo } from "./db.ts";
+import { startSession, laneStreamRef } from "../core/boards.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -27,14 +31,44 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
   expect(offenders).toEqual([]);
 });
 
+test("a pre-lanes database opens under the new code, lanes recreated additively", () => {
+  // Simulate a database from before this feature: no lanes table, no
+  // claim_events.lane column. Deployed databases must open under new code,
+  // so reopen the same FILE and assert both come back and data survives.
+  const path = join(mkdtempSync(join(tmpdir(), "gb-db-")), "bus.db");
+  const { db, repo } = openDatabase(path);
+  const user = repo.users.upsertByEmail("you@example.com", null);
+  const identity = repo.identities.create(user.id, "be");
+  // A pre-lanes writer's DM cursor: identity-scoped, no lane suffix.
+  repo.cursors.advance(identity.id, "direct", "you@example.com/be", 42);
+  db.exec("DROP TABLE lanes");
+  db.exec("ALTER TABLE claim_events DROP COLUMN lane");
+  db.close();
+
+  const { db: db2, repo: repo2 } = openDatabase(path);
+  const kept = repo2.identities.findByUserAndName(user.id, "be");
+  expect(kept?.id).toBe(identity.id);
+  // The identity-scoped row is the main lane's stream by format (backfill
+  // without migration): reopened code reads it under the lane scheme, and
+  // the lane read markers see it as the default lane.
+  expect(repo2.cursors.get(kept!.id, "direct", laneStreamRef("you@example.com/be", "main"))).toBe(42);
+  expect(repo2.cursors.lanesRead("you@example.com/be", 42)).toEqual(["main"]);
+  // The re-created tables take writes through the real APIs.
+  startSession(db2, `you@example.com/be`, null);
+  db2.prepare(`INSERT INTO claim_events (key, handle, event, at, lane) VALUES ('k', 'you@example.com/be', 'take', ?, 'main')`).run(Date.now());
+  db2.close();
+});
+
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
 describe("Repo", () => {
+  let db: ReturnType<typeof openDatabase>["db"];
   let repo: Repo;
 
   beforeEach(() => {
     // Use an in-memory DB for each test
-    const { repo: r } = openDatabase(":memory:");
+    const { db: d, repo: r } = openDatabase(":memory:");
+    db = d;
     repo = r;
   });
 
@@ -88,6 +122,71 @@ describe("Repo", () => {
     expect(thread[0].id).toBe(root.id);
     expect(thread[1].id).toBe(reply.id);
     expect(repo.messages.thread(reply.id).map(m => m.id)).toEqual([root.id, reply.id]);
+  });
+
+  test("undeliveredFrom is lane-aware: a lane's reads count for the identity", () => {
+    // After a rotation the acks land on the lane row (`full#lane`) and the
+    // bare row freezes; sender-side delivery truth must follow the lanes
+    // (the local twin's rule), or every sender gets false "undelivered".
+    const beUser = repo.users.upsertByEmail("be@example.com", null);
+    const be = repo.identities.create(beUser.id, "be");
+    const sender = "fe@example.com/fe";
+    for (const body of ["one", "two", "three", "four", "five"]) repo.messages.insert(sender, "user", "be@example.com/be", body, null);
+    repo.cursors.advance(be.id, "direct", "be@example.com/be", 3);
+    repo.cursors.advance(be.id, "direct", laneStreamRef("be@example.com/be", "research"), 5);
+    expect(repo.messages.undeliveredFrom(sender)).toEqual([]);
+    // Without the lane row, the bare cursor is the whole truth again.
+    db.run("DELETE FROM cursors WHERE stream_ref = ?", [laneStreamRef("be@example.com/be", "research")]);
+    expect(repo.messages.undeliveredFrom(sender)).toEqual([{ recipient: "be@example.com/be", n: 2, oldest_id: 4 }]);
+  });
+
+  test("the lane cursor queries use the stream index, not a table scan", () => {
+    // directFor runs on every hello; lanesRead and undeliveredFrom's
+    // subquery carry the same predicate. The PK leads with identity_id,
+    // which these don't know — without idx_cursors_stream each was a full
+    // cursors scan (EXPLAIN said "SCAN cursors"). A single range predicate
+    // (`>= x AND < x || '$'`) keeps stream_ref INSIDE the index bounds; the
+    // old `= x OR range` form left stream_ref out of the index constraints.
+    // EXPLAIN the statement the code executes (DIRECT_FOR_SQL), not a
+    // hand-copied query: a copy can drift back to the OR form while the
+    // code keeps the range (round-6 item 4).
+    const beUser = repo.users.upsertByEmail("be@example.com", null);
+    repo.identities.create(beUser.id, "be");
+    const plan = db
+      .prepare(`EXPLAIN QUERY PLAN ${DIRECT_FOR_SQL}`)
+      .all("be@example.com/be", "be@example.com/be") as { detail: string }[];
+    const detail = plan.map((p) => p.detail).join(" ");
+    expect(detail).toContain("USING INDEX idx_cursors_stream");
+    // The range must actually constrain the index: "SEARCH cursors USING
+    // INDEX ... (stream_type=? AND stream_ref>? AND stream_ref<?)" — a
+    // bare index mention with an unconstrained stream_ref is the old bug.
+    expect(detail).toContain("stream_ref>");
+    expect(detail).not.toContain("SCAN cursors");
+  });
+
+  test("previousBetween is the sender's previous message ADDRESSED TO the recipient, not the global id below", () => {
+    // Message ids are global: an unrelated pair can hold the id just below
+    // this one, so "caught up to just before it" must compare against the
+    // sender's previous message to the recipient (N4). DIRECTIONAL — only
+    // messages addressed TO the recipient: the recipient's own reply sits
+    // above its receive cursor forever, so a bidirectional compare would
+    // hide the read state after the first back-and-forth.
+    const u = repo.users.upsertByEmail("you@example.com", null);
+    repo.identities.create(u.id, "fe");
+    repo.identities.create(u.id, "sim");
+    repo.identities.create(u.id, "be");
+    const fe = "you@example.com/fe", sim = "you@example.com/sim", other = "you@example.com/be";
+    const one = repo.messages.insert(fe, "user", sim, "one", null);
+    repo.messages.insert(fe, "user", other, "noise", null); // takes the id between, another pair
+    const two = repo.messages.insert(fe, "user", sim, "two", null);
+    expect(repo.messages.previousBetween(fe, sim, two.id)).toBe(one.id); // not two.id - 1
+    expect(repo.messages.previousBetween(fe, sim, one.id)).toBe(0); // their first
+    // The recipient's reply never counts as "the previous message": it
+    // isn't addressed to it.
+    const reply = repo.messages.insert(sim, "user", fe, "sim replies", null);
+    const three = repo.messages.insert(fe, "user", sim, "three", null);
+    expect(reply.id).toBeGreaterThan(two.id); // the reply sits above two
+    expect(repo.messages.previousBetween(fe, sim, three.id)).toBe(two.id); // not the reply's id
   });
 
   test("cursors: advance is idempotent and takes MAX", () => {

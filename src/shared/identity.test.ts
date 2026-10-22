@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity, sessionLane } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -71,9 +71,95 @@ describe("describeLocation", () => {
 });
 
 describe("sessionIdentity", () => {
-  test("BUS_IDENTITY wins", () => expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be"));
+  test("a true explicit BUS_IDENTITY wins, literal: no worktree suffix", () => {
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be");
+    // The wrong-fleet bug: an explicit identity launched from a worktree
+    // joins that identity's fleet instead of forking a look-alike.
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be");
+    // BUS_LANE makes it explicit even when it matches the pin: the user
+    // named the fleet they're joining.
+    expect(sessionIdentity({ BUS_IDENTITY: "be", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("be");
+  });
+  test("a BUS_IDENTITY that re-delivers the repo's pin is derived: the suffix composes (be-stream keeps its mail and claims)", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      // Harnesses load the pin into BUS_IDENTITY: treating it as literal
+      // would silently migrate every worktree identity (be-stream → be),
+      // orphaning its queued mail and claims. Equal to the pin = derived.
+      expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be-stream");
+      expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo"))).toBe("be");
+      // And its lane is the default (the suffix is in the name).
+      expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeNull();
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
+  test("a pin keeps the worktree suffix (derived identities unchanged)", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("be-stream");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
   test("default plus worktree suffix", () => expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream"));
   test("empty BUS_IDENTITY falls back", () => expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("repo"));
+
+  test("an EMPTY BUS_IDENTITY falls through to the pin (N3: ?? skipped it)", () => {
+    // `BUS_IDENTITY=` is how a caller clears an inherited value; the pin —
+    // not the directory name — is what it must fall back to, as master did.
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBe("fe");
+      expect(sessionIdentity({ BUS_IDENTITY: "" }, at("repo", ".wt", "stream"))).toBe("fe-stream");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
+
+  test("a BUS_IDENTITY equal to the repo's .omp/mcp.json pin is derived: the suffix composes", () => {
+    // omp pins per-repo identities in .omp/mcp.json, not .mcp.json; a
+    // harness re-delivering THAT pin must be derived too, or every existing
+    // omp worktree identity (fe-omp-stream) silently becomes fe-omp on lane
+    // stream, orphaning its mail and claims.
+    mkdirSync(at("repo", ".omp"), { recursive: true });
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe-omp" } } } };
+    writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp" }, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      // A name no pin source knows is still a true explicit join.
+      expect(sessionIdentity({ BUS_IDENTITY: "scratch" }, at("repo", ".wt", "stream"))).toBe("scratch");
+    } finally {
+      rmSync(at("repo", ".omp"), { recursive: true });
+    }
+  });
+
+  test("with BOTH pins present, a BUS_IDENTITY matching EITHER pin is derived", () => {
+    // README's omp recipe: .mcp.json pins the Claude Code identity (fe),
+    // omp's .omp/mcp.json pins its own (fe-omp). omp re-delivers ITS pin as
+    // env; comparing against only the first pin (.mcp.json's fe) would call
+    // fe-omp explicit, drop the worktree suffix, and orphan fe-omp-stream's
+    // mail and claims.
+    const pinA = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+    const pinB = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe-omp" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pinA));
+    mkdirSync(at("repo", ".omp"), { recursive: true });
+    writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(pinB));
+    try {
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp" }, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      expect(sessionIdentity({ BUS_IDENTITY: "fe" }, at("repo", ".wt", "stream"))).toBe("fe-stream");
+      // Still explicit: a name no pin source knows, or a named lane.
+      expect(sessionIdentity({ BUS_IDENTITY: "other" }, at("repo", ".wt", "stream"))).toBe("other");
+      expect(sessionIdentity({ BUS_IDENTITY: "fe-omp", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("fe-omp");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+      rmSync(at("repo", ".omp"), { recursive: true });
+    }
+  });
 
   test("unset BUS_IDENTITY uses the repo's .mcp.json pin, worktrees included", () => {
     const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
@@ -84,6 +170,35 @@ describe("sessionIdentity", () => {
       expect(sessionIdentity({ BUS_IDENTITY: "other" }, at("repo"))).toBe("other");
       writeFileSync(at("repo", ".mcp.json"), "{ not json");
       expect(sessionIdentity({}, at("repo"))).toBe("repo");
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+  });
+});
+
+describe("sessionLane", () => {
+  test("BUS_LANE wins", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be", BUS_LANE: "research-3" }, at("repo"))).toBe("research-3");
+    expect(sessionLane({ BUS_LANE: "Research-3" }, at("repo"))).toBe("research-3");
+  });
+  test("invalid BUS_LANE fails loudly", () => {
+    expect(() => sessionLane({ BUS_LANE: "Bad Lane!" }, at("repo"))).toThrow(/invalid BUS_LANE/);
+  });
+  test("an explicit identity in a worktree: the worktree name is the implicit lane", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("stream");
+    expect(sessionLane({ BUS_IDENTITY: "be", BUS_LANE: "x" }, at("repo", ".wt", "stream"))).toBe("x");
+  });
+  test("an explicit identity outside a worktree: no lane of its own", () => {
+    expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo"))).toBeNull();
+  });
+  test("a derived identity carries the suffix in the name; its lane is the default", () => {
+    expect(sessionLane({}, at("repo", ".wt", "stream"))).toBeNull();
+    expect(sessionLane({}, at("repo"))).toBeNull();
+    // A pin re-delivered as BUS_IDENTITY is derived too (see sessionIdentity).
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(sessionLane({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeNull();
     } finally {
       rmSync(at("repo", ".mcp.json"));
     }

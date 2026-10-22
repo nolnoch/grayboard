@@ -73,12 +73,12 @@ function mcpCommand(): McpInvocation {
 
 // ── .mcp.json helpers ─────────────────────────────────────────────────────────
 
-function writeMcpJson(targetPath: string, identityName: string, force: boolean): void {
+function writeMcpJson(targetPath: string, identityName: string, force: boolean, lane?: string): void {
   const plugin = mcpCommand();
   const entry = {
     command: plugin.command,
     args:    plugin.args,
-    env:     { BUS_IDENTITY: identityName },
+    env:     { BUS_IDENTITY: identityName, ...(lane ? { BUS_LANE: lane } : {}) },
   };
 
   if (force) {
@@ -217,11 +217,11 @@ program
     const { actingIdentity, busHandle } = await import("./claim.ts");
     let acting;
     try {
-      const { name, source } = actingIdentity(globalAs());
-      acting = { handle: busHandle(name), source };
+      const { name, source, lane } = actingIdentity(globalAs());
+      acting = { handle: busHandle(name), source, ...(lane ? { lane } : {}) };
     } catch (e) { console.error(`[grayboard] whoami: ${(e as Error).message}`); process.exit(1); }
     if (busMode() === "local") {
-      output(globalJson() ? acting : `${acting.handle} (from ${acting.source})`, globalJson());
+      output(globalJson() ? acting : `${acting.handle}${acting.lane ? ` (lane ${acting.lane})` : ""} (from ${acting.source})`, globalJson());
       return;
     }
     try {
@@ -240,6 +240,38 @@ program
     // Imported lazily: opening the local bus creates ~/.claude-bus.
     const { runTail } = await import("../local/tail.ts");
     await runTail(board, Number.parseInt(opts.lines, 10) || 0);
+  });
+
+// ── fleet (lanes) ───────────────────────────────────────────────────────
+
+const fleetCmd = program.command("fleet").description("List or disconnect the live sessions (lanes) of an identity; several sessions of one identity run side by side, one per BUS_LANE");
+
+fleetCmd
+  .command("list [identity]")
+  .description("The identity's live lanes, with liveness and who owns push delivery")
+  .action(async (identity: string | undefined) => {
+    if (busMode() === "local") {
+      const fleet = await import("./fleet.ts");
+      try { output(await fleet.fleetLocalList(identity), globalJson()); } catch (e) { console.error(`[grayboard] fleet list: ${(e as Error).message}`); process.exit(1); }
+      return;
+    }
+    try {
+      output(await makeClient().get("/api/fleet" + (identity ? `?identity=${encodeURIComponent(identity)}` : "")), globalJson());
+    } catch (e) { handleApiError(e); }
+  });
+
+fleetCmd
+  .command("disconnect <identity> <lane>")
+  .description("Disconnect one of your identity's lanes (its owner — you — orders it; a lane leaves on its own by exiting)")
+  .action(async (identity: string, lane: string) => {
+    if (busMode() === "local") {
+      const fleet = await import("./fleet.ts");
+      try { output(await fleet.fleetLocalDisconnect(identity, lane), globalJson()); } catch (e) { console.error(`[grayboard] fleet disconnect: ${(e as Error).message}`); process.exit(1); }
+      return;
+    }
+    try {
+      output(await makeClient().post("/api/fleet/disconnect", { identity, lane }), globalJson());
+    } catch (e) { handleApiError(e); }
   });
 
 // ── claims ───────────────────────────────────────────────────────────────────
@@ -482,7 +514,7 @@ program
       const where = creds?.server ? ` from ${creds.server}` : "";
       if (!(await confirm(`Local mode signs you out${where}. Continue?`, true))) process.exit(1);
       if (creds?.session_token) {
-        try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch {}
+        try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch { /* best-effort: local creds go regardless */ }
       }
       rmSync(credentialsPath(), { force: true });
       console.log("Using local mode.");
@@ -567,7 +599,8 @@ program
       `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
       `Each session is named after its repo (in ~/code/api you're "api"). ` +
-      `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
+      `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp). ` +
+      `To run several sessions of one identity side by side, give each a BUS_LANE (grayboard fleet lists them).`,
     );
   });
 
@@ -629,12 +662,17 @@ identityCmd
   .command("create <name>")
   .description("Create an identity (local mode: nothing to reserve; use with --mcp)")
   .option("--mcp [path]",  "Write .mcp.json entry (default: ./.mcp.json)")
+  .option("--lane <lane>", "Pin BUS_LANE in the .mcp.json entry: this repo's sessions join that identity's lane")
   .option("--force",       "Overwrite entire .mcp.json instead of merging")
-  .action(async (name: string, opts: { mcp?: string | boolean; force?: boolean }) => {
+  .action(async (name: string, opts: { mcp?: string | boolean; lane?: string; force?: boolean }) => {
     const mcpPath = opts.mcp === undefined ? null : opts.mcp === true ? "./.mcp.json" : opts.mcp;
     // Before anything is created, so a typo'd path isn't an ENOENT after the fact.
     if (mcpPath && !existsSync(dirname(resolve(mcpPath)))) {
       console.error(`--mcp ${mcpPath}: directory ${dirname(resolve(mcpPath))} doesn't exist`);
+      process.exit(1);
+    }
+    if (opts.lane !== undefined && !/^[a-zA-Z0-9_-]{1,32}$/.test(opts.lane)) {
+      console.error(`Invalid lane "${opts.lane}": 1–32 chars, a-z 0-9 _ -`);
       process.exit(1);
     }
     if (busMode() === "local") {
@@ -646,7 +684,7 @@ identityCmd
         console.error(`Invalid identity "${name}": 1–32 chars, a-z 0-9 _ -`);
         process.exit(1);
       }
-      writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
+      writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false, opts.lane?.toLowerCase());
       return;
     }
 
@@ -661,7 +699,7 @@ identityCmd
       console.log(`Created identity '${res!.name}'`);
     }
 
-    if (mcpPath) writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
+    if (mcpPath) writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false, opts.lane?.toLowerCase());
   });
 
 identityCmd
