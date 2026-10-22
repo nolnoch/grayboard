@@ -91,9 +91,19 @@ test("web: waits out a rate limit, then classifies errors", async () => {
 
 // ── outbox ───────────────────────────────────────────────────────────────────
 
+// A bus for tests that carry no files.
+const noFiles: Pick<Bus, "attachment" | "withFiles"> = {
+  attachment: async () => {
+    throw new Error("no attachments here");
+  },
+  withFiles: async () => {
+    throw new Error("no attachments here");
+  },
+};
+
 test("outbox: rows a stopped bridge couldn't post go out on the next run, in order", async () => {
   const path = join(dir, "b.db");
-  const nobus: Bus = { call: async () => ({ ok: true, value: [] }) };
+  const nobus: Bus = { call: async () => ({ ok: true, value: [] }), ...noFiles };
   const down: Fetch = async () => new Response("down", { status: 503 });
   let relay = new Relay(new Store(path), nobus, new SlackWeb("xoxb-t", "http://slack.test/api/", down), {
     channel: "G1",
@@ -125,7 +135,7 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
   let fatal = "";
   const f: Fetch = async () => Response.json({ ok: false, error: "invalid_auth" });
   const store = new Store(join(dir, "b.db"));
-  const relay = new Relay(store, { call: async () => ({ ok: true, value: [] }) }, new SlackWeb("x", "http://slack.test/api/", f), {
+  const relay = new Relay(store, { call: async () => ({ ok: true, value: [] }), ...noFiles }, new SlackWeb("x", "http://slack.test/api/", f), {
     channel: "G1",
     owner: "U1",
     onFatal: (r) => (fatal = r),
@@ -134,6 +144,68 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
   await Bun.sleep(50);
   expect(fatal).toContain("invalid_auth");
   expect(store.pending()).toHaveLength(1); // kept for after the token is fixed
+  store.close();
+});
+
+// A bus holding attachment 7, and a Slack whose file methods answer `files`
+// (a status to fail with, or an error code), recording every call.
+function withAttachment(files: { upload?: number; complete?: string }) {
+  const bus: Bus = {
+    call: async () => ({ ok: true, value: [] }),
+    attachment: async (id) => ({ id, filename: "shot.png", type: "image/png", size: 3, data: new Uint8Array([1, 2, 3]) }),
+    withFiles: noFiles.withFiles,
+  };
+  const calls: string[] = [];
+  const said: string[] = [];
+  const f: Fetch = async (url, init) => {
+    const method = String(url).split("/").pop()!;
+    calls.push(method);
+    if (method === "chat.postMessage") said.push(JSON.parse(String(init.body)).markdown_text);
+    if (method === "files.getUploadURLExternal" && files.upload) {
+      const status = files.upload;
+      delete files.upload;
+      return new Response("down", { status });
+    }
+    if (method === "files.getUploadURLExternal") return Response.json({ ok: true, file_id: "F1", upload_url: "http://slack.test/upload/F1" });
+    if (method === "F1") return new Response("OK");
+    if (method === "files.completeUploadExternal" && files.complete) return Response.json({ ok: false, error: files.complete });
+    return Response.json({ ok: true, ts: "5.0" });
+  };
+  return { bus, calls, said, f };
+}
+
+test("files: a retry after Slack was unavailable resends the files, not the text", async () => {
+  const { bus, calls, f } = withAttachment({ upload: 503 });
+  const store = new Store(join(dir, "b.db"));
+  const sent: string[] = [];
+  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), {
+    channel: "G1", owner: "U1", onFatal: () => {}, retryMs: 20, onFileSent: (x) => sent.push(`${x.attachment}→${x.slack_file}@${x.thread_ts}`),
+  });
+  relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } });
+  await Bun.sleep(150);
+  expect(calls).toEqual(["chat.postMessage", "files.getUploadURLExternal", "files.getUploadURLExternal", "F1", "files.completeUploadExternal"]);
+  expect(sent).toEqual(["7→F1@5.0"]);
+  expect(store.pending()).toEqual([]);
+  store.close();
+});
+
+test("files: an app without files:write still relays text and says why the file didn't come", async () => {
+  const { bus, calls, said, f } = withAttachment({ complete: "missing_scope" });
+  const store = new Store(join(dir, "b.db"));
+  let fatal = "";
+  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: (r) => (fatal = r) });
+  relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } });
+  relay.notify({ content: "next", meta: { message_id: "2", from: "be" } });
+  await Bun.sleep(100);
+  expect(fatal).toBe("");
+  // The text, the file attempt, the warning in the thread, then the next item.
+  expect(calls).toEqual(["chat.postMessage", "files.getUploadURLExternal", "F1", "files.completeUploadExternal", "chat.postMessage", "chat.postMessage"]);
+  expect(said).toEqual([
+    "**be** look",
+    "⚠️ not delivered to Slack: shot.png: the Slack app lacks files:write (reinstall it from the current manifest)",
+    "**be** next",
+  ]);
+  expect(store.pending()).toEqual([]);
   store.close();
 });
 
@@ -148,6 +220,7 @@ function owned(results: Record<string, { ok: true; value: any } | { ok: false; e
       calls.push([name, args]);
       return results[name] ?? { ok: true, value: {} };
     },
+    ...noFiles,
   };
   const f: Fetch = async (url, init) => {
     const body = JSON.parse(String(init.body));

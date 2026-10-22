@@ -1,6 +1,6 @@
-// Slack Web API over fetch: the few methods the bridge calls. Slack answers
-// HTTP 200 with {ok:false, error} for most failures, and 429 + Retry-After
-// (error "ratelimited") when throttled.
+// Slack Web API over fetch: the few methods the bridge calls, plus file bytes
+// both ways. Slack answers HTTP 200 with {ok:false, error} for most failures,
+// and 429 + Retry-After (error "ratelimited") when throttled.
 
 export const SLACK_API = "https://slack.com/api/";
 
@@ -44,14 +44,26 @@ export class SlackWeb {
     private readonly fetchImpl: Fetch = fetch,
   ) {}
 
-  async call<T = Record<string, unknown>>(method: string, body: Record<string, unknown> = {}): Promise<T & { ok: true }> {
+  // form: send the arguments form-encoded (non-string values as JSON), the
+  // encoding every method takes; the files.* methods get it.
+  async call<T = Record<string, unknown>>(
+    method: string,
+    body: Record<string, unknown> = {},
+    opts: { form?: boolean } = {},
+  ): Promise<T & { ok: true }> {
+    const encoded = opts.form
+      ? {
+          type: "application/x-www-form-urlencoded",
+          body: new URLSearchParams(Object.entries(body).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)])).toString(),
+        }
+      : { type: "application/json; charset=utf-8", body: JSON.stringify(body) };
     for (let waits = 0; ; waits++) {
       let res: Response;
       try {
         res = await this.fetchImpl(new URL(method, this.base).toString(), {
           method: "POST",
-          headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json; charset=utf-8" },
-          body: JSON.stringify(body),
+          headers: { Authorization: `Bearer ${this.token}`, "Content-Type": encoded.type },
+          body: encoded.body,
         });
       } catch (e) {
         throw new SlackUnavailable(`slack ${method}: ${(e as Error).message}`);
@@ -72,5 +84,36 @@ export class SlackWeb {
       if (!data.ok) throw new SlackError(method, data.error ?? `HTTP ${res.status}`);
       return data as T & { ok: true };
     }
+  }
+
+  /** Sends a file's bytes to the upload_url files.getUploadURLExternal gave. */
+  async upload(url: string, data: Uint8Array): Promise<void> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: new Uint8Array(data) });
+    } catch (e) {
+      throw new SlackUnavailable(`slack file upload: ${(e as Error).message}`);
+    }
+    if (res.status >= 500 || res.status === 429) throw new SlackUnavailable(`slack file upload: HTTP ${res.status}`);
+    if (res.status !== 200) throw new SlackError("file upload", `HTTP ${res.status}`);
+  }
+
+  /**
+   * A shared file's bytes, from its url_private_download. Without files:read,
+   * Slack answers with a sign-in page instead, so a size other than `size`
+   * (the file's, from Slack) is refused.
+   */
+  async download(url: string, size: number): Promise<Uint8Array> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${this.token}` } });
+    } catch (e) {
+      throw new SlackUnavailable(`slack file download: ${(e as Error).message}`);
+    }
+    if (res.status >= 500 || res.status === 429) throw new SlackUnavailable(`slack file download: HTTP ${res.status}`);
+    if (res.status !== 200) throw new SlackError("file download", `HTTP ${res.status}`);
+    const data = new Uint8Array(await res.arrayBuffer());
+    if (data.length !== size) throw new SlackError("file download", "size_mismatch");
+    return data;
   }
 }

@@ -7,6 +7,9 @@
 // tools, so roster checks, wakeups, and identity uniqueness come for free.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { busMode } from "../cli/api.ts";
 import { declareHuman, humanHandles } from "../core/boards.ts";
@@ -80,17 +83,48 @@ export async function startSlackBridge(
     finish(code);
   };
 
+  const call: Bus["call"] = async (name, args) => {
+    const r = await client.callTool({ name, arguments: args });
+    const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
+    if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "") };
+    try {
+      return { ok: true, value: JSON.parse(text) };
+    } catch {
+      return { ok: true, value: text };
+    }
+  };
+  // Files cross the tool boundary as paths, the way an agent's do: through a
+  // private temp directory (a root the child may read and write), removed
+  // once the call returns.
+  const scratch = async <T>(use: (dir: string) => Promise<T>): Promise<T> => {
+    const dir = await mkdtemp(join(tmpdir(), "grayboard-slack-"));
+    try {
+      return await use(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
   const bus: Bus = {
-    async call(name, args) {
-      const r = await client.callTool({ name, arguments: args });
-      const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
-      if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "") };
-      try {
-        return { ok: true, value: JSON.parse(text) };
-      } catch {
-        return { ok: true, value: text };
-      }
-    },
+    call,
+    attachment: (id) =>
+      scratch(async (dir) => {
+        const r = await call("attachment_get", { id, dir });
+        if (!r.ok) throw new Error(r.error);
+        const v = r.value as { path: string; filename: string; type: string; size: number };
+        return { id, filename: v.filename, type: v.type, size: v.size, data: new Uint8Array(await readFile(v.path)) };
+      }),
+    withFiles: (files, send) =>
+      scratch(async (dir) => {
+        // One directory per file, so two files of the same name keep it.
+        const paths: string[] = [];
+        for (const [i, f] of files.entries()) {
+          await mkdir(join(dir, String(i)));
+          const path = join(dir, String(i), f.filename);
+          await writeFile(path, f.data, { mode: 0o600 });
+          paths.push(path);
+        }
+        return send({ attachments: paths });
+      }),
   };
 
   relay = new Relay(store, bus, web, {

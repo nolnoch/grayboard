@@ -4,6 +4,7 @@ import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
   mintToken, hashToken, type AuthedUser,
 } from "./auth.ts";
+import { readableAttachment } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
@@ -11,7 +12,7 @@ import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.t
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import {
-  attachmentData, attachmentLimits, canReadAttachment, getAttachment, pruneUnbound, storeAttachment, unboundBytes,
+  attachmentData, attachmentLimits, pruneUnbound, storeAttachment, unboundBytes,
 } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS, contentDisposition, formatSize, sanitizeFilename, sniffType, unboundCap } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -231,13 +232,8 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
 function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const id = Number(idStr);
-  const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
-  const dmVisible = (messageId: number) => {
-    const m = repo.messages.getById(messageId);
-    return !!m && m.recipient_type === "user" && (m.sender === handle || m.recipient === handle);
-  };
-  if (!row || !canReadAttachment(db, handle, row, dmVisible)) {
+  const row = readableAttachment(repo, db, handle, Number(idStr));
+  if (!row) {
     writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
     return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
   }

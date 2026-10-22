@@ -3,6 +3,7 @@ import type { Repo } from "./db.ts";
 export type AuditAction =
   | "attachment.downloaded"
   | "attachment.download_refused"
+  | "attachment.sent_to_slack"
   | "attachment.uploaded"
   | "auth.login"
   | "auth.logout"

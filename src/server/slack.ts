@@ -10,13 +10,16 @@
 // app gets linked.
 import { randomInt } from "node:crypto";
 
+import { attachmentData, attachmentLimits, storeAttachment } from "../core/attachments.ts";
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
 import { boardNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
+import { formatAttachmentsMeta } from "../shared/attachments.ts";
 import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, ServerMessage, ThreadOk } from "../shared/protocol.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackWeb } from "../bridge/web.ts";
+import { readableAttachment } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
@@ -233,10 +236,11 @@ export class SlackBridge implements SlackLinker {
   // ── a linked user's human ──────────────────────────────────────────────────
 
   private async attach(link: SlackLink): Promise<void> {
-    const { repo } = this.o;
+    const { repo, db } = this.o;
     const user = repo.users.findById(link.user_id);
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
+    const handle = `${prefix}${HUMAN_NAME}`;
     const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, session_id: 0 };
 
     let relay!: Relay;
@@ -245,6 +249,7 @@ export class SlackBridge implements SlackLinker {
         const msg = m.message;
         const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
         if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+        if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
         relay.notify({ content: msg.body, meta });
       } else if (m.item.kind === "digest") {
         // Only says a board has unread posts; on a phone that's noise.
@@ -287,6 +292,7 @@ export class SlackBridge implements SlackLinker {
             const { type: _t, req_id: _r, ...v } = await conn.request<SendOk>({
               type: "send", recipient: args.to, body: args.body,
               ...(args.parent_id !== undefined ? { parent_id: args.parent_id } : {}),
+              ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids } : {}),
             });
             return { ok: true, value: v };
           }
@@ -297,6 +303,26 @@ export class SlackBridge implements SlackLinker {
         } catch (e) {
           return { ok: false, error: (e as Error).message };
         }
+      },
+      // In process: the read check the download route makes, and the store an
+      // upload makes, audited the same way.
+      async attachment(id) {
+        const row = readableAttachment(repo, db, handle, id);
+        if (!row) {
+          writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
+          throw new Error(`no attachment ${id} on a message or post you can read`);
+        }
+        return { id: row.id, filename: row.filename, type: row.type, size: row.size, data: attachmentData(db, row.sha256) };
+      },
+      async withFiles(files, send) {
+        const ids = files.map((f) => {
+          const row = storeAttachment(db, handle, f);
+          writeAudit(repo, "attachment.uploaded", link.email, `attachment:${row.id}`, {
+            identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, slack_file: f.slack_file,
+          });
+          return row.id;
+        });
+        return send({ attachment_ids: ids });
       },
     };
 
@@ -313,6 +339,11 @@ export class SlackBridge implements SlackLinker {
       },
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
+      attachmentLimits: attachmentLimits(db),
+      onFileSent: (f) =>
+        writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
+          identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file,
+        }),
     });
     this.linked.set(link.user_id, { link, conn, relay });
     try {
@@ -336,9 +367,9 @@ export class SlackBridge implements SlackLinker {
   private async onEvent(payload: Record<string, any>): Promise<void> {
     if (payload.type !== "event_callback") return;
     const e = payload.event as Record<string, any> | undefined;
-    // Only people's new messages in a DM with the app: no edits, deletes or
-    // bot posts, including our own.
-    if (!e || e.type !== "message" || e.channel_type !== "im" || e.subtype || e.bot_id || !e.user) return;
+    // Only people's new messages in a DM with the app, with or without files:
+    // no edits, deletes or bot posts, including our own.
+    if (!e || e.type !== "message" || e.channel_type !== "im" || (e.subtype && e.subtype !== "file_share") || e.bot_id || !e.user) return;
     const user = String(e.user);
     const channel = String(e.channel);
     const ts = String(e.ts);
