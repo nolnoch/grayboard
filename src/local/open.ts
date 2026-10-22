@@ -72,11 +72,11 @@ export function openLocalDb(path = localDbPath()): Database {
     db.exec(`UPDATE dm_claims SET delivered_at = claimed_at WHERE delivered_at IS NULL`);
   }
   // A partial index over the pending (undelivered) claims only. The clamp
-  // queries' CURRENT plans (EXPLAIN) drive from messages and probe
-  // dm_claims by rowid, so this index changes no plan today — it is the
-  // shape a pending-first clamp rewrite needs (bounding the scan by the
-  // number of stuck claims instead of the recipient's messages), which
-  // remains open (round-6 low item).
+  // queries drive from dm_claims (their CROSS JOIN pins the join order —
+  // a plain JOIN let the planner drive from messages and scan the
+  // recipient's whole history), so this index bounds them by the number of
+  // stuck claims instead (round-7 item 6; EXPLAIN-pinned in
+  // tests/integration/local.test.ts).
   db.exec(`CREATE INDEX IF NOT EXISTS idx_dm_claims_pending ON dm_claims(message_id) WHERE delivered_at IS NULL`);
   // dm_send pending: the sender owes a follow-up in the thread.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];

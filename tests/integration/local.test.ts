@@ -366,6 +366,76 @@ test("a skipped live claim arms its own TTL retry: a crashed claimer's DM delive
   expect(live.pushes).toEqual(["ttl-armed"]);
 }, 20_000);
 
+test("a drain whose tail spans the claim's expiry reruns instead of losing the retry (round-7 N1)", async () => {
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const stuck = await call(sim, "dm_send", { to: "be", body: "tail-span" });
+  expect(stuck.delivered_now).toBe(false);
+  // A ghost claim with ~1 s of remaining TTL: the live lane's drain skips
+  // it and arms the retry. A poke 300 ms before expiry starts its own
+  // drain, whose test-injected tail (BUS_TEST_DRAIN_TAIL_MS) spans the
+  // expiry — the armed timer fires mid-drain and bails on `draining`. The
+  // drain's own expiry check then sees the claim expired
+  // (nextClaimExpiry filters claimed_at > now - ttl) and returns null:
+  // without the rerun flag nothing re-arms and the message is lost — the
+  // reviewer's widened-window repro.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  db.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(stuck.message_id, Date.now() - DM_CLAIM_TTL_MS + 1_000);
+  db.close();
+  process.env.BUS_TEST_DRAIN_TAIL_MS = "600";
+  try {
+    const live = await startCollecting("be", "research");
+    // The startup drain skips the live claim and arms the retry for the
+    // remaining TTL (~1 s from the insert, ~300 ms spent on startup).
+    await Bun.sleep(700);
+    await call(sim, "dm_send", { to: "be", body: "poke" });
+    // Past the expiry, the timer's bail on `draining`, the tail, and the
+    // rerun pass: the poke delivered, the expired claim taken over —
+    // each exactly once.
+    await Bun.sleep(2_500);
+    expect(live.pushes).toEqual(["poke", "tail-span"]);
+  } finally {
+    delete process.env.BUS_TEST_DRAIN_TAIL_MS;
+  }
+}, 20_000);
+
+test("the pending-claim queries drive from dm_claims through the partial index (round-7 item 6)", async () => {
+  // EXPLAIN the exported constants the code executes — not a hand copy.
+  // A plain JOIN lets the planner drive from messages (a scan of the
+  // recipient's whole history, ~5 ms at 100k messages); CROSS JOIN pins
+  // dm_claims outer so idx_dm_claims_pending bounds the clamp by the
+  // number of stuck claims. Reverting any CROSS JOIN fails this pin.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const {
+    READ_POINT_SQL, UNDELIVERED_BELOW_SQL, NEXT_EXPIRY_SQL, PRUNE_DISTINCT_SQL,
+  } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "explain.db"));
+  const detail = (sql: string, ...params: unknown[]) =>
+    (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[])
+      .map((r) => r.detail).join(" | ");
+  for (const [sql, params] of [
+    [READ_POINT_SQL, ["be"]],
+    [UNDELIVERED_BELOW_SQL, ["be", 5]],
+    [NEXT_EXPIRY_SQL, ["be", Date.now()]],
+  ] as const) {
+    const d = detail(sql, ...params);
+    expect(d).toContain("SEARCH cl USING INDEX idx_dm_claims_pending");
+    expect(d).toContain("SEARCH m USING INTEGER PRIMARY KEY");
+    expect(d).not.toContain("SCAN m");
+  }
+  // The prune scans dm_claims (small: markers) and probes messages by
+  // rowid — never a scan of the recipient's message history.
+  const prune = detail(PRUNE_DISTINCT_SQL, Date.now());
+  expect(prune).toContain("SCAN d");
+  expect(prune).toContain("SEARCH m USING INTEGER PRIMARY KEY");
+  expect(prune).not.toContain("SCAN m");
+  db.close();
+}, 20_000);
+
 test("a pre-delivered_at dm_claims row is backfilled as delivered, not clamped forever (round-6 item 3)", async () => {
   // A round-4-shaped database: dm_claims without the delivered_at column.
   // The guarded ALTER adds it; the same branch backfills every row as

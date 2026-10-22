@@ -70,30 +70,32 @@ export function anyCursorFor(identity: string): number {
   return row?.id ?? 0;
 }
 
-// The identity's read point, held back by any undelivered claim: a message
-// no agent has received must keep the read point before it, or a sibling's
-// later delivery would sync every lane past the stuck message and lose it
-// (D1). The clamp resolves itself: any draining lane takes an expired claim
-// over and delivers it.
+// The pending-claim queries drive from dm_claims (CROSS JOIN pins the
+// join order: a plain JOIN let the planner drive from messages and scan
+// the recipient's whole history — ~5 ms at 100k messages). Driven from
+// dm_claims, the partial index idx_dm_claims_pending bounds the clamp by
+// the number of stuck claims instead (round-7 item 6; EXPLAIN-pinned in
+// tests/integration/local.test.ts).
+export const READ_POINT_SQL = `SELECT MIN(cl.message_id) AS id FROM dm_claims cl CROSS JOIN messages m ON m.id = cl.message_id
+  WHERE cl.delivered_at IS NULL AND m.recipient = ?`;
+
+/** The identity's read point, held back by any undelivered claim: a message
+ * no agent has received must keep the read point before it, or a sibling's
+ * later delivery would sync every lane past the stuck message and lose it
+ * (D1). The clamp resolves itself: any draining lane takes an expired claim
+ * over and delivers it. */
 export function readPointFor(identity: string): number {
   const max = anyCursorFor(identity);
-  const stuck = db
-    .prepare(
-      `SELECT MIN(cl.message_id) AS id FROM dm_claims cl JOIN messages m ON m.id = cl.message_id
-        WHERE cl.delivered_at IS NULL AND m.recipient = ?`,
-    )
-    .get(identity) as { id: number | null } | undefined;
+  const stuck = db.prepare(READ_POINT_SQL).get(identity) as { id: number | null } | undefined;
   return stuck?.id ? Math.min(max, stuck.id - 1) : max;
 }
 
+export const UNDELIVERED_BELOW_SQL = `SELECT 1 FROM dm_claims cl CROSS JOIN messages m ON m.id = cl.message_id
+  WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.message_id < ? LIMIT 1`;
+
 /** True while an earlier message of `identity` is claimed but undelivered: a lane's cursor must not pass it (D1). */
 export function undeliveredClaimBelow(identity: string, messageId: number): boolean {
-  const row = db
-    .prepare(
-      `SELECT 1 FROM dm_claims cl JOIN messages m ON m.id = cl.message_id
-        WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.message_id < ? LIMIT 1`,
-    )
-    .get(identity, messageId);
+  const row = db.prepare(UNDELIVERED_BELOW_SQL).get(identity, messageId);
   return !!row;
 }
 
@@ -298,14 +300,12 @@ export function markClaimDelivered(id: number): void {
  * back, and the lane that later takes that claim over must still find the
  * later messages marked delivered, or it re-delivers them (round-6 item 1).
  */
+export const PRUNE_DISTINCT_SQL = `SELECT DISTINCT m.recipient AS r FROM dm_claims d CROSS JOIN messages m ON m.id = d.message_id
+  WHERE d.delivered_at IS NOT NULL AND d.claimed_at < ?`;
+
 export function pruneDmClaims(now = Date.now()): void {
   const aged = now - DM_CLAIM_RETENTION_MS;
-  const rows = db
-    .prepare(
-      `SELECT DISTINCT m.recipient AS r FROM dm_claims d JOIN messages m ON m.id = d.message_id
-        WHERE d.delivered_at IS NOT NULL AND d.claimed_at < ?`,
-    )
-    .all(aged) as { r: string }[];
+  const rows = db.prepare(PRUNE_DISTINCT_SQL).all(aged) as { r: string }[];
   for (const { r } of rows) {
     db.prepare(
       `DELETE FROM dm_claims WHERE delivered_at IS NOT NULL AND claimed_at < ?
@@ -314,20 +314,20 @@ export function pruneDmClaims(now = Date.now()): void {
   }
 }
 
+export const NEXT_EXPIRY_SQL = `SELECT MIN(cl.claimed_at) AS t FROM dm_claims cl CROSS JOIN messages m ON m.id = cl.message_id
+  WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.claimed_at > ?`;
+
 /**
  * When the identity's oldest live (unexpired, undelivered) claim expires:
  * the delay a drain that skipped the claim must wait before it can take it
  * over. Null when no live claim holds. A drain that skips a live claim arms
  * a retry for this, so a crashed claimer's message doesn't wait for an
- * unrelated wake (round-6 item 2).
+ * unrelated wake (round-6 item 2). A claim that expired while a drain ran
+ * its tail also reads null here — the drain's rerun pass takes that one
+ * over (round-7 N1).
  */
 export function nextClaimExpiry(identity: string, now = Date.now(), ttlMs = DM_CLAIM_TTL_MS): number | null {
-  const row = db
-    .prepare(
-      `SELECT MIN(cl.claimed_at) AS t FROM dm_claims cl JOIN messages m ON m.id = cl.message_id
-        WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.claimed_at > ?`,
-    )
-    .get(identity, now - ttlMs) as { t: number | null } | undefined;
+  const row = db.prepare(NEXT_EXPIRY_SQL).get(identity, now - ttlMs) as { t: number | null } | undefined;
   return row?.t == null ? null : row.t + ttlMs;
 }
 

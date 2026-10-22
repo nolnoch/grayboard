@@ -398,6 +398,20 @@ async function liveHandles(): Promise<(h: string) => boolean> {
 // single query still get picked up. Re-entry is guarded; crashed drains
 // re-deliver (at-least-once).
 let draining = false;
+// A drain requested while one runs: the running drain loops once more
+// before it exits (round-7 N1). The retry timer bails on `draining` (it
+// must not stack), and a drain's tail — board notifications, slow stdout —
+// can span a skipped claim's expiry: the last scan saw it live, the expiry
+// check after the tail sees it expired (nextClaimExpiry filters
+// claimed_at > now - ttl) and returns null, so nothing re-arms and the
+// takeover is lost. The rerun closes that window: the extra pass finds the
+// claim expired and takes it over. A poke arriving during the tail rides
+// the same rerun.
+let rerunDrain = false;
+// Test seam (BUS_TEST_DRAIN_TAIL_MS): delays the tail between the last
+// scan and the expiry check, widening the window the rerun flag exists for
+// so a test can hit it deterministically. Zero in production.
+const DRAIN_TAIL_TEST_MS = Math.max(Number(process.env.BUS_TEST_DRAIN_TAIL_MS ?? 0) || 0, 0);
 // The first drain also brings deferred thread replies and digests: a new
 // session is the natural time to see them.
 let firstDrain = true;
@@ -411,7 +425,13 @@ function armClaimRetry(delayMs: number): void {
   if (claimRetry !== null) clearTimeout(claimRetry);
   claimRetry = setTimeout(() => {
     claimRetry = null;
-    void drainToClaude();
+    // .catch is load-bearing: an unhandled rejection here (e.g. SQLITE_BUSY
+    // when another connection holds a write lock past busy_timeout) exits
+    // the whole MCP server (round-7 N2); a failed retry just logs — the
+    // claim stays armed in the table, the next wake takes it over.
+    drainToClaude().catch((err) => {
+      console.error("grayboard claim-retry drain error:", err);
+    });
   }, Math.max(delayMs, 0));
   (claimRetry as { unref?: () => void }).unref?.();
 }
@@ -424,9 +444,14 @@ mcp.oninitialized = () => markInitialized();
 
 async function drainToClaude(): Promise<void> {
   await initialized;
-  if (draining) return;
+  if (draining) {
+    rerunDrain = true;
+    return;
+  }
   draining = true;
   try {
+    do {
+    rerunDrain = false;
     // Lazy sweep first (ruling 3): local sockets have no close event, so any
     // draining reader ends lanes whose session crashed — kind "session"
     // rows, past a grace window, whose lane socket no longer answers.
@@ -495,14 +520,18 @@ async function drainToClaude(): Promise<void> {
     }
     // A live claim this drain skipped may belong to a claimer that died:
     // nothing else fires the takeover (the next DM or poke could be hours
-    // away), so arm one retry for the claim's remaining TTL. No pending
-    // claim clears an earlier arm — its claimer delivered (round-6 item 2).
+    // away), so arm one retry for the claim's remaining TTL. Null means no
+    // LIVE claim: either the claimer delivered, or the claim expired while
+    // this drain ran its tail — the rerun flag took that one over, so
+    // clearing an earlier arm is safe (round-6 item 2, round-7 N1).
+    if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
     const expiry = nextClaimExpiry(IDENTITY);
     if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
     else if (claimRetry !== null) {
       clearTimeout(claimRetry);
       claimRetry = null;
     }
+    } while (rerunDrain);
   } finally {
     draining = false;
   }
