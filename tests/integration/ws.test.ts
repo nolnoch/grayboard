@@ -673,7 +673,7 @@ test("a fresh lane joins an identity that only ever ran non-main lanes without r
   await fresh.none((x) => x.type === "push");
 });
 
-test("read_lanes compares against the pair's own previous message, not the global id below (N4)", async () => {
+test("read_lanes compares against the sender's previous message to the recipient, not the global id below (N4)", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   const carol = await login("carol@example.com");
@@ -689,8 +689,8 @@ test("read_lanes compares against the pair's own previous message, not the globa
 
   // fe↔be exchange, then an UNRELATED pair's message takes the very next
   // global id, then fe↔be again. "Caught up before this message" must mean
-  // the pair's previous message — with the old `id - 1` compare, the noise
-  // message's id hid the recipient's read state.
+  // the sender's previous message ADDRESSED TO the recipient — with the old
+  // `id - 1` compare, the noise message's id hid the recipient's read state.
   const one = await fe.request({ type: "send", recipient: "bob@example.com/be", body: "one" });
   await be.next((x) => x.type === "push");
   await be.request({ type: "ack", message_ids: [one.message_id] });

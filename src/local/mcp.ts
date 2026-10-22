@@ -283,9 +283,12 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     const p = pending ? { pending: true } : {};
     // Fleet delivery truth, like the server's send_ok: how many of the
     // recipient's lanes are live, and which had read past this point — the
-    // pair's own previous message, not `id - 1`: ids are global, and an
-    // unrelated pair may hold the id in between. Surfaced only when it says
-    // more than the default, so single-session results stay unchanged.
+    // sender's previous message ADDRESSED TO the recipient (directional: an
+    // either-direction compare counts the recipient's own reply, which sits
+    // above its receive cursor forever, hiding read state after the first
+    // back-and-forth), not `id - 1`: ids are global, and an unrelated pair
+    // may hold the id in between. Surfaced only when it says more than the
+    // default, so single-session results stay unchanged.
     const { live, any: delivered } = await pokeLanes(recipient);
     const fleet: Record<string, unknown> = {};
     if (recipient === IDENTITY || live > 1) {

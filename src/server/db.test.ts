@@ -165,13 +165,13 @@ describe("Repo", () => {
     expect(detail).not.toContain("SCAN cursors");
   });
 
-  test("previousBetween is the pair's own previous message, not the global id below", () => {
+  test("previousBetween is the sender's previous message ADDRESSED TO the recipient, not the global id below", () => {
     // Message ids are global: an unrelated pair can hold the id just below
     // this one, so "caught up to just before it" must compare against the
-    // pair's own previous message (N4). Directional — only messages ADDRESSED
-    // TO the recipient: the recipient's own reply sits above its receive
-    // cursor forever, so a bidirectional compare would hide the read state
-    // after the first back-and-forth.
+    // sender's previous message to the recipient (N4). DIRECTIONAL — only
+    // messages addressed TO the recipient: the recipient's own reply sits
+    // above its receive cursor forever, so a bidirectional compare would
+    // hide the read state after the first back-and-forth.
     const u = repo.users.upsertByEmail("you@example.com", null);
     repo.identities.create(u.id, "fe");
     repo.identities.create(u.id, "sim");

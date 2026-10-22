@@ -136,8 +136,9 @@ test("lanes of one identity run side by side; each DM is delivered exactly once 
   // EXACTLY once — toBe(1), not toBeGreaterThanOrEqual(1).
   {
     // The first send is the deterministic fleet-truth case: both lanes are
-    // caught up past the pair's previous message (a because it read it, b
-    // because its startup seeding synced to the read point).
+    // caught up past the sender's previous message to the recipient (a
+    // because it read it, b because its startup seeding synced to the read
+    // point).
     const r = await call(sim, "dm_send", { to: "be", body: "second" });
     expect(r.live_lanes).toBe(2);
     expect(r.read_lanes.sort()).toEqual(["research", "scratch"]);

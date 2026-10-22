@@ -754,10 +754,13 @@ function handleSend(
 
 // Fleet delivery truth for send_ok: how many of the recipient identity's
 // lanes are live, and which lanes are caught up to just before this message.
-// "Just before" is the PAIR's own previous message, not messageId - 1: ids
+// "Just before" is the sender's previous message ADDRESSED TO the recipient
+// (directional — NOT any message in the pair: the recipient's own reply sits
+// above its receive cursor forever, so an either-direction compare hides
+// read state after the first back-and-forth), and not messageId - 1: ids
 // are global, and an unrelated pair may hold the id in between (N4). A fresh
 // message can't have been read by anyone yet; "caught up before it" is the
-// honest sender-side marker — empty when this is the pair's first message.
+// honest sender-side marker — empty when this is their first exchange.
 function fleetTruth(hub: Hub, repo: Repo, senderFull: string, recipientFull: string, messageId: number): { live_lanes: number; read_lanes: string[] } {
   const live = fleetConns(hub, recipientFull).filter((ws) => ws.data.ready).length;
   const prev = repo.messages.previousBetween(senderFull, recipientFull, messageId);
