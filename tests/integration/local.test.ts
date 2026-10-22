@@ -291,6 +291,108 @@ test("the lane that loses the claim race is not woken by deferred items alone (D
   expect([...a.pushes, ...b.pushes].filter((p) => p.startsWith("answer")).length).toBeLessThanOrEqual(24);
 }, 45_000);
 
+test("prune keeps delivered markers above a stuck claim; only the read point's own markers go (round-6 item 1)", async () => {
+  // A stuck undelivered claim holds the read point below itself; delivered
+  // markers ABOVE it must survive any age, or the lane that later takes the
+  // stuck claim over re-delivers them (the reviewer's 24h repro). Markers at
+  // or below the read point are unreachable by any future scan (every drain
+  // syncs its cursor to the read point first), so aging them out is safe.
+  // Prune runs inside the sessions (a drain's sweep); rows are asserted on
+  // the database directly. Aged markers are aged past DM_CLAIM_RETENTION_MS.
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const stuck = await call(sim, "dm_send", { to: "be", body: "stuck" });    // N
+  const above1 = await call(sim, "dm_send", { to: "be", body: "above-1" }); // N+1
+  const above2 = await call(sim, "dm_send", { to: "be", body: "above-2" }); // N+2
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_RETENTION_MS } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  const now = Date.now();
+  const aged = now - DM_CLAIM_RETENTION_MS - 1_000;
+  const marker = (id: number) =>
+    db.prepare(`INSERT OR REPLACE INTO dm_claims (message_id, claimer, claimed_at, delivered_at) VALUES (?, 'be#marker', ?, ?)`)
+      .run(id, aged, aged);
+  marker(above1.message_id);
+  marker(above2.message_id);
+  // A FRESH undelivered claim on N: the read point clamps below it even
+  // though the recipient's cursor row reads past N+2.
+  db.prepare(`INSERT OR REPLACE INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(stuck.message_id, now - 1_000);
+  db.prepare(`INSERT OR REPLACE INTO cursors (reader, last_seen_id) VALUES ('be', ?)`).run(above2.message_id);
+  // A draining session runs pruneDmClaims (its sweep): everything for 'be'
+  // sits above the clamped read point, so all of it survives any age.
+  await start("fe");
+  await Bun.sleep(300);
+  const present = (id: number) => !!db.prepare(`SELECT 1 FROM dm_claims WHERE message_id = ?`).get(id);
+  expect(present(stuck.message_id)).toBe(true);
+  expect(present(above1.message_id)).toBe(true);
+  expect(present(above2.message_id)).toBe(true);
+  // Deliver the stuck claim and age its row: the read point releases past
+  // N+2, every marker is now at-or-below it and aged — the next drain's
+  // prune takes them all.
+  db.prepare(`UPDATE dm_claims SET delivered_at = ?, claimed_at = ? WHERE message_id = ?`).run(now, aged, stuck.message_id);
+  await call(sim, "peer_list"); // pokes every handle: fe drains, prune runs
+  await Bun.sleep(300);
+  expect(present(stuck.message_id)).toBe(false);
+  expect(present(above1.message_id)).toBe(false);
+  expect(present(above2.message_id)).toBe(false);
+  db.close();
+}, 20_000);
+
+test("a skipped live claim arms its own TTL retry: a crashed claimer's DM delivers with no other wake (round-6 item 2)", async () => {
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const stuck = await call(sim, "dm_send", { to: "be", body: "ttl-armed" });
+  expect(stuck.delivered_now).toBe(false);
+  // A ghost claim with a generous remaining TTL (~2.5 s): a live lane's
+  // drain skips it and must arm the retry itself — no further send or poke
+  // happens in this test, so only the armed timer can deliver the message.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  db.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(stuck.message_id, Date.now() - DM_CLAIM_TTL_MS + 2_500);
+  db.close();
+  // The startup drain skips the live claim (nothing delivered, no board
+  // items) and arms the retry for the remaining TTL.
+  const live = await startCollecting("be", "research");
+  await Bun.sleep(300);
+  expect(live.pushes).toEqual([]);
+  // No traffic of any kind: the armed timer fires past the TTL, the drain
+  // takes the expired claim over, and the message delivers exactly once.
+  await Bun.sleep(3_500);
+  expect(live.pushes).toEqual(["ttl-armed"]);
+}, 20_000);
+
+test("a pre-delivered_at dm_claims row is backfilled as delivered, not clamped forever (round-6 item 3)", async () => {
+  // A round-4-shaped database: dm_claims without the delivered_at column.
+  // The guarded ALTER adds it; the same branch backfills every row as
+  // delivered (claimed_at), or they read as undelivered forever, clamping
+  // the read point below themselves and re-delivering on takeover.
+  const { Database } = await import("bun:sqlite");
+  const old = new Database(join(dir, "bus.db"));
+  old.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+              body TEXT NOT NULL, parent_id INTEGER, created_at INTEGER NOT NULL);
+            CREATE TABLE cursors (reader TEXT PRIMARY KEY, last_seen_id INTEGER NOT NULL);
+            CREATE TABLE dm_claims (message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+              claimer TEXT NOT NULL, claimed_at INTEGER NOT NULL);
+            INSERT INTO messages (sender, recipient, body, created_at) VALUES ('sim', 'be', 'old-claim', 1);
+            INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (1, 'be#ghost', 1111);`);
+  old.close();
+  const be = await startCollecting("be", "research");
+  await Bun.sleep(300);
+  // Backfilled as delivered: no re-delivery at startup…
+  expect(be.pushes).toEqual([]);
+  // …and no clamp: the row carries delivered_at = claimed_at.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  const row = db.prepare(`SELECT delivered_at FROM dm_claims WHERE message_id = 1`).get() as { delivered_at: number };
+  expect(row.delivered_at).toBe(1111);
+  db.close();
+}, 20_000);
+
 test("a second session on a live lane fails loudly instead of shadowing it", async () => {
   const first = await start("be", dir, [CLI, "mcp", "--mode", "local"], "research");
   const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "local"], {

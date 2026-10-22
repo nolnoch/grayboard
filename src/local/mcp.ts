@@ -32,6 +32,7 @@ import {
   insertMessage,
   lanesReadPast,
   markClaimDelivered,
+  nextClaimExpiry,
   previousBetween,
   pruneDmClaims,
   readPointFor,
@@ -401,6 +402,20 @@ let draining = false;
 // session is the natural time to see them.
 let firstDrain = true;
 
+// One armed TTL-retry drain: a drain that skips a live claim must not leave
+// the takeover waiting for the next unrelated wake, which might be hours
+// away — the claimer may be dead (round-6 item 2). Replaced, never stacked;
+// unref'd so it can't hold the process open on its own.
+let claimRetry: ReturnType<typeof setTimeout> | null = null;
+function armClaimRetry(delayMs: number): void {
+  if (claimRetry !== null) clearTimeout(claimRetry);
+  claimRetry = setTimeout(() => {
+    claimRetry = null;
+    void drainToClaude();
+  }, Math.max(delayMs, 0));
+  (claimRetry as { unref?: () => void }).unref?.();
+}
+
 // Claude Code drops notifications that arrive before it sends `initialized`,
 // so the startup drain (and any early wakeup) waits for it.
 let markInitialized!: () => void;
@@ -477,6 +492,16 @@ async function drainToClaude(): Promise<void> {
       // do): nothing more for this lane — the siblings' deliveries move the
       // read point, and this lane's next drain syncs past them.
       if (!deliveredDm && boardItems.length === 0) break;
+    }
+    // A live claim this drain skipped may belong to a claimer that died:
+    // nothing else fires the takeover (the next DM or poke could be hours
+    // away), so arm one retry for the claim's remaining TTL. No pending
+    // claim clears an earlier arm — its claimer delivered (round-6 item 2).
+    const expiry = nextClaimExpiry(IDENTITY);
+    if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
+    else if (claimRetry !== null) {
+      clearTimeout(claimRetry);
+      claimRetry = null;
     }
   } finally {
     draining = false;

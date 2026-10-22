@@ -13,6 +13,13 @@ export type Session  = { id: number; user_id: number; token_hash: string; create
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
+
+// The statement `cursors.directFor` executes, exported so the EXPLAIN pin
+// (db.test.ts) runs the SQL the code runs — a hand-copied query in the test
+// can drift back to the old `= x OR range` form while the code keeps the
+// index-shaped range (round-6 item 4).
+export const DIRECT_FOR_SQL = `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
+  AND (stream_ref >= ? AND stream_ref < ? || '$')`;
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
 // thread_ts: the Slack top-level message. root_id: the grayboard thread's root
@@ -507,10 +514,7 @@ function makeRepo(db: Database): Repo {
         return row?.last_seen_id ?? 0;
       },
       directFor(identityFull) {
-        const row = db.query<{ id: number | null }, [string, string]>(
-          `SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct'
-             AND (stream_ref >= ? AND stream_ref < ? || '$')`,
-        ).get(identityFull, identityFull);
+        const row = db.query<{ id: number | null }, [string, string]>(DIRECT_FOR_SQL).get(identityFull, identityFull);
         return row?.id ?? 0;
       },
       lanesRead(identityFull, messageId) {

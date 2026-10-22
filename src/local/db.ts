@@ -235,9 +235,11 @@ export const DM_CLAIM_TTL_MS = 30_000;
 // A delivered message's claim row stays as its delivery marker (it is never
 // released on delivery: a sibling whose scan predates the winner's mark must
 // still see it claimed or it re-delivers). DELIVERED rows outlive any
-// conceivable concurrent scan by this much, then go; an UNdelivered row is
-// never pruned — it holds the identity's read point until a lane takes it
-// over past its TTL and delivers it (D1).
+// conceivable concurrent scan by this much; then go — but only at or below
+// the recipient's clamped read point (pruneDmClaims): above it they survive
+// any age, held back with the read point by a stuck undelivered claim. An
+// UNdelivered row is never pruned — it holds the identity's read point until
+// a lane takes it over past its TTL and delivers it (D1).
 export const DM_CLAIM_RETENTION_MS = 24 * 3_600_000;
 
 export type ClaimOutcome = "claimed" | "skip" | "delivered";
@@ -287,9 +289,46 @@ export function markClaimDelivered(id: number): void {
   db.prepare(`UPDATE dm_claims SET delivered_at = ? WHERE message_id = ? AND delivered_at IS NULL`).run(Date.now(), id);
 }
 
-/** Delivery-marker rows old enough that no live scan can still hold their message. */
+/**
+ * Delivered-marker rows no future scan can reach: past the retention
+ * window AND at or below the recipient's clamped read point. Every drain
+ * syncs its lane's cursor up to the read point before scanning, so no scan
+ * starts below it — deleting below it is safe. A marker ABOVE the read
+ * point survives any age: a stuck undelivered claim holds the read point
+ * back, and the lane that later takes that claim over must still find the
+ * later messages marked delivered, or it re-delivers them (round-6 item 1).
+ */
 export function pruneDmClaims(now = Date.now()): void {
-  db.prepare(`DELETE FROM dm_claims WHERE delivered_at IS NOT NULL AND claimed_at < ?`).run(now - DM_CLAIM_RETENTION_MS);
+  const aged = now - DM_CLAIM_RETENTION_MS;
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT m.recipient AS r FROM dm_claims d JOIN messages m ON m.id = d.message_id
+        WHERE d.delivered_at IS NOT NULL AND d.claimed_at < ?`,
+    )
+    .all(aged) as { r: string }[];
+  for (const { r } of rows) {
+    db.prepare(
+      `DELETE FROM dm_claims WHERE delivered_at IS NOT NULL AND claimed_at < ?
+         AND message_id IN (SELECT m.id FROM messages m WHERE m.recipient = ? AND m.id <= ?)`,
+    ).run(aged, r, readPointFor(r));
+  }
+}
+
+/**
+ * When the identity's oldest live (unexpired, undelivered) claim expires:
+ * the delay a drain that skipped the claim must wait before it can take it
+ * over. Null when no live claim holds. A drain that skips a live claim arms
+ * a retry for this, so a crashed claimer's message doesn't wait for an
+ * unrelated wake (round-6 item 2).
+ */
+export function nextClaimExpiry(identity: string, now = Date.now(), ttlMs = DM_CLAIM_TTL_MS): number | null {
+  const row = db
+    .prepare(
+      `SELECT MIN(cl.claimed_at) AS t FROM dm_claims cl JOIN messages m ON m.id = cl.message_id
+        WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.claimed_at > ?`,
+    )
+    .get(identity, now - ttlMs) as { t: number | null } | undefined;
+  return row?.t == null ? null : row.t + ttlMs;
 }
 
 /**

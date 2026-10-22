@@ -3,7 +3,7 @@ import { Glob } from "bun";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, type Repo } from "./db.ts";
+import { openDatabase, DIRECT_FOR_SQL, type Repo } from "./db.ts";
 import { startSession, laneStreamRef } from "../core/boards.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
@@ -147,14 +147,13 @@ describe("Repo", () => {
     // cursors scan (EXPLAIN said "SCAN cursors"). A single range predicate
     // (`>= x AND < x || '$'`) keeps stream_ref INSIDE the index bounds; the
     // old `= x OR range` form left stream_ref out of the index constraints.
+    // EXPLAIN the statement the code executes (DIRECT_FOR_SQL), not a
+    // hand-copied query: a copy can drift back to the OR form while the
+    // code keeps the range (round-6 item 4).
     const beUser = repo.users.upsertByEmail("be@example.com", null);
     repo.identities.create(beUser.id, "be");
     const plan = db
-      .prepare(
-        `EXPLAIN QUERY PLAN SELECT MAX(last_seen_id) AS id FROM cursors
-          WHERE stream_type = 'direct'
-            AND (stream_ref >= ? AND stream_ref < ? || '$')`,
-      )
+      .prepare(`EXPLAIN QUERY PLAN ${DIRECT_FOR_SQL}`)
       .all("be@example.com/be", "be@example.com/be") as { detail: string }[];
     const detail = plan.map((p) => p.detail).join(" ");
     expect(detail).toContain("USING INDEX idx_cursors_stream");

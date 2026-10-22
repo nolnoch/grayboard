@@ -68,7 +68,8 @@ export type SendOk      = {
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
   // Fleet delivery truth: how many of the recipient identity's lanes are
-  // live, and which lanes have read (acked) this message.
+  // live, and which of its lanes have read past the sender's previous
+  // message to the recipient (a just-sent message cannot be acked yet).
   live_lanes?: number;
   read_lanes?: string[];
 };

@@ -50,9 +50,10 @@ export function openLocalDb(path = localDbPath()): Database {
     -- re-delivering (it is never released on success — releasing would
     -- reopen the duplicate window); a row past its TTL (the claimer crashed
     -- mid-handle) is taken over by another lane, DELIVERED rows are pruned
-    -- after a day, and an undelivered row is never pruned — it holds the
-    -- identity's read point until some lane takes it over and delivers it.
-    -- Delivery is at-least-once at the claim level, exactly-once per attempt.
+    -- after a day — only at or below the recipient's clamped read point —
+    -- and an undelivered row is never pruned — it holds the identity's read
+    -- point until some lane takes it over and delivers it. Delivery is
+    -- at-least-once at the claim level, exactly-once per attempt.
     CREATE TABLE IF NOT EXISTS dm_claims (
       message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       claimer    TEXT NOT NULL,
@@ -61,9 +62,22 @@ export function openLocalDb(path = localDbPath()): Database {
     );
   `);
   // dm_claims.delivered_at, added after the claims themselves (D1: the
-  // marker that keeps a crashed claimer's message from being lost).
+  // marker that keeps a crashed claimer's message from being lost). Rows
+  // from before the column read as undelivered forever and clamp the read
+  // point below themselves, so the same branch backfills them as delivered
+  // (branch-only data: shipped builds never wrote these rows).
   const claimCols = db.prepare(`PRAGMA table_info(dm_claims)`).all() as { name: string }[];
-  if (!claimCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE dm_claims ADD COLUMN delivered_at INTEGER`);
+  if (!claimCols.some((c) => c.name === "delivered_at")) {
+    db.exec(`ALTER TABLE dm_claims ADD COLUMN delivered_at INTEGER`);
+    db.exec(`UPDATE dm_claims SET delivered_at = claimed_at WHERE delivered_at IS NULL`);
+  }
+  // A partial index over the pending (undelivered) claims only. The clamp
+  // queries' CURRENT plans (EXPLAIN) drive from messages and probe
+  // dm_claims by rowid, so this index changes no plan today — it is the
+  // shape a pending-first clamp rewrite needs (bounding the scan by the
+  // number of stuck claims instead of the recipient's messages), which
+  // remains open (round-6 low item).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_dm_claims_pending ON dm_claims(message_id) WHERE delivered_at IS NULL`);
   // dm_send pending: the sender owes a follow-up in the thread.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
