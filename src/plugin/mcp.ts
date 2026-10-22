@@ -7,12 +7,15 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
-import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
+import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
+import {
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, dispositionFilename, formatAttachmentsMeta, readAttachmentFiles, saveAttachment,
+} from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // Team boards are members-only on the server; this keeps their content from
@@ -52,6 +55,8 @@ function loadCredentials(): Credentials {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const identity = sessionIdentity();
+// Directories this session may attach files from and save them to.
+const ROOTS = attachRoots();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
 // Claude Code started without a channels flag drops pushes silently; say so.
@@ -92,6 +97,7 @@ const client = new GrayboardClient(
       created_at: String(msg.created_at),
     };
     if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+    if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
     if (await fromOwnHuman(msg.sender)) meta.human = "true";
     return notify({ content: msg.body, meta });
   },
@@ -159,7 +165,7 @@ const TOOLS = [
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description:
-      `dm_send(to, body, parent_id?, pending?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -167,6 +173,7 @@ const TOOLS = [
         body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
         parent_id: { type: "number", description: "Optional. message_id to reply to." },
         pending:   PENDING_PARAM,
+        attachments: ATTACHMENTS_PARAM,
       },
       required: ["to", "body"],
     },
@@ -196,7 +203,8 @@ const TOOLS = [
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
   DM_RETRACT_TOOL,
-...boardTools({ teams: true }),
+  ATTACHMENT_GET_TOOL,
+  ...boardTools({ teams: true }),
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -228,15 +236,19 @@ async function call(name: string, a: Record<string, unknown>) {
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
     if (isBoardTool(name)) {
-      return text((await client.request<CallOk>({ type: "call", tool: name, args: a })).result);
+      const { attachments: paths, ...args } = a;
+      const ids = await upload(paths);
+      return text((await client.request<CallOk>({ type: "call", tool: name, args: ids.length ? { ...args, attachment_ids: ids } : args })).result);
     }
     if (name === "dm_send") {
+      const ids = await upload(a.attachments);
       const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
         type: "send",
         recipient: a.to,
         body: a.body,
         ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
         ...(a.pending === true ? { pending: true } : {}),
+        ...(ids.length ? { attachment_ids: ids } : {}),
       });
       // A server from before pending ignores the field, which would lose the promise silently.
       if (a.pending === true && !rest.pending) {
@@ -273,11 +285,50 @@ async function call(name: string, a: Record<string, unknown>) {
     if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);
     }
+    if (name === "attachment_get") {
+      if (!Number.isInteger(a.id)) return { ...text("error: id must be an attachment id"), isError: true };
+      const res = await api().download(`/api/attachments/${a.id}?identity=${encodeURIComponent(identity)}`);
+      const data = new Uint8Array(await res.arrayBuffer());
+      const info = {
+        id: a.id as number,
+        filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
+        type: res.headers.get("content-type") ?? "application/octet-stream",
+        size: data.length,
+      };
+      const path = await saveAttachment(info, data, a.dir, ROOTS);
+      return text({ path, filename: info.filename, type: info.type, size: info.size });
+    }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
     // Server errors arrive as "code: message"; show them to the agent.
     return { ...text(`error: ${(e as Error).message}`), isError: true };
   }
+}
+
+// The server's HTTP API as this session's user, with the current token.
+const api = () => new ApiClient(serverUrl, currentToken());
+
+// Reads and checks the files an agent named (all before any is sent), then
+// uploads each as this identity. The server checks them again and binds them
+// to the dm_send or board_post that names their ids; unsent ones expire.
+async function upload(paths: unknown): Promise<number[]> {
+  if (paths === undefined) return [];
+  // A server from before attachment_limits gets the defaults, its own then.
+  const files = await readAttachmentFiles(paths, ROOTS, { limits: hello.attachment_limits });
+  const ids: number[] = [];
+  for (const f of files) {
+    const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
+    try {
+      ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
+    } catch (e) {
+      // The router's catch-all: a server from before attachments.
+      if (e instanceof ApiError && e.status === 404 && e.message === "not found") {
+        throw new Error("this server doesn't take attachments; it needs updating");
+      }
+      throw e;
+    }
+  }
+  return ids;
 }
 
 // ── start stdio transport ─────────────────────────────────────────────────────

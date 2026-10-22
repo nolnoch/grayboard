@@ -10,6 +10,10 @@ import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from ".
 import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
+import {
+  attachmentData, attachmentLimits, canReadAttachment, getAttachment, pruneUnbound, storeAttachment, unboundBytes,
+} from "../core/attachments.ts";
+import { UNBOUND_TTL_MS, contentDisposition, formatSize, sanitizeFilename, sniffType, unboundCap } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
@@ -179,6 +183,75 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
   return json({ ok: true });
 }
 
+// ── attachments ──────────────────────────────────────────────────────────────
+
+// The caller's identity named by ?identity=, as a full handle, or why not.
+// The Slack bridge's human identity stores its files in-process, not here.
+function ownIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Response {
+  const name = url.searchParams.get("identity")?.toLowerCase();
+  if (!name) return badRequest("identity required");
+  if (name === HUMAN_NAME) return forbidden(HUMAN_RESERVED);
+  if (!repo.identities.findByUserAndName(authed.user_id, name)) return jsonErr("not_found", `you have no identity "${name}"`, 404);
+  return `${authed.user_email}/${name}`;
+}
+
+// POST /api/attachments?identity=&filename=, the file's bytes as the body.
+// The session's MCP process has already checked the path it came from; this
+// checks what arrives (size, type, the user's unsent total) and stores it
+// unbound, for a dm_send or board_post by that identity to carry.
+async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+  const handle = ownIdentity(url, authed, repo);
+  if (handle instanceof Response) return handle;
+  const rawName = url.searchParams.get("filename");
+  if (!rawName) return badRequest("filename required");
+  const limits = attachmentLimits(db);
+  const tooLarge = () => jsonErr("too_large", `exceeds this server's ${formatSize(limits.file)} limit per file`, 413);
+  if (Number(req.headers.get("content-length") ?? "0") > limits.file) return tooLarge();
+  const data = new Uint8Array(await req.arrayBuffer());
+  if (data.length === 0) return badRequest("empty file");
+  if (data.length > limits.file) return tooLarge();
+  const filename = sanitizeFilename(rawName);
+  const type = sniffType(data, filename);
+  if (!type) return badRequest("not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text");
+  const now = Date.now();
+  pruneUnbound(db, now - UNBOUND_TTL_MS);
+  const cap = unboundCap(limits);
+  if (unboundBytes(db, `${authed.user_email}/`) + data.length > cap) {
+    return jsonErr("too_large", `your unsent uploads would exceed ${formatSize(cap)}; send or wait for them to expire`, 413);
+  }
+  const row = storeAttachment(db, handle, { filename, type, data }, now);
+  writeAudit(repo, "attachment.uploaded", authed.user_email, `attachment:${row.id}`, {
+    identity: handle, filename, type, size: row.size, sha256: row.sha256,
+  });
+  return json({ id: row.id, filename, type, size: row.size, sha256: row.sha256 }, 201);
+}
+
+// GET /api/attachments/<id>?identity=: the file, for an identity that can
+// read the message or post carrying it. One it can't reads as missing.
+function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+  const handle = ownIdentity(url, authed, repo);
+  if (handle instanceof Response) return handle;
+  const id = Number(idStr);
+  const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
+  const dmVisible = (messageId: number) => {
+    const m = repo.messages.getById(messageId);
+    return !!m && m.recipient_type === "user" && (m.sender === handle || m.recipient === handle);
+  };
+  if (!row || !canReadAttachment(db, handle, row, dmVisible)) {
+    writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
+    return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
+  }
+  writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
+  return new Response(new Uint8Array(attachmentData(db, row.sha256)), {
+    headers: {
+      "Content-Type": row.type,
+      "Content-Disposition": contentDisposition(row.filename),
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "private, no-store",
+    },
+  });
+}
+
 // ── teams ────────────────────────────────────────────────────────────────────
 
 function teamList(authed: AuthedUser, repo: Repo): Response {
@@ -336,6 +409,11 @@ export async function handleHttp(
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake);
+
+  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db);
+  if (path.startsWith("/api/attachments/") && method === "GET") {
+    return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
+  }
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);

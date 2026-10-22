@@ -52,23 +52,30 @@ export class ApiClient {
       headers: { ...headers, ...(options.headers as Record<string, string> | undefined ?? {}) },
     });
 
-    let body: unknown;
-    try { body = await res.json(); } catch { body = {}; }
-
-    if (!res.ok) {
-      const errBody = body as { code?: string; message?: string };
-      throw new ApiError(
-        errBody.message ?? `HTTP ${res.status}`,
-        errBody.code ?? "error",
-        res.status,
-      );
-    }
-    return body;
+    if (!res.ok) throw await apiError(res);
+    try { return await res.json(); } catch { return {}; }
   }
 
   get(path: string)                  { return this.fetch(path); }
   post(path: string, body?: unknown) { return this.fetch(path, { method: "POST",  body: body !== undefined ? JSON.stringify(body) : undefined }); }
   del(path: string)                  { return this.fetch(path, { method: "DELETE" }); }
+  // A raw body (an attachment upload); the answer is JSON.
+  upload(path: string, data: Uint8Array) {
+    return this.fetch(path, { method: "POST", body: new Uint8Array(data), headers: { "Content-Type": "application/octet-stream" } });
+  }
+
+  // A raw answer (an attachment download), for the caller to read.
+  async download(path: string): Promise<Response> {
+    const res = await fetch(`${this.baseUrl}${path}`, { headers: this.token ? { Authorization: `Bearer ${this.token}` } : {} });
+    if (!res.ok) throw await apiError(res);
+    return res;
+  }
+}
+
+async function apiError(res: Response): Promise<ApiError> {
+  let body: { code?: string; message?: string } = {};
+  try { body = await res.json() as typeof body; } catch { /* not JSON, e.g. a proxy's page */ }
+  return new ApiError(body.message ?? `HTTP ${res.status}`, body.code ?? "error", res.status);
 }
 
 export class ApiError extends Error {

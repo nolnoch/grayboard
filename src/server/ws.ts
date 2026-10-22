@@ -21,6 +21,7 @@ import {
   type PendingRef,
 } from "../core/boards.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { attachmentIds, attachmentLimits } from "../core/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
@@ -195,7 +196,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
             err(ws, msg.req_id, "bad_request", "already authenticated");
             break;
           case "send":
-            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
+            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
             break;
           case "history":
             handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -369,6 +370,7 @@ async function handleHello(
     user_email: authed.user_email,
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    attachment_limits: attachmentLimits(db),
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -426,10 +428,13 @@ function handleSend(
   body: string,
   parentId: number | null,
   pending: boolean,
+  attachmentIdsRaw: unknown,
 ): void {
   const { repo, db, registry } = hub;
+  let ids: number[];
   try {
     dmBody(body);
+    ids = attachmentIds(attachmentIdsRaw);
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
@@ -472,8 +477,14 @@ function handleSend(
     return;
   }
 
-  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending);
-  const p = pending ? { pending: true as const } : {};
+  let msg: MessageRow;
+  try {
+    msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending, ids);
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    throw e;
+  }
+  const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
   let deliveredNow = false;
   const recipientWs = registry.get(parsed.full);

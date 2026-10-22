@@ -5,6 +5,8 @@ import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
+import { DEFAULT_ATTACHMENT_LIMITS } from "../shared/attachments.ts";
+import { setAttachmentLimits } from "../core/attachments.ts";
 
 export type StartOptions = WsOptions & {
   // Tests skip the nightly retention timer and heartbeat.
@@ -14,6 +16,8 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, humanReach);
+  const attachmentLimits = config.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
+  setAttachmentLimits(db, attachmentLimits);
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
@@ -31,6 +35,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const server = Bun.serve<WsData>({
     port: config.httpPort,
     idleTimeout: 75,
+    // The largest body is an attachment upload (src/server/http.ts).
+    maxRequestBodySize: attachmentLimits.file + 64 * 1024,
 
     fetch(req, server) {
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {

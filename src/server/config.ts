@@ -1,4 +1,5 @@
 import type { HumanReach } from "./can_send.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type Config = {
   dbPath: string;
@@ -14,6 +15,8 @@ export type Config = {
   admins: string[];
   // Who can reach another user's human; default "team".
   humanReach?: HumanReach;
+  // Attachment size caps per file and per message; default local mode's.
+  attachmentLimits?: AttachmentLimits;
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -46,8 +49,22 @@ export function loadConfig(): Config {
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
+    attachmentLimits: parseAttachmentLimits(process.env),
     ...slackConfig(),
   };
+}
+
+function parseAttachmentLimits(env: Record<string, string | undefined>): AttachmentLimits {
+  const bytes = (name: string, fallback: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return fallback;
+    if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive number of bytes, not "${raw}"`);
+    return Number(raw);
+  };
+  const file = bytes("GRAYBOARD_ATTACHMENT_MAX_BYTES", DEFAULT_ATTACHMENT_LIMITS.file);
+  const total = bytes("GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_ATTACHMENT_LIMITS.total);
+  if (file > total) throw new Error("GRAYBOARD_ATTACHMENT_MAX_BYTES can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
+  return { file, total };
 }
 
 function parseReach(raw: string | undefined): HumanReach {

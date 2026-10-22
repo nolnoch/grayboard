@@ -6,7 +6,9 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 
 import { CoreError, canSeeBoard, getPost } from "./boards.ts";
-import { MAX_ATTACHMENTS, MAX_ATTACHMENTS_TOTAL_BYTES, UNBOUND_TTL_MS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
+import {
+  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, UNBOUND_TTL_MS, formatSize, type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
+} from "../shared/attachments.ts";
 
 export type AttachmentRow = AttachmentInfo & {
   sha256: string;
@@ -20,6 +22,17 @@ export type AttachTarget = { message_id: number } | { post_id: number };
 type Kind = "message_id" | "post_id";
 
 const INFO = `id, filename, type, size`;
+
+const limitsByDb = new WeakMap<Database, AttachmentLimits>();
+
+// A server's configured limits for this database; local mode keeps the defaults.
+export function setAttachmentLimits(db: Database, limits: AttachmentLimits): void {
+  limitsByDb.set(db, limits);
+}
+
+export function attachmentLimits(db: Database): AttachmentLimits {
+  return limitsByDb.get(db) ?? DEFAULT_ATTACHMENT_LIMITS;
+}
 
 // Stores one checked file as an unbound upload of `uploader`'s. Identical
 // bytes share one blob. Also prunes uploads left unbound past their TTL.
@@ -65,7 +78,8 @@ export function bindAttachments(db: Database, ids: number[], uploader: string, t
     }
     total += r.size;
   }
-  if (total > MAX_ATTACHMENTS_TOTAL_BYTES) throw new CoreError(`attachments exceed ${MAX_ATTACHMENTS_TOTAL_BYTES} bytes in all`);
+  const max = attachmentLimits(db).total;
+  if (total > max) throw new CoreError(`attachments exceed ${formatSize(max)} in all`);
   const [col, value] = "message_id" in target ? ["message_id", target.message_id] : ["post_id", target.post_id];
   db.prepare(`UPDATE attachments SET ${col} = ? WHERE id IN (SELECT value FROM json_each(?))`).run(value, JSON.stringify(ids));
   return ids.map((id) => info(byId.get(id)!));
@@ -132,6 +146,18 @@ export function dropAttachments(db: Database, kind: "message" | "post", ownersSq
   if (shas.length === 0) return;
   db.prepare(`DELETE FROM attachments WHERE ${col} IN (${ownersSql})`).run(...params);
   dropOrphanBlobs(db, shas.map((s) => s.sha256));
+}
+
+// Bytes of unbound uploads held by the handles under `prefix` (a server
+// user's "email/"), for the per-user quota on uploads.
+export function unboundBytes(db: Database, prefix: string): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(size), 0) AS n FROM attachments
+        WHERE message_id IS NULL AND post_id IS NULL AND substr(uploader, 1, length(?)) = ?`,
+    )
+    .get(prefix, prefix) as { n: number };
+  return row.n;
 }
 
 // Uploads no message or post claimed, created before `olderThanMs`.

@@ -1,6 +1,8 @@
 import type { Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { prunePosts, type CoreDb } from "../core/boards.ts";
+import { pruneUnbound } from "../core/attachments.ts";
+import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 
 export function pruneMessages(repo: Repo, cutoffMs: number): void {
   repo.messages.prune(cutoffMs);
@@ -30,6 +32,7 @@ export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void
       pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
       prunePosts(db, now - config.messageRetentionDays * 86_400_000);
       pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
+      pruneUnbound(db, now - UNBOUND_TTL_MS);
     } catch (e) {
       console.error("[grayboard] retention failed:", e);
     }

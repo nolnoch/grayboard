@@ -3,16 +3,19 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
+import { bindAttachments, dropAttachments, withAttachments } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
 
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
+// attachments: present on reads when the message carries files.
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; attachments?: AttachmentInfo[] };
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
 // thread_ts: the Slack top-level message. root_id: the grayboard thread's root
@@ -53,7 +56,9 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean): MessageRow;
+    // attachmentIds: the sender's unbound uploads, bound in the insert's
+    // transaction (a refused id throws CoreError and nothing is written).
+    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[]): MessageRow;
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
@@ -218,6 +223,7 @@ function initSchema(db: Database): void {
 }
 
 function makeRepo(db: Database): Repo {
+  const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   return {
     users: {
       upsertByEmail(email, displayName) {
@@ -339,51 +345,54 @@ function makeRepo(db: Database): Repo {
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false) {
-        const r = db.run(
-          `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0],
-        );
-        return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(Number(r.lastInsertRowid))!;
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = []) {
+        return db.transaction(() => {
+          const row = db.query<MessageRow, [string, string, string, string, number | null, number, number]>(
+            `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          ).get(sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
+          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id });
+          return attachments.length ? { ...row, attachments } : row;
+        })();
       },
       getById(id) {
-        return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id) ?? undefined;
+        const row = db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id);
+        return row ? withAttachments(db, "message", [row])[0] : undefined;
       },
       history(identityFull, peer, limit = 20, beforeId) {
         const cap = Math.min(limit, 200);
         if (peer) {
           if (beforeId !== undefined) {
-            return db.query<MessageRow, [string, string, string, string, number, number]>(
+            return att(db.query<MessageRow, [string, string, string, string, number, number]>(
               `SELECT * FROM messages
                WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                  AND recipient_type = 'user' AND id < ?
                ORDER BY id DESC LIMIT ?`,
-            ).all(identityFull, peer, peer, identityFull, beforeId, cap);
+            ).all(identityFull, peer, peer, identityFull, beforeId, cap));
           }
-          return db.query<MessageRow, [string, string, string, string, number]>(
+          return att(db.query<MessageRow, [string, string, string, string, number]>(
             `SELECT * FROM messages
              WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                AND recipient_type = 'user'
              ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, peer, peer, identityFull, cap);
+          ).all(identityFull, peer, peer, identityFull, cap));
         }
         if (beforeId !== undefined) {
-          return db.query<MessageRow, [string, string, number, number]>(
+          return att(db.query<MessageRow, [string, string, number, number]>(
             `SELECT * FROM messages
              WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user')) AND id < ?
              ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, identityFull, beforeId, cap);
+          ).all(identityFull, identityFull, beforeId, cap));
         }
-        return db.query<MessageRow, [string, string, number]>(
+        return att(db.query<MessageRow, [string, string, number]>(
           `SELECT * FROM messages
            WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user'))
            ORDER BY id DESC LIMIT ?`,
-        ).all(identityFull, identityFull, cap);
+        ).all(identityFull, identityFull, cap));
       },
       // The whole thread containing message `id`: walk up to its root, then down.
       thread(id) {
-        return db.query<MessageRow, [number]>(`
+        return att(db.query<MessageRow, [number]>(`
           WITH RECURSIVE up(id, parent_id) AS (
             SELECT id, parent_id FROM messages WHERE id = ?
             UNION ALL
@@ -395,7 +404,7 @@ function makeRepo(db: Database): Repo {
             SELECT m.id FROM messages m JOIN tree t ON m.parent_id = t.id
           )
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
-        `).all(id);
+        `).all(id));
       },
       unreadSince(streams) {
         if (streams.length === 0) return [];
@@ -408,7 +417,7 @@ function makeRepo(db: Database): Repo {
           all.push(...rows);
         }
         all.sort((a, b) => a.id - b.id);
-        return all;
+        return att(all);
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
@@ -420,35 +429,37 @@ function makeRepo(db: Database): Repo {
         ).all(sender, olderThan);
       },
       receivedUnacked(reader, since) {
-        return db.query<MessageRow, [string, number]>(
+        return att(db.query<MessageRow, [string, number]>(
           `SELECT * FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(reader, since);
+        ).all(reader, since));
       },
       sentPending(sender, since) {
-        return db.query<MessageRow, [string, number]>(
+        return att(db.query<MessageRow, [string, number]>(
           `SELECT * FROM messages m
             WHERE m.recipient_type = 'user' AND m.sender = ? AND m.pending = 1 AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(sender, since);
+        ).all(sender, since));
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
       },
       retract(sender, id) {
         return db.transaction(() => {
-          const { changes } = db.run(
-            `DELETE FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+          const retractable = db.query<{ x: number }, [number, string]>(
+            `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT MAX(last_seen_id) FROM cursors
                                    WHERE stream_type = 'direct' AND stream_ref = messages.recipient), 0)
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
-            [id, sender],
-          );
-          if (changes) db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
-          return changes > 0;
+          ).get(id, sender);
+          if (!retractable) return false;
+          dropAttachments(db, "message", "?", id);
+          db.run("DELETE FROM messages WHERE id = ?", [id]);
+          db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
+          return true;
         })();
       },
       prune(olderThanMs) {
@@ -462,6 +473,7 @@ function makeRepo(db: Database): Repo {
             "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)",
             [olderThanMs],
           );
+          dropAttachments(db, "message", "SELECT id FROM messages WHERE created_at < ?", olderThanMs);
           db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
         })();
       },

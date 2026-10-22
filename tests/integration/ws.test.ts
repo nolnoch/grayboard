@@ -762,3 +762,135 @@ test("a tools-only connection works beside the live owner without taking its pus
   const peers = (await b.call("peer_list")).result.peers;
   expect(peers.find((p: any) => p.handle === "alice@example.com/be")?.online).toBe(true);
 });
+
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
+
+async function upload(token: string, identity: string, filename: string, data: Uint8Array | string) {
+  const r = await fetch(`${base}/api/attachments?identity=${identity}&filename=${encodeURIComponent(filename)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: data,
+  });
+  return { status: r.status, body: (await r.json()) as Record<string, any> };
+}
+
+const download = (token: string, identity: string, id: number) =>
+  fetch(`${base}/api/attachments/${id}?identity=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
+
+const audits = (action: string) =>
+  (app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
+
+test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  const c = new Client(carol, "sim");
+  for (const x of [a, b, c]) expect((await x.connect()).type).toBe("hello_ok");
+
+  expect((await upload(alice, "nope", "x.png", PNG)).status).toBe(404);
+  expect((await upload(alice, "human", "x.png", PNG)).status).toBe(403);
+  expect((await upload(alice, "be", "x.bin", new Uint8Array([0, 1, 2]))).body.message).toMatch(/not an image/);
+  expect((await upload(alice, "be", "x.txt", new Uint8Array(0))).body.message).toBe("empty file");
+
+  const up = await upload(alice, "be", "../shot.png", PNG);
+  expect(up.status).toBe(201);
+  expect(up.body).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: PNG.length, sha256: expect.any(String) });
+  const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length };
+  expect(audits("attachment.uploaded")).toEqual([
+    { actor: "alice@example.com", target: `attachment:${up.body.id}`, detail: expect.stringContaining('"identity":"alice@example.com/be"') },
+  ]);
+
+  // Only the uploader's identity can send it.
+  expect(await c.request({ type: "send", recipient: "bob@example.com/fe", body: "mine now", attachment_ids: [up.body.id] })).toMatchObject({
+    type: "error",
+    code: "bad_request",
+    message: `attachment ${up.body.id} isn't an unsent upload of yours`,
+  });
+  const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "see shot", attachment_ids: [up.body.id] });
+  expect(sent).toMatchObject({ type: "send_ok", delivered_now: true, attachments: [info] });
+  expect((await b.next((m) => m.type === "push")).message).toMatchObject({ body: "see shot", attachments: [info] });
+  // Once bound, it can't ride a second message.
+  expect((await a.request({ type: "send", recipient: "bob@example.com/fe", body: "again", attachment_ids: [up.body.id] })).type).toBe("error");
+
+  expect((await b.request({ type: "thread", message_id: sent.message_id })).messages[0].attachments).toEqual([info]);
+  expect((await b.request({ type: "history", peer: "alice@example.com/be" })).messages[0].attachments).toEqual([info]);
+  expect((await b.request({ type: "inbox" })).unanswered[0].attachments).toEqual([info]);
+
+  const got = await download(bob, "fe", up.body.id);
+  expect(got.status).toBe(200);
+  expect(got.headers.get("content-type")).toBe("image/png");
+  expect(got.headers.get("content-disposition")).toBe("attachment; filename*=UTF-8''shot.png");
+  expect(new Uint8Array(await got.arrayBuffer())).toEqual(PNG);
+  expect((await download(alice, "be", up.body.id)).status).toBe(200);
+  // Not a party: reads as missing, and is logged.
+  const refused = await download(carol, "sim", up.body.id);
+  expect(refused.status).toBe(404);
+  expect(((await refused.json()) as { message: string }).message).toBe(`no attachment ${up.body.id} on a message or post you can read`);
+  expect(audits("attachment.download_refused")).toMatchObject([{ actor: "carol@example.com", target: `attachment:${up.body.id}` }]);
+  expect(audits("attachment.downloaded").map((r) => r.actor)).toEqual(["bob@example.com", "alice@example.com"]);
+});
+
+test("attachments on a team board post follow the board; a retracted DM takes its files; uploads are capped", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
+  await api(bob, "POST", "/api/identities", { name: "fe" });
+  const a = new Client(alice, "be");
+  const c = new Client(carol, "sim");
+  for (const x of [a, c]) expect((await x.connect()).type).toBe("hello_ok");
+
+  const up = await upload(alice, "be", "plan.md", "# plan");
+  expect(up.body.type).toBe("text/markdown");
+  // A client can't name paths for the server to read.
+  expect(await a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).toMatchObject({ type: "error" });
+  const posted = await a.call("board_post", { board: "eng", body: "@sim plan attached", attachment_ids: [up.body.id] });
+  const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6 };
+  expect(posted.result.attachments).toEqual([info]);
+  expect((await c.next(boardPush)).item.post.attachments).toEqual([info]);
+  expect((await download(carol, "sim", up.body.id)).status).toBe(200);
+  expect((await download(bob, "fe", up.body.id)).status).toBe(404);
+
+  // bob/fe is offline, so the DM stays retractable.
+  const note = await upload(alice, "be", "note.txt", "retract me");
+  const queued = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "oops", attachment_ids: [note.body.id] });
+  expect(queued.delivered_now).toBe(false);
+  expect((await a.request({ type: "dm_retract", message_id: queued.message_id })).type).toBe("ack_ok");
+  expect((await download(alice, "be", note.body.id)).status).toBe(404);
+  expect(app.db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256)).toEqual({ n: 0 });
+
+  const big = new Uint8Array(10 * 1024 * 1024).fill(0x61);
+  expect((await upload(alice, "be", "big.txt", new Uint8Array(big.length + 1).fill(0x61))).status).toBe(413);
+  // 50MB of unsent uploads per user, across their identities.
+  for (let i = 0; i < 5; i++) {
+    big[0] = 0x62 + i;
+    expect((await upload(alice, "be", `big${i}.txt`, big)).status).toBe(201);
+  }
+  const over = await upload(alice, "be", "one-more.txt", "x");
+  expect(over.status).toBe(413);
+  expect(over.body.message).toMatch(/unsent uploads would exceed 50MB/);
+  expect((await upload(carol, "sim", "theirs.txt", "x")).status).toBe(201);
+});
+
+test("a server's own attachment limits: sent in hello_ok, enforced per file, per message and on unsent uploads", async () => {
+  app.stop();
+  app = startServer(config({ attachmentLimits: { file: 100, total: 150 } }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const alice = await login("alice@example.com");
+  const a = new Client(alice, "be");
+  expect((await a.connect()).attachment_limits).toEqual({ file: 100, total: 150 });
+
+  expect((await upload(alice, "be", "big.txt", "x".repeat(101))).body.message).toBe("exceeds this server's 100B limit per file");
+  const one = await upload(alice, "be", "a.txt", "a".repeat(80));
+  const two = await upload(alice, "be", "b.txt", "b".repeat(80));
+  expect(await a.request({ type: "send", recipient: "be", body: "both", attachment_ids: [one.body.id, two.body.id] })).toMatchObject({
+    type: "error",
+    message: "attachments exceed 150B in all",
+  });
+  // Unsent uploads are capped at twice the per-message total.
+  await upload(alice, "be", "c.txt", "c".repeat(80));
+  expect((await upload(alice, "be", "d.txt", "d".repeat(80))).body.message).toMatch(/unsent uploads would exceed 300B/);
+});

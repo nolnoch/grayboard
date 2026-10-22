@@ -8,11 +8,15 @@ import { basename, delimiter, extname, isAbsolute, join, relative, resolve, sep 
 
 import { CoreError } from "../core/boards.ts";
 
-export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_ATTACHMENTS = 5;
-export const MAX_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024;
+// Size caps per file and per message or post. A server sets its own
+// (src/server/config.ts) and tells clients in hello_ok; local mode uses these.
+export type AttachmentLimits = { file: number; total: number };
+export const DEFAULT_ATTACHMENT_LIMITS: AttachmentLimits = { file: 10 * 1024 * 1024, total: 25 * 1024 * 1024 };
 // An upload no message or post claimed within this long is dropped.
 export const UNBOUND_TTL_MS = 3_600_000;
+// How many bytes of unsent uploads one user may hold on a server at a time.
+export const unboundCap = (limits: AttachmentLimits): number => 2 * limits.total;
 
 // What reads and pushes show for each attachment.
 export type AttachmentInfo = { id: number; filename: string; type: string; size: number };
@@ -105,15 +109,15 @@ export function checkSaveDir(dir: string, roots: string[], cwd = process.cwd()):
 // Reads and checks the files an agent named, all of them before any is
 // stored. Each must resolve (symlinks followed) under a root, with no dot
 // component below it and no credential-like name; be at most maxBytes; and
-// be an image, a PDF, or UTF-8 text. At most MAX_ATTACHMENTS files and
-// MAX_ATTACHMENTS_TOTAL_BYTES in all.
+// be an image, a PDF, or UTF-8 text. At most MAX_ATTACHMENTS files, and
+// within the limits (the server's, in server mode).
 export async function readAttachmentFiles(
   paths: unknown,
   roots: string[],
-  opts: { cwd?: string; maxBytes?: number } = {},
+  opts: { cwd?: string; limits?: AttachmentLimits } = {},
 ): Promise<AttachmentFile[]> {
   const cwd = opts.cwd ?? process.cwd();
-  const maxBytes = opts.maxBytes ?? MAX_ATTACHMENT_BYTES;
+  const { file: maxBytes, total: maxTotal } = opts.limits ?? DEFAULT_ATTACHMENT_LIMITS;
   if (!Array.isArray(paths) || !paths.every((p) => typeof p === "string" && p)) {
     throw new CoreError("attachments must be a list of file paths");
   }
@@ -139,7 +143,7 @@ export async function readAttachmentFiles(
     if (st.size === 0) throw new CoreError(`attachment ${p}: empty file`);
     if (st.size > maxBytes) throw new CoreError(`attachment ${p}: ${formatSize(st.size)} exceeds the ${formatSize(maxBytes)} limit`);
     total += st.size;
-    if (total > MAX_ATTACHMENTS_TOTAL_BYTES) throw new CoreError(`attachments exceed ${formatSize(MAX_ATTACHMENTS_TOTAL_BYTES)} in all`);
+    if (total > maxTotal) throw new CoreError(`attachments exceed ${formatSize(maxTotal)} in all`);
     const data = new Uint8Array(await readFile(real));
     // Re-checked on the bytes read, in case the file grew after stat.
     if (data.length > maxBytes) throw new CoreError(`attachment ${p}: exceeds the ${formatSize(maxBytes)} limit`);
@@ -200,7 +204,7 @@ export async function saveAttachment(
 export const ATTACHMENTS_PARAM = {
   type: "array",
   items: { type: "string" },
-  description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}, ${formatSize(MAX_ATTACHMENT_BYTES)} each. Readers get them with attachment_get.`,
+  description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`,
 };
 
 // Not alwaysLoad: a message or post with files names its attachment ids.
@@ -217,6 +221,22 @@ export const ATTACHMENT_GET_TOOL = {
     required: ["id"],
   },
 };
+
+// The Content-Disposition a server sends an attachment with, and the filename
+// a client reads back from it (sanitizeFilename's output, so no quotes).
+export function contentDisposition(filename: string): string {
+  return `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+export function dispositionFilename(header: string | null): string | null {
+  const m = /filename\*=UTF-8''([^;]+)/.exec(header ?? "");
+  if (!m) return null;
+  try {
+    return sanitizeFilename(decodeURIComponent(m[1]!));
+  } catch {
+    return null;
+  }
+}
 
 // Where attachment_get saves by default.
 export function attachmentsDir(env: Record<string, string | undefined> = process.env): string {

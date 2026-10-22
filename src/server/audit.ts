@@ -1,6 +1,9 @@
 import type { Repo } from "./db.ts";
 
 export type AuditAction =
+  | "attachment.downloaded"
+  | "attachment.download_refused"
+  | "attachment.uploaded"
   | "auth.login"
   | "auth.logout"
   | "auth.session_revoked"

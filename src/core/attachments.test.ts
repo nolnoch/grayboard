@@ -19,7 +19,7 @@ import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./bo
 import { boardNotification, callBoardTool } from "./tools.ts";
 import { initCoreSchema } from "./schema.ts";
 import {
-  MAX_ATTACHMENTS_TOTAL_BYTES,
+  DEFAULT_ATTACHMENT_LIMITS,
   UNBOUND_TTL_MS,
   attachRoots,
   checkSaveDir,
@@ -127,7 +127,7 @@ describe("reading files to attach", () => {
 
   test("size, count, type and emptiness limits", async () => {
     writeFileSync(join(root, "big.txt"), "x".repeat(101));
-    await expect(readAttachmentFiles(["big.txt"], [root], { cwd: root, maxBytes: 100 })).rejects.toThrow("exceeds the 100B limit");
+    await expect(readAttachmentFiles(["big.txt"], [root], { cwd: root, limits: { file: 100, total: 1000 } })).rejects.toThrow("exceeds the 100B limit");
     writeFileSync(join(root, "bin"), new Uint8Array([0, 1, 2]));
     await expect(read1("bin")).rejects.toThrow("not an image");
     writeFileSync(join(root, "empty.txt"), "");
@@ -137,7 +137,7 @@ describe("reading files to attach", () => {
     writeFileSync(join(root, "a.txt"), "a");
     await expect(readAttachmentFiles(Array(6).fill("a.txt"), [root], { cwd: root })).rejects.toThrow("at most 5");
     await expect(readAttachmentFiles("a.txt", [root], { cwd: root })).rejects.toThrow("list of file paths");
-    const chunk = Math.ceil(MAX_ATTACHMENTS_TOTAL_BYTES / 3) + 1;
+    const chunk = Math.ceil(DEFAULT_ATTACHMENT_LIMITS.total / 3) + 1;
     writeFileSync(join(root, "c.txt"), "x".repeat(chunk));
     await expect(readAttachmentFiles(["c.txt", "c.txt", "c.txt"], [root], { cwd: root })).rejects.toThrow("in all");
   });

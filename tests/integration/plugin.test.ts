@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
@@ -293,4 +293,100 @@ test("a frame the server can't parse is answered with its req_id, so the call fa
   await be.ready();
   await expect(be.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: "5" })).rejects.toThrow(/bad_request: .*parent_id/);
   be.close();
+}, 20_000);
+
+test("attachments in server mode: dm_send and board_post upload files, pushes name them, attachment_get saves them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
+  writeFileSync(join(dir, "shot.png"), png);
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  writeFileSync(join(dir, ".env"), "TOKEN=x");
+  const env = { GRAYBOARD_ATTACHMENTS_DIR: join(dir, "saved") };
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const carol = await login("carol@example.com");
+  const be = await session(alice, "be", env);
+  const fe = await session(bob, "fe", env);
+  const sim = await session(carol, "sim", env);
+
+  await expect(be.call("dm_send", { to: "bob@example.com/fe", body: "x", attachments: [join(dir, ".env")] })).rejects.toThrow(/dotfiles/);
+  const sent = await be.call("dm_send", { to: "bob@example.com/fe", body: "see these", attachments: [join(dir, "shot.png"), join(dir, "notes.md")] });
+  const [shot, notes] = sent.attachments;
+  expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length });
+  expect(notes).toMatchObject({ filename: "notes.md", type: "text/markdown", size: 7 });
+  await Bun.sleep(300);
+  expect(fe.pushes.find((p) => p.content === "see these")!.meta.attachments).toBe(`${shot.id}:shot.png image/png 10B; ${notes.id}:notes.md text/markdown 7B`);
+
+  const saved = await fe.call("attachment_get", { id: shot.id });
+  expect(saved).toEqual({ path: join(dir, "saved", `${shot.id}-shot.png`), filename: "shot.png", type: "image/png", size: png.length });
+  expect(new Uint8Array(readFileSync(saved.path))).toEqual(png);
+  await expect(sim.call("attachment_get", { id: shot.id })).rejects.toThrow(`no attachment ${shot.id} on a message or post you can read`);
+
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const posted = await be.call("board_post", { board: "e2e", body: "@sim shot", attachments: [join(dir, "shot.png")] });
+  expect(posted.attachments).toEqual([{ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length }]);
+  await Bun.sleep(300);
+  expect(sim.pushes.find((p) => p.content === "@sim shot")!.meta.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B`);
+  expect((await sim.call("attachment_get", { id: posted.attachments[0].id, dir })).path).toBe(join(realpathSync(dir), `${posted.attachments[0].id}-shot.png`));
+}, 20_000);
+
+test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {
+  app.stop();
+  app = startServer(
+    {
+      dbPath: ":memory:", httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com",
+      publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [],
+      attachmentLimits: { file: 5, total: 10 },
+    },
+    { background: false },
+  );
+  base = `http://localhost:${app.server.port}`;
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  const be = await session(await login("alice@example.com"), "be");
+  await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(/notes\.md: 7B exceeds the 5B limit/);
+  expect(app.db.query("SELECT COUNT(*) AS n FROM attachments").get()).toEqual({ n: 0 });
+}, 20_000);
+
+test("attachments against a server from before them: the upload says the server needs updating", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  // Passes everything through to the real server except the upload route,
+  // which gets an older router's catch-all.
+  type Pipe = { auth: string; up?: WebSocket; queue: (string | Buffer)[] };
+  const proxy = Bun.serve<Pipe>({
+    port: 0,
+    fetch(req, srv) {
+      const u = new URL(req.url);
+      if (u.pathname === "/api/attachments") return Response.json({ code: "not_found", message: "not found" }, { status: 404 });
+      if (req.headers.get("upgrade")) return srv.upgrade(req, { data: { auth: req.headers.get("authorization") ?? "", queue: [] } }) ? undefined : new Response("no", { status: 500 });
+      return fetch(`${base}${u.pathname}${u.search}`, { method: req.method, headers: req.headers, body: req.body });
+    },
+    websocket: {
+      open(ws) {
+        const up = new (WebSocket as any)(`${base.replace("http", "ws")}/ws`, { headers: { Authorization: ws.data.auth } }) as WebSocket;
+        ws.data.up = up;
+        up.onopen = () => ws.data.queue.splice(0).forEach((m) => up.send(m));
+        up.onmessage = (e) => ws.send(e.data as string);
+        up.onclose = () => ws.close();
+      },
+      message(ws, m) {
+        if (ws.data.up?.readyState === WebSocket.OPEN) ws.data.up.send(m);
+        else ws.data.queue.push(m);
+      },
+      close(ws) {
+        ws.data.up?.close();
+      },
+    },
+  });
+  try {
+    const alice = await login("alice@example.com");
+    const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${proxy.port}` });
+    await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(
+      "this server doesn't take attachments; it needs updating",
+    );
+    expect(await be.call("dm_send", { to: "be", body: "plain" })).toMatchObject({ message_id: expect.any(Number) });
+  } finally {
+    proxy.stop(true);
+  }
 }, 20_000);
