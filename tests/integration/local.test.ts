@@ -166,6 +166,45 @@ test("a crashed lane's row is swept lazily by the next draining session", async 
   void be;
 }, 20_000);
 
+test("a bridge lane's row is sticky: the lazy sweep leaves it alone", async () => {
+  const be = await start("be");
+  const sim = await start("sim");
+  // A bridge lane (the human's reachability rides on it) whose process died
+  // long ago: role "bridge" is exempt from the sweep, unlike "session" rows.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  const stale = Date.now() - 120_000;
+  db.prepare(
+    `INSERT INTO lanes (handle, lane, role, cwd, push_capable, first_seen, last_seen) VALUES ('be', 'slackbridge', 'bridge', NULL, 1, ?, ?)`,
+  ).run(stale, stale);
+  db.close();
+  writeFileSync(join(dir, "sock.be.slackbridge"), "");
+
+  // A drain (this DM wakes be's session) sweeps stale session rows only.
+  await call(sim, "dm_send", { to: "be", body: "nudge" });
+  await Bun.sleep(400);
+  const db2 = openLocalDb(join(dir, "bus.db"));
+  const rows2 = db2.prepare(`SELECT lane, role FROM lanes WHERE handle = 'be' ORDER BY lane`).all() as { lane: string; role: string }[];
+  db2.close();
+  expect(rows2).toEqual([
+    { lane: "main", role: "session" },
+    { lane: "slackbridge", role: "bridge" },
+  ]);
+  void be;
+}, 20_000);
+
+test("a stale lane socket file from a crash is taken over, not a lockout", async () => {
+  // Bind-first: the path exists but nothing answers, so it's a stale file
+  // from a crashed session — cleared and rebound, never a live holder's.
+  // The proof the lane really holds it: a DM wakes and reaches it.
+  writeFileSync(join(dir, "sock.be.rescue"), "");
+  const be = await startCollecting("be", "rescue");
+  const sim = await start("sim");
+  await call(sim, "dm_send", { to: "be", body: "anyone there?" });
+  await Bun.sleep(300);
+  expect(be.pushes).toContain("anyone there?");
+}, 20_000);
+
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });

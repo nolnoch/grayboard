@@ -36,10 +36,14 @@ export class GrayboardClient {
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
-    // This session's lane key within the identity's fleet, when not the
-    // default. Sent in hello; a server predating lanes ignores it (and its
-    // one-session refusal still applies).
+    // This session's lane key within the identity's fleet. Sent in hello
+    // even when "main", so a server can tell a lane-aware client from an
+    // older one; a server predating lanes ignores it (and its one-session
+    // refusal still applies).
     private readonly lane: string | null = null,
+    // True when the identity came from BUS_IDENTITY: an explicit join, which
+    // a lanes-aware server treats as attach-or-refuse (never a lazy create).
+    private readonly explicit = false,
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -72,7 +76,8 @@ export class GrayboardClient {
         ...(this.push ? {} : { push: false }),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : {}),
-        ...(this.lane && this.lane !== "main" ? { lane: this.lane } : {}),
+        ...(this.lane ? { lane: this.lane } : {}),
+        ...(this.explicit ? { explicit: true } : {}),
       });
     };
 

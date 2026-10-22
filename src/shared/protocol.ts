@@ -21,7 +21,11 @@ export type Message = {
 // lane: this session's lane key within the identity's fleet ([a-z0-9_-],
 // 1-32; default "main"). A second push session on the same lane is refused
 // or supersedes; on another lane it joins as a tool lane (push_granted false).
-export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean; lane?: string };
+// explicit: true when the client's identity came from BUS_IDENTITY (an
+// explicit join): the server then refuses unknown identities instead of
+// lazily creating them, naming what exists. Derived identities (pin or
+// directory default) keep the lazy create, as they always have.
+export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean; lane?: string; explicit?: boolean };
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };

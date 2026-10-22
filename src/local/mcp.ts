@@ -342,7 +342,13 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     // Only a human can start an announcement, which reaches the sessions live now.
     const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles(), lane: LANE } : { lane: LANE };
     const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
-    await wakeAll(wake);
+    // The response must reach the caller before the wake fires. A woken
+    // sibling can round-trip a reply faster than the poster's own follow-up
+    // bookkeeping (the bridge relay registers its thread map only once this
+    // response arrives), so waking inside the call turns that bookkeeping
+    // into a race. The timer crosses into the next macrotask, after the
+    // response write has gone out; the wake is at-least-once either way.
+    setTimeout(() => { void wakeAll(wake).catch((e) => console.error("[grayboard] wake failed:", e)); }, 0);
     return text(result);
   }
 

@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
-import { startSession } from "../core/boards.ts";
+import { startSession, laneStreamRef } from "../core/boards.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -39,6 +39,8 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
   const { db, repo } = openDatabase(path);
   const user = repo.users.upsertByEmail("you@example.com", null);
   const identity = repo.identities.create(user.id, "be");
+  // A pre-lanes writer's DM cursor: identity-scoped, no lane suffix.
+  repo.cursors.advance(identity.id, "direct", "you@example.com/be", 42);
   db.exec("DROP TABLE lanes");
   db.exec("ALTER TABLE claim_events DROP COLUMN lane");
   db.close();
@@ -46,6 +48,11 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
   const { db: db2, repo: repo2 } = openDatabase(path);
   const kept = repo2.identities.findByUserAndName(user.id, "be");
   expect(kept?.id).toBe(identity.id);
+  // The identity-scoped row is the main lane's stream by format (backfill
+  // without migration): reopened code reads it under the lane scheme, and
+  // the lane read markers see it as the default lane.
+  expect(repo2.cursors.get(kept!.id, "direct", laneStreamRef("you@example.com/be", "main"))).toBe(42);
+  expect(repo2.cursors.lanesRead("you@example.com/be", 42)).toEqual(["main"]);
   // The re-created tables take writes through the real APIs.
   startSession(db2, `you@example.com/be`, null);
   db2.prepare(`INSERT INTO claim_events (key, handle, event, at, lane) VALUES ('k', 'you@example.com/be', 'take', ?, 'main')`).run(Date.now());
@@ -55,11 +62,13 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
 describe("Repo", () => {
+  let db: ReturnType<typeof openDatabase>["db"];
   let repo: Repo;
 
   beforeEach(() => {
     // Use an in-memory DB for each test
-    const { repo: r } = openDatabase(":memory:");
+    const { db: d, repo: r } = openDatabase(":memory:");
+    db = d;
     repo = r;
   });
 
@@ -113,6 +122,22 @@ describe("Repo", () => {
     expect(thread[0].id).toBe(root.id);
     expect(thread[1].id).toBe(reply.id);
     expect(repo.messages.thread(reply.id).map(m => m.id)).toEqual([root.id, reply.id]);
+  });
+
+  test("undeliveredFrom is lane-aware: a lane's reads count for the identity", () => {
+    // After a rotation the acks land on the lane row (`full#lane`) and the
+    // bare row freezes; sender-side delivery truth must follow the lanes
+    // (the local twin's rule), or every sender gets false "undelivered".
+    const beUser = repo.users.upsertByEmail("be@example.com", null);
+    const be = repo.identities.create(beUser.id, "be");
+    const sender = "fe@example.com/fe";
+    for (const body of ["one", "two", "three", "four", "five"]) repo.messages.insert(sender, "user", "be@example.com/be", body, null);
+    repo.cursors.advance(be.id, "direct", "be@example.com/be", 3);
+    repo.cursors.advance(be.id, "direct", laneStreamRef("be@example.com/be", "research"), 5);
+    expect(repo.messages.undeliveredFrom(sender)).toEqual([]);
+    // Without the lane row, the bare cursor is the whole truth again.
+    db.run("DELETE FROM cursors WHERE stream_ref = ?", [laneStreamRef("be@example.com/be", "research")]);
+    expect(repo.messages.undeliveredFrom(sender)).toEqual([{ recipient: "be@example.com/be", n: 2, oldest_id: 4 }]);
   });
 
   test("cursors: advance is idempotent and takes MAX", () => {

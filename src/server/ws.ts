@@ -230,7 +230,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true, msg.lane).catch((e) => {
+        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true, msg.lane, msg.explicit === true).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
@@ -385,7 +385,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 }
 
 async function handleHello(
-  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false, laneInput?: string,
+  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false, laneInput?: string, explicit = false,
 ): Promise<void> {
   const { repo, db, registry } = hub;
   const name = identityInput.toLowerCase();
@@ -456,6 +456,22 @@ async function handleHello(
   let identity = repo.identities.findByUserAndName(authed.user_id, name);
   const created = !identity;
   if (!identity) {
+    // An explicit join (BUS_IDENTITY) attaches or refuses — never a lazy
+    // fork: a typo'd name must not create a look-alike identity. A user with
+    // no identities yet is bootstrapping (the adapter flow: pin, launch), so
+    // the first identity still lazy-creates. Derived identities (pin or
+    // directory default) keep the lazy create below, as they always have.
+    if (explicit) {
+      // The human identity (created by a Slack link) doesn't count: a linked
+      // user's first AGENT identity is still a bootstrap, not a typo.
+      const mine = repo.identities.listForUser(authed.user_id).filter((i) => i.name !== HUMAN_NAME);
+      if (mine.length > 0) {
+        err(ws, reqId, "not_found",
+          `no identity "${name}" for your account; your identities: ${mine.map((i) => `${authed.user_email}/${i.name}`).join(", ")}`);
+        ws.close();
+        return;
+      }
+    }
     identity = repo.identities.create(authed.user_id, name);
     writeAudit(repo, "identity.created", authed.user_email, name, { lazy: true });
     onIdentityCreated(db, repo, authed.user_id, full);
@@ -463,8 +479,18 @@ async function handleHello(
 
   // A push hello that found the identity's delivery already owned by a live
   // owner on another lane: join as a tools-only lane, first in line for
-  // rotation when the owner ends (takeover is refused).
+  // rotation when the owner ends (takeover is refused). A lane-less hello —
+  // a client predating lanes — is refused instead: it would silently join
+  // as tools-only, never receiving the pushes it asked for and ignoring the
+  // field that says so. Lane-aware clients always send their lane, so only
+  // old clients hit this; they see the refusal they have always seen.
   const owner = registry.get(full);
+  if (push && laneInput === undefined && owner && owner !== ws && owner.data.lane !== MAIN_LANE) {
+    err(ws, reqId, "identity_in_use",
+      `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
+    ws.close();
+    return;
+  }
   const demoted = push && !!owner && owner !== ws;
 
   ws.data.identityId   = identity.id;

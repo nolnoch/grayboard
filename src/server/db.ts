@@ -416,9 +416,12 @@ function makeRepo(db: Database): Repo {
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
+                                    WHERE c.stream_type = 'direct'
+                                      AND (c.stream_ref = m.recipient
+                                           OR substr(c.stream_ref, 1, length(m.recipient) + 1) = m.recipient || '#')), 0)
+              AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`,
         ).all(sender, olderThan);
       },

@@ -57,6 +57,10 @@ const identity = sessionIdentity();
 // session of the identity joins as a tool lane; a server predating lanes
 // keeps its one-session refusal.
 const lane = sessionLane() ?? "main";
+// BUS_IDENTITY is an explicit join: a lanes-aware server refuses the name if
+// it doesn't exist (attach, never a lazy fork on a typo). Derived identities
+// (pin or directory default) keep the lazy create, as they always have.
+const EXPLICIT = !!process.env.BUS_IDENTITY;
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
 // Claude Code started without a channels flag drops pushes silently; say so.
@@ -108,6 +112,7 @@ const client = new GrayboardClient(
   DELIVER,
   (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
   lane,
+  EXPLICIT,
 );
 
 // Only a server that reserves the name sends hello_ok.human, so only there is

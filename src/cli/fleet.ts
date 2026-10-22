@@ -46,10 +46,12 @@ export async function fleetLocalList(identity?: string): Promise<LocalLane[] | {
 
 /**
  * `grayboard fleet disconnect <identity> <lane>`: end the lane's row and nudge
- * its socket (a live process drains on the poke; a live-but-ignoring process
- * may re-assert its row on its next drain — local mode has no way to kill a
- * process, so enforcement is observation, like the server's). Bridge lanes
- * (a human handle's) are refused: disconnect never reaches human sessions.
+ * its socket (a live process drains on the poke). The row never comes back
+ * (only a session start re-inserts one), but a live-but-ignoring process
+ * keeps its socket and keeps draining, invisible to the roster — local mode
+ * has no way to kill a process, so enforcement is observation, like the
+ * server's). Bridge lanes (a human handle's) are refused: disconnect never
+ * reaches human sessions.
  */
 export async function fleetLocalDisconnect(identity: string, lane: string): Promise<{ ok: true } | { error: string }> {
   if (!existsSync(localDbPath())) return { error: "no local bus yet; run a session first (grayboard mcp)" };

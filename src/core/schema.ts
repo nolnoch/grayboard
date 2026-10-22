@@ -97,13 +97,13 @@ export function initCoreSchema(db: Database): void {
     -- cwd/place/status replace the shared handle columns, which stay as the
     -- pre-lanes display fallback for offline handles. push_capable: the
     -- session asked for push; ownership itself is the server's registry slot.
-    -- role: "session", or "bridge" for a bridge's sticky lane (exempt from
+    -- role: "session", or "bridge" for a bridge's lane (exempt from
     -- local stale sweeps). Attribution stays the identity handle; lanes are
     -- roster truth, never authority.
     CREATE TABLE IF NOT EXISTS lanes (
       handle       TEXT NOT NULL REFERENCES handles(name) ON DELETE CASCADE,
       lane         TEXT NOT NULL,
-      role         TEXT NOT NULL CHECK (role IN ('session','sticky','bridge')) DEFAULT 'session',
+      role         TEXT NOT NULL CHECK (role IN ('session','bridge')) DEFAULT 'session',
       cwd          TEXT,
       place        TEXT,
       status       TEXT,

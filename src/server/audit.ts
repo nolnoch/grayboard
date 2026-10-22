@@ -9,7 +9,6 @@ export type AuditAction =
   | "identity.created"
   | "identity.deleted"
   | "lane.joined"
-  | "lane.left"
   | "lane.disconnected"
   | "lane.dropped"
   | "lane.owner_rotated"

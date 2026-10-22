@@ -527,6 +527,48 @@ test("a second push session on another lane joins as a tool lane; the owner is t
   expect(peers.map((p: any) => p.lane)).toEqual([undefined, "research-3"]);
 });
 
+test("an explicit join attaches or refuses — never a lazy fork on a typo", async () => {
+  const alice = await login("alice@example.com");
+  const real = new Client(alice, "be");
+  await real.connect();
+  // A client whose identity came from BUS_IDENTITY (explicit: true) with a
+  // typo'd name is refused, naming the user's existing identities.
+  const typo = new Client(alice, "voic-ordering", { hello: { explicit: true } });
+  const refused = await typo.connect();
+  expect(refused).toMatchObject({ type: "error", code: "not_found" });
+  expect(refused.message).toContain("alice@example.com/be");
+  const list = await api(alice, "GET", "/api/identities");
+  expect((list.body as any[]).map((i) => i.name)).not.toContain("voic-ordering");
+  // A derived identity (no explicit flag) still lazy-creates, with the notice.
+  const derived = new Client(alice, "side");
+  const hello = await derived.connect();
+  expect(hello).toMatchObject({ type: "hello_ok" });
+  expect(hello.notices.some((n: string) => n.includes("created"))).toBe(true);
+  // A user with no identities yet is bootstrapping, even with BUS_IDENTITY:
+  // the first pinned identity creates, with the notice.
+  const carol = await login("carol@example.com");
+  const first = new Client(carol, "fe", { hello: { explicit: true } });
+  const boot = await first.connect();
+  expect(boot).toMatchObject({ type: "hello_ok" });
+  expect(boot.notices.some((n: string) => n.includes("created"))).toBe(true);
+});
+
+test("a lane-less push hello under an owner on another lane is refused, not silently demoted", async () => {
+  const alice = await login("alice@example.com");
+  // The owner lives on a named lane (e.g. after a rotation).
+  const owner = new Client(alice, "be", { hello: { lane: "research" } });
+  await owner.connect();
+  // A client predating lanes: no lane field, wants push. It would silently
+  // join tools-only and never learn why — refuse it the way it has always
+  // been refused.
+  const old = new Client(alice, "be");
+  const refused = await old.connect();
+  expect(refused).toMatchObject({ type: "error", code: "identity_in_use" });
+  // A lane-aware client on main still demotes (that's the fleet path).
+  const laneAware = new Client(alice, "be", { hello: { lane: "main" } });
+  expect(await laneAware.connect()).toMatchObject({ type: "hello_ok", push_granted: false, owner_lane: "research" });
+});
+
 test("owner close rotates push to the lane: fleet event, its own DM stream, unacked boards redelivered", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -538,8 +580,13 @@ test("owner close rotates push to the lane: fleet event, its own DM stream, unac
   // A DM arrives while the lane is demoted: pushed to the owner only.
   const b = new Client(bob, "fe");
   await b.connect();
-  await b.request({ type: "send", recipient: "alice@example.com/be", body: "one" });
+  const m1 = await b.request({ type: "send", recipient: "alice@example.com/be", body: "one" });
   expect((await owner.next((m) => m.type === "push")).message.body).toBe("one");
+  // The lane acks "one" from its own stream: its cursor passes it, so a later
+  // rotation must redeliver only what its stream never saw — no replay, no dup.
+  await lane.request({ type: "ack", message_ids: [m1.message_id] });
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "two" });
+  expect((await owner.next((m) => m.type === "push")).message.body).toBe("two");
   // An unacked board push sits in the outbox for the identity.
   await b.call("board_create", { name: "e2e", purpose: "fixtures" });
   await b.call("board_post", { board: "e2e", body: "@alice/be look" });
@@ -547,16 +594,17 @@ test("owner close rotates push to the lane: fleet event, its own DM stream, unac
   expect(item.item.post.body).toContain("look"); // received, never acked
 
   await closeAndSettle(owner);
-  // Rotation: the lane is told, gets the DM its stream never saw, and the
-  // unacked board item redelivers (at-least-once).
+  // Rotation: the lane is told, gets the DM its stream never saw ("two", not
+  // the acked "one"), and the unacked board item redelivers (at-least-once).
   expect(await lane.next((m) => m.type === "fleet")).toMatchObject({ event: "owner_rotated", lane: "b" });
-  expect((await lane.next((m) => m.type === "push")).message.body).toBe("one");
+  expect((await lane.next((m) => m.type === "push")).message.body).toBe("two");
+  await lane.none((m) => m.type === "push" && m.message.body === "one");
   const redelivered = await lane.next((m) => m.type === "board_push");
   expect(redelivered.item.post.id).toBe(item.item.post.id);
 
   // It owns delivery now: a new DM arrives live.
-  await b.request({ type: "send", recipient: "alice@example.com/be", body: "two" });
-  expect((await lane.next((m) => m.type === "push")).message.body).toBe("two");
+  await b.request({ type: "send", recipient: "alice@example.com/be", body: "three" });
+  expect((await lane.next((m) => m.type === "push")).message.body).toBe("three");
   const audit = app.db.prepare(`SELECT action FROM access_log WHERE action = 'lane.owner_rotated'`).all() as { action: string }[];
   expect(audit.length).toBe(1);
 });
@@ -593,6 +641,12 @@ test("per-lane DM cursors: a lane's ack never suppresses a sibling's pending del
   await rejoined.connect();
   expect((await rejoined.next((m) => m.type === "push")).message.body).toBe("second");
   expect((await rejoined.next((m) => m.type === "push")).message.body).toBe("third");
+
+  // A fresh lane seeds from main's cursor: joining a fleet must not replay
+  // the identity's already-read history (main has acked through "third").
+  const fresh = new Client(alice, "be", { hello: { lane: "c" } });
+  await fresh.connect();
+  await fresh.none((m) => m.type === "push");
 });
 
 test("auto-drop: a closed lane's row goes; the roster keeps no ghost lane", async () => {
@@ -633,6 +687,21 @@ test("fleet disconnect is owner-ordered, audited, and never invents lanes", asyn
   expect(JSON.parse(audit[0]!.detail)).toMatchObject({ lane: "b" });
   // The owner stays live and keeps delivery.
   expect((await owner.call("board_list")).type).toBe("call_ok");
+
+  // The disconnected lane's row went with its connection: no ghost for the roster.
+  await Bun.sleep(50);
+  expect((await api(alice, "GET", "/api/fleet?identity=be")).body.map((l: any) => l.lane)).toEqual(["main"]);
+
+  // Enforcement is audit + revocation, not prevention: the kicked process,
+  // still holding its token, rejoins (demoted again — the owner is live).
+  const again = new Client(alice, "be", { hello: { lane: "b" } });
+  expect(await again.connect()).toMatchObject({ type: "hello_ok", push_granted: false });
+
+  // Disconnect never reaches a human handle's sessions (slack-bridge §3):
+  // the reserved name, and a handle declared human.
+  expect((await api(alice, "POST", "/api/fleet/disconnect", { identity: "human", lane: "main" })).status).toBe(400);
+  app.db.prepare(`UPDATE handles SET human = 1 WHERE name = ?`).run("alice@example.com/be");
+  expect((await api(alice, "POST", "/api/fleet/disconnect", { identity: "be", lane: "main" })).status).toBe(403);
 });
 
 test("simultaneous push joins on distinct lanes: exactly one owner, the rest demoted", async () => {
@@ -650,7 +719,9 @@ test("simultaneous push joins on distinct lanes: exactly one owner, the rest dem
 
 test("a fleet of many lanes: one owner, the rest tools-only, all usable", async () => {
   const alice = await login("alice@example.com");
-  const conns = [new Client(alice, "be")];
+  // Lane-aware on every lane, including main: a lane-less (old-client) hello
+  // is refused under a foreign-lane owner instead of joining the fleet.
+  const conns = [new Client(alice, "be", { hello: { lane: "main" } })];
   for (const lane of ["b", "c", "d", "e"]) conns.push(new Client(alice, "be", { hello: { lane } }));
   const results = await Promise.all(conns.map((c) => c.connect()));
   expect(results.filter((r) => r.type === "hello_ok" && r.push_granted !== false)).toHaveLength(1);
