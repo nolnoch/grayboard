@@ -9,6 +9,7 @@ import {
 
 import { CoreError, activeAnnouncements, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { attachmentData, canReadAttachment, getAttachment, storeAttachment } from "../core/attachments.ts";
 import {
   BOARD_INSTRUCTIONS,
   announcementsInstruction,
@@ -37,6 +38,7 @@ import {
 } from "./db.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, formatAttachmentsMeta, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -62,6 +64,8 @@ import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
 console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
+// Directories this session may attach files from and save them to.
+const ROOTS = attachRoots();
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
@@ -119,7 +123,7 @@ const TOOLS = [
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
-    description: `dm_send(to, body, parent_id?, pending?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+    description: `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -137,6 +141,7 @@ const TOOLS = [
             "Optional. message_id this is replying to; sets the thread parent.",
         },
         pending: PENDING_PARAM,
+        attachments: ATTACHMENTS_PARAM,
       },
       required: ["to", "body"],
     },
@@ -184,7 +189,8 @@ const TOOLS = [
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
   DM_RETRACT_TOOL,
-...boardTools({ teams: false }),
+  ATTACHMENT_GET_TOOL,
+  ...boardTools({ teams: false }),
 ];
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -262,8 +268,9 @@ async function dispatch(name: string, a: Record<string, any>) {
         isError: true,
       };
     }
-    const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
-    const p = pending ? { pending: true } : {};
+    const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
+    const { id, attachments } = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, files);
+    const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     const delivered = await poke(recipient);
     if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
@@ -327,10 +334,24 @@ async function dispatch(name: string, a: Record<string, any>) {
     return text("ok");
   }
 
+  if (name === "attachment_get") {
+    const row = getAttachment(db, a.id);
+    if (!row || !canReadAttachment(db, IDENTITY, row, (id) => mine(getMessage(id)))) {
+      return { ...text(`error: no attachment ${a.id} on a message or post you can read`), isError: true };
+    }
+    const path = await saveAttachment(row, attachmentData(db, row.sha256), a.dir, ROOTS);
+    return text({ path, filename: row.filename, type: row.type, size: row.size });
+  }
+
   if (isBoardTool(name)) {
     // Only a human can start an announcement, which reaches the sessions live now.
     const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {};
-    const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
+    const { attachments: paths, ...args } = a;
+    const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
+    // Stored and bound in the post's transaction: a refused post leaves no upload.
+    const { result, wake } = db.transaction(() =>
+      callBoardTool(db, IDENTITY, name, files.length ? { ...args, attachment_ids: files.map((f) => storeAttachment(db, IDENTITY, f).id) } : args, ctx),
+    )();
     await wakeAll(wake);
     return text(result);
   }
@@ -380,6 +401,7 @@ async function drainToClaude(): Promise<void> {
           created_at: String(msg.created_at),
         };
         if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+        if (msg.attachments) meta.attachments = formatAttachmentsMeta(msg.attachments);
         if (isHuman(db, msg.sender)) meta.human = "true";
         await mcp.notification({
           method: "notifications/claude/channel",

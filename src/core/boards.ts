@@ -1,5 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -31,6 +33,8 @@ export type Post = {
   created_at: number;
   // An announcement's TTL; null (or absent, from older peers) otherwise.
   expires_at?: number | null;
+  // Present on reads and pushes when the post carries files.
+  attachments?: AttachmentInfo[];
 };
 
 export type Pending =
@@ -349,13 +353,14 @@ function resolveMentions(
 }
 
 // wake: handles to wake now. deferred: thread participants whose push waits
-// for their next wake.
-export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
+// for their next wake. attachments: those bound to the post.
+export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[]; attachments: AttachmentInfo[] };
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
-// sessions' instructions.
-export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number };
+// sessions' instructions. attachment_ids: the poster's unbound uploads to
+// carry, bound in the post's transaction.
+export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number; attachment_ids?: number[] };
 
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
@@ -404,6 +409,7 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
+    const attachments = bindAttachments(db, opts.attachment_ids ?? [], handle, { post_id: p.id });
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
@@ -451,10 +457,11 @@ export function post(
     // Digest subscribers aren't woken: their notice rides with their next wake.
     const all = [...targets];
     return {
-      post: p,
+      post: attachments.length ? { ...p, attachments } : p,
       wake: all.filter(([, t]) => t.wake).map(([h]) => h),
       deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
       unresolved,
+      attachments,
     };
   })();
 }
@@ -652,7 +659,7 @@ export function read(
     )
     .get(handle, board, handle, handle) as { n: number };
 
-  return { board, posts, unread_remaining: remaining.n };
+  return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
 }
 
 // ── delivery ─────────────────────────────────────────────────────────────────
@@ -679,12 +686,16 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   };
 
   const out: Pending[] = [];
-  const pushes = db
-    .prepare(
-      `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
-        WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
-    )
-    .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[];
+  const pushes = withAttachments(
+    db,
+    "post",
+    db
+      .prepare(
+        `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
+          WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
+      )
+      .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[],
+  );
   for (const { reason, wake, ...p } of pushes) {
     if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
     else acknowledge(db, handle, { kind: "push", post_id: p.id });
@@ -758,6 +769,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
+    dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.

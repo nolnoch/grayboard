@@ -1,9 +1,10 @@
 import { CoreError, MAX_BODY_BYTES, age } from "../core/boards.ts";
+import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string };
-export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string };
+export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
+export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
@@ -29,6 +30,7 @@ function item(m: Msg, now: number) {
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
     age: age(now - m.created_at),
     body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
+    ...(m.attachments ? { attachments: m.attachments } : {}),
   };
 }
 

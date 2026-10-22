@@ -20,6 +20,8 @@ import {
   type SubMode,
 } from "./boards.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
+import { attachmentIds } from "./attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta } from "../shared/attachments.ts";
 
 export type ToolDef = {
   name: string;
@@ -63,13 +65,14 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
+          attachments: ATTACHMENTS_PARAM,
         },
         required: ["board", "body"],
       },
@@ -305,18 +308,22 @@ export function callBoardTool(
     }
 
     case "board_post": {
-      const { post: p, wake, deferred, unresolved } = post(
+      // Paths name files on the agent's host: its MCP process reads, checks
+      // and uploads them, and passes the upload ids as attachment_ids.
+      if (a.attachments !== undefined) throw new CoreError("attachments must be read by the session's grayboard MCP process; this one can't");
+      const { post: p, wake, deferred, unresolved, attachments } = post(
         db,
         handle,
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online },
+        { online: ctx.online, attachment_ids: attachmentIds(a.attachment_ids) },
       );
       return {
         result: {
           post_id: p.id,
           board: p.board,
+          ...(attachments.length ? { attachments } : {}),
           notified: wake.filter((h) => !isViewer(h)),
           ...(deferred.length ? { deferred } : {}),
           ...(unresolved.length ? { unresolved } : {}),
@@ -400,6 +407,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       created_at: String(p.created_at),
     };
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
+    if (p.attachments?.length) meta.attachments = formatAttachmentsMeta(p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }

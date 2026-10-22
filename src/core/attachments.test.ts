@@ -1,0 +1,273 @@
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  attachmentData,
+  attachmentIds,
+  bindAttachments,
+  canReadAttachment,
+  dropAttachments,
+  getAttachment,
+  pruneUnbound,
+  storeAttachment,
+  withAttachments,
+} from "./attachments.ts";
+import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
+import { boardNotification, callBoardTool } from "./tools.ts";
+import { initCoreSchema } from "./schema.ts";
+import {
+  MAX_ATTACHMENTS_TOTAL_BYTES,
+  UNBOUND_TTL_MS,
+  attachRoots,
+  checkSaveDir,
+  formatAttachmentsMeta,
+  parseAttachmentsMeta,
+  readAttachmentFiles,
+  sanitizeFilename,
+  saveAttachment,
+  sniffType,
+  type AttachmentFile,
+} from "../shared/attachments.ts";
+
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const file = (data: Uint8Array | string, filename = "f.txt", type = "text/plain"): AttachmentFile => ({
+  filename,
+  type,
+  data: typeof data === "string" ? new TextEncoder().encode(data) : data,
+});
+const blobCount = (db: Database) => (db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs`).get() as { n: number }).n;
+
+describe("type detection and names", () => {
+  test("sniffType goes by the bytes; text is typed by extension", () => {
+    const bytes = (s: string) => new TextEncoder().encode(s);
+    expect(sniffType(PNG, "x.txt")).toBe("image/png");
+    expect(sniffType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), "x")).toBe("image/jpeg");
+    expect(sniffType(bytes("GIF89a..."), "x")).toBe("image/gif");
+    expect(sniffType(bytes("RIFF\0\0\0\0WEBPVP8 "), "x")).toBe("image/webp");
+    expect(sniffType(bytes("%PDF-1.7\n"), "x")).toBe("application/pdf");
+    expect(sniffType(bytes("# hi"), "notes.md")).toBe("text/markdown");
+    expect(sniffType(bytes("{}"), "a.JSON")).toBe("application/json");
+    expect(sniffType(bytes("a,b"), "t.csv")).toBe("text/csv");
+    expect(sniffType(bytes("héllo"), "log")).toBe("text/plain");
+    expect(sniffType(bytes("a\0b"), "x.txt")).toBeNull();
+    expect(sniffType(new Uint8Array([0xc3, 0x28]), "x.txt")).toBeNull();
+    expect(sniffType(new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0, 1]), "a.out")).toBeNull();
+  });
+
+  test("sanitizeFilename keeps a safe last segment", () => {
+    expect(sanitizeFilename("/a/b/shot.png")).toBe("shot.png");
+    expect(sanitizeFilename("..\\..\\evil.txt")).toBe("evil.txt");
+    expect(sanitizeFilename('a;b"c\n.txt')).toBe("a_b_c_.txt");
+    expect(sanitizeFilename("..")).toBe("file");
+    expect(sanitizeFilename("")).toBe("file");
+    expect(new TextEncoder().encode(sanitizeFilename("é".repeat(300))).length).toBeLessThanOrEqual(200);
+  });
+
+  test("meta lists attachments and parses back to ids", () => {
+    const meta = formatAttachmentsMeta([
+      { id: 12, filename: "shot 1.png", type: "image/png", size: 340 * 1024 },
+      { id: 13, filename: "n.md", type: "text/markdown", size: 900 },
+    ]);
+    expect(meta).toBe("12:shot 1.png image/png 340KB; 13:n.md text/markdown 900B");
+    expect(parseAttachmentsMeta(meta)).toEqual([12, 13]);
+    expect(parseAttachmentsMeta(undefined)).toEqual([]);
+  });
+});
+
+describe("reading files to attach", () => {
+  let root: string;
+  let outside: string;
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "gb-attach-root-")));
+    outside = realpathSync(mkdtempSync(join(tmpdir(), "gb-attach-out-")));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+  const read1 = (p: string, roots = [root]) => readAttachmentFiles([p], roots, { cwd: root });
+
+  test("a file under a root is read, typed and named as given", async () => {
+    writeFileSync(join(root, "shot.png"), PNG);
+    mkdirSync(join(root, "docs"));
+    writeFileSync(join(root, "docs", "n.md"), "# notes");
+    const files = await readAttachmentFiles(["shot.png", join(root, "docs", "n.md")], [root], { cwd: root });
+    expect(files.map((f) => [f.filename, f.type, f.data.length])).toEqual([
+      ["shot.png", "image/png", PNG.length],
+      ["n.md", "text/markdown", 7],
+    ]);
+  });
+
+  test("outside the roots, through a symlink, dot paths and key names are refused", async () => {
+    writeFileSync(join(outside, "secret.txt"), "x");
+    await expect(read1(join(outside, "secret.txt"))).rejects.toThrow("outside the directories");
+    symlinkSync(join(outside, "secret.txt"), join(root, "link.txt"));
+    await expect(read1("link.txt")).rejects.toThrow("outside the directories");
+    writeFileSync(join(root, ".env"), "TOKEN=x");
+    await expect(read1(".env")).rejects.toThrow("dotfiles");
+    mkdirSync(join(root, ".ssh"));
+    writeFileSync(join(root, ".ssh", "config"), "Host x");
+    await expect(read1(".ssh/config")).rejects.toThrow("dot directories");
+    for (const name of ["id_ed25519", "id_rsa.pub", "server.pem", "tls.key", "cert.p12", "credentials", "credentials.json"]) {
+      writeFileSync(join(root, name), "x");
+      await expect(read1(name)).rejects.toThrow("key or credentials");
+    }
+    await expect(read1("missing.txt")).rejects.toThrow("no such file");
+  });
+
+  test("a root's own dot components don't count against files under it", async () => {
+    const lane = join(root, ".claude", "worktrees", "lane");
+    mkdirSync(lane, { recursive: true });
+    writeFileSync(join(lane, "a.txt"), "ok");
+    expect((await readAttachmentFiles([join(lane, "a.txt")], [lane])).length).toBe(1);
+  });
+
+  test("size, count, type and emptiness limits", async () => {
+    writeFileSync(join(root, "big.txt"), "x".repeat(101));
+    await expect(readAttachmentFiles(["big.txt"], [root], { cwd: root, maxBytes: 100 })).rejects.toThrow("exceeds the 100B limit");
+    writeFileSync(join(root, "bin"), new Uint8Array([0, 1, 2]));
+    await expect(read1("bin")).rejects.toThrow("not an image");
+    writeFileSync(join(root, "empty.txt"), "");
+    await expect(read1("empty.txt")).rejects.toThrow("empty file");
+    mkdirSync(join(root, "dir"));
+    await expect(read1("dir")).rejects.toThrow("not a regular file");
+    writeFileSync(join(root, "a.txt"), "a");
+    await expect(readAttachmentFiles(Array(6).fill("a.txt"), [root], { cwd: root })).rejects.toThrow("at most 5");
+    await expect(readAttachmentFiles("a.txt", [root], { cwd: root })).rejects.toThrow("list of file paths");
+    const chunk = Math.ceil(MAX_ATTACHMENTS_TOTAL_BYTES / 3) + 1;
+    writeFileSync(join(root, "c.txt"), "x".repeat(chunk));
+    await expect(readAttachmentFiles(["c.txt", "c.txt", "c.txt"], [root], { cwd: root })).rejects.toThrow("in all");
+  });
+
+  test("attachRoots resolves cwd, temp and BUS_ATTACH_ROOTS; missing roots drop out", () => {
+    const roots = attachRoots({ BUS_ATTACH_ROOTS: `${outside}:/no/such/dir` }, root);
+    expect(roots).toContain(root);
+    expect(roots).toContain(outside);
+    expect(roots).toContain(realpathSync(tmpdir()));
+    expect(roots).not.toContain("/no/such/dir");
+  });
+
+  test("saving goes to the default directory or a dir under a root, private to the user", async () => {
+    const a = { id: 7, filename: "shot.png", type: "image/png", size: PNG.length };
+    const def = join(outside, "saved");
+    const p1 = await saveAttachment(a, PNG, undefined, [root], { GRAYBOARD_ATTACHMENTS_DIR: def });
+    expect(p1).toBe(join(def, "7-shot.png"));
+    expect(new Uint8Array(readFileSync(p1))).toEqual(PNG);
+    expect(statSync(p1).mode & 0o777).toBe(0o600);
+    expect(await saveAttachment(a, PNG, root, [root])).toBe(join(root, "7-shot.png"));
+    expect(() => checkSaveDir(outside, [root])).toThrow("outside the directories");
+    expect(() => checkSaveDir(join(root, "nope"), [root])).toThrow("doesn't exist");
+  });
+});
+
+describe("storage", () => {
+  let db: Database;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    db.exec("PRAGMA foreign_keys = ON;");
+    // Each mode brings its own messages table; this is the shape the store needs.
+    db.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT)`);
+    initCoreSchema(db);
+    createBoard(db, "be", "e2e", "fixtures");
+  });
+  const msg = (sender = "be", recipient = "fe") =>
+    Number(db.prepare(`INSERT INTO messages (sender, recipient) VALUES (?, ?)`).run(sender, recipient).lastInsertRowid);
+
+  test("identical bytes share one blob; it goes with the last attachment naming it", () => {
+    const a = storeAttachment(db, "be", file("same"));
+    const b = storeAttachment(db, "fe", file("same", "other.txt"));
+    expect(a.sha256).toBe(b.sha256);
+    expect(blobCount(db)).toBe(1);
+    const m1 = msg();
+    const m2 = msg("fe", "be");
+    bindAttachments(db, [a.id], "be", { message_id: m1 });
+    bindAttachments(db, [b.id], "fe", { message_id: m2 });
+    dropAttachments(db, "message", "?", m1);
+    expect(getAttachment(db, a.id)).toBeUndefined();
+    expect(blobCount(db)).toBe(1);
+    dropAttachments(db, "message", "?", m2);
+    expect(blobCount(db)).toBe(0);
+  });
+
+  test("binding takes only the caller's unbound uploads", () => {
+    const mine = storeAttachment(db, "be", file("a"));
+    const theirs = storeAttachment(db, "fe", file("b"));
+    const m = msg();
+    expect(() => bindAttachments(db, [theirs.id], "be", { message_id: m })).toThrow(`attachment ${theirs.id} isn't an unsent upload of yours`);
+    expect(() => bindAttachments(db, [999], "be", { message_id: m })).toThrow("isn't an unsent upload");
+    expect(bindAttachments(db, [mine.id], "be", { message_id: m })).toEqual([{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1 }]);
+    expect(() => bindAttachments(db, [mine.id], "be", { message_id: msg() })).toThrow("isn't an unsent upload");
+    expect(withAttachments(db, "message", [{ id: m }, { id: m + 100 }])).toEqual([
+      { id: m, attachments: [{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1 }] },
+      { id: m + 100 },
+    ]);
+  });
+
+  test("attachment_ids are checked for shape and count", () => {
+    expect(attachmentIds(undefined)).toEqual([]);
+    expect(attachmentIds([3, 3, 4])).toEqual([3, 4]);
+    expect(() => attachmentIds(["3"])).toThrow("list of attachment ids");
+    expect(() => attachmentIds([1, 2, 3, 4, 5, 6])).toThrow("at most 5");
+  });
+
+  test("a post binds its attachments in its own transaction; a refused post binds nothing", () => {
+    const up = storeAttachment(db, "be", file(PNG, "shot.png", "image/png"));
+    expect(() => post(db, "be", "e2e", "hi", 999, { attachment_ids: [up.id] })).toThrow("parent_id");
+    expect(getAttachment(db, up.id)!.post_id).toBeNull();
+    const stranger = storeAttachment(db, "fe", file("x"));
+    expect(() => post(db, "be", "e2e", "hi", null, { attachment_ids: [up.id, stranger.id] })).toThrow("isn't an unsent upload");
+    expect(getAttachment(db, up.id)!.post_id).toBeNull();
+    expect(read(db, "be", "e2e").posts).toEqual([]);
+
+    subscribe(db, "fe", "e2e", "push");
+    const r = post(db, "be", "e2e", "see shot", null, { attachment_ids: [up.id] });
+    const info = { id: up.id, filename: "shot.png", type: "image/png", size: PNG.length };
+    expect(r.attachments).toEqual([info]);
+    const [item] = pendingFor(db, "fe");
+    expect(boardNotification(item!).meta.attachments).toBe(`${up.id}:shot.png image/png 11B`);
+    expect(read(db, "fe", "e2e", { thread: r.post.id }).posts[0]!.attachments).toEqual([info]);
+  });
+
+  test("board_post takes attachment_ids, never paths", () => {
+    const up = storeAttachment(db, "be", file("a"));
+    expect(() => callBoardTool(db, "be", "board_post", { board: "e2e", body: "x", attachments: ["/etc/hosts"] })).toThrow("MCP process");
+    const r = callBoardTool(db, "be", "board_post", { board: "e2e", body: "x", attachment_ids: [up.id] }).result as { attachments: unknown[] };
+    expect(r.attachments).toEqual([{ id: up.id, filename: "f.txt", type: "text/plain", size: 1 }]);
+  });
+
+  test("unbound uploads are pruned after their TTL; pruned posts take their attachments", () => {
+    const old = storeAttachment(db, "be", file("old"), 1_000);
+    const p = post(db, "be", "e2e", "x", null, { attachment_ids: [storeAttachment(db, "be", file("kept"), 1_000).id] });
+    pruneUnbound(db, 1_001);
+    expect(getAttachment(db, old.id)).toBeUndefined();
+    expect(blobCount(db)).toBe(1);
+    // Storing prunes too.
+    const stale = storeAttachment(db, "be", file("stale"), 5_000);
+    storeAttachment(db, "be", file("new"), 5_000 + UNBOUND_TTL_MS + 1);
+    expect(getAttachment(db, stale.id)).toBeUndefined();
+    prunePosts(db, Date.now() + 1);
+    expect(getAttachment(db, p.attachments[0]!.id)).toBeUndefined();
+    expect(blobCount(db)).toBe(1);
+  });
+
+  test("who may fetch: board viewers, the DM's two ends, an upload's uploader", () => {
+    const m = msg("be", "fe");
+    const onDm = storeAttachment(db, "be", file("dm"));
+    bindAttachments(db, [onDm.id], "be", { message_id: m });
+    const dm = (h: string) => (id: number) => {
+      const row = db.prepare(`SELECT sender, recipient FROM messages WHERE id = ?`).get(id) as { sender: string; recipient: string };
+      return row.sender === h || row.recipient === h;
+    };
+    expect(canReadAttachment(db, "fe", getAttachment(db, onDm.id)!, dm("fe"))).toBe(true);
+    expect(canReadAttachment(db, "sim", getAttachment(db, onDm.id)!, dm("sim"))).toBe(false);
+    const loose = storeAttachment(db, "be", file("loose"));
+    expect(canReadAttachment(db, "be", loose, dm("be"))).toBe(true);
+    expect(canReadAttachment(db, "fe", loose, dm("fe"))).toBe(false);
+    const p = post(db, "be", "e2e", "x", null, { attachment_ids: [storeAttachment(db, "be", file("post")).id] });
+    expect(canReadAttachment(db, "sim", getAttachment(db, p.attachments[0]!.id)!, dm("sim"))).toBe(true);
+    expect(new TextDecoder().decode(attachmentData(db, onDm.sha256))).toBe("dm");
+  });
+});
