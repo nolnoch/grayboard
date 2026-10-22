@@ -315,19 +315,21 @@ export function pruneDmClaims(now = Date.now()): void {
 }
 
 export const NEXT_EXPIRY_SQL = `SELECT MIN(cl.claimed_at) AS t FROM dm_claims cl CROSS JOIN messages m ON m.id = cl.message_id
-  WHERE cl.delivered_at IS NULL AND m.recipient = ? AND cl.claimed_at > ?`;
+  WHERE cl.delivered_at IS NULL AND m.recipient = ?`;
 
 /**
- * When the identity's oldest live (unexpired, undelivered) claim expires:
- * the delay a drain that skipped the claim must wait before it can take it
- * over. Null when no live claim holds. A drain that skips a live claim arms
- * a retry for this, so a crashed claimer's message doesn't wait for an
- * unrelated wake (round-6 item 2). A claim that expired while a drain ran
- * its tail also reads null here — the drain's rerun pass takes that one
- * over (round-7 N1).
+ * The expiry moment of the identity's oldest undelivered claim — when a
+ * drain that skipped the claim may take it over. The claimed row itself is
+ * the pending signal, so the moment may already be in the past (the claimer
+ * died, or the claim expired mid-drain); the caller clamps the wait to
+ * >= 0, so an expired undelivered claim arms an immediate retry (round-8
+ * N1: with the old `claimed_at > now - ttl` filter an expired claim read
+ * null, and a first skip whose tail spanned the expiry armed nothing at
+ * all). Null means no undelivered claim exists — nothing pending, so
+ * clearing any armed retry is safe.
  */
-export function nextClaimExpiry(identity: string, now = Date.now(), ttlMs = DM_CLAIM_TTL_MS): number | null {
-  const row = db.prepare(NEXT_EXPIRY_SQL).get(identity, now - ttlMs) as { t: number | null } | undefined;
+export function nextClaimExpiry(identity: string, ttlMs = DM_CLAIM_TTL_MS): number | null {
+  const row = db.prepare(NEXT_EXPIRY_SQL).get(identity) as { t: number | null } | undefined;
   return row?.t == null ? null : row.t + ttlMs;
 }
 

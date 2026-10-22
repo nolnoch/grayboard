@@ -400,13 +400,11 @@ async function liveHandles(): Promise<(h: string) => boolean> {
 let draining = false;
 // A drain requested while one runs: the running drain loops once more
 // before it exits (round-7 N1). The retry timer bails on `draining` (it
-// must not stack), and a drain's tail — board notifications, slow stdout —
-// can span a skipped claim's expiry: the last scan saw it live, the expiry
-// check after the tail sees it expired (nextClaimExpiry filters
-// claimed_at > now - ttl) and returns null, so nothing re-arms and the
-// takeover is lost. The rerun closes that window: the extra pass finds the
-// claim expired and takes it over. A poke arriving during the tail rides
-// the same rerun.
+// must not stack). A drain's tail — board notifications, slow stdout — can
+// span a skipped claim's expiry; the expiry check after the tail sees the
+// expired claim (the claimed row is the pending signal, round-8 N1) and
+// arms an immediate retry, and a poke arriving during the tail rides the
+// rerun to deliver at once.
 let rerunDrain = false;
 // Test seam (BUS_TEST_DRAIN_TAIL_MS): delays the tail between the last
 // scan and the expiry check, widening the window the rerun flag exists for
@@ -518,12 +516,12 @@ async function drainToClaude(): Promise<void> {
       // read point, and this lane's next drain syncs past them.
       if (!deliveredDm && boardItems.length === 0) break;
     }
-    // A live claim this drain skipped may belong to a claimer that died:
-    // nothing else fires the takeover (the next DM or poke could be hours
-    // away), so arm one retry for the claim's remaining TTL. Null means no
-    // LIVE claim: either the claimer delivered, or the claim expired while
-    // this drain ran its tail — the rerun flag took that one over, so
-    // clearing an earlier arm is safe (round-6 item 2, round-7 N1).
+    // A claim this drain skipped may belong to a claimer that died: nothing
+    // else fires the takeover (the next DM or poke could be hours away), so
+    // arm one retry for the claim's expiry moment — clamped to now by
+    // armClaimRetry when the claim already expired, an immediate retry
+    // (round-8 N1). Null means no undelivered claim exists at all, so
+    // clearing an earlier arm is safe (round-6 item 2).
     if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
     const expiry = nextClaimExpiry(IDENTITY);
     if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);

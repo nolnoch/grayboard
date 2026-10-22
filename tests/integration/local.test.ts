@@ -42,7 +42,7 @@ async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp"
 
 // Like start, collecting channel notifications. Like Claude Code, it drops
 // any that arrive before it has sent `initialized`.
-async function startCollecting(identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> {
+async function startCollecting(identity: string, lane?: string, stderr: "ignore" | "inherit" = "ignore"): Promise<{ c: Client; pushes: string[] }> {
   const pushes: string[] = [];
   const c = new Client({ name: "test", version: "0" });
   let initialized = false;
@@ -50,7 +50,7 @@ async function startCollecting(identity: string, lane?: string): Promise<{ c: Cl
     if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
   };
   await c.connect(
-    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr: "ignore" }),
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr }),
   );
   initialized = true;
   open.push(c);
@@ -366,6 +366,119 @@ test("a skipped live claim arms its own TTL retry: a crashed claimer's DM delive
   expect(live.pushes).toEqual(["ttl-armed"]);
 }, 20_000);
 
+test("a first skip whose tail spans the claim's expiry still arms the takeover: no poke, no wake (round-8 N1 residual)", async () => {
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const stuck = await call(sim, "dm_send", { to: "be", body: "tail-span-silent" });
+  expect(stuck.delivered_now).toBe(false);
+  // A ghost claim with ~1 s of remaining TTL. The live lane's startup drain
+  // skips it for the FIRST time — nothing is armed yet — and its
+  // test-injected tail spans the expiry. No poke arrives (the round-7 pin
+  // had one: the poke's drain request set the rerun flag and its pass took
+  // the claim over). Here nobody requests anything: the drain's own expiry
+  // check is the only chance to arm. With nextClaimExpiry filtering
+  // expired claims it reads null and arms nothing — the reviewer's
+  // reproduced residual: the message waits forever. The fix drops the
+  // filter, so the expired claim arms an immediate retry.
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const db = openLocalDb(join(dir, "bus.db"));
+  db.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(stuck.message_id, Date.now() - DM_CLAIM_TTL_MS + 1_000);
+  db.close();
+  process.env.BUS_TEST_DRAIN_TAIL_MS = "1500";
+  try {
+    const live = await startCollecting("be", "research", "inherit");
+    // The startup drain: skip (batch empty), 1.5 s tail past the ~1 s
+    // remaining TTL, then the expiry check. No traffic of any kind after
+    // this point — only an armed timer can deliver the message.
+    await Bun.sleep(500);
+    expect(live.pushes).toEqual([]);
+    await Bun.sleep(4_000);
+    expect(live.pushes).toEqual(["tail-span-silent"]);
+  } finally {
+    delete process.env.BUS_TEST_DRAIN_TAIL_MS;
+  }
+}, 20_000);
+
+test("nextClaimExpiry: an expired undelivered claim is pending, not gone — null means nothing undelivered (round-8 N1)", async () => {
+  // A check landing between a claim's expiry and its armed timer must not
+  // read the claim as gone: with the old `claimed_at > now - ttl` filter it
+  // read null and cleared the armed retry. The claimed row is the pending
+  // signal now; the caller clamps the (possibly past) moment to >= 0. Bound
+  // to this test's DB by importing the module fresh with BUS_DB_PATH set.
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const expired = await call(sim, "dm_send", { to: "be", body: "expired-pending" });
+  const live = await call(sim, "dm_send", { to: "be", body: "live-pending" });
+  const done = await call(sim, "dm_send", { to: "be", body: "delivered-only" });
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const w = openLocalDb(join(dir, "bus.db"));
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const now = Date.now();
+  w.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(expired.message_id, now - DM_CLAIM_TTL_MS - 100); // expired 100 ms ago
+  w.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#holder', ?)`)
+    .run(live.message_id, now - DM_CLAIM_TTL_MS + 5_000); // live, 5 s remaining
+  w.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at, delivered_at) VALUES (?, 'be#gone', ?, ?)`)
+    .run(done.message_id, now - DM_CLAIM_TTL_MS - 100, now); // delivered: never pending
+  const prevDbPath = process.env.BUS_DB_PATH;
+  process.env.BUS_DB_PATH = join(dir, "bus.db");
+  try {
+    const mod = await import(`../../src/local/db.ts?pinb-${Date.now()}`);
+    // The expired claim is the oldest pending: its (past) expiry moment,
+    // not null — the value a check in the arm window must still see.
+    expect(mod.nextClaimExpiry("be")).toBe(now - DM_CLAIM_TTL_MS - 100 + DM_CLAIM_TTL_MS);
+    // Only the live claim pending: its future expiry moment.
+    w.prepare(`UPDATE dm_claims SET delivered_at = ? WHERE message_id = ?`).run(Date.now(), expired.message_id);
+    expect(mod.nextClaimExpiry("be")).toBe(now - DM_CLAIM_TTL_MS + 5_000 + DM_CLAIM_TTL_MS);
+    // Nothing undelivered: null — and only then is clearing an arm safe.
+    w.prepare(`UPDATE dm_claims SET delivered_at = ? WHERE message_id = ?`).run(Date.now(), live.message_id);
+    expect(mod.nextClaimExpiry("be")).toBeNull();
+  } finally {
+    if (prevDbPath === undefined) delete process.env.BUS_DB_PATH;
+    else process.env.BUS_DB_PATH = prevDbPath;
+    w.close();
+  }
+}, 10_000);
+
+test("an immediate-retry-armed drain skips a live claim and takes it over only at expiry (round-8 N1, live-claimer invariant)", async () => {
+  // The clamp arms retries at once for expired claims; the invariant the
+  // old filter half-served is that a claim WITHIN its TTL is never taken
+  // over — no double-claiming while the original claimer is alive. A drain
+  // that delivers an expired claim arms for the live one's expiry; the
+  // armed retry fires past that expiry and only then takes it over.
+  const sim = await start("sim");
+  const be = await start("be");
+  await stop(be);
+  const expired = await call(sim, "dm_send", { to: "be", body: "expired-now" });
+  const held = await call(sim, "dm_send", { to: "be", body: "held-live" });
+  const { openLocalDb } = await import("../../src/local/open.ts");
+  const { DM_CLAIM_TTL_MS } = await import("../../src/local/db.ts");
+  const now = Date.now();
+  const w = openLocalDb(join(dir, "bus.db"));
+  // Expired 100 ms ago: the startup drain takes it over at once.
+  w.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#ghost', ?)`)
+    .run(expired.message_id, now - DM_CLAIM_TTL_MS - 100);
+  // Live with ~1.5 s of TTL left at insert: within TTL at the drain's scan
+  // (~300 ms in), so the drain must SKIP it — the claimer 'be#holder' is
+  // alive by TTL's definition — and arm for its expiry instead.
+  w.prepare(`INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (?, 'be#holder', ?)`)
+    .run(held.message_id, now - DM_CLAIM_TTL_MS + 1_500);
+  w.close();
+  const other = await startCollecting("be", "research");
+  // First pass: the expired claim delivered, the live claim suppressed —
+  // the immediate-retry arming must not steamroll a within-TTL claim.
+  await Bun.sleep(600);
+  expect(other.pushes).toEqual(["expired-now"]);
+  // The armed retry fires past the held claim's expiry (~1.2 s out from
+  // the scan) and takes it over: delivered exactly once, by the timer.
+  await Bun.sleep(3_000);
+  expect(other.pushes).toEqual(["expired-now", "held-live"]);
+}, 15_000);
+
 test("a drain whose tail spans the claim's expiry reruns instead of losing the retry (round-7 N1)", async () => {
   const sim = await start("sim");
   const be = await start("be");
@@ -420,7 +533,7 @@ test("the pending-claim queries drive from dm_claims through the partial index (
   for (const [sql, params] of [
     [READ_POINT_SQL, ["be"]],
     [UNDELIVERED_BELOW_SQL, ["be", 5]],
-    [NEXT_EXPIRY_SQL, ["be", Date.now()]],
+    [NEXT_EXPIRY_SQL, ["be"]], // one bind: the filter is gone, the row is the signal (round-8 N1)
   ] as const) {
     const d = detail(sql, ...params);
     expect(d).toContain("SEARCH cl USING INDEX idx_dm_claims_pending");
