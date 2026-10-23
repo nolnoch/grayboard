@@ -73,7 +73,7 @@ type Progress = {
   files?: UploadedFile[];
   /** Files that won't reach Slack. */
   refused?: Refused[];
-  /** files.completeUploadExternal went out; a retry asks Slack whether it landed before resending. */
+  /** files.completeUploadExternal went out; a retry asks Slack whether it landed before resending, and a resend Slack refuses counts as landed. */
   completing?: boolean;
   /** The item's message is in Slack and the thread map knows it. */
   posted?: boolean;
@@ -284,7 +284,8 @@ export class Relay {
   private async share(progress: Progress, save: () => void, text: string, name: string, threadTs: string | undefined): Promise<string | null | undefined> {
     const files = progress.files!;
     // The last attempt may have landed with its answer lost; resending would share the files twice.
-    let ts = progress.completing ? await this.sharedTs(files[0]!.id) : null;
+    const resuming = progress.completing === true;
+    let ts = resuming ? await this.sharedTs(files[0]!.id) : null;
     if (!ts) {
       progress.completing = true;
       save();
@@ -302,11 +303,19 @@ export class Relay {
         );
       } catch (e) {
         const why = refusal(e);
-        progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
-        progress.files = [];
-        progress.completing = false;
-        save();
-        return undefined;
+        if (resuming) {
+          // Slack completes an upload once, so a refusal now most likely means
+          // the last attempt landed with its answer lost (its share not yet in
+          // files.info, or no files:read to see it). Posting the text again
+          // would show it twice and tell the sender its files never arrived.
+          this.log(`slack: files.completeUploadExternal refused a resumed share (${why}); taking the earlier attempt as landed`);
+        } else {
+          progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
+          progress.files = [];
+          progress.completing = false;
+          save();
+          return undefined;
+        }
       }
       // Slack's answer names the files, not the message; a reply already knows its thread.
       ts = threadTs ?? (await this.sharedTs(files[0]!.id));

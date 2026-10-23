@@ -171,8 +171,9 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
 // it, and a Slack whose file methods answer per `slack`, recording every call.
 // upload: a status getUploadURLExternal fails with once. complete: an error
 // code it refuses with, or a status it answers once after the share landed
-// (a lost answer). shares: how many files.info calls show no shares yet.
-function withAttachment(slack: { upload?: number; complete?: string | number; shares?: number } = {}) {
+// (a lost answer), then `again` for the next call. shares: how many files.info
+// calls show no shares yet.
+function withAttachment(slack: { upload?: number; complete?: string | number; again?: string; shares?: number } = {}) {
   const told: Record<string, unknown>[] = [];
   const bus: Bus = {
     call: async (name, args) => {
@@ -206,7 +207,7 @@ function withAttachment(slack: { upload?: number; complete?: string | number; sh
       blocks.push(JSON.parse(new URLSearchParams(String(init.body)).get("blocks")!)[0].text);
       if (typeof slack.complete === "number") {
         const status = slack.complete;
-        delete slack.complete;
+        slack.complete = slack.again;
         return new Response("lost", { status });
       }
       return Response.json({ ok: true, files: [{ id: "F1", title: "shot.png" }] });
@@ -272,6 +273,22 @@ test("files: a share whose answer was lost isn't sent twice", async () => {
   expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.info", "files.info", "files.info"]);
   expect(sent).toEqual(["7→F1@6.0"]);
   expect(store.byTs("6.0")).toBeDefined();
+  store.close();
+});
+
+test("files: a resent share Slack refuses counts as the lost one landing, not as refused files", async () => {
+  // The answer is lost, files.info never shows the share (as without files:read), and the resend is refused.
+  const x = withAttachment({ complete: 503, again: "invalid_arguments", shares: 100 });
+  const store = new Store(join(dir, "b.db"));
+  const { relay, sent } = fileRelay(store, x);
+  relay.notify(LOOK);
+  await Bun.sleep(400);
+  expect(x.calls.filter((c) => c === "files.completeUploadExternal")).toHaveLength(2);
+  // No second copy of the text, no warning about the files, nothing told to the sender.
+  expect(x.said).toEqual(["⚠️ Slack didn't say where it put message 1 from be, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead."]);
+  expect(x.told).toEqual([]);
+  expect(sent).toEqual(["7→F1@null"]);
+  expect(errors(store)).toEqual(["ts_unknown"]);
   store.close();
 });
 
