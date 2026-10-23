@@ -58,7 +58,10 @@ async function session(token: string, identity: string, extraEnv: Record<string,
   c.fallbackNotificationHandler = async (n) => {
     if (initialized && n.method === "notifications/claude/channel") pushes.push(n.params as any);
   };
-  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, ...extraEnv } as Record<string, string>;
+  // The tests' files are under the temp directory, declared as a scratch root.
+  const env = {
+    ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, BUS_ATTACH_ROOTS: tmpdir(), ...extraEnv,
+  } as Record<string, string>;
   await c.connect(
     new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
   );

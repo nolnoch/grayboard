@@ -27,7 +27,7 @@ export function insertMessage(
 ): { id: number; attachments: AttachmentInfo[] } {
   return db.transaction(() => {
     const now = Date.now();
-    const ids = files.map((f) => storeAttachment(db, sender, f, now).id);
+    const ids = files.map((f) => storeAttachment(db, sender, f, { now }).id);
     const { lastInsertRowid } = db
       .prepare(
         `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)

@@ -3,11 +3,11 @@
 // any byte leaves its host. Storage is src/core/attachments.ts.
 import { createHash, randomUUID } from "node:crypto";
 import { constants, realpathSync } from "node:fs";
-import { link, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { link, mkdir, open, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, delimiter, extname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
-import { CoreError } from "../core/boards.ts";
+import { CoreError, TooLargeError } from "../core/boards.ts";
 
 export const MAX_ATTACHMENTS = 5;
 // Size caps per file and per message or post. A server sets its own
@@ -32,7 +32,9 @@ const MAX_FILENAME_BYTES = 200;
 export function sanitizeFilename(name: string): string {
   const base = name.split(/[\\/]/).pop() ?? "";
   // Cut by code point, so a surrogate pair is never split.
-  const chars = [...base.replace(/[\u0000-\u001f\u007f"';<>|:*?]/g, "_").trim()];
+  // \p{Cf}: bidi overrides and other invisible format characters, which can
+  // make "gnp.exe" read as "exe.png".
+  const chars = [...base.replace(/[\u0000-\u001f\u007f"';<>|:*?]|\p{Cf}/gu, "_").trim()];
   while (new TextEncoder().encode(chars.join("")).length > MAX_FILENAME_BYTES) chars.pop();
   const out = chars.join("");
   if (!out || out === "." || out === "..") return "file";
@@ -66,25 +68,98 @@ export function sniffType(data: Uint8Array, filename: string): string | null {
   return TEXT_TYPES[extname(filename).toLowerCase()] ?? "text/plain";
 }
 
-// Private keys, certificates and credential stores, by name. Dotfiles and
-// dot directories (.env, .ssh, .aws, .netrc) are refused separately.
-const SECRET_NAME = /^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?|credentials(\..*)?)$|\.(pem|key|p12|pfx|jks|keystore)$/i;
+// Private keys, certificates, credential stores, and cloud and cluster
+// configs, by name. Dotfiles and dot directories (.env, .ssh, .aws, .netrc)
+// are refused separately.
+const SECRET_NAME =
+  /^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?|credentials(\..*)?|kubeconfig(\..*)?|service[-_]?account.*\.json|authkey_.*\.p8|.*\.tfvars(\.json)?|.*\.tfstate(\.backup)?)$|\.(pem|key|p8|p12|pfx|jks|keystore|ppk|kdbx|ovpn)$/i;
+// Key material in a text file, whatever its name.
+const SECRET_CONTENT = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|PuTTY-User-Key-File-\d|aws_secret_access_key\s*=/;
 
-// Where an agent may attach files from: the session's working directory, the
-// OS temp directories, and BUS_ATTACH_ROOTS (a path list). Resolved, since a
-// file's own path is compared after symlinks are resolved.
+// Extensions each type may keep; a name without one gets the first appended.
+// Text keeps its own extension unless a browser or the OS would render or run
+// it rather than show it as text.
+const TYPE_EXTENSIONS: Record<string, string[]> = {
+  "image/png": [".png"],
+  "image/jpeg": [".jpg", ".jpeg"],
+  "image/gif": [".gif"],
+  "image/webp": [".webp"],
+  "application/pdf": [".pdf"],
+};
+const RENDERED_TEXT = new Set([
+  ".html", ".htm", ".xhtml", ".mhtml", ".svg", ".xml", ".url", ".webloc", ".inetloc", ".desktop", ".hta", ".lnk", ".scf",
+]);
+
+// The name with an extension that matches its sniffed type, so a saved file
+// or a Slack title can't pass one kind of file off as another.
+export function typedName(name: string, type: string): string {
+  const ext = extname(name).toLowerCase();
+  const allowed = TYPE_EXTENSIONS[type];
+  if (allowed) return allowed.includes(ext) ? name : `${name}${allowed[0]}`;
+  return RENDERED_TEXT.has(ext) ? `${name}.txt` : name;
+}
+
+/**
+ * The checks a file gets wherever it enters the bus: an agent's path, an HTTP
+ * upload, a Slack share. A safe name, not a dotfile or credential-like name,
+ * not empty, an allowed type sniffed from its bytes, no key material in text,
+ * and an extension that matches the type. `label` leads each refusal.
+ */
+export function checkFile(label: string, rawName: string, data: Uint8Array): AttachmentFile {
+  const name = sanitizeFilename(rawName);
+  if (name.startsWith(".")) throw new CoreError(`${label}: dotfiles aren't attachable`);
+  if (SECRET_NAME.test(name)) throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
+  if (data.length === 0) throw new CoreError(`${label}: empty file`);
+  const type = sniffType(data, name);
+  if (!type) throw new CoreError(`${label}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
+  if (!TYPE_EXTENSIONS[type] && SECRET_CONTENT.test(new TextDecoder().decode(data))) {
+    throw new CoreError(`${label}: holds private key or secret key material; not attachable`);
+  }
+  return { filename: typedName(name, type), type, data };
+}
+
+/** The per-file and per-message caps, checked as files are added, worded the same everywhere. */
+export class SizeTally {
+  private total = 0;
+
+  constructor(private readonly limits: AttachmentLimits, count: number) {
+    if (count > MAX_ATTACHMENTS) throw new CoreError(`at most ${MAX_ATTACHMENTS} attachments per message`);
+  }
+
+  add(label: string, size: number): void {
+    if (size > this.limits.file) throw new TooLargeError(`${label}: ${formatSize(size)} exceeds the ${formatSize(this.limits.file)} limit per file`);
+    this.total += size;
+    if (this.total > this.limits.total) throw new TooLargeError(`attachments exceed ${formatSize(this.limits.total)} in all`);
+  }
+}
+
+// Where an agent may attach files from: the session's working directory and
+// BUS_ATTACH_ROOTS (a path list, the declared scratch directories). A working
+// directory that is the home directory or a filesystem root doesn't count:
+// it would let an agent attach almost anything. Resolved, since a file's own
+// path is compared after symlinks are resolved.
 export function attachRoots(env: Record<string, string | undefined> = process.env, cwd = process.cwd()): string[] {
-  const roots = [cwd, tmpdir(), "/tmp", ...(env.BUS_ATTACH_ROOTS ?? "").split(delimiter).filter(Boolean)];
   const out = new Set<string>();
-  for (const r of roots) {
+  const add = (r: string) => {
     try {
       out.add(realpathSync(resolve(cwd, r)));
     } catch {
       // A root that doesn't exist holds no files.
     }
+  };
+  add(cwd);
+  for (const broad of [homedir(), parse(resolve(cwd)).root]) {
+    try {
+      out.delete(realpathSync(broad));
+    } catch {
+      // Nothing to drop.
+    }
   }
+  for (const r of (env.BUS_ATTACH_ROOTS ?? "").split(delimiter).filter(Boolean)) add(r);
   return [...out];
 }
+
+const ROOTS_HINT = "its working directory unless that's the home directory, and BUS_ATTACH_ROOTS";
 
 // The root `real` lies under and its path below that root, or null.
 function under(real: string, roots: string[]): string[] | null {
@@ -107,60 +182,72 @@ export function checkSaveDir(dir: string, roots: string[], cwd = process.cwd()):
   }
   if (roots.includes(real)) return real;
   const rel = under(real, roots);
-  if (!rel) {
-    throw new CoreError(`dir ${dir} is outside the directories this session may write to (its working directory, the temp directory, BUS_ATTACH_ROOTS)`);
-  }
+  if (!rel) throw new CoreError(`dir ${dir} is outside the directories this session may write to (${ROOTS_HINT})`);
   if (rel.some((c) => c.startsWith("."))) throw new CoreError(`dir ${dir}: saving into dot directories isn't allowed`);
   return real;
 }
 
 // Reads and checks the files an agent named, all of them before any is
-// stored. Each must resolve (symlinks followed) under a root, with no dot
-// component below it and no credential-like name; be at most maxBytes; and
-// be an image, a PDF, or UTF-8 text. At most MAX_ATTACHMENTS files, and
-// within the limits (the server's, in server mode).
+// stored. Each must resolve (symlinks followed) under a root with no dot
+// component below it, pass checkFile, and fit the limits (the server's, in
+// server mode). Each file is opened once, without following a symlink swapped
+// in after the check, and read no further than its checked size.
 export async function readAttachmentFiles(
   paths: unknown,
   roots: string[],
   opts: { cwd?: string; limits?: AttachmentLimits } = {},
 ): Promise<AttachmentFile[]> {
   const cwd = opts.cwd ?? process.cwd();
-  const { file: maxBytes, total: maxTotal } = opts.limits ?? DEFAULT_ATTACHMENT_LIMITS;
   if (!Array.isArray(paths) || !paths.every((p) => typeof p === "string" && p)) {
     throw new CoreError("attachments must be a list of file paths");
   }
-  if (paths.length > MAX_ATTACHMENTS) throw new CoreError(`at most ${MAX_ATTACHMENTS} attachments per message`);
+  const tally = new SizeTally(opts.limits ?? DEFAULT_ATTACHMENT_LIMITS, paths.length);
   const out: AttachmentFile[] = [];
-  let total = 0;
   for (const p of paths as string[]) {
+    const label = `attachment ${p}`;
     let real: string;
     try {
       real = realpathSync(resolve(cwd, p));
     } catch {
-      throw new CoreError(`attachment ${p}: no such file`);
+      throw new CoreError(`${label}: no such file`);
     }
     const rel = under(real, roots);
-    if (!rel) {
-      throw new CoreError(`attachment ${p}: outside the directories this session may attach from (its working directory, the temp directory, BUS_ATTACH_ROOTS)`);
-    }
-    if (rel.some((c) => c.startsWith("."))) throw new CoreError(`attachment ${p}: dotfiles and files in dot directories aren't attachable`);
-    const name = basename(real);
-    if (SECRET_NAME.test(name)) throw new CoreError(`attachment ${p}: looks like a key or credentials file; not attachable`);
-    const st = await stat(real);
-    if (!st.isFile()) throw new CoreError(`attachment ${p}: not a regular file`);
-    if (st.size === 0) throw new CoreError(`attachment ${p}: empty file`);
-    if (st.size > maxBytes) throw new CoreError(`attachment ${p}: ${formatSize(st.size)} exceeds the ${formatSize(maxBytes)} limit`);
-    total += st.size;
-    if (total > maxTotal) throw new CoreError(`attachments exceed ${formatSize(maxTotal)} in all`);
-    const data = new Uint8Array(await readFile(real));
-    // Re-checked on the bytes read, in case the file grew after stat.
-    if (data.length > maxBytes) throw new CoreError(`attachment ${p}: exceeds the ${formatSize(maxBytes)} limit`);
-    const filename = sanitizeFilename(p.split(/[\\/]/).pop() ?? name);
-    const type = sniffType(data, filename);
-    if (!type) throw new CoreError(`attachment ${p}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
-    out.push({ filename, type, data });
+    if (!rel) throw new CoreError(`${label}: outside the directories this session may attach from (${ROOTS_HINT})`);
+    if (rel.some((c) => c.startsWith("."))) throw new CoreError(`${label}: dotfiles and files in dot directories aren't attachable`);
+    // The real name is checked too, so a link named notes.txt can't carry id_rsa.
+    if (SECRET_NAME.test(basename(real))) throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
+    const data = await readChecked(real, label, tally);
+    out.push(checkFile(label, p.split(/[\\/]/).pop() ?? basename(real), data));
   }
   return out;
+}
+
+async function readChecked(real: string, label: string, tally: SizeTally): Promise<Uint8Array> {
+  let fh: FileHandle;
+  try {
+    // O_NONBLOCK: a FIFO opens at once and fails the regular-file check below.
+    fh = await open(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch (e) {
+    throw new CoreError(`${label}: can't be opened (${(e as NodeJS.ErrnoException).code ?? "error"})`);
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) throw new CoreError(`${label}: not a regular file`);
+    if (st.size === 0) throw new CoreError(`${label}: empty file`);
+    tally.add(label, st.size);
+    // One byte past the checked size, to notice a file that grew.
+    const buf = new Uint8Array(st.size + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const { bytesRead } = await fh.read(buf, n, buf.length - n, n);
+      if (bytesRead === 0) break;
+      n += bytesRead;
+    }
+    if (n !== st.size) throw new CoreError(`${label}: changed while being read`);
+    return buf.subarray(0, n);
+  } finally {
+    await fh.close();
+  }
 }
 
 export function formatSize(n: number): string {
@@ -279,7 +366,7 @@ export const ATTACHMENT_GET_TOOL = {
     type: "object",
     properties: {
       id: { type: "number", description: "The attachment id." },
-      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or the temp directory. Default ~/.grayboard/attachments." },
+      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or BUS_ATTACH_ROOTS. Default ~/.grayboard/attachments." },
     },
     required: ["id"],
   },

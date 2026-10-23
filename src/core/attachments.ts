@@ -5,9 +5,10 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 
-import { CoreError, canSeeBoard, getPost } from "./boards.ts";
+import { CoreError, TooLargeError, canSeeBoard, getPost } from "./boards.ts";
 import {
-  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, UNBOUND_TTL_MS, formatSize, type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
+  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize,
+  type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 
 export type AttachmentRow = AttachmentInfo & {
@@ -34,12 +35,28 @@ export function attachmentLimits(db: Database): AttachmentLimits {
   return limitsByDb.get(db) ?? DEFAULT_ATTACHMENT_LIMITS;
 }
 
+// A cap on the unbound bytes the uploaders under `prefix` (a server user's
+// "email/") may hold.
+export type UploadQuota = { prefix: string; cap: number };
+
 // Stores one checked file as an unbound upload of `uploader`'s. Identical
-// bytes share one blob. Also prunes uploads left unbound past their TTL.
-export function storeAttachment(db: Database, uploader: string, file: AttachmentFile, now = Date.now()): AttachmentRow {
+// bytes share one blob. Also prunes uploads left unbound past their TTL, then
+// checks `quota` in the same write transaction, so two concurrent uploads
+// can't both fit under it.
+export function storeAttachment(
+  db: Database,
+  uploader: string,
+  file: AttachmentFile,
+  opts: { now?: number; quota?: UploadQuota } = {},
+): AttachmentRow {
+  const now = opts.now ?? Date.now();
   const sha256 = createHash("sha256").update(file.data).digest("hex");
   return db.transaction(() => {
     pruneUnbound(db, now - UNBOUND_TTL_MS);
+    const q = opts.quota;
+    if (q && unboundBytes(db, q.prefix) + file.data.length > q.cap) {
+      throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.cap)}; send or wait for them to expire`);
+    }
     db.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, data, size) VALUES (?, ?, ?)`).run(sha256, file.data, file.data.length);
     return db
       .prepare(
@@ -70,16 +87,15 @@ export function bindAttachments(db: Database, ids: number[], uploader: string, t
     .prepare(`SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?))`)
     .all(JSON.stringify(ids)) as AttachmentRow[];
   const byId = new Map(rows.map((r) => [r.id, r]));
-  let total = 0;
+  // Each upload was checked alone when stored; the message's total is known only here.
+  const tally = new SizeTally(attachmentLimits(db), ids.length);
   for (const id of ids) {
     const r = byId.get(id);
     if (!r || r.uploader !== uploader || r.message_id !== null || r.post_id !== null) {
       throw new CoreError(`attachment ${id} isn't an unsent upload of yours`);
     }
-    total += r.size;
+    tally.add(`attachment ${id}`, r.size);
   }
-  const max = attachmentLimits(db).total;
-  if (total > max) throw new CoreError(`attachments exceed ${formatSize(max)} in all`);
   const [col, value] = "message_id" in target ? ["message_id", target.message_id] : ["post_id", target.post_id];
   db.prepare(`UPDATE attachments SET ${col} = ? WHERE id IN (SELECT value FROM json_each(?))`).run(value, JSON.stringify(ids));
   return ids.map((id) => info(byId.get(id)!));

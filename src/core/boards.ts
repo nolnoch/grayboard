@@ -57,6 +57,9 @@ export type PendingRef =
 
 export class CoreError extends Error {}
 
+/** A file, a message's files, or a user's unsent uploads over a size cap (HTTP 413). */
+export class TooLargeError extends CoreError {}
+
 // ── access policy ────────────────────────────────────────────────────────────
 
 // Who can see which board, and who an @token means. Every core read and write

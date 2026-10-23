@@ -4,17 +4,17 @@ import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
   mintToken, hashToken, type AuthedUser,
 } from "./auth.ts";
-import { readableAttachment } from "./attachments.ts";
+import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { CoreError, TooLargeError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import {
-  attachmentData, attachmentLimits, pruneUnbound, releaseUpload, storeAttachment, unboundBytes,
+  attachmentData, attachmentLimits,
 } from "../core/attachments.ts";
-import { UNBOUND_TTL_MS, contentDisposition, formatSize, sanitizeFilename, sniffType, unboundCap } from "../shared/attachments.ts";
+import { SizeTally, checkFile, contentDisposition, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
@@ -198,33 +198,27 @@ function ownIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Respons
 
 // POST /api/attachments?identity=&filename=, the file's bytes as the body.
 // The session's MCP process has already checked the path it came from; this
-// checks what arrives (size, type, the user's unsent total) and stores it
-// unbound, for a dm_send or board_post by that identity to carry.
+// runs the same checks on what arrives (checkFile, the size caps) plus the
+// user's quota of unsent bytes, and stores it unbound, for a dm_send or
+// board_post by that identity to carry.
 async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
-  const limits = attachmentLimits(db);
-  const tooLarge = () => jsonErr("too_large", `exceeds this server's ${formatSize(limits.file)} limit per file`, 413);
-  if (Number(req.headers.get("content-length") ?? "0") > limits.file) return tooLarge();
-  const data = new Uint8Array(await req.arrayBuffer());
-  if (data.length === 0) return badRequest("empty file");
-  if (data.length > limits.file) return tooLarge();
-  const filename = sanitizeFilename(rawName);
-  const type = sniffType(data, filename);
-  if (!type) return badRequest("not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text");
-  const now = Date.now();
-  pruneUnbound(db, now - UNBOUND_TTL_MS);
-  const cap = unboundCap(limits);
-  if (unboundBytes(db, `${authed.user_email}/`) + data.length > cap) {
-    return jsonErr("too_large", `your unsent uploads would exceed ${formatSize(cap)}; send or wait for them to expire`, 413);
+  const label = `file ${sanitizeFilename(rawName)}`;
+  try {
+    // A declared length over the cap is refused before the body is read.
+    new SizeTally(attachmentLimits(db), 1).add(label, Number(req.headers.get("content-length") ?? "0"));
+    const data = new Uint8Array(await req.arrayBuffer());
+    new SizeTally(attachmentLimits(db), 1).add(label, data.length);
+    const row = storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
+    return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
+  } catch (e) {
+    if (e instanceof TooLargeError) return jsonErr("too_large", e.message, 413);
+    if (e instanceof CoreError) return badRequest(e.message);
+    throw e;
   }
-  const row = storeAttachment(db, handle, { filename, type, data }, now);
-  writeAudit(repo, "attachment.uploaded", authed.user_email, `attachment:${row.id}`, {
-    identity: handle, filename, type, size: row.size, sha256: row.sha256,
-  });
-  return json({ id: row.id, filename, type, size: row.size, sha256: row.sha256 }, 201);
 }
 
 // GET /api/attachments/<id>?identity=: the file, for an identity that can
@@ -255,11 +249,8 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
 function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const row = /^\d{1,15}$/.test(idStr) ? releaseUpload(db, Number(idStr), handle) : null;
+  const row = /^\d{1,15}$/.test(idStr) ? releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
-  writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
-    identity: handle, filename: row.filename, size: row.size, sha256: row.sha256,
-  });
   return json({ ok: true });
 }
 

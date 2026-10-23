@@ -792,7 +792,11 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect((await upload(alice, "nope", "x.png", PNG)).status).toBe(404);
   expect((await upload(alice, "human", "x.png", PNG)).status).toBe(403);
   expect((await upload(alice, "be", "x.bin", new Uint8Array([0, 1, 2]))).body.message).toMatch(/not an image/);
-  expect((await upload(alice, "be", "x.txt", new Uint8Array(0))).body.message).toBe("empty file");
+  expect((await upload(alice, "be", "x.txt", new Uint8Array(0))).body.message).toBe("file x.txt: empty file");
+  // The upload runs the checks an agent's path gets: names, key material, an extension matching the type.
+  expect((await upload(alice, "be", ".env", "A=1")).body.message).toMatch(/dotfiles/);
+  expect((await upload(alice, "be", "id_rsa", "x")).body.message).toMatch(/key or credentials/);
+  expect((await upload(alice, "be", "n.txt", "-----BEGIN RSA PRIVATE KEY-----")).body.message).toMatch(/key material/);
 
   const up = await upload(alice, "be", "../shot.png", PNG);
   expect(up.status).toBe(201);
@@ -883,7 +887,8 @@ test("a server's own attachment limits: sent in hello_ok, enforced per file, per
   const a = new Client(alice, "be");
   expect((await a.connect()).attachment_limits).toEqual({ file: 100, total: 150 });
 
-  expect((await upload(alice, "be", "big.txt", "x".repeat(101))).body.message).toBe("exceeds this server's 100B limit per file");
+  expect((await upload(alice, "be", "big.txt", "x".repeat(101))).body.message).toBe("file big.txt: 101B exceeds the 100B limit per file");
+  expect((await upload(alice, "be", "page.html", "<script>")).body.filename).toBe("page.html.txt");
   const one = await upload(alice, "be", "a.txt", "a".repeat(80));
   const two = await upload(alice, "be", "b.txt", "b".repeat(80));
   expect(await a.request({ type: "send", recipient: "be", body: "both", attachment_ids: [one.body.id, two.body.id] })).toMatchObject({

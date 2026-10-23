@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -13,10 +13,11 @@ import {
   getAttachment,
   pruneUnbound,
   releaseUpload,
+  setAttachmentLimits,
   storeAttachment,
   withAttachments,
 } from "./attachments.ts";
-import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
+import { TooLargeError, createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
 import { boardNotification, callBoardTool } from "./tools.ts";
 import { initCoreSchema } from "./schema.ts";
 import {
@@ -28,10 +29,13 @@ import {
   localBusDir,
   parseAttachmentsMeta,
   readAttachmentFiles,
+  SizeTally,
+  checkFile,
   sanitizeFilename,
   saveAttachment,
   serverBusDir,
   sniffType,
+  typedName,
   type AttachmentFile,
 } from "../shared/attachments.ts";
 
@@ -71,6 +75,46 @@ describe("type detection and names", () => {
     const cut = sanitizeFilename("a" + "😀".repeat(60));
     expect(cut).toBe("a" + "😀".repeat(49));
     expect(() => encodeURIComponent(cut)).not.toThrow();
+  });
+
+  test("sanitizeFilename replaces bidi overrides and other format characters", () => {
+    expect(sanitizeFilename("shot\u202Egnp.exe")).toBe("shot_gnp.exe");
+    expect(sanitizeFilename("a\u200Bb.txt")).toBe("a_b.txt");
+  });
+
+  test("checkFile refuses dotfiles, key names, empty files, unknown types and key material", () => {
+    const bytes = (s: string) => new TextEncoder().encode(s);
+    expect(() => checkFile("f", ".env", bytes("A=1"))).toThrow("f: dotfiles");
+    for (const name of ["id_ecdsa_sk", "kubeconfig", "service-account-prod.json", "AuthKey_ABC.p8", "prod.tfvars", "terraform.tfstate.backup", "vault.kdbx", "me.ovpn"]) {
+      expect(() => checkFile("f", name, bytes("x"))).toThrow("key or credentials");
+    }
+    expect(() => checkFile("f", "a.txt", new Uint8Array())).toThrow("empty file");
+    expect(() => checkFile("f", "a.bin", new Uint8Array([0, 1]))).toThrow("not an image");
+    expect(() => checkFile("f", "notes.txt", bytes("x\n-----BEGIN OPENSSH PRIVATE KEY-----\n"))).toThrow("key material");
+    expect(() => checkFile("f", "notes.txt", bytes("[default]\naws_secret_access_key = abc"))).toThrow("key material");
+    // Images aren't searched for key text.
+    expect(checkFile("f", "shot.png", PNG).type).toBe("image/png");
+  });
+
+  test("checkFile gives the name an extension that matches its type", () => {
+    const bytes = (s: string) => new TextEncoder().encode(s);
+    expect(checkFile("f", "shot", PNG).filename).toBe("shot.png");
+    expect(checkFile("f", "shot.txt", PNG).filename).toBe("shot.txt.png");
+    expect(checkFile("f", "photo.jpeg", new Uint8Array([0xff, 0xd8, 0xff, 0xe0])).filename).toBe("photo.jpeg");
+    expect(checkFile("f", "doc", bytes("%PDF-1.7\n")).filename).toBe("doc.pdf");
+    expect(checkFile("f", "page.html", bytes("<script>")).filename).toBe("page.html.txt");
+    expect(checkFile("f", "icon.SVG", bytes("<svg/>")).filename).toBe("icon.SVG.txt");
+    expect(checkFile("f", "go.url", bytes("[InternetShortcut]")).filename).toBe("go.url.txt");
+    expect(checkFile("f", "notes.md", bytes("# hi"))).toMatchObject({ filename: "notes.md", type: "text/markdown" });
+    expect(typedName("a.png", "image/png")).toBe("a.png");
+  });
+
+  test("SizeTally words each cap the same way", () => {
+    const t = new SizeTally({ file: 100, total: 150 }, 2);
+    expect(() => t.add("file a", 101)).toThrow("file a: 101B exceeds the 100B limit per file");
+    t.add("file a", 100);
+    expect(() => t.add("file b", 51)).toThrow(TooLargeError);
+    expect(() => new SizeTally({ file: 1, total: 1 }, 6)).toThrow("at most 5 attachments per message");
   });
 
   test("meta lists attachments and parses back to ids", () => {
@@ -158,12 +202,22 @@ describe("reading files to attach", () => {
     await expect(readAttachmentFiles(["c.txt", "c.txt", "c.txt"], [root], { cwd: root })).rejects.toThrow("in all");
   });
 
-  test("attachRoots resolves cwd, temp and BUS_ATTACH_ROOTS; missing roots drop out", () => {
+  test("attachRoots is cwd and BUS_ATTACH_ROOTS, resolved; missing roots drop out", () => {
     const roots = attachRoots({ BUS_ATTACH_ROOTS: `${outside}:/no/such/dir` }, root);
-    expect(roots).toContain(root);
-    expect(roots).toContain(outside);
-    expect(roots).toContain(realpathSync(tmpdir()));
-    expect(roots).not.toContain("/no/such/dir");
+    expect(roots.sort()).toEqual([root, outside].sort());
+    expect(roots).not.toContain(realpathSync(tmpdir()));
+  });
+
+  test("a cwd that is the home directory or a filesystem root isn't a root", () => {
+    expect(attachRoots({}, homedir())).toEqual([]);
+    expect(attachRoots({}, "/")).toEqual([]);
+    expect(attachRoots({ BUS_ATTACH_ROOTS: root }, homedir())).toEqual([root]);
+  });
+
+  test("a link's real name is checked too", async () => {
+    writeFileSync(join(root, "id_rsa"), "x");
+    symlinkSync(join(root, "id_rsa"), join(root, "notes.txt"));
+    await expect(read1("notes.txt")).rejects.toThrow("key or credentials");
   });
 
   test("saving goes to the default directory or a dir under a root, private to the user", async () => {
@@ -262,6 +316,21 @@ describe("storage", () => {
   const msg = (sender = "be", recipient = "fe") =>
     Number(db.prepare(`INSERT INTO messages (sender, recipient) VALUES (?, ?)`).run(sender, recipient).lastInsertRowid);
 
+  test("a quota caps the unbound bytes a user's handles hold, counted inside the store", () => {
+    const quota = { prefix: "you@example.com/", cap: 10 };
+    storeAttachment(db, "you@example.com/be", file("123456"), { quota });
+    storeAttachment(db, "other@example.com/be", file("123456"), { quota: { ...quota, prefix: "other@example.com/" } });
+    expect(() => storeAttachment(db, "you@example.com/fe", file("12345"), { quota })).toThrow(TooLargeError);
+    expect(storeAttachment(db, "you@example.com/fe", file("1234"), { quota }).size).toBe(4);
+  });
+
+  test("bind checks the message's total against the limits", () => {
+    setAttachmentLimits(db, { file: 100, total: 30 });
+    const ids = [storeAttachment(db, "be", file("x".repeat(20))).id, storeAttachment(db, "be", file("y".repeat(20))).id];
+    expect(() => bindAttachments(db, ids, "be", { message_id: msg() })).toThrow("attachments exceed 30B in all");
+    expect(bindAttachments(db, ids.slice(0, 1), "be", { message_id: msg() }).length).toBe(1);
+  });
+
   test("identical bytes share one blob; it goes with the last attachment naming it", () => {
     const a = storeAttachment(db, "be", file("same"));
     const b = storeAttachment(db, "fe", file("same", "other.txt"));
@@ -336,14 +405,14 @@ describe("storage", () => {
   });
 
   test("unbound uploads are pruned after their TTL; pruned posts take their attachments", () => {
-    const old = storeAttachment(db, "be", file("old"), 1_000);
-    const p = post(db, "be", "e2e", "x", null, { attachment_ids: [storeAttachment(db, "be", file("kept"), 1_000).id] });
+    const old = storeAttachment(db, "be", file("old"), { now: 1_000 });
+    const p = post(db, "be", "e2e", "x", null, { attachment_ids: [storeAttachment(db, "be", file("kept"), { now: 1_000 }).id] });
     pruneUnbound(db, 1_001);
     expect(getAttachment(db, old.id)).toBeUndefined();
     expect(blobCount(db)).toBe(1);
     // Storing prunes too.
-    const stale = storeAttachment(db, "be", file("stale"), 5_000);
-    storeAttachment(db, "be", file("new"), 5_000 + UNBOUND_TTL_MS + 1);
+    const stale = storeAttachment(db, "be", file("stale"), { now: 5_000 });
+    storeAttachment(db, "be", file("new"), { now: 5_000 + UNBOUND_TTL_MS + 1 });
     expect(getAttachment(db, stale.id)).toBeUndefined();
     prunePosts(db, Date.now() + 1);
     expect(getAttachment(db, p.attachments[0]!.id)).toBeUndefined();

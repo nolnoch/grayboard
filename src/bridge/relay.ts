@@ -14,7 +14,7 @@
 import { createHash } from "node:crypto";
 
 import {
-  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, formatSize, parseAttachmentsMeta, sanitizeFilename, sniffType,
+  DEFAULT_ATTACHMENT_LIMITS, SizeTally, checkFile, parseAttachmentsMeta, sanitizeFilename,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import type { Store, ThreadRow } from "./store.ts";
@@ -437,30 +437,27 @@ export class Relay {
     return this.bus.withFiles(got, (extra) => send(body || got.map((f) => f.filename).join(", "), extra));
   }
 
+  // The same name, type, content and size checks as an agent's files
+  // (checkFile, SizeTally), so a Slack share can't carry what a path can't.
   private async fetchFiles(list: Record<string, any>[]): Promise<SlackFile[]> {
-    const { file: max, total: maxTotal } = this.limits;
-    if (list.length > MAX_ATTACHMENTS) throw new Error(`at most ${MAX_ATTACHMENTS} files per message`);
+    const tally = new SizeTally(this.limits, list.length);
     const out: SlackFile[] = [];
-    let total = 0;
     for (let f of list) {
       // Some events carry only the file's id; files.info has the rest.
       if (!f.url_private_download && f.id) f = (await this.fileInfo(String(f.id))) ?? f;
-      const name = sanitizeFilename(String(f.name ?? f.title ?? "file"));
+      const raw = String(f.name ?? f.title ?? "file");
+      const label = `file ${sanitizeFilename(raw)}`;
       const size = Number(f.size);
-      if (!f.url_private_download || !Number.isInteger(size)) throw new Error(`file ${name}: Slack gives the app no download for it`);
-      if (size > max) throw new Error(`file ${name}: ${formatSize(size)} exceeds the ${formatSize(max)} limit`);
-      total += size;
-      if (total > maxTotal) throw new Error(`files exceed ${formatSize(maxTotal)} in all`);
+      if (!f.url_private_download || !Number.isInteger(size)) throw new Error(`${label}: Slack gives the app no download for it`);
+      tally.add(label, size);
       let data: Uint8Array;
       try {
         data = await this.slack.download(String(f.url_private_download), size);
       } catch (e) {
-        if (e instanceof SlackError && e.code === "size_mismatch") throw new Error(`file ${name}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
+        if (e instanceof SlackError && e.code === "size_mismatch") throw new Error(`${label}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
         throw e;
       }
-      const type = sniffType(data, name);
-      if (!type) throw new Error(`file ${name}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
-      out.push({ filename: name, type, data, slack_file: String(f.id) });
+      out.push({ ...checkFile(label, raw, data), slack_file: String(f.id) });
     }
     return out;
   }

@@ -10,7 +10,7 @@
 // app gets linked.
 import { randomInt } from "node:crypto";
 
-import { attachmentData, attachmentLimits, storeAttachment } from "../core/attachments.ts";
+import { attachmentData, attachmentLimits } from "../core/attachments.ts";
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
 import { boardNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -19,7 +19,7 @@ import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, Se
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackWeb } from "../bridge/web.ts";
-import { readableAttachment } from "./attachments.ts";
+import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
@@ -322,15 +322,19 @@ export class SlackBridge implements SlackLinker {
         }
         return { id: row.id, filename: row.filename, type: row.type, size: row.size, data: attachmentData(db, row.sha256) };
       },
+      // Files the relay checked (checkFile), stored as the HTTP upload route
+      // stores them; released again if the send doesn't carry them.
       async withFiles(files, send) {
-        const ids = files.map((f) => {
-          const row = storeAttachment(db, handle, f);
-          writeAudit(repo, "attachment.uploaded", link.email, `attachment:${row.id}`, {
-            identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, slack_file: f.slack_file,
-          });
-          return row.id;
-        });
-        return send({ attachment_ids: ids });
+        const ids: number[] = [];
+        let sent = false;
+        try {
+          for (const f of files) ids.push(storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file }).id);
+          const r = await send({ attachment_ids: ids });
+          sent = (r as { ok?: boolean }).ok !== false;
+          return r;
+        } finally {
+          if (!sent) for (const id of ids) releaseStored(repo, db, link.email, handle, id, { via: "slack" });
+        }
       },
     };
 

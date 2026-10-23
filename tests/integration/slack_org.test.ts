@@ -73,7 +73,8 @@ async function session(token: string, identity: string) {
   c.fallbackNotificationHandler = async (n) => {
     if (n.method === "notifications/claude/channel") pushes.push(n.params as any);
   };
-  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity } as Record<string, string>;
+  // The tests' files are under the temp directory, declared as a scratch root.
+  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, BUS_ATTACH_ROOTS: tmpdir() } as Record<string, string>;
   delete env.BUS_HUMAN;
   await c.connect(
     new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
@@ -156,6 +157,8 @@ test("attachments cross the org bridge both ways, and the audit log says where t
     expect(s.thread_ts).toBeUndefined();
     expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
 
+    // The relay maps the thread once files.info shows the share's ts, which lags the upload.
+    await until(() => app.db.prepare(`SELECT 1 FROM slack_threads WHERE thread_ts = ?`).get(s.ts));
     slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
     const got = await until(() => be.pushes.find((p) => p.content === "here"));
     expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
@@ -205,6 +208,18 @@ test("a file Slack refuses goes back to its sender, and the text carries the war
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+}, 30_000);
+
+test("files on a Slack message the bus refuses are released, not left holding the quota", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const { ts } = slack.say("@nobody look", { extra: { subtype: "file_share", files: [slack.host("n.md", "x")] } });
+  const reply = await until(() => slack.posts().find((p) => p.thread_ts === ts));
+  expect(reply.markdown_text).toStartWith("⚠️ not sent:");
+  const actions = app.db.prepare(`SELECT action, detail FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id`).all() as { action: string; detail: string }[];
+  expect(actions.map((a) => a.action)).toEqual(["attachment.uploaded", "attachment.released"]);
+  expect(JSON.parse(actions[1]!.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "n.md", via: "slack" });
+  expect(app.db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get()).toEqual({ n: 0 });
 }, 30_000);
 
 test("a post Slack refuses is retried and lands once", async () => {

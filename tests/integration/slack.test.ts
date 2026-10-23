@@ -320,10 +320,10 @@ test("a Slack file that can't come along refuses the whole message, in its threa
   expect(await answer("@be binary", [slack.host("blob.bin", new Uint8Array([0, 1, 2]))])).toBe(
     "⚠️ not sent: file blob.bin: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text",
   );
-  expect(await answer("@be big", [slack.host("big.png", PNG, { size: 11 * 1024 * 1024 })])).toBe("⚠️ not sent: file big.png: 11MB exceeds the 10MB limit");
+  expect(await answer("@be big", [slack.host("big.png", PNG, { size: 11 * 1024 * 1024 })])).toBe("⚠️ not sent: file big.png: 11MB exceeds the 10MB limit per file");
   // What Slack serves an app without files:read is its sign-in page, not the file.
   expect(await answer("@be scoped", [slack.host("x.png", PNG, { size: 5 })])).toMatch(/^⚠️ not sent: file x\.png: Slack didn't serve it \(does the app have files:read/);
-  expect(await answer("@be many", Array.from({ length: 6 }, (_, i) => slack.host(`${i}.md`, "x")))).toBe("⚠️ not sent: at most 5 files per message");
+  expect(await answer("@be many", Array.from({ length: 6 }, (_, i) => slack.host(`${i}.md`, "x")))).toBe("⚠️ not sent: at most 5 attachments per message");
   expect(await answer("new #docs specs", [slack.host("a.md", "x")])).toBe('⚠️ not created: files don\'t come along when making a board; make #docs first, then post them with "#docs …"');
   expect(be.pushes).toEqual([]);
 }, 30_000);
