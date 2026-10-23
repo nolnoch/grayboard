@@ -2,6 +2,7 @@
 // server answers ok with the tag's version.
 import { afterAll, expect, test } from "bun:test";
 import { join } from "node:path";
+import { cleanEnv } from "../support/env.ts";
 import { ROOT } from "../support/paths.ts";
 
 let health: Record<string, unknown> = { ok: true, version: "1.2.3" };
@@ -9,7 +10,7 @@ const srv = Bun.serve({ port: 0, fetch: (r) => (new URL(r.url).pathname === "/he
 afterAll(() => srv.stop(true));
 
 async function check(url: string, tag: string): Promise<{ code: number; out: string }> {
-  const p = Bun.spawn([join(ROOT, "scripts", "deploy_check.sh"), url, tag], { stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn([join(ROOT, "scripts", "deploy_check.sh"), url, tag], { env: cleanEnv(), stdout: "pipe", stderr: "pipe" });
   const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
   return { code, out: out + err };
 }

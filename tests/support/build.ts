@@ -28,7 +28,9 @@ if (import.meta.main) {
     plugins: version
       ? [{
           name: "version",
-          setup: (b) => b.onLoad({ filter: /[\\/]package\.json$/ }, async (a) => ({ contents: JSON.stringify({ ...(await Bun.file(a.path).json()), version }), loader: "json" })),
+          setup: (b) => {
+            b.onLoad({ filter: /[\\/]package\.json$/ }, async (a) => ({ contents: JSON.stringify({ ...(await Bun.file(a.path).json()), version }), loader: "json" }));
+          },
         }]
       : [],
   });
