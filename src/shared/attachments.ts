@@ -379,7 +379,7 @@ export const ATTACHMENT_GET_TOOL = {
     type: "object",
     properties: {
       id: { type: "number", description: "The attachment id." },
-      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or BUS_ATTACH_ROOTS. Default ~/.grayboard/attachments." },
+      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or BUS_ATTACH_ROOTS. Default: this bus's folder under $GRAYBOARD_ATTACHMENTS_DIR (~/.grayboard/attachments)." },
     },
     required: ["id"],
   },
