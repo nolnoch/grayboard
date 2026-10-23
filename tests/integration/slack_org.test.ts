@@ -2,7 +2,10 @@
 // with a fake Slack, and agents as server-mode `grayboard mcp` children.
 // Linking, the human identity's round trip, who may reach it, and unlinking.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -21,7 +24,7 @@ const open: (Client | WebSocket)[] = [];
 function serve(apiUrl: string): ReturnType<typeof startServer> {
   return startServer(
     {
-      dbPath: ":memory:",
+      dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
       httpPort: 0,
       googleClientId: "dev",
       googleClientSecret: "",
@@ -70,7 +73,8 @@ async function session(token: string, identity: string) {
   c.fallbackNotificationHandler = async (n) => {
     if (n.method === "notifications/claude/channel") pushes.push(n.params as any);
   };
-  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity } as Record<string, string>;
+  // The tests' files are under the temp directory, declared as a scratch root.
+  const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, BUS_ATTACH_ROOTS: tmpdir() } as Record<string, string>;
   delete env.BUS_HUMAN;
   await c.connect(
     new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
@@ -137,6 +141,87 @@ test("link, then an agent's DM to human is a Slack thread whose reply comes back
   expect(follow.delivered_now).toBe(true);
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
   expect(post.thread_ts).toBe(tsOf(top));
+}, 30_000);
+
+test("attachments cross the org bridge both ways, and the audit log says where they went", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  const tmp = mkdtempSync(join(tmpdir(), "grayboard-slack-org-"));
+  try {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]);
+    writeFileSync(join(tmp, "shot.png"), png);
+    const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
+    const s = await until(() => slack.shares()[0]);
+    expect(s).toMatchObject({ channel_id: DM, blocks: [{ type: "markdown", text: "**be** look" }] });
+    // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
+    expect(s.username).toBeUndefined();
+    expect(s.thread_ts).toBeUndefined();
+    expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
+
+    // The relay maps the thread once files.info shows the share's ts, which lags the upload.
+    await until(() => app.db.prepare(`SELECT 1 FROM slack_threads WHERE thread_ts = ?`).get(s.ts));
+    slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
+    const got = await until(() => be.pushes.find((p) => p.content === "here"));
+    expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
+    expect(got.meta.attachments).toMatch(/^\d+:reply\.md text\/markdown 3B sha256:[0-9a-f]{64}$/);
+    const id = Number(got.meta.attachments!.split(":")[0]);
+    const saved = await be.call("attachment_get", { id, dir: tmp });
+    expect(readFileSync(saved.path, "utf8")).toBe("ok\n");
+
+    const audit = (action: string) =>
+      app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
+    const sent = await until(() => audit("attachment.sent_to_slack")[0]);
+    expect(sent.actor).toBe("alice@example.com");
+    const sha256 = createHash("sha256").update(png).digest("hex");
+    expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
+    // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
+    const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+    expect(bound).toEqual([
+      { target: `attachment:${q.attachments[0].id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
+      { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: Number(got.meta.message_id), recipient: "alice@example.com/be" },
+    ]);
+    const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
+    expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a file Slack refuses goes back to its sender, and the text carries the warning", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  slack.refuseUploads = "file_type_not_allowed";
+  const tmp = mkdtempSync(join(tmpdir(), "grayboard-slack-org-"));
+  try {
+    writeFileSync(join(tmp, "shot.png"), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]));
+    const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
+    const top = await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("**be** look")));
+    expect(top.markdown_text).toBe("**be** look\n\n⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
+    const back = await until(() => be.pushes.find((p) => p.meta.from === "alice@example.com/human"));
+    expect(back.meta.parent_id).toBe(String(q.message_id));
+    expect(back.content).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
+    const refused = await until(() => app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'attachment.slack_refused'`).get() as { actor: string; target: string; detail: string } | null);
+    expect(refused.actor).toBe("alice@example.com");
+    expect(JSON.parse(refused.detail)).toMatchObject({ identity: "alice@example.com/human", channel: DM, filename: "shot.png", reason: "file_type_not_allowed", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    // Done items leave no progress behind.
+    await until(() => (app.db.prepare(`SELECT COUNT(*) AS n FROM slack_progress`).get() as { n: number }).n === 0);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("files on a Slack message the bus refuses are released, not left holding the quota", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const { ts } = slack.say("@nobody look", { extra: { subtype: "file_share", files: [slack.host("n.md", "x")] } });
+  const reply = await until(() => slack.posts().find((p) => p.thread_ts === ts));
+  expect(reply.markdown_text).toStartWith("⚠️ not sent:");
+  const actions = app.db.prepare(`SELECT action, detail FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id`).all() as { action: string; detail: string }[];
+  expect(actions.map((a) => a.action)).toEqual(["attachment.uploaded", "attachment.released"]);
+  expect(JSON.parse(actions[1]!.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "n.md", via: "slack" });
+  expect(app.db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get()).toEqual({ n: 0 });
 }, 30_000);
 
 test("a post Slack refuses is retried and lands once", async () => {

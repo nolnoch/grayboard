@@ -1,5 +1,6 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
+import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
 
 export type Message = {
   id: number;
@@ -11,6 +12,8 @@ export type Message = {
   created_at: number;
   // Only when set: the sender marked it as owing a follow-up.
   pending?: true;
+  // Only when it carries files.
+  attachments?: AttachmentInfo[];
 };
 
 // Client -> Server
@@ -19,7 +22,8 @@ export type Message = {
 // where: the client's describeLocation (the server can't see its files).
 // resume: a reconnect within one session, so its peer_status stays.
 export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean };
-export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean };
+// attachment_ids: the sender's uploads (POST /api/attachments) to carry.
+export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
@@ -45,11 +49,14 @@ export type HelloOk     = {
   // Slack bridge, so a message from that handle can only be your user's.
   // linked: whether anyone reads it (the user has linked Slack).
   human?: { handle: string; linked: boolean };
+  // This server's attachment size caps, for the client's checks before upload.
+  attachment_limits?: AttachmentLimits;
 };
 export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
   // Echoed when the request set it, so a client can tell this server recorded it.
   pending?: true;
+  attachments?: AttachmentInfo[];
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
@@ -94,6 +101,8 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.parent_id !== undefined && typeof m.parent_id !== "number")
         throw new Error("parent_id must be number");
       if (m.pending !== undefined && typeof m.pending !== "boolean") throw new Error("pending must be boolean");
+      if (m.attachment_ids !== undefined && (!Array.isArray(m.attachment_ids) || !m.attachment_ids.every(x => typeof x === "number")))
+        throw new Error("attachment_ids must be number[]");
       return m as unknown as SendRequest;
     case "history":
       assertStr(m, "req_id");

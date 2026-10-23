@@ -7,13 +7,17 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { retentionDays, startLocalRetention } from "./retention.ts";
+import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
   BOARD_INSTRUCTIONS,
   announcementsInstruction,
   claimsInstruction,
   boardNotification,
+  dmNotification,
   humanInstruction,
   boardTools,
   callBoardTool,
@@ -21,6 +25,7 @@ import {
 } from "../core/tools.ts";
 import {
   ackMessage,
+  blobs,
   db,
   getCursor,
   getHistory,
@@ -34,9 +39,12 @@ import {
   undeliveredFrom,
   type Message,
   unreadFor,
+  withUploads,
 } from "./db.ts";
+import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -48,7 +56,6 @@ import {
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
-  dmBody,
   historyLimit,
   inboxDays,
   promised,
@@ -62,6 +69,15 @@ import pkg from "../../package.json" with { type: "json" };
 
 const IDENTITY: string = sessionIdentity();
 console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
+// Directories this session may attach files from and save them to.
+const ROOTS = attachRoots();
+// This bus's subdirectory of the default save directory.
+const BUS_DIR = localBusDir(localDbPath());
+const RETENTION_DAYS = retentionDays();
+if (RETENTION_DAYS === null) {
+  console.error(`[grayboard] BUS_RETENTION_DAYS must be a whole number of days, not "${process.env.BUS_RETENTION_DAYS}"`);
+  process.exit(1);
+}
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
@@ -119,7 +135,7 @@ const TOOLS = [
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
-    description: `dm_send(to, body, parent_id?, pending?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+    description: `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -137,6 +153,7 @@ const TOOLS = [
             "Optional. message_id this is replying to; sets the thread parent.",
         },
         pending: PENDING_PARAM,
+        attachments: ATTACHMENTS_PARAM,
       },
       required: ["to", "body"],
     },
@@ -184,7 +201,8 @@ const TOOLS = [
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
   DM_RETRACT_TOOL,
-...boardTools({ teams: false }),
+  ATTACHMENT_GET_TOOL,
+  ...boardTools({ teams: false }),
 ];
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -249,7 +267,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       parent_id?: number;
       pending?: boolean;
     };
-    dmBody(body);
+    checkBody(body);
     if (!rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
@@ -262,8 +280,9 @@ async function dispatch(name: string, a: Record<string, any>) {
         isError: true,
       };
     }
-    const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
-    const p = pending ? { pending: true } : {};
+    const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
+    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
+    const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     const delivered = await poke(recipient);
     if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
@@ -324,13 +343,33 @@ async function dispatch(name: string, a: Record<string, any>) {
     if (!retractMessage(IDENTITY, m.id)) {
       return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
     }
+    await sweepBlobs(db, blobs);
     return text("ok");
+  }
+
+  if (name === "attachment_get") {
+    const id = checkAttachmentId(a.id);
+    const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
+    const row = getAttachment(db, id);
+    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)))) {
+      return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
+    }
+    const path = await saveAttachment(row, await blobs.get(row.sha256), target);
+    return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
   }
 
   if (isBoardTool(name)) {
     // Only a human can start an announcement, which reaches the sessions live now.
-    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {};
-    const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
+    const ctx = {
+      ...(name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {}),
+      attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+    };
+    const { attachments: paths, ...args } = a;
+    const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
+    // Bound in the post's transaction; a refused post releases the uploads.
+    const { result, wake } = await withUploads(IDENTITY, files, (ids) =>
+      db.transaction(() => callBoardTool(db, IDENTITY, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
+    );
     await wakeAll(wake);
     return text(result);
   }
@@ -374,17 +413,9 @@ async function drainToClaude(): Promise<void> {
       firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
       for (const msg of batch) {
-        const meta: Record<string, string> = {
-          message_id: String(msg.id),
-          from: msg.sender,
-          created_at: String(msg.created_at),
-        };
-        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-        if (isHuman(db, msg.sender)) meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: { content: msg.body, meta },
-        });
+        const params = dmNotification(msg);
+        if (isHuman(db, msg.sender)) params.meta.human = "true";
+        await mcp.notification({ method: "notifications/claude/channel", params });
         setCursor(IDENTITY, msg.id);
       }
       for (const item of boardItems) {
@@ -410,6 +441,8 @@ if (DELIVER) await assertIdentityFree(IDENTITY);
 if (DELIVER) startSession(db, IDENTITY, process.cwd());
 else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
+// Prunes the bus at most once a day across the sessions that share it.
+startLocalRetention(db, blobs, RETENTION_DAYS);
 
 let cleanup = () => {};
 const shutdown = () => {

@@ -42,6 +42,11 @@ export function openLocalDb(path = localDbPath()): Database {
       acked_at    INTEGER NOT NULL,
       PRIMARY KEY (reader, message_id)
     );
+    -- When a session last ran retention (retention.ts); one row.
+    CREATE TABLE IF NOT EXISTS retention_runs (
+      id        INTEGER PRIMARY KEY CHECK (id = 1),
+      last_run  INTEGER NOT NULL
+    );
   `);
   // dm_send pending: the sender owes a follow-up in the thread.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];

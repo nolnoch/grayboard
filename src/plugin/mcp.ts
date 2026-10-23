@@ -7,12 +7,17 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
-import { loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
+import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
-import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { checkBody } from "../core/boards.ts";
+import { BOARD_INSTRUCTIONS, boardNotification, boardTools, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
+import {
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
+  type AttachmentLimits,
+} from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // Team boards are members-only on the server; this keeps their content from
@@ -52,6 +57,8 @@ function loadCredentials(): Credentials {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const identity = sessionIdentity();
+// Directories this session may attach files from and save them to.
+const ROOTS = attachRoots();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
 const PUSH = process.env.BUS_PUSH !== "off";
 // Claude Code started without a channels flag drops pushes silently; say so.
@@ -86,14 +93,9 @@ const client = new GrayboardClient(
   currentToken,
   identity,
   async (msg: Message) => {
-    const meta: Record<string, string> = {
-      message_id: String(msg.id),
-      from:       msg.sender,
-      created_at: String(msg.created_at),
-    };
-    if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-    if (await fromOwnHuman(msg.sender)) meta.human = "true";
-    return notify({ content: msg.body, meta });
+    const params = dmNotification(msg);
+    if (await fromOwnHuman(msg.sender)) params.meta.human = "true";
+    return notify(params);
   },
   async (item) => {
     const params = boardNotification(item);
@@ -159,7 +161,7 @@ const TOOLS = [
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description:
-      `dm_send(to, body, parent_id?, pending?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). You are "${identity}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -167,6 +169,7 @@ const TOOLS = [
         body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
         parent_id: { type: "number", description: "Optional. message_id to reply to." },
         pending:   PENDING_PARAM,
+        attachments: ATTACHMENTS_PARAM,
       },
       required: ["to", "body"],
     },
@@ -196,7 +199,8 @@ const TOOLS = [
   DM_INBOX_TOOL,
   DM_ACK_TOOL,
   DM_RETRACT_TOOL,
-...boardTools({ teams: true }),
+  ATTACHMENT_GET_TOOL,
+  ...boardTools({ teams: true }),
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -228,16 +232,25 @@ async function call(name: string, a: Record<string, unknown>) {
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
     if (isBoardTool(name)) {
-      return text((await client.request<CallOk>({ type: "call", tool: name, args: a })).result);
+      const { attachments: paths, ...args } = a;
+      if (paths !== undefined && name === "board_post") checkBody(args.body);
+      const { result } = await withUploads(paths, (ids) =>
+        client.request<CallOk>({ type: "call", tool: name, args: ids.length ? { ...args, attachment_ids: ids } : args }),
+      );
+      return text(result);
     }
     if (name === "dm_send") {
-      const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
-        type: "send",
-        recipient: a.to,
-        body: a.body,
-        ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
-        ...(a.pending === true ? { pending: true } : {}),
-      });
+      if (a.attachments !== undefined) checkBody(a.body);
+      const { type: _t, req_id: _r, ...rest } = await withUploads(a.attachments, (ids) =>
+        client.request<SendOk>({
+          type: "send",
+          recipient: a.to,
+          body: a.body,
+          ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
+          ...(a.pending === true ? { pending: true } : {}),
+          ...(ids.length ? { attachment_ids: ids } : {}),
+        }),
+      );
       // A server from before pending ignores the field, which would lose the promise silently.
       if (a.pending === true && !rest.pending) {
         rest.note = `${rest.note ? `${rest.note} ` : ""}Sent, but this server doesn't record pending, so dm_inbox won't list the promise; the server needs updating.`;
@@ -273,10 +286,96 @@ async function call(name: string, a: Record<string, unknown>) {
     if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);
     }
+    if (name === "attachment_get") {
+      const id = checkAttachmentId(a.id);
+      const limits = attachmentLimits();
+      const target = await saveTarget(a.dir, ROOTS, serverBusDir(serverUrl));
+      const { res, data } = await api().download(`/api/attachments/${id}?identity=${encodeURIComponent(identity)}`, limits.file);
+      // Checked before anything is saved: the bytes must be the ones the server stored.
+      const sha256 = sha256Hex(data);
+      const want = digestSha256(res.headers.get("repr-digest"));
+      if (!want) throw new Error(`attachment ${id}: the server sent no digest; it needs updating`);
+      if (want !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
+      const info = {
+        id,
+        filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
+        type: res.headers.get("content-type") ?? "application/octet-stream",
+        size: data.length,
+        sha256,
+      };
+      const path = await saveAttachment(info, data, target);
+      return text({ path, filename: info.filename, type: info.type, size: info.size, sha256 });
+    }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
+    if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
+    // The HTTP API (attachments) refused the token, as a WS hello would have.
+    if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
     // Server errors arrive as "code: message"; show them to the agent.
     return { ...text(`error: ${(e as Error).message}`), isError: true };
+  }
+}
+
+// The server's HTTP API as this session's user, with the current token.
+const api = () => new ApiClient(serverUrl, currentToken());
+
+// The live connection's attachment limits, which every hello_ok (a reconnect's
+// too) carries. A server from before attachments sends none.
+function attachmentLimits(): AttachmentLimits {
+  const limits = client.assertConnected().attachment_limits;
+  if (!limits) throw new Error("this server doesn't take attachments; it needs updating");
+  return limits;
+}
+
+// Reads and checks the files an agent named (all before any is sent), uploads
+// each as this identity, and runs `send` with their ids; the server checks
+// them again and binds them to that dm_send or board_post. Uploads go only
+// over a live connection, and if any upload or the send fails, the ones made
+// are released, so a refused send doesn't hold the user's unsent quota.
+async function withUploads<T>(paths: unknown, send: (ids: number[]) => Promise<T>): Promise<T> {
+  if (paths === undefined) return send([]);
+  const files = await readAttachmentFiles(paths, ROOTS, { limits: attachmentLimits() });
+  client.assertConnected();
+  const ids: number[] = [];
+  let sent = false;
+  try {
+    for (const f of files) {
+      const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
+      ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
+    }
+    sent = true;
+    return await send(ids);
+  } catch (e) {
+    const bound = await releaseUploads(ids);
+    // A send binds all its files in one transaction or none: if every one is
+    // bound, the send landed and only its answer was lost.
+    if (sent && ids.length && bound === ids.length) throw new SendLanded(ids, e as Error);
+    throw e;
+  }
+}
+
+// Releases uploads a failed send left unbound. Returns how many the server
+// says are no longer unsent: bound after all (the answer was lost, not the send).
+async function releaseUploads(ids: number[]): Promise<number> {
+  let bound = 0;
+  for (const id of ids) {
+    try {
+      await api().del(`/api/attachments/${id}?identity=${encodeURIComponent(identity)}`);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        bound++;
+        continue;
+      }
+      console.error(`[grayboard] couldn't release upload ${id} (it expires in an hour): ${(e as Error).message}`);
+    }
+  }
+  return bound;
+}
+
+// A send whose answer was lost, though the server bound its attachments.
+class SendLanded extends Error {
+  constructor(readonly attachments: number[], cause: Error) {
+    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. Don't send it again; dm_history or board_read shows it.`);
   }
 }
 

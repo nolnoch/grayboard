@@ -14,7 +14,10 @@ export type SocketLog = (msg: string) => void;
 export type SocketOptions = {
   /** A fresh wss:// URL (apps.connections.open). */
   open: () => Promise<string>;
-  /** An events_api payload. The envelope is acked after this settles. */
+  /**
+   * An events_api payload, called in arrival order once its envelope is acked.
+   * Not awaited: a handler that needs order keeps its own queue.
+   */
   onEvent: (payload: Record<string, any>) => Promise<void>;
   /** Socket Mode was turned off for the app (disconnect reason link_disabled). */
   onFatal: (reason: string) => void;
@@ -110,7 +113,7 @@ export class SocketMode {
     conn.ws.addEventListener("pong" as any, heard);
     conn.ws.addEventListener("message", (ev) => {
       heard();
-      void this.onFrame(conn, String((ev as MessageEvent).data));
+      this.onFrame(conn, String((ev as MessageEvent).data));
     });
     conn.ws.addEventListener("close", (ev) => this.onClose(conn, (ev as CloseEvent).code));
     conn.ws.addEventListener("error", () => {}); // close follows; handled there
@@ -140,7 +143,7 @@ export class SocketMode {
     this.retryLater();
   }
 
-  private async onFrame(conn: Conn, raw: string): Promise<void> {
+  private onFrame(conn: Conn, raw: string): void {
     let msg: Record<string, any>;
     try {
       msg = JSON.parse(raw);
@@ -176,20 +179,16 @@ export class SocketMode {
     }
     if (!msg.envelope_id) return;
     const id = String(msg.envelope_id);
-    if (msg.type === "events_api" && msg.payload) {
-      const eventId = String(msg.payload.event_id ?? id);
-      if (!this.seen.has(eventId)) {
-        this.remember(eventId);
-        try {
-          await this.o.onEvent(msg.payload);
-        } catch (e) {
-          this.o.log(`socket: event handler failed: ${(e as Error).message}`);
-        }
-      }
-    }
-    // Every envelope gets acked, including types we don't handle, so Slack
-    // doesn't retry them.
+    // Ack first, inside Slack's 3 s window: handling can take minutes (file
+    // downloads), and a late ack makes Slack redeliver. Every envelope gets
+    // acked, including types we don't handle, so Slack doesn't retry them.
     if (conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify({ envelope_id: id }));
+    if (msg.type !== "events_api" || !msg.payload) return;
+    const eventId = String(msg.payload.event_id ?? id);
+    if (this.seen.has(eventId)) return;
+    this.remember(eventId);
+    // Called in arrival order, not awaited: the handler queues its own work.
+    this.o.onEvent(msg.payload).catch((e) => this.o.log(`socket: event handler failed: ${(e as Error).message}`));
   }
 
   private remember(eventId: string): void {

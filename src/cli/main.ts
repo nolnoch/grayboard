@@ -311,7 +311,7 @@ function requireLocalBus(mode: string | undefined): void {
 async function humanCommand(run: (m: typeof import("../local/human.ts")) => void | Promise<void>): Promise<void> {
   // Imported lazily: opening the local bus creates ~/.claude-bus.
   const m = await import("../local/human.ts");
-  const { CoreError } = await import("../core/boards.ts");
+  const { CoreError } = await import("../core/errors.ts");
   try {
     await run(m);
   } catch (e) {

@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Glob } from "bun";
 import { openDatabase, type Repo } from "./db.ts";
 
@@ -34,7 +37,7 @@ describe("Repo", () => {
 
   beforeEach(() => {
     // Use an in-memory DB for each test
-    const { repo: r } = openDatabase(":memory:");
+    const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
     repo = r;
   });
 

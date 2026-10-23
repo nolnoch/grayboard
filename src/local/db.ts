@@ -1,6 +1,23 @@
 import { openLocalDb } from "./open.ts";
+import { SqliteBlobs } from "./blobs.ts";
+import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments } from "../core/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 
 export const db = openLocalDb();
+export const blobs = new SqliteBlobs(db);
+
+// Stores files as `uploader`'s unbound uploads, then runs `send`, a write
+// that binds them in its own transaction. If it throws, the uploads go again.
+export async function withUploads<T>(uploader: string, files: AttachmentFile[], send: (ids: number[]) => T): Promise<T> {
+  const ids: number[] = [];
+  try {
+    for (const f of files) ids.push((await storeAttachment(db, blobs, uploader, f)).id);
+    return send(ids);
+  } catch (e) {
+    for (const id of ids) await releaseUpload(db, blobs, id, uploader);
+    throw e;
+  }
+}
 
 export type Message = {
   id: number;
@@ -10,34 +27,45 @@ export type Message = {
   parent_id: number | null;
   created_at: number;
   pending: number;
+  // Present on reads when the message carries files.
+  attachments?: AttachmentInfo[];
 };
 
+// Stores the message and binds the sender's uploads `ids` to it, in one transaction.
 export function insertMessage(
   sender: string,
   recipient: string,
   body: string,
   parent_id: number | null,
   pending = false,
-): number {
-  const now = Date.now();
-  const { lastInsertRowid } = db
-    .prepare(
-      `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
-  return Number(lastInsertRowid);
+  ids: number[] = [],
+): { id: number; attachments: AttachmentInfo[] } {
+  return db.transaction(() => {
+    const now = Date.now();
+    const { lastInsertRowid } = db
+      .prepare(
+        `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
+    const id = Number(lastInsertRowid);
+    return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
+  }).immediate();
 }
 
 export function unreadFor(reader: string): Message[] {
   const cursor = getCursor(reader);
-  return db
-    .prepare(
-      `SELECT * FROM messages
-       WHERE recipient = ? AND id > ?
-       ORDER BY id ASC`,
-    )
-    .all(reader, cursor) as Message[];
+  return withAttachments(
+    db,
+    "message",
+    db
+      .prepare(
+        `SELECT * FROM messages
+         WHERE recipient = ? AND id > ?
+         ORDER BY id ASC`,
+      )
+      .all(reader, cursor) as Message[],
+  );
 }
 
 export function getCursor(reader: string): number {
@@ -64,6 +92,10 @@ export function getMessage(id: number): Message | undefined {
 
 // The whole thread containing message `id`: walk up to its root, then down.
 export function getThread(id: number): Message[] {
+  return withAttachments(db, "message", threadRows(id));
+}
+
+function threadRows(id: number): Message[] {
   return db
     .prepare(
       `WITH RECURSIVE up(id, parent_id) AS (
@@ -135,7 +167,7 @@ export function getHistory(
     LIMIT ?
   `;
   args.push(limit);
-  const rows = db.prepare(sql).all(...args) as Message[];
+  const rows = withAttachments(db, "message", db.prepare(sql).all(...args) as Message[]);
   return rows.reverse().map((m) =>
     m.sender === identity && m.recipient !== identity ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
   );
@@ -147,26 +179,26 @@ export function ackMessage(reader: string, id: number): void {
 
 // Messages to `reader` since `since` that it hasn't acked, oldest first.
 export function receivedUnacked(reader: string, since: number): Message[] {
-  return db
+  return withAttachments(db, "message", db
     .prepare(
       `SELECT * FROM messages m
         WHERE m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
           AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
         ORDER BY m.id ASC`,
     )
-    .all(reader, since) as Message[];
+    .all(reader, since) as Message[]);
 }
 
 // Messages `sender` sent pending since `since` that it hasn't acked, oldest first.
 export function sentPending(sender: string, since: number): Message[] {
-  return db
+  return withAttachments(db, "message", db
     .prepare(
       `SELECT * FROM messages m
         WHERE m.sender = ? AND m.pending = 1 AND m.created_at >= ?
           AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
         ORDER BY m.id ASC`,
     )
-    .all(sender, since) as Message[];
+    .all(sender, since) as Message[]);
 }
 
 // Deletes a message `sender` sent that the recipient's session hasn't received
@@ -174,14 +206,17 @@ export function sentPending(sender: string, since: number): Message[] {
 // it. False if any of that doesn't hold.
 export function retractMessage(sender: string, id: number): boolean {
   return db.transaction(() => {
-    const { changes } = db
+    const retractable = db
       .prepare(
-        `DELETE FROM messages WHERE id = ? AND sender = ?
+        `SELECT 1 FROM messages WHERE id = ? AND sender = ?
            AND id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = messages.recipient), 0)
            AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
       )
-      .run(id, sender);
-    if (changes) db.prepare(`DELETE FROM dm_acks WHERE message_id = ?`).run(id);
-    return changes > 0;
-  })();
+      .get(id, sender);
+    if (!retractable) return false;
+    dropAttachments(db, "message", "?", id);
+    db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
+    db.prepare(`DELETE FROM dm_acks WHERE message_id = ?`).run(id);
+    return true;
+  }).immediate();
 }

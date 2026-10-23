@@ -11,12 +11,13 @@
 import { randomInt } from "node:crypto";
 
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
-import { boardNotification } from "../core/tools.ts";
+import { boardNotification, dmNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, ServerMessage, ThreadOk } from "../shared/protocol.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackWeb } from "../bridge/web.ts";
+import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
@@ -233,19 +234,17 @@ export class SlackBridge implements SlackLinker {
   // ── a linked user's human ──────────────────────────────────────────────────
 
   private async attach(link: SlackLink): Promise<void> {
-    const { repo } = this.o;
+    const { repo, db } = this.o;
     const user = repo.users.findById(link.user_id);
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
+    const handle = `${prefix}${HUMAN_NAME}`;
     const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, session_id: 0 };
 
     let relay!: Relay;
     const conn = new HumanConn(this.o.handlers, authed, (m) => {
       if (m.type === "push") {
-        const msg = m.message;
-        const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
-        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-        relay.notify({ content: msg.body, meta });
+        relay.notify(dmNotification(m.message));
       } else if (m.item.kind === "digest") {
         // Only says a board has unread posts; on a phone that's noise.
         void conn.request({ type: "board_ack", refs: [refOf(m.item)] }).catch(() => {});
@@ -255,9 +254,14 @@ export class SlackBridge implements SlackLinker {
     });
 
     // The outbox is memory: an item is acked to the hub only once Slack has
-    // it, so one that never made it is resent at the next start.
+    // it, so one that never made it is resent at the next start. How far it
+    // got is in the database, keyed by the item, so that resend resumes.
     const outbox = new Map<number, ChannelParams>();
     let next = 0;
+    const ref = (id: number) => {
+      const m = outbox.get(id)?.meta ?? {};
+      return m.board && m.post_id ? `post:${m.post_id}` : `dm:${m.message_id}`;
+    };
     const store: RelayStore = {
       thread: (kind, board, root) => repo.slack.thread(link.user_id, kind, board, root),
       byTs: (ts) => repo.slack.threadByTs(link.user_id, ts),
@@ -268,7 +272,10 @@ export class SlackBridge implements SlackLinker {
         return next;
       },
       pending: () => [...outbox].map(([id, p]) => ({ id, params: JSON.stringify(p) })),
+      progress: (id) => repo.slack.progress(link.user_id, ref(id)),
+      setProgress: (id, progress) => repo.slack.setProgress(link.user_id, ref(id), progress),
       done: (id) => {
+        repo.slack.clearProgress(link.user_id, ref(id));
         const p = outbox.get(id);
         outbox.delete(id);
         const m = p?.meta ?? {};
@@ -287,6 +294,7 @@ export class SlackBridge implements SlackLinker {
             const { type: _t, req_id: _r, ...v } = await conn.request<SendOk>({
               type: "send", recipient: args.to, body: args.body,
               ...(args.parent_id !== undefined ? { parent_id: args.parent_id } : {}),
+              ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids } : {}),
             });
             return { ok: true, value: v };
           }
@@ -296,6 +304,30 @@ export class SlackBridge implements SlackLinker {
           return { ok: true, value: (await conn.request<CallOk>({ type: "call", tool: name, args })).result };
         } catch (e) {
           return { ok: false, error: (e as Error).message };
+        }
+      },
+      // In process: the read check the download route makes, and the store an
+      // upload makes, audited the same way.
+      async attachment(id) {
+        const row = readableAttachment(repo, db, handle, id);
+        if (!row) {
+          writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
+          throw new Error(`no attachment ${id} on a message or post you can read`);
+        }
+        return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };
+      },
+      // Files the relay checked (checkFile), stored as the HTTP upload route
+      // stores them; released again if the send doesn't carry them.
+      async withFiles(files, send) {
+        const ids: number[] = [];
+        let sent = false;
+        try {
+          for (const f of files) ids.push((await storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file })).id);
+          const r = await send({ attachment_ids: ids });
+          sent = (r as { ok?: boolean }).ok !== false;
+          return r;
+        } finally {
+          if (!sent) for (const id of ids) await releaseStored(repo, db, link.email, handle, id, { via: "slack" });
         }
       },
     };
@@ -313,6 +345,15 @@ export class SlackBridge implements SlackLinker {
       },
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
+      attachmentLimits: repo.attachmentLimits,
+      onFileSent: (f) =>
+        writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
+          identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
+        }),
+      onFileRefused: (f) =>
+        writeAudit(repo, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
+          identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
+        }),
     });
     this.linked.set(link.user_id, { link, conn, relay });
     try {
@@ -336,9 +377,9 @@ export class SlackBridge implements SlackLinker {
   private async onEvent(payload: Record<string, any>): Promise<void> {
     if (payload.type !== "event_callback") return;
     const e = payload.event as Record<string, any> | undefined;
-    // Only people's new messages in a DM with the app: no edits, deletes or
-    // bot posts, including our own.
-    if (!e || e.type !== "message" || e.channel_type !== "im" || e.subtype || e.bot_id || !e.user) return;
+    // Only people's new messages in a DM with the app, with or without files:
+    // no edits, deletes or bot posts, including our own.
+    if (!e || e.type !== "message" || e.channel_type !== "im" || (e.subtype && e.subtype !== "file_share") || e.bot_id || !e.user) return;
     const user = String(e.user);
     const channel = String(e.channel);
     const ts = String(e.ts);

@@ -1,6 +1,8 @@
+import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
+import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer } from "./auth.ts";
 import type { Config } from "./config.ts";
@@ -13,7 +15,7 @@ export type StartOptions = WsOptions & {
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db, repo } = openDatabase(config.dbPath, humanReach);
+  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
@@ -28,9 +30,15 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     slack.stop();
   });
 
+  // Room for four messages' worth of upload bodies at once, one per user.
+  const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
+
   const server = Bun.serve<WsData>({
     port: config.httpPort,
     idleTimeout: 75,
+    // The largest body is an attachment upload (src/server/http.ts); the
+    // margin covers a JSON request carrying a full message body.
+    maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     fetch(req, server) {
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -55,10 +63,18 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser);
     },
 
     websocket: handlers,
+
+    // A route that throws something other than a refusal it maps itself. Bun's
+    // default answer, without NODE_ENV=production, is a dev page carrying the
+    // message (blob paths, errno text); the client gets a bare 500 instead.
+    error(e) {
+      console.error(`[grayboard] request failed: ${e.stack ?? e.message}`);
+      return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
+    },
   });
 
   const timers: ReturnType<typeof setInterval>[] = [];

@@ -2,11 +2,12 @@
 // `grayboard mcp --mode local` driven by an MCP client, sharing a temp database
 // and socket directory. Covers liveness in `who`, which only works across processes.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -24,7 +25,14 @@ afterEach(async () => {
 
 // Local-mode env for a session in `dir`; no credentials file, so `grayboard mcp` picks local.
 function busEnv(identity?: string): Record<string, string> {
-  const env = { ...process.env, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir, GRAYBOARD_CREDENTIALS: join(dir, "credentials") };
+  const env = {
+    ...process.env,
+    BUS_DB_PATH: join(dir, "bus.db"),
+    BUS_SOCK_DIR: dir,
+    GRAYBOARD_CREDENTIALS: join(dir, "credentials"),
+    GRAYBOARD_ATTACHMENTS_DIR: join(dir, "saved"),
+  };
+  delete env.BUS_ATTACH_ROOTS;
   delete env.BUS_IDENTITY;
   delete env.GRAYBOARD_TOKEN;
   return (identity ? { ...env, BUS_IDENTITY: identity } : env) as Record<string, string>;
@@ -183,7 +191,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?, pending?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?, attachments?): missing to; unknown recipient.",
   );
 }, 20_000);
 
@@ -537,4 +545,64 @@ test("grayboard announce reaches live sessions marked human; a TTL carries it in
 
   const fe = await start("fe");
   expect(fe.getInstructions()).toMatch(/announcements still in effect \(human="true"\): post \d+ from alex, in effect until .*: merge freeze/);
+}, 20_000);
+
+test("attachments: sent with a DM or post, shown on reads and pushes, fetched by readers only", async () => {
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
+  writeFileSync(join(dir, "shot.png"), png);
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  writeFileSync(join(dir, ".env"), "TOKEN=x");
+  const be = await start("be");
+  const fe = await start("fe");
+  const sim = await start("sim");
+  const pushes: Record<string, string>[] = [];
+  fe.fallbackNotificationHandler = async (n) => {
+    pushes.push((n.params as { meta: Record<string, string> }).meta);
+  };
+
+  await expect(call(be, "dm_send", { to: "fe", body: "x", attachments: [".env"] })).rejects.toThrow(/dotfiles/);
+  await expect(call(be, "dm_send", { to: "fe", body: "x", attachments: ["/etc/hosts"] })).rejects.toThrow(/outside the directories/);
+  const sent = await call(be, "dm_send", { to: "fe", body: "see these", attachments: ["shot.png", join(dir, "notes.md")] });
+  const [shot, notes] = sent.attachments;
+  expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) });
+  expect(notes).toMatchObject({ filename: "notes.md", type: "text/markdown", size: 7 });
+
+  await Bun.sleep(300);
+  const meta = pushes.find((m) => m.message_id === String(sent.message_id))!;
+  expect(meta.files_tool).toMatch(/^attachment_get\(id/);
+  expect(meta.attachments).toBe(`${shot.id}:shot.png image/png 10B sha256:${sha256Hex(png)}; ${notes.id}:notes.md text/markdown 7B sha256:${sha256Hex(new TextEncoder().encode("# notes"))}`);
+  expect((await call(fe, "dm_thread", { thread: sent.message_id }))[0].attachments).toEqual(sent.attachments);
+  expect((await call(fe, "dm_inbox")).unanswered[0].attachments).toEqual(sent.attachments);
+
+  const saved = await call(fe, "attachment_get", { id: shot.id });
+  expect(saved.path).toBe(join(dir, "saved", localBusDir(join(dir, "bus.db")), `${shot.id}-shot.png`));
+  expect(new Uint8Array(readFileSync(saved.path))).toEqual(png);
+  mkdirSync(join(dir, "out"));
+  expect((await call(fe, "attachment_get", { id: notes.id, dir: "out" })).path).toBe(join(realpathSync(dir), "out", `${notes.id}-notes.md`));
+  await expect(call(fe, "attachment_get", { id: notes.id, dir: "/" })).rejects.toThrow(/outside the directories/);
+  await expect(call(sim, "attachment_get", { id: shot.id })).rejects.toThrow(/no attachment/);
+
+  await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(fe, "board_subscribe", { board: "e2e", mode: "push" });
+  await expect(call(be, "board_post", { board: "e2e", body: "x", parent_id: 9999, attachments: ["shot.png"] })).rejects.toThrow(/parent_id/);
+  const posted = await call(be, "board_post", { board: "e2e", body: "shot", attachments: ["shot.png"] });
+  expect(posted.attachments).toEqual([{ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) }]);
+  await Bun.sleep(300);
+  expect(pushes.find((m) => m.post_id === String(posted.post_id))!.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B sha256:${sha256Hex(png)}`);
+  expect((await call(sim, "board_read", { board: "e2e" })).posts[0].attachments).toEqual(posted.attachments);
+  expect((await call(sim, "attachment_get", { id: posted.attachments[0].id })).size).toBe(png.length);
+
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(join(dir, "bus.db"));
+  const count = () => (db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get() as { n: number }).n;
+  // The refused post released its upload; the blob is shared by content.
+  expect(count()).toBe(3);
+  expect((db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs`).get() as { n: number }).n).toBe(2);
+
+  await stop(fe);
+  const queued = await call(be, "dm_send", { to: "fe", body: "oops", attachments: ["notes.md"] });
+  expect(count()).toBe(4);
+  expect(await call(be, "dm_retract", { message_id: queued.message_id })).toBe("ok");
+  expect(count()).toBe(3);
+  db.close();
 }, 20_000);

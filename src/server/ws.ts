@@ -1,4 +1,4 @@
-import type { MessageRow, Repo } from "./db.ts";
+import { participant, type MessageRow, type Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
@@ -7,9 +7,9 @@ import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  CoreError,
   acknowledge,
   age,
+  checkBody,
   lastSeen,
   pendingFor,
   post,
@@ -20,11 +20,14 @@ import {
   type CoreDb,
   type PendingRef,
 } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, dmBody, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
@@ -195,7 +198,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
             err(ws, msg.req_id, "bad_request", "already authenticated");
             break;
           case "send":
-            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
+            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
             break;
           case "history":
             handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -369,6 +372,7 @@ async function handleHello(
     user_email: authed.user_email,
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    attachment_limits: repo.attachmentLimits,
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -426,10 +430,13 @@ function handleSend(
   body: string,
   parentId: number | null,
   pending: boolean,
+  attachmentIdsRaw: unknown,
 ): void {
   const { repo, db, registry } = hub;
+  let ids: number[];
   try {
-    dmBody(body);
+    checkBody(body);
+    ids = attachmentIds(attachmentIdsRaw);
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
@@ -472,8 +479,17 @@ function handleSend(
     return;
   }
 
-  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending);
-  const p = pending ? { pending: true as const } : {};
+  let msg: MessageRow;
+  try {
+    msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending, ids);
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    throw e;
+  }
+  for (const a of msg.attachments ?? []) {
+    writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: parsed.full });
+  }
+  const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
   let deliveredNow = false;
   const recipientWs = registry.get(parsed.full);
@@ -512,6 +528,7 @@ function handleRetract(hub: Hub, ws: Ws, reqId: string, id: number): void {
   }
   if (!repo.messages.retract(ws.data.identityFull, id)) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
   send(ws, { type: "ack_ok", req_id: reqId });
+  void sweepBlobs(hub.db, repo.blobs);
 }
 
 function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {
@@ -524,11 +541,18 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   try {
     outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
       online: (h) => hub.registry.get(h)?.data.ready === true,
+      attachmentLimits: hub.repo.attachmentLimits,
     });
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);
     return err(ws, reqId, "internal", `${tool} failed`);
+  }
+  if (tool === "board_post") {
+    const r = outcome.result as { post_id: number; board: string; attachments?: AttachmentInfo[] };
+    for (const a of r.attachments ?? []) {
+      writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, post_id: r.post_id, board: r.board });
+    }
   }
   send(ws, { type: "call_ok", req_id: reqId, result: outcome.result });
   wake(hub, outcome.wake);
@@ -589,12 +613,6 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
     ...(promises.length ? { promised: promises } : {}),
     ...(queued.length ? { undelivered_from_you: queued } : {}),
   });
-}
-
-// Only a message's sender and recipient can see it, or thread from it. A
-// message you're not in reads as missing, so its existence doesn't leak.
-function participant(m: MessageRow | undefined, me: string): m is MessageRow {
-  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
 }
 
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {

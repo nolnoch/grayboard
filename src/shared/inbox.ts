@@ -1,9 +1,11 @@
-import { CoreError, MAX_BODY_BYTES, age } from "../core/boards.ts";
+import { age } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
+import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string };
-export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string };
+export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
+export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
@@ -29,6 +31,7 @@ function item(m: Msg, now: number) {
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
     age: age(now - m.created_at),
     body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
+    ...(m.attachments ? { attachments: m.attachments } : {}),
   };
 }
 
@@ -52,15 +55,7 @@ export function showPending<M extends { pending: number | boolean }>(m: M): Omit
   return pending ? { ...rest, pending: true } : rest;
 }
 
-// dm_send's body and dm_history's limit, checked alike in both modes (#75).
-export function dmBody(body: unknown): string {
-  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
-  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
-    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
-  }
-  return body;
-}
-
+// dm_history's limit, checked alike in both modes (#75).
 export function historyLimit(limit: unknown): number {
   if (limit === undefined || limit === null) return 20;
   if (typeof limit !== "number" || !Number.isFinite(limit)) throw new CoreError("limit must be a number");

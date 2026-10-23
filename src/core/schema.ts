@@ -91,6 +91,37 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+
+    -- File attachments (src/core/attachments.ts). The catalog of stored
+    -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
+    -- blob goes when the last attachment naming it does.
+    CREATE TABLE IF NOT EXISTS attachment_blobs (
+      sha256      TEXT PRIMARY KEY,
+      size        INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+
+    -- One per file attached. Unbound (both targets null) from upload until
+    -- the message or post that carries it is written, in that write's
+    -- transaction; unbound rows are pruned after an hour. messages is each
+    -- mode's direct-message table.
+    CREATE TABLE IF NOT EXISTS attachments (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      sha256      TEXT    NOT NULL REFERENCES attachment_blobs(sha256),
+      filename    TEXT    NOT NULL,
+      type        TEXT    NOT NULL,
+      size        INTEGER NOT NULL,
+      uploader    TEXT    NOT NULL,
+      message_id  INTEGER REFERENCES messages(id),
+      post_id     INTEGER REFERENCES posts(id),
+      created_at  INTEGER NOT NULL,
+      CHECK (message_id IS NULL OR post_id IS NULL)
+    );
+    CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id) WHERE message_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_attachments_post ON attachments(post_id) WHERE post_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
+    CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a

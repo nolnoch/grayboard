@@ -7,6 +7,10 @@
 // tools, so roster checks, wakeups, and identity uniqueness come for free.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
 import { busMode } from "../cli/api.ts";
 import { declareHuman, humanHandles } from "../core/boards.ts";
@@ -61,6 +65,11 @@ export async function startSlackBridge(
 
   const me = await web.call<{ user_id: string; team?: string }>("auth.test");
   const store = new Store(cfg.dbPath);
+  // Files cross the tool boundary as paths, the way an agent's do, through
+  // one private directory the bridge owns and declares to its child as an
+  // attach root; nothing else under the temp directory is readable to it.
+  // Resolved, as the child compares resolved paths.
+  const scratchRoot = realpathSync(await mkdtemp(join(tmpdir(), "grayboard-slack-")));
 
   let finish!: (code: number) => void;
   const done = new Promise<number>((r) => (finish = r));
@@ -77,20 +86,51 @@ export async function startSlackBridge(
     relay?.stop();
     await client.close().catch(() => {});
     store.close();
+    await rm(scratchRoot, { recursive: true, force: true });
     finish(code);
   };
 
+  const call: Bus["call"] = async (name, args) => {
+    const r = await client.callTool({ name, arguments: args });
+    const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
+    // The scratch path means nothing to the Slack owner the error goes to.
+    if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "").replaceAll(`${scratchRoot}/`, "") };
+    try {
+      return { ok: true, value: JSON.parse(text) };
+    } catch {
+      return { ok: true, value: text };
+    }
+  };
+  // A subdirectory of the scratch root per call, removed once it returns.
+  const scratch = async <T>(use: (dir: string) => Promise<T>): Promise<T> => {
+    const dir = await mkdtemp(join(scratchRoot, "call-"));
+    try {
+      return await use(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
   const bus: Bus = {
-    async call(name, args) {
-      const r = await client.callTool({ name, arguments: args });
-      const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
-      if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "") };
-      try {
-        return { ok: true, value: JSON.parse(text) };
-      } catch {
-        return { ok: true, value: text };
-      }
-    },
+    call,
+    attachment: (id) =>
+      scratch(async (dir) => {
+        const r = await call("attachment_get", { id, dir });
+        if (!r.ok) throw new Error(r.error);
+        const v = r.value as { path: string; filename: string; type: string; size: number; sha256: string };
+        return { id, filename: v.filename, type: v.type, size: v.size, sha256: v.sha256, data: new Uint8Array(await readFile(v.path)) };
+      }),
+    withFiles: (files, send) =>
+      scratch(async (dir) => {
+        // One directory per file, so two files of the same name keep it.
+        const paths: string[] = [];
+        for (const [i, f] of files.entries()) {
+          await mkdir(join(dir, String(i)));
+          const path = join(dir, String(i), f.filename);
+          await writeFile(path, f.data, { mode: 0o600 });
+          paths.push(path);
+        }
+        return send({ attachments: paths });
+      }),
   };
 
   relay = new Relay(store, bus, web, {
@@ -99,6 +139,8 @@ export async function startSlackBridge(
     log,
     debug,
     onFatal: (reason) => void stop(1, `stopping: ${reason}`),
+    // Local mode has no audit log; the bridge's log is the trail.
+    onFileSent: (f) => log(`attachment ${f.attachment} (sha256 ${f.sha256}) → Slack file ${f.slack_file} in thread ${f.thread_ts ?? "unknown"}`),
   });
 
   // Pushes can arrive as soon as the handshake completes.
@@ -110,12 +152,14 @@ export async function startSlackBridge(
   delete childEnv.BUS_PUSH;
   childEnv.BUS_IDENTITY = cfg.handle;
   childEnv.BUS_HUMAN = "1";
+  childEnv.BUS_ATTACH_ROOTS = [childEnv.BUS_ATTACH_ROOTS, scratchRoot].filter(Boolean).join(delimiter);
   const args = mode === "local" ? [...mcp.args, "--mode", "local"] : mcp.args;
   const transport = new StdioClientTransport({ command: mcp.command, args, env: childEnv, stderr: "inherit" });
   try {
     await client.connect(transport);
   } catch (e) {
     store.close();
+    await rm(scratchRoot, { recursive: true, force: true });
     throw new Error(`couldn't start grayboard as "${cfg.handle}" (is another session using that handle?): ${(e as Error).message}`);
   }
   // Without the child, nothing reaches the bus: exit and let a supervisor restart us.

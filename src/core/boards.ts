@@ -1,11 +1,23 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
+import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
+import { CoreError, TooLargeError } from "./errors.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+
+// A post's or direct message's body, checked alike in both modes (#75).
+export function checkBody(body: unknown): string {
+  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
+  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
+    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
+  }
+  return body;
+}
 // @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
 // so plain email addresses in prose aren't mentions.
 const MENTION_RE =
@@ -31,6 +43,8 @@ export type Post = {
   created_at: number;
   // An announcement's TTL; null (or absent, from older peers) otherwise.
   expires_at?: number | null;
+  // Present on reads and pushes when the post carries files.
+  attachments?: AttachmentInfo[];
 };
 
 export type Pending =
@@ -42,7 +56,6 @@ export type PendingRef =
   | { kind: "push"; post_id: number }
   | { kind: "digest"; board: string; latest_id: number };
 
-export class CoreError extends Error {}
 
 // ── access policy ────────────────────────────────────────────────────────────
 
@@ -349,13 +362,18 @@ function resolveMentions(
 }
 
 // wake: handles to wake now. deferred: thread participants whose push waits
-// for their next wake.
+// for their next wake. post.attachments: those bound to the post.
 export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
-// sessions' instructions.
-export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number };
+// sessions' instructions. attachments: the poster's unbound uploads to
+// carry, bound in the post's transaction under the mode's size caps.
+export type PostOpts = {
+  online?: (handle: string) => boolean;
+  ttl_ms?: number;
+  attachments?: { ids: number[]; limits?: AttachmentLimits };
+};
 
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
@@ -372,10 +390,7 @@ export function post(
 ): PostResult {
   const b = visibleBoard(db, handle, boardInput);
   const board = b.name;
-  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
-  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
-    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
-  }
+  checkBody(body);
   if (parentId !== null) {
     const parent = getPost(db, parentId);
     if (!parent || parent.board !== board) {
@@ -395,6 +410,8 @@ export function post(
   if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
   }
+  const files = opts.attachments ?? { ids: [] };
+  if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
 
   return db.transaction((): PostResult => {
     const now = Date.now();
@@ -404,6 +421,7 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
+    const attachments = files.limits ? bindAttachments(db, files.ids, handle, { post_id: p.id }, files.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
@@ -451,7 +469,7 @@ export function post(
     // Digest subscribers aren't woken: their notice rides with their next wake.
     const all = [...targets];
     return {
-      post: p,
+      post: attachments.length ? { ...p, attachments } : p,
       wake: all.filter(([, t]) => t.wake).map(([h]) => h),
       deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
       unresolved,
@@ -652,7 +670,7 @@ export function read(
     )
     .get(handle, board, handle, handle) as { n: number };
 
-  return { board, posts, unread_remaining: remaining.n };
+  return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
 }
 
 // ── delivery ─────────────────────────────────────────────────────────────────
@@ -679,12 +697,16 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   };
 
   const out: Pending[] = [];
-  const pushes = db
-    .prepare(
-      `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
-        WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
-    )
-    .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[];
+  const pushes = withAttachments(
+    db,
+    "post",
+    db
+      .prepare(
+        `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
+          WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
+      )
+      .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[],
+  );
   for (const { reason, wake, ...p } of pushes) {
     if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
     else acknowledge(db, handle, { kind: "push", post_id: p.id });
@@ -750,6 +772,9 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
 
 // ── retention ────────────────────────────────────────────────────────────────
 
+// How long messages and posts keep, unless the operator (or a local user) says otherwise.
+export const DEFAULT_RETENTION_DAYS = 90;
+
 // Operator retention, not an agent operation. Replies outlive their pruned
 // parents as thread roots.
 export function prunePosts(db: Database, olderThanMs: number): void {
@@ -758,6 +783,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
+    dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.

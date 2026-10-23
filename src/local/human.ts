@@ -3,7 +3,8 @@
 // inside a session), never through an agent's tools.
 import { db } from "./db.ts";
 import { poke } from "./wakeup.ts";
-import { ANNOUNCE_BOARD, CoreError, createBoard, declareHuman, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { ANNOUNCE_BOARD, createBoard, declareHuman, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import { parseTtl as parseDuration } from "../shared/ttl.ts";
 

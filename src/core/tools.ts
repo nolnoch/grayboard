@@ -4,7 +4,6 @@
 import type { Database } from "bun:sqlite";
 
 import {
-  CoreError,
   createBoard,
   isViewer,
   listBoards,
@@ -19,7 +18,10 @@ import {
   type Post,
   type SubMode,
 } from "./boards.ts";
+import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
+import { attachmentIds } from "./attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type ToolDef = {
   name: string;
@@ -63,13 +65,14 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
+          attachments: ATTACHMENTS_PARAM,
         },
         required: ["board", "body"],
       },
@@ -284,7 +287,9 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
 export type ToolOutcome = { result: unknown; wake: string[] };
 
 // What only the mode knows. online: does this handle have a live session?
-export type ToolContext = { online?: (handle: string) => boolean };
+// attachmentLimits: the caps a post's files are bound under; a mode without
+// them can't post files.
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits };
 
 export function callBoardTool(
   db: Database,
@@ -305,18 +310,22 @@ export function callBoardTool(
     }
 
     case "board_post": {
+      // Paths name files on the agent's host: its MCP process reads, checks
+      // and uploads them, and passes the upload ids as attachment_ids.
+      if (a.attachments !== undefined) throw new CoreError("attachments must be read by the session's grayboard MCP process; this one can't");
       const { post: p, wake, deferred, unresolved } = post(
         db,
         handle,
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online },
+        { online: ctx.online, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
       );
       return {
         result: {
           post_id: p.id,
           board: p.board,
+          ...(p.attachments ? { attachments: p.attachments } : {}),
           notified: wake.filter((h) => !isViewer(h)),
           ...(deferred.length ? { deferred } : {}),
           ...(unresolved.length ? { unresolved } : {}),
@@ -388,6 +397,23 @@ export function callBoardTool(
   throw new CoreError(`unknown tool: ${name}`);
 }
 
+// A message's or post's files, in its channel meta. attachment_get isn't
+// alwaysLoad, so the notification that carries files names it; one without
+// files costs nothing.
+function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefined): void {
+  if (!list?.length) return;
+  meta.attachments = formatAttachmentsMeta(list);
+  meta.files_tool = "attachment_get(id, dir?) saves one; ids lead each item";
+}
+
+// The channel notification for a direct message. Same shape in every mode.
+export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+  const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+  addFiles(meta, msg.attachments);
+  return { content: msg.body, meta };
+}
+
 // The channel notification for a board item. Same shape in every mode.
 export function boardNotification(item: Pending): { content: string; meta: Record<string, string> } {
   if (item.kind === "push") {
@@ -400,6 +426,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       created_at: String(p.created_at),
     };
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
+    addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }
