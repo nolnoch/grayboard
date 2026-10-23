@@ -33,7 +33,9 @@ jobs:
 
   # deploy/grayboard.service as systemd reads it. verify also checks that the
   # user, env file and binary it names exist, so stand-ins go in first. It
-  # exits 0 on some warnings, so any output fails the job.
+  # exits 0 on some warnings, so any output about our unit fails the job;
+  # lines about the runner's own units (/usr/lib, /lib, /etc/systemd) don't.
+  # A copy with an unknown key must fail, so the lint can't go quiet.
   deploy-lint:
     runs-on: ubuntu-latest
     steps:
@@ -44,5 +46,15 @@ jobs:
           sudo useradd --system grayboard
           sudo install -D -m 600 /dev/null /etc/grayboard/env
           sudo install -m 755 /bin/true /usr/local/bin/grayboard-server
-          out="$(systemd-analyze verify deploy/grayboard.service 2>&1)" || { echo "$out"; exit 1; }
-          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+          lint() {
+            local out code=0
+            out="$(systemd-analyze verify "$1" 2>&1)" || code=$?
+            out="$(printf '%s\n' "$out" | grep -v -E '^/(usr/lib|lib|etc)/systemd/' || true)"
+            [ -n "$out" ] && printf '%s\n' "$out"
+            [ "$code" -eq 0 ] && [ -z "$out" ]
+          }
+          lint deploy/grayboard.service
+          bad="$RUNNER_TEMP/grayboard.service"
+          sed 's/^Restart=always$/Restart=always\nRestartBogus=1/' deploy/grayboard.service > "$bad"
+          grep -q RestartBogus "$bad"
+          if lint "$bad"; then echo "::error::the lint passed a unit with an unknown key"; exit 1; fi
