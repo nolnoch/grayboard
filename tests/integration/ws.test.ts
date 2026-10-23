@@ -904,3 +904,31 @@ test("a server's own attachment limits: sent in hello_ok, enforced per file, per
   await upload(alice, "be", "c.txt", "c".repeat(80));
   expect((await upload(alice, "be", "d.txt", "d".repeat(80))).body.message).toMatch(/unsent uploads would exceed 300B/);
 });
+
+test("a user's stored attachments are capped, sent or not; an upload needs a length; refusals are audited", async () => {
+  app.stop();
+  app = startServer(config({ attachmentLimits: { file: 100, total: 150 }, attachmentUserQuota: 200 }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const alice = await login("alice@example.com");
+  const a = new Client(alice, "be");
+  await a.connect();
+  for (const n of ["a", "b"]) {
+    const up = await upload(alice, "be", `${n}.txt`, n.repeat(90));
+    expect(await a.request({ type: "send", recipient: "be", body: n, attachment_ids: [up.body.id] })).toMatchObject({ type: "send_ok" });
+  }
+  const over = await upload(alice, "be", "c.txt", "c".repeat(30));
+  expect(over).toMatchObject({ status: 413, body: { message: "your stored attachments would exceed 200B; they're freed as their messages and posts age out" } });
+  expect((await upload(alice, "be", "d.txt", "d".repeat(20))).status).toBe(201);
+
+  // A streamed body declares no length.
+  const streamed = await fetch(`${base}/api/attachments?identity=be&filename=e.txt`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${alice}` },
+    body: new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }),
+  });
+  expect(streamed.status).toBe(411);
+
+  expect(audits("attachment.upload_refused").map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([
+    { actor: "alice@example.com", identity: "alice@example.com/be", filename: "c.txt", size: 30, reason: over.body.message },
+  ]);
+});

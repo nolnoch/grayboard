@@ -7,6 +7,7 @@ export type AuditAction =
   | "attachment.released"
   | "attachment.sent_to_slack"
   | "attachment.slack_refused"
+  | "attachment.upload_refused"
   | "attachment.uploaded"
   | "auth.login"
   | "auth.logout"

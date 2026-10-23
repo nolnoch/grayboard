@@ -1,6 +1,7 @@
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
+import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer } from "./auth.ts";
 import type { Config } from "./config.ts";
@@ -13,7 +14,7 @@ export type StartOptions = WsOptions & {
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits });
+  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
@@ -27,6 +28,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     console.error(`[grayboard slack] not started: ${(e as Error).message}`);
     slack.stop();
   });
+
+  // Room for four messages' worth of upload bodies at once, one per user.
+  const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -57,7 +61,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser);
     },
 
     websocket: handlers,

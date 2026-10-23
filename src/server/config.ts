@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentLimits } from "../shared/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS } from "../core/boards.ts";
 
 export type Config = {
@@ -22,6 +22,8 @@ export type Config = {
   humanReach?: HumanReach;
   // Attachment size caps per file and per message; default local mode's.
   attachmentLimits?: AttachmentLimits;
+  // The bytes of attachments one user may store, sent or not.
+  attachmentUserQuota?: number;
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -55,22 +57,30 @@ export function loadConfig(): Config {
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
-    attachmentLimits: parseAttachmentLimits(process.env),
+    ...parseAttachmentLimits(process.env),
     ...slackConfig(),
   };
 }
 
-function parseAttachmentLimits(env: Record<string, string | undefined>): AttachmentLimits {
-  const bytes = (name: string, fallback: number): number => {
+// The most an operator may raise the caps to. An upload's body is held in
+// memory while it's checked (src/server/uploads.ts bounds how many at once).
+const MAX_FILE_CEILING = 100 * 1024 * 1024;
+const MAX_TOTAL_CEILING = 250 * 1024 * 1024;
+
+function parseAttachmentLimits(env: Record<string, string | undefined>): { attachmentLimits: AttachmentLimits; attachmentUserQuota: number } {
+  const bytes = (name: string, fallback: number, ceiling = Infinity): number => {
     const raw = env[name];
     if (raw === undefined || raw === "") return fallback;
     if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive number of bytes, not "${raw}"`);
+    if (Number(raw) > ceiling) throw new Error(`${name} can be at most ${ceiling} bytes`);
     return Number(raw);
   };
-  const file = bytes("GRAYBOARD_ATTACHMENT_MAX_BYTES", DEFAULT_ATTACHMENT_LIMITS.file);
-  const total = bytes("GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_ATTACHMENT_LIMITS.total);
+  const file = bytes("GRAYBOARD_ATTACHMENT_MAX_BYTES", DEFAULT_ATTACHMENT_LIMITS.file, MAX_FILE_CEILING);
+  const total = bytes("GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_ATTACHMENT_LIMITS.total, MAX_TOTAL_CEILING);
   if (file > total) throw new Error("GRAYBOARD_ATTACHMENT_MAX_BYTES can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
-  return { file, total };
+  const quota = bytes("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", DEFAULT_ATTACHMENT_USER_QUOTA);
+  if (quota < total) throw new Error("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES can't be less than GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
+  return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
 }
 
 function parseReach(raw: string | undefined): HumanReach {

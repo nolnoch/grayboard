@@ -5,6 +5,7 @@ import {
   mintToken, hashToken, type AuthedUser,
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
+import type { UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
@@ -198,23 +199,34 @@ function ownIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Respons
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
-async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate): Promise<Response> {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
   const label = `file ${sanitizeFilename(rawName)}`;
+  // The body's length is reserved before it's read, so it must be declared.
+  const declared = req.headers.get("content-length");
+  if (declared === null || !/^\d{1,15}$/.test(declared)) return jsonErr("length_required", "an upload needs a Content-Length", 411);
+  const refuse = (code: string, message: string, status: number) => {
+    writeAudit(repo, "attachment.upload_refused", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), reason: message });
+    return jsonErr(code, message, status);
+  };
+  let release = () => {};
   try {
     // A declared length over the cap is refused before the body is read.
-    new SizeTally(repo.attachmentLimits, 1).add(label, Number(req.headers.get("content-length") ?? "0"));
+    new SizeTally(repo.attachmentLimits, 1).add(label, Number(declared));
+    release = await uploads.reserve(authed.user_email, Number(declared), req.signal);
     const data = new Uint8Array(await req.arrayBuffer());
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
     const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
     return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
   } catch (e) {
-    if (e instanceof TooLargeError) return jsonErr("too_large", e.message, 413);
-    if (e instanceof CoreError) return badRequest(e.message);
+    if (e instanceof TooLargeError) return refuse("too_large", e.message, 413);
+    if (e instanceof CoreError) return refuse("bad_request", e.message, 400);
     throw e;
+  } finally {
+    release();
   }
 }
 
@@ -386,7 +398,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 // ── main router ──────────────────────────────────────────────────────────────
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
+  req: Request, repo: Repo, db: CoreDb, config: Config, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
 ): Promise<Response> {
   const url    = new URL(req.url);
@@ -410,7 +422,7 @@ export async function handleHttp(
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake);
 
-  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db);
+  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
   if (path.startsWith("/api/attachments/") && method === "GET") {
     return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
   }

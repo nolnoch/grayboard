@@ -51,7 +51,10 @@ async function withBlob<T>(sha256: string, fn: () => Promise<T>): Promise<T> {
 
 // A cap on the unbound bytes the uploaders under `prefix` (a server user's
 // "email/") may hold.
-export type UploadQuota = { prefix: string; cap: number };
+// A server user's caps, over the uploads of every handle under `prefix` (the
+// user's "email/"): `unsent` bytes not yet on a message or post, and `stored`
+// bytes in all, sent or not.
+export type UploadQuota = { prefix: string; unsent: number; stored: number };
 
 // Stores one checked file as an unbound upload of `uploader`'s. Identical
 // bytes share one blob. Also prunes uploads left unbound past their TTL, then
@@ -74,8 +77,11 @@ export async function storeAttachment(
       const row = db.transaction(() => {
         unnamed = pruneUnbound(db, now - UNBOUND_TTL_MS) > 0;
         const q = opts.quota;
-        if (q && unboundBytes(db, q.prefix) + file.data.length > q.cap) {
-          throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.cap)}; send or wait for them to expire`);
+        if (q && uploadedBytes(db, q.prefix, true) + file.data.length > q.unsent) {
+          throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.unsent)}; send or wait for them to expire`);
+        }
+        if (q && uploadedBytes(db, q.prefix, false) + file.data.length > q.stored) {
+          throw new TooLargeError(`your stored attachments would exceed ${formatSize(q.stored)}; they're freed as their messages and posts age out`);
         }
         db.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(sha256, file.data.length, now);
         return db
@@ -192,15 +198,18 @@ export function dropAttachments(db: Database, kind: "message" | "post", ownersSq
   return db.prepare(`DELETE FROM attachments WHERE ${col} IN (${ownersSql})`).run(...params).changes;
 }
 
-// Bytes of unbound uploads held by the handles under `prefix` (a server
-// user's "email/"), for the per-user quota on uploads.
-export function unboundBytes(db: Database, prefix: string): number {
+// Bytes uploaded by the handles under `prefix` (a server user's "email/"),
+// only the unbound ones if `unbound`, for the per-user quotas. The range on
+// uploader uses its index: every handle under the prefix sorts below the
+// prefix with its last character incremented.
+export function uploadedBytes(db: Database, prefix: string, unbound: boolean): number {
+  const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
   const row = db
     .prepare(
       `SELECT COALESCE(SUM(size), 0) AS n FROM attachments
-        WHERE message_id IS NULL AND post_id IS NULL AND substr(uploader, 1, length(?)) = ?`,
+        WHERE uploader >= ? AND uploader < ?${unbound ? " AND message_id IS NULL AND post_id IS NULL" : ""}`,
     )
-    .get(prefix, prefix) as { n: number };
+    .get(prefix, end) as { n: number };
   return row.n;
 }
 

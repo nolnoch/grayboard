@@ -11,6 +11,7 @@ import {
   dropAttachments,
   getAttachment,
   pruneUnbound,
+  uploadedBytes,
   releaseUpload,
   storeAttachment,
   sweepBlobs,
@@ -342,11 +343,23 @@ describe("storage", () => {
   const files = (ids: number[]) => ({ attachments: { ids, limits: LIMITS } });
 
   test("a quota caps the unbound bytes a user's handles hold, counted inside the store", async () => {
-    const quota = { prefix: "you@example.com/", cap: 10 };
+    const quota = { prefix: "you@example.com/", unsent: 10, stored: 1000 };
     await store("you@example.com/be", file("123456"), { quota });
     await store("other@example.com/be", file("123456"), { quota: { ...quota, prefix: "other@example.com/" } });
-    await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow(TooLargeError);
+    // A handle that only shares the prefix's text isn't under it.
+    await store("you@example.com.evil/be", file("123456"), { quota: { ...quota, prefix: "you@example.com.evil/" } });
+    await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow("your unsent uploads would exceed 10B");
     expect((await store("you@example.com/fe", file("1234"), { quota })).size).toBe(4);
+  });
+
+  test("a quota caps the bytes a user's handles store in all, sent or not", async () => {
+    const quota = { prefix: "you@example.com/", unsent: 1000, stored: 10 };
+    const sent = await store("you@example.com/be", file("123456"), { quota });
+    bindAttachments(db, [sent.id], "you@example.com/be", { message_id: msg("you@example.com/be") }, LIMITS);
+    await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow(/your stored attachments would exceed 10B/);
+    expect((await store("you@example.com/fe", file("1234"), { quota })).size).toBe(4);
+    expect(uploadedBytes(db, "you@example.com/", false)).toBe(10);
+    expect(uploadedBytes(db, "you@example.com/", true)).toBe(4);
   });
 
   test("bind checks the message's total against the limits it's given", async () => {

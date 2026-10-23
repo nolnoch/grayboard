@@ -7,7 +7,7 @@ import { bindAttachments, dropAttachments, withAttachments, type BlobStore } fro
 import { initCoreSchema } from "../core/schema.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 
 // Row types
@@ -109,9 +109,11 @@ export interface Repo {
   blobs: BlobStore;
   // The server's per-file and per-message caps; insert binds files under them.
   attachmentLimits: AttachmentLimits;
+  // The bytes of attachments one user may store, sent or not.
+  attachmentUserQuota: number;
 }
 
-export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits };
+export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
 
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
@@ -121,7 +123,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   );
   initSchema(db);
   initCoreSchema(db);
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS);
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
   setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
   return { db, repo };
 }
@@ -243,7 +245,7 @@ function initSchema(db: Database): void {
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
 }
 
-function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   return {
     users: {
@@ -614,5 +616,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     blobs,
     attachmentLimits,
+    attachmentUserQuota,
   };
 }

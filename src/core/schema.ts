@@ -121,6 +121,7 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_attachments_post ON attachments(post_id) WHERE post_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
     CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a

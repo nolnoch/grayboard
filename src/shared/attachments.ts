@@ -18,6 +18,8 @@ export const DEFAULT_ATTACHMENT_LIMITS: AttachmentLimits = { file: 10 * 1024 * 1
 export const UNBOUND_TTL_MS = 3_600_000;
 // How many bytes of unsent uploads one user may hold on a server at a time.
 export const unboundCap = (limits: AttachmentLimits): number => 2 * limits.total;
+// How many bytes of attachments, sent or not, one user may store on a server.
+export const DEFAULT_ATTACHMENT_USER_QUOTA = 1024 * 1024 * 1024;
 
 // What reads and pushes show for each attachment. sha256 is of the bytes, so a
 // reader can check what it saved and match it against the audit log.
