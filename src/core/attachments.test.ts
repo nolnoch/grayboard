@@ -102,7 +102,10 @@ describe("type detection and names", () => {
     expect(() => checkFile("f", "a.bin", new Uint8Array([0, 1]))).toThrow("not an image");
     expect(() => checkFile("f", "notes.txt", bytes("x\n-----BEGIN OPENSSH PRIVATE KEY-----\n"))).toThrow("key material");
     expect(() => checkFile("f", "notes.txt", bytes("[default]\naws_secret_access_key = abc"))).toThrow("key material");
-    // Images aren't searched for key text.
+    // A key behind an image or PDF header is still found.
+    const key = bytes("\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n");
+    expect(() => checkFile("f", "shot.png", new Uint8Array([...PNG, ...key]))).toThrow("key material");
+    expect(() => checkFile("f", "doc.pdf", bytes("%PDF-1.7\n-----BEGIN OPENSSH PRIVATE KEY-----\n"))).toThrow("key material");
     expect(checkFile("f", "shot.png", PNG).type).toBe("image/png");
   });
 

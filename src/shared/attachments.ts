@@ -107,7 +107,7 @@ export function typedName(name: string, type: string): string {
 /**
  * The checks a file gets wherever it enters the bus: an agent's path, an HTTP
  * upload, a Slack share. A safe name, not a dotfile or credential-like name,
- * not empty, an allowed type sniffed from its bytes, no key material in text,
+ * not empty, an allowed type sniffed from its bytes, no key material anywhere in it,
  * and an extension that matches the type. `label` leads each refusal.
  */
 export function checkFile(label: string, rawName: string, data: Uint8Array): AttachmentFile {
@@ -117,7 +117,10 @@ export function checkFile(label: string, rawName: string, data: Uint8Array): Att
   if (data.length === 0) throw new CoreError(`${label}: empty file`);
   const type = sniffType(data, name);
   if (!type) throw new CoreError(`${label}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
-  if (!TYPE_EXTENSIONS[type] && SECRET_CONTENT.test(new TextDecoder().decode(data))) {
+  // Every type: an image or PDF header is a few bytes anyone can put in front
+  // of a key. Latin-1 maps each byte to one character, so the ASCII markers
+  // match wherever they sit.
+  if (SECRET_CONTENT.test(new TextDecoder("latin1").decode(data))) {
     throw new CoreError(`${label}: holds private key or secret key material; not attachable`);
   }
   return { filename: typedName(name, type), type, data };
