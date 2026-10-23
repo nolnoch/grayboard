@@ -91,9 +91,53 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The compiled binaries, before they're published: --version, the pi
+  # scenario and a server round trip (tests/e2e/binaries.e2e.ts).
+  e2e:
+    name: E2E ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+          - target: darwin-arm64
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      # The pi scenario runs the real pi CLI, which needs Node >= 22.19.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist
+
+      - name: Binaries suite
+        env:
+          GRAYBOARD_E2E_BIN_DIR: ${{ github.workspace }}/dist
+          GRAYBOARD_E2E_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          chmod +x dist/*   # artifacts don't keep the executable bit
+          bun test ./tests/e2e/binaries.e2e.ts
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, e2e]
     runs-on: ubuntu-latest
 
     steps:
