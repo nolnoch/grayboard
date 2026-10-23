@@ -129,20 +129,29 @@ function claimList(url: URL, db: CoreDb): Response {
   return json(listClaims(db, prefix).map(({ board: _b, ...c }) => c));
 }
 
+// The caller's identity `name` as a full handle, or the refusal: the human
+// identity (`humanReason` says why), or one no session has created, so a
+// wrong name can't act as a fresh identity.
+function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: Repo, humanReason: string): string | Response {
+  if (!name) return badRequest("identity required");
+  name = name.toLowerCase();
+  if (name === HUMAN_NAME) return forbidden(humanReason);
+  if (!repo.identities.findByUserAndName(authed.user_id, name)) {
+    return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
+  }
+  return `${authed.user_email}/${name}`;
+}
+
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
-// One no session has created is refused, so a wrong name can't hold claims.
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
 async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void): Promise<Response> {
   const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
-  const name = body.identity.toLowerCase();
-  if (name === HUMAN_NAME) return badRequest(`claims are for agents; "${HUMAN_NAME}" is your Slack link`);
-  if (!repo.identities.findByUserAndName(authed.user_id, name)) {
-    return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
-  }
+  const handle = ownIdentity(body.identity, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  if (handle instanceof Response) return handle;
   try {
-    const outcome = callBoardTool(db, `${authed.user_email}/${name}`, body.tool, body.args ?? {});
+    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {});
     wake(outcome.wake);
     return json(outcome.result);
   } catch (e) {
@@ -184,14 +193,10 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-// The caller's identity named by ?identity=, as a full handle, or why not.
-// The Slack bridge's human identity stores its files in-process, not here.
-function ownIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Response {
-  const name = url.searchParams.get("identity")?.toLowerCase();
-  if (!name) return badRequest("identity required");
-  if (name === HUMAN_NAME) return forbidden(HUMAN_RESERVED);
-  if (!repo.identities.findByUserAndName(authed.user_id, name)) return jsonErr("not_found", `you have no identity "${name}"`, 404);
-  return `${authed.user_email}/${name}`;
+// The caller's identity named by ?identity=. The Slack bridge's human
+// identity stores its files in-process, not here.
+function queryIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Response {
+  return ownIdentity(url.searchParams.get("identity"), authed, repo, HUMAN_RESERVED);
 }
 
 // POST /api/attachments?identity=&filename=, the file's bytes as the body.
@@ -200,7 +205,7 @@ function ownIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Respons
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
 async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate): Promise<Response> {
-  const handle = ownIdentity(url, authed, repo);
+  const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
@@ -233,7 +238,7 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
 // GET /api/attachments/<id>?identity=: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const handle = ownIdentity(url, authed, repo);
+  const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const row = readableAttachment(repo, db, handle, Number(idStr));
   if (!row) {
@@ -257,7 +262,7 @@ async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, r
 // DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const handle = ownIdentity(url, authed, repo);
+  const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);

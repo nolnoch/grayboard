@@ -4,16 +4,13 @@ import { canReadAttachment, getAttachment, releaseUpload, storeAttachment, type 
 import type { CoreDb } from "../core/boards.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
-import type { Repo } from "./db.ts";
+import { participant, type Repo } from "./db.ts";
 
 // Attachment `id`, if `handle` may read it: on a post on a board it can see,
 // on a direct message it sent or received, or its own unsent upload.
 export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: number): AttachmentRow | undefined {
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
-  const dmVisible = (messageId: number) => {
-    const m = repo.messages.getById(messageId);
-    return !!m && m.recipient_type === "user" && (m.sender === handle || m.recipient === handle);
-  };
+  const dmVisible = (messageId: number) => participant(repo.messages.getById(messageId), handle);
   return row && canReadAttachment(db, handle, row, dmVisible) ? row : undefined;
 }
 

@@ -17,6 +17,12 @@ export type Identity = { id: number; user_id: number; name: string; created_at: 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; attachments?: AttachmentInfo[] };
+// Only a direct message's sender and recipient can see it, its thread, or
+// the files it carries. One you're not in reads as missing, so its existence
+// doesn't leak.
+export function participant(m: MessageRow | undefined, me: string): m is MessageRow {
+  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
+}
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
 // thread_ts: the Slack top-level message. root_id: the grayboard thread's root

@@ -1,4 +1,4 @@
-import type { MessageRow, Repo } from "./db.ts";
+import { participant, type MessageRow, type Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
@@ -613,12 +613,6 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
     ...(promises.length ? { promised: promises } : {}),
     ...(queued.length ? { undelivered_from_you: queued } : {}),
   });
-}
-
-// Only a message's sender and recipient can see it, or thread from it. A
-// message you're not in reads as missing, so its existence doesn't leak.
-function participant(m: MessageRow | undefined, me: string): m is MessageRow {
-  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
 }
 
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {

@@ -793,7 +793,8 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   const c = new Client(carol, "sim");
   for (const x of [a, b, c]) expect((await x.connect()).type).toBe("hello_ok");
 
-  expect((await upload(alice, "nope", "x.png", PNG)).status).toBe(404);
+  // An unknown identity is refused as `grayboard claim` refuses one.
+  expect(await upload(alice, "nope", "x.png", PNG)).toMatchObject({ status: 404, body: { code: "unknown_identity" } });
   expect((await upload(alice, "human", "x.png", PNG)).status).toBe(403);
   expect((await upload(alice, "be", "x.bin", new Uint8Array([0, 1, 2]))).body.message).toMatch(/not an image/);
   expect((await upload(alice, "be", "x.txt", new Uint8Array(0))).body.message).toBe("file x.txt: empty file");
