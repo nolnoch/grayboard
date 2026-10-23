@@ -95,6 +95,20 @@ test("web: waits out a rate limit, then classifies errors", async () => {
   expect(await web.call("chat.postMessage").catch((e) => e)).toBeInstanceOf(SlackUnavailable);
 });
 
+test("SlackWeb sends the bot token only to the API's host or its subdomains", async () => {
+  const seen: string[] = [];
+  const f = async (url: string, init: RequestInit) => {
+    seen.push(`${url} ${(init.headers as Record<string, string>).Authorization}`);
+    return new Response("abc");
+  };
+  const web = new SlackWeb("xoxb-t", "https://slack.com/api/", f);
+  expect(new TextDecoder().decode(await web.download("https://files.slack.com/files-pri/T1-F1/download/a.txt", 3))).toBe("abc");
+  for (const bad of ["https://evil.example/a.txt", "http://files.slack.com/a.txt", "https://files.slack.com.evil.example/a", "https://evilslack.com/a", "https://files.slack.com:8443/a", "not a url"]) {
+    expect(await web.download(bad, 3).catch((e) => e)).toMatchObject({ code: "untrusted_host" });
+  }
+  expect(seen).toEqual(["https://files.slack.com/files-pri/T1-F1/download/a.txt Bearer xoxb-t"]);
+});
+
 // ── outbox ───────────────────────────────────────────────────────────────────
 
 // A bus for tests that carry no files.

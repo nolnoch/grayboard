@@ -95,6 +95,17 @@ export class SlackWeb {
     }
   }
 
+  private ownsUrl(url: string): boolean {
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      return false;
+    }
+    const api = new URL(this.base);
+    return u.protocol === api.protocol && u.port === api.port && (u.hostname === api.hostname || u.hostname.endsWith(`.${api.hostname}`));
+  }
+
   /** Sends a file's bytes to the upload_url files.getUploadURLExternal gave. */
   async upload(url: string, data: Uint8Array): Promise<void> {
     const ms = transferTimeoutMs(data.length);
@@ -116,9 +127,12 @@ export class SlackWeb {
   /**
    * A shared file's bytes, from its url_private_download. Without files:read,
    * Slack answers with a sign-in page instead, so a size other than `size`
-   * (the file's, from Slack) is refused.
+   * (the file's, from Slack) is refused. The bot token goes only to the API's
+   * own host or a subdomain of it (files.slack.com for slack.com), over the
+   * API's scheme, whatever URL an event names.
    */
   async download(url: string, size: number): Promise<Uint8Array> {
+    if (!this.ownsUrl(url)) throw new SlackError("file download", "untrusted_host");
     const ms = transferTimeoutMs(size);
     let res: Response;
     try {
