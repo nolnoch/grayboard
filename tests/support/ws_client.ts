@@ -9,7 +9,7 @@ export type WsClientOptions = { pong?: boolean; push?: boolean; hello?: Record<s
 export class WsClient {
   ws!: WebSocket;
   inbox: Any[] = [];
-  private waiters: { pred: (m: Any) => boolean; resolve: (m: Any) => void }[] = [];
+  private waiters: { pred: (m: Any) => boolean; resolve: (m: Any) => void; reject: (e: Error) => void }[] = [];
   private n = 0;
 
   constructor(
@@ -31,6 +31,9 @@ export class WsClient {
       if (i >= 0) this.waiters.splice(i, 1)[0]!.resolve(m);
       else this.inbox.push(m);
     };
+    // A dropped socket fails every pending wait now, not at its timeout.
+    this.ws.onclose = (e) => this.fail(`socket closed (${e.code}${e.reason ? ` ${e.reason}` : ""})`);
+    this.ws.onerror = () => this.fail("socket error");
     this.ws.onopen = () =>
       this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello }));
     return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
@@ -40,16 +43,24 @@ export class WsClient {
     const i = this.inbox.findIndex(pred);
     if (i >= 0) return Promise.resolve(this.inbox.splice(i, 1)[0]!);
     return new Promise((resolve, reject) => {
-      const w = { pred, resolve };
-      this.waiters.push(w);
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         const j = this.waiters.indexOf(w);
         if (j >= 0) {
           this.waiters.splice(j, 1);
           reject(new Error(`${this.identity}: timed out waiting`));
         }
       }, ms);
+      const w = {
+        pred,
+        resolve: (m: Any) => (clearTimeout(timer), resolve(m)),
+        reject: (e: Error) => (clearTimeout(timer), reject(e)),
+      };
+      this.waiters.push(w);
     });
+  }
+
+  private fail(why: string): void {
+    for (const w of this.waiters.splice(0)) w.reject(new Error(`${this.identity}: ${why}`));
   }
 
   // Nothing matching arrives within ms.

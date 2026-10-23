@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { localEnv } from "../support/env.ts";
 import { onChannelDm, messageText, startFakeModel, type FakeModel } from "../support/fake_model.ts";
-import { closeSessions, mcpSession } from "../support/mcp.ts";
+import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { CLI, ROOT } from "../support/paths.ts";
 import { until } from "../support/until.ts";
 
@@ -30,11 +30,11 @@ afterEach(async () => {
   for (const p of procs.splice(0)) p.kill();
   await closeSessions();
   model?.stop();
+  model = undefined;
   rmSync(dir, { recursive: true, force: true });
 });
 
-const peer = (identity: string, extra: Record<string, string> = {}) =>
-  mcpSession({ args: ["mcp", "--mode", "local"], cwd: dir, env: localEnv(dir, identity, extra) });
+const peer = (identity: string, extra: Record<string, string> = {}) => localSession(dir, identity, { extra });
 
 // ── pi in RPC mode ───────────────────────────────────────────────────────────
 
@@ -99,13 +99,13 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest rides alo
   const p = await peer("peer");
   await p.call("board_create", { name: "ops", purpose: "ops" });
   await setup.call("board_subscribe", { board: "ops", mode: "digest" });
-  await setup.c.close();
+  await stopSession(setup.c);
 
   model = startFakeModel([onChannelDm("peer", (id) => ({ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "pong", parent_id: id } }))]);
   const { requests } = model;
   const pi = startPi(model.port);
   await pi.command({ type: "get_state" });
-  await until(async () => (await p.call("peer_list")).peers.some((x: any) => x.handle === "pi") || undefined, 15_000, "pi online");
+  await until(async () => (await p.call("peer_list")).peers.some((x: any) => x.handle === "pi"), 15_000, "pi online");
 
   // Digest: no model call. It reaches the session with the next wake, or with
   // the first drain if the adapter's MCP handshake finishes after this post.
@@ -119,7 +119,7 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest rides alo
   // <channel> tag and grayboard's instructions, and its dm_send reply reaches
   // the peer in the same thread.
   const sent = await p.call("dm_send", { to: "pi", body: "ping" });
-  await until(async () => (await hasDigest()) || undefined, 15_000, "digest in session");
+  await until(hasDigest, 15_000, "digest in session");
   const reply = await until(() => p.pushes.find((x) => x.content.includes("pong")), 30_000, "pong at peer");
   expect(reply).toBeDefined();
   const thread = await p.call("dm_thread", { thread: sent.message_id });
@@ -128,12 +128,13 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest rides alo
     ["pi", "pong", sent.message_id],
   ]);
 
-  const first = requests[0]!;
+  expect(model.unhandled).toEqual([]);
+  const first = requests[0]!.body;
   const system = first.messages.filter((m) => m.role === "system" || m.role === "developer").map(messageText).join("\n");
   expect(system).toContain("<grayboard>");
   expect(system).toContain('You are identity "pi" on the grayboard bus');
   expect(first.messages.map(messageText).join("\n")).toContain(`<channel source="grayboard" message_id="${sent.message_id}" from="peer"`);
-  await until(() => pi.events.some((e) => e.type === "agent_settled") || undefined, 15_000, "agent_settled");
+  await until(() => pi.events.some((e) => e.type === "agent_settled"), 15_000, "agent_settled");
 
   // One delivery, one reply: a DM pushed twice would wake the session twice.
   const copies = (await messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${sent.message_id}\\"`));
@@ -143,7 +144,7 @@ test("pi: a DM wakes the session, which replies with dm_send; a digest rides alo
   // Quitting pi stops the push process and frees the identity.
   await pi.quit();
   await until(
-    async () => ((await p.call("peer_list", { include_offline: true })).peers.find((x: any) => x.handle === "pi")?.online === false) || undefined,
+    async () => (await p.call("peer_list", { include_offline: true })).peers.find((x: any) => x.handle === "pi")?.online === false,
     15_000,
     "pi offline",
   );

@@ -2,7 +2,6 @@
 // server: what was queued while a session was offline reaches it at start.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
@@ -10,7 +9,7 @@ import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { sha256Hex, serverBusDir } from "../../src/shared/attachments.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv, serverEnv } from "../support/env.ts";
-import { closeSessions, mcpSession, stopSession, type Session } from "../support/mcp.ts";
+import { closeSessions, stopSession } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 
 let srv: TestServer;
@@ -26,9 +25,7 @@ afterEach(async () => {
 
 const login = (email: string) => srv.login(email);
 
-// A grayboard MCP session in server mode.
-const session = (token: string, identity: string, extra: Record<string, string> = {}): Promise<Session> =>
-  mcpSession({ env: serverEnv(srv.base, token, identity, tmpdir(), extra), args: ["mcp", "--mode", "server"] });
+const session = (token: string, identity: string, extra: Record<string, string> = {}) => srv.session(token, identity, extra);
 
 test("queued messages and posts are pushed at session start; instructions list claims", async () => {
   const alice = await login("alice@example.com");
@@ -97,7 +94,7 @@ test("grayboard claims in server mode reads /api/claims and leaves out boards", 
   const r = await fetch(`${srv.base}/api/claims?prefix=dev:`, { headers: { Authorization: `Bearer ${bob}` } });
   expect(await r.json()).toEqual([expect.not.objectContaining({ board: expect.anything() })]);
 
-  const dir = mkdtempSync(join(tmpdir(), "grayboard-claims-"));
+  const dir = mkdtempSync(join(srv.dir, "grayboard-claims-"));
   const claims = async (token: string, email: string, identity: string) => {
     const creds = join(dir, `${identity}-${email}`);
     writeFileSync(creds, JSON.stringify({ session_token: token, server: srv.base, user_email: email }));
@@ -150,7 +147,7 @@ test("a refused token says to sign in again: at startup, in a running session's 
   expect(await be.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok" });
   be.close();
 
-  const creds = join(mkdtempSync(join(tmpdir(), "gb-creds-")), "credentials");
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
   writeFileSync(creds, JSON.stringify({ session_token: "stale", server: srv.base, user_email: "alice@example.com" }));
   const r = await runCli(["team", "list"], { env: cleanEnv({ GRAYBOARD_CREDENTIALS: creds }) });
   expect(r.code).toBe(1);
@@ -162,15 +159,15 @@ test("a refused token says to sign in again: at startup, in a running session's 
 test("a hello the server refuses exits at once with its reason, not a timeout (#74)", async () => {
   const token = await login("alice@example.com");
   const t0 = Date.now();
-  const r = await runCli(["mcp", "--mode", "server"], { env: serverEnv(srv.base, token, "human", tmpdir()), holdStdin: true });
+  const r = await runCli(["mcp", "--mode", "server"], { env: serverEnv(srv.dir, srv.base, token, "human"), holdStdin: true });
   expect(r.code).toBe(1);
   expect(Date.now() - t0).toBeLessThan(5000);
   expect(r.err).toContain(HUMAN_RESERVED);
 }, 20_000);
 
 test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () => {
-  const home = mkdtempSync(join(tmpdir(), "gb-home-"));
-  const creds = join(mkdtempSync(join(tmpdir(), "gb-creds-")), "sub", "credentials");
+  const home = mkdtempSync(join(srv.dir, "gb-home-"));
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "sub", "credentials");
   const run = async (...args: string[]) => {
     const r = await runCli(args, { env: cleanEnv({ HOME: home, GRAYBOARD_CREDENTIALS: creds }) });
     expect(r.code, r.err).toBe(0);
@@ -192,7 +189,7 @@ test("grayboard claim in server mode acts as one of your identities; its session
   await session(bob, "fe");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
 
-  const dir = mkdtempSync(join(tmpdir(), "grayboard-claim-"));
+  const dir = mkdtempSync(join(srv.dir, "grayboard-claim-"));
   const gb = async (token: string, email: string, identity: string, ...args: string[]) => {
     const creds = join(dir, `${identity}-${email}`);
     writeFileSync(creds, JSON.stringify({ session_token: token, server: srv.base, user_email: email }));
@@ -231,7 +228,7 @@ test("a frame the server can't parse is answered with its req_id, so the call fa
 }, 20_000);
 
 test("attachments in server mode: dm_send and board_post upload files, pushes name them, attachment_get saves them", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
   writeFileSync(join(dir, "shot.png"), png);
   writeFileSync(join(dir, "notes.md"), "# notes");
@@ -276,7 +273,7 @@ test("attachments in server mode: dm_send and board_post upload files, pushes na
 }, 20_000);
 
 test("a send the server refuses releases its uploads, so they don't hold the user's unsent quota", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   const be = await session(await login("alice@example.com"), "be");
   const unsent = () => srv.app.db.query("SELECT COUNT(*) AS n FROM attachments").get();
@@ -294,7 +291,7 @@ test("a send the server refuses releases its uploads, so they don't hold the use
 }, 20_000);
 
 test("a send whose answer is lost, though its files were bound, reports it landed instead of failing", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   // The server's answer to a send or a board_post never arrives: the connection drops instead.
   let lose = false;
@@ -325,7 +322,7 @@ test("a send whose answer is lost, though its files were bound, reports it lande
 test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {
   srv.stop();
   srv = new TestServer({ attachmentLimits: { file: 5, total: 10 } });
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   const be = await session(await login("alice@example.com"), "be");
   await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(/notes\.md: 7B exceeds the 5B limit/);
@@ -379,7 +376,7 @@ const helloRewrite = (edit: (hello: Record<string, unknown>) => void) => (frame:
 };
 
 test("attachments against a server from before them: hello_ok without limits says the server needs updating", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   let uploads = 0;
   const old = proxy(
@@ -400,7 +397,7 @@ test("attachments against a server from before them: hello_ok without limits say
 }, 20_000);
 
 test("the plugin takes attachment limits from the hello_ok of each reconnect", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   let file = 5;
   const p = proxy(() => undefined, helloRewrite((h) => (h.attachment_limits = { file, total: 1000 })));
@@ -427,7 +424,7 @@ test("the plugin takes attachment limits from the hello_ok of each reconnect", a
 }, 20_000);
 
 test("attachment HTTP: a refused token gets the sign-in hint, and a refused dir costs no download", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   let downloads = 0;
   let refuse = false;
@@ -451,7 +448,7 @@ test("attachment HTTP: a refused token gets the sign-in hint, and a refused dir 
 }, 20_000);
 
 test("attachment_get saves nothing unless the bytes match the server's Repr-Digest", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
   // Downloads come back with the digest dropped, or with one byte changed.
   let mode: "drop" | "alter" = "drop";

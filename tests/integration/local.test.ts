@@ -9,7 +9,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 import { runCli } from "../support/cli.ts";
 import { localEnv } from "../support/env.ts";
-import { call, closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
 
 let dir: string;
 
@@ -24,8 +24,7 @@ afterEach(async () => {
 
 const busEnv = (identity?: string, extra: Record<string, string> = {}) => localEnv(dir, identity, extra);
 
-const session = (identity: string | undefined, cwd = dir, args = ["mcp", "--mode", "local"]): Promise<Session> =>
-  mcpSession({ env: busEnv(identity), cwd, args });
+const session = (identity: string | undefined, cwd = dir, args?: string[]): Promise<Session> => localSession(dir, identity, { cwd, args });
 
 async function start(identity: string | undefined, cwd = dir, args?: string[]): Promise<Client> {
   return (await session(identity, cwd, args)).c;
@@ -406,7 +405,7 @@ test("a Claude Code session started without a channels flag runs tools-only and 
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
 Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
   const claude = async (identity: string, flags: string[]) =>
-    (await mcpSession({ env: busEnv(identity, { CLAUDECODE: "1" }), cwd: dir, args: ["mcp", "--mode", "local"], via: [fake, host, ...flags, "::"] })).c;
+    (await localSession(dir, identity, { extra: { CLAUDECODE: "1" }, via: [fake, host, ...flags, "::"] })).c;
   const texts = async (c: Client) => ((await c.callTool({ name: "peer_list", arguments: {} })).content as { text: string }[]).map((t) => t.text);
 
   const off = await claude("be", []);

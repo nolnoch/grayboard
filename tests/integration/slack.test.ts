@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { startSlackBridge, type BridgeHandle } from "../../src/bridge/slack.ts";
 import { FakeSlack } from "./fake_slack.ts";
 import { localEnv } from "../support/env.ts";
-import { call, closeSessions, mcpSession, stopSession, type Session } from "../support/mcp.ts";
+import { call, closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
 import { until } from "../support/until.ts";
 
@@ -36,12 +36,12 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const env = (identity?: string): Record<string, string> =>
-  localEnv(dir, identity, {
-    GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
-    GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
-    SLACK_API_URL: slack.api,
-  });
+const slackVars = (): Record<string, string> => ({
+  GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
+  GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
+  SLACK_API_URL: slack.api,
+});
+const env = (identity?: string): Record<string, string> => localEnv(dir, identity, slackVars());
 
 function writeConfig(extra: Record<string, unknown> = {}, mode = 0o600): void {
   const path = join(dir, "slack.json");
@@ -55,9 +55,7 @@ async function startBridge(): Promise<BridgeHandle> {
   return bridge;
 }
 
-const agent = (identity: string): Promise<Session> => mcpSession({ env: env(identity), cwd: dir, args: ARGS });
-
-const stopAgent = (a: Session) => stopSession(a.c);
+const agent = (identity: string): Promise<Session> => localSession(dir, identity, { extra: slackVars() });
 
 test("an agent's DM becomes a Slack thread; the reply reaches only that agent, marked human", async () => {
   const be = await agent("be");
@@ -133,7 +131,7 @@ test("board mentions forward with the board's name; a reply posts in the board t
 test("top-level @handle and #board start conversations; mistakes get an answer", async () => {
   const be = await agent("be");
   const sim = await agent("sim");
-  await stopAgent(sim);
+  await stopSession(sim.c);
   await startBridge();
   await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
 

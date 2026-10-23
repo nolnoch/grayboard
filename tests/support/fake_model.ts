@@ -1,12 +1,15 @@
 // A scriptable fake LLM serving OpenAI chat completions, streamed (pi; omp and
 // OpenCode use the same API). A script is a list of rules tried in order; the
 // first that answers a request decides the reply, else the model says it has
-// nothing to do. Every request is recorded, so a test asserts on what the
-// harness sent. The Anthropic Messages side (Claude Code) lands with the
-// Claude Code harness tests, after probe P1 measures which routes it calls.
+// nothing to do. Every completion request is recorded, so a test asserts on
+// what the harness sent. Any other route gets a 404 and lands in `unhandled`,
+// so a harness calling a route the fake doesn't serve fails visibly. The
+// Anthropic Messages side (Claude Code) lands with the Claude Code harness
+// tests, after probe P1 measures which routes it calls.
 
 export type ChatMessage = { role: string; content?: unknown; tool_calls?: unknown };
 export type ChatRequest = { messages: ChatMessage[] };
+export type Recorded<B> = { method: string; path: string; body: B };
 export type Reply = { text: string } | { tool: string; args: Record<string, unknown> };
 export type Rule = (req: ChatRequest) => Reply | undefined;
 
@@ -22,7 +25,7 @@ export const messageText = (m: ChatMessage): string =>
 // can land after the tool result, mid-turn; that isn't a new DM to answer. A
 // DM delivered twice still gets two replies.
 export function onChannelDm(from: string, reply: (messageId: number) => Reply): Rule {
-  const dm = new RegExp(`<channel source="grayboard" message_id="(\\d+)" from="${from}"`);
+  const dm = new RegExp(`<channel source="grayboard" message_id="(\\d+)" from="${RegExp.escape(from)}"`);
   return (req) => {
     const at = req.messages.findLastIndex((m) => dm.test(messageText(m)));
     if (at < 0 || req.messages.slice(at + 1).some((m) => m.role === "assistant")) return undefined;
@@ -30,15 +33,22 @@ export function onChannelDm(from: string, reply: (messageId: number) => Reply): 
   };
 }
 
-export type FakeModel = { port: number; requests: ChatRequest[]; stop: () => void };
+export type FakeModel = { port: number; requests: Recorded<ChatRequest>[]; unhandled: Recorded<string>[]; stop: () => void };
 
 export function startFakeModel(rules: Rule[]): FakeModel {
-  const requests: ChatRequest[] = [];
+  const requests: Recorded<ChatRequest>[] = [];
+  const unhandled: Recorded<string>[] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
+      const { pathname: path } = new URL(req.url);
+      if (req.method !== "POST" || !path.endsWith("/chat/completions")) {
+        unhandled.push({ method: req.method, path, body: await req.text() });
+        console.error(`[fake model] unhandled ${req.method} ${path}`);
+        return new Response("not served by the fake model", { status: 404 });
+      }
       const body = (await req.json()) as ChatRequest;
-      requests.push(body);
+      requests.push({ method: req.method, path, body });
       const reply = rules.reduce<Reply | undefined>((r, rule) => r ?? rule(body), undefined) ?? { text: "nothing to do" };
       return "text" in reply
         ? sse({ content: reply.text }, "stop")
@@ -48,7 +58,7 @@ export function startFakeModel(rules: Rule[]): FakeModel {
           );
     },
   });
-  return { port: server.port!, requests, stop: () => server.stop(true) };
+  return { port: server.port!, requests, unhandled, stop: () => server.stop(true) };
 }
 
 function sse(delta: Record<string, unknown>, finish: string): Response {
