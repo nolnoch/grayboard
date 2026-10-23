@@ -205,15 +205,24 @@ export class GrayboardClient {
     return `c${++this.counter}`;
   }
 
+  /** Throws unless requests can go out now: before hello_ok the server
+   *  rejects them and closes the socket, so a caller fails fast instead. */
+  assertConnected(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
+      throw new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly");
+    }
+  }
+
   /** Send a request and wait for the corresponding response. */
   request<T extends ServerMessage>(msg: { type: string; [key: string]: unknown }): Promise<T> {
     return new Promise((resolve, reject) => {
-      // Before hello_ok the server rejects requests and closes the socket,
-      // so fail fast instead of leaving the tool call hanging.
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
-        reject(new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly"));
+      try {
+        this.assertConnected();
+      } catch (e) {
+        reject(e);
         return;
       }
+      const ws = this.ws!;
       const req_id = this.nextId();
       const full = { ...msg, req_id } as ClientMessage;
       // Backstop for an answer that never names this req_id (#40): fail the tool call instead of hanging it.
@@ -224,7 +233,7 @@ export class GrayboardClient {
         resolve: (m) => { clearTimeout(timer); resolve(m as T); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      this.ws.send(JSON.stringify(full));
+      ws.send(JSON.stringify(full));
     });
   }
 

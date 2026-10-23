@@ -8,6 +8,15 @@ export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+
+// A post's or direct message's body, checked alike in both modes (#75).
+export function checkBody(body: unknown): string {
+  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
+  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
+    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
+  }
+  return body;
+}
 // @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
 // so plain email addresses in prose aren't mentions.
 const MENTION_RE =
@@ -377,10 +386,7 @@ export function post(
 ): PostResult {
   const b = visibleBoard(db, handle, boardInput);
   const board = b.name;
-  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
-  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
-    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
-  }
+  checkBody(body);
   if (parentId !== null) {
     const parent = getPost(db, parentId);
     if (!parent || parent.board !== board) {

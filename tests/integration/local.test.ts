@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { localBusDir } from "../../src/shared/attachments.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -573,7 +574,7 @@ test("attachments: sent with a DM or post, shown on reads and pushes, fetched by
   expect((await call(fe, "dm_inbox")).unanswered[0].attachments).toEqual(sent.attachments);
 
   const saved = await call(fe, "attachment_get", { id: shot.id });
-  expect(saved.path).toBe(join(dir, "saved", `${shot.id}-shot.png`));
+  expect(saved.path).toBe(join(dir, "saved", localBusDir(join(dir, "bus.db")), `${shot.id}-shot.png`));
   expect(new Uint8Array(readFileSync(saved.path))).toEqual(png);
   mkdirSync(join(dir, "out"));
   expect((await call(fe, "attachment_get", { id: notes.id, dir: "out" })).path).toBe(join(realpathSync(dir), "out", `${notes.id}-notes.md`));

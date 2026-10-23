@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError, activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { attachmentData, canReadAttachment, getAttachment, storeAttachment } from "../core/attachments.ts";
 import {
@@ -36,9 +36,10 @@ import {
   type Message,
   unreadFor,
 } from "./db.ts";
+import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, formatAttachmentsMeta, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, formatAttachmentsMeta, localBusDir, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -50,7 +51,6 @@ import {
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
-  dmBody,
   historyLimit,
   inboxDays,
   promised,
@@ -66,6 +66,8 @@ const IDENTITY: string = sessionIdentity();
 console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
+// This bus's subdirectory of the default save directory.
+const BUS_DIR = localBusDir(localDbPath());
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
@@ -255,7 +257,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       parent_id?: number;
       pending?: boolean;
     };
-    dmBody(body);
+    checkBody(body);
     if (!rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
@@ -339,7 +341,7 @@ async function dispatch(name: string, a: Record<string, any>) {
     if (!row || !canReadAttachment(db, IDENTITY, row, (id) => mine(getMessage(id)))) {
       return { ...text(`error: no attachment ${a.id} on a message or post you can read`), isError: true };
     }
-    const path = await saveAttachment(row, attachmentData(db, row.sha256), a.dir, ROOTS);
+    const path = await saveAttachment(row, attachmentData(db, row.sha256), a.dir, ROOTS, BUS_DIR);
     return text({ path, filename: row.filename, type: row.type, size: row.size });
   }
 
@@ -351,7 +353,7 @@ async function dispatch(name: string, a: Record<string, any>) {
     // Stored and bound in the post's transaction: a refused post leaves no upload.
     const { result, wake } = db.transaction(() =>
       callBoardTool(db, IDENTITY, name, files.length ? { ...args, attachment_ids: files.map((f) => storeAttachment(db, IDENTITY, f).id) } : args, ctx),
-    )();
+    ).immediate();
     await wakeAll(wake);
     return text(result);
   }

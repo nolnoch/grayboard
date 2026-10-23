@@ -36,7 +36,7 @@ export function insertMessage(
       .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
     return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }) };
-  })();
+  }).immediate();
 }
 
 export function unreadFor(reader: string): Message[] {
@@ -204,5 +204,5 @@ export function retractMessage(sender: string, id: number): boolean {
     db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
     db.prepare(`DELETE FROM dm_acks WHERE message_id = ?`).run(id);
     return true;
-  })();
+  }).immediate();
 }

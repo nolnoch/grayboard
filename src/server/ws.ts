@@ -10,6 +10,7 @@ import {
   CoreError,
   acknowledge,
   age,
+  checkBody,
   lastSeen,
   pendingFor,
   post,
@@ -25,7 +26,7 @@ import { attachmentIds, attachmentLimits } from "../core/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, dmBody, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
@@ -433,7 +434,7 @@ function handleSend(
   const { repo, db, registry } = hub;
   let ids: number[];
   try {
-    dmBody(body);
+    checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);

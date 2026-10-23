@@ -12,6 +12,7 @@ import { GrayboardClient } from "../../src/plugin/client.ts";
 import { startServer } from "../../src/server/app.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
+import { serverBusDir } from "../../src/shared/attachments.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -318,7 +319,7 @@ test("attachments in server mode: dm_send and board_post upload files, pushes na
   expect(fe.pushes.find((p) => p.content === "see these")!.meta.attachments).toBe(`${shot.id}:shot.png image/png 10B; ${notes.id}:notes.md text/markdown 7B`);
 
   const saved = await fe.call("attachment_get", { id: shot.id });
-  expect(saved).toEqual({ path: join(dir, "saved", `${shot.id}-shot.png`), filename: "shot.png", type: "image/png", size: png.length });
+  expect(saved).toEqual({ path: join(dir, "saved", serverBusDir(base), `${shot.id}-shot.png`), filename: "shot.png", type: "image/png", size: png.length });
   expect(new Uint8Array(readFileSync(saved.path))).toEqual(png);
   await expect(sim.call("attachment_get", { id: shot.id })).rejects.toThrow(`no attachment ${shot.id} on a message or post you can read`);
 
@@ -328,6 +329,24 @@ test("attachments in server mode: dm_send and board_post upload files, pushes na
   await Bun.sleep(300);
   expect(sim.pushes.find((p) => p.content === "@sim shot")!.meta.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B`);
   expect((await sim.call("attachment_get", { id: posted.attachments[0].id, dir })).path).toBe(join(realpathSync(dir), `${posted.attachments[0].id}-shot.png`));
+}, 20_000);
+
+test("a send the server refuses releases its uploads, so they don't hold the user's unsent quota", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  const be = await session(await login("alice@example.com"), "be");
+  const unsent = () => app.db.query("SELECT COUNT(*) AS n FROM attachments").get();
+  await expect(be.call("dm_send", { to: "nobody@example.com/x", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow();
+  await expect(be.call("board_post", { board: "nope", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow();
+  // Refused before anything is uploaded.
+  await expect(be.call("dm_send", { to: "be", body: "x".repeat(70_000), attachments: [join(dir, "notes.md")] })).rejects.toThrow(/body exceeds/);
+  expect(unsent()).toEqual({ n: 0 });
+  expect(app.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
+  const audit = app.db.query("SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id").all();
+  expect(audit).toEqual([
+    { action: "attachment.uploaded" }, { action: "attachment.released" },
+    { action: "attachment.uploaded" }, { action: "attachment.released" },
+  ]);
 }, 20_000);
 
 test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {

@@ -47,7 +47,7 @@ export function storeAttachment(db: Database, uploader: string, file: Attachment
          VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(sha256, file.filename, file.type, file.data.length, uploader, now) as AttachmentRow;
-  })();
+  }).immediate();
 }
 
 // The attachment ids a tool call or wire frame carries, checked for shape.
@@ -158,6 +158,18 @@ export function unboundBytes(db: Database, prefix: string): number {
     )
     .get(prefix, prefix) as { n: number };
   return row.n;
+}
+
+// Drops one of `uploader`'s unsent uploads, for a send that failed after
+// uploading. Null if it isn't theirs or a message or post already carries it.
+export function releaseUpload(db: Database, id: number, uploader: string): AttachmentRow | null {
+  return db.transaction(() => {
+    const row = db
+      .prepare(`DELETE FROM attachments WHERE id = ? AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`)
+      .get(id, uploader) as AttachmentRow | null;
+    if (row) dropOrphanBlobs(db, [row.sha256]);
+    return row;
+  }).immediate();
 }
 
 // Uploads no message or post claimed, created before `olderThanMs`.

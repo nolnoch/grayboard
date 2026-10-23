@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import {
   dropAttachments,
   getAttachment,
   pruneUnbound,
+  releaseUpload,
   storeAttachment,
   withAttachments,
 } from "./attachments.ts";
@@ -24,10 +25,12 @@ import {
   attachRoots,
   checkSaveDir,
   formatAttachmentsMeta,
+  localBusDir,
   parseAttachmentsMeta,
   readAttachmentFiles,
   sanitizeFilename,
   saveAttachment,
+  serverBusDir,
   sniffType,
   type AttachmentFile,
 } from "../shared/attachments.ts";
@@ -64,6 +67,10 @@ describe("type detection and names", () => {
     expect(sanitizeFilename("..")).toBe("file");
     expect(sanitizeFilename("")).toBe("file");
     expect(new TextEncoder().encode(sanitizeFilename("é".repeat(300))).length).toBeLessThanOrEqual(200);
+    // The cut lands mid-emoji: the pair is dropped whole, never split.
+    const cut = sanitizeFilename("a" + "😀".repeat(60));
+    expect(cut).toBe("a" + "😀".repeat(49));
+    expect(() => encodeURIComponent(cut)).not.toThrow();
   });
 
   test("meta lists attachments and parses back to ids", () => {
@@ -153,13 +160,83 @@ describe("reading files to attach", () => {
   test("saving goes to the default directory or a dir under a root, private to the user", async () => {
     const a = { id: 7, filename: "shot.png", type: "image/png", size: PNG.length };
     const def = join(outside, "saved");
-    const p1 = await saveAttachment(a, PNG, undefined, [root], { GRAYBOARD_ATTACHMENTS_DIR: def });
-    expect(p1).toBe(join(def, "7-shot.png"));
+    const p1 = await saveAttachment(a, PNG, undefined, [root], "local-x", { GRAYBOARD_ATTACHMENTS_DIR: def });
+    expect(p1).toBe(join(def, "local-x", "7-shot.png"));
     expect(new Uint8Array(readFileSync(p1))).toEqual(PNG);
     expect(statSync(p1).mode & 0o777).toBe(0o600);
-    expect(await saveAttachment(a, PNG, root, [root])).toBe(join(root, "7-shot.png"));
+    expect(await saveAttachment(a, PNG, root, [root], "local-x")).toBe(join(root, "7-shot.png"));
     expect(() => checkSaveDir(outside, [root])).toThrow("outside the directories");
     expect(() => checkSaveDir(join(root, "nope"), [root])).toThrow("doesn't exist");
+  });
+
+  test("saves are refused in dot directories under a root", async () => {
+    mkdirSync(join(root, ".claude", "rules"), { recursive: true });
+    mkdirSync(join(root, "docs"), { recursive: true });
+    const a = { id: 9, filename: "evil.md", type: "text/markdown", size: 2 };
+    await expect(saveAttachment(a, PNG, join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
+    expect(() => checkSaveDir(join(root, ".claude"), [root], root)).toThrow("dot directories");
+    expect(checkSaveDir("docs", [root], root)).toBe(join(root, "docs"));
+    expect(readdirSync(join(root, ".claude", "rules"))).toEqual([]);
+  });
+
+  test("a save never follows or replaces what's at its name", async () => {
+    const victim = join(outside, "victim");
+    writeFileSync(victim, "keep");
+    symlinkSync(victim, join(root, "8-shot.png"));
+    writeFileSync(join(root, "8-shot-2.png"), "other bytes");
+    const a = { id: 8, filename: "shot.png", type: "image/png", size: PNG.length };
+    const p = await saveAttachment(a, PNG, root, [root], "b");
+    expect(p).toBe(join(root, "8-shot-3.png"));
+    expect(readFileSync(victim, "utf8")).toBe("keep");
+    expect(readFileSync(join(root, "8-shot-2.png"), "utf8")).toBe("other bytes");
+    expect(new Uint8Array(readFileSync(p))).toEqual(PNG);
+    // Saving the same attachment again finds this user's own copy.
+    expect(await saveAttachment(a, PNG, root, [root], "b")).toBe(p);
+    // No temp file is left behind.
+    expect(readdirSync(root).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("each bus saves into its own default subdirectory", () => {
+    expect(serverBusDir("https://bus.example.com")).toBe("bus.example.com");
+    expect(serverBusDir("http://localhost:8080")).toBe("localhost_8080");
+    expect(localBusDir("/a/bus.db")).toMatch(/^local-[0-9a-f]{12}$/);
+    expect(localBusDir("/a/bus.db")).not.toBe(localBusDir("/b/bus.db"));
+  });
+});
+
+describe("concurrent writers", () => {
+  // Another process holds the write lock, then commits a row. A transaction
+  // that read first would fail on its stale snapshot at its first write
+  // (SQLITE_BUSY, busy_timeout or not); one that takes the lock up front waits.
+  test("storing an upload waits out another process's write", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-attach-busy-"));
+    const path = join(dir, "bus.db");
+    const db = new Database(path);
+    db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    db.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT)`);
+    initCoreSchema(db);
+    const holder = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `const { Database } = require("bun:sqlite");
+         const db = new Database(${JSON.stringify(path)});
+         db.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+         console.log("locked");
+         await Bun.sleep(300);
+         db.run("INSERT INTO messages (sender, recipient) VALUES ('fe', 'be')");
+         db.exec("COMMIT");`,
+      ],
+      { stdout: "pipe" },
+    );
+    await holder.stdout.getReader().read();
+    try {
+      expect(storeAttachment(db, "be", file("x")).id).toBeGreaterThan(0);
+    } finally {
+      await holder.exited;
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -190,6 +267,17 @@ describe("storage", () => {
     expect(blobCount(db)).toBe(1);
     dropAttachments(db, "message", "?", m2);
     expect(blobCount(db)).toBe(0);
+  });
+
+  test("releasing drops only the caller's own unsent upload, and its blob once nothing names it", () => {
+    const mine = storeAttachment(db, "be", file("a"));
+    const bound = storeAttachment(db, "be", file("b"));
+    bindAttachments(db, [bound.id], "be", { message_id: msg() });
+    expect(releaseUpload(db, mine.id, "fe")).toBeNull();
+    expect(releaseUpload(db, bound.id, "be")).toBeNull();
+    expect(releaseUpload(db, mine.id, "be")?.id).toBe(mine.id);
+    expect(getAttachment(db, mine.id)).toBeUndefined();
+    expect(blobCount(db)).toBe(1);
   });
 
   test("binding takes only the caller's unbound uploads", () => {

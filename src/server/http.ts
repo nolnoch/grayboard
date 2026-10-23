@@ -12,7 +12,7 @@ import { CoreError, forgetHandle, getBoard, type CoreDb } from "../core/boards.t
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import {
-  attachmentData, attachmentLimits, pruneUnbound, storeAttachment, unboundBytes,
+  attachmentData, attachmentLimits, pruneUnbound, releaseUpload, storeAttachment, unboundBytes,
 } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS, contentDisposition, formatSize, sanitizeFilename, sniffType, unboundCap } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -248,6 +248,19 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
   });
 }
 
+// DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
+// that no message or post carries, when the send it was for failed.
+function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+  const handle = ownIdentity(url, authed, repo);
+  if (handle instanceof Response) return handle;
+  const row = /^\d{1,15}$/.test(idStr) ? releaseUpload(db, Number(idStr), handle) : null;
+  if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
+  writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
+    identity: handle, filename: row.filename, size: row.size, sha256: row.sha256,
+  });
+  return json({ ok: true });
+}
+
 // ── teams ────────────────────────────────────────────────────────────────────
 
 function teamList(authed: AuthedUser, repo: Repo): Response {
@@ -409,6 +422,9 @@ export async function handleHttp(
   if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db);
   if (path.startsWith("/api/attachments/") && method === "GET") {
     return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
+  }
+  if (path.startsWith("/api/attachments/") && method === "DELETE") {
+    return attachmentRelease(path.slice("/api/attachments/".length), url, authed, repo, db);
   }
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);

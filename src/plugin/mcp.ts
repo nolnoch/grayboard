@@ -11,10 +11,11 @@ import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } 
 import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
+import { checkBody } from "../core/boards.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, dispositionFilename, formatAttachmentsMeta, readAttachmentFiles, saveAttachment,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, dispositionFilename, formatAttachmentsMeta, readAttachmentFiles, saveAttachment, serverBusDir,
 } from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -237,19 +238,24 @@ async function call(name: string, a: Record<string, unknown>) {
   try {
     if (isBoardTool(name)) {
       const { attachments: paths, ...args } = a;
-      const ids = await upload(paths);
-      return text((await client.request<CallOk>({ type: "call", tool: name, args: ids.length ? { ...args, attachment_ids: ids } : args })).result);
+      if (paths !== undefined && name === "board_post") checkBody(args.body);
+      const { result } = await withUploads(paths, (ids) =>
+        client.request<CallOk>({ type: "call", tool: name, args: ids.length ? { ...args, attachment_ids: ids } : args }),
+      );
+      return text(result);
     }
     if (name === "dm_send") {
-      const ids = await upload(a.attachments);
-      const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
-        type: "send",
-        recipient: a.to,
-        body: a.body,
-        ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
-        ...(a.pending === true ? { pending: true } : {}),
-        ...(ids.length ? { attachment_ids: ids } : {}),
-      });
+      if (a.attachments !== undefined) checkBody(a.body);
+      const { type: _t, req_id: _r, ...rest } = await withUploads(a.attachments, (ids) =>
+        client.request<SendOk>({
+          type: "send",
+          recipient: a.to,
+          body: a.body,
+          ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
+          ...(a.pending === true ? { pending: true } : {}),
+          ...(ids.length ? { attachment_ids: ids } : {}),
+        }),
+      );
       // A server from before pending ignores the field, which would lose the promise silently.
       if (a.pending === true && !rest.pending) {
         rest.note = `${rest.note ? `${rest.note} ` : ""}Sent, but this server doesn't record pending, so dm_inbox won't list the promise; the server needs updating.`;
@@ -295,7 +301,7 @@ async function call(name: string, a: Record<string, unknown>) {
         type: res.headers.get("content-type") ?? "application/octet-stream",
         size: data.length,
       };
-      const path = await saveAttachment(info, data, a.dir, ROOTS);
+      const path = await saveAttachment(info, data, a.dir, ROOTS, serverBusDir(serverUrl));
       return text({ path, filename: info.filename, type: info.type, size: info.size });
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
@@ -308,27 +314,48 @@ async function call(name: string, a: Record<string, unknown>) {
 // The server's HTTP API as this session's user, with the current token.
 const api = () => new ApiClient(serverUrl, currentToken());
 
-// Reads and checks the files an agent named (all before any is sent), then
-// uploads each as this identity. The server checks them again and binds them
-// to the dm_send or board_post that names their ids; unsent ones expire.
-async function upload(paths: unknown): Promise<number[]> {
-  if (paths === undefined) return [];
+// Reads and checks the files an agent named (all before any is sent), uploads
+// each as this identity, and runs `send` with their ids; the server checks
+// them again and binds them to that dm_send or board_post. Uploads go only
+// over a live connection, and if any upload or the send fails, the ones made
+// are released, so a refused send doesn't hold the user's unsent quota.
+async function withUploads<T>(paths: unknown, send: (ids: number[]) => Promise<T>): Promise<T> {
+  if (paths === undefined) return send([]);
   // A server from before attachment_limits gets the defaults, its own then.
   const files = await readAttachmentFiles(paths, ROOTS, { limits: hello.attachment_limits });
+  client.assertConnected();
   const ids: number[] = [];
-  for (const f of files) {
-    const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
-    try {
-      ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
-    } catch (e) {
-      // The router's catch-all: a server from before attachments.
-      if (e instanceof ApiError && e.status === 404 && e.message === "not found") {
-        throw new Error("this server doesn't take attachments; it needs updating");
+  try {
+    for (const f of files) {
+      const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
+      try {
+        ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
+      } catch (e) {
+        // The router's catch-all: a server from before attachments.
+        if (e instanceof ApiError && e.status === 404 && e.message === "not found") {
+          throw new Error("this server doesn't take attachments; it needs updating");
+        }
+        throw e;
       }
-      throw e;
+    }
+    return await send(ids);
+  } catch (e) {
+    await releaseUploads(ids);
+    throw e;
+  }
+}
+
+// Releases uploads a failed send left unbound. One the server says no longer
+// is unsent was bound after all (the answer was lost, not the send).
+async function releaseUploads(ids: number[]): Promise<void> {
+  for (const id of ids) {
+    try {
+      await api().del(`/api/attachments/${id}?identity=${encodeURIComponent(identity)}`);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) continue;
+      console.error(`[grayboard] couldn't release upload ${id} (it expires in an hour): ${(e as Error).message}`);
     }
   }
-  return ids;
 }
 
 // ── start stdio transport ─────────────────────────────────────────────────────

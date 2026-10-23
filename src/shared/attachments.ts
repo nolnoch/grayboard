@@ -1,8 +1,9 @@
 // File attachments on direct messages and posts: limits, type detection, and
 // the checks a session's MCP process runs on the paths an agent names before
 // any byte leaves its host. Storage is src/core/attachments.ts.
-import { realpathSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, realpathSync } from "node:fs";
+import { link, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -30,8 +31,10 @@ const MAX_FILENAME_BYTES = 200;
 // meta list separator) replaced.
 export function sanitizeFilename(name: string): string {
   const base = name.split(/[\\/]/).pop() ?? "";
-  let out = base.replace(/[\u0000-\u001f\u007f"';<>|:*?]/g, "_").trim();
-  while (new TextEncoder().encode(out).length > MAX_FILENAME_BYTES) out = out.slice(0, -1);
+  // Cut by code point, so a surrogate pair is never split.
+  const chars = [...base.replace(/[\u0000-\u001f\u007f"';<>|:*?]/g, "_").trim()];
+  while (new TextEncoder().encode(chars.join("")).length > MAX_FILENAME_BYTES) chars.pop();
+  const out = chars.join("");
   if (!out || out === "." || out === "..") return "file";
   return out;
 }
@@ -92,7 +95,9 @@ function under(real: string, roots: string[]): string[] | null {
   return null;
 }
 
-// A directory attachment_get may write into: under one of the roots.
+// A directory attachment_get may write into: a root, or under one with no dot
+// component below it (as for reads), so a save can't plant files where tools
+// load them from (.claude/rules, .github/workflows, .git/hooks).
 export function checkSaveDir(dir: string, roots: string[], cwd = process.cwd()): string {
   let real: string;
   try {
@@ -100,9 +105,12 @@ export function checkSaveDir(dir: string, roots: string[], cwd = process.cwd()):
   } catch {
     throw new CoreError(`dir ${dir} doesn't exist`);
   }
-  if (!roots.includes(real) && !under(real, roots)) {
+  if (roots.includes(real)) return real;
+  const rel = under(real, roots);
+  if (!rel) {
     throw new CoreError(`dir ${dir} is outside the directories this session may write to (its working directory, the temp directory, BUS_ATTACH_ROOTS)`);
   }
+  if (rel.some((c) => c.startsWith("."))) throw new CoreError(`dir ${dir}: saving into dot directories isn't allowed`);
   return real;
 }
 
@@ -177,28 +185,80 @@ export function parseAttachmentsMeta(meta: string | undefined): number[] {
     .map(Number);
 }
 
-// attachment_get's write: into `dir` (checked against the roots) or the
-// default directory, as <id>-<filename>, readable only by this user. The id
-// keeps names unique; the same attachment saved twice is the same bytes.
+// attachment_get's write: into `dir` (checked against the roots) or the bus's
+// subdirectory of the default directory, as <id>-<filename>, readable only by
+// this user. Ids are per bus, so the default directory is split by bus.
 export async function saveAttachment(
   a: AttachmentInfo,
   data: Uint8Array,
   dir: unknown,
   roots: string[],
+  bus: string,
   env: Record<string, string | undefined> = process.env,
 ): Promise<string> {
   if (dir !== undefined && typeof dir !== "string") throw new CoreError("dir must be a string");
   let target: string;
   if (dir === undefined) {
-    target = attachmentsDir(env);
+    target = join(attachmentsDir(env), bus);
     await mkdir(target, { recursive: true, mode: 0o700 });
   } else {
     target = checkSaveDir(dir, roots);
   }
-  const path = join(target, `${a.id}-${sanitizeFilename(a.filename)}`);
-  await writeFile(path, data, { mode: 0o600 });
-  return path;
+  return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
 }
+
+const MAX_NAME_TRIES = 100;
+
+// Writes data into dir as name, or name-2, name-3… when that's taken by
+// anything but this user's own copy of the same bytes. The bytes go to a
+// private temp file first, then a hard link puts them in place: link never
+// follows or replaces what's at the name, so a symlink or file another user
+// planted in a shared directory (/tmp) is skipped, and no reader sees a
+// partial file.
+async function writeNew(dir: string, name: string, data: Uint8Array): Promise<string> {
+  const tmp = join(dir, `.grayboard-${randomUUID()}.tmp`);
+  await writeFile(tmp, data, { mode: 0o600, flag: "wx" });
+  try {
+    const ext = extname(name);
+    const stem = name.slice(0, name.length - ext.length);
+    for (let n = 1; n <= MAX_NAME_TRIES; n++) {
+      const path = join(dir, n === 1 ? name : `${stem}-${n}${ext}`);
+      try {
+        await link(tmp, path);
+        return path;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+      if (await isOwnCopy(path, data)) return path;
+    }
+    throw new CoreError(`can't save ${name} in ${dir}: ${MAX_NAME_TRIES} files by that name already exist`);
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
+
+// Whether path is a regular file (not a symlink) this user owns holding
+// exactly data: an earlier save of the same attachment.
+async function isOwnCopy(path: string, data: Uint8Array): Promise<boolean> {
+  let fh;
+  try {
+    fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile() || st.uid !== process.getuid?.() || st.size !== data.length) return false;
+    return Buffer.from(await fh.readFile()).equals(data);
+  } finally {
+    await fh.close();
+  }
+}
+
+// The default save directory's subdirectory for a bus: the server's host, or
+// a hash of the local database's path.
+export const serverBusDir = (serverUrl: string): string => new URL(serverUrl).host.replace(/[^A-Za-z0-9.-]/g, "_");
+export const localBusDir = (dbPath: string): string => `local-${createHash("sha256").update(resolve(dbPath)).digest("hex").slice(0, 12)}`;
 
 // dm_send's and board_post's attachments parameter, the same in both modes.
 export const ATTACHMENTS_PARAM = {
