@@ -10,7 +10,7 @@ import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
-import { CoreError, TooLargeError } from "../core/errors.ts";
+import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
@@ -232,6 +232,9 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
     if (e instanceof TooLargeError) return refuse("too_large", e.message, 413);
     if (e instanceof UploadTimeout) return refuse("timeout", e.message, 408);
     if (e instanceof CoreError) return refuse("bad_request", e.message, 400);
+    // A fault (disk full, unwritable blob dir, the client gone mid-wait): the
+    // audit keeps it, the server's error handler answers a bare 500.
+    writeAudit(repo, "attachment.upload_failed", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), error: (e as Error).message });
     throw e;
   } finally {
     release();
@@ -249,7 +252,15 @@ async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, r
     return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
   }
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
-  const data = new Uint8Array(await repo.blobs.get(row.sha256));
+  let data: Uint8Array<ArrayBuffer>;
+  try {
+    data = new Uint8Array(await repo.blobs.get(row.sha256));
+  } catch (e) {
+    writeAudit(repo, "attachment.download_failed", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256, error: (e as Error).message });
+    // Swept between the read check and the read: the file is gone, as a 404 says.
+    if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
+    throw e;
+  }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
     headers: {

@@ -29,7 +29,7 @@ const INFO = `id, filename, type, size, sha256`;
 export interface BlobStore {
   // Idempotent: the same sha256 is the same bytes.
   put(sha256: string, data: Uint8Array): Promise<void>;
-  // Throws if the bytes are missing.
+  // Throws BlobMissing if the bytes are missing.
   get(sha256: string): Promise<Uint8Array>;
   // Missing bytes are fine.
   delete(sha256: string): Promise<void>;

@@ -67,6 +67,14 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     },
 
     websocket: handlers,
+
+    // A route that throws something other than a refusal it maps itself. Bun's
+    // default answer, without NODE_ENV=production, is a dev page carrying the
+    // message (blob paths, errno text); the client gets a bare 500 instead.
+    error(e) {
+      console.error(`[grayboard] request failed: ${e.stack ?? e.message}`);
+      return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
+    },
   });
 
   const timers: ReturnType<typeof setInterval>[] = [];

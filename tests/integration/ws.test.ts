@@ -3,7 +3,7 @@
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -840,6 +840,38 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect(((await refused.json()) as { message: string }).message).toBe(`no attachment ${up.body.id} on a message or post you can read`);
   expect(audits("attachment.download_refused")).toMatchObject([{ actor: "carol@example.com", target: `attachment:${up.body.id}` }]);
   expect(audits("attachment.downloaded").map((r) => r.actor)).toEqual(["bob@example.com", "alice@example.com"]);
+});
+
+test("attachments: a failed blob read or write is audited; a swept blob is a 404, a fault a bare 500", async () => {
+  app.stop();
+  const blobDir = mkdtempSync(join(tmpdir(), "gb-blobs-"));
+  app = startServer(config({ blobDir }), { probeMs: 150, background: false });
+  base = `http://localhost:${app.server.port}`;
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = new Client(alice, "be");
+  const b = new Client(bob, "fe");
+  for (const x of [a, b]) expect((await x.connect()).type).toBe("hello_ok");
+
+  const up = await upload(alice, "be", "shot.png", PNG);
+  expect((await a.request({ type: "send", recipient: "bob@example.com/fe", body: "see shot", attachment_ids: [up.body.id] })).type).toBe("send_ok");
+  // Swept between the read check and the read.
+  rmSync(join(blobDir, up.body.sha256.slice(0, 2), up.body.sha256));
+  const gone = await download(bob, "fe", up.body.id);
+  expect(gone.status).toBe(404);
+  expect(await gone.json()).toEqual({ code: "not_found", message: `attachment ${up.body.id}'s bytes are gone` });
+  expect(audits("attachment.download_failed")).toMatchObject([{ actor: "bob@example.com", target: `attachment:${up.body.id}`, detail: expect.stringContaining("are missing") }]);
+  expect(audits("attachment.downloaded")).toEqual([]);
+
+  // An unwritable blob directory: the client hears nothing of the path or errno.
+  chmodSync(join(blobDir, "tmp"), 0o500);
+  try {
+    const failed = await upload(alice, "be", "other.png", new Uint8Array([...PNG, 1]));
+    expect(failed).toEqual({ status: 500, body: { code: "internal", message: "internal error" } });
+  } finally {
+    chmodSync(join(blobDir, "tmp"), 0o700);
+  }
+  expect(audits("attachment.upload_failed")).toMatchObject([{ actor: "alice@example.com", target: null, detail: expect.stringMatching(/"filename":"other.png".*EACCES/) }]);
 });
 
 test("attachments on a team board post follow the board; a retracted DM takes its files; uploads are capped", async () => {

@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { BlobStore } from "../core/attachments.ts";
+import { BlobMissing } from "../core/errors.ts";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -51,7 +52,7 @@ export class DiskBlobs implements BlobStore {
     try {
       return new Uint8Array(await readFile(this.path(sha256)));
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`attachment bytes ${sha256} are missing`);
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new BlobMissing(sha256);
       throw e;
     }
   }

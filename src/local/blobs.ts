@@ -3,6 +3,7 @@
 import type { Database } from "bun:sqlite";
 
 import type { BlobStore } from "../core/attachments.ts";
+import { BlobMissing } from "../core/errors.ts";
 
 export class SqliteBlobs implements BlobStore {
   constructor(private readonly db: Database) {
@@ -15,7 +16,7 @@ export class SqliteBlobs implements BlobStore {
 
   async get(sha256: string): Promise<Uint8Array> {
     const row = this.db.prepare(`SELECT data FROM attachment_bytes WHERE sha256 = ?`).get(sha256) as { data: Uint8Array } | null;
-    if (!row) throw new Error(`attachment bytes ${sha256} are missing`);
+    if (!row) throw new BlobMissing(sha256);
     return row.data;
   }
 
