@@ -36,6 +36,8 @@ import {
   reprDigest,
   sanitizeFilename,
   saveAttachment,
+  saveTarget,
+  checkAttachmentId,
   serverBusDir,
   sha256Hex,
   sniffType,
@@ -237,20 +239,25 @@ describe("reading files to attach", () => {
   test("saving goes to the default directory or a dir under a root, private to the user", async () => {
     const a = { id: 7, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
     const def = join(outside, "saved");
-    const p1 = await saveAttachment(a, PNG, undefined, [root], "local-x", { GRAYBOARD_ATTACHMENTS_DIR: def });
+    const p1 = await saveAttachment(a, PNG, await saveTarget(undefined, [root], "local-x", { GRAYBOARD_ATTACHMENTS_DIR: def }));
     expect(p1).toBe(join(def, "local-x", "7-shot.png"));
     expect(new Uint8Array(readFileSync(p1))).toEqual(PNG);
     expect(statSync(p1).mode & 0o777).toBe(0o600);
-    expect(await saveAttachment(a, PNG, root, [root], "local-x")).toBe(join(root, "7-shot.png"));
+    expect(await saveAttachment(a, PNG, await saveTarget(root, [root], "local-x"))).toBe(join(root, "7-shot.png"));
     expect(() => checkSaveDir(outside, [root])).toThrow("outside the directories");
     expect(() => checkSaveDir(join(root, "nope"), [root])).toThrow("doesn't exist");
+    await expect(saveTarget(7, [root], "b")).rejects.toThrow("dir must be a string");
+  });
+
+  test("attachment ids are positive whole numbers in both modes", () => {
+    expect(checkAttachmentId(12)).toBe(12);
+    for (const bad of [0, -1, 1.5, "3", null, Number.MAX_SAFE_INTEGER + 1]) expect(() => checkAttachmentId(bad)).toThrow("id must be an attachment id");
   });
 
   test("saves are refused in dot directories under a root", async () => {
     mkdirSync(join(root, ".claude", "rules"), { recursive: true });
     mkdirSync(join(root, "docs"), { recursive: true });
-    const a = { id: 9, filename: "evil.md", type: "text/markdown", size: 2, sha256: sha256Hex(PNG) };
-    await expect(saveAttachment(a, PNG, join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
+    await expect(saveTarget(join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
     expect(() => checkSaveDir(join(root, ".claude"), [root], root)).toThrow("dot directories");
     expect(checkSaveDir("docs", [root], root)).toBe(join(root, "docs"));
     expect(readdirSync(join(root, ".claude", "rules"))).toEqual([]);
@@ -262,13 +269,13 @@ describe("reading files to attach", () => {
     symlinkSync(victim, join(root, "8-shot.png"));
     writeFileSync(join(root, "8-shot-2.png"), "other bytes");
     const a = { id: 8, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
-    const p = await saveAttachment(a, PNG, root, [root], "b");
+    const p = await saveAttachment(a, PNG, root);
     expect(p).toBe(join(root, "8-shot-3.png"));
     expect(readFileSync(victim, "utf8")).toBe("keep");
     expect(readFileSync(join(root, "8-shot-2.png"), "utf8")).toBe("other bytes");
     expect(new Uint8Array(readFileSync(p))).toEqual(PNG);
     // Saving the same attachment again finds this user's own copy.
-    expect(await saveAttachment(a, PNG, root, [root], "b")).toBe(p);
+    expect(await saveAttachment(a, PNG, root)).toBe(p);
     // No temp file is left behind.
     expect(readdirSync(root).filter((n) => n.endsWith(".tmp"))).toEqual([]);
   });

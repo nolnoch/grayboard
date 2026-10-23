@@ -2,6 +2,8 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { HTTP_TIMEOUT_MS, describeFetchError, transferTimeoutMs } from "../shared/http.ts";
+
 export type Credentials = { session_token: string; server: string; user_email: string };
 
 export function credentialsPath(env = process.env): string {
@@ -43,17 +45,33 @@ export class ApiClient {
     private readonly token: string | null = null,
   ) {}
 
-  private async fetch(path: string, options: RequestInit = {}): Promise<unknown> {
+  // Every request has a deadline (ms), which covers reading the answer too.
+  private async request(path: string, options: RequestInit, ms: number): Promise<Response> {
+    const signal = AbortSignal.timeout(ms);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, { ...options, signal });
+    } catch (e) {
+      throw new Error(`grayboard server at ${this.baseUrl}: ${describeFetchError(e, ms)}`);
+    }
+    if (!res.ok) throw await apiError(res);
+    return res;
+  }
+
+  private async fetch(path: string, options: RequestInit = {}, ms = HTTP_TIMEOUT_MS): Promise<unknown> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.request(path, {
       ...options,
       headers: { ...headers, ...(options.headers as Record<string, string> | undefined ?? {}) },
-    });
-
-    if (!res.ok) throw await apiError(res);
-    try { return await res.json(); } catch { return {}; }
+    }, ms);
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (e) {
+      throw new Error(`grayboard server at ${this.baseUrl}: ${describeFetchError(e, ms)}`);
+    }
+    try { return JSON.parse(text); } catch { return {}; }
   }
 
   get(path: string)                  { return this.fetch(path); }
@@ -61,14 +79,18 @@ export class ApiClient {
   del(path: string)                  { return this.fetch(path, { method: "DELETE" }); }
   // A raw body (an attachment upload); the answer is JSON.
   upload(path: string, data: Uint8Array) {
-    return this.fetch(path, { method: "POST", body: new Uint8Array(data), headers: { "Content-Type": "application/octet-stream" } });
+    return this.fetch(path, { method: "POST", body: new Uint8Array(data), headers: { "Content-Type": "application/octet-stream" } }, transferTimeoutMs(data.length));
   }
 
-  // A raw answer (an attachment download), for the caller to read.
-  async download(path: string): Promise<Response> {
-    const res = await fetch(`${this.baseUrl}${path}`, { headers: this.token ? { Authorization: `Bearer ${this.token}` } : {} });
-    if (!res.ok) throw await apiError(res);
-    return res;
+  // A raw answer (an attachment download) of at most `maxBytes`, read in full.
+  async download(path: string, maxBytes: number): Promise<{ res: Response; data: Uint8Array }> {
+    const ms = transferTimeoutMs(maxBytes);
+    const res = await this.request(path, { headers: this.token ? { Authorization: `Bearer ${this.token}` } : {} }, ms);
+    try {
+      return { res, data: new Uint8Array(await res.arrayBuffer()) };
+    } catch (e) {
+      throw new Error(`grayboard server at ${this.baseUrl}: ${describeFetchError(e, ms)}`);
+    }
   }
 }
 

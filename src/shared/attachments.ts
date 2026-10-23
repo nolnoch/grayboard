@@ -278,25 +278,32 @@ export function parseAttachmentsMeta(meta: string | undefined): number[] {
   });
 }
 
-// attachment_get's write: into `dir` (checked against the roots) or the bus's
-// subdirectory of the default directory, as <id>-<filename>, readable only by
-// this user. Ids are per bus, so the default directory is split by bus.
-export async function saveAttachment(
-  a: AttachmentInfo,
-  data: Uint8Array,
+// attachment_get's id, alike in both modes.
+export function checkAttachmentId(id: unknown): number {
+  if (!Number.isSafeInteger(id) || (id as number) < 1) throw new CoreError("id must be an attachment id");
+  return id as number;
+}
+
+// Where attachment_get saves: `dir` (checked against the roots) or the bus's
+// subdirectory of the default directory. Ids are per bus, so the default
+// directory is split by bus. Resolved before the bytes are fetched, so a
+// refused dir costs no download.
+export async function saveTarget(
   dir: unknown,
   roots: string[],
   bus: string,
   env: Record<string, string | undefined> = process.env,
 ): Promise<string> {
   if (dir !== undefined && typeof dir !== "string") throw new CoreError("dir must be a string");
-  let target: string;
-  if (dir === undefined) {
-    target = join(attachmentsDir(env), bus);
-    await mkdir(target, { recursive: true, mode: 0o700 });
-  } else {
-    target = checkSaveDir(dir, roots);
-  }
+  if (dir !== undefined) return checkSaveDir(dir, roots);
+  const target = join(attachmentsDir(env), bus);
+  await mkdir(target, { recursive: true, mode: 0o700 });
+  return target;
+}
+
+// attachment_get's write into `target` (from saveTarget), as
+// <id>-<filename>, readable only by this user.
+export function saveAttachment(a: AttachmentInfo, data: Uint8Array, target: string): Promise<string> {
   return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
 }
 

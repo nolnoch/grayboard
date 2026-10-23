@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GrayboardClient } from "../../src/plugin/client.ts";
@@ -380,10 +380,13 @@ test("the plugin checks files against the server's limits from hello_ok before u
 }, 20_000);
 
 // A proxy to the real server that passes everything through, WebSockets
-// included, except the HTTP requests `intercept` answers.
-function proxy(intercept: (req: Request, u: URL) => Response | Promise<Response> | undefined) {
+// included, except the HTTP requests `intercept` answers. `down` rewrites
+// frames the server sends; `drop()` closes every session's socket, so each
+// reconnects.
+function proxy(intercept: (req: Request, u: URL) => Response | Promise<Response> | undefined, down: (frame: string) => string = (f) => f) {
   type Pipe = { auth: string; up?: WebSocket; queue: (string | Buffer)[] };
-  return Bun.serve<Pipe>({
+  const open = new Set<{ close(): void }>();
+  const srv = Bun.serve<Pipe>({
     port: 0,
     async fetch(req, srv) {
       const u = new URL(req.url);
@@ -394,10 +397,11 @@ function proxy(intercept: (req: Request, u: URL) => Response | Promise<Response>
     },
     websocket: {
       open(ws) {
+        open.add(ws);
         const up = new (WebSocket as any)(`${base.replace("http", "ws")}/ws`, { headers: { Authorization: ws.data.auth } }) as WebSocket;
         ws.data.up = up;
         up.onopen = () => ws.data.queue.splice(0).forEach((m) => up.send(m));
-        up.onmessage = (e) => ws.send(e.data as string);
+        up.onmessage = (e) => ws.send(down(e.data as string));
         up.onclose = () => ws.close();
       },
       message(ws, m) {
@@ -405,26 +409,91 @@ function proxy(intercept: (req: Request, u: URL) => Response | Promise<Response>
         else ws.data.queue.push(m);
       },
       close(ws) {
+        open.delete(ws);
         ws.data.up?.close();
       },
     },
   });
+  return Object.assign(srv, { drop: () => [...open].forEach((ws) => ws.close()) });
 }
 
-test("attachments against a server from before them: the upload says the server needs updating", async () => {
+// Rewrites the server's hello_ok.
+const helloRewrite = (edit: (hello: Record<string, unknown>) => void) => (frame: string) => {
+  const msg = JSON.parse(frame) as Record<string, unknown>;
+  if (msg.type !== "hello_ok") return frame;
+  edit(msg);
+  return JSON.stringify(msg);
+};
+
+test("attachments against a server from before them: hello_ok without limits says the server needs updating", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
   writeFileSync(join(dir, "notes.md"), "# notes");
-  // An older router's catch-all answers the upload route.
-  const old = proxy((_, u) => (u.pathname === "/api/attachments" ? Response.json({ code: "not_found", message: "not found" }, { status: 404 }) : undefined));
+  let uploads = 0;
+  const old = proxy(
+    (_, u) => (u.pathname.startsWith("/api/attachments") && ++uploads ? Response.json({ code: "not_found", message: "not found" }, { status: 404 }) : undefined),
+    helloRewrite((h) => delete h.attachment_limits),
+  );
   try {
     const alice = await login("alice@example.com");
     const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${old.port}` });
-    await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(
-      "this server doesn't take attachments; it needs updating",
-    );
+    const outdated = "this server doesn't take attachments; it needs updating";
+    await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(outdated);
+    await expect(be.call("attachment_get", { id: 1 })).rejects.toThrow(outdated);
+    expect(uploads).toBe(0);
     expect(await be.call("dm_send", { to: "be", body: "plain" })).toMatchObject({ message_id: expect.any(Number) });
   } finally {
     old.stop(true);
+  }
+}, 20_000);
+
+test("the plugin takes attachment limits from the hello_ok of each reconnect", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  let file = 5;
+  const p = proxy(() => undefined, helloRewrite((h) => (h.attachment_limits = { file, total: 1000 })));
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    const send = () => be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] });
+    await expect(send()).rejects.toThrow(/7B exceeds the 5B limit/);
+    file = 1000;
+    p.drop();
+    // The plugin reconnects about 2s later.
+    for (let i = 0; i < 50; i++) {
+      await Bun.sleep(100);
+      try {
+        expect((await send()).attachments).toHaveLength(1);
+        return;
+      } catch (e) {
+        if (!/reconnecting|5B limit/.test((e as Error).message)) throw e;
+      }
+    }
+    throw new Error("the limits never changed");
+  } finally {
+    p.stop(true);
+  }
+}, 20_000);
+
+test("attachment HTTP: a refused token gets the sign-in hint, and a refused dir costs no download", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  let downloads = 0;
+  let refuse = false;
+  const p = proxy((_, u) => {
+    if (!u.pathname.startsWith("/api/attachments")) return undefined;
+    if (refuse) return Response.json({ code: "unauthenticated", message: "invalid session" }, { status: 401 });
+    if (/^\/api\/attachments\/\d+$/.test(u.pathname)) downloads++;
+    return undefined;
+  });
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    const [notes] = (await be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).attachments;
+    await expect(be.call("attachment_get", { id: notes.id, dir: "/" })).rejects.toThrow(/outside the directories/);
+    await expect(be.call("attachment_get", { id: 1.5 })).rejects.toThrow("id must be an attachment id");
+    expect(downloads).toBe(0);
+    refuse = true;
+    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(/refused GRAYBOARD_TOKEN; set a valid one or unset it/);
+  } finally {
+    p.stop(true);
   }
 }, 20_000);
 
@@ -450,7 +519,8 @@ test("attachment_get saves nothing unless the bytes match the server's Repr-Dige
     await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the server sent no digest; it needs updating`);
     mode = "alter";
     await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the bytes received don't match the server's sha256`);
-    expect(existsSync(save)).toBe(false);
+    // The default directory exists (resolved before the download); nothing is in it.
+    expect(readdirSync(save, { recursive: true }).filter((n) => String(n).endsWith("notes.md"))).toEqual([]);
   } finally {
     bad.stop(true);
   }

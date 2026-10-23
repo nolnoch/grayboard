@@ -15,7 +15,8 @@ import { checkBody } from "../core/boards.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, digestSha256, dispositionFilename, formatAttachmentsMeta, sha256Hex, readAttachmentFiles, saveAttachment, serverBusDir,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, checkAttachmentId, digestSha256, dispositionFilename, formatAttachmentsMeta, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
+  type AttachmentLimits,
 } from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -292,26 +293,29 @@ async function call(name: string, a: Record<string, unknown>) {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);
     }
     if (name === "attachment_get") {
-      if (!Number.isInteger(a.id)) return { ...text("error: id must be an attachment id"), isError: true };
-      const res = await api().download(`/api/attachments/${a.id}?identity=${encodeURIComponent(identity)}`);
-      const data = new Uint8Array(await res.arrayBuffer());
+      const id = checkAttachmentId(a.id);
+      const limits = attachmentLimits();
+      const target = await saveTarget(a.dir, ROOTS, serverBusDir(serverUrl));
+      const { res, data } = await api().download(`/api/attachments/${id}?identity=${encodeURIComponent(identity)}`, limits.file);
       // Checked before anything is saved: the bytes must be the ones the server stored.
       const sha256 = sha256Hex(data);
       const want = digestSha256(res.headers.get("repr-digest"));
-      if (!want) throw new Error(`attachment ${a.id}: the server sent no digest; it needs updating`);
-      if (want !== sha256) throw new Error(`attachment ${a.id}: the bytes received don't match the server's sha256`);
+      if (!want) throw new Error(`attachment ${id}: the server sent no digest; it needs updating`);
+      if (want !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
       const info = {
-        id: a.id as number,
+        id,
         filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
         type: res.headers.get("content-type") ?? "application/octet-stream",
         size: data.length,
         sha256,
       };
-      const path = await saveAttachment(info, data, a.dir, ROOTS, serverBusDir(serverUrl));
+      const path = await saveAttachment(info, data, target);
       return text({ path, filename: info.filename, type: info.type, size: info.size, sha256 });
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
+    // The HTTP API (attachments) refused the token, as a WS hello would have.
+    if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
     // Server errors arrive as "code: message"; show them to the agent.
     return { ...text(`error: ${(e as Error).message}`), isError: true };
   }
@@ -320,6 +324,14 @@ async function call(name: string, a: Record<string, unknown>) {
 // The server's HTTP API as this session's user, with the current token.
 const api = () => new ApiClient(serverUrl, currentToken());
 
+// The live connection's attachment limits, which every hello_ok (a reconnect's
+// too) carries. A server from before attachments sends none.
+function attachmentLimits(): AttachmentLimits {
+  const limits = client.assertConnected().attachment_limits;
+  if (!limits) throw new Error("this server doesn't take attachments; it needs updating");
+  return limits;
+}
+
 // Reads and checks the files an agent named (all before any is sent), uploads
 // each as this identity, and runs `send` with their ids; the server checks
 // them again and binds them to that dm_send or board_post. Uploads go only
@@ -327,22 +339,13 @@ const api = () => new ApiClient(serverUrl, currentToken());
 // are released, so a refused send doesn't hold the user's unsent quota.
 async function withUploads<T>(paths: unknown, send: (ids: number[]) => Promise<T>): Promise<T> {
   if (paths === undefined) return send([]);
-  // A server from before attachment_limits gets the defaults, its own then.
-  const files = await readAttachmentFiles(paths, ROOTS, { limits: hello.attachment_limits });
+  const files = await readAttachmentFiles(paths, ROOTS, { limits: attachmentLimits() });
   client.assertConnected();
   const ids: number[] = [];
   try {
     for (const f of files) {
       const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
-      try {
-        ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
-      } catch (e) {
-        // The router's catch-all: a server from before attachments.
-        if (e instanceof ApiError && e.status === 404 && e.message === "not found") {
-          throw new Error("this server doesn't take attachments; it needs updating");
-        }
-        throw e;
-      }
+      ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
     }
     return await send(ids);
   } catch (e) {

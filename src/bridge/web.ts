@@ -2,6 +2,8 @@
 // both ways. Slack answers HTTP 200 with {ok:false, error} for most failures,
 // and 429 + Retry-After (error "ratelimited") when throttled.
 
+import { HTTP_TIMEOUT_MS, describeFetchError, transferTimeoutMs } from "../shared/http.ts";
+
 export const SLACK_API = "https://slack.com/api/";
 
 // Failures a retry can't fix: the token or the channel is wrong. The bridge
@@ -64,14 +66,21 @@ export class SlackWeb {
           method: "POST",
           headers: { Authorization: `Bearer ${this.token}`, "Content-Type": encoded.type },
           body: encoded.body,
+          signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         });
       } catch (e) {
-        throw new SlackUnavailable(`slack ${method}: ${(e as Error).message}`);
+        throw new SlackUnavailable(`slack ${method}: ${describeFetchError(e, HTTP_TIMEOUT_MS)}`);
       }
       if (res.status >= 500) throw new SlackUnavailable(`slack ${method}: HTTP ${res.status}`);
       let data: { ok?: boolean; error?: string } = {};
+      let text: string;
       try {
-        data = (await res.json()) as typeof data;
+        text = await res.text();
+      } catch (e) {
+        throw new SlackUnavailable(`slack ${method}: ${describeFetchError(e, HTTP_TIMEOUT_MS)}`);
+      }
+      try {
+        data = JSON.parse(text) as typeof data;
       } catch {
         if (res.status !== 429) throw new SlackUnavailable(`slack ${method}: HTTP ${res.status}, not JSON`);
       }
@@ -88,11 +97,17 @@ export class SlackWeb {
 
   /** Sends a file's bytes to the upload_url files.getUploadURLExternal gave. */
   async upload(url: string, data: Uint8Array): Promise<void> {
+    const ms = transferTimeoutMs(data.length);
     let res: Response;
     try {
-      res = await this.fetchImpl(url, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: new Uint8Array(data) });
+      res = await this.fetchImpl(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: new Uint8Array(data),
+        signal: AbortSignal.timeout(ms),
+      });
     } catch (e) {
-      throw new SlackUnavailable(`slack file upload: ${(e as Error).message}`);
+      throw new SlackUnavailable(`slack file upload: ${describeFetchError(e, ms)}`);
     }
     if (res.status >= 500 || res.status === 429) throw new SlackUnavailable(`slack file upload: HTTP ${res.status}`);
     if (res.status !== 200) throw new SlackError("file upload", `HTTP ${res.status}`);
@@ -104,15 +119,21 @@ export class SlackWeb {
    * (the file's, from Slack) is refused.
    */
   async download(url: string, size: number): Promise<Uint8Array> {
+    const ms = transferTimeoutMs(size);
     let res: Response;
     try {
-      res = await this.fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${this.token}` } });
+      res = await this.fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${this.token}` }, signal: AbortSignal.timeout(ms) });
     } catch (e) {
-      throw new SlackUnavailable(`slack file download: ${(e as Error).message}`);
+      throw new SlackUnavailable(`slack file download: ${describeFetchError(e, ms)}`);
     }
     if (res.status >= 500 || res.status === 429) throw new SlackUnavailable(`slack file download: HTTP ${res.status}`);
     if (res.status !== 200) throw new SlackError("file download", `HTTP ${res.status}`);
-    const data = new Uint8Array(await res.arrayBuffer());
+    let data: Uint8Array;
+    try {
+      data = new Uint8Array(await res.arrayBuffer());
+    } catch (e) {
+      throw new SlackUnavailable(`slack file download: ${describeFetchError(e, ms)}`);
+    }
     if (data.length !== size) throw new SlackError("file download", "size_mismatch");
     return data;
   }

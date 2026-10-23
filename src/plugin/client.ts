@@ -206,11 +206,13 @@ export class GrayboardClient {
   }
 
   /** Throws unless requests can go out now: before hello_ok the server
-   *  rejects them and closes the socket, so a caller fails fast instead. */
-  assertConnected(): void {
+   *  rejects them and closes the socket, so a caller fails fast instead.
+   *  Returns this connection's hello_ok, which a reconnect replaces. */
+  assertConnected(): HelloOk {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
       throw new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly");
     }
+    return this.helloData;
   }
 
   /** Send a request and wait for the corresponding response. */

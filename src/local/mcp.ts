@@ -42,7 +42,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, formatAttachmentsMeta, localBusDir, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, formatAttachmentsMeta, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -346,11 +346,13 @@ async function dispatch(name: string, a: Record<string, any>) {
   }
 
   if (name === "attachment_get") {
-    const row = getAttachment(db, a.id);
-    if (!row || !canReadAttachment(db, IDENTITY, row, (id) => mine(getMessage(id)))) {
-      return { ...text(`error: no attachment ${a.id} on a message or post you can read`), isError: true };
+    const id = checkAttachmentId(a.id);
+    const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
+    const row = getAttachment(db, id);
+    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)))) {
+      return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
     }
-    const path = await saveAttachment(row, await blobs.get(row.sha256), a.dir, ROOTS, BUS_DIR);
+    const path = await saveAttachment(row, await blobs.get(row.sha256), target);
     return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
   }
 
