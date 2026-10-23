@@ -456,10 +456,10 @@ Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. I
 ```bash
 curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
   | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-curl -s https://grayboard.example.com/healthz   # "version" is the new release
+scripts/deploy_check.sh https://grayboard.example.com v1.11.0   # from a checkout, anywhere
 ```
 
-The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. The `curl` above repeats the check through Caddy.
+The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. `scripts/deploy_check.sh` repeats the check from outside the host, through Caddy: it exits 1 unless `/healthz` answers ok with the release you name.
 
 ### Per-developer setup (one-time)
 
