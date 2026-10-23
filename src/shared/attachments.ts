@@ -369,7 +369,8 @@ export const ATTACHMENTS_PARAM = {
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`,
 };
 
-// Not alwaysLoad: a message or post with files names its attachment ids.
+// Not alwaysLoad: a channel notification with files names this tool
+// (files_tool, src/core/tools.ts), and tool results list the ids.
 export const ATTACHMENT_GET_TOOL = {
   name: "attachment_get",
   description:

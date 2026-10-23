@@ -569,6 +569,7 @@ test("attachments: sent with a DM or post, shown on reads and pushes, fetched by
 
   await Bun.sleep(300);
   const meta = pushes.find((m) => m.message_id === String(sent.message_id))!;
+  expect(meta.files_tool).toMatch(/^attachment_get\(id/);
   expect(meta.attachments).toBe(`${shot.id}:shot.png image/png 10B sha256:${sha256Hex(png)}; ${notes.id}:notes.md text/markdown 7B sha256:${sha256Hex(new TextEncoder().encode("# notes"))}`);
   expect((await call(fe, "dm_thread", { thread: sent.message_id }))[0].attachments).toEqual(sent.attachments);
   expect((await call(fe, "dm_inbox")).unanswered[0].attachments).toEqual(sent.attachments);

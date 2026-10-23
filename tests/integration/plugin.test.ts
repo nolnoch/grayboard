@@ -319,6 +319,7 @@ test("attachments in server mode: dm_send and board_post upload files, pushes na
   expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) });
   expect(notes).toMatchObject({ filename: "notes.md", type: "text/markdown", size: 7 });
   await Bun.sleep(300);
+  expect(fe.pushes.find((p) => p.content === "see these")!.meta.files_tool).toMatch(/^attachment_get\(id/);
   expect(fe.pushes.find((p) => p.content === "see these")!.meta.attachments).toBe(`${shot.id}:shot.png image/png 10B sha256:${sha256Hex(png)}; ${notes.id}:notes.md text/markdown 7B sha256:${sha256Hex(new TextEncoder().encode("# notes"))}`);
 
   const saved = await fe.call("attachment_get", { id: shot.id });

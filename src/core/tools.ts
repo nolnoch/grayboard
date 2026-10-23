@@ -397,11 +397,20 @@ export function callBoardTool(
   throw new CoreError(`unknown tool: ${name}`);
 }
 
+// A message's or post's files, in its channel meta. attachment_get isn't
+// alwaysLoad, so the notification that carries files names it; one without
+// files costs nothing.
+function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefined): void {
+  if (!list?.length) return;
+  meta.attachments = formatAttachmentsMeta(list);
+  meta.files_tool = "attachment_get(id, dir?) saves one; ids lead each item";
+}
+
 // The channel notification for a direct message. Same shape in every mode.
 export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-  if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
+  addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
 
@@ -417,7 +426,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       created_at: String(p.created_at),
     };
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
-    if (p.attachments?.length) meta.attachments = formatAttachmentsMeta(p.attachments);
+    addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }

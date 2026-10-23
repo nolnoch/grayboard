@@ -21,7 +21,7 @@ import {
 import { SqliteBlobs } from "../local/blobs.ts";
 import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
 import { TooLargeError } from "./errors.ts";
-import { boardNotification, callBoardTool } from "./tools.ts";
+import { boardNotification, callBoardTool, dmNotification } from "./tools.ts";
 import { initCoreSchema } from "./schema.ts";
 import {
   DEFAULT_ATTACHMENT_LIMITS,
@@ -143,6 +143,16 @@ describe("type detection and names", () => {
     expect(meta).toBe(`12:shot 1.png image/png 340KB sha256:${"a".repeat(64)}; 13:n.md text/markdown 900B sha256:${"b".repeat(64)}`);
     expect(parseAttachmentsMeta(meta)).toEqual([12, 13]);
     expect(parseAttachmentsMeta(undefined)).toEqual([]);
+  });
+
+  test("a notification with files names attachment_get; one without adds nothing", () => {
+    const msg = { id: 7, sender: "be", body: "hi", parent_id: null, created_at: 1 };
+    const file = { id: 12, filename: "a.png", type: "image/png", size: 3, sha256: "a".repeat(64) };
+    expect(dmNotification(msg).meta).toEqual({ message_id: "7", from: "be", created_at: "1" });
+    expect(dmNotification({ ...msg, attachments: [file] }).meta).toMatchObject({
+      attachments: formatAttachmentsMeta([file]),
+      files_tool: expect.stringMatching(/^attachment_get\(id/),
+    });
   });
 
   test("meta round-trips every size class and sanitized name, and refuses what it can't read", () => {
