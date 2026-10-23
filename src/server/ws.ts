@@ -22,7 +22,7 @@ import {
   type PendingRef,
 } from "../core/boards.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
-import { attachmentIds, attachmentLimits } from "../core/attachments.ts";
+import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
@@ -372,7 +372,7 @@ async function handleHello(
     user_email: authed.user_email,
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
-    attachment_limits: attachmentLimits(db),
+    attachment_limits: repo.attachmentLimits,
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -528,6 +528,7 @@ function handleRetract(hub: Hub, ws: Ws, reqId: string, id: number): void {
   }
   if (!repo.messages.retract(ws.data.identityFull, id)) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
   send(ws, { type: "ack_ok", req_id: reqId });
+  void sweepBlobs(hub.db, repo.blobs);
 }
 
 function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {
@@ -540,6 +541,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   try {
     outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
       online: (h) => hub.registry.get(h)?.data.ready === true,
+      attachmentLimits: hub.repo.attachmentLimits,
     });
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);

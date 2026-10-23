@@ -1,8 +1,23 @@
 import { openLocalDb } from "./open.ts";
-import { bindAttachments, dropAttachments, storeAttachment, withAttachments } from "../core/attachments.ts";
-import type { AttachmentFile, AttachmentInfo } from "../shared/attachments.ts";
+import { SqliteBlobs } from "./blobs.ts";
+import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments } from "../core/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 
 export const db = openLocalDb();
+export const blobs = new SqliteBlobs(db);
+
+// Stores files as `uploader`'s unbound uploads, then runs `send`, a write
+// that binds them in its own transaction. If it throws, the uploads go again.
+export async function withUploads<T>(uploader: string, files: AttachmentFile[], send: (ids: number[]) => T): Promise<T> {
+  const ids: number[] = [];
+  try {
+    for (const f of files) ids.push((await storeAttachment(db, blobs, uploader, f)).id);
+    return send(ids);
+  } catch (e) {
+    for (const id of ids) await releaseUpload(db, blobs, id, uploader);
+    throw e;
+  }
+}
 
 export type Message = {
   id: number;
@@ -16,18 +31,17 @@ export type Message = {
   attachments?: AttachmentInfo[];
 };
 
-// Stores the message and its files in one transaction.
+// Stores the message and binds the sender's uploads `ids` to it, in one transaction.
 export function insertMessage(
   sender: string,
   recipient: string,
   body: string,
   parent_id: number | null,
   pending = false,
-  files: AttachmentFile[] = [],
+  ids: number[] = [],
 ): { id: number; attachments: AttachmentInfo[] } {
   return db.transaction(() => {
     const now = Date.now();
-    const ids = files.map((f) => storeAttachment(db, sender, f, { now }).id);
     const { lastInsertRowid } = db
       .prepare(
         `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)
@@ -35,7 +49,7 @@ export function insertMessage(
       )
       .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
-    return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }) };
+    return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
 }
 

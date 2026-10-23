@@ -1,8 +1,12 @@
+import { dirname, join } from "node:path";
+
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type Config = {
   dbPath: string;
+  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside the database.
+  blobDir: string;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -39,6 +43,7 @@ export function loadConfig(): Config {
 
   return {
     dbPath,
+    blobDir: process.env.GRAYBOARD_BLOB_DIR || join(dirname(dbPath), "blobs"),
     httpPort: parseInt(process.env.GRAYBOARD_HTTP_PORT ?? "8080", 10),
     googleClientId,
     googleClientSecret,

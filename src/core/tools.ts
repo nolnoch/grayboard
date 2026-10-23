@@ -21,7 +21,7 @@ import {
 } from "./boards.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, formatAttachmentsMeta } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type ToolDef = {
   name: string;
@@ -287,7 +287,9 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
 export type ToolOutcome = { result: unknown; wake: string[] };
 
 // What only the mode knows. online: does this handle have a live session?
-export type ToolContext = { online?: (handle: string) => boolean };
+// attachmentLimits: the caps a post's files are bound under; a mode without
+// them can't post files.
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits };
 
 export function callBoardTool(
   db: Database,
@@ -317,7 +319,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, attachment_ids: attachmentIds(a.attachment_ids) },
+        { online: ctx.online, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
       );
       return {
         result: {

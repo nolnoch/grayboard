@@ -24,7 +24,7 @@ const open: (Client | WebSocket)[] = [];
 function serve(apiUrl: string): ReturnType<typeof startServer> {
   return startServer(
     {
-      dbPath: ":memory:",
+      dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
       httpPort: 0,
       googleClientId: "dev",
       googleClientSecret: "",

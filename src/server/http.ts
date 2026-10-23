@@ -11,9 +11,6 @@ import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from ".
 import { CoreError, TooLargeError, forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
-import {
-  attachmentData, attachmentLimits,
-} from "../core/attachments.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
@@ -209,10 +206,10 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
   const label = `file ${sanitizeFilename(rawName)}`;
   try {
     // A declared length over the cap is refused before the body is read.
-    new SizeTally(attachmentLimits(db), 1).add(label, Number(req.headers.get("content-length") ?? "0"));
+    new SizeTally(repo.attachmentLimits, 1).add(label, Number(req.headers.get("content-length") ?? "0"));
     const data = new Uint8Array(await req.arrayBuffer());
-    new SizeTally(attachmentLimits(db), 1).add(label, data.length);
-    const row = storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
+    new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
+    const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
     return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
   } catch (e) {
     if (e instanceof TooLargeError) return jsonErr("too_large", e.message, 413);
@@ -223,7 +220,7 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
 
 // GET /api/attachments/<id>?identity=: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
-function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const row = readableAttachment(repo, db, handle, Number(idStr));
@@ -232,7 +229,7 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
     return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
   }
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
-  const data = new Uint8Array(attachmentData(db, row.sha256));
+  const data = new Uint8Array(await repo.blobs.get(row.sha256));
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
     headers: {
@@ -247,10 +244,10 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
 
 // DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
-function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const handle = ownIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const row = /^\d{1,15}$/.test(idStr) ? releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
+  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });
 }

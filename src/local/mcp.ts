@@ -9,7 +9,7 @@ import {
 
 import { CoreError, activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
-import { attachmentData, canReadAttachment, getAttachment, storeAttachment } from "../core/attachments.ts";
+import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
   BOARD_INSTRUCTIONS,
   announcementsInstruction,
@@ -22,6 +22,7 @@ import {
 } from "../core/tools.ts";
 import {
   ackMessage,
+  blobs,
   db,
   getCursor,
   getHistory,
@@ -35,11 +36,12 @@ import {
   undeliveredFrom,
   type Message,
   unreadFor,
+  withUploads,
 } from "./db.ts";
 import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, formatAttachmentsMeta, localBusDir, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, formatAttachmentsMeta, localBusDir, readAttachmentFiles, saveAttachment } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -271,7 +273,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, files);
+    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     const delivered = await poke(recipient);
     if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
@@ -333,6 +335,7 @@ async function dispatch(name: string, a: Record<string, any>) {
     if (!retractMessage(IDENTITY, m.id)) {
       return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
     }
+    await sweepBlobs(db, blobs);
     return text("ok");
   }
 
@@ -341,19 +344,22 @@ async function dispatch(name: string, a: Record<string, any>) {
     if (!row || !canReadAttachment(db, IDENTITY, row, (id) => mine(getMessage(id)))) {
       return { ...text(`error: no attachment ${a.id} on a message or post you can read`), isError: true };
     }
-    const path = await saveAttachment(row, attachmentData(db, row.sha256), a.dir, ROOTS, BUS_DIR);
+    const path = await saveAttachment(row, await blobs.get(row.sha256), a.dir, ROOTS, BUS_DIR);
     return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
   }
 
   if (isBoardTool(name)) {
     // Only a human can start an announcement, which reaches the sessions live now.
-    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {};
+    const ctx = {
+      ...(name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {}),
+      attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+    };
     const { attachments: paths, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
-    // Stored and bound in the post's transaction: a refused post leaves no upload.
-    const { result, wake } = db.transaction(() =>
-      callBoardTool(db, IDENTITY, name, files.length ? { ...args, attachment_ids: files.map((f) => storeAttachment(db, IDENTITY, f).id) } : args, ctx),
-    ).immediate();
+    // Bound in the post's transaction; a refused post releases the uploads.
+    const { result, wake } = await withUploads(IDENTITY, files, (ids) =>
+      db.transaction(() => callBoardTool(db, IDENTITY, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
+    );
     await wakeAll(wake);
     return text(result);
   }

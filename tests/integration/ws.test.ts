@@ -3,13 +3,16 @@
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { startServer } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
 import type { ServerMessage } from "../../src/shared/protocol.ts";
 
 const config = (overrides: Partial<Config> = {}): Config => ({
-  dbPath: ":memory:",
+  dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
   httpPort: 0,
   googleClientId: "dev",
   googleClientSecret: "",

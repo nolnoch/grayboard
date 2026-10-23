@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
-import type { AttachmentInfo } from "../shared/attachments.ts";
+import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
@@ -370,9 +370,13 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
-// sessions' instructions. attachment_ids: the poster's unbound uploads to
-// carry, bound in the post's transaction.
-export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number; attachment_ids?: number[] };
+// sessions' instructions. attachments: the poster's unbound uploads to
+// carry, bound in the post's transaction under the mode's size caps.
+export type PostOpts = {
+  online?: (handle: string) => boolean;
+  ttl_ms?: number;
+  attachments?: { ids: number[]; limits?: AttachmentLimits };
+};
 
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
@@ -409,6 +413,8 @@ export function post(
   if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
   }
+  const files = opts.attachments ?? { ids: [] };
+  if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
 
   return db.transaction((): PostResult => {
     const now = Date.now();
@@ -418,7 +424,7 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
-    const attachments = bindAttachments(db, opts.attachment_ids ?? [], handle, { post_id: p.id });
+    const attachments = files.limits ? bindAttachments(db, files.ids, handle, { post_id: p.id }, files.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };

@@ -594,7 +594,7 @@ test("attachments: sent with a DM or post, shown on reads and pushes, fetched by
   const { Database } = await import("bun:sqlite");
   const db = new Database(join(dir, "bus.db"));
   const count = () => (db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get() as { n: number }).n;
-  // The refused post's upload rolled back with it; the blob is shared by content.
+  // The refused post released its upload; the blob is shared by content.
   expect(count()).toBe(3);
   expect((db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs`).get() as { n: number }).n).toBe(2);
 

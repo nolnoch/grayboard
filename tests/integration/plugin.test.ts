@@ -23,7 +23,7 @@ const open: Client[] = [];
 beforeEach(() => {
   app = startServer(
     {
-      dbPath: ":memory:",
+      dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
       httpPort: 0,
       googleClientId: "dev",
       googleClientSecret: "",
@@ -365,7 +365,7 @@ test("the plugin checks files against the server's limits from hello_ok before u
   app.stop();
   app = startServer(
     {
-      dbPath: ":memory:", httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com",
+      dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com",
       publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [],
       attachmentLimits: { file: 5, total: 10 },
     },

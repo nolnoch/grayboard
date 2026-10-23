@@ -92,12 +92,13 @@ export function initCoreSchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
 
-    -- File attachments (src/core/attachments.ts). Bytes are stored once per
-    -- content hash; a blob goes when the last attachment naming it does.
+    -- File attachments (src/core/attachments.ts). The catalog of stored
+    -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
+    -- blob goes when the last attachment naming it does.
     CREATE TABLE IF NOT EXISTS attachment_blobs (
-      sha256  TEXT PRIMARY KEY,
-      data    BLOB NOT NULL,
-      size    INTEGER NOT NULL
+      sha256      TEXT PRIMARY KEY,
+      size        INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL
     );
 
     -- One per file attached. Unbound (both targets null) from upload until

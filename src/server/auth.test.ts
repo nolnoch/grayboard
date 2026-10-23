@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { hashToken, mintToken, verifySessionToken } from "./auth.ts";
 import { openDatabase, type Repo } from "./db.ts";
 
@@ -25,7 +28,7 @@ describe("verifySessionToken", () => {
   let repo: Repo;
 
   beforeEach(() => {
-    const { repo: r } = openDatabase(":memory:");
+    const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
     repo = r;
   });
 

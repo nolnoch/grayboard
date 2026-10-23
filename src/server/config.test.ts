@@ -4,7 +4,7 @@ import { loadConfig } from "./config.ts";
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
-  "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES",
+  "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_BLOB_DIR",
 ];
 
 describe("loadConfig", () => {
@@ -40,6 +40,14 @@ describe("loadConfig", () => {
     expect(loadConfig().admins).toEqual([]);
     process.env.GRAYBOARD_ADMINS = " Alice@Example.com, bob@example.com ,,";
     expect(loadConfig().admins).toEqual(["alice@example.com", "bob@example.com"]);
+  });
+
+  test("attachment bytes go in blobs/ beside the database unless GRAYBOARD_BLOB_DIR says otherwise", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_DB_PATH = "/var/lib/grayboard/bus.db";
+    expect(loadConfig().blobDir).toBe("/var/lib/grayboard/blobs");
+    process.env.GRAYBOARD_BLOB_DIR = "/srv/blobs";
+    expect(loadConfig().blobDir).toBe("/srv/blobs");
   });
 
   test("attachment limits default to local mode's; set, they must be byte counts with the file cap within the total", () => {

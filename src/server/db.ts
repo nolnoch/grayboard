@@ -3,11 +3,12 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
-import { bindAttachments, dropAttachments, withAttachments } from "../core/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
-import type { AttachmentInfo } from "../shared/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { DiskBlobs } from "./blobs.ts";
 
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
@@ -104,9 +105,15 @@ export interface Repo {
     setProgress(userId: number, ref: string, progress: unknown): void;
     clearProgress(userId: number, ref: string): void;
   };
+  // Attachment bytes, by sha256; the attachment rows are metadata in this database.
+  blobs: BlobStore;
+  // The server's per-file and per-message caps; insert binds files under them.
+  attachmentLimits: AttachmentLimits;
 }
 
-export function openDatabase(path: string, humanReach: HumanReach = "team"): { db: Database; repo: Repo } {
+export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits };
+
+export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.exec(
@@ -114,8 +121,8 @@ export function openDatabase(path: string, humanReach: HumanReach = "team"): { d
   );
   initSchema(db);
   initCoreSchema(db);
-  const repo = makeRepo(db);
-  setAccess(db, serverAccess(repo, humanReach));
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS);
+  setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
   return { db, repo };
 }
 
@@ -236,7 +243,7 @@ function initSchema(db: Database): void {
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
 }
 
-function makeRepo(db: Database): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   return {
     users: {
@@ -365,7 +372,7 @@ function makeRepo(db: Database): Repo {
             `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
              VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           ).get(sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
-          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id });
+          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
@@ -604,5 +611,8 @@ function makeRepo(db: Database): Repo {
         db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
       },
     },
+
+    blobs,
+    attachmentLimits,
   };
 }

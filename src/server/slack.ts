@@ -10,7 +10,6 @@
 // app gets linked.
 import { randomInt } from "node:crypto";
 
-import { attachmentData, attachmentLimits } from "../core/attachments.ts";
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
 import { boardNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -320,7 +319,7 @@ export class SlackBridge implements SlackLinker {
           writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
           throw new Error(`no attachment ${id} on a message or post you can read`);
         }
-        return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: attachmentData(db, row.sha256) };
+        return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };
       },
       // Files the relay checked (checkFile), stored as the HTTP upload route
       // stores them; released again if the send doesn't carry them.
@@ -328,12 +327,12 @@ export class SlackBridge implements SlackLinker {
         const ids: number[] = [];
         let sent = false;
         try {
-          for (const f of files) ids.push(storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file }).id);
+          for (const f of files) ids.push((await storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file })).id);
           const r = await send({ attachment_ids: ids });
           sent = (r as { ok?: boolean }).ok !== false;
           return r;
         } finally {
-          if (!sent) for (const id of ids) releaseStored(repo, db, link.email, handle, id, { via: "slack" });
+          if (!sent) for (const id of ids) await releaseStored(repo, db, link.email, handle, id, { via: "slack" });
         }
       },
     };
@@ -351,7 +350,7 @@ export class SlackBridge implements SlackLinker {
       },
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
-      attachmentLimits: attachmentLimits(db),
+      attachmentLimits: repo.attachmentLimits,
       onFileSent: (f) =>
         writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
