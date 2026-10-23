@@ -61,6 +61,8 @@ async function healthz(repo: Repo): Promise<Response> {
     // The version lets a deploy check tell a restarted server from a stale one.
     return json({ ok: true, version: pkg.version });
   } catch (e) {
+    // A deploy check that sees this 503 needs the cause in the journal.
+    console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
     return jsonErr("internal", "db not reachable", 503);
   }
 }

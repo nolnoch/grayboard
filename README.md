@@ -459,7 +459,7 @@ curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh 
 curl -s https://grayboard.example.com/healthz   # "version" is the new release
 ```
 
-The installer restarts the running `grayboard` service, and fails if it doesn't come back. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. If `/healthz` still shows the old version, the old process is still running.
+The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. The `curl` above repeats the check through Caddy.
 
 ### Per-developer setup (one-time)
 

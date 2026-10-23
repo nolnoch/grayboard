@@ -5,11 +5,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
+import pkg from "../../package.json" with { type: "json" };
 import { startServer } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
 import type { ServerMessage } from "../../src/shared/protocol.ts";
+
+const SERVER = resolve(import.meta.dir, "../../src/server/main.ts");
 
 const config = (overrides: Partial<Config> = {}): Config => ({
   dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
@@ -967,11 +970,10 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
 });
 
 test("the server reports its version: /healthz and --version", async () => {
-  const pkg = (await import("../../package.json", { with: { type: "json" } })).default;
   const r = await fetch(`${base}/healthz`);
   expect(await r.json()).toEqual({ ok: true, version: pkg.version });
   // --version answers before the config is loaded, so it needs no server env.
-  const p = Bun.spawnSync([process.execPath, `${import.meta.dir}/../../src/server/main.ts`, "--version"], { env: { PATH: process.env.PATH ?? "" } });
+  const p = Bun.spawnSync([process.execPath, SERVER, "--version"], { env: { PATH: process.env.PATH ?? "" } });
   expect(p.exitCode).toBe(0);
   expect(p.stdout.toString().trim()).toBe(pkg.version);
 });
