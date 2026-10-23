@@ -965,3 +965,13 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
     { actor: "alice@example.com", identity: "alice@example.com/be", filename: "c.txt", size: 30, reason: over.body.message },
   ]);
 });
+
+test("the server reports its version: /healthz and --version", async () => {
+  const pkg = (await import("../../package.json", { with: { type: "json" } })).default;
+  const r = await fetch(`${base}/healthz`);
+  expect(await r.json()).toEqual({ ok: true, version: pkg.version });
+  // --version answers before the config is loaded, so it needs no server env.
+  const p = Bun.spawnSync([process.execPath, `${import.meta.dir}/../../src/server/main.ts`, "--version"], { env: { PATH: process.env.PATH ?? "" } });
+  expect(p.exitCode).toBe(0);
+  expect(p.stdout.toString().trim()).toBe(pkg.version);
+});

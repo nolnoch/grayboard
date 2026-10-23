@@ -8,7 +8,7 @@
 # Server install (one-deployment-per-org):
 #   curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
 #     | INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-#   → also installs `grayboard-server`
+#   → also installs `grayboard-server`, and restarts the grayboard service if it's running
 #
 # Overrides:
 #   GRAYBOARD_VERSION=v1.0.0   pin a release (default: latest)
@@ -92,7 +92,11 @@ echo
 echo "grayboard installed to ${INSTALL_DIR}"
 echo
 
-if [ "$INSTALL_SERVER" = "1" ]; then
+if [ "$INSTALL_SERVER" = "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet grayboard; then
+  # An upgrade: the running process still holds the old binary until restarted.
+  { systemctl restart grayboard && systemctl is-active --quiet grayboard; } || { echo "grayboard: the service didn't come back; see journalctl -u grayboard" >&2; exit 1; }
+  echo "Restarted the grayboard service; /healthz reports the version it runs."
+elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed. Next:"
   echo "  1. Create /etc/grayboard/env with GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL,"
   echo "     GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET"

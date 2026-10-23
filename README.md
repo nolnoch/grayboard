@@ -361,14 +361,14 @@ GRAYBOARD_DEV_AUTH=1
 sudo systemctl daemon-reload
 sudo systemctl enable --now grayboard
 sudo systemctl restart caddy
-journalctl -u grayboard -n 20 --no-pager     # "grayboard server listening on port 8080"
-curl -s localhost:8080/healthz               # {"ok":true}
+journalctl -u grayboard -n 20 --no-pager     # "grayboard server <version> listening on port 8080"
+curl -s localhost:8080/healthz               # {"ok":true,"version":"<version>"}
 ```
 
 From your laptop:
 
 ```bash
-curl -s https://grayboard.example.com/healthz           # {"ok":true}
+curl -s https://grayboard.example.com/healthz           # {"ok":true,"version":"<version>"}
 curl -s https://grayboard.example.com/api/auth/config   # {"google_client_id":"dev","org_domain":"example.com"}
 ```
 
@@ -456,10 +456,10 @@ Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. I
 ```bash
 curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
   | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-sudo systemctl restart grayboard
+curl -s https://grayboard.example.com/healthz   # "version" is the new release
 ```
 
-To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds.
+The installer restarts the running `grayboard` service, and fails if it doesn't come back. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. If `/healthz` still shows the old version, the old process is still running.
 
 ### Per-developer setup (one-time)
 

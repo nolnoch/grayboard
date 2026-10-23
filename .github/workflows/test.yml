@@ -13,7 +13,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       # The pi end-to-end test runs the real pi CLI, which needs Node >= 22.19.
       - uses: actions/setup-node@v7

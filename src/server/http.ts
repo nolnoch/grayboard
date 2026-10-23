@@ -1,3 +1,4 @@
+import pkg from "../../package.json" with { type: "json" };
 import type { Repo, Team } from "./db.ts";
 import type { Config } from "./config.ts";
 import {
@@ -57,7 +58,8 @@ function makePrincipal(authed: AuthedUser): SendPrincipal {
 async function healthz(repo: Repo): Promise<Response> {
   try {
     repo.users.findByEmail("__healthz__");
-    return json({ ok: true });
+    // The version lets a deploy check tell a restarted server from a stale one.
+    return json({ ok: true, version: pkg.version });
   } catch (e) {
     return jsonErr("internal", "db not reachable", 503);
   }
