@@ -102,6 +102,9 @@ export class Relay {
   private readonly retryMs: number;
   private readonly limits: AttachmentLimits;
   private readonly shareWaitMs: number;
+  // Slack → bus events, one at a time in arrival order: a reply reads its
+  // thread's last_id, which the message before it may still be sending.
+  private inbound: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly store: RelayStore,
@@ -383,9 +386,18 @@ export class Relay {
 
   // ── Slack → grayboard ──────────────────────────────────────────────────────
 
-  /** An events_api payload from Socket Mode. */
-  async onEvent(payload: Record<string, any>): Promise<void> {
-    if (payload.type !== "event_callback") return;
+  /**
+   * An events_api payload from Socket Mode, queued behind the ones before it.
+   * Settles when this one has been handled; never rejects.
+   */
+  onEvent(payload: Record<string, any>): Promise<void> {
+    const run = this.inbound.then(() => this.handle(payload)).catch((e) => this.log(`slack event failed: ${(e as Error).message}`));
+    this.inbound = run;
+    return run;
+  }
+
+  private async handle(payload: Record<string, any>): Promise<void> {
+    if (this.stopped || payload.type !== "event_callback") return;
     const e = payload.event as Record<string, any> | undefined;
     if (!e || e.type !== "message") return;
     // Only the owner, only this channel, only new messages, with or without

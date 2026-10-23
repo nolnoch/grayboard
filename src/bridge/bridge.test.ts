@@ -403,6 +403,38 @@ test("slack: posting to a missing board lists the boards and how to make it", as
   r.close();
 });
 
+test("slack: a reply sent while the one before it is still sending threads under it", async () => {
+  const posts: Record<string, unknown>[] = [];
+  let release!: () => void;
+  const slow = new Promise<void>((r) => (release = r));
+  let next = 6;
+  const bus: Bus = {
+    call: async (name, args) => {
+      if (name !== "board_post") return { ok: true, value: {} };
+      posts.push(args);
+      if (posts.length === 1) await slow; // the first reply's files are still downloading
+      return { ok: true, value: { post_id: next++, board: "ops" } };
+    },
+    ...noFiles,
+  };
+  const store = new Store(join(dir, "b.db"));
+  store.addThread({ thread_ts: "1.0", kind: "board", board: "ops", root_id: 5, peer: null, last_id: 5 });
+  const f: Fetch = async () => Response.json({ ok: true, ts: "9.0" });
+  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: () => {} });
+  const reply = (text: string, ts: string) => relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text, ts, thread_ts: "1.0" } });
+  const a = reply("here's the screen", "2.0");
+  const b = reply("fix the button in it", "3.0");
+  await Bun.sleep(20);
+  expect(posts.length).toBe(1); // the second waits for the first
+  release();
+  await Promise.all([a, b]);
+  expect(posts.map((p) => [p.body, p.parent_id])).toEqual([
+    ["here's the screen", 5],
+    ["fix the button in it", 6],
+  ]);
+  store.close();
+});
+
 // ── socket ───────────────────────────────────────────────────────────────────
 
 // A WebSocket server that completes the handshake, says hello, and then goes
@@ -474,6 +506,33 @@ test("socket: Slack's pings are fine with debug logging off", async () => {
   sm.stop();
   server.stop(true);
   expect(events).toBe(1);
+});
+
+test("socket: an envelope is acked before its handler settles, and handlers start in arrival order", async () => {
+  const acked: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req, srv) => (srv.upgrade(req) ? undefined : new Response("no")),
+    websocket: {
+      open(ws) {
+        ws.send(JSON.stringify({ type: "hello" }));
+        for (const n of [1, 2]) ws.send(JSON.stringify({ type: "events_api", envelope_id: `e${n}`, payload: { event_id: `Ev${n}` } }));
+      },
+      message(_ws, m) {
+        acked.push(JSON.parse(String(m)).envelope_id);
+      },
+    },
+  });
+  const started: string[] = [];
+  // A handler that never settles, like a download slower than Slack's 3 s window.
+  const sm = new SocketMode({ open: async () => `ws://localhost:${server.port}/`, onEvent: (p) => (started.push(p.event_id), new Promise(() => {})), onFatal: () => {} });
+  await sm.start();
+  const end = Date.now() + 2000;
+  while (acked.length < 2 && Date.now() < end) await Bun.sleep(10);
+  sm.stop();
+  server.stop(true);
+  expect(acked).toEqual(["e1", "e2"]);
+  expect(started).toEqual(["Ev1", "Ev2"]);
 });
 
 test("socket: link_disabled is fatal; a bad app token is fatal", async () => {
