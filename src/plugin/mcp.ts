@@ -308,6 +308,7 @@ async function call(name: string, a: Record<string, unknown>) {
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
+    if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
     // The HTTP API (attachments) refused the token, as a WS hello would have.
     if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
     // Server errors arrive as "code: message"; show them to the agent.
@@ -336,28 +337,45 @@ async function withUploads<T>(paths: unknown, send: (ids: number[]) => Promise<T
   const files = await readAttachmentFiles(paths, ROOTS, { limits: attachmentLimits() });
   client.assertConnected();
   const ids: number[] = [];
+  let sent = false;
   try {
     for (const f of files) {
       const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(f.filename)}`;
       ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
     }
+    sent = true;
     return await send(ids);
   } catch (e) {
-    await releaseUploads(ids);
+    const bound = await releaseUploads(ids);
+    // A send binds all its files in one transaction or none: if every one is
+    // bound, the send landed and only its answer was lost.
+    if (sent && ids.length && bound === ids.length) throw new SendLanded(ids, e as Error);
     throw e;
   }
 }
 
-// Releases uploads a failed send left unbound. One the server says no longer
-// is unsent was bound after all (the answer was lost, not the send).
-async function releaseUploads(ids: number[]): Promise<void> {
+// Releases uploads a failed send left unbound. Returns how many the server
+// says are no longer unsent: bound after all (the answer was lost, not the send).
+async function releaseUploads(ids: number[]): Promise<number> {
+  let bound = 0;
   for (const id of ids) {
     try {
       await api().del(`/api/attachments/${id}?identity=${encodeURIComponent(identity)}`);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 404) continue;
+      if (e instanceof ApiError && e.status === 404) {
+        bound++;
+        continue;
+      }
       console.error(`[grayboard] couldn't release upload ${id} (it expires in an hour): ${(e as Error).message}`);
     }
+  }
+  return bound;
+}
+
+// A send whose answer was lost, though the server bound its attachments.
+class SendLanded extends Error {
+  constructor(readonly attachments: number[], cause: Error) {
+    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. Don't send it again; dm_history or board_read shows it.`);
   }
 }
 

@@ -362,6 +362,35 @@ test("a send the server refuses releases its uploads, so they don't hold the use
   ]);
 }, 20_000);
 
+test("a send whose answer is lost, though its files were bound, reports it landed instead of failing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-attach-"));
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  // The server's answer to a send or a board_post never arrives: the connection drops instead.
+  let lose = false;
+  const p = proxy(() => undefined, (frame) => {
+    const msg = JSON.parse(frame) as { type: string };
+    if (!lose || (msg.type !== "send_ok" && msg.type !== "call_ok")) return frame;
+    setTimeout(() => p.drop(), 0);
+    return JSON.stringify({ ...msg, req_id: "lost" });
+  });
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    lose = true;
+    const dm = await be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] });
+    const row = app.db.query("SELECT id, message_id FROM attachments").get() as { id: number; message_id: number };
+    expect(dm).toEqual({
+      sent: true,
+      attachment_ids: [row.id],
+      note: `sent, but the server's answer was lost (connection to the grayboard server was lost); its attachments (${row.id}) are bound to it. Don't send it again; dm_history or board_read shows it.`,
+    });
+    // The bound upload wasn't released, and the message carries it.
+    expect(row.message_id).toBeNumber();
+    expect(app.db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  } finally {
+    p.stop(true);
+  }
+}, 20_000);
+
 test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {
   app.stop();
   app = startServer(
