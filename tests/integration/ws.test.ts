@@ -3,136 +3,41 @@
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { chmodSync, rmSync } from "node:fs";
+import { join } from "node:path";
 
 import pkg from "../../package.json" with { type: "json" };
-import { startServer } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
-import type { ServerMessage } from "../../src/shared/protocol.ts";
+import { ROOT } from "../support/paths.ts";
+import { TestServer } from "../support/server.ts";
+import type { Any, WsClient, WsClientOptions } from "../support/ws_client.ts";
 
-const SERVER = resolve(import.meta.dir, "../../src/server/main.ts");
+const SERVER = join(ROOT, "src/server/main.ts");
 
-const config = (overrides: Partial<Config> = {}): Config => ({
-  dbPath: ":memory:", blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")),
-  httpPort: 0,
-  googleClientId: "dev",
-  googleClientSecret: "",
-  orgDomain: "example.com",
-  publicUrl: "http://localhost",
-  messageRetentionDays: 90,
-  auditRetentionDays: 90,
-  devAuth: true,
-  admins: [],
-  ...overrides,
-});
+// Each test's server, with a short probe so heartbeat tests run fast.
+const start = (overrides: Partial<Config> = {}) => new TestServer(overrides, { probeMs: 150 });
+let srv: TestServer;
 
-let app: ReturnType<typeof startServer>;
-let base: string;
-const open: Client[] = [];
+// A test that needs other config replaces the server.
+const restart = (overrides: Partial<Config> = {}) => {
+  srv.stop();
+  srv = start(overrides);
+};
 
 beforeEach(() => {
-  app = startServer(config(), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  srv = start();
 });
 
-afterEach(() => {
-  for (const c of open.splice(0)) c.close();
-  app.stop();
-});
+afterEach(() => srv.stop());
 
-async function login(email: string): Promise<string> {
-  const r = await fetch(`${base}/api/auth/dev-login`, {
-    method: "POST",
-    body: JSON.stringify({ email }),
-  });
-  return ((await r.json()) as { session_token: string }).session_token;
-}
-
-async function api(token: string, method: string, path: string, body?: unknown) {
-  const r = await fetch(`${base}${path}`, {
-    method,
-    headers: { Authorization: `Bearer ${token}` },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  return { status: r.status, body: await r.json() };
-}
-
-type Any = ServerMessage & Record<string, any>;
-
-class Client {
-  ws!: WebSocket;
-  inbox: Any[] = [];
-  private waiters: { pred: (m: Any) => boolean; resolve: (m: Any) => void }[] = [];
-  private n = 0;
-
-  constructor(
-    private token: string,
-    private identity: string,
-    private opts: { pong?: boolean; push?: boolean; hello?: Record<string, unknown> } = {},
-  ) {}
-
-  // Resolves with hello_ok, or the error that refused the hello.
-  connect(): Promise<Any> {
-    this.ws = new (WebSocket as any)(`${base.replace("http", "ws")}/ws`, {
-      headers: { Authorization: `Bearer ${this.token}` },
-    });
-    open.push(this);
-    this.ws.onmessage = (e) => {
-      const m = JSON.parse(e.data as string) as Any;
-      if (m.type === "ping" && this.opts.pong !== false) this.ws.send(JSON.stringify({ type: "pong" }));
-      const i = this.waiters.findIndex((w) => w.pred(m));
-      if (i >= 0) this.waiters.splice(i, 1)[0]!.resolve(m);
-      else this.inbox.push(m);
-    };
-    this.ws.onopen = () =>
-      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello }));
-    return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
-  }
-
-  next(pred: (m: Any) => boolean, ms = 1000): Promise<Any> {
-    const i = this.inbox.findIndex(pred);
-    if (i >= 0) return Promise.resolve(this.inbox.splice(i, 1)[0]!);
-    return new Promise((resolve, reject) => {
-      const w = { pred, resolve };
-      this.waiters.push(w);
-      setTimeout(() => {
-        const j = this.waiters.indexOf(w);
-        if (j >= 0) {
-          this.waiters.splice(j, 1);
-          reject(new Error(`${this.identity}: timed out waiting`));
-        }
-      }, ms);
-    });
-  }
-
-  // Nothing matching arrives within ms.
-  async none(pred: (m: Any) => boolean, ms = 150): Promise<void> {
-    await Bun.sleep(ms);
-    expect(this.inbox.filter(pred)).toEqual([]);
-  }
-
-  async request(msg: Record<string, unknown>): Promise<Any> {
-    const req_id = `r${++this.n}`;
-    this.ws.send(JSON.stringify({ ...msg, req_id }));
-    return this.next((m) => m.req_id === req_id);
-  }
-
-  async call(tool: string, args: Record<string, unknown> = {}): Promise<Any> {
-    return this.request({ type: "call", tool, args });
-  }
-
-  close() {
-    try {
-      this.ws.close();
-    } catch {}
-  }
-}
+const login = (email: string) => srv.login(email);
+const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
+const upload = (token: string, identity: string, filename: string, data: Uint8Array | string) => srv.upload(token, identity, filename, data);
+const client = (token: string, identity: string, opts?: WsClientOptions) => srv.client(token, identity, opts);
 
 const boardPush = (m: Any) => m.type === "board_push";
 
-async function closeAndSettle(c: Client) {
+async function closeAndSettle(c: WsClient) {
   c.close();
   await Bun.sleep(50);
 }
@@ -145,9 +50,9 @@ test("team board: members see it and get pushes; non-members can't see or be men
   expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
 
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
-  const c = new Client(carol, "sim");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
+  const c = client(carol, "sim");
   for (const x of [a, b, c]) expect((await x.connect()).type).toBe("hello_ok");
 
   const posted = await a.call("board_post", { board: "eng", body: "@sim @bob/fe secret plan" });
@@ -177,10 +82,10 @@ test("who: live connections are online; a closed one is offline with last_seen; 
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
 
-  const a = new Client(alice, "be");
-  const a2 = new Client(alice, "be-stream");
-  const b = new Client(bob, "fe");
-  const c = new Client(carol, "sim");
+  const a = client(alice, "be");
+  const a2 = client(alice, "be-stream");
+  const b = client(bob, "fe");
+  const c = client(carol, "sim");
   for (const x of [a, a2, b, c]) expect((await x.connect()).type).toBe("hello_ok");
 
   const online = await c.call("peer_list");
@@ -213,8 +118,8 @@ test("who: live connections are online; a closed one is offline with last_seen; 
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
   const alice = await login("alice@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
-  const a = new Client(alice, "be");
-  const s = new Client(alice, "sim");
+  const a = client(alice, "be");
+  const s = client(alice, "sim");
   await a.connect();
   await s.connect();
 
@@ -222,7 +127,7 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   const first = await s.next(boardPush);
   await closeAndSettle(s);
 
-  const s2 = new Client(alice, "sim");
+  const s2 = client(alice, "sim");
   await s2.connect();
   const again = await s2.next(boardPush);
   expect(again.item.post.id).toBe(first.item.post.id);
@@ -230,7 +135,7 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   expect((await s2.request({ type: "board_ack", refs })).type).toBe("ack_ok");
   await closeAndSettle(s2);
 
-  const s3 = new Client(alice, "sim");
+  const s3 = client(alice, "sim");
   await s3.connect();
   await s3.none(boardPush);
 });
@@ -238,22 +143,22 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
 test("peer_list shows where the client says it runs; a resumed hello keeps the status, a new session clears it", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const watcher = new Client(bob, "fe");
+  const watcher = client(bob, "fe");
   await watcher.connect();
   const be = async () => (await watcher.call("peer_list", { include_offline: true })).result.peers.find((p: any) => p.handle === "alice@example.com/be");
 
-  const first = new Client(alice, "be", { hello: { where: "api worktree stream \n on stream" } });
+  const first = client(alice, "be", { hello: { where: "api worktree stream \n on stream" } });
   await first.connect();
   await first.call("peer_status", { text: "soaking" });
   expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
 
   await closeAndSettle(first);
-  const resumed = new Client(alice, "be", { hello: { where: "api worktree stream on main", resume: true } });
+  const resumed = client(alice, "be", { hello: { where: "api worktree stream on main", resume: true } });
   await resumed.connect();
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
   await closeAndSettle(resumed);
-  await new Client(alice, "be").connect();
+  await client(alice, "be").connect();
   const fresh = await be();
   expect(fresh.where).toBeUndefined();
   expect(fresh.status).toBeUndefined();
@@ -264,8 +169,8 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
-  const a = new Client(alice, "be");
-  const c = new Client(carol, "sim");
+  const a = client(alice, "be");
+  const c = client(carol, "sim");
   await a.connect();
   await c.connect();
 
@@ -277,7 +182,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   await a.call("board_post", { board: "eng", body: "standup in 5" });
   await c.none(boardPush);
   await closeAndSettle(c);
-  const c2 = new Client(carol, "sim");
+  const c2 = client(carol, "sim");
   await c2.connect();
   const digest = await c2.next(boardPush);
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
@@ -290,7 +195,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   expect(r.result.posts.map((p: any) => p.body)).toEqual(["standup in 5", "make that 10"]);
 
   const bob = await login("bob@example.com");
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
   expect(await b.call("board_post", { board: "eng", body: "hi" })).toMatchObject({
     type: "error",
@@ -303,14 +208,14 @@ test("leaving a team drops its board and pending pushes", async () => {
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
   // carol is offline when mentioned, then leaves before connecting.
   await api(carol, "POST", "/api/identities", { name: "sim" });
   await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
   await api(carol, "POST", "/api/teams/eng/leave");
 
-  const c = new Client(carol, "sim");
+  const c = client(carol, "sim");
   await c.connect();
   await c.none(boardPush);
   expect((await c.call("board_list")).result).toEqual([]);
@@ -321,13 +226,13 @@ test("removing a member drops their board and pending pushes", async () => {
   const carol = await login("carol@example.com");
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
   await api(carol, "POST", "/api/identities", { name: "sim" });
   await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
   expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "carol@example.com" })).status).toBe(200);
 
-  const c = new Client(carol, "sim");
+  const c = client(carol, "sim");
   await c.connect();
   await c.none(boardPush);
   expect((await c.call("board_list")).result).toEqual([]);
@@ -363,7 +268,7 @@ test("teams are invite-only: members add and remove; outsiders can't join, add, 
   expect((await api(carol, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(404);
   expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual([]);
 
-  const audit = app.db
+  const audit = srv.app.db
     .query("SELECT actor, action, detail FROM access_log WHERE action = 'team.member_removed'")
     .all();
   expect(audit).toEqual([{ actor: "carol@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com"}' }]);
@@ -375,9 +280,7 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   const none = await api(alice, "POST", "/api/admin/disable-user", { email: "bob@example.com" });
   expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("GRAYBOARD_ADMINS") } });
 
-  app.stop();
-  app = startServer(config({ admins: ["alice@example.com"] }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ admins: ["alice@example.com"] });
   const admin = await login("alice@example.com");
   const bob = await login("bob@example.com");
   for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session"]) {
@@ -388,9 +291,7 @@ test("admin routes: refused for non-admins and when no admins are configured", a
 });
 
 test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
-  app.stop();
-  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
   for (const all of [false, true, undefined]) {
     const laptop = await login("bob@example.com");
@@ -402,19 +303,17 @@ test("admin revoke-session signs a user out of every session, ignoring an old CL
 });
 
 test("revoking or disabling a user closes their open connections; the heartbeat catches a disable it missed", async () => {
-  app.stop();
-  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ admins: ["root@example.com"] });
   const [root, alice] = await Promise.all([login("root@example.com"), login("alice@example.com")]);
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
-  const closed = (c: Client) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
+  const closed = (c: WsClient) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
 
   for (const path of ["/api/admin/revoke-session", "/api/admin/disable-user"]) {
     await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
     const bob = await login("bob@example.com");
-    const live = new Client(bob, "be");
-    const tools = new Client(bob, "fe", { push: false });
+    const live = client(bob, "be");
+    const tools = client(bob, "fe", { push: false });
     await Promise.all([live.connect(), tools.connect()]);
     const gone = Promise.all([closed(live), closed(tools)]);
     expect((await api(root, "POST", path, { email: "bob@example.com" })).status).toBe(200);
@@ -425,19 +324,17 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
 
   // Disabled behind the server's back (no admin route): the next tick closes it.
   await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
-  const late = new Client(await login("bob@example.com"), "be");
+  const late = client(await login("bob@example.com"), "be");
   await late.connect();
   const gone = closed(late);
-  app.repo.users.setDisabled(app.repo.users.findByEmail("bob@example.com")!.id, true);
-  app.revalidate();
+  srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail("bob@example.com")!.id, true);
+  srv.app.revalidate();
   await gone;
   expect((await a.call("board_list")).type).toBe("call_ok");
 });
 
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
-  app.stop();
-  app = startServer(config({ admins: ["root@example.com"] }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -453,7 +350,7 @@ test("an admin can manage a team they're not in, e.g. after its last member left
   expect((await api(root, "GET", "/api/whoami")).body.teams).toEqual([]);
   expect((await api(root, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
 
-  const audit = app.db
+  const audit = srv.app.db
     .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
     .all();
   expect(audit).toEqual([
@@ -465,9 +362,9 @@ test("an admin can manage a team they're not in, e.g. after its last member left
 test("org boards are open to everyone; bare @name prefers the author's own identity", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const as = new Client(alice, "sim");
-  const bs = new Client(bob, "sim");
+  const a = client(alice, "be");
+  const as = client(alice, "sim");
+  const bs = client(bob, "sim");
   for (const x of [a, as, bs]) await x.connect();
 
   expect((await a.call("board_create", { name: "general", purpose: "Everyone" })).type).toBe("call_ok");
@@ -486,8 +383,8 @@ test("org boards are open to everyone; bare @name prefers the author's own ident
 test("claims are org-wide and atomic across users", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "be");
+  const a = client(alice, "be");
+  const b = client(bob, "be");
   await a.connect();
   await b.connect();
   expect((await a.call("claim_take", { key: "ticket:ENG-1", note: "on it" })).result.ok).toBe(true);
@@ -501,9 +398,9 @@ test("claims are org-wide and atomic across users", async () => {
 
 test("a live identity refuses a second connection", async () => {
   const alice = await login("alice@example.com");
-  const first = new Client(alice, "be");
+  const first = client(alice, "be");
   await first.connect();
-  const second = new Client(alice, "be");
+  const second = client(alice, "be");
   expect(await second.connect()).toMatchObject({ type: "error", code: "identity_in_use" });
   // The first connection still works.
   expect((await first.call("board_list")).type).toBe("call_ok");
@@ -511,28 +408,28 @@ test("a live identity refuses a second connection", async () => {
 
 test("a connection that doesn't answer the probe is replaced", async () => {
   const alice = await login("alice@example.com");
-  const stale = new Client(alice, "be", { pong: false });
+  const stale = client(alice, "be", { pong: false });
   await stale.connect();
-  const fresh = new Client(alice, "be");
+  const fresh = client(alice, "be");
   expect((await fresh.connect()).type).toBe("hello_ok");
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
 });
 
 test("a hello arriving while another probes the holder waits for it, so only one wins", async () => {
   const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
-  const dead = new Client(alice, "be", { pong: false });
+  const dead = client(alice, "be", { pong: false });
   await dead.connect();
-  const n1 = new Client(alice, "be");
+  const n1 = client(alice, "be");
   const first = n1.connect(); // probes the dead holder (150 ms)
   await Bun.sleep(40);
   dead.close(); // the holder goes away mid-probe
   await Bun.sleep(40);
-  const n2 = new Client(alice, "be");
+  const n2 = client(alice, "be");
   const [r1, r2] = await Promise.all([first, n2.connect()]);
   expect(r1.type).toBe("hello_ok");
   expect(r2).toMatchObject({ type: "error", code: "identity_in_use" });
 
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
   expect(await b.request({ type: "send", recipient: "alice@example.com/be", body: "who?" })).toMatchObject({ delivered_now: true });
   expect((await n1.next((m) => m.type === "push")).message.body).toBe("who?");
@@ -541,8 +438,8 @@ test("a hello arriving while another probes the holder waits for it, so only one
 test("direct messages still deliver live", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
   await a.connect();
   await b.connect();
   const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "hi" });
@@ -552,8 +449,8 @@ test("direct messages still deliver live", async () => {
 
 test("a handler that throws answers the call with an internal error and keeps the socket", async () => {
   const alice = await login("alice@example.com");
-  const be = new Client(alice, "be");
-  const fe = new Client(alice, "fe");
+  const be = client(alice, "be");
+  const fe = client(alice, "fe");
   await Promise.all([be.connect(), fe.connect()]);
   await be.request({ type: "send", recipient: "fe", body: "hi" });
   const id = (await fe.next((m) => m.type === "push")).message.id;
@@ -564,17 +461,17 @@ test("a handler that throws answers the call with an internal error and keeps th
 });
 
 test("login refuses an email no direct address can carry", async () => {
-  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "o'brien@example.com" }) });
+  const r = await fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "o'brien@example.com" }) });
   expect(r.status).toBe(400);
 });
 
 test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
   const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
-  const a = new Client(alice, "be");
-  const a2 = new Client(alice, "be-stream");
-  const b = new Client(bob, "be-stream");
-  const b2 = new Client(bob, "fe");
-  const c = new Client(carol, "fe");
+  const a = client(alice, "be");
+  const a2 = client(alice, "be-stream");
+  const b = client(bob, "be-stream");
+  const b2 = client(bob, "fe");
+  const c = client(carol, "fe");
   await Promise.all([a, a2, b, b2, c].map((x) => x.connect()));
 
   // alice and bob both have be-stream: alice's bare name means her own.
@@ -592,8 +489,8 @@ test("a bare DM recipient is your own identity of that name, else the only one w
 
 test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
   const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
   await Promise.all([a.connect(), b.connect()]);
   for (const body of ["one", "two", "three"]) await a.request({ type: "send", recipient: "fe", body });
   expect(await a.request({ type: "send", recipient: "fe", body: "  " })).toMatchObject({ type: "error", code: "bad_request" });
@@ -610,10 +507,10 @@ test("dm_history: peer resolves like dm_send's recipient, oldest first, limit cl
 test("senders see what hasn't reached an offline peer", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
   await closeAndSettle(b);
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
   await a.request({ type: "send", recipient: "bob@example.com/fe", body: "one" });
   const sent = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "two" });
@@ -622,7 +519,7 @@ test("senders see what hasn't reached an offline peer", async () => {
     (await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.delivered);
   expect(await delivered()).toEqual([false, false]);
 
-  const b2 = new Client(bob, "fe");
+  const b2 = client(bob, "fe");
   await b2.connect();
   const ids = [(await b2.next((m) => m.type === "push")).message.id, (await b2.next((m) => m.type === "push")).message.id];
   await b2.request({ type: "ack", message_ids: ids });
@@ -632,25 +529,25 @@ test("senders see what hasn't reached an offline peer", async () => {
 test("dm_retract withdraws a queued message; one the recipient is holding or has acked stays", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
   await closeAndSettle(b);
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
   const fresh = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fresh" });
   expect(fresh.note).toMatch(/^Recipient offline/);
-  app.db.prepare("UPDATE handles SET last_seen = ? WHERE name = ?").run(Date.now() - 22 * 3_600_000, "bob@example.com/fe");
+  srv.app.db.prepare("UPDATE handles SET last_seen = ? WHERE name = ?").run(Date.now() - 22 * 3_600_000, "bob@example.com/fe");
   const wrong = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "wrong" });
   expect(wrong.note).toMatch(/^Queued: bob@example.com\/fe last seen 22h ago\. .*dm_retract/);
 
-  const other = new Client(bob, "sim");
+  const other = client(bob, "sim");
   await other.connect();
   expect(await other.request({ type: "dm_retract", message_id: wrong.message_id })).toMatchObject({ type: "error", code: "not_found" });
   expect(await a.request({ type: "dm_retract", message_id: wrong.message_id })).toMatchObject({ type: "ack_ok" });
   expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.body)).toEqual(["fresh"]);
 
   // Pushed but not acked: the cursor hasn't moved, but bob is live.
-  const b2 = new Client(bob, "fe");
+  const b2 = client(bob, "fe");
   await b2.connect();
   expect((await b2.next((m) => m.type === "push")).message.body).toBe("fresh");
   await b2.none((m) => m.type === "push");
@@ -661,29 +558,29 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
 test("hello_ok carries active claims and DMs undelivered after a day", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
   await closeAndSettle(b);
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   expect((await a.connect()).notices).toBeUndefined();
   await a.call("claim_take", { key: "ticket:ENG-2", note: "on it" });
   const old = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "stale" });
   await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fresh" });
-  app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
+  srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
   await closeAndSettle(a);
 
-  const notices: string[] = (await new Client(alice, "be").connect()).notices;
+  const notices: string[] = (await client(alice, "be").connect()).notices;
   expect(notices).toHaveLength(2);
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
-  expect((await new Client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
+  expect((await client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
   await a.connect();
   await b.connect();
   const q = await b.request({ type: "send", recipient: "alice@example.com/be", body: "question?" });
@@ -700,8 +597,8 @@ test("dm_inbox: replied and acked messages drop out; only the recipient can ack"
 test("a pending send is echoed, listed as promised until the sender's next message, and ackable by the sender", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
   await a.connect();
   await b.connect();
   const p = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "results by noon", pending: true });
@@ -728,9 +625,9 @@ test("a pending send is echoed, listed as promised until the sender's next messa
 
 test("only a message's sender and recipient can read its thread or reply to it", async () => {
   const [alice, bob, carol] = await Promise.all(["alice", "bob", "carol"].map((n) => login(`${n}@example.com`)));
-  const a = new Client(alice!, "be");
-  const b = new Client(bob!, "fe");
-  const c = new Client(carol!, "sim");
+  const a = client(alice!, "be");
+  const b = client(bob!, "fe");
+  const c = client(carol!, "sim");
   await Promise.all([a.connect(), b.connect(), c.connect()]);
   const root = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "private" });
   const reply = await b.request({ type: "send", recipient: "alice@example.com/be", body: "re", parent_id: root.message_id });
@@ -751,11 +648,11 @@ test("only a message's sender and recipient can read its thread or reply to it",
 test("a tools-only connection works beside the live owner without taking its pushes", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const owner = new Client(alice, "be");
+  const owner = client(alice, "be");
   await owner.connect();
-  const tools = new Client(alice, "be", { push: false });
+  const tools = client(alice, "be", { push: false });
   expect(await tools.connect()).toMatchObject({ type: "hello_ok" });
-  const b = new Client(bob, "fe");
+  const b = client(bob, "fe");
   await b.connect();
 
   const sent = await b.request({ type: "send", recipient: "alice@example.com/be", body: "hi" });
@@ -772,28 +669,19 @@ test("a tools-only connection works beside the live owner without taking its pus
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
-async function upload(token: string, identity: string, filename: string, data: Uint8Array | string) {
-  const r = await fetch(`${base}/api/attachments?identity=${identity}&filename=${encodeURIComponent(filename)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: data,
-  });
-  return { status: r.status, body: (await r.json()) as Record<string, any> };
-}
-
 const download = (token: string, identity: string, id: number) =>
-  fetch(`${base}/api/attachments/${id}?identity=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
+  fetch(`${srv.base}/api/attachments/${id}?identity=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
 const audits = (action: string) =>
-  (app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
+  (srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
 
 test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   const carol = await login("carol@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
-  const c = new Client(carol, "sim");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
+  const c = client(carol, "sim");
   for (const x of [a, b, c]) expect((await x.connect()).type).toBe("hello_ok");
 
   // An unknown identity is refused as `grayboard claim` refuses one.
@@ -846,14 +734,11 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
 });
 
 test("attachments: a failed blob read or write is audited; a swept blob is a 404, a fault a bare 500", async () => {
-  app.stop();
-  const blobDir = mkdtempSync(join(tmpdir(), "gb-blobs-"));
-  app = startServer(config({ blobDir }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  const { blobDir } = srv.config;
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  const a = new Client(alice, "be");
-  const b = new Client(bob, "fe");
+  const a = client(alice, "be");
+  const b = client(bob, "fe");
   for (const x of [a, b]) expect((await x.connect()).type).toBe("hello_ok");
 
   const up = await upload(alice, "be", "shot.png", PNG);
@@ -884,8 +769,8 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "carol@example.com" });
   await api(bob, "POST", "/api/identities", { name: "fe" });
-  const a = new Client(alice, "be");
-  const c = new Client(carol, "sim");
+  const a = client(alice, "be");
+  const c = client(carol, "sim");
   for (const x of [a, c]) expect((await x.connect()).type).toBe("hello_ok");
 
   const up = await upload(alice, "be", "plan.md", "# plan");
@@ -905,7 +790,7 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   expect(queued.delivered_now).toBe(false);
   expect((await a.request({ type: "dm_retract", message_id: queued.message_id })).type).toBe("ack_ok");
   expect((await download(alice, "be", note.body.id)).status).toBe(404);
-  expect(app.db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256)).toEqual({ n: 0 });
+  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256)).toEqual({ n: 0 });
 
   const big = new Uint8Array(10 * 1024 * 1024).fill(0x61);
   expect((await upload(alice, "be", "big.txt", new Uint8Array(big.length + 1).fill(0x61))).status).toBe(413);
@@ -921,11 +806,9 @@ test("attachments on a team board post follow the board; a retracted DM takes it
 });
 
 test("a server's own attachment limits: sent in hello_ok, enforced per file, per message and on unsent uploads", async () => {
-  app.stop();
-  app = startServer(config({ attachmentLimits: { file: 100, total: 150 } }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ attachmentLimits: { file: 100, total: 150 } });
   const alice = await login("alice@example.com");
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   expect((await a.connect()).attachment_limits).toEqual({ file: 100, total: 150 });
 
   expect((await upload(alice, "be", "big.txt", "x".repeat(101))).body.message).toBe("file big.txt: 101B exceeds the 100B limit per file");
@@ -942,11 +825,9 @@ test("a server's own attachment limits: sent in hello_ok, enforced per file, per
 });
 
 test("a user's stored attachments are capped, sent or not; an upload needs a length; refusals are audited", async () => {
-  app.stop();
-  app = startServer(config({ attachmentLimits: { file: 100, total: 150 }, attachmentUserQuota: 200 }), { probeMs: 150, background: false });
-  base = `http://localhost:${app.server.port}`;
+  restart({ attachmentLimits: { file: 100, total: 150 }, attachmentUserQuota: 200 });
   const alice = await login("alice@example.com");
-  const a = new Client(alice, "be");
+  const a = client(alice, "be");
   await a.connect();
   for (const n of ["a", "b"]) {
     const up = await upload(alice, "be", `${n}.txt`, n.repeat(90));
@@ -957,7 +838,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
   expect((await upload(alice, "be", "d.txt", "d".repeat(20))).status).toBe(201);
 
   // A streamed body declares no length.
-  const streamed = await fetch(`${base}/api/attachments?identity=be&filename=e.txt`, {
+  const streamed = await fetch(`${srv.base}/api/attachments?identity=be&filename=e.txt`, {
     method: "POST",
     headers: { Authorization: `Bearer ${alice}` },
     body: new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }),
@@ -970,7 +851,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
 });
 
 test("the server reports its version: /healthz and --version", async () => {
-  const r = await fetch(`${base}/healthz`);
+  const r = await fetch(`${srv.base}/healthz`);
   expect(await r.json()).toEqual({ ok: true, version: pkg.version });
   // --version answers before the config is loaded, so it needs no server env.
   const p = Bun.spawnSync([process.execPath, SERVER, "--version"], { env: { PATH: process.env.PATH ?? "" } });
