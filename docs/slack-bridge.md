@@ -113,7 +113,7 @@ One Slack app per server, inside `grayboard-server`, enabled by `SLACK_APP_TOKEN
 - That killing the child mid-run makes the bridge exit nonzero (`client.onclose`); no test covers it.
 - Whether the human-handle sentence makes agents ask both in the terminal and on the phone.
 
-Files, unverified against real Slack (the fake in `tests/integration/fake_slack.ts` encodes our reading of the docs): the `file_share` event's shape (whether it carries `url_private_download` or only the id).
+Files, unverified against real Slack: the live `message.im` event for an owner's upload. Measured in `conversations.history` instead: no `subtype` (not `file_share`), `upload: true`, and full file objects with `url_private_download` on `files.slack.com`, `mode: hosted`, `file_access: visible`. The filter takes either subtype, and `fetchFiles` takes full objects or bare ids (`files.info`), so either event shape works.
 
 Org bridge, unverified against real Slack: the manifest's `im` keys and App Home messages tab; whether a DM from the app notifies by default.
 
