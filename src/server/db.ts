@@ -98,6 +98,11 @@ export interface Repo {
     addThread(userId: number, t: SlackThread): void;
     // Moves a thread's reply target forward, never back.
     advanceThread(userId: number, threadTs: string, id: number): void;
+    // How far an outbound item got in Slack, keyed by its grayboard ref
+    // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
+    progress(userId: number, ref: string): unknown;
+    setProgress(userId: number, ref: string, progress: unknown): void;
+    clearProgress(userId: number, ref: string): void;
   };
 }
 
@@ -207,6 +212,15 @@ function initSchema(db: Database): void {
       last_id   INTEGER NOT NULL,
       PRIMARY KEY (user_id, thread_ts),
       UNIQUE (user_id, kind, board, root_id)
+    );
+    -- An outbound item partway into Slack (src/bridge/relay.ts Progress), so
+    -- a restart neither reposts it nor shares its files twice. The outbox
+    -- itself is the hub's unacked pushes.
+    CREATE TABLE IF NOT EXISTS slack_progress (
+      user_id   INTEGER NOT NULL REFERENCES users(id),
+      ref       TEXT NOT NULL,
+      progress  TEXT NOT NULL,
+      PRIMARY KEY (user_id, ref)
     );
 
     -- Received direct messages marked handled without a reply (dm_ack).
@@ -532,12 +546,14 @@ function makeRepo(db: Database): Repo {
       },
       link(userId, slackUser, dmChannel) {
         db.transaction(() => {
-          // Threads live in the old account's DM; a new account starts fresh.
-          db.run(
-            `DELETE FROM slack_threads WHERE user_id = ?
-               AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
-            [userId, userId, slackUser, dmChannel],
-          );
+          // Threads and progress live in the old account's DM; a new account starts fresh.
+          for (const table of ["slack_threads", "slack_progress"]) {
+            db.run(
+              `DELETE FROM ${table} WHERE user_id = ?
+                 AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
+              [userId, userId, slackUser, dmChannel],
+            );
+          }
           db.run(
             `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
@@ -548,6 +564,7 @@ function makeRepo(db: Database): Repo {
       unlink(userId) {
         db.transaction(() => {
           db.run("DELETE FROM slack_threads WHERE user_id = ?", [userId]);
+          db.run("DELETE FROM slack_progress WHERE user_id = ?", [userId]);
           db.run("DELETE FROM slack_links WHERE user_id = ?", [userId]);
         })();
       },
@@ -571,6 +588,20 @@ function makeRepo(db: Database): Repo {
       },
       advanceThread(userId, threadTs, id) {
         db.run("UPDATE slack_threads SET last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?", [id, userId, threadTs]);
+      },
+      progress(userId, ref) {
+        const r = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
+        return r ? JSON.parse(r.progress) : undefined;
+      },
+      setProgress(userId, ref, progress) {
+        db.run(
+          `INSERT INTO slack_progress (user_id, ref, progress) VALUES (?, ?, ?)
+           ON CONFLICT(user_id, ref) DO UPDATE SET progress = excluded.progress`,
+          [userId, ref, JSON.stringify(progress)],
+        );
+      },
+      clearProgress(userId, ref) {
+        db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
       },
     },
   };

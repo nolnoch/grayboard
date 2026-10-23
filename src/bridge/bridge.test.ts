@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError, loadConfig } from "./config.ts";
-import { Relay, format, fromSlack, type Bus } from "./relay.ts";
+import { Relay, format, fromSlack, type Bus, type RelayOptions } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
 import { Store } from "./store.ts";
 import { SlackError, SlackUnavailable, SlackWeb, type Fetch } from "./web.ts";
@@ -35,6 +35,11 @@ test("format leads with the handle, names the board on a new thread, and truncat
   const long = format("be", null, "x".repeat(20_000), 7);
   expect(long.length).toBeLessThan(12_000);
   expect(long).toEndWith("(truncated; the full text is grayboard message 7)");
+  // A note ends the message; the body gives way so the whole still fits.
+  expect(format("be", null, "x", 1, "⚠️ n")).toBe("**be** x\n\n⚠️ n");
+  const noted = format("be", null, "x".repeat(20_000), 7, "⚠️ " + "n".repeat(5_000));
+  expect(noted.length).toBeLessThan(12_000);
+  expect(noted).toContain("(truncated; the full text is grayboard message 7)\n\n⚠️ nnn");
 });
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -147,65 +152,154 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
   store.close();
 });
 
-// A bus holding attachment 7, and a Slack whose file methods answer `files`
-// (a status to fail with, or an error code), recording every call.
-function withAttachment(files: { upload?: number; complete?: string }) {
+// A bus holding attachment 7 that records what the relay sends back through
+// it, and a Slack whose file methods answer per `slack`, recording every call.
+// upload: a status getUploadURLExternal fails with once. complete: an error
+// code it refuses with, or a status it answers once after the share landed
+// (a lost answer). shares: how many files.info calls show no shares yet.
+function withAttachment(slack: { upload?: number; complete?: string | number; shares?: number } = {}) {
+  const told: Record<string, unknown>[] = [];
   const bus: Bus = {
-    call: async () => ({ ok: true, value: [] }),
+    call: async (name, args) => {
+      if (name === "dm_send") told.push(args);
+      return { ok: true, value: name === "dm_send" ? { message_id: 99 } : [] };
+    },
     attachment: async (id) => ({ id, filename: "shot.png", type: "image/png", size: 3, data: new Uint8Array([1, 2, 3]) }),
     withFiles: noFiles.withFiles,
   };
   const calls: string[] = [];
   const said: string[] = [];
+  const blocks: string[] = [];
+  let shared = false;
   const f: Fetch = async (url, init) => {
     const method = String(url).split("/").pop()!;
     calls.push(method);
-    if (method === "chat.postMessage") said.push(JSON.parse(String(init.body)).markdown_text);
-    if (method === "files.getUploadURLExternal" && files.upload) {
-      const status = files.upload;
-      delete files.upload;
+    if (method === "chat.postMessage") {
+      said.push(JSON.parse(String(init.body)).markdown_text);
+      return Response.json({ ok: true, ts: "5.0" });
+    }
+    if (method === "files.getUploadURLExternal" && slack.upload) {
+      const status = slack.upload;
+      delete slack.upload;
       return new Response("down", { status });
     }
     if (method === "files.getUploadURLExternal") return Response.json({ ok: true, file_id: "F1", upload_url: "http://slack.test/upload/F1" });
     if (method === "F1") return new Response("OK");
-    if (method === "files.completeUploadExternal" && files.complete) return Response.json({ ok: false, error: files.complete });
-    return Response.json({ ok: true, ts: "5.0" });
+    if (method === "files.completeUploadExternal") {
+      if (typeof slack.complete === "string") return Response.json({ ok: false, error: slack.complete });
+      shared = true;
+      blocks.push(JSON.parse(new URLSearchParams(String(init.body)).get("blocks")!)[0].text);
+      if (typeof slack.complete === "number") {
+        const status = slack.complete;
+        delete slack.complete;
+        return new Response("lost", { status });
+      }
+      return Response.json({ ok: true, files: [{ id: "F1", title: "shot.png" }] });
+    }
+    if (method === "files.info") {
+      const show = shared && !(slack.shares && slack.shares-- > 0);
+      return Response.json({ ok: true, file: { id: "F1", shares: show ? { private: { G1: [{ ts: "6.0" }] } } : {} } });
+    }
+    return Response.json({ ok: true });
   };
-  return { bus, calls, said, f };
+  return { bus, told, calls, said, blocks, f };
 }
 
-test("files: a retry after Slack was unavailable resends the files, not the text", async () => {
-  const { bus, calls, f } = withAttachment({ upload: 503 });
-  const store = new Store(join(dir, "b.db"));
+const LOOK = { content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } };
+const errors = (store: Store) => (store.db.prepare(`SELECT error FROM outbox ORDER BY id`).all() as { error: string | null }[]).map((r) => r.error);
+
+function fileRelay(store: Store, x: ReturnType<typeof withAttachment>, extra: Partial<RelayOptions> = {}) {
   const sent: string[] = [];
-  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), {
-    channel: "G1", owner: "U1", onFatal: () => {}, retryMs: 20, onFileSent: (x) => sent.push(`${x.attachment}→${x.slack_file}@${x.thread_ts}`),
+  const relay = new Relay(store, x.bus, new SlackWeb("xoxb-t", "http://slack.test/api/", x.f), {
+    channel: "G1", owner: "U1", onFatal: () => {}, retryMs: 20, shareWaitMs: 50,
+    onFileSent: (f) => sent.push(`${f.attachment}→${f.slack_file}@${f.thread_ts}`),
+    ...extra,
   });
-  relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } });
+  return { relay, sent };
+}
+
+test("files: text and files go as one message, whose ts files.info gives; a retry re-uploads but shares once", async () => {
+  const x = withAttachment({ upload: 503 });
+  const store = new Store(join(dir, "b.db"));
+  const { relay, sent } = fileRelay(store, x);
+  relay.notify(LOOK);
   await Bun.sleep(150);
-  expect(calls).toEqual(["chat.postMessage", "files.getUploadURLExternal", "files.getUploadURLExternal", "F1", "files.completeUploadExternal"]);
-  expect(sent).toEqual(["7→F1@5.0"]);
+  expect(x.calls).toEqual(["files.getUploadURLExternal", "files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.info"]);
+  expect(x.blocks).toEqual(["**be** look"]);
+  expect(x.said).toEqual([]);
+  expect(sent).toEqual(["7→F1@6.0"]);
+  expect(store.byTs("6.0")).toMatchObject({ kind: "dm", root_id: 1, peer: "be", last_id: 1 });
+  expect(store.pending()).toEqual([]);
+  expect(errors(store)).toEqual([null]);
+  store.close();
+});
+
+test("files: a restart after the upload resumes at the share, without uploading again", async () => {
+  const x = withAttachment();
+  const store = new Store(join(dir, "b.db"));
+  const id = store.enqueue(LOOK);
+  store.setProgress(id, { files: [{ id: "F1", title: "shot.png", attachment: 7 }], refused: [] });
+  const { relay, sent } = fileRelay(store, x);
+  await relay.drain();
+  expect(x.calls).toEqual(["files.completeUploadExternal", "files.info"]);
+  expect(sent).toEqual(["7→F1@6.0"]);
   expect(store.pending()).toEqual([]);
   store.close();
 });
 
-test("files: an app without files:write still relays text and says why the file didn't come", async () => {
-  const { bus, calls, said, f } = withAttachment({ complete: "missing_scope" });
+test("files: a share whose answer was lost isn't sent twice", async () => {
+  const x = withAttachment({ complete: 503, shares: 2 });
+  const store = new Store(join(dir, "b.db"));
+  const { relay, sent } = fileRelay(store, x);
+  relay.notify(LOOK);
+  await Bun.sleep(200);
+  // The retry asks files.info until the lagging share shows, then maps it.
+  expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.info", "files.info", "files.info"]);
+  expect(sent).toEqual(["7→F1@6.0"]);
+  expect(store.byTs("6.0")).toBeDefined();
+  store.close();
+});
+
+test("files: a share whose message never shows in files.info leaves the thread unmapped, and says so", async () => {
+  const x = withAttachment({ shares: 100 });
+  const store = new Store(join(dir, "b.db"));
+  const { relay, sent } = fileRelay(store, x);
+  relay.notify(LOOK);
+  await Bun.sleep(200);
+  expect(x.calls.filter((c) => c === "files.info")).toHaveLength(10);
+  expect(sent).toEqual(["7→F1@null"]);
+  expect(x.said).toEqual(["⚠️ Slack didn't say where it put message 1 from be, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead."]);
+  expect(errors(store)).toEqual(["ts_unknown"]);
+  store.close();
+});
+
+test("files: an app without files:write still relays the text with a warning, and the sender hears why", async () => {
+  const x = withAttachment({ complete: "missing_scope" });
   const store = new Store(join(dir, "b.db"));
   let fatal = "";
-  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: (r) => (fatal = r) });
-  relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } });
+  const { relay } = fileRelay(store, x, { onFatal: (r) => (fatal = r) });
+  relay.notify(LOOK);
   relay.notify({ content: "next", meta: { message_id: "2", from: "be" } });
   await Bun.sleep(100);
   expect(fatal).toBe("");
-  // The text, the file attempt, the warning in the thread, then the next item.
-  expect(calls).toEqual(["chat.postMessage", "files.getUploadURLExternal", "F1", "files.completeUploadExternal", "chat.postMessage", "chat.postMessage"]);
-  expect(said).toEqual([
-    "**be** look",
-    "⚠️ not delivered to Slack: shot.png: the Slack app lacks files:write (reinstall it from the current manifest)",
-    "**be** next",
-  ]);
-  expect(store.pending()).toEqual([]);
+  // The file attempt, the text with the warning as one message, then the next item.
+  expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "chat.postMessage", "chat.postMessage"]);
+  const why = "shot.png: the Slack app lacks files:write (reinstall it from the current manifest)";
+  expect(x.said).toEqual([`**be** look\n\n⚠️ not delivered to Slack: ${why}`, "**be** next"]);
+  expect(x.told).toEqual([{ to: "be", parent_id: 1, body: `[Slack bridge] Files on your message 1 didn't reach Slack, so the human hasn't seen them: ${why}. The text did reach them.` }]);
+  expect(errors(store)).toEqual(["files_refused", null]);
+  store.close();
+});
+
+test("files: attachments meta the relay can't read is refused loudly, not dropped", async () => {
+  const x = withAttachment();
+  const store = new Store(join(dir, "b.db"));
+  const { relay } = fileRelay(store, x);
+  relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "shot.png, 3 bytes" } });
+  await Bun.sleep(100);
+  expect(x.calls).toEqual(["chat.postMessage"]);
+  expect(x.said[0]).toStartWith("**be** look\n\n⚠️ not delivered to Slack: its files (unreadable attachments meta item");
+  expect(x.told).toHaveLength(1);
   store.close();
 });
 

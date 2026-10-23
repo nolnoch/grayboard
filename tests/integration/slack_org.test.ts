@@ -150,12 +150,12 @@ test("attachments cross the org bridge both ways, and the audit log says where t
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]);
     writeFileSync(join(tmp, "shot.png"), png);
     const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
-    const top = await until(() => slack.posts().find((p) => p.markdown_text === "**be** look"));
     const s = await until(() => slack.shares()[0]);
-    expect(s).toMatchObject({ channel_id: DM, thread_ts: tsOf(top), username: "be" });
+    expect(s).toMatchObject({ channel_id: DM, username: "be", blocks: [{ type: "markdown", text: "**be** look" }] });
+    expect(s.thread_ts).toBeUndefined();
     expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
 
-    slack.say("here", { thread_ts: tsOf(top), extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
+    slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
     const got = await until(() => be.pushes.find((p) => p.content === "here"));
     expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
     expect(got.meta.attachments).toMatch(/^\d+:reply\.md text\/markdown 3B$/);
@@ -167,9 +167,30 @@ test("attachments cross the org bridge both ways, and the audit log says where t
       app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
     const sent = await until(() => audit("attachment.sent_to_slack")[0]);
     expect(sent.actor).toBe("alice@example.com");
-    expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: tsOf(top), slack_file: s.files[0].id });
+    expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id });
     const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
     expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a file Slack refuses goes back to its sender, and the text carries the warning", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await session(alice, "be");
+  slack.refuseUploads = "file_type_not_allowed";
+  const tmp = mkdtempSync(join(tmpdir(), "grayboard-slack-org-"));
+  try {
+    writeFileSync(join(tmp, "shot.png"), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]));
+    const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
+    const top = await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("**be** look")));
+    expect(top.markdown_text).toBe("**be** look\n\n⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
+    const back = await until(() => be.pushes.find((p) => p.meta.from === "alice@example.com/human"));
+    expect(back.meta.parent_id).toBe(String(q.message_id));
+    expect(back.content).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
+    // Done items leave no progress behind.
+    await until(() => (app.db.prepare(`SELECT COUNT(*) AS n FROM slack_progress`).get() as { n: number }).n === 0);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

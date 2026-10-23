@@ -241,31 +241,43 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2
 const share = (files: Record<string, any>[]) => ({ extra: { subtype: "file_share", files } });
 const firstId = (meta: string) => Number(meta.split(":")[0]);
 
-test("an agent's attachments follow its text, as one file reply in the thread", async () => {
+test("an agent's attachments and text reach Slack as one message, whose thread maps back", async () => {
   const be = await agent("be");
   await startBridge();
   writeFileSync(join(dir, "shot.png"), PNG);
   writeFileSync(join(dir, "notes.md"), "# notes\n");
-  await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png", "notes.md"] });
-  const top = await until(() => slack.posts().find((p) => p.markdown_text === "**be** see attached"));
+  const q = await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png", "notes.md"] });
   const s = await until(() => slack.shares()[0]);
-  expect(s).toMatchObject({ channel_id: CHANNEL, thread_ts: slackTsOf(top), username: "be" });
+  expect(s).toMatchObject({ channel_id: CHANNEL, username: "be", blocks: [{ type: "markdown", text: "**be** see attached" }] });
+  expect(s.thread_ts).toBeUndefined();
   expect(s.files.map((f: { title: string }) => f.title)).toEqual(["shot.png", "notes.md"]);
   expect(slack.uploaded.get(s.files[0].id)).toEqual(PNG);
   expect(new TextDecoder().decode(slack.uploaded.get(s.files[1].id))).toBe("# notes\n");
   expect(slack.calls.find((c) => c.method === "files.getUploadURLExternal")!.body).toEqual({ filename: "shot.png", length: String(PNG.length) });
+  expect(slack.posts()).toEqual([]);
+
+  // Slack's answer doesn't name the message; files.info's shares do, and the thread maps to it.
+  slack.say("thanks", { thread_ts: s.ts });
+  const got = await until(() => be.pushes.find((p) => p.content === "thanks"));
+  expect(got.meta.parent_id).toBe(String(q.message_id));
+  // The agent's follow-up with a file lands in that thread.
+  await call(be.c, "dm_send", { to: "alex", body: "one more", parent_id: Number(got.meta.message_id), attachments: ["notes.md"] });
+  const s2 = await until(() => slack.shares()[1]);
+  expect(s2).toMatchObject({ thread_ts: s.ts, blocks: [{ type: "markdown", text: "**be** one more" }] });
 }, 30_000);
 
-test("a file Slack refuses still lets the text through, and the thread says which", async () => {
+test("a file Slack refuses still lets the text through with a warning, and goes back to its sender", async () => {
   const be = await agent("be");
   slack.refuseUploads = "file_type_not_allowed";
   await startBridge();
   writeFileSync(join(dir, "shot.png"), PNG);
-  await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png"] });
-  const top = await until(() => slack.posts().find((p) => p.markdown_text === "**be** see attached"));
-  const warn = await until(() => slack.posts().find((p) => p.thread_ts === slackTsOf(top)));
-  expect(warn.markdown_text).toBe("⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
+  const q = await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png"] });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("**be** see attached")));
+  expect(top.markdown_text).toBe("**be** see attached\n\n⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
   expect(slack.shares()).toEqual([]);
+  const back = await until(() => be.pushes.find((p) => p.meta.from === "alex"));
+  expect(back.meta.parent_id).toBe(String(q.message_id));
+  expect(back.content).toBe(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack, so the human hasn't seen them: shot.png: file_type_not_allowed. The text did reach them.`);
 }, 30_000);
 
 test("files the owner shares in Slack ride on the reply or the new conversation", async () => {

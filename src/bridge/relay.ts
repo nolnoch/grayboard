@@ -8,8 +8,9 @@
 // replies (dm_send / board_post with parent_id), so only that conversation's
 // agents wake. A top-level "@handle …" or "#board …" starts a new one.
 //
-// Attachments go both ways: an item's files follow its text into the Slack
-// thread, and files the owner shares in Slack ride on the dm_send/board_post.
+// Attachments go both ways: an item's files and text go to Slack as one
+// message, and files the owner shares in Slack ride on the dm_send/board_post.
+// A file Slack won't take goes back to its sender as a reply.
 import {
   DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, formatSize, parseAttachmentsMeta, sanitizeFilename, sniffType,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
@@ -18,7 +19,7 @@ import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
 /** The thread map and outbox: store.ts locally, the server's tables and acks in server mode. */
-export type RelayStore = Pick<Store, "thread" | "byTs" | "addThread" | "advance" | "enqueue" | "pending" | "done">;
+export type RelayStore = Pick<Store, "thread" | "byTs" | "addThread" | "advance" | "enqueue" | "pending" | "progress" | "setProgress" | "done">;
 
 export type ChannelParams = { content: string; meta: Record<string, string> };
 
@@ -50,16 +51,38 @@ export type RelayOptions = {
   label?: (handle: string) => string;
   /** The bus's size caps, checked on Slack's sizes before downloading. */
   attachmentLimits?: AttachmentLimits;
-  /** Each grayboard attachment Slack took, for a server's audit log. */
-  onFileSent?: (f: { attachment: number; slack_file: string; thread_ts: string }) => void;
+  /** Each grayboard attachment Slack took, for a server's audit log; thread_ts null when Slack didn't say where. */
+  onFileSent?: (f: { attachment: number; slack_file: string; thread_ts: string | null }) => void;
+  /** How long to look in files.info for the message a file share made, which can lag the share. */
+  shareWaitMs?: number;
 };
 
-// How far one outbox item got, so a retry after Slack was unavailable
-// doesn't post its text twice.
-type Progress = { threadTs?: string; filesDone?: boolean };
+type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; body: string; attachments: number[] };
 
-// Slack's markdown_text limit is 12,000 chars; leave room for the header.
+type UploadedFile = { id: string; title: string; attachment: number };
+
+// How far one outbox item got, kept in the store so neither a retry nor a
+// restart posts it twice or shares its files twice.
+type Progress = {
+  /** Uploaded to Slack, waiting to be shared with the text. */
+  files?: UploadedFile[];
+  /** Files that won't reach Slack, each "name: why". */
+  refused?: string[];
+  /** files.completeUploadExternal went out; a retry asks Slack whether it landed before resending. */
+  completing?: boolean;
+  /** The item's message is in Slack and the thread map knows it. */
+  posted?: boolean;
+  /** Why the item counts as given up on, if it does (the outbox row's error). */
+  error?: string | null;
+  /** The sender heard which files didn't reach Slack. */
+  told?: boolean;
+};
+
+// Slack's markdown_text and markdown block limit is 12,000 chars; leave room
+// for the header. The body and a note of files that didn't make it share this.
 const MAX_BODY = 11_500;
+const MAX_NOTE = 3_000;
+const SHARE_POLLS = 10;
 const CHECK = "white_check_mark";
 
 const HINT =
@@ -73,6 +96,7 @@ export class Relay {
   private readonly debug: (msg: string) => void;
   private readonly retryMs: number;
   private readonly limits: AttachmentLimits;
+  private readonly shareWaitMs: number;
 
   constructor(
     private readonly store: RelayStore,
@@ -84,6 +108,7 @@ export class Relay {
     this.debug = o.debug ?? (() => {});
     this.retryMs = o.retryMs ?? 5000;
     this.limits = o.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
+    this.shareWaitMs = o.shareWaitMs ?? 10_000;
   }
 
   stop(): void {
@@ -125,11 +150,12 @@ export class Relay {
 
   // Retries until Slack takes it, except for errors a retry can't fix.
   private async deliver(id: number, p: ChannelParams): Promise<void> {
-    const progress: Progress = {};
+    const progress = (this.store.progress(id) ?? {}) as Progress;
+    const save = () => this.store.setProgress(id, progress);
     for (;;) {
       try {
-        await this.forward(p, progress);
-        this.store.done(id);
+        await this.forward(p, progress, save);
+        this.store.done(id, progress.error ?? null);
         return;
       } catch (e) {
         if (e instanceof SlackError) {
@@ -151,64 +177,76 @@ export class Relay {
     }
   }
 
-  private async forward(p: ChannelParams, progress: Progress): Promise<void> {
+  private async forward(p: ChannelParams, progress: Progress, save: () => void): Promise<void> {
     const m = p.meta ?? {};
-    const attachments = parseAttachmentsMeta(m.attachments);
+    let attachments: number[] = [];
+    try {
+      attachments = parseAttachmentsMeta(m.attachments);
+    } catch (e) {
+      // The meta format changed under the relay: say so rather than drop the files.
+      progress.refused ??= [`its files (${(e as Error).message})`];
+    }
+    const base = { from: m.from ?? "?", body: p.content, attachments };
     if (m.board && m.post_id) {
       const id = Number(m.post_id);
       const root = m.parent_id ? await this.boardRoot(m.board, id) : id;
-      await this.postInThread({ kind: "board", board: m.board, root, id, from: m.from ?? "?", body: p.content, attachments }, progress);
+      await this.postItem({ kind: "board", board: m.board, root, id, ...base }, progress, save);
     } else if (m.message_id) {
       const id = Number(m.message_id);
       const root = m.parent_id ? await this.dmRoot(id) : id;
-      await this.postInThread({ kind: "dm", board: null, root, id, from: m.from ?? "?", body: p.content, attachments }, progress);
+      await this.postItem({ kind: "dm", board: null, root, id, ...base }, progress, save);
     }
   }
 
-  // The text as its own message, so it keeps markdown_text rendering and its
-  // ts maps the thread; then the files, as one reply in that thread.
-  private async postInThread(
-    x: { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; body: string; attachments: number[] },
-    progress: Progress,
-  ): Promise<void> {
+  // The text and files as one Slack message: files.completeUploadExternal
+  // with the text as a markdown block, or chat.postMessage when no file made
+  // it. Each step is saved in `progress` before the next, so a retry or a
+  // restart resumes where this one stopped.
+  private async postItem(x: Item, progress: Progress, save: () => void): Promise<void> {
     const name = this.o.label?.(x.from) ?? x.from;
-    if (progress.threadTs === undefined) {
+    if (!progress.posted) {
+      if (x.attachments.length && !progress.files) {
+        await this.upload(x.attachments, progress);
+        save();
+      }
       const row = this.store.thread(x.kind, x.board, x.root);
-      const text = format(name, row ? null : x.board, x.body, x.id);
-      const r = await this.slack.call<{ ts: string; message?: Record<string, any> }>("chat.postMessage", {
-        channel: this.o.channel,
-        markdown_text: text,
-        username: name,
-        ...(row ? { thread_ts: row.thread_ts } : {}),
-      });
-      this.debug(`posted ${r.ts} as username=${JSON.stringify(r.message?.username)} (asked ${JSON.stringify(x.from)})`);
+      const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
+      // The item's message ts; null when Slack took it but never said where.
+      let ts: string | null | undefined;
+      if (progress.files?.length) ts = await this.share(progress, save, text(), name, row?.thread_ts);
+      if (ts === undefined) ts = await this.postText(text(), name, row?.thread_ts);
       if (row) this.store.advance(row.thread_ts, x.id);
-      else this.store.addThread({ thread_ts: r.ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
-      progress.threadTs = row?.thread_ts ?? r.ts;
+      else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
+      const errors = [progress.refused?.length ? "files_refused" : null, !row && !ts ? "ts_unknown" : null].filter(Boolean);
+      progress.error = errors.length ? errors.join(",") : null;
+      progress.posted = true;
+      save();
+      if (!row && !ts) {
+        this.log(`slack: no ts for grayboard ${x.kind} ${x.id}; its Slack thread isn't mapped`);
+        await this.say(null, `⚠️ Slack didn't say where it put ${x.kind === "dm" ? "message" : "post"} ${x.id} from ${name}, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead.`);
+      }
     }
-    if (x.attachments.length && !progress.filesDone) {
-      await this.postFiles(x.attachments, progress.threadTs!, name);
-      progress.filesDone = true;
+    if (progress.refused?.length && !progress.told) {
+      this.log(`slack: files on ${x.kind} ${x.id} not delivered: ${progress.refused.join("; ")}`);
+      await this.tell(x, progress.refused);
+      progress.told = true;
+      save();
     }
   }
 
-  // Uploads what it can and says in the thread which files didn't make it
+  // Uploads each file. Keeps the ones Slack takes and says why for the rest
   // (Slack refused the type or size, the workspace blocks uploads, the app
-  // lacks files:write). Only Slack being unavailable, or a fatal error,
-  // throws.
-  private async postFiles(ids: number[], threadTs: string, name: string): Promise<void> {
-    const sent: { id: string; title: string; attachment: number }[] = [];
-    const failed: string[] = [];
-    const refused = (what: string, e: unknown) => {
-      if (!(e instanceof SlackError) || (e.fatal && e.code !== "missing_scope")) throw e;
-      failed.push(`${what}: ${e.code === "missing_scope" ? "the Slack app lacks files:write (reinstall it from the current manifest)" : e.code}`);
-    };
+  // lacks files:write, the bus wouldn't give the file). Only Slack being
+  // unavailable, or a fatal error, throws.
+  private async upload(ids: number[], progress: Progress): Promise<void> {
+    const files: UploadedFile[] = [];
+    const refused = [...(progress.refused ?? [])];
     for (const id of ids) {
       let a: AttachmentInfo & { data: Uint8Array };
       try {
         a = await this.bus.attachment(id);
       } catch (e) {
-        failed.push(`attachment ${id}: ${(e as Error).message}`);
+        refused.push(`attachment ${id}: ${(e as Error).message}`);
         continue;
       }
       try {
@@ -218,27 +256,95 @@ export class Relay {
           { form: true },
         );
         await this.slack.upload(u.upload_url, a.data);
-        sent.push({ id: u.file_id, title: a.filename, attachment: id });
+        files.push({ id: u.file_id, title: a.filename, attachment: id });
       } catch (e) {
-        refused(a.filename, e);
+        refused.push(`${a.filename}: ${refusal(e)}`);
       }
     }
-    if (sent.length) {
+    progress.files = files;
+    progress.refused = refused;
+  }
+
+  // Shares the uploaded files with the text as one message. Returns its ts
+  // (the thread's, for a reply), null if Slack took it but files.info never
+  // showed where, or undefined if Slack refused it, with the files moved to
+  // `refused` for a text-only post.
+  private async share(progress: Progress, save: () => void, text: string, name: string, threadTs: string | undefined): Promise<string | null | undefined> {
+    const files = progress.files!;
+    // The last attempt may have landed with its answer lost; resending would share the files twice.
+    let ts = progress.completing ? await this.sharedTs(files[0]!.id) : null;
+    if (!ts) {
+      progress.completing = true;
+      save();
       try {
         await this.slack.call(
           "files.completeUploadExternal",
-          { files: sent.map(({ id, title }) => ({ id, title })), channel_id: this.o.channel, thread_ts: threadTs, username: name },
+          {
+            files: files.map(({ id, title }) => ({ id, title })),
+            channel_id: this.o.channel,
+            ...(threadTs ? { thread_ts: threadTs } : {}),
+            blocks: [{ type: "markdown", text }],
+            username: name,
+          },
           { form: true },
         );
-        for (const f of sent) this.o.onFileSent?.({ attachment: f.attachment, slack_file: f.id, thread_ts: threadTs });
       } catch (e) {
-        refused(sent.map((f) => f.title).join(", "), e);
+        const why = refusal(e);
+        progress.refused = [...(progress.refused ?? []), ...files.map((f) => `${f.title}: ${why}`)];
+        progress.files = [];
+        progress.completing = false;
+        save();
+        return undefined;
       }
+      // Slack's answer names the files, not the message; a reply already knows its thread.
+      ts = threadTs ?? (await this.sharedTs(files[0]!.id));
     }
-    if (failed.length) {
-      this.log(`slack: files not delivered: ${failed.join("; ")}`);
-      await this.say(threadTs, `⚠️ not delivered to Slack: ${failed.join("; ")}`);
+    const thread = threadTs ?? ts;
+    for (const f of files) this.o.onFileSent?.({ attachment: f.attachment, slack_file: f.id, thread_ts: thread });
+    return thread;
+  }
+
+  // The ts of the message that shared `file` in this channel, from files.info.
+  // Polled, since a file's shares can lag its share. Null if it never shows,
+  // or the app can't read files (no files:read).
+  private async sharedTs(file: string): Promise<string | null> {
+    for (let i = 0; i < SHARE_POLLS; i++) {
+      if (i) await Bun.sleep(this.shareWaitMs / SHARE_POLLS);
+      let f: Record<string, any> | undefined;
+      try {
+        f = (await this.slack.call<{ file?: Record<string, any> }>("files.info", { file }, { form: true })).file;
+      } catch (e) {
+        if (!(e instanceof SlackError) || (e.fatal && e.code !== "missing_scope")) throw e;
+        this.log(`slack: files.info ${file}: ${e.code}`);
+        return null;
+      }
+      const shares = f?.shares ?? {};
+      const ts = (shares.private?.[this.o.channel] ?? shares.public?.[this.o.channel])?.[0]?.ts;
+      this.debug(`files.info ${file} try ${i + 1}: shares in channel ${ts ? `ts=${ts}` : "none yet"}`);
+      if (ts) return String(ts);
     }
+    return null;
+  }
+
+  private async postText(text: string, name: string, threadTs: string | undefined): Promise<string> {
+    const r = await this.slack.call<{ ts: string; message?: Record<string, any> }>("chat.postMessage", {
+      channel: this.o.channel,
+      markdown_text: text,
+      username: name,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+    });
+    this.debug(`posted ${r.ts} as username=${JSON.stringify(r.message?.username)} (asked ${JSON.stringify(name)})`);
+    return r.ts;
+  }
+
+  // Files that didn't reach Slack go back to their sender, so it knows the
+  // human never saw them. Sent as the human's handle, so the body says it's
+  // the bridge speaking. A DM's notice replies to it; a post's is a new DM.
+  private async tell(x: Item, refused: string[]): Promise<void> {
+    const what = x.kind === "dm" ? `your message ${x.id}` : `your post ${x.id} on #${x.board}`;
+    const body = `[Slack bridge] Files on ${what} didn't reach Slack, so the human hasn't seen them: ${refused.join("; ")}. The text did reach them.`;
+    const r = await this.bus.call("dm_send", { to: x.from, body, ...(x.kind === "dm" ? { parent_id: x.id } : {}) });
+    if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.error}`);
   }
 
   // Notifications carry parent_id, not the root; key the map on the root so a
@@ -410,11 +516,11 @@ export class Relay {
     return `no board #${board}${names ? ` (boards: ${names})` : ""}. To make it: "new #${board} what it's for"`;
   }
 
-  // Bridge status lines, as the bot itself. Failing to post one isn't worth
-  // more than a log line.
-  private async say(threadTs: string, text: string): Promise<void> {
+  // Bridge status lines, as the bot itself, in a thread or (null) top level.
+  // Failing to post one isn't worth more than a log line.
+  private async say(threadTs: string | null, text: string): Promise<void> {
     try {
-      await this.slack.call("chat.postMessage", { channel: this.o.channel, thread_ts: threadTs, markdown_text: text });
+      await this.slack.call("chat.postMessage", { channel: this.o.channel, ...(threadTs ? { thread_ts: threadTs } : {}), markdown_text: text });
     } catch (e) {
       this.log(`slack: couldn't post a status reply: ${(e as Error).message}`);
     }
@@ -429,18 +535,33 @@ export class Relay {
   }
 }
 
+// Why Slack refused a file. Rethrows what a retry might fix (Slack
+// unavailable) or nothing here can (a dead token); a missing files:write is a
+// refusal, fixed by a reinstall.
+function refusal(e: unknown): string {
+  if (!(e instanceof SlackError) || (e.fatal && e.code !== "missing_scope")) throw e;
+  return e.code === "missing_scope" ? "the Slack app lacks files:write (reinstall it from the current manifest)" : e.code;
+}
+
+function warning(refused: string[] | undefined): string | undefined {
+  return refused?.length ? `⚠️ not delivered to Slack: ${refused.join("; ")}` : undefined;
+}
+
 /**
  * A grayboard item as Slack Markdown. The sender's handle leads in bold, so
  * attribution survives even if Slack ignores the username override. A new
  * thread from a board names the board. A handle with an email in it goes in a
  * code span, or Slack auto-links the address and shows it as "mailto:…".
+ * A note (files that didn't make it) ends it, and the body is cut to fit.
  */
-export function format(from: string, board: string | null, body: string, id: number): string {
+export function format(from: string, board: string | null, body: string, id: number, note?: string): string {
   const name = from.includes("@") ? `\`${from}\`` : `**${from}**`;
   const head = board ? `${name} · #${board} ·` : name;
-  const cut = body.length > MAX_BODY;
-  const text = cut ? `${body.slice(0, MAX_BODY)}\n\n… (truncated; the full text is grayboard ${board ? "post" : "message"} ${id})` : body;
-  return `${head}${text.includes("\n") ? "\n" : " "}${text}`;
+  const tail = note ? `\n\n${note.length > MAX_NOTE ? `${note.slice(0, MAX_NOTE)}…` : note}` : "";
+  const max = MAX_BODY - tail.length;
+  const cut = body.length > max;
+  const text = cut ? `${body.slice(0, max)}\n\n… (truncated; the full text is grayboard ${board ? "post" : "message"} ${id})` : body;
+  return `${head}${text.includes("\n") ? "\n" : " "}${text}${tail}`;
 }
 
 /** Slack message text as plain text: links unwrapped, entities unescaped. */

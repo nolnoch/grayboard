@@ -6,8 +6,8 @@ type Call = { method: string; body: Record<string, any> };
 
 // Just enough Slack: auth.test, apps.connections.open, chat.postMessage,
 // reactions.add, the external file upload (get URL, send bytes, complete),
-// files.info and file downloads, and a Socket Mode WebSocket that says hello
-// and records acks.
+// files.info (hosted files, and uploaded ones with their shares) and file
+// downloads, and a Socket Mode WebSocket that says hello and records acks.
 export class FakeSlack {
   constructor(private readonly o: { channel: string; owner: string; channelType: "group" | "im" }) {}
 
@@ -20,6 +20,10 @@ export class FakeSlack {
   refuseUploads: string | null = null;
   /** Bytes sent to each upload URL, by file id. */
   readonly uploaded = new Map<string, Uint8Array>();
+  /** Where completeUploadExternal shared each uploaded file: files.info's `shares`. */
+  private readonly shared = new Map<string, { ts: string; thread_ts?: string }>();
+  /** files.info answers for an uploaded file this many times before its shares show. */
+  shareLag = 0;
   /** Files the owner can share: what say() sends in an event's files. */
   private readonly hosted = new Map<string, { name: string; data: Uint8Array }>();
   private fileN = 0;
@@ -72,12 +76,23 @@ export class FakeSlack {
         case "files.completeUploadExternal": {
           const files = JSON.parse(String(body.files ?? "[]")) as { id: string; title?: string }[];
           if (!files.length || files.some((f) => !this.uploaded.has(f.id))) return Response.json({ ok: false, error: "file_not_found" });
-          return Response.json({ ok: true, files });
+          // Like Slack: one message, and an answer that names the files but not the message.
+          const ts = `${++this.ts}.000100`;
+          this.postTs.set(body, ts);
+          for (const f of files) this.shared.set(f.id, { ts, ...(body.thread_ts ? { thread_ts: String(body.thread_ts) } : {}) });
+          return Response.json({ ok: true, files: files.map((f) => ({ id: f.id, title: f.title })) });
         }
         case "files.info": {
-          const f = this.hosted.get(String(body.file));
+          const id = String(body.file);
+          const share = this.shared.get(id);
+          if (this.uploaded.has(id)) {
+            const lagging = this.shareLag > 0 && this.shareLag-- > 0;
+            const shares = share && !lagging ? { private: { [this.o.channel]: [share] } } : {};
+            return Response.json({ ok: true, file: { id, name: id, size: this.uploaded.get(id)!.length, shares } });
+          }
+          const f = this.hosted.get(id);
           if (!f) return Response.json({ ok: false, error: "file_not_found" });
-          return Response.json({ ok: true, file: this.fileObject(String(body.file), f) });
+          return Response.json({ ok: true, file: this.fileObject(id, f) });
         }
       }
       return Response.json({ ok: false, error: "unknown_method" });
@@ -105,9 +120,11 @@ export class FakeSlack {
     return this.calls.filter((c) => c.method === "chat.postMessage").map((c) => c.body);
   }
 
-  /** files.completeUploadExternal calls, with files parsed. */
+  /** files.completeUploadExternal calls, with files and blocks parsed, and the ts of the message each made. */
   shares(): Record<string, any>[] {
-    return this.calls.filter((c) => c.method === "files.completeUploadExternal").map((c) => ({ ...c.body, files: JSON.parse(c.body.files) }));
+    return this.calls
+      .filter((c) => c.method === "files.completeUploadExternal")
+      .map((c) => ({ ...c.body, files: JSON.parse(c.body.files), blocks: c.body.blocks ? JSON.parse(c.body.blocks) : undefined, ts: this.postTs.get(c.body) }));
   }
 
   /** A file the owner can attach to a message; its event object, or only its id with `idOnly`. */

@@ -175,14 +175,17 @@ export function formatAttachmentsMeta(list: AttachmentInfo[]): string {
   return list.map((a) => `${a.id}:${a.filename} ${a.type} ${formatSize(a.size)}`).join("; ");
 }
 
-// The attachment ids in such a meta value, in order.
+// The attachment ids in such a meta value, in order. Throws on any item that
+// isn't in formatAttachmentsMeta's shape, so a change to one without the other
+// fails loudly instead of dropping files. Filenames can't hold ";" or ":"
+// (sanitizeFilename), so the split is exact.
 export function parseAttachmentsMeta(meta: string | undefined): number[] {
   if (!meta) return [];
-  return meta
-    .split("; ")
-    .map((item) => /^(\d+):/.exec(item)?.[1])
-    .filter((id): id is string => id !== undefined)
-    .map(Number);
+  return meta.split("; ").map((item) => {
+    const m = /^(\d+):.+ \S+\/\S+ \d+(?:\.\d)?(?:B|KB|MB)$/.exec(item);
+    if (!m) throw new Error(`unreadable attachments meta item: ${JSON.stringify(item)}`);
+    return Number(m[1]);
+  });
 }
 
 // attachment_get's write: into `dir` (checked against the roots) or the bus's

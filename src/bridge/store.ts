@@ -49,6 +49,10 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(done_at, id);
     `);
+    // How far a pending item got in Slack (relay.ts Progress), so a restart
+    // neither reposts it nor shares its files twice.
+    const outboxCols = this.db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
+    if (!outboxCols.some((c) => c.name === "progress")) this.db.exec(`ALTER TABLE outbox ADD COLUMN progress TEXT`);
   }
 
   thread(kind: ThreadKind, board: string | null, rootId: number): ThreadRow | undefined {
@@ -85,6 +89,15 @@ export class Store {
 
   pending(): OutboxRow[] {
     return this.db.prepare(`SELECT id, params FROM outbox WHERE done_at IS NULL ORDER BY id`).all() as OutboxRow[];
+  }
+
+  progress(id: number): unknown {
+    const r = this.db.prepare(`SELECT progress FROM outbox WHERE id = ?`).get(id) as { progress: string | null } | null;
+    return r?.progress ? JSON.parse(r.progress) : undefined;
+  }
+
+  setProgress(id: number, progress: unknown): void {
+    this.db.prepare(`UPDATE outbox SET progress = ? WHERE id = ?`).run(JSON.stringify(progress), id);
   }
 
   /** Posted, or given up on (error says why). */

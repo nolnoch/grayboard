@@ -260,9 +260,14 @@ export class SlackBridge implements SlackLinker {
     });
 
     // The outbox is memory: an item is acked to the hub only once Slack has
-    // it, so one that never made it is resent at the next start.
+    // it, so one that never made it is resent at the next start. How far it
+    // got is in the database, keyed by the item, so that resend resumes.
     const outbox = new Map<number, ChannelParams>();
     let next = 0;
+    const ref = (id: number) => {
+      const m = outbox.get(id)?.meta ?? {};
+      return m.board && m.post_id ? `post:${m.post_id}` : `dm:${m.message_id}`;
+    };
     const store: RelayStore = {
       thread: (kind, board, root) => repo.slack.thread(link.user_id, kind, board, root),
       byTs: (ts) => repo.slack.threadByTs(link.user_id, ts),
@@ -273,7 +278,10 @@ export class SlackBridge implements SlackLinker {
         return next;
       },
       pending: () => [...outbox].map(([id, p]) => ({ id, params: JSON.stringify(p) })),
+      progress: (id) => repo.slack.progress(link.user_id, ref(id)),
+      setProgress: (id, progress) => repo.slack.setProgress(link.user_id, ref(id), progress),
       done: (id) => {
+        repo.slack.clearProgress(link.user_id, ref(id));
         const p = outbox.get(id);
         outbox.delete(id);
         const m = p?.meta ?? {};

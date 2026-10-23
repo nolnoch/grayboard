@@ -82,6 +82,15 @@ describe("type detection and names", () => {
     expect(parseAttachmentsMeta(meta)).toEqual([12, 13]);
     expect(parseAttachmentsMeta(undefined)).toEqual([]);
   });
+
+  test("meta round-trips every size class and sanitized name, and refuses what it can't read", () => {
+    const list = [0, 1023, 1024, 340 * 1024, 1024 * 1024, 1.5 * 1024 * 1024, 25 * 1024 * 1024].map((size, i) => ({
+      id: 100 + i, filename: sanitizeFilename(`a b;c:${i} é.txt`), type: i % 2 ? "image/png" : "text/markdown", size,
+    }));
+    expect(parseAttachmentsMeta(formatAttachmentsMeta(list))).toEqual(list.map((a) => a.id));
+    expect(() => parseAttachmentsMeta("12:shot.png image/png 3B; 13 notes.md")).toThrow(/unreadable/);
+    expect(() => parseAttachmentsMeta("shot.png")).toThrow(/unreadable/);
+  });
 });
 
 describe("reading files to attach", () => {
