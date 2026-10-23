@@ -8,3 +8,4 @@ meta/
 dist/
 .claude/settings.local.json
 .claude/HANDOFF*.md
+.e2e-cache/

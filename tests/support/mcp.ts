@@ -18,17 +18,21 @@ const open = new Set<Client>();
 // Starts `grayboard <args>` (default: `mcp`) and collects its channel
 // notifications. Like Claude Code, it drops any that arrive before it has
 // sent `initialized`. `via` runs the CLI under a launcher (its command and
-// leading args) that execs bun itself, as a harness wrapper would.
-export async function mcpSession(o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[] }): Promise<Session> {
+// leading args) that execs bun itself, as a harness wrapper would. `bin` runs
+// a compiled grayboard (a release) instead of the source.
+export async function mcpSession(
+  o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[]; bin?: string },
+): Promise<Session> {
   const pushes: Push[] = [];
   const c = new Client({ name: "test", version: "0" });
   let initialized = false;
   c.fallbackNotificationHandler = async (n) => {
     if (initialized && n.method === "notifications/claude/channel") pushes.push(n.params as Push);
   };
+  const args = o.args ?? ["mcp"];
   const transport = new StdioClientTransport({
-    command: o.via?.[0] ?? process.execPath,
-    args: [...(o.via?.slice(1) ?? []), CLI, ...(o.args ?? ["mcp"])],
+    command: o.bin ?? o.via?.[0] ?? process.execPath,
+    args: o.bin ? args : [...(o.via?.slice(1) ?? []), CLI, ...args],
     cwd: o.cwd,
     env: o.env,
     stderr: "pipe",
@@ -48,9 +52,9 @@ export async function mcpSession(o: { env: Record<string, string>; cwd?: string;
 
 // A local-mode session on the bus in `dir`, started there unless `cwd` says otherwise.
 export function localSession(
-  dir: string, identity?: string, o: { cwd?: string; args?: string[]; extra?: Record<string, string>; via?: string[] } = {},
+  dir: string, identity?: string, o: { cwd?: string; args?: string[]; extra?: Record<string, string>; via?: string[]; bin?: string } = {},
 ): Promise<Session> {
-  return mcpSession({ env: localEnv(dir, identity, o.extra), cwd: o.cwd ?? dir, args: o.args ?? ["mcp", "--mode", "local"], via: o.via });
+  return mcpSession({ env: localEnv(dir, identity, o.extra), cwd: o.cwd ?? dir, args: o.args ?? ["mcp", "--mode", "local"], via: o.via, bin: o.bin });
 }
 
 function withStderr(e: unknown, stderr: () => string): Error {

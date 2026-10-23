@@ -1,15 +1,15 @@
 // One `grayboard <args>` run, as a lane's shell runs it: env and cwd decide
 // the handle. stdin is closed unless `holdStdin`, so `grayboard mcp` sees EOF
 // and exits. A run that outlives `timeoutMs` is killed and fails with what it
-// printed.
+// printed. `bin` runs a compiled grayboard (a release) instead of the source.
 import { CLI } from "./paths.ts";
 
 export type CliResult = { code: number; out: string; err: string };
 
 export async function runCli(
-  args: string[], o: { env: Record<string, string>; cwd?: string; holdStdin?: boolean; timeoutMs?: number },
+  args: string[], o: { env: Record<string, string>; cwd?: string; holdStdin?: boolean; timeoutMs?: number; bin?: string },
 ): Promise<CliResult> {
-  const p = Bun.spawn([process.execPath, CLI, ...args], {
+  const p = Bun.spawn(o.bin ? [o.bin, ...args] : [process.execPath, CLI, ...args], {
     cwd: o.cwd,
     env: o.env,
     stdin: o.holdStdin ? "pipe" : "ignore",

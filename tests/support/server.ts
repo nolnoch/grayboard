@@ -4,10 +4,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
-import { serverEnv } from "./env.ts";
+import { cleanEnv, serverEnv } from "./env.ts";
 import { mcpSession, type Session } from "./mcp.ts";
 import { WsClient, type WsClientOptions } from "./ws_client.ts";
 
@@ -28,6 +29,13 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
   };
 }
 
+// A dev-auth session token for `email` on the server at `base`.
+export async function devLogin(base: string, email: string): Promise<string> {
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
+  return ((await r.json()) as { session_token: string }).session_token;
+}
+
 export class TestServer {
   readonly app: ReturnType<typeof startServer>;
   readonly base: string;
@@ -42,11 +50,8 @@ export class TestServer {
     this.base = `http://localhost:${this.app.server.port}`;
   }
 
-  // A dev-auth session token for `email`.
-  async login(email: string): Promise<string> {
-    const r = await fetch(`${this.base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
-    if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
-    return ((await r.json()) as { session_token: string }).session_token;
+  login(email: string): Promise<string> {
+    return devLogin(this.base, email);
   }
 
   async api(token: string, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
@@ -85,5 +90,61 @@ export class TestServer {
     for (const c of this.clients.splice(0)) c.close();
     this.app.stop();
     rmSync(this.dir, { recursive: true, force: true });
+  }
+}
+
+// A compiled grayboard-server (a release, or the build under test) as its own
+// process: dev auth, port 0, its DB at `dbPath` and its blobs beside it. Ready
+// once it prints the port it listens on.
+export class ServerProcess {
+  private constructor(
+    readonly proc: Subprocess<"ignore", "pipe", "pipe">,
+    readonly base: string,
+    readonly log: () => string,
+  ) {}
+
+  static async start(bin: string, dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
+    const proc = Bun.spawn([bin], {
+      env: cleanEnv({ GRAYBOARD_DEV_AUTH: "1", GRAYBOARD_DB_PATH: dbPath, GRAYBOARD_PUBLIC_URL: "http://localhost", GRAYBOARD_HTTP_PORT: "0", ...extra }),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let out = "";
+    const stderr = new Response(proc.stderr).text().then((t) => (out += t));
+    const log = () => out;
+    const reader = proc.stdout.getReader();
+    const deadline = setTimeout(() => proc.kill("SIGKILL"), 10_000);
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) {
+          const code = await proc.exited;
+          await stderr;
+          throw new Error(`${bin} exited before listening (code ${code})\n${out}`);
+        }
+        out += new TextDecoder().decode(value);
+        const port = /listening on port (\d+)/.exec(out)?.[1];
+        if (port) {
+          // Keep draining stdout so the server never blocks on a full pipe.
+          void (async () => {
+            for (let r = await reader.read(); !r.done; r = await reader.read()) out += new TextDecoder().decode(r.value);
+          })();
+          return new ServerProcess(proc, `http://localhost:${port}`, log);
+        }
+      }
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
+  login(email: string): Promise<string> {
+    return devLogin(this.base, email);
+  }
+
+  // SIGTERM runs the server's own shutdown, which closes its database.
+  async stop(): Promise<void> {
+    this.proc.kill("SIGTERM");
+    await this.proc.exited;
   }
 }
