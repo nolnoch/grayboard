@@ -6,7 +6,8 @@
 // and only moves its own cursor.
 import { db } from "./db.ts";
 import { listenForWakeup, poke } from "./wakeup.ts";
-import { CoreError, normalizeBoard, subscribe, type Post } from "../core/boards.ts";
+import { normalizeBoard, subscribe, type Post } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { withAttachments } from "../core/attachments.ts";
 import { formatAttachmentsMeta } from "../shared/attachments.ts";
 

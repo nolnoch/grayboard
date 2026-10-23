@@ -11,9 +11,8 @@
 import { randomInt } from "node:crypto";
 
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
-import { boardNotification } from "../core/tools.ts";
+import { boardNotification, dmNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import { formatAttachmentsMeta } from "../shared/attachments.ts";
 import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, ServerMessage, ThreadOk } from "../shared/protocol.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
@@ -245,11 +244,7 @@ export class SlackBridge implements SlackLinker {
     let relay!: Relay;
     const conn = new HumanConn(this.o.handlers, authed, (m) => {
       if (m.type === "push") {
-        const msg = m.message;
-        const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
-        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-        if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
-        relay.notify({ content: msg.body, meta });
+        relay.notify(dmNotification(m.message));
       } else if (m.item.kind === "digest") {
         // Only says a board has unread posts; on a phone that's noise.
         void conn.request({ type: "board_ack", refs: [refOf(m.item)] }).catch(() => {});

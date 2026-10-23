@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
-import { CoreError, canSeeBoard, normalizeBoard, post } from "./boards.ts";
+import { canSeeBoard, normalizeBoard, post } from "./boards.ts";
+import { CoreError } from "./errors.ts";
 
 export type Claim = {
   key: string;

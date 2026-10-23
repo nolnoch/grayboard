@@ -5,7 +5,8 @@
 // attachment_blobs catalog. Bytes live in a BlobStore, outside any transaction.
 import type { Database } from "bun:sqlite";
 
-import { CoreError, TooLargeError, canSeeBoard, getPost } from "./boards.ts";
+import { canSeeBoard, getPost } from "./boards.ts";
+import { CoreError, TooLargeError } from "./errors.ts";
 import {
   MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize, sha256Hex,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
@@ -49,8 +50,6 @@ async function withBlob<T>(sha256: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-// A cap on the unbound bytes the uploaders under `prefix` (a server user's
-// "email/") may hold.
 // A server user's caps, over the uploads of every handle under `prefix` (the
 // user's "email/"): `unsent` bytes not yet on a message or post, and `stored`
 // bytes in all, sent or not.

@@ -19,7 +19,8 @@ import {
   type BlobStore,
 } from "./attachments.ts";
 import { SqliteBlobs } from "../local/blobs.ts";
-import { TooLargeError, createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
+import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
+import { TooLargeError } from "./errors.ts";
 import { boardNotification, callBoardTool } from "./tools.ts";
 import { initCoreSchema } from "./schema.ts";
 import {
@@ -461,7 +462,7 @@ describe("storage", () => {
     subscribe(db, "fe", "e2e", "push");
     const r = post(db, "be", "e2e", "see shot", null, files([up.id]));
     const info = { id: up.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
-    expect(r.attachments).toEqual([info]);
+    expect(r.post.attachments).toEqual([info]);
     const [item] = pendingFor(db, "fe");
     expect(boardNotification(item!).meta.attachments).toBe(`${up.id}:shot.png image/png 11B sha256:${sha256Hex(PNG)}`);
     expect(read(db, "fe", "e2e", { thread: r.post.id }).posts[0]!.attachments).toEqual([info]);
@@ -488,7 +489,7 @@ describe("storage", () => {
     expect(getAttachment(db, stale.id)).toBeUndefined();
     expect([blobCount(db), byteCount(db)]).toEqual([2, 2]);
     prunePosts(db, Date.now() + 1);
-    expect(getAttachment(db, p.attachments[0]!.id)).toBeUndefined();
+    expect(getAttachment(db, p.post.attachments![0]!.id)).toBeUndefined();
     await sweepBlobs(db, blobs);
     expect([blobCount(db), byteCount(db)]).toEqual([1, 1]);
   });
@@ -507,7 +508,7 @@ describe("storage", () => {
     expect(canReadAttachment(db, "be", loose, dm("be"))).toBe(true);
     expect(canReadAttachment(db, "fe", loose, dm("fe"))).toBe(false);
     const p = post(db, "be", "e2e", "x", null, files([(await store("be", file("post"))).id]));
-    expect(canReadAttachment(db, "sim", getAttachment(db, p.attachments[0]!.id)!, dm("sim"))).toBe(true);
+    expect(canReadAttachment(db, "sim", getAttachment(db, p.post.attachments![0]!.id)!, dm("sim"))).toBe(true);
     expect(new TextDecoder().decode(await blobs.get(onDm.sha256))).toBe("dm");
   });
 });

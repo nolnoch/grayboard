@@ -4,7 +4,6 @@
 import type { Database } from "bun:sqlite";
 
 import {
-  CoreError,
   createBoard,
   isViewer,
   listBoards,
@@ -19,9 +18,10 @@ import {
   type Post,
   type SubMode,
 } from "./boards.ts";
+import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentLimits } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type ToolDef = {
   name: string;
@@ -313,7 +313,7 @@ export function callBoardTool(
       // Paths name files on the agent's host: its MCP process reads, checks
       // and uploads them, and passes the upload ids as attachment_ids.
       if (a.attachments !== undefined) throw new CoreError("attachments must be read by the session's grayboard MCP process; this one can't");
-      const { post: p, wake, deferred, unresolved, attachments } = post(
+      const { post: p, wake, deferred, unresolved } = post(
         db,
         handle,
         str(a, "board"),
@@ -325,7 +325,7 @@ export function callBoardTool(
         result: {
           post_id: p.id,
           board: p.board,
-          ...(attachments.length ? { attachments } : {}),
+          ...(p.attachments ? { attachments: p.attachments } : {}),
           notified: wake.filter((h) => !isViewer(h)),
           ...(deferred.length ? { deferred } : {}),
           ...(unresolved.length ? { unresolved } : {}),
@@ -395,6 +395,14 @@ export function callBoardTool(
       return { result: listClaims(db, optStr(a, "prefix"), handle), wake: [] };
   }
   throw new CoreError(`unknown tool: ${name}`);
+}
+
+// The channel notification for a direct message. Same shape in every mode.
+export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+  const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+  if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
+  return { content: msg.body, meta };
 }
 
 // The channel notification for a board item. Same shape in every mode.

@@ -1,3 +1,4 @@
+import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
@@ -35,8 +36,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const server = Bun.serve<WsData>({
     port: config.httpPort,
     idleTimeout: 75,
-    // The largest body is an attachment upload (src/server/http.ts).
-    maxRequestBodySize: repo.attachmentLimits.file + 64 * 1024,
+    // The largest body is an attachment upload (src/server/http.ts); the
+    // margin covers a JSON request carrying a full message body.
+    maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     fetch(req, server) {
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {

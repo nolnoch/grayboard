@@ -1,4 +1,5 @@
-import { CoreError, age } from "../core/boards.ts";
+import { age } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import type { AttachmentInfo } from "./attachments.ts";
 
 type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] };

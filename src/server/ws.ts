@@ -7,7 +7,6 @@ import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  CoreError,
   acknowledge,
   age,
   checkBody,
@@ -21,6 +20,7 @@ import {
   type CoreDb,
   type PendingRef,
 } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";

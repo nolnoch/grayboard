@@ -12,10 +12,10 @@ import { sessionIdentity } from "../shared/identity.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
-import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { BOARD_INSTRUCTIONS, boardNotification, boardTools, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, checkAttachmentId, digestSha256, dispositionFilename, formatAttachmentsMeta, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
   type AttachmentLimits,
 } from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -93,15 +93,9 @@ const client = new GrayboardClient(
   currentToken,
   identity,
   async (msg: Message) => {
-    const meta: Record<string, string> = {
-      message_id: String(msg.id),
-      from:       msg.sender,
-      created_at: String(msg.created_at),
-    };
-    if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-    if (msg.attachments?.length) meta.attachments = formatAttachmentsMeta(msg.attachments);
-    if (await fromOwnHuman(msg.sender)) meta.human = "true";
-    return notify({ content: msg.body, meta });
+    const params = dmNotification(msg);
+    if (await fromOwnHuman(msg.sender)) params.meta.human = "true";
+    return notify(params);
   },
   async (item) => {
     const params = boardNotification(item);

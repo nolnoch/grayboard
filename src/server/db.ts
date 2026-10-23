@@ -66,6 +66,7 @@ export interface Repo {
     // attachmentIds: the sender's unbound uploads, bound in the insert's
     // transaction (a refused id throws CoreError and nothing is written).
     insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[]): MessageRow;
+    // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
@@ -385,8 +386,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         })();
       },
       getById(id) {
-        const row = db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id);
-        return row ? withAttachments(db, "message", [row])[0] : undefined;
+        return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id) ?? undefined;
       },
       history(identityFull, peer, limit = 20, beforeId) {
         const cap = Math.min(limit, 200);

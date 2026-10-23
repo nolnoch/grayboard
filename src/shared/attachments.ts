@@ -7,7 +7,7 @@ import { link, mkdir, open, rm, writeFile, type FileHandle } from "node:fs/promi
 import { homedir } from "node:os";
 import { basename, delimiter, extname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
-import { CoreError, TooLargeError } from "../core/boards.ts";
+import { CoreError, TooLargeError } from "../core/errors.ts";
 
 export const MAX_ATTACHMENTS = 5;
 // Size caps per file and per message or post. A server sets its own

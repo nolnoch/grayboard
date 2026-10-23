@@ -59,7 +59,7 @@ describe("retention pruning", () => {
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
-    expect(r.messages.getById(kept.id)?.attachments).toHaveLength(1);
+    expect(r.messages.thread(kept.id)[0].attachments).toHaveLength(1);
     expect(db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 1 });
     expect(readdirSync(blobDir).filter((d) => d !== "tmp")).toHaveLength(1);
     await runRetention(r, db, config, Date.now() + 2 * 86_400_000);

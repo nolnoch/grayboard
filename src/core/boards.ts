@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
 import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
+import { CoreError, TooLargeError } from "./errors.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -55,10 +56,6 @@ export type PendingRef =
   | { kind: "push"; post_id: number }
   | { kind: "digest"; board: string; latest_id: number };
 
-export class CoreError extends Error {}
-
-/** A file, a message's files, or a user's unsent uploads over a size cap (HTTP 413). */
-export class TooLargeError extends CoreError {}
 
 // ── access policy ────────────────────────────────────────────────────────────
 
@@ -365,8 +362,8 @@ function resolveMentions(
 }
 
 // wake: handles to wake now. deferred: thread participants whose push waits
-// for their next wake. attachments: those bound to the post.
-export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[]; attachments: AttachmentInfo[] };
+// for their next wake. post.attachments: those bound to the post.
+export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
@@ -476,7 +473,6 @@ export function post(
       wake: all.filter(([, t]) => t.wake).map(([h]) => h),
       deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
       unresolved,
-      attachments,
     };
   })();
 }

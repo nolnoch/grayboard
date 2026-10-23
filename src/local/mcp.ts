@@ -7,7 +7,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
@@ -16,6 +17,7 @@ import {
   announcementsInstruction,
   claimsInstruction,
   boardNotification,
+  dmNotification,
   humanInstruction,
   boardTools,
   callBoardTool,
@@ -42,7 +44,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
-import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, formatAttachmentsMeta, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   DM_ACK_TOOL,
@@ -411,18 +413,9 @@ async function drainToClaude(): Promise<void> {
       firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
       for (const msg of batch) {
-        const meta: Record<string, string> = {
-          message_id: String(msg.id),
-          from: msg.sender,
-          created_at: String(msg.created_at),
-        };
-        if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-        if (msg.attachments) meta.attachments = formatAttachmentsMeta(msg.attachments);
-        if (isHuman(db, msg.sender)) meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: { content: msg.body, meta },
-        });
+        const params = dmNotification(msg);
+        if (isHuman(db, msg.sender)) params.meta.human = "true";
+        await mcp.notification({ method: "notifications/claude/channel", params });
         setCursor(IDENTITY, msg.id);
       }
       for (const item of boardItems) {
