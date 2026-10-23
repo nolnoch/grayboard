@@ -5,22 +5,23 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { join } from "node:path";
 
 import { startSlackBridge, type BridgeHandle } from "../../src/bridge/slack.ts";
 import { FakeSlack } from "./fake_slack.ts";
+import { localEnv } from "../support/env.ts";
+import { call, closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
+import { CLI } from "../support/paths.ts";
+import { until } from "../support/until.ts";
 
-const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
-const MCP = { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] };
+const ARGS = ["mcp", "--mode", "local"];
+const MCP = { command: process.execPath, args: [CLI, ...ARGS] };
 const CHANNEL = "G0PRIVATE";
 const OWNER = "U0OWNER";
 
 let dir: string;
 let slack: FakeSlack;
 let bridge: BridgeHandle | null;
-const open: Client[] = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-slack-"));
@@ -30,29 +31,17 @@ beforeEach(() => {
 
 afterEach(async () => {
   await bridge?.stop();
-  await Promise.all(open.splice(0).map((c) => c.close().catch(() => {})));
+  await closeSessions();
   slack.stop();
   rmSync(dir, { recursive: true, force: true });
 });
 
-function env(identity?: string): Record<string, string> {
-  const e: Record<string, string | undefined> = {
-    ...process.env,
-    BUS_DB_PATH: join(dir, "bus.db"),
-    BUS_SOCK_DIR: dir,
-    GRAYBOARD_CREDENTIALS: join(dir, "credentials"),
-    GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
-    GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
-    SLACK_API_URL: slack.api,
-  };
-  delete e.BUS_IDENTITY;
-  delete e.BUS_HUMAN;
-  delete e.GRAYBOARD_TOKEN;
-  delete e.SLACK_APP_TOKEN;
-  delete e.SLACK_BOT_TOKEN;
-  if (identity) e.BUS_IDENTITY = identity;
-  return e as Record<string, string>;
-}
+const slackVars = (): Record<string, string> => ({
+  GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
+  GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
+  SLACK_API_URL: slack.api,
+});
+const env = (identity?: string): Record<string, string> => localEnv(dir, identity, slackVars());
 
 function writeConfig(extra: Record<string, unknown> = {}, mode = 0o600): void {
   const path = join(dir, "slack.json");
@@ -66,45 +55,7 @@ async function startBridge(): Promise<BridgeHandle> {
   return bridge;
 }
 
-type Agent = { c: Client; pushes: { content: string; meta: Record<string, string> }[] };
-
-async function agent(identity: string): Promise<Agent> {
-  const pushes: Agent["pushes"] = [];
-  const c = new Client({ name: "test", version: "0" });
-  c.fallbackNotificationHandler = async (n) => {
-    if (n.method === "notifications/claude/channel") pushes.push(n.params as Agent["pushes"][number]);
-  };
-  await c.connect(new StdioClientTransport({ ...MCP, cwd: dir, env: env(identity), stderr: "ignore" }));
-  open.push(c);
-  return { c, pushes };
-}
-
-async function stopAgent(a: Agent): Promise<void> {
-  open.splice(open.indexOf(a.c), 1);
-  await a.c.close();
-  await Bun.sleep(200);
-}
-
-async function call(c: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
-  const r = await c.callTool({ name, arguments: args });
-  const body = (r.content as { text: string }[])[0]!.text;
-  if (r.isError) throw new Error(body);
-  try {
-    return JSON.parse(body);
-  } catch {
-    return body;
-  }
-}
-
-async function until<T>(f: () => T | undefined | null | false, ms = 5000): Promise<T> {
-  const end = Date.now() + ms;
-  for (;;) {
-    const v = f();
-    if (v) return v;
-    if (Date.now() > end) throw new Error("timed out waiting");
-    await Bun.sleep(20);
-  }
-}
+const agent = (identity: string): Promise<Session> => localSession(dir, identity, { extra: slackVars() });
 
 test("an agent's DM becomes a Slack thread; the reply reaches only that agent, marked human", async () => {
   const be = await agent("be");
@@ -180,7 +131,7 @@ test("board mentions forward with the board's name; a reply posts in the board t
 test("top-level @handle and #board start conversations; mistakes get an answer", async () => {
   const be = await agent("be");
   const sim = await agent("sim");
-  await stopAgent(sim);
+  await stopSession(sim.c);
   await startBridge();
   await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
 

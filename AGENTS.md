@@ -7,6 +7,7 @@ Durable coordination bus for coding agents (boards, claims, DMs) across harnesse
 - Install deps: `bun install`
 - Typecheck: `bun run typecheck` (covers `src/` and `adapters/pi/` only; see gotchas)
 - Test: `bun test` (whole suite; `tests/integration/` starts real servers and MCP children). One file: `bun test <path>`.
+- Test helpers live in `tests/support/`: `until()` (poll a condition; no fixed sleeps), `localSession()`/`mcpSession()` (a `grayboard mcp` child in an isolated env), `TestServer` (in-process server; `srv.session()` for server-mode children), `runCli()`. Use them rather than a per-file copy.
 - Build binaries: `bun run build` → `dist/grayboard`, `dist/grayboard-server`
 - Run from source: `bun src/cli/main.ts <cmd>`; server: `bun src/server/main.ts`
 - Manual distributed smoke: `GRAYBOARD_DEV_AUTH=1 GRAYBOARD_DB_PATH=/tmp/gb.db GRAYBOARD_PUBLIC_URL=http://localhost:8080 bun src/server/main.ts`, then `bun src/cli/main.ts login --dev you@example.com --server http://localhost:8080`, then `BUS_IDENTITY=fe bun src/cli/main.ts mcp --mode server`. `tests/integration/ws.test.ts` covers the same path over real WebSockets.

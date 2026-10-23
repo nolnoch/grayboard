@@ -4,9 +4,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { ROOT } from "../support/paths.ts";
 
-const INSTALL = resolve(import.meta.dir, "../../install.sh");
+const INSTALL = join(ROOT, "install.sh");
 
 let dir: string;
 
