@@ -29,7 +29,16 @@ export async function releases(): Promise<string[]> {
     .sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0));
 }
 
-// The newest release other than this tree's own version: what a user upgrades from.
+// The newest release: what a user's databases were last written by. Between a
+// release and the next version bump it carries this tree's own version.
+export async function latestRelease(): Promise<string> {
+  const [tag] = await releases();
+  if (!tag) throw new Error(`no release at or above ${FLOOR}`);
+  return tag;
+}
+
+// The newest release other than this tree's own version: what `grayboard
+// update` can update from to this tree.
 export async function previousRelease(): Promise<string> {
   const tag = (await releases()).find((t) => t !== `v${pkg.version}`);
   if (!tag) throw new Error(`no release at or above ${FLOOR} other than v${pkg.version}`);

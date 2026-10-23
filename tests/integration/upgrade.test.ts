@@ -4,9 +4,10 @@
 // database had still exists, and each table matches a fresh database's column
 // for column (a missing guarded ALTER shows here); (b) what was written reads
 // back through this tree's tools. The same for the local Slack bridge's store.
-// Per push: the latest release before this
-// tree's version. GRAYBOARD_UPGRADE_FROM=<tag> picks another (the nightly
-// matrix runs every v1.x tag).
+// Per push: the latest release, which carries
+// this tree's version until the next bump. GRAYBOARD_UPGRADE_FROM=<tag> picks another (the nightly
+// matrix runs every v1.x tag). Under scripts/e2e.sh each test keeps the
+// files as the release left them and as this tree left them in the run dir.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
@@ -20,12 +21,14 @@ import { runCli } from "../support/cli.ts";
 import { localEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
-import { previousRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { keep } from "../support/run_dir.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 let rel: ReleaseBinaries;
 let dir: string;
+let label: string;
 let old: ServerProcess | undefined;
 let srv: TestServer | undefined;
 let slack: FakeSlack | undefined;
@@ -33,7 +36,7 @@ let oldBridge: Subprocess | undefined;
 let bridge: BridgeHandle | undefined;
 
 beforeAll(async () => {
-  rel = await releaseBinaries(process.env.GRAYBOARD_UPGRADE_FROM ?? (await previousRelease()));
+  rel = await releaseBinaries(process.env.GRAYBOARD_UPGRADE_FROM ?? (await latestRelease()));
 }, 120_000);
 
 beforeEach(() => {
@@ -48,12 +51,19 @@ afterEach(async () => {
   await closeSessions();
   slack?.stop();
   slack = undefined;
-  await old?.stop();
-  old = undefined;
+  if (old) await stopOld();
   srv?.stop();
   srv = undefined;
+  keep(label, dir);
   rmSync(dir, { recursive: true, force: true });
 });
+
+// Stops the release's server, keeping its log beside its database.
+async function stopOld(): Promise<void> {
+  await old!.stop();
+  writeFileSync(join(dir, "old", "server.log"), old!.log());
+  old = undefined;
+}
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 4, 2]);
 
@@ -151,6 +161,7 @@ async function readAll(be: Session, fe: Session, w: Written, beHandle: string, f
 }
 
 test("server: a database the previous release wrote opens and reads back", async () => {
+  label = "server";
   const dbPath = join(dir, "old", "grayboard.db");
   mkdirSync(join(dir, "old"));
   old = await ServerProcess.start(rel.server, dbPath);
@@ -173,8 +184,8 @@ test("server: a database the previous release wrote opens and reads back", async
   }
   await stopSession(be.c);
   await stopSession(fe.c);
-  await old.stop();
-  old = undefined;
+  await stopOld();
+  keep(`${label}-as-written`, join(dir, "old"));
   const before = schema(dbPath);
 
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
@@ -192,6 +203,7 @@ test("server: a database the previous release wrote opens and reads back", async
 }, 60_000);
 
 test("local: a bus the previous release wrote opens and reads back", async () => {
+  label = "local";
   const bus = join(dir, "bus");
   mkdirSync(bus);
   const be = await localSession(bus, "be", { bin: rel.cli });
@@ -204,6 +216,7 @@ test("local: a bus the previous release wrote opens and reads back", async () =>
   }
   await stopSession(be.c);
   await stopSession(fe.c);
+  keep(`${label}-as-written`, bus);
   const before = schema(join(bus, "bus.db"));
 
   await readAll(await localSession(bus, "be"), await localSession(bus, "fe"), w, "be", "fe");
@@ -217,6 +230,7 @@ test("local: a bus the previous release wrote opens and reads back", async () =>
 }, 60_000);
 
 test("Slack bridge: a store the previous release wrote opens and reads back", async () => {
+  label = "slack";
   // The bridge shipped in v1.2.0.
   if (!(await hasCommand(rel.cli, "slack", "bridge"))) return;
   slack = new FakeSlack({ channel: "G0PRIVATE", owner: "U0OWNER", channelType: "group" });
@@ -231,10 +245,12 @@ test("Slack bridge: a store the previous release wrote opens and reads back", as
   const posted = (text: string) => slack!.posts().find((p) => JSON.stringify(p).includes(text));
   const ts = (post: Record<string, any>) => slack!.postTs.get(post)!;
 
+  // The session creates the bus before the bridge opens it: released opens race
+  // on a new bus (#170).
+  const be = await localSession(bus, "be", { bin: rel.cli });
   const proc = Bun.spawn([rel.cli, "bridge", "slack"], { cwd: bus, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   oldBridge = proc;
   const log = new Response(proc.stderr).text();
-  const be = await localSession(bus, "be", { bin: rel.cli });
   await until(async () => (await be.call("peer_list")).peers.find((p: { handle: string }) => p.handle === "alex"), 10_000);
   // A DM thread and a board thread, each mapped to its Slack thread...
   const q = await be.call("dm_send", { to: "alex", body: "question" });
@@ -249,7 +265,9 @@ test("Slack bridge: a store the previous release wrote opens and reads back", as
   proc.kill("SIGTERM");
   expect(await proc.exited, await log).toBe(0);
   oldBridge = undefined;
+  writeFileSync(join(bus, "old-bridge.log"), await log);
   await stopSession(be.c);
+  keep(`${label}-as-written`, bus);
   const before = schema(store);
   const db = new Database(store, { readonly: true });
   expect((db.query(`SELECT COUNT(*) AS n FROM outbox WHERE done_at IS NULL`).get() as { n: number }).n).toBe(1);

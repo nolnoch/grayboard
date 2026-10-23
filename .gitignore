@@ -9,3 +9,4 @@ dist/
 .claude/settings.local.json
 .claude/HANDOFF*.md
 .e2e-cache/
+.e2e-runs/

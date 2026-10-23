@@ -47,6 +47,8 @@ jobs:
         run: bun run typecheck
 
       - name: Test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
         run: bun test
 
   build:
@@ -131,13 +133,33 @@ jobs:
         env:
           GRAYBOARD_E2E_BIN_DIR: ${{ github.workspace }}/dist
           GRAYBOARD_E2E_TAG: ${{ inputs.tag || github.ref_name }}
+          GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
         run: |
           chmod +x dist/*   # artifacts don't keep the executable bit
-          bun test ./tests/e2e/binaries.e2e.ts
+          scripts/e2e.sh binaries
+
+      - name: Upload run dir
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-binaries-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-run
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Every v1.x release's databases and installs upgrade to this tree.
+  upgrade-matrix:
+    name: Upgrade matrix
+    permissions:
+      contents: read
+      issues: write   # e2e.yml asks for it; it opens issues only on scheduled runs
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: upgrade-matrix
 
   release:
     name: Publish release
-    needs: [build, e2e]
+    needs: [build, e2e, upgrade-matrix]
     runs-on: ubuntu-latest
 
     steps:

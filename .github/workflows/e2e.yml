@@ -1,0 +1,75 @@
+name: E2E
+
+# The slow and release-gating e2e suites, through scripts/e2e.sh: nightly, by
+# hand, and from release.yml before a release publishes. A scheduled run that
+# fails opens (or comments on) one tracking issue per suite.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite to run"
+        type: choice
+        options: [upgrade-matrix]
+        default: upgrade-matrix
+  workflow_call:
+    inputs:
+      suite:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix"]' || format('["{0}"]', inputs.suite)) }}
+    permissions:
+      contents: read
+      issues: write   # the tracking issue on a scheduled failure
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run ${{ matrix.suite }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # lifts the releases API's anonymous rate limit
+          GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
+        run: scripts/e2e.sh ${{ matrix.suite }}
+
+      - name: Upload run dir
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-run
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Open or comment on the tracking issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUITE: ${{ matrix.suite }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly e2e failing: $SUITE"
+          body="Nightly \`scripts/e2e.sh $SUITE\` failed on $(git rev-parse --short HEAD): $RUN_URL (the run dir is attached as an artifact for 7 days)."
+          issue="$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
