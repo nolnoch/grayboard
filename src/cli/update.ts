@@ -2,6 +2,11 @@ import { chmodSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 const REPO = process.env.GRAYBOARD_REPO ?? "nolnoch/grayboard";
+// One origin serving GitHub's paths for both its API and its downloads (a
+// mirror, or the upgrade tests' release server); GitHub itself by default.
+const RELEASES = process.env.GRAYBOARD_RELEASES_URL?.replace(/\/+$/, "");
+const API = RELEASES ?? "https://api.github.com";
+const DOWNLOADS = RELEASES ?? "https://github.com";
 
 /** True if version `a` is newer than `b` ("v1.2.0" vs "1.10.0" compares numerically). */
 export function newer(a: string, b: string): boolean {
@@ -14,7 +19,7 @@ export function newer(a: string, b: string): boolean {
 }
 
 /**
- * Replace this binary with the latest GitHub release, in place. The rename is
+ * Replace this binary with the latest release, in place. The rename is
  * atomic, so sessions running the old binary keep it until they reconnect.
  * Returns the new release's tag, or null if already current.
  */
@@ -23,7 +28,7 @@ export async function selfUpdate(current: string): Promise<string | null> {
   if (/^bun(\.exe)?$/.test(basename(self))) {
     throw new Error("running from source; update with git pull instead");
   }
-  const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+  const res = await fetch(`${API}/repos/${REPO}/releases/latest`, {
     headers: { accept: "application/vnd.github+json" },
   });
   if (!res.ok) throw new Error(`couldn't read the latest release (HTTP ${res.status})`);
@@ -31,7 +36,7 @@ export async function selfUpdate(current: string): Promise<string | null> {
   if (!newer(tag, current)) return null;
 
   const target = `${process.platform}-${process.arch}`;
-  const bin = await fetch(`https://github.com/${REPO}/releases/download/${tag}/grayboard-${target}`);
+  const bin = await fetch(`${DOWNLOADS}/${REPO}/releases/download/${tag}/grayboard-${target}`);
   if (!bin.ok) throw new Error(`no ${tag} binary for ${target} (HTTP ${bin.status})`);
 
   // Download next to the binary so the rename stays on one filesystem.
