@@ -298,7 +298,7 @@ test("files: attachments meta the relay can't read is refused loudly, not droppe
   relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "shot.png, 3 bytes" } });
   await Bun.sleep(100);
   expect(x.calls).toEqual(["chat.postMessage"]);
-  expect(x.said[0]).toStartWith("**be** look\n\n⚠️ not delivered to Slack: its files (unreadable attachments meta item");
+  expect(x.said[0]).toStartWith("**be** look\n\n⚠️ not delivered to Slack: its files: unreadable attachments meta item");
   expect(x.told).toHaveLength(1);
   store.close();
 });

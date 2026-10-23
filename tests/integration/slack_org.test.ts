@@ -2,6 +2,7 @@
 // with a fake Slack, and agents as server-mode `grayboard mcp` children.
 // Linking, the human identity's round trip, who may reach it, and unlinking.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -167,7 +168,14 @@ test("attachments cross the org bridge both ways, and the audit log says where t
       app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
     const sent = await until(() => audit("attachment.sent_to_slack")[0]);
     expect(sent.actor).toBe("alice@example.com");
-    expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id });
+    const sha256 = createHash("sha256").update(png).digest("hex");
+    expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
+    // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
+    const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+    expect(bound).toEqual([
+      { target: `attachment:${q.attachments[0].id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
+      { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: Number(got.meta.message_id), recipient: "alice@example.com/be" },
+    ]);
     const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
     expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
   } finally {
@@ -189,6 +197,9 @@ test("a file Slack refuses goes back to its sender, and the text carries the war
     const back = await until(() => be.pushes.find((p) => p.meta.from === "alice@example.com/human"));
     expect(back.meta.parent_id).toBe(String(q.message_id));
     expect(back.content).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
+    const refused = await until(() => app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'attachment.slack_refused'`).get() as { actor: string; target: string; detail: string } | null);
+    expect(refused.actor).toBe("alice@example.com");
+    expect(JSON.parse(refused.detail)).toMatchObject({ identity: "alice@example.com/human", channel: DM, filename: "shot.png", reason: "file_type_not_allowed", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
     // Done items leave no progress behind.
     await until(() => (app.db.prepare(`SELECT COUNT(*) AS n FROM slack_progress`).get() as { n: number }).n === 0);
   } finally {

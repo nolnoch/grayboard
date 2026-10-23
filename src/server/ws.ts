@@ -23,6 +23,7 @@ import {
 } from "../core/boards.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { attachmentIds, attachmentLimits } from "../core/attachments.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
@@ -485,6 +486,9 @@ function handleSend(
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     throw e;
   }
+  for (const a of msg.attachments ?? []) {
+    writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: parsed.full });
+  }
   const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
   let deliveredNow = false;
@@ -541,6 +545,12 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);
     return err(ws, reqId, "internal", `${tool} failed`);
+  }
+  if (tool === "board_post") {
+    const r = outcome.result as { post_id: number; board: string; attachments?: AttachmentInfo[] };
+    for (const a of r.attachments ?? []) {
+      writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, post_id: r.post_id, board: r.board });
+    }
   }
   send(ws, { type: "call_ok", req_id: reqId, result: outcome.result });
   wake(hub, outcome.wake);

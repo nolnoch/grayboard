@@ -237,8 +237,10 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
     writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
     return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
   }
+  // Audited once the bytes are in hand, so a failed read isn't logged as a download.
+  const data = new Uint8Array(attachmentData(db, row.sha256));
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
-  return new Response(new Uint8Array(attachmentData(db, row.sha256)), {
+  return new Response(data, {
     headers: {
       "Content-Type": row.type,
       "Content-Disposition": contentDisposition(row.filename),

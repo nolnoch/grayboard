@@ -329,6 +329,15 @@ test("attachments in server mode: dm_send and board_post upload files, pushes na
   await Bun.sleep(300);
   expect(sim.pushes.find((p) => p.content === "@sim shot")!.meta.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B`);
   expect((await sim.call("attachment_get", { id: posted.attachments[0].id, dir })).path).toBe(join(realpathSync(dir), `${posted.attachments[0].id}-shot.png`));
+
+  // The audit log binds each file to the message or post that carried it.
+  const bound = (app.db.query("SELECT target, detail FROM access_log WHERE action = 'attachment.bound' ORDER BY id").all() as { target: string; detail: string }[])
+    .map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  expect(bound).toEqual([
+    { target: `attachment:${shot.id}`, identity: "alice@example.com/be", message_id: sent.message_id, recipient: "bob@example.com/fe" },
+    { target: `attachment:${notes.id}`, identity: "alice@example.com/be", message_id: sent.message_id, recipient: "bob@example.com/fe" },
+    { target: `attachment:${posted.attachments[0].id}`, identity: "alice@example.com/be", post_id: posted.post_id, board: "e2e" },
+  ]);
 }, 20_000);
 
 test("a send the server refuses releases its uploads, so they don't hold the user's unsent quota", async () => {

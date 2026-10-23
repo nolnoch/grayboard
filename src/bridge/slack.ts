@@ -133,6 +133,8 @@ export async function startSlackBridge(
     log,
     debug,
     onFatal: (reason) => void stop(1, `stopping: ${reason}`),
+    // Local mode has no audit log; the bridge's log is the trail.
+    onFileSent: (f) => log(`attachment ${f.attachment} (sha256 ${f.sha256}) → Slack file ${f.slack_file} in thread ${f.thread_ts ?? "unknown"}`),
   });
 
   // Pushes can arrive as soon as the handshake completes.

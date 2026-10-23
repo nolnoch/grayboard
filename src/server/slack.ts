@@ -350,7 +350,11 @@ export class SlackBridge implements SlackLinker {
       attachmentLimits: attachmentLimits(db),
       onFileSent: (f) =>
         writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
-          identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file,
+          identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
+        }),
+      onFileRefused: (f) =>
+        writeAudit(repo, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
+          identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
         }),
     });
     this.linked.set(link.user_id, { link, conn, relay });

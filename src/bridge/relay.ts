@@ -11,6 +11,8 @@
 // Attachments go both ways: an item's files and text go to Slack as one
 // message, and files the owner shares in Slack ride on the dm_send/board_post.
 // A file Slack won't take goes back to its sender as a reply.
+import { createHash } from "node:crypto";
+
 import {
   DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, formatSize, parseAttachmentsMeta, sanitizeFilename, sniffType,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
@@ -52,22 +54,27 @@ export type RelayOptions = {
   /** The bus's size caps, checked on Slack's sizes before downloading. */
   attachmentLimits?: AttachmentLimits;
   /** Each grayboard attachment Slack took, for a server's audit log; thread_ts null when Slack didn't say where. */
-  onFileSent?: (f: { attachment: number; slack_file: string; thread_ts: string | null }) => void;
+  onFileSent?: (f: { attachment: number; sha256: string; slack_file: string; thread_ts: string | null }) => void;
+  /** Each grayboard attachment that didn't reach Slack, once, when its sender is told. */
+  onFileRefused?: (f: Refused) => void;
   /** How long to look in files.info for the message a file share made, which can lag the share. */
   shareWaitMs?: number;
 };
 
 type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; body: string; attachments: number[] };
 
-type UploadedFile = { id: string; title: string; attachment: number };
+type UploadedFile = { id: string; title: string; attachment: number; sha256: string };
+
+/** A file that won't reach Slack; attachment null when the relay couldn't tell which. */
+export type Refused = { attachment: number | null; name: string; why: string; sha256?: string };
 
 // How far one outbox item got, kept in the store so neither a retry nor a
 // restart posts it twice or shares its files twice.
 type Progress = {
   /** Uploaded to Slack, waiting to be shared with the text. */
   files?: UploadedFile[];
-  /** Files that won't reach Slack, each "name: why". */
-  refused?: string[];
+  /** Files that won't reach Slack. */
+  refused?: Refused[];
   /** files.completeUploadExternal went out; a retry asks Slack whether it landed before resending. */
   completing?: boolean;
   /** The item's message is in Slack and the thread map knows it. */
@@ -184,7 +191,7 @@ export class Relay {
       attachments = parseAttachmentsMeta(m.attachments);
     } catch (e) {
       // The meta format changed under the relay: say so rather than drop the files.
-      progress.refused ??= [`its files (${(e as Error).message})`];
+      progress.refused ??= [{ attachment: null, name: "its files", why: (e as Error).message }];
     }
     const base = { from: m.from ?? "?", body: p.content, attachments };
     if (m.board && m.post_id) {
@@ -227,7 +234,8 @@ export class Relay {
       }
     }
     if (progress.refused?.length && !progress.told) {
-      this.log(`slack: files on ${x.kind} ${x.id} not delivered: ${progress.refused.join("; ")}`);
+      this.log(`slack: files on ${x.kind} ${x.id} not delivered: ${listRefused(progress.refused)}`);
+      for (const r of progress.refused) this.o.onFileRefused?.(r);
       await this.tell(x, progress.refused);
       progress.told = true;
       save();
@@ -246,9 +254,10 @@ export class Relay {
       try {
         a = await this.bus.attachment(id);
       } catch (e) {
-        refused.push(`attachment ${id}: ${(e as Error).message}`);
+        refused.push({ attachment: id, name: `attachment ${id}`, why: (e as Error).message });
         continue;
       }
+      const sha256 = createHash("sha256").update(a.data).digest("hex");
       try {
         const u = await this.slack.call<{ upload_url: string; file_id: string }>(
           "files.getUploadURLExternal",
@@ -256,9 +265,9 @@ export class Relay {
           { form: true },
         );
         await this.slack.upload(u.upload_url, a.data);
-        files.push({ id: u.file_id, title: a.filename, attachment: id });
+        files.push({ id: u.file_id, title: a.filename, attachment: id, sha256 });
       } catch (e) {
-        refused.push(`${a.filename}: ${refusal(e)}`);
+        refused.push({ attachment: id, name: a.filename, why: refusal(e), sha256 });
       }
     }
     progress.files = files;
@@ -290,7 +299,7 @@ export class Relay {
         );
       } catch (e) {
         const why = refusal(e);
-        progress.refused = [...(progress.refused ?? []), ...files.map((f) => `${f.title}: ${why}`)];
+        progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
         progress.files = [];
         progress.completing = false;
         save();
@@ -300,7 +309,7 @@ export class Relay {
       ts = threadTs ?? (await this.sharedTs(files[0]!.id));
     }
     const thread = threadTs ?? ts;
-    for (const f of files) this.o.onFileSent?.({ attachment: f.attachment, slack_file: f.id, thread_ts: thread });
+    for (const f of files) this.o.onFileSent?.({ attachment: f.attachment, sha256: f.sha256, slack_file: f.id, thread_ts: thread });
     return thread;
   }
 
@@ -340,9 +349,9 @@ export class Relay {
   // Files that didn't reach Slack go back to their sender, so it knows the
   // human never saw them. Sent as the human's handle, so the body says it's
   // the bridge speaking. A DM's notice replies to it; a post's is a new DM.
-  private async tell(x: Item, refused: string[]): Promise<void> {
+  private async tell(x: Item, refused: Refused[]): Promise<void> {
     const what = x.kind === "dm" ? `your message ${x.id}` : `your post ${x.id} on #${x.board}`;
-    const body = `[Slack bridge] Files on ${what} didn't reach Slack, so the human hasn't seen them: ${refused.join("; ")}. The text did reach them.`;
+    const body = `[Slack bridge] Files on ${what} didn't reach Slack, so the human hasn't seen them: ${listRefused(refused)}. The text did reach them.`;
     const r = await this.bus.call("dm_send", { to: x.from, body, ...(x.kind === "dm" ? { parent_id: x.id } : {}) });
     if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.error}`);
   }
@@ -543,8 +552,10 @@ function refusal(e: unknown): string {
   return e.code === "missing_scope" ? "the Slack app lacks files:write (reinstall it from the current manifest)" : e.code;
 }
 
-function warning(refused: string[] | undefined): string | undefined {
-  return refused?.length ? `⚠️ not delivered to Slack: ${refused.join("; ")}` : undefined;
+const listRefused = (refused: Refused[]) => refused.map((r) => `${r.name}: ${r.why}`).join("; ");
+
+function warning(refused: Refused[] | undefined): string | undefined {
+  return refused?.length ? `⚠️ not delivered to Slack: ${listRefused(refused)}` : undefined;
 }
 
 /**
