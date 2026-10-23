@@ -116,8 +116,8 @@ export async function startSlackBridge(
       scratch(async (dir) => {
         const r = await call("attachment_get", { id, dir });
         if (!r.ok) throw new Error(r.error);
-        const v = r.value as { path: string; filename: string; type: string; size: number };
-        return { id, filename: v.filename, type: v.type, size: v.size, data: new Uint8Array(await readFile(v.path)) };
+        const v = r.value as { path: string; filename: string; type: string; size: number; sha256: string };
+        return { id, filename: v.filename, type: v.type, size: v.size, sha256: v.sha256, data: new Uint8Array(await readFile(v.path)) };
       }),
     withFiles: (files, send) =>
       scratch(async (dir) => {

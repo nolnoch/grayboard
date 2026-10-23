@@ -15,7 +15,7 @@ import { checkBody } from "../core/boards.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, dispositionFilename, formatAttachmentsMeta, readAttachmentFiles, saveAttachment, serverBusDir,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, digestSha256, dispositionFilename, formatAttachmentsMeta, sha256Hex, readAttachmentFiles, saveAttachment, serverBusDir,
 } from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -295,14 +295,20 @@ async function call(name: string, a: Record<string, unknown>) {
       if (!Number.isInteger(a.id)) return { ...text("error: id must be an attachment id"), isError: true };
       const res = await api().download(`/api/attachments/${a.id}?identity=${encodeURIComponent(identity)}`);
       const data = new Uint8Array(await res.arrayBuffer());
+      // Checked before anything is saved: the bytes must be the ones the server stored.
+      const sha256 = sha256Hex(data);
+      const want = digestSha256(res.headers.get("repr-digest"));
+      if (!want) throw new Error(`attachment ${a.id}: the server sent no digest; it needs updating`);
+      if (want !== sha256) throw new Error(`attachment ${a.id}: the bytes received don't match the server's sha256`);
       const info = {
         id: a.id as number,
         filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
         type: res.headers.get("content-type") ?? "application/octet-stream",
         size: data.length,
+        sha256,
       };
       const path = await saveAttachment(info, data, a.dir, ROOTS, serverBusDir(serverUrl));
-      return text({ path, filename: info.filename, type: info.type, size: info.size });
+      return text({ path, filename: info.filename, type: info.type, size: info.size, sha256 });
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {

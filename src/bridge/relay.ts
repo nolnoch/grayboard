@@ -11,10 +11,8 @@
 // Attachments go both ways: an item's files and text go to Slack as one
 // message, and files the owner shares in Slack ride on the dm_send/board_post.
 // A file Slack won't take goes back to its sender as a reply.
-import { createHash } from "node:crypto";
-
 import {
-  DEFAULT_ATTACHMENT_LIMITS, SizeTally, checkFile, parseAttachmentsMeta, sanitizeFilename,
+  DEFAULT_ATTACHMENT_LIMITS, SizeTally, checkFile, parseAttachmentsMeta, sanitizeFilename, sha256Hex,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import type { Store, ThreadRow } from "./store.ts";
@@ -257,7 +255,12 @@ export class Relay {
         refused.push({ attachment: id, name: `attachment ${id}`, why: (e as Error).message });
         continue;
       }
-      const sha256 = createHash("sha256").update(a.data).digest("hex");
+      // What goes to Slack must be what the bus stored; the audit row names this hash.
+      const sha256 = sha256Hex(a.data);
+      if (sha256 !== a.sha256) {
+        refused.push({ attachment: id, name: a.filename, why: "its bytes don't match the stored sha256", sha256 });
+        continue;
+      }
       try {
         const u = await this.slack.call<{ upload_url: string; file_id: string }>(
           "files.getUploadURLExternal",

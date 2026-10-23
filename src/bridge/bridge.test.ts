@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { sha256Hex } from "../shared/attachments.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import { Relay, format, fromSlack, type Bus, type RelayOptions } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
@@ -164,7 +165,7 @@ function withAttachment(slack: { upload?: number; complete?: string | number; sh
       if (name === "dm_send") told.push(args);
       return { ok: true, value: name === "dm_send" ? { message_id: 99 } : [] };
     },
-    attachment: async (id) => ({ id, filename: "shot.png", type: "image/png", size: 3, data: new Uint8Array([1, 2, 3]) }),
+    attachment: async (id) => ({ id, filename: "shot.png", type: "image/png", size: 3, sha256: sha256Hex(new Uint8Array([1, 2, 3])), data: new Uint8Array([1, 2, 3]) }),
     withFiles: noFiles.withFiles,
   };
   const calls: string[] = [];
@@ -205,7 +206,7 @@ function withAttachment(slack: { upload?: number; complete?: string | number; sh
   return { bus, told, calls, said, blocks, f };
 }
 
-const LOOK = { content: "look", meta: { message_id: "1", from: "be", attachments: "7:shot.png image/png 3B" } };
+const LOOK = { content: "look", meta: { message_id: "1", from: "be", attachments: `7:shot.png image/png 3B sha256:${sha256Hex(new Uint8Array([1, 2, 3]))}` } };
 const errors = (store: Store) => (store.db.prepare(`SELECT error FROM outbox ORDER BY id`).all() as { error: string | null }[]).map((r) => r.error);
 
 function fileRelay(store: Store, x: ReturnType<typeof withAttachment>, extra: Partial<RelayOptions> = {}) {
@@ -288,6 +289,22 @@ test("files: an app without files:write still relays the text with a warning, an
   expect(x.said).toEqual([`**be** look\n\n⚠️ not delivered to Slack: ${why}`, "**be** next"]);
   expect(x.told).toEqual([{ to: "be", parent_id: 1, body: `[Slack bridge] Files on your message 1 didn't reach Slack, so the human hasn't seen them: ${why}. The text did reach them.` }]);
   expect(errors(store)).toEqual(["files_refused", null]);
+  store.close();
+});
+
+test("files: bytes that don't match the stored sha256 never reach Slack", async () => {
+  const x = withAttachment();
+  const good = x.bus.attachment;
+  x.bus.attachment = async (id) => ({ ...(await good(id)), data: new Uint8Array([1, 2, 4]) });
+  const store = new Store(join(dir, "b.db"));
+  const { relay, sent } = fileRelay(store, x);
+  relay.notify(LOOK);
+  await Bun.sleep(100);
+  expect(x.calls).toEqual(["chat.postMessage"]);
+  expect(x.said).toEqual(["**be** look\n\n⚠️ not delivered to Slack: shot.png: its bytes don't match the stored sha256"]);
+  expect(x.told).toHaveLength(1);
+  expect(sent).toEqual([]);
+  expect(errors(store)).toEqual(["files_refused"]);
   store.close();
 });
 

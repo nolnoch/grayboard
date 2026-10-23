@@ -14,7 +14,7 @@ import { callBoardTool } from "../core/tools.ts";
 import {
   attachmentData, attachmentLimits,
 } from "../core/attachments.ts";
-import { SizeTally, checkFile, contentDisposition, sanitizeFilename } from "../shared/attachments.ts";
+import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
@@ -238,6 +238,7 @@ function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: R
     headers: {
       "Content-Type": row.type,
       "Content-Disposition": contentDisposition(row.filename),
+      "Repr-Digest": reprDigest(row.sha256),
       "X-Content-Type-Options": "nosniff",
       "Cache-Control": "private, no-store",
     },

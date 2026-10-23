@@ -3,16 +3,14 @@
 // this stores their bytes, binds them to the message or post that carries
 // them, and drops them with it.
 import type { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 
 import { CoreError, TooLargeError, canSeeBoard, getPost } from "./boards.ts";
 import {
-  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize,
+  DEFAULT_ATTACHMENT_LIMITS, MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize, sha256Hex,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 
 export type AttachmentRow = AttachmentInfo & {
-  sha256: string;
   uploader: string;
   message_id: number | null;
   post_id: number | null;
@@ -22,7 +20,7 @@ export type AttachmentRow = AttachmentInfo & {
 export type AttachTarget = { message_id: number } | { post_id: number };
 type Kind = "message_id" | "post_id";
 
-const INFO = `id, filename, type, size`;
+const INFO = `id, filename, type, size, sha256`;
 
 const limitsByDb = new WeakMap<Database, AttachmentLimits>();
 
@@ -50,7 +48,7 @@ export function storeAttachment(
   opts: { now?: number; quota?: UploadQuota } = {},
 ): AttachmentRow {
   const now = opts.now ?? Date.now();
-  const sha256 = createHash("sha256").update(file.data).digest("hex");
+  const sha256 = sha256Hex(file.data);
   return db.transaction(() => {
     pruneUnbound(db, now - UNBOUND_TTL_MS);
     const q = opts.quota;
@@ -101,7 +99,7 @@ export function bindAttachments(db: Database, ids: number[], uploader: string, t
   return ids.map((id) => info(byId.get(id)!));
 }
 
-const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size });
+const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size, sha256: r.sha256 });
 
 // Each row with its attachments added, for those that have any.
 export function withAttachments<T extends { id: number }>(

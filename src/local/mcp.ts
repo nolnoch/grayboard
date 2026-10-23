@@ -342,7 +342,7 @@ async function dispatch(name: string, a: Record<string, any>) {
       return { ...text(`error: no attachment ${a.id} on a message or post you can read`), isError: true };
     }
     const path = await saveAttachment(row, attachmentData(db, row.sha256), a.dir, ROOTS, BUS_DIR);
-    return text({ path, filename: row.filename, type: row.type, size: row.size });
+    return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
   }
 
   if (isBoardTool(name)) {

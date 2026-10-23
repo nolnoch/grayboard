@@ -31,9 +31,12 @@ import {
   readAttachmentFiles,
   SizeTally,
   checkFile,
+  digestSha256,
+  reprDigest,
   sanitizeFilename,
   saveAttachment,
   serverBusDir,
+  sha256Hex,
   sniffType,
   typedName,
   type AttachmentFile,
@@ -117,19 +120,27 @@ describe("type detection and names", () => {
     expect(() => new SizeTally({ file: 1, total: 1 }, 6)).toThrow("at most 5 attachments per message");
   });
 
+  test("Repr-Digest carries the sha256 and reads back; anything else reads as none", () => {
+    const h = sha256Hex(PNG);
+    expect(digestSha256(reprDigest(h))).toBe(h);
+    expect(digestSha256(`sha-512=:AAAA:, ${reprDigest(h)}`)).toBe(h);
+    expect(digestSha256(null)).toBeNull();
+    expect(digestSha256("md5=:AAAA:")).toBeNull();
+  });
+
   test("meta lists attachments and parses back to ids", () => {
     const meta = formatAttachmentsMeta([
-      { id: 12, filename: "shot 1.png", type: "image/png", size: 340 * 1024 },
-      { id: 13, filename: "n.md", type: "text/markdown", size: 900 },
+      { id: 12, filename: "shot 1.png", type: "image/png", size: 340 * 1024, sha256: "a".repeat(64) },
+      { id: 13, filename: "n.md", type: "text/markdown", size: 900, sha256: "b".repeat(64) },
     ]);
-    expect(meta).toBe("12:shot 1.png image/png 340KB; 13:n.md text/markdown 900B");
+    expect(meta).toBe(`12:shot 1.png image/png 340KB sha256:${"a".repeat(64)}; 13:n.md text/markdown 900B sha256:${"b".repeat(64)}`);
     expect(parseAttachmentsMeta(meta)).toEqual([12, 13]);
     expect(parseAttachmentsMeta(undefined)).toEqual([]);
   });
 
   test("meta round-trips every size class and sanitized name, and refuses what it can't read", () => {
     const list = [0, 1023, 1024, 340 * 1024, 1024 * 1024, 1.5 * 1024 * 1024, 25 * 1024 * 1024].map((size, i) => ({
-      id: 100 + i, filename: sanitizeFilename(`a b;c:${i} é.txt`), type: i % 2 ? "image/png" : "text/markdown", size,
+      id: 100 + i, filename: sanitizeFilename(`a b;c:${i} é.txt`), type: i % 2 ? "image/png" : "text/markdown", size, sha256: "c".repeat(64),
     }));
     expect(parseAttachmentsMeta(formatAttachmentsMeta(list))).toEqual(list.map((a) => a.id));
     expect(() => parseAttachmentsMeta("12:shot.png image/png 3B; 13 notes.md")).toThrow(/unreadable/);
@@ -221,7 +232,7 @@ describe("reading files to attach", () => {
   });
 
   test("saving goes to the default directory or a dir under a root, private to the user", async () => {
-    const a = { id: 7, filename: "shot.png", type: "image/png", size: PNG.length };
+    const a = { id: 7, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
     const def = join(outside, "saved");
     const p1 = await saveAttachment(a, PNG, undefined, [root], "local-x", { GRAYBOARD_ATTACHMENTS_DIR: def });
     expect(p1).toBe(join(def, "local-x", "7-shot.png"));
@@ -235,7 +246,7 @@ describe("reading files to attach", () => {
   test("saves are refused in dot directories under a root", async () => {
     mkdirSync(join(root, ".claude", "rules"), { recursive: true });
     mkdirSync(join(root, "docs"), { recursive: true });
-    const a = { id: 9, filename: "evil.md", type: "text/markdown", size: 2 };
+    const a = { id: 9, filename: "evil.md", type: "text/markdown", size: 2, sha256: sha256Hex(PNG) };
     await expect(saveAttachment(a, PNG, join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
     expect(() => checkSaveDir(join(root, ".claude"), [root], root)).toThrow("dot directories");
     expect(checkSaveDir("docs", [root], root)).toBe(join(root, "docs"));
@@ -247,7 +258,7 @@ describe("reading files to attach", () => {
     writeFileSync(victim, "keep");
     symlinkSync(victim, join(root, "8-shot.png"));
     writeFileSync(join(root, "8-shot-2.png"), "other bytes");
-    const a = { id: 8, filename: "shot.png", type: "image/png", size: PNG.length };
+    const a = { id: 8, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
     const p = await saveAttachment(a, PNG, root, [root], "b");
     expect(p).toBe(join(root, "8-shot-3.png"));
     expect(readFileSync(victim, "utf8")).toBe("keep");
@@ -364,10 +375,10 @@ describe("storage", () => {
     const m = msg();
     expect(() => bindAttachments(db, [theirs.id], "be", { message_id: m })).toThrow(`attachment ${theirs.id} isn't an unsent upload of yours`);
     expect(() => bindAttachments(db, [999], "be", { message_id: m })).toThrow("isn't an unsent upload");
-    expect(bindAttachments(db, [mine.id], "be", { message_id: m })).toEqual([{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1 }]);
+    expect(bindAttachments(db, [mine.id], "be", { message_id: m })).toEqual([{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1, sha256: mine.sha256 }]);
     expect(() => bindAttachments(db, [mine.id], "be", { message_id: msg() })).toThrow("isn't an unsent upload");
     expect(withAttachments(db, "message", [{ id: m }, { id: m + 100 }])).toEqual([
-      { id: m, attachments: [{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1 }] },
+      { id: m, attachments: [{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1, sha256: mine.sha256 }] },
       { id: m + 100 },
     ]);
   });
@@ -390,10 +401,10 @@ describe("storage", () => {
 
     subscribe(db, "fe", "e2e", "push");
     const r = post(db, "be", "e2e", "see shot", null, { attachment_ids: [up.id] });
-    const info = { id: up.id, filename: "shot.png", type: "image/png", size: PNG.length };
+    const info = { id: up.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: sha256Hex(PNG) };
     expect(r.attachments).toEqual([info]);
     const [item] = pendingFor(db, "fe");
-    expect(boardNotification(item!).meta.attachments).toBe(`${up.id}:shot.png image/png 11B`);
+    expect(boardNotification(item!).meta.attachments).toBe(`${up.id}:shot.png image/png 11B sha256:${sha256Hex(PNG)}`);
     expect(read(db, "fe", "e2e", { thread: r.post.id }).posts[0]!.attachments).toEqual([info]);
   });
 
@@ -401,7 +412,7 @@ describe("storage", () => {
     const up = storeAttachment(db, "be", file("a"));
     expect(() => callBoardTool(db, "be", "board_post", { board: "e2e", body: "x", attachments: ["/etc/hosts"] })).toThrow("MCP process");
     const r = callBoardTool(db, "be", "board_post", { board: "e2e", body: "x", attachment_ids: [up.id] }).result as { attachments: unknown[] };
-    expect(r.attachments).toEqual([{ id: up.id, filename: "f.txt", type: "text/plain", size: 1 }]);
+    expect(r.attachments).toEqual([{ id: up.id, filename: "f.txt", type: "text/plain", size: 1, sha256: up.sha256 }]);
   });
 
   test("unbound uploads are pruned after their TTL; pruned posts take their attachments", () => {

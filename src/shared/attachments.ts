@@ -19,8 +19,11 @@ export const UNBOUND_TTL_MS = 3_600_000;
 // How many bytes of unsent uploads one user may hold on a server at a time.
 export const unboundCap = (limits: AttachmentLimits): number => 2 * limits.total;
 
-// What reads and pushes show for each attachment.
-export type AttachmentInfo = { id: number; filename: string; type: string; size: number };
+// What reads and pushes show for each attachment. sha256 is of the bytes, so a
+// reader can check what it saved and match it against the audit log.
+export type AttachmentInfo = { id: number; filename: string; type: string; size: number; sha256: string };
+
+export const sha256Hex = (data: Uint8Array): string => createHash("sha256").update(data).digest("hex");
 
 export type AttachmentFile = { filename: string; type: string; data: Uint8Array };
 
@@ -257,9 +260,9 @@ export function formatSize(n: number): string {
 }
 
 // The channel meta value for a message's or post's attachments:
-// "12:shot.png image/png 340KB; 13:notes.md text/markdown 2KB".
+// "12:shot.png image/png 340KB sha256:<hex>; 13:notes.md text/markdown 2KB sha256:<hex>".
 export function formatAttachmentsMeta(list: AttachmentInfo[]): string {
-  return list.map((a) => `${a.id}:${a.filename} ${a.type} ${formatSize(a.size)}`).join("; ");
+  return list.map((a) => `${a.id}:${a.filename} ${a.type} ${formatSize(a.size)} sha256:${a.sha256}`).join("; ");
 }
 
 // The attachment ids in such a meta value, in order. Throws on any item that
@@ -269,7 +272,7 @@ export function formatAttachmentsMeta(list: AttachmentInfo[]): string {
 export function parseAttachmentsMeta(meta: string | undefined): number[] {
   if (!meta) return [];
   return meta.split("; ").map((item) => {
-    const m = /^(\d+):.+ \S+\/\S+ \d+(?:\.\d)?(?:B|KB|MB)$/.exec(item);
+    const m = /^(\d+):.+ \S+\/\S+ \d+(?:\.\d)?(?:B|KB|MB) sha256:[0-9a-f]{64}$/.exec(item);
     if (!m) throw new Error(`unreadable attachments meta item: ${JSON.stringify(item)}`);
     return Number(m[1]);
   });
@@ -371,6 +374,15 @@ export const ATTACHMENT_GET_TOOL = {
     required: ["id"],
   },
 };
+
+// The Repr-Digest (RFC 9530) a server sends an attachment with, and the hex
+// sha256 a client reads back from it to check the bytes it got.
+export const reprDigest = (sha256: string): string => `sha-256=:${Buffer.from(sha256, "hex").toString("base64")}:`;
+
+export function digestSha256(header: string | null): string | null {
+  const m = /(?:^|,)\s*sha-256=:([A-Za-z0-9+/]+=*):/.exec(header ?? "");
+  return m ? Buffer.from(m[1]!, "base64").toString("hex") : null;
+}
 
 // The Content-Disposition a server sends an attachment with, and the filename
 // a client reads back from it (sanitizeFilename's output, so no quotes).

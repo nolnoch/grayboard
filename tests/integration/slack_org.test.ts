@@ -162,7 +162,7 @@ test("attachments cross the org bridge both ways, and the audit log says where t
     slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
     const got = await until(() => be.pushes.find((p) => p.content === "here"));
     expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
-    expect(got.meta.attachments).toMatch(/^\d+:reply\.md text\/markdown 3B$/);
+    expect(got.meta.attachments).toMatch(/^\d+:reply\.md text\/markdown 3B sha256:[0-9a-f]{64}$/);
     const id = Number(got.meta.attachments!.split(":")[0]);
     const saved = await be.call("attachment_get", { id, dir: tmp });
     expect(readFileSync(saved.path, "utf8")).toBe("ok\n");

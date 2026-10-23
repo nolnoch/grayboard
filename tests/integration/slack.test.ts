@@ -290,14 +290,14 @@ test("files the owner shares in Slack ride on the reply or the new conversation"
   slack.say("", { thread_ts: slackTsOf(top), ...share([slack.host("run.log", "line 1\nline 2\n")]) });
   const got = await until(() => be.pushes.find((p) => p.meta.attachments));
   expect(got.content).toBe("run.log");
-  expect(got.meta.attachments).toMatch(/^\d+:run\.log text\/plain 14B$/);
+  expect(got.meta.attachments).toMatch(/^\d+:run\.log text\/plain 14B sha256:[0-9a-f]{64}$/);
   const saved = await call(be.c, "attachment_get", { id: firstId(got.meta.attachments), dir });
   expect(readFileSync(saved.path, "utf8")).toBe("line 1\nline 2\n");
 
   // Top level, and a file the event names only by id (files.info has the rest).
   const m = slack.say("@be the screenshot", share([slack.host("shot.png", PNG, { idOnly: true })]));
   const got2 = await until(() => be.pushes.find((p) => p.content === "the screenshot"));
-  expect(got2.meta.attachments).toMatch(/^\d+:shot\.png image\/png 12B$/);
+  expect(got2.meta.attachments).toMatch(/^\d+:shot\.png image\/png 12B sha256:[0-9a-f]{64}$/);
   expect(new Uint8Array(readFileSync((await call(be.c, "attachment_get", { id: firstId(got2.meta.attachments), dir })).path))).toEqual(PNG);
   await until(() => slack.reactions().find((r) => r.timestamp === m.ts));
 
@@ -307,7 +307,7 @@ test("files the owner shares in Slack ride on the reply or the new conversation"
   slack.say("#e2e", share([slack.host("plan.md", "1. ship\n")]));
   const post = await until(() => be.pushes.find((p) => p.meta.board === "e2e"));
   expect(post.content).toBe("plan.md");
-  expect(post.meta.attachments).toMatch(/^\d+:plan\.md text\/markdown 8B$/);
+  expect(post.meta.attachments).toMatch(/^\d+:plan\.md text\/markdown 8B sha256:[0-9a-f]{64}$/);
 }, 30_000);
 
 test("a Slack file that can't come along refuses the whole message, in its thread", async () => {

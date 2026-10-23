@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { localBusDir } from "../../src/shared/attachments.ts";
+import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 
 const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
 
@@ -564,12 +564,12 @@ test("attachments: sent with a DM or post, shown on reads and pushes, fetched by
   await expect(call(be, "dm_send", { to: "fe", body: "x", attachments: ["/etc/hosts"] })).rejects.toThrow(/outside the directories/);
   const sent = await call(be, "dm_send", { to: "fe", body: "see these", attachments: ["shot.png", join(dir, "notes.md")] });
   const [shot, notes] = sent.attachments;
-  expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length });
+  expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) });
   expect(notes).toMatchObject({ filename: "notes.md", type: "text/markdown", size: 7 });
 
   await Bun.sleep(300);
   const meta = pushes.find((m) => m.message_id === String(sent.message_id))!;
-  expect(meta.attachments).toBe(`${shot.id}:shot.png image/png 10B; ${notes.id}:notes.md text/markdown 7B`);
+  expect(meta.attachments).toBe(`${shot.id}:shot.png image/png 10B sha256:${sha256Hex(png)}; ${notes.id}:notes.md text/markdown 7B sha256:${sha256Hex(new TextEncoder().encode("# notes"))}`);
   expect((await call(fe, "dm_thread", { thread: sent.message_id }))[0].attachments).toEqual(sent.attachments);
   expect((await call(fe, "dm_inbox")).unanswered[0].attachments).toEqual(sent.attachments);
 
@@ -585,9 +585,9 @@ test("attachments: sent with a DM or post, shown on reads and pushes, fetched by
   await call(fe, "board_subscribe", { board: "e2e", mode: "push" });
   await expect(call(be, "board_post", { board: "e2e", body: "x", parent_id: 9999, attachments: ["shot.png"] })).rejects.toThrow(/parent_id/);
   const posted = await call(be, "board_post", { board: "e2e", body: "shot", attachments: ["shot.png"] });
-  expect(posted.attachments).toEqual([{ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length }]);
+  expect(posted.attachments).toEqual([{ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) }]);
   await Bun.sleep(300);
-  expect(pushes.find((m) => m.post_id === String(posted.post_id))!.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B`);
+  expect(pushes.find((m) => m.post_id === String(posted.post_id))!.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B sha256:${sha256Hex(png)}`);
   expect((await call(sim, "board_read", { board: "e2e" })).posts[0].attachments).toEqual(posted.attachments);
   expect((await call(sim, "attachment_get", { id: posted.attachments[0].id })).size).toBe(png.length);
 

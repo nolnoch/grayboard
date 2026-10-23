@@ -320,7 +320,7 @@ export class SlackBridge implements SlackLinker {
           writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
           throw new Error(`no attachment ${id} on a message or post you can read`);
         }
-        return { id: row.id, filename: row.filename, type: row.type, size: row.size, data: attachmentData(db, row.sha256) };
+        return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: attachmentData(db, row.sha256) };
       },
       // Files the relay checked (checkFile), stored as the HTTP upload route
       // stores them; released again if the send doesn't carry them.

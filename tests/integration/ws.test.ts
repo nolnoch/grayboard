@@ -2,6 +2,7 @@
 // clients for two or three users. Covers the distributed board semantics in
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 
 import { startServer } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
@@ -801,7 +802,7 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   const up = await upload(alice, "be", "../shot.png", PNG);
   expect(up.status).toBe(201);
   expect(up.body).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: PNG.length, sha256: expect.any(String) });
-  const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length };
+  const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: up.body.sha256 };
   expect(audits("attachment.uploaded")).toEqual([
     { actor: "alice@example.com", target: `attachment:${up.body.id}`, detail: expect.stringContaining('"identity":"alice@example.com/be"') },
   ]);
@@ -826,6 +827,7 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect(got.status).toBe(200);
   expect(got.headers.get("content-type")).toBe("image/png");
   expect(got.headers.get("content-disposition")).toBe("attachment; filename*=UTF-8''shot.png");
+  expect(got.headers.get("repr-digest")).toBe(`sha-256=:${createHash("sha256").update(PNG).digest("base64")}:`);
   expect(new Uint8Array(await got.arrayBuffer())).toEqual(PNG);
   expect((await download(alice, "be", up.body.id)).status).toBe(200);
   // Not a party: reads as missing, and is logged.
@@ -852,7 +854,7 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   // A client can't name paths for the server to read.
   expect(await a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).toMatchObject({ type: "error" });
   const posted = await a.call("board_post", { board: "eng", body: "@sim plan attached", attachment_ids: [up.body.id] });
-  const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6 };
+  const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6, sha256: up.body.sha256 };
   expect(posted.result.attachments).toEqual([info]);
   expect((await c.next(boardPush)).item.post.attachments).toEqual([info]);
   expect((await download(carol, "sim", up.body.id)).status).toBe(200);
