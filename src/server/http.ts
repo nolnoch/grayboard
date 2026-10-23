@@ -5,12 +5,13 @@ import {
   mintToken, hashToken, type AuthedUser,
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
-import type { UploadGate } from "./uploads.ts";
+import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { CoreError, TooLargeError } from "../core/errors.ts";
+import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
@@ -223,12 +224,13 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
     // A declared length over the cap is refused before the body is read.
     new SizeTally(repo.attachmentLimits, 1).add(label, Number(declared));
     release = await uploads.reserve(authed.user_email, Number(declared), req.signal);
-    const data = new Uint8Array(await req.arrayBuffer());
+    const data = await readUploadBody(req, Number(declared), transferTimeoutMs(Number(declared)));
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
     const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
     return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
   } catch (e) {
     if (e instanceof TooLargeError) return refuse("too_large", e.message, 413);
+    if (e instanceof UploadTimeout) return refuse("timeout", e.message, 408);
     if (e instanceof CoreError) return refuse("bad_request", e.message, 400);
     throw e;
   } finally {
