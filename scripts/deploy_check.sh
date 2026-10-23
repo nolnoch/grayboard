@@ -11,7 +11,7 @@ fi
 url="${1%/}/healthz"
 want="${2#v}"
 
-body="$(curl -fsS --max-time 10 "$url")" || { echo "deploy_check: no healthy answer from ${url}" >&2; exit 1; }
+body="$(curl -fsSL --max-time 10 "$url")" || { echo "deploy_check: no healthy answer from ${url}" >&2; exit 1; }
 got="$(printf '%s' "$body" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
 case "$body" in *'"ok":true'*) ok=1 ;; *) ok=0 ;; esac
 if [ "$ok" != 1 ] || [ "$got" != "$want" ]; then

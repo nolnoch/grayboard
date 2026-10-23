@@ -9,25 +9,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "../../src/cli/adapters.ts";
-import { newer } from "../../src/cli/update.ts";
+import { REPO, TARGET } from "../../src/cli/update.ts";
 import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { ROOT } from "../support/paths.ts";
 import { ReleaseServer } from "../support/release_server.ts";
-import { previousRelease, releaseBinaries } from "../support/releases.ts";
+import { ownUpdater, previousRelease, releaseBinaries } from "../support/releases.ts";
+import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
 
-const REPO = "nolnoch/grayboard";
-const ASSET = `grayboard-${process.platform}-${process.arch}`;
+const ASSET = `grayboard-${TARGET}`;
 const TAG = `v${pkg.version}`;
-// The last release whose `grayboard update` ignores GRAYBOARD_RELEASES_URL:
-// from it back, a build of this tree versioned 0.0.0 runs the update instead.
-const LAST_WITHOUT_RELEASES_URL = "v1.10.0";
+// The release the update test starts from (scripts/e2e.sh runs it per tag).
+const FROM = process.env.GRAYBOARD_UPGRADE_FROM ?? (await previousRelease());
 
 let buildDir: string;
 let built: string;
 let dir: string;
+let label: string;
 let home: string;
 let bin: string;
 let releases: ReleaseServer | undefined;
@@ -54,11 +54,15 @@ beforeEach(() => {
   }
 });
 
+// Under scripts/e2e.sh each test keeps its temp HOME (less the installed
+// binaries), the stubs' argv.log and the release server's requests.
 afterEach(() => {
+  if (releases) writeFileSync(join(dir, "requests.log"), releases.requests.join("\n") + "\n");
   releases?.stop();
   releases = undefined;
   srv?.stop();
   srv = undefined;
+  keep(label, dir, (p) => p.startsWith(bin + "/") || p.startsWith(join(dir, "grayboard-")));
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -102,6 +106,7 @@ function expectRegistered(): void {
 }
 
 test("install.sh installs the latest release; setup --local registers it with every harness", async () => {
+  label = "install-setup-local";
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
   expect(await expectOk(install())).toContain(`installing ${TAG}`);
   expect(releases.requests).toEqual(expect.arrayContaining([`HEAD /${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
@@ -113,6 +118,7 @@ test("install.sh installs the latest release; setup --local registers it with ev
 }, 60_000);
 
 test("setup --server keeps the sign-in at mode 600; logout truncates it; setup --local removes it", async () => {
+  label = "setup-server-logout";
   srv = new TestServer();
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
   await expectOk(install({ GRAYBOARD_VERSION: TAG }));
@@ -134,10 +140,10 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   expect(existsSync(CREDENTIALS())).toBe(false);
 }, 60_000);
 
-test("update replaces an older release with the build under test and refreshes its adapters", async () => {
-  const from = process.env.GRAYBOARD_UPGRADE_FROM ?? (await previousRelease());
-  const old = newer(from, LAST_WITHOUT_RELEASES_URL)
-    ? { tag: from, cli: (await releaseBinaries(from)).cli }
+test(`update from ${FROM} replaces it with the build under test and refreshes its adapters`, async () => {
+  label = `update-from-${FROM}`;
+  const old = ownUpdater(FROM)
+    ? { tag: FROM, cli: (await releaseBinaries(FROM)).cli }
     : { tag: "v0.0.0", cli: await buildCli(join(dir, "grayboard-v0.0.0"), "0.0.0") };
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built }, [old.tag]: { [ASSET]: old.cli } });
   await expectOk(install({ GRAYBOARD_VERSION: old.tag }));
@@ -153,7 +159,7 @@ test("update replaces an older release with the build under test and refreshes i
   symlinkSync(join(dir, "checkout.ts"), opencode);
 
   const out = await expectOk(grayboard("update"));
-  expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG}.`);
+  expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}.`);
   expect(out).toContain(`Refreshed ${omp}`);
   expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(pkg.version);

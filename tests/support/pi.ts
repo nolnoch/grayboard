@@ -16,7 +16,8 @@ import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
-const PI_CLI = join(dirname(PI_PKG), JSON.parse(readFileSync(PI_PKG, "utf8")).bin.pi);
+const PI = JSON.parse(readFileSync(PI_PKG, "utf8")) as { version: string; bin: { pi: string } };
+const PI_CLI = join(dirname(PI_PKG), PI.bin.pi);
 
 // ── pi in RPC mode ───────────────────────────────────────────────────────────
 
@@ -58,7 +59,8 @@ function startPi(dir: string, modelPort: number, procs: ChildProcess[], bin?: st
   if (bin) {
     // The adapter the binary carries: refresh-adapters rewrites an installed one.
     writeFileSync(extension, "");
-    const r = Bun.spawnSync([bin, "refresh-adapters"], { env: localEnv(dir, undefined, { PI_CODING_AGENT_DIR: agentDir }) });
+    const r = Bun.spawnSync([bin, "refresh-adapters"], { env: localEnv(dir, undefined, { PI_CODING_AGENT_DIR: agentDir }), timeout: 10_000, killSignal: "SIGKILL" });
+    if (r.exitedDueToTimeout) throw new Error(`${bin} refresh-adapters: no exit in 10 s`);
     if (r.exitCode !== 0 || !readFileSync(extension, "utf8")) throw new Error(`${bin} refresh-adapters: ${r.stderr}`);
   } else {
     copyFileSync(ADAPTER, extension);
@@ -83,8 +85,17 @@ function startPi(dir: string, modelPort: number, procs: ChildProcess[], bin?: st
 }
 
 // A DM wakes the session, which replies with dm_send; a digest rides along as context.
-// The caller closes the MCP sessions (closeSessions).
+// The caller closes the MCP sessions (closeSessions). A failure names pi's version.
 export async function piScenario(dir: string, bin?: string): Promise<void> {
+  try {
+    await scenario(dir, bin);
+  } catch (e) {
+    if (e instanceof Error) e.message = `pi ${PI.version}: ${e.message}`;
+    throw e;
+  }
+}
+
+async function scenario(dir: string, bin?: string): Promise<void> {
   const procs: ChildProcess[] = [];
   let model: ReturnType<typeof startFakeModel> | undefined;
   try {
@@ -143,7 +154,16 @@ export async function piScenario(dir: string, bin?: string): Promise<void> {
       "pi offline",
     );
   } finally {
-    for (const p of procs) p.kill();
+    // SIGTERM lets pi stop its own children; awaited (SIGKILL after 5 s) so
+    // the caller's rmSync doesn't race a pi still writing in dir.
+    await Promise.all(procs.map(async (p) => {
+      if (p.exitCode !== null || p.signalCode !== null) return;
+      const exited = new Promise((r) => p.once("exit", r));
+      p.kill("SIGTERM");
+      const force = setTimeout(() => p.kill("SIGKILL"), 5_000);
+      await exited;
+      clearTimeout(force);
+    }));
     model?.stop();
   }
 }

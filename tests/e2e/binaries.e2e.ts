@@ -52,7 +52,8 @@ function readEnvFile(path: string): Record<string, string> {
 
 test("both binaries report the tag", () => {
   for (const bin of [CLI, SERVER]) {
-    const r = Bun.spawnSync([bin, "--version"]);
+    const r = Bun.spawnSync([bin, "--version"], { timeout: 10_000, killSignal: "SIGKILL" });
+    expect(r.exitedDueToTimeout ?? false, `${bin} --version: no answer in 10 s`).toBe(false);
     expect(r.exitCode, `${bin}: ${r.stderr}`).toBe(0);
     expect(r.stdout.toString().trim()).toBe(TAG.replace(/^v/, ""));
   }

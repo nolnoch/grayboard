@@ -23,8 +23,14 @@
 set -euo pipefail
 
 REPO="${GRAYBOARD_REPO:-nolnoch/grayboard}"
+# One origin for every download, without trailing slashes. It serves the
+# binaries this script installs, so https, or http to this machine only.
 RELEASES_URL="${GRAYBOARD_RELEASES_URL:-https://github.com}"
-RELEASES_URL="${RELEASES_URL%/}"
+while [ "${RELEASES_URL%/}" != "$RELEASES_URL" ]; do RELEASES_URL="${RELEASES_URL%/}"; done
+case "$RELEASES_URL" in
+  https://* | http://localhost | http://localhost:* | http://localhost/* | http://127.0.0.1 | http://127.0.0.1:* | http://127.0.0.1/* | "http://[::1]" | "http://[::1]:"* | "http://[::1]/"*) ;;
+  *) echo "grayboard: GRAYBOARD_RELEASES_URL must be https (or http to localhost): ${GRAYBOARD_RELEASES_URL}" >&2; exit 1 ;;
+esac
 VERSION="${GRAYBOARD_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_SERVER="${INSTALL_SERVER:-0}"
@@ -55,7 +61,7 @@ echo "grayboard: detected ${target}"
 # server install knows which version /healthz must report.
 if [ "$VERSION" = "latest" ]; then
   latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/${REPO}/releases/latest")" || {
-    echo "grayboard: couldn't resolve the latest release of ${REPO}" >&2; exit 1; }
+    echo "grayboard: couldn't resolve the latest release of ${REPO} from ${RELEASES_URL}" >&2; exit 1; }
   VERSION="${latest_url##*/}"
 fi
 echo "grayboard: installing ${VERSION}"

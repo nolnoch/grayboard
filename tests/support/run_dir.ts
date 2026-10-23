@@ -15,10 +15,11 @@ function copyable(p: string): boolean {
   return s.isFile() || s.isDirectory() || s.isSymbolicLink();
 }
 
-// Copies `path` (a file or a directory, less caches and sockets) to <run dir>/<name>.
-export function keep(name: string, path: string): void {
+// Copies `path` (a file or a directory, less caches, sockets and whatever
+// `skip` names, such as installed binaries) to <run dir>/<name>.
+export function keep(name: string, path: string, skip: (p: string) => boolean = () => false): void {
   const run = process.env.GRAYBOARD_E2E_RUN_DIR;
   if (!run) return;
   mkdirSync(run, { recursive: true });
-  cpSync(path, join(run, name), { recursive: true, filter: (p) => !isCache(p) && copyable(p) });
+  cpSync(path, join(run, name), { recursive: true, filter: (p) => !isCache(p) && copyable(p) && !skip(p) });
 }

@@ -4,10 +4,10 @@
 // database had still exists, and each table matches a fresh database's column
 // for column (a missing guarded ALTER shows here); (b) what was written reads
 // back through this tree's tools. The same for the local Slack bridge's store.
-// Per push: the latest release, which carries
-// this tree's version until the next bump. GRAYBOARD_UPGRADE_FROM=<tag> picks another (the nightly
-// matrix runs every v1.x tag). Under scripts/e2e.sh each test keeps the
-// files as the release left them and as this tree left them in the run dir.
+// Per push: the latest release, which carries this tree's version until the
+// next bump. GRAYBOARD_UPGRADE_FROM=<tag> picks another (the nightly matrix
+// runs every v1.x tag). Under scripts/e2e.sh each test keeps the files as the
+// release left them and as this tree left them in the run dir.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
@@ -21,10 +21,14 @@ import { runCli } from "../support/cli.ts";
 import { localEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
+import { newer } from "../../src/cli/update.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+
+// The release that writes the files; every test name carries it.
+const FROM = process.env.GRAYBOARD_UPGRADE_FROM ?? (await latestRelease());
 
 let rel: ReleaseBinaries;
 let dir: string;
@@ -36,33 +40,58 @@ let oldBridge: Subprocess | undefined;
 let bridge: BridgeHandle | undefined;
 
 beforeAll(async () => {
-  rel = await releaseBinaries(process.env.GRAYBOARD_UPGRADE_FROM ?? (await latestRelease()));
+  rel = await releaseBinaries(FROM);
 }, 120_000);
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-upgrade-"));
 });
 
+// Each step runs even if an earlier one throws, so a failure never orphans
+// the release's server or loses the run dir's copy; the first error is rethrown.
 afterEach(async () => {
-  oldBridge?.kill("SIGKILL");
-  oldBridge = undefined;
-  await bridge?.stop();
-  bridge = undefined;
-  await closeSessions();
-  slack?.stop();
-  slack = undefined;
-  if (old) await stopOld();
-  srv?.stop();
-  srv = undefined;
-  keep(label, dir);
-  rmSync(dir, { recursive: true, force: true });
+  const steps: (() => unknown)[] = [
+    () => {
+      oldBridge?.kill("SIGKILL");
+      oldBridge = undefined;
+    },
+    async () => {
+      const b = bridge;
+      bridge = undefined;
+      await b?.stop();
+    },
+    () => closeSessions(),
+    () => {
+      slack?.stop();
+      slack = undefined;
+    },
+    async () => {
+      if (old) await stopOld();
+    },
+    () => {
+      srv?.stop();
+      srv = undefined;
+    },
+    () => keep(label, dir),
+    () => rmSync(dir, { recursive: true, force: true }),
+  ];
+  let first: unknown;
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (e) {
+      first ??= e;
+    }
+  }
+  if (first) throw first;
 });
 
 // Stops the release's server, keeping its log beside its database.
 async function stopOld(): Promise<void> {
-  await old!.stop();
-  writeFileSync(join(dir, "old", "server.log"), old!.log());
+  const o = old!;
   old = undefined;
+  await o.stop();
+  writeFileSync(join(dir, "old", "server.log"), o.log());
 }
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 4, 2]);
@@ -112,29 +141,40 @@ async function hasCommand(bin: string, command: string, ...path: string[]): Prom
 }
 
 // What the old release wrote, for the read-back.
-type Written = { root: number; watched: boolean; inbox: boolean; queued?: number; attachment?: number };
+type Written = { root: number; muted: boolean; watched: boolean; inbox: boolean; acked: boolean; queued?: number; attachment?: number; postFile?: number };
 
 // Two agents write through every tool path the release has: a board, a thread,
 // a board and a thread mode, a claim and a watch, a status, DMs (one pending,
-// one with a file) and their acks.
+// one with a file, one acked) and a post with a file. peer_status is written
+// for the schema check only: it clears when a session restarts.
 async function writeAll(be: Session, fe: Session, feHandle: string, beHandle: string, cwd: string): Promise<Written> {
   const tools = await surface(be);
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   const root = (await be.call("board_post", { board: "e2e", body: "root" })).post_id as number;
   await fe.call("board_post", { board: "e2e", body: "reply", parent_id: root });
   await fe.call("board_subscribe", { board: "e2e", mode: "digest" });
-  if (tools.get("board_subscribe")!.has("thread")) await fe.call("board_subscribe", { board: "e2e", thread: root, mode: "off" });
+  const muted = tools.get("board_subscribe")!.has("thread");
+  if (muted) await fe.call("board_subscribe", { board: "e2e", thread: root, mode: "off" });
   await be.call("claim_take", { key: "ticket:ENG-1", board: "e2e", note: "upgrade" });
-  const w: Written = { root, watched: tools.has("claim_watch"), inbox: tools.has("dm_inbox") };
+  const w: Written = { root, muted, watched: tools.has("claim_watch"), inbox: tools.has("dm_inbox"), acked: tools.has("dm_ack") };
   if (w.watched) await fe.call("claim_watch", { key: "ticket:ENG-1" });
   if (tools.has("peer_status")) await be.call("peer_status", { text: "soaking" });
   // fe is online, so this is pushed and acked; be leaves it unanswered.
   await fe.call("dm_send", { to: beHandle, body: "question" });
+  if (w.acked) {
+    const fyi = (await fe.call("dm_send", { to: beHandle, body: "fyi" })).message_id;
+    // Early releases name the parameter id.
+    await be.call("dm_ack", { [tools.get("dm_ack")!.has("message_id") ? "message_id" : "id"]: fyi });
+  }
   const send = tools.get("dm_send")!;
   if (send.has("pending")) w.queued = (await be.call("dm_send", { to: feHandle, body: "queued", pending: true })).message_id;
   if (send.has("attachments")) {
     writeFileSync(join(cwd, "shot.png"), PNG);
     w.attachment = (await be.call("dm_send", { to: feHandle, body: "file", attachments: [join(cwd, "shot.png")] })).attachments[0].id;
+  }
+  if (tools.get("board_post")!.has("attachments")) {
+    writeFileSync(join(cwd, "shot.png"), PNG);
+    w.postFile = (await be.call("board_post", { board: "e2e", body: "screenshot", attachments: [join(cwd, "shot.png")] })).attachments[0].id;
   }
   return w;
 }
@@ -142,6 +182,7 @@ async function writeAll(be: Session, fe: Session, feHandle: string, beHandle: st
 async function readAll(be: Session, fe: Session, w: Written, beHandle: string, feHandle: string): Promise<void> {
   const thread = await fe.call("board_read", { board: "e2e", thread: w.root });
   expect(thread.posts.map((p: { body: string }) => p.body)).toEqual(["root", "reply"]);
+  expect(await fe.call("board_list")).toEqual(expect.arrayContaining([expect.objectContaining({ name: "e2e", purpose: "fixtures", mode: "digest" })]));
   expect(await fe.call("claim_list")).toMatchObject([{ key: "ticket:ENG-1", holder: beHandle, note: "upgrade" }]);
   // The watch reads back as its effect: fe hears the release.
   if (w.watched) {
@@ -153,14 +194,28 @@ async function readAll(be: Session, fe: Session, w: Written, beHandle: string, f
   // Acks are what dm_inbox reads; a release without it may not have kept them alike.
   const inbox = await be.call("dm_inbox");
   if (w.inbox) expect(inbox.unanswered.map((m: { body: string }) => m.body)).toContain("question");
+  if (w.inbox && w.acked) expect(inbox.unanswered.map((m: { body: string }) => m.body)).not.toContain("fyi");
   if (w.queued) expect(inbox.promised.map((m: { id: number }) => m.id)).toContain(w.queued);
   if (w.attachment) {
     const saved = await fe.call("attachment_get", { id: w.attachment });
     expect(new Uint8Array(readFileSync(saved.path))).toEqual(PNG);
   }
+  if (w.postFile) {
+    const saved = await fe.call("attachment_get", { id: w.postFile });
+    expect(new Uint8Array(readFileSync(saved.path))).toEqual(PNG);
+  }
+  // The mute reads back as its effect: with fe in push mode, a new post
+  // reaches it and a reply in the muted thread doesn't.
+  if (w.muted) {
+    await fe.call("board_subscribe", { board: "e2e", mode: "push" });
+    await be.call("board_post", { board: "e2e", body: "muted reply", parent_id: w.root });
+    await be.call("board_post", { board: "e2e", body: "after the mute" });
+    await until(() => fe.pushes.find((p) => p.content.includes("after the mute")));
+    expect(fe.pushes.some((p) => p.content.includes("muted reply"))).toBe(false);
+  }
 }
 
-test("server: a database the previous release wrote opens and reads back", async () => {
+test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   label = "server";
   const dbPath = join(dir, "old", "grayboard.db");
   mkdirSync(join(dir, "old"));
@@ -202,7 +257,7 @@ test("server: a database the previous release wrote opens and reads back", async
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 }, 60_000);
 
-test("local: a bus the previous release wrote opens and reads back", async () => {
+test(`local: a bus ${FROM} wrote opens and reads back`, async () => {
   label = "local";
   const bus = join(dir, "bus");
   mkdirSync(bus);
@@ -229,10 +284,9 @@ test("local: a bus the previous release wrote opens and reads back", async () =>
   expectUpgraded(before, schema(join(bus, "bus.db")), schema(join(fresh, "bus.db")));
 }, 60_000);
 
-test("Slack bridge: a store the previous release wrote opens and reads back", async () => {
+// The bridge shipped in v1.2.0.
+test.skipIf(newer("v1.2.0", FROM))(`Slack bridge: a store ${FROM} wrote opens and reads back`, async () => {
   label = "slack";
-  // The bridge shipped in v1.2.0.
-  if (!(await hasCommand(rel.cli, "slack", "bridge"))) return;
   slack = new FakeSlack({ channel: "G0PRIVATE", owner: "U0OWNER", channelType: "group" });
   const bus = join(dir, "bus");
   mkdirSync(join(bus, "home", ".grayboard"), { recursive: true });
@@ -248,7 +302,7 @@ test("Slack bridge: a store the previous release wrote opens and reads back", as
   // The session creates the bus before the bridge opens it: released opens race
   // on a new bus (#170).
   const be = await localSession(bus, "be", { bin: rel.cli });
-  const proc = Bun.spawn([rel.cli, "bridge", "slack"], { cwd: bus, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([rel.cli, "bridge", "slack"], { cwd: bus, env, stdin: "ignore", stdout: "ignore", stderr: "pipe" });
   oldBridge = proc;
   const log = new Response(proc.stderr).text();
   await until(async () => (await be.call("peer_list")).peers.find((p: { handle: string }) => p.handle === "alex"), 10_000);

@@ -95,12 +95,15 @@ export class TestServer {
 
 // A compiled grayboard-server (a release, or the build under test) as its own
 // process: dev auth, port 0, its DB at `dbPath` and its blobs beside it. Ready
-// once it prints the port it listens on.
+// once it prints the port it listens on. Its stdout and stderr are drained
+// into one log as they arrive, so it never blocks on a full pipe and log()
+// mid-run has both.
 export class ServerProcess {
   private constructor(
     readonly proc: Subprocess<"ignore", "pipe", "pipe">,
     readonly base: string,
-    readonly log: () => string,
+    private readonly out: { text: string },
+    private readonly drained: Promise<unknown>,
   ) {}
 
   static async start(bin: string, dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
@@ -110,27 +113,27 @@ export class ServerProcess {
       stdout: "pipe",
       stderr: "pipe",
     });
-    let out = "";
-    const stderr = new Response(proc.stderr).text().then((t) => (out += t));
-    const log = () => out;
-    const reader = proc.stdout.getReader();
-    const deadline = setTimeout(() => proc.kill("SIGKILL"), 10_000);
+    const out = { text: "" };
+    const drain = async (stream: ReadableStream<Uint8Array>) => {
+      const decoder = new TextDecoder();
+      for await (const chunk of stream) out.text += decoder.decode(chunk, { stream: true });
+      out.text += decoder.decode();
+    };
+    const drained = Promise.all([drain(proc.stdout), drain(proc.stderr)]);
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, 10_000);
+    const exited = proc.exited.then((code) => ({ code }));
     try {
       for (;;) {
-        const { value, done } = await reader.read();
+        const port = /listening on port (\d+)\n/.exec(out.text)?.[1];
+        if (port) return new ServerProcess(proc, `http://localhost:${port}`, out, drained);
+        const done = await Promise.race([exited, Bun.sleep(20)]);
         if (done) {
-          const code = await proc.exited;
-          await stderr;
-          throw new Error(`${bin} exited before listening (code ${code})\n${out}`);
-        }
-        out += new TextDecoder().decode(value);
-        const port = /listening on port (\d+)/.exec(out)?.[1];
-        if (port) {
-          // Keep draining stdout so the server never blocks on a full pipe.
-          void (async () => {
-            for (let r = await reader.read(); !r.done; r = await reader.read()) out += new TextDecoder().decode(r.value);
-          })();
-          return new ServerProcess(proc, `http://localhost:${port}`, log);
+          await drained;
+          throw new Error(timedOut ? `${bin} didn't listen within 10 s; killed\n${out.text}` : `${bin} exited before listening (code ${done.code})\n${out.text}`);
         }
       }
     } finally {
@@ -138,13 +141,26 @@ export class ServerProcess {
     }
   }
 
+  // Everything it has printed so far, stdout and stderr interleaved.
+  log(): string {
+    return this.out.text;
+  }
+
   login(email: string): Promise<string> {
     return devLogin(this.base, email);
   }
 
-  // SIGTERM runs the server's own shutdown, which closes its database.
+  // SIGTERM runs the server's own shutdown (it doesn't close its database,
+  // #168: a copy needs the -wal and -shm files beside it); SIGKILL after 5 s.
+  // Resolves once it has exited and its output is all in log().
   async stop(): Promise<void> {
     this.proc.kill("SIGTERM");
-    await this.proc.exited;
+    const force = setTimeout(() => this.proc.kill("SIGKILL"), 5_000);
+    try {
+      await this.proc.exited;
+      await this.drained;
+    } finally {
+      clearTimeout(force);
+    }
   }
 }
