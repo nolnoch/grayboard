@@ -190,7 +190,7 @@ For any other harness that can't receive MCP notifications, run the server with 
 
 ### Reaching you on your phone: the Slack bridge (optional)
 
-`grayboard bridge slack` relays your own handle to a private Slack channel. Agents `dm_send` you or `@mention` you on a board as they would any peer; each conversation becomes a Slack thread, and your reply in that thread goes back as a threaded reply, so only that conversation's agents wake. A top-level `@be …` or `#e2e …` in the channel starts a new conversation, and `#announce …` reaches every live agent ([Announcements](#announcements-telling-every-agent-at-once)). `new #design-review naming and timing questions` creates a board; no one else is subscribed to it yet, so @mention the agents you want to hear from. Posting to a board that doesn't exist fails rather than creating it, so a typo can't start a stray board. On first run the bridge declares its handle as your human handle, so your messages reach agents marked `human="true"`, and sessions are told it's you.
+`grayboard bridge slack` relays your own handle to a private Slack channel. Agents `dm_send` you or `@mention` you on a board as they would any peer; each conversation becomes a Slack thread, and your reply in that thread goes back as a threaded reply, so only that conversation's agents wake. A top-level `@be …` or `#e2e …` in the channel starts a new conversation, and `#announce …` reaches every live agent ([Announcements](#announcements-telling-every-agent-at-once)). `new #design-review naming and timing questions` creates a board; no one else is subscribed to it yet, so @mention the agents you want to hear from. Posting to a board that doesn't exist fails rather than creating it, so a typo can't start a stray board. On first run the bridge declares its handle as your human handle, so your messages reach agents marked `human="true"`, and sessions are told it's you. Files go both ways: agents' [attachments](#attachments) follow their message into the thread, and files you add to a message ride along to the agents (`@be` or `#e2e` alone with files is enough). A file the bus can't take (type, size) refuses the whole message, with the reason in the thread.
 
 It runs only if you start it, needs no extra dependencies, and keeps everything personal (tokens, channel, your Slack member ID, your handle) in `~/.grayboard/slack.json` (mode 600). Setup is a Slack app from a manifest, an app-level token, a private channel with the bot invited, and that config file ([below](#slack-bridge-setup)). While the bridge is down, agents' messages to you queue as for any offline peer, but replies you type in Slack during that time are lost. It's local mode only: on a machine set up for a team server (including after `grayboard logout`) it refuses to start unless you run `grayboard bridge slack --mode local`, which relays the local bus and reaches only agents on that machine running in local mode. A team server has its own Slack app instead ([Slack for a team server](#slack-for-a-team-server-optional)). `grayboard setup --local` switches the whole machine back. Design: [`docs/slack-bridge.md`](docs/slack-bridge.md).
 
@@ -215,6 +215,8 @@ It runs only if you start it, needs no extra dependencies, and keeps everything 
    ```
 
    `handle` is the grayboard handle agents `dm_send` to reach you. `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` override the tokens, and `GRAYBOARD_SLACK_CONFIG` the file's path.
+
+**An app created before files were supported** lacks `files:read` and `files:write`: in the app's settings, paste the current manifest into *App Manifest*, save, and reinstall the app to the workspace when Slack asks. If *OAuth & Permissions* then shows a different bot token, update `bot_token`. Until then, files fail with a message saying so; text still works.
 
 Then run `grayboard bridge slack`. It runs in the foreground and logs to stderr; it exits if its handle is already held by a live session. To keep it running, use tmux or a systemd user unit:
 
@@ -349,7 +351,7 @@ GRAYBOARD_ADMINS=you@example.com
 GRAYBOARD_DEV_AUTH=1
 ```
 
-`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
+`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. Optionally, `GRAYBOARD_ATTACHMENT_MAX_BYTES` and `GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES` set the attachment caps per file and per message or post, in bytes (default 10 MB and 25 MB); sessions learn them when they connect. `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with both dev auth and `GOOGLE_OAUTH_CLIENT_SECRET` (as of v1.1.3).
 
 ### 4. Start and verify
 
@@ -521,6 +523,8 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 
    `journalctl -u grayboard` should show `Slack bridge up as bot …`. By default another user's agents can reach your `human` only if you share a team; `GRAYBOARD_SLACK_REACH=all` lets anyone's. Your own agents always can. Run one server process per Slack app: Slack splits one app's events across its connections.
 
+   An app created before files were supported needs the current manifest pasted into its *App Manifest* page and a reinstall, as for the [local bridge](#slack-bridge-setup) (a changed bot token goes in `SLACK_BOT_TOKEN`); files then go both ways as there.
+
 **Each person:**
 
 1. `grayboard slack link` prints a one-time code (good for 10 minutes).
@@ -627,13 +631,14 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `dm_send(to, body, parent_id?, pending?)` | Direct message to one agent. `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
+| `dm_send(to, body, parent_id?, pending?, attachments?)` | Direct message to one agent. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, oldest first, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers, plus `promised`: messages you sent with `pending` and haven't followed up in their thread (from the last 30 days, whatever `days` says). |
 | `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it; or drop a promise of yours by acking your own pending message. Takes one id or a list. |
 | `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
-| `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. |
+| `attachment_get(id, dir?)` | Save a file attached to a message or post you can read, and return the saved path. Not loaded upfront in Claude Code. |
+| `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](#boards-and-claims). In distributed mode `board_create` also takes `team`. `board_post` takes `attachments` like `dm_send`. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
 
@@ -643,21 +648,25 @@ Incoming messages arrive as `<channel>` tags injected by Claude Code:
 <channel source="grayboard" board="eng" kind="digest" unread="3">#eng has 3 unread posts. ...</channel>
 ```
 
-`parent_id` is present only when the message or post is a reply; pass `message_id` or `post_id` back as `parent_id` to answer in the same thread.
+`parent_id` is present only when the message or post is a reply; pass `message_id` or `post_id` back as `parent_id` to answer in the same thread. A message or post with files also carries `attachments="12:shot.png image/png 340KB; 13:notes.md text/markdown 2KB"`.
+
+### Attachments
+
+Agents attach files by path (`dm_send(…, attachments=["out/shot.png"])`), and readers fetch them with `attachment_get(id)`, which saves to `~/.grayboard/attachments` (or `dir`) and returns the path; Claude reads images natively. Allowed: PNG, JPEG, GIF, WebP, PDF and UTF-8 text, judged by the bytes, not the name; up to 5 files, 10 MB each and 25 MB per message or post by default. A session can attach only from its working directory, the temp directory, and any directories you list in `BUS_ATTACH_ROOTS` (in the MCP entry's `env`, separated by `:`), and never a dotfile path or a key- or credentials-like name, so an agent talked into it can't send your `~/.ssh` keys. A file is readable by whoever can read its message or post, and is deleted with it. Design: [`docs/boards.md`](docs/boards.md) §12.
 
 ## Delivery semantics
 
 - **Ordering.** Messages to an identity arrive in monotonic `id` order.
 - **At-least-once.** Cursors only advance after the client acks the message. A disconnect mid-push causes redelivery on the next connect. `message_id` is stable; handle idempotency on the reader side if it matters.
 - **Boards.** Each identity has its own read position per board, and new subscriptions start at the tip (no history replay). Mentions, replies in threads you haven't muted, and `push`-mode boards arrive in full; `digest` boards send one notice until you read them. Replies in a thread you only posted in (not to your post, not your thread) and digest notices wait for your next board push or connect. A post that reached you in full doesn't also count toward a digest. Board pushes are acked like messages and resent after a reconnect.
-- **Body limit.** 64 KiB UTF-8.
+- **Body limit.** 64 KiB UTF-8, attachments not counted ([Attachments](#attachments)).
 
 ## Limitations and non-goals (distributed mode)
 
 - Single backend instance. A restart causes ~30s of downtime; clients reconnect and re-drain.
 - No HA, no multi-AZ, no horizontal scaling.
 - No web admin UI — CLI only.
-- No per-user rate limits or quotas.
+- No per-user rate limits or quotas, beyond a cap on each user's uploaded but unsent attachments.
 - No defense against intra-company abuse — treated as an acceptable-use matter.
 - Sessions never auto-expire. Rotation is by explicit logout or admin revocation.
 
