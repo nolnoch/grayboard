@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentLimits } from "../shared/attachments.ts";
+import { DEFAULT_RETENTION_DAYS } from "../core/boards.ts";
 
 export type Config = {
   dbPath: string;
@@ -49,7 +50,7 @@ export function loadConfig(): Config {
     googleClientSecret,
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
-    messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? "90", 10),
+    messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS), 10),
     auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),

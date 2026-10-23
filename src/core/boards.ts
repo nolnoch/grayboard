@@ -776,6 +776,9 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
 
 // ── retention ────────────────────────────────────────────────────────────────
 
+// How long messages and posts keep, unless the operator (or a local user) says otherwise.
+export const DEFAULT_RETENTION_DAYS = 90;
+
 // Operator retention, not an agent operation. Replies outlive their pruned
 // parents as thread roots.
 export function prunePosts(db: Database, olderThanMs: number): void {

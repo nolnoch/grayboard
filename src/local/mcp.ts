@@ -9,6 +9,7 @@ import {
 
 import { CoreError, activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
   BOARD_INSTRUCTIONS,
@@ -70,6 +71,11 @@ console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 const ROOTS = attachRoots();
 // This bus's subdirectory of the default save directory.
 const BUS_DIR = localBusDir(localDbPath());
+const RETENTION_DAYS = retentionDays();
+if (RETENTION_DAYS === null) {
+  console.error(`[grayboard] BUS_RETENTION_DAYS must be a whole number of days, not "${process.env.BUS_RETENTION_DAYS}"`);
+  process.exit(1);
+}
 
 // BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
 // separate adapter owns the wakeup socket and delivery. Draining here would
@@ -440,6 +446,8 @@ if (DELIVER) await assertIdentityFree(IDENTITY);
 if (DELIVER) startSession(db, IDENTITY, process.cwd());
 else touchHandle(db, IDENTITY);
 await mcp.connect(new StdioServerTransport());
+// Prunes the bus at most once a day across the sessions that share it.
+startLocalRetention(db, blobs, RETENTION_DAYS);
 
 let cleanup = () => {};
 const shutdown = () => {
