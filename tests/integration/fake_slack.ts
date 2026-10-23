@@ -76,6 +76,11 @@ export class FakeSlack {
         case "files.completeUploadExternal": {
           const files = JSON.parse(String(body.files ?? "[]")) as { id: string; title?: string }[];
           if (!files.length || files.some((f) => !this.uploaded.has(f.id))) return Response.json({ ok: false, error: "file_not_found" });
+          // Like Slack (measured): completing files already shared posts nothing
+          // new, and the answer names the first share.
+          if (files.every((f) => this.shared.has(f.id))) {
+            return Response.json({ ok: true, files: files.map((f) => ({ id: f.id, title: f.title, shares: { private: { [this.o.channel]: [this.shared.get(f.id)] } } })) });
+          }
           // Like Slack: one message, and an answer that names the files but not the message.
           const ts = `${++this.ts}.000100`;
           this.postTs.set(body, ts);

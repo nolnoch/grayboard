@@ -73,8 +73,6 @@ type Progress = {
   files?: UploadedFile[];
   /** Files that won't reach Slack. */
   refused?: Refused[];
-  /** files.completeUploadExternal went out; a retry asks Slack whether it landed before resending, and a resend Slack refuses counts as landed. */
-  completing?: boolean;
   /** The item's message is in Slack and the thread map knows it. */
   posted?: boolean;
   /** Why the item counts as given up on, if it does (the outbox row's error). */
@@ -221,7 +219,7 @@ export class Relay {
       const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
       // The item's message ts; null when Slack took it but never said where.
       let ts: string | null | undefined;
-      if (progress.files?.length) ts = await this.share(progress, save, text(), name, row?.thread_ts);
+      if (progress.files?.length) ts = await this.share(progress, save, text(), row?.thread_ts);
       if (ts === undefined) ts = await this.postText(text(), name, row?.thread_ts);
       if (row) this.store.advance(row.thread_ts, x.id);
       else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
@@ -281,51 +279,44 @@ export class Relay {
   }
 
   // Shares the uploaded files with the text as one message. Returns its ts
-  // (the thread's, for a reply), null if Slack took it but files.info never
-  // showed where, or undefined if Slack refused it, with the files moved to
-  // `refused` for a text-only post.
-  private async share(progress: Progress, save: () => void, text: string, name: string, threadTs: string | undefined): Promise<string | null | undefined> {
+  // (the thread's, for a reply), null if Slack took it but never said where,
+  // or undefined if Slack refused it, with the files moved to `refused` for a
+  // text-only post. A retry after a lost answer just completes again: Slack
+  // answers a repeat ok, posts nothing new, and names the first share
+  // (measured live, PR #135). It takes no `username` (measured: ignored), so
+  // the sender's name rides only in the text (`format`).
+  private async share(progress: Progress, save: () => void, text: string, threadTs: string | undefined): Promise<string | null | undefined> {
     const files = progress.files!;
-    // The last attempt may have landed with its answer lost; resending would share the files twice.
-    const resuming = progress.completing === true;
-    let ts = resuming ? await this.sharedTs(files[0]!.id) : null;
-    if (!ts) {
-      progress.completing = true;
+    let answer: { files?: Record<string, any>[] };
+    try {
+      answer = await this.slack.call(
+        "files.completeUploadExternal",
+        {
+          files: files.map(({ id, title }) => ({ id, title })),
+          channel_id: this.o.channel,
+          ...(threadTs ? { thread_ts: threadTs } : {}),
+          blocks: [{ type: "markdown", text }],
+        },
+        { form: true },
+      );
+    } catch (e) {
+      const why = refusal(e);
+      progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
+      progress.files = [];
       save();
-      try {
-        await this.slack.call(
-          "files.completeUploadExternal",
-          {
-            files: files.map(({ id, title }) => ({ id, title })),
-            channel_id: this.o.channel,
-            ...(threadTs ? { thread_ts: threadTs } : {}),
-            blocks: [{ type: "markdown", text }],
-            username: name,
-          },
-          { form: true },
-        );
-      } catch (e) {
-        const why = refusal(e);
-        if (resuming) {
-          // Slack completes an upload once, so a refusal now most likely means
-          // the last attempt landed with its answer lost (its share not yet in
-          // files.info, or no files:read to see it). Posting the text again
-          // would show it twice and tell the sender its files never arrived.
-          this.log(`slack: files.completeUploadExternal refused a resumed share (${why}); taking the earlier attempt as landed`);
-        } else {
-          progress.refused = [...(progress.refused ?? []), ...files.map((f) => ({ attachment: f.attachment, name: f.title, why, sha256: f.sha256 }))];
-          progress.files = [];
-          progress.completing = false;
-          save();
-          return undefined;
-        }
-      }
-      // Slack's answer names the files, not the message; a reply already knows its thread.
-      ts = threadTs ?? (await this.sharedTs(files[0]!.id));
+      return undefined;
     }
-    const thread = threadTs ?? ts;
-    for (const f of files) this.o.onFileSent?.({ attachment: f.attachment, sha256: f.sha256, slack_file: f.id, thread_ts: thread });
-    return thread;
+    // A first answer's shares are empty (they lag); a repeat's name the message.
+    const ts = threadTs ?? this.shareIn(answer.files?.[0]) ?? (await this.sharedTs(files[0]!.id));
+    for (const f of files) this.o.onFileSent?.({ attachment: f.attachment, sha256: f.sha256, slack_file: f.id, thread_ts: ts });
+    return ts;
+  }
+
+  // The ts of the message that shared this file object in this channel, if Slack says yet.
+  private shareIn(file: Record<string, any> | undefined): string | null {
+    const shares = file?.shares ?? {};
+    const ts = (shares.private?.[this.o.channel] ?? shares.public?.[this.o.channel])?.[0]?.ts;
+    return ts ? String(ts) : null;
   }
 
   // The ts of the message that shared `file` in this channel, from files.info.
@@ -342,10 +333,9 @@ export class Relay {
         this.log(`slack: files.info ${file}: ${e.code}`);
         return null;
       }
-      const shares = f?.shares ?? {};
-      const ts = (shares.private?.[this.o.channel] ?? shares.public?.[this.o.channel])?.[0]?.ts;
+      const ts = this.shareIn(f);
       this.debug(`files.info ${file} try ${i + 1}: shares in channel ${ts ? `ts=${ts}` : "none yet"}`);
-      if (ts) return String(ts);
+      if (ts) return ts;
     }
     return null;
   }

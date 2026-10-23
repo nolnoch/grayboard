@@ -248,7 +248,9 @@ test("an agent's attachments and text reach Slack as one message, whose thread m
   writeFileSync(join(dir, "notes.md"), "# notes\n");
   const q = await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png", "notes.md"] });
   const s = await until(() => slack.shares()[0]);
-  expect(s).toMatchObject({ channel_id: CHANNEL, username: "be", blocks: [{ type: "markdown", text: "**be** see attached" }] });
+  expect(s).toMatchObject({ channel_id: CHANNEL, blocks: [{ type: "markdown", text: "**be** see attached" }] });
+  // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
+  expect(s.username).toBeUndefined();
   expect(s.thread_ts).toBeUndefined();
   expect(s.files.map((f: { title: string }) => f.title)).toEqual(["shot.png", "notes.md"]);
   expect(slack.uploaded.get(s.files[0].id)).toEqual(PNG);

@@ -153,7 +153,9 @@ test("attachments cross the org bridge both ways, and the audit log says where t
     writeFileSync(join(tmp, "shot.png"), png);
     const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
     const s = await until(() => slack.shares()[0]);
-    expect(s).toMatchObject({ channel_id: DM, username: "be", blocks: [{ type: "markdown", text: "**be** look" }] });
+    expect(s).toMatchObject({ channel_id: DM, blocks: [{ type: "markdown", text: "**be** look" }] });
+    // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
+    expect(s.username).toBeUndefined();
     expect(s.thread_ts).toBeUndefined();
     expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
 

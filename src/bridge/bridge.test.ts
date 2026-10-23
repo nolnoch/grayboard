@@ -203,6 +203,8 @@ function withAttachment(slack: { upload?: number; complete?: string | number; ag
     if (method === "F1") return new Response("OK");
     if (method === "files.completeUploadExternal") {
       if (typeof slack.complete === "string") return Response.json({ ok: false, error: slack.complete });
+      // Like Slack: a repeat posts nothing new and names the first share.
+      if (shared) return Response.json({ ok: true, files: [{ id: "F1", title: "shot.png", shares: { private: { G1: [{ ts: "6.0" }] } } }] });
       shared = true;
       blocks.push(JSON.parse(new URLSearchParams(String(init.body)).get("blocks")!)[0].text);
       if (typeof slack.complete === "number") {
@@ -263,32 +265,35 @@ test("files: a restart after the upload resumes at the share, without uploading 
   store.close();
 });
 
-test("files: a share whose answer was lost isn't sent twice", async () => {
-  const x = withAttachment({ complete: 503, shares: 2 });
+test("files: a share whose answer was lost is completed again, which Slack doesn't post twice", async () => {
+  const x = withAttachment({ complete: 503, shares: 100 });
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
   await Bun.sleep(200);
-  // The retry asks files.info until the lagging share shows, then maps it.
-  expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.info", "files.info", "files.info"]);
+  // The repeat's answer names the share, so files.info isn't needed.
+  expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.completeUploadExternal"]);
+  expect(x.blocks).toEqual(["**be** look"]);
+  expect(x.said).toEqual([]);
   expect(sent).toEqual(["7→F1@6.0"]);
   expect(store.byTs("6.0")).toBeDefined();
+  expect(errors(store)).toEqual([null]);
   store.close();
 });
 
-test("files: a resent share Slack refuses counts as the lost one landing, not as refused files", async () => {
-  // The answer is lost, files.info never shows the share (as without files:read), and the resend is refused.
-  const x = withAttachment({ complete: 503, again: "invalid_arguments", shares: 100 });
+test("files: a completion Slack refuses after a lost answer is a refusal: the text posts alone and the sender hears why", async () => {
+  const x = withAttachment({ complete: 503, again: "invalid_arguments" });
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(400);
+  await Bun.sleep(200);
   expect(x.calls.filter((c) => c === "files.completeUploadExternal")).toHaveLength(2);
-  // No second copy of the text, no warning about the files, nothing told to the sender.
-  expect(x.said).toEqual(["⚠️ Slack didn't say where it put message 1 from be, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead."]);
-  expect(x.told).toEqual([]);
-  expect(sent).toEqual(["7→F1@null"]);
-  expect(errors(store)).toEqual(["ts_unknown"]);
+  expect(x.said).toHaveLength(1);
+  expect(x.said[0]).toStartWith("**be** look");
+  expect(x.said[0]).toContain("invalid_arguments");
+  expect(x.told).toHaveLength(1);
+  expect(sent).toEqual([]);
+  expect(errors(store)).toEqual(["files_refused"]);
   store.close();
 });
 
