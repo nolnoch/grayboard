@@ -43,7 +43,9 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
 
 // Returns a stop function that cancels the pending nightly run and the daily
 // sweep, so a server stop() can close the db without them firing afterwards.
-export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): () => void {
+// `firstDelayMs` replaces the next-UTC-midnight delay for the first run — a
+// test hook that lets a test hold the nightly timer pending across a stop().
+export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}): () => void {
   const runNightly = () => void runRetention(repo, db, config);
 
   const runVacuumIfNeeded = () => {
@@ -58,7 +60,7 @@ export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): () =
   let daily: ReturnType<typeof setInterval> | undefined;
 
   const scheduleNightly = () => {
-    const delay = msUntilMidnightUTC();
+    const delay = opts.firstDelayMs ?? msUntilMidnightUTC();
     nightly = setTimeout(() => {
       nightly = undefined;
       runNightly();

@@ -24,25 +24,39 @@ export function mintToken(): string {
 
 // The deferred last-used touch below outlives the request that scheduled it.
 // A touch that fires after stop() closed the database would be an unhandled
-// crash (the CI failure this fixes), so stop() cancels what is pending.
-const pendingTouches = new Set<NodeJS.Immediate>();
-export function cancelPendingTouches(): void {
-  for (const t of pendingTouches) clearImmediate(t);
-  pendingTouches.clear();
+// crash (the CI failure this fixes), so stop() cancels what is pending. The
+// queue is per-server: one startServer's stop() must not cancel a different
+// live server's touches in the same process (two TestServers in one test run).
+export type TouchQueue = {
+  schedule(run: () => void): void;
+  cancelAll(): void;
+};
+
+export function createTouchQueue(): TouchQueue {
+  const pending = new Set<NodeJS.Immediate>();
+  return {
+    schedule(run: () => void): void {
+      const t = setImmediate(() => {
+        pending.delete(t);
+        run();
+      });
+      pending.add(t);
+    },
+    cancelAll(): void {
+      for (const t of pending) clearImmediate(t);
+      pending.clear();
+    },
+  };
 }
 
-export function verifySessionToken(raw: string, repo: Repo): AuthedUser | null {
+export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue): AuthedUser | null {
   const hash = hashToken(raw);
   const session = repo.sessions.findByTokenHash(hash);
   if (!session) return null;
   const user = repo.users.findById(session.user_id);
   if (!user || user.disabled_at !== null) return null;
   // Off the request path: last-used is a stamp, not a result the caller waits on.
-  const t = setImmediate(() => {
-    pendingTouches.delete(t);
-    repo.sessions.touch(session.id, Date.now());
-  });
-  pendingTouches.add(t);
+  touches.schedule(() => repo.sessions.touch(session.id, Date.now()));
   return { user_id: user.id, user_email: user.email, session_id: session.id };
 }
 

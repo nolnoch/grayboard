@@ -4,13 +4,16 @@ import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
-import { verifySessionToken, extractBearer, cancelPendingTouches } from "./auth.ts";
+import { verifySessionToken, extractBearer, createTouchQueue } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
 export type StartOptions = WsOptions & {
   // Tests skip the nightly retention timer and heartbeat.
   background?: boolean;
+  // Test hook: ms until the first nightly retention run, instead of the next
+  // UTC midnight — so a test can hold the timer pending across a stop().
+  retentionFirstDelayMs?: number;
 };
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -19,6 +22,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
+
+  // The deferred session-touch queue this server owns; stop() cancels it
+  // before closing the db (a fired-after-close touch is an unhandled crash).
+  const touches = createTouchQueue();
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -46,7 +53,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!raw) {
           return Response.json({ code: "unauthenticated", message: "missing token" }, { status: 401 });
         }
-        const authed = verifySessionToken(raw, repo);
+        const authed = verifySessionToken(raw, repo, touches);
         if (!authed) {
           return Response.json({ code: "unauthenticated", message: "invalid token" }, { status: 401 });
         }
@@ -63,7 +70,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser);
     },
 
     websocket: handlers,
@@ -82,7 +89,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopped = false;
   if (opts.background !== false) {
     timers.push(startPing());
-    stopRetention = startRetentionJobs(repo, db, config);
+    stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined);
   }
 
   return {
@@ -93,6 +100,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     revalidate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
+    // The session-touch queue, for tests that schedule touches directly.
+    touches,
     // Owns everything startServer opened: idempotent, closes the database
     // once the server and every user of it (bridge, timers, expiry) is down.
     stop() {
@@ -102,7 +111,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       for (const t of timers) clearInterval(t);
       stopRetention?.();
       stopExpiry();
-      cancelPendingTouches();
+      touches.cancelAll();
       server.stop(true);
       db.close();
     },

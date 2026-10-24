@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hashToken, mintToken, verifySessionToken } from "./auth.ts";
+import { createTouchQueue, hashToken, mintToken, verifySessionToken } from "./auth.ts";
 import { openDatabase, type Repo } from "./db.ts";
 
 describe("token helpers", () => {
@@ -26,6 +26,7 @@ describe("token helpers", () => {
 
 describe("verifySessionToken", () => {
   let repo: Repo;
+  const touches = createTouchQueue();
 
   beforeEach(() => {
     const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
@@ -36,13 +37,13 @@ describe("verifySessionToken", () => {
     const u   = repo.users.upsertByEmail("wade@example.com", null);
     const raw = mintToken();
     repo.sessions.create(u.id, hashToken(raw), null);
-    const authed = verifySessionToken(raw, repo);
+    const authed = verifySessionToken(raw, repo, touches);
     expect(authed).not.toBeNull();
     expect(authed!.user_email).toBe("wade@example.com");
   });
 
   test("missing token returns null", () => {
-    expect(verifySessionToken("gbrd_v1_nonexistent", repo)).toBeNull();
+    expect(verifySessionToken("gbrd_v1_nonexistent", repo, touches)).toBeNull();
   });
 
   test("revoked token returns null", () => {
@@ -50,7 +51,7 @@ describe("verifySessionToken", () => {
     const raw = mintToken();
     const s   = repo.sessions.create(u.id, hashToken(raw), null);
     repo.sessions.revoke(s.id);
-    expect(verifySessionToken(raw, repo)).toBeNull();
+    expect(verifySessionToken(raw, repo, touches)).toBeNull();
   });
 
   test("disabled user returns null", () => {
@@ -58,7 +59,7 @@ describe("verifySessionToken", () => {
     const raw = mintToken();
     repo.sessions.create(u.id, hashToken(raw), null);
     repo.users.setDisabled(u.id, true);
-    expect(verifySessionToken(raw, repo)).toBeNull();
+    expect(verifySessionToken(raw, repo, touches)).toBeNull();
   });
 
   test("re-enabled user returns authed user", () => {
@@ -67,6 +68,6 @@ describe("verifySessionToken", () => {
     repo.sessions.create(u.id, hashToken(raw), null);
     repo.users.setDisabled(u.id, true);
     repo.users.setDisabled(u.id, false);
-    expect(verifySessionToken(raw, repo)).not.toBeNull();
+    expect(verifySessionToken(raw, repo, touches)).not.toBeNull();
   });
 });
