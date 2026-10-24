@@ -1,9 +1,10 @@
 // The Slack bridge's own SQLite file: which Slack thread holds which grayboard
 // thread, and an outbox of notifications not yet posted to Slack. Separate
 // from the bus database, so the bus schema never carries bridge state.
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { openSqlite } from "../core/sqlite.ts";
 
 export type ThreadKind = "dm" | "board";
 
@@ -23,36 +24,35 @@ export class Store {
 
   constructor(path: string) {
     if (path !== ":memory:" && !existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new Database(path);
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = 5000;
-      -- thread_ts: the Slack top-level message's ts. root_id: the grayboard
-      -- thread's root (message id for dm, post id for board). peer: the agent
-      -- in a dm thread. last_id: the newest grayboard id seen in the thread,
-      -- the parent for the next reply from Slack.
-      CREATE TABLE IF NOT EXISTS threads (
-        thread_ts  TEXT PRIMARY KEY,
-        kind       TEXT NOT NULL CHECK (kind IN ('dm','board')),
-        board      TEXT NOT NULL DEFAULT '',
-        root_id    INTEGER NOT NULL,
-        peer       TEXT,
-        last_id    INTEGER NOT NULL,
-        UNIQUE (kind, board, root_id)
-      );
-      CREATE TABLE IF NOT EXISTS outbox (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        params      TEXT NOT NULL,
-        created_at  INTEGER NOT NULL,
-        done_at     INTEGER,
-        error       TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(done_at, id);
-    `);
-    // How far a pending item got in Slack (relay.ts Progress), so a restart
-    // neither reposts it nor shares its files twice.
-    const outboxCols = this.db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
-    if (!outboxCols.some((c) => c.name === "progress")) this.db.exec(`ALTER TABLE outbox ADD COLUMN progress TEXT`);
+    this.db = openSqlite(path, "PRAGMA journal_mode = WAL;", (db) => {
+      db.exec(`
+        -- thread_ts: the Slack top-level message's ts. root_id: the grayboard
+        -- thread's root (message id for dm, post id for board). peer: the agent
+        -- in a dm thread. last_id: the newest grayboard id seen in the thread,
+        -- the parent for the next reply from Slack.
+        CREATE TABLE IF NOT EXISTS threads (
+          thread_ts  TEXT PRIMARY KEY,
+          kind       TEXT NOT NULL CHECK (kind IN ('dm','board')),
+          board      TEXT NOT NULL DEFAULT '',
+          root_id    INTEGER NOT NULL,
+          peer       TEXT,
+          last_id    INTEGER NOT NULL,
+          UNIQUE (kind, board, root_id)
+        );
+        CREATE TABLE IF NOT EXISTS outbox (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          params      TEXT NOT NULL,
+          created_at  INTEGER NOT NULL,
+          done_at     INTEGER,
+          error       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(done_at, id);
+      `);
+      // How far a pending item got in Slack (relay.ts Progress), so a restart
+      // neither reposts it nor shares its files twice.
+      const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
+      if (!outboxCols.some((c) => c.name === "progress")) db.exec(`ALTER TABLE outbox ADD COLUMN progress TEXT`);
+    });
   }
 
   thread(kind: ThreadKind, board: string | null, rootId: number): ThreadRow | undefined {

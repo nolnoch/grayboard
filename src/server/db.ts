@@ -1,10 +1,11 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { openSqlite } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -124,12 +125,12 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
-  db.exec(
-    "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA auto_vacuum = INCREMENTAL;",
-  );
-  initSchema(db);
-  initCoreSchema(db);
+  // auto_vacuum first: it takes effect only before the file's first page is
+  // written, and the WAL switch writes it.
+  const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", (d) => {
+    initSchema(d);
+    initCoreSchema(d);
+  });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
   setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
   return { db, repo };
