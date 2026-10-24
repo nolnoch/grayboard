@@ -78,9 +78,6 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
-  // Pending bridge-down notices, by user id: armed when the bridge dies
-  // fatally, drained once at that user's next hello (any identity).
-  bridgeDown: Map<number, string[]>;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -117,13 +114,28 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
-// The bridge-down notices held for this user, drained once (their next hello,
-// any identity) and cleared — one notice per fatal stop, not per hello.
-function drainBridgeDown(hub: Hub, userId: number): string[] {
-  const held = hub.bridgeDown.get(userId);
-  if (!held?.length) return [];
-  hub.bridgeDown.delete(userId);
-  return held;
+// The bridge-down notice is durable, not hub memory: a fatal stop writes a
+// `bridge.stopped` audit row per linked user (src/server/slack.ts), and the
+// drain writes `bridge.notified`. An unsuppressed death newer than the last
+// delivery is still owed — across a restart too, which is why it lives in
+// the audit log — and drains once, at the user's next agent-session hello.
+// Reads and the write run synchronously, so two hellos of one user can't
+// both deliver.
+function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+  const target = `${email}/${HUMAN_NAME}`;
+  const stop = repo.audit.last("bridge.stopped", target);
+  if (!stop) return undefined;
+  let detail: { reason?: string; at?: string; suppressed?: boolean };
+  try {
+    detail = stop.detail ? (JSON.parse(stop.detail) as typeof detail) : {};
+  } catch {
+    return undefined;
+  }
+  if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  const notified = repo.audit.last("bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
 }
 
 // Does the connection answer a ping within ms? The plugin pongs every ping.
@@ -153,7 +165,6 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), probing: new Map(), toolsOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
-    bridgeDown: new Map(),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -164,12 +175,6 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     },
     // The Slack bridge died fatally: hold the notice for the owner's next
     // hello (any of their identities), drained once per user per stop.
-    bridgeDownNotice(userId: number, text: string): void {
-      const held = hub.bridgeDown.get(userId) ?? [];
-      held.push(text);
-      hub.bridgeDown.set(userId, held);
-    },
-
     message(ws: Ws, rawData: string | Buffer) {
       const raw = typeof rawData === "string" ? rawData : rawData.toString("utf8");
 
@@ -402,7 +407,10 @@ async function handleHello(
   // Bridge-down notices drain on agent-session hellos only: the bridge's own
   // human hello (HumanConn) would steal the notice into a handshake nobody
   // reads, leaving the owner uninformed.
-  if (!ws.data.human) notices.push(...drainBridgeDown(hub, authed.user_id));
+  if (!ws.data.human) {
+    const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
+    if (bridgeNotice) notices.push(bridgeNotice);
+  }
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;

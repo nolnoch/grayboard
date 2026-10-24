@@ -29,9 +29,10 @@ const CODE_TTL_MS = 10 * 60_000;
 // guessing hopeless well before this.
 const MAX_TRIES = 5;
 const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
-// A second bridge.stopped for the same user inside this window records the
-// audit row but skips the repeat hello notice: one flapping bridge must not
-// spam its owner per retry.
+// A second notice for the same user inside this window is suppressed (the
+// death still records): one flapping bridge must not spam its owner per
+// retry. Counted against notices delivered, not deaths recorded, so an
+// armed-but-undelivered notice survives a restart.
 const BRIDGE_NOTIFY_DEDUP_MS = 60 * 60_000;
 
 const NOT_LINKED =
@@ -40,8 +41,6 @@ const NOT_LINKED =
 type Handlers = {
   message(ws: Conn, raw: string): void;
   close(ws: Conn): void;
-  // The hub holds a bridge-down notice for this user's next hello.
-  bridgeDownNotice(userId: number, text: string): void;
 };
 
 export type SlackBridgeOptions = {
@@ -160,29 +159,37 @@ export class SlackBridge implements SlackLinker {
    * Deliberate teardown (app shutdown) passes no reason: the bridge goes down
    * silently, because the operator knows. The fatal shape — Slack ended the
    * connection, or startup failed — records one `bridge.stopped` audit row per
-   * linked user and arms a hello notice for each, deduped to one notice per
-   * user per BRIDGE_NOTIFY_DEDUP_MS so a flapping bridge can't spam its owner.
+   * linked user; that row is the pending notice, drained by the user's next
+   * agent-session hello (src/server/ws.ts), deduped to one delivered notice
+   * per user per BRIDGE_NOTIFY_DEDUP_MS so a flapping bridge can't spam its
+   * owner.
    */
   stop(reason?: { fatal: true; detail: string }): void {
     this.stopped = true;
     this.socket?.stop();
-    const linked = [...this.linked.entries()];
-    for (const userId of this.linked.keys()) this.detach(userId);
+    for (const userId of [...this.linked.keys()]) this.detach(userId);
     if (!reason?.fatal) return;
     const at = Date.now();
-    for (const [userId, { link }] of linked) {
+    // Durable links, not the in-memory map: a boot-time failure (revoked
+    // token, Slack outage) throws before any link is attached, and that is
+    // exactly the death the owner must hear about (app.ts's catch). A
+    // disabled user's human is offline by admin action, not the bridge's
+    // death, so their row is skipped.
+    for (const link of this.o.repo.slack.links()) {
+      const user = this.o.repo.users.findById(link.user_id);
+      if (!user || user.disabled_at !== null) continue;
       const target = `${link.email}/${HUMAN_NAME}`;
-      // Query BEFORE writing: `last()` must be the previous stop's row, or the
-      // guard races its own insert (same-ms -> duplicate notice; ticked-ms ->
-      // the first fatal silenced). The clamp rides out clock skew in both
-      // directions.
-      const last = this.o.repo.audit.last("bridge.stopped", target);
+      // Dedup against the last DELIVERED notice, not the last death: the
+      // unsuppressed row itself is what's owed, so a notice armed but not
+      // yet delivered survives a restart. `last()` before the insert and
+      // the clamp ride out clock skew in both directions.
+      const last = this.o.repo.audit.last("bridge.notified", target);
       const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
       writeAudit(this.o.repo, "bridge.stopped", null, target, {
         reason: reason.detail,
         at: new Date(at).toISOString(),
+        ...(prior ? { suppressed: true } : {}),
       });
-      if (!prior) this.o.handlers.bridgeDownNotice(userId, `your Slack bridge stopped at ${new Date(at).toISOString()} (${reason.detail}); linked humans are offline until it reconnects or the server restarts`);
     }
   }
 
