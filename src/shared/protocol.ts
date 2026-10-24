@@ -25,6 +25,8 @@ export type Message = {
 // session_id: the client process's session ID (#182), the key of its
 // binding_events; a hello from the same session under another name is a
 // rebind, and the session's claims move to the new name.
+// restored_from: the session ID of the process this one restarted from,
+// taking back its name (#182 decision 14): logged, and its status stays.
 // create: false refuses a name that has never existed (identity_unknown);
 // absent, the name is created lazily, as before #182.
 // read_only: an unbound session's connection (no identity; push must be
@@ -32,7 +34,7 @@ export type Message = {
 // the checkout's default name, listed first among hello_ok.candidates.
 export type HelloRequest = {
   type: "hello"; req_id: string; identity?: string; push?: boolean; where?: string; resume?: boolean;
-  session_id?: string; create?: boolean; read_only?: boolean; suggested?: string;
+  session_id?: string; create?: boolean; read_only?: boolean; suggested?: string; restored_from?: string;
 };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
@@ -125,6 +127,8 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.create !== undefined && typeof m.create !== "boolean") throw new Error("create must be boolean");
       if (m.session_id !== undefined && (typeof m.session_id !== "string" || !SESSION_ID.test(m.session_id)))
         throw new Error("session_id must be 16 lowercase hex characters");
+      if (m.restored_from !== undefined && (typeof m.restored_from !== "string" || !SESSION_ID.test(m.restored_from)))
+        throw new Error("restored_from must be 16 lowercase hex characters");
       if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");

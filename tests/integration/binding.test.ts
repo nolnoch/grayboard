@@ -303,3 +303,45 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect(events("fe").at(-1)!.event).toBe("released");
   expect(existsSync(join(dir, "sock.fe"))).toBe(false);
 }, 30_000);
+
+test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
+  // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
+  let s = await session("be");
+  await s.call("bind", { name: "api", create: true });
+  await s.call("peer_status", { text: "mid-task" });
+  const peer = await session("fe");
+  for (const how of ["reconnect", "crash"] as const) {
+    const before = rows<{ session_id: string }>(`SELECT session_id FROM bindings WHERE name = 'api'`)[0]!.session_id;
+    const harness = s.harnessPid;
+    s = await s.restart(how);
+    expect(s.harnessPid).toBe(harness);
+    expect(s.c.getInstructions()).toStartWith(`You are identity "api"`);
+    expect((await s.call("peer_list", {})).you).toBe("api");
+    const now = rows<{ session_id: string }>(`SELECT session_id FROM bindings WHERE name = 'api'`)[0]!.session_id;
+    expect(now).not.toBe(before);
+    expect(events("api").at(-1)).toEqual({ session_id: now, event: "bound", detail: `restored: restart of session ${before}` });
+    // The same session to its peers: its status stays, and its mail arrives.
+    expect((await peer.call("peer_list", {})).peers).toContainEqual(expect.objectContaining({ handle: "api", status: "mid-task" }));
+    await peer.call("dm_send", { to: "api", body: how });
+    await until(() => contents(s).includes(how));
+  }
+  // "be" was never taken back: the restart restored "api", not BUS_IDENTITY.
+  expect(events("be").map((e) => e.event)).toEqual(["bound", "released"]);
+
+  // A new harness process is a new session: unbound, with "api" free to bind.
+  await stop(s.c);
+  const fresh = await session();
+  expect(fresh.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(fresh.c.getInstructions()).not.toContain("restarted");
+
+  // A launcher between harness and grayboard is a new parent on each restart,
+  // so the name can't come back; the instructions say why.
+  const sh = ["sh", "-c", `"$@"; exit $?`, "sh", process.execPath];
+  let l = await localSession(dir, undefined, { via: sh });
+  const launcherNote = "Its parent process is a launcher (sh), so if this grayboard process restarts, its name won't come back";
+  expect(l.c.getInstructions()).toContain(launcherNote);
+  await l.call("bind", { name: "web", create: true });
+  l = await l.restart("reconnect");
+  expect(l.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(l.c.getInstructions()).toContain(launcherNote);
+}, 60_000);

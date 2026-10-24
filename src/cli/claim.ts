@@ -85,7 +85,7 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
 
 // The local bus's live sessions; none when no session has created the bus.
 async function localView(): Promise<LocalView> {
-  const { ancestors } = await import("../local/proc.ts");
+  const { ancestors } = await import("../shared/proc.ts");
   const { localDbPath, openLocalDb } = await import("../local/open.ts");
   if (!existsSync(localDbPath())) return { sessions: [], ancestors: ancestors() };
   const { liveSessions } = await import("../local/binding.ts");

@@ -415,7 +415,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     const previous = m.session_id === undefined ? undefined : [...registry.values()].find((c) =>
       c !== ws && c.data.sessionId === sessionId && c.data.authed.user_id === authed.user_id && c.data.identityFull !== full);
     registry.set(full, ws);
-    if (m.resume) touchHandle(db, full);
+    // A reconnect, or a restart taking its name back, is the same session: its status stays.
+    if (m.resume || m.restored_from) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     ws.data.owner = true;
@@ -424,7 +425,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
       if (previous.data.owner) release(hub, previous, `rebound to ${full}`);
       logBinding(db, sessionId, full, "moved", from);
-    } else logBinding(db, sessionId, full, "bound", m.resume ? "reconnect" : null);
+    } else logBinding(db, sessionId, full, "bound", m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null);
   } else {
     hub.toolsOnly.add(ws);
     touchHandle(db, full);

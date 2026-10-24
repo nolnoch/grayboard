@@ -13,7 +13,10 @@ import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
-import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, mintSessionId, unboundInstruction } from "../core/bindings.ts";
+import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
+import { freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { launcherName } from "../shared/proc.ts";
+import { sockDir } from "../local/wakeup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, boardTools, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
@@ -123,7 +126,7 @@ let lostNotice: string | null = null;
 // A connection for `identity` (null: read-only). Its pushes go to the agent
 // only while it's live; a client that's been replaced or refused is dead and
 // hands nothing on, so its unacked messages stay queued for the name.
-function connect(identity: string | null, opts: { push: boolean; create?: boolean }): GrayboardClient {
+function connect(identity: string | null, opts: { push: boolean; create?: boolean; restoredFrom?: string }): GrayboardClient {
   const c: GrayboardClient = new GrayboardClient(
     serverUrl,
     currentToken,
@@ -140,7 +143,7 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     },
     opts.push,
     (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
-    { sessionId: SESSION_ID, create: opts.create, suggested: SUGGESTED, onDead: (reason) => lost(c, reason) },
+    { sessionId: SESSION_ID, create: opts.create, suggested: SUGGESTED, restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason) },
   );
   c.connect();
   return c;
@@ -154,6 +157,7 @@ function lost(c: GrayboardClient, reason: string): void {
   if (bound === null) return;
   lostNotice = `This session lost its bus name "${bound}" (${reason}) and is unbound now: bind(name) to take a name again.`;
   bound = null;
+  writeName(null);
 }
 
 // Only a server that reserves the name sends hello_ok.human, so only there is
@@ -171,32 +175,65 @@ const helloWithin = (c: GrayboardClient): Promise<HelloOk> => Promise.race([
 
 const OLD_SERVER = "this grayboard server predates unbound sessions, so reads are unavailable until you bind a name; the server needs updating";
 
-// Set when an explicit name was already held at start.
-let heldAtStart: { name: string; holder: string } | undefined;
+// Why this session started unbound, for its instructions.
+const unboundNotes: string[] = [];
 const fatal = (e: Error): never => {
   console.error(`[grayboard] ${e.message}`);
   process.exit(1);
 };
 
+// The name record (#182 decision 14), written by the session that owns
+// delivery whenever its name changes, so a restart under the same harness
+// takes the name back.
+const RECORD_DIR = sockDir();
+function writeName(name: string | null): void {
+  if (PUSH) writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: serverUrl });
+}
+
+// A bound connection for `name`, or why the server refused it. A restore
+// retries while the name is in use: the process it replaces may still hold
+// it for a moment.
+async function helloAs(name: string, opts: { create: boolean; restoredFrom?: string }): Promise<{ c: GrayboardClient; hello: HelloOk } | { refused: HelloRefused }> {
+  const deadline = Date.now() + 6000;
+  for (;;) {
+    const c = connect(name, { push: DELIVER, ...opts });
+    try {
+      return { c, hello: await helloWithin(c) };
+    } catch (e) {
+      c.close();
+      if (!(e instanceof HelloRefused)) throw e;
+      if (!(opts.restoredFrom && e.code === "identity_in_use" && Date.now() < deadline)) return { refused: e };
+      await Bun.sleep(500);
+    }
+  }
+}
+
 // Wait for hello_ok before the MCP handshake, so a refused identity or an
 // unreachable server shows as a failed server in the client, and so the
 // instructions can carry its notices or candidates.
 let hello: HelloOk | null = null;
-if (!PUSH || EXPLICIT) {
-  const c = connect(SUGGESTED!, { push: DELIVER, create: true });
-  try {
-    hello = await helloWithin(c);
-    client = c;
-    bound = SUGGESTED;
-  } catch (e) {
-    c.close();
-    // A held explicit name starts the session unbound, naming the holder:
-    // exiting would show the agent nothing it can act on.
-    if (!(PUSH && e instanceof HelloRefused && e.code === "identity_in_use")) fatal(e as Error);
-    heldAtStart = { name: SUGGESTED!, holder: (e as HelloRefused).holder ?? (e as Error).message };
-  }
+if (PUSH) sweepRecords(RECORD_DIR);
+const rec = PUSH ? freshRecord(RECORD_DIR, process.ppid, serverUrl) : null;
+// A restart under the same harness takes back its predecessor's name, ahead
+// of BUS_IDENTITY: it's the same session, mid-task.
+const want = rec?.name ? normalizeIdentityName(rec.name) : null;
+if (want && !want.ok) unboundNotes.push(restoreNote(rec!.name!, want.error));
+const startName = want?.ok ? want.name : !PUSH || EXPLICIT ? SUGGESTED : null;
+if (startName) {
+  const r = await helloAs(startName, want?.ok ? { create: false, restoredFrom: rec!.session_id } : { create: true }).catch(fatal);
+  if ("hello" in r) {
+    hello = r.hello;
+    client = r.c;
+    bound = startName;
+  } else if (want?.ok) unboundNotes.push(restoreNote(startName, r.refused.message));
+  // A held explicit name starts the session unbound, naming the holder:
+  // exiting would show the agent nothing it can act on.
+  else if (PUSH && r.refused.code === "identity_in_use") unboundNotes.push(heldNote(startName, r.refused.holder ?? r.refused.message));
+  else fatal(r.refused);
 }
 if (!bound) {
+  const launcher = PUSH ? launcherName(process.ppid) : null;
+  if (launcher) unboundNotes.push(launcherNote(launcher));
   const c = connect(null, { push: false });
   try {
     hello = await helloWithin(c);
@@ -207,6 +244,7 @@ if (!bound) {
     readsUnavailable = OLD_SERVER;
   }
 }
+writeName(bound);
 console.error(`[grayboard] server mode (${serverUrl}), session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
 
 // What a session bound to `name` is told: at start, or in bind's result.
@@ -244,7 +282,7 @@ const server = new Server(
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       ...(bound && hello
         ? boundInstructions(bound, hello, true)
-        : [unboundInstruction(hello?.candidates ?? [], heldAtStart), ...(readsUnavailable ? [`(${readsUnavailable}.)`] : [])]),
+        : [unboundInstruction(hello?.candidates ?? [], unboundNotes), ...(readsUnavailable ? [`(${readsUnavailable}.)`] : [])]),
     ].join(" "),
   },
 );
@@ -533,6 +571,7 @@ async function bind(a: Record<string, unknown>) {
     const old = client;
     client = next;
     bound = n.name;
+    writeName(bound);
     lostNotice = null;
     old?.close();
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);

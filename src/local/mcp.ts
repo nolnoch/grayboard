@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, mintSessionId, unboundInstruction } from "../core/bindings.ts";
+import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
@@ -43,8 +43,10 @@ import {
   withUploads,
 } from "./db.ts";
 import { localDbPath } from "./open.ts";
-import { listenForWakeup, poke } from "./wakeup.ts";
-import { acquireName, candidateNames, endSession, liveSessions, registerSession, thisSession } from "./binding.ts";
+import { listenForWakeup, poke, sockDir } from "./wakeup.ts";
+import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
+import { freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { launcherName } from "../shared/proc.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
@@ -133,15 +135,41 @@ const DELIVER = PUSH && !CHANNELS_OFF;
 // The bus name this session holds, or null while unbound. bind() changes it,
 // only between drains.
 let bound: string | null = null;
-// Set when an explicit name was already held at start.
-let heldAtStart: { name: string; holder: string } | undefined;
+// Why this session started unbound, for its instructions.
+const unboundNotes: string[] = [];
+// The name came back from the name record: the same harness session, so its
+// peer status stays.
+let restored = false;
+// The name record (#182 decision 14), written by the session that owns
+// delivery whenever its name changes. The Slack bridge's child keeps none:
+// its name is fixed, and a restart that can't have it must fail loudly.
+const RECORD_DIR = sockDir();
+const RECORDS = PUSH && !HUMAN;
+const writeName = (name: string | null) => {
+  if (RECORDS) writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+};
 if (!PUSH) bound = SUGGESTED;
 else {
   // The session that owns delivery owns the name: it writes the bindings row,
   // its presence while unbound, and acquires through it. Channels-off
   // sessions too: they own the session, they just don't listen.
   registerSession(db, thisSession(SESSION_ID));
-  if (EXPLICIT) {
+  if (RECORDS) sweepRecords(RECORD_DIR);
+  // A restart under the same harness takes back its predecessor's name, ahead
+  // of BUS_IDENTITY: it's the same session, mid-task.
+  const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
+  if (rec?.name) {
+    const n = normalizeIdentityName(rec.name);
+    // The process it replaces may not have exited yet.
+    if (n.ok) await siblingGone(db, n.name, process.ppid);
+    const r = n.ok
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, detail: `restored: restart of session ${rec.session_id}` })
+      : { ok: false as const, error: n.error };
+    if (r.ok) {
+      bound = r.name;
+      restored = true;
+    } else unboundNotes.push(restoreNote(rec.name, r.error));
+  } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
     if (r.ok) bound = r.name;
     else if (HUMAN) {
@@ -149,8 +177,13 @@ else {
       console.error(`[grayboard] ${r.error}`);
       endSession(db, SESSION_ID);
       process.exit(1);
-    } else heldAtStart = { name: SUGGESTED!, holder: r.holder ?? r.error };
+    } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
+  if (!bound) {
+    const launcher = launcherName(process.ppid);
+    if (launcher) unboundNotes.push(launcherNote(launcher));
+  }
+  writeName(bound);
 }
 console.error(`[grayboard] local mode, session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
 
@@ -186,7 +219,7 @@ const mcp = new Server(
     // a name receives anything, so bind's result carries it.
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      ...(bound ? boundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), heldAtStart)]),
+      ...(bound ? boundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
     ].join(" "),
   },
 );
@@ -560,6 +593,7 @@ async function bind(a: Record<string, any>) {
     if (previous) touchHandle(db, previous);
     startSession(db, n.name, process.cwd());
     bound = n.name;
+    writeName(bound);
     firstDrain = true;
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
     return text(bindResult(n.name, previous, r.moved.map((c) => c.key), boundInstructions(n.name, previous === null)));
@@ -574,8 +608,9 @@ async function bind(a: Record<string, any>) {
 // Startup: the name (if any) is already acquired. Connect MCP so
 // notifications are accepted, listen on the name's wakeup socket, and replay
 // what arrived while offline.
-// A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (bound && PUSH) startSession(db, bound, process.cwd());
+// A tools-only server runs beside the session that owns the identity, and a
+// restored name is the same session restarted: leave their status alone.
+if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
 else if (bound) touchHandle(db, bound);
 await mcp.connect(new StdioServerTransport());
 // Prunes the bus at most once a day across the sessions that share it.

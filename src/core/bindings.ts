@@ -69,14 +69,31 @@ function describe(c: Candidate): string {
 }
 
 /**
- * The unbound session's instructions: one sentence and the candidates.
- * `held` names the explicit name this session was started with and its
- * holder, when a live session already has it.
+ * The unbound session's instructions: one sentence, `notes` on why it has no
+ * name (heldNote, restoreNote, launcherNote), and the candidates.
  */
-export function unboundInstruction(candidates: Candidate[], held?: { name: string; holder: string }): string {
-  const heldNote = held ? ` BUS_IDENTITY asked for "${held.name}", but ${held.holder} holds it, so this session started without a name.` : "";
+export function unboundInstruction(candidates: Candidate[], notes: string[] = []): string {
+  const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
-  return `This session has no bus name yet.${heldNote} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+  return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+}
+
+/** An explicit name a live session already held at start. */
+export function heldNote(name: string, holder: string): string {
+  return `BUS_IDENTITY asked for "${name}", but ${holder} holds it, so this session started without a name.`;
+}
+
+/** A name record (decision 14) this restart couldn't take back. */
+export function restoreNote(name: string, why: string): string {
+  return `This grayboard process restarted; the one before it held "${name}", but ${why}, so this one started without a name.`;
+}
+
+/**
+ * The parent is a launcher (npx, a shell), not the harness: each restart gets
+ * a new parent, so the name record never matches it.
+ */
+export function launcherNote(launcher: string): string {
+  return `Its parent process is a launcher (${launcher}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
 }
 
 /**

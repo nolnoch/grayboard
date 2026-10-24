@@ -346,14 +346,15 @@ test("grayboard claim take/release acts as the shell's bound session; held exits
   const api = await start(undefined, repo, ["mcp"]);
   const be = await start("be");
 
-  // Every session here runs under this test process, an ancestor of the
-  // CLI too, so the checkout picks among them (#182 decision 18). An
-  // unbound session has no name to act as: refuse, never guess.
+  // Each session runs under its own harness stand-in, none of them an
+  // ancestor of the CLI, so the checkout picks (#182 decision 18); the
+  // ancestor rule is src/cli/claim.test.ts's. An unbound session has no name
+  // to act as: refuse, never guess.
   const unbound = await gb(undefined, repo, "whoami");
   expect(unbound.code).toBe(1);
   expect(unbound.err).toContain("hasn't bound a name yet");
   await call(api, "bind", { name: "api", create: true });
-  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session this shell runs under)\n" });
+  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout)\n" });
   const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
   expect((await gb(undefined, elsewhere, "whoami")).err).toContain("no live session runs this shell or this checkout");
   expect(JSON.parse((await gb("be", dir, "--json", "whoami")).out)).toEqual({ handle: "be", source: "BUS_IDENTITY" });

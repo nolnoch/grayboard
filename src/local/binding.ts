@@ -13,7 +13,7 @@ import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
-import { aliveRows, commandName, isAlive, procStart } from "./proc.ts";
+import { aliveRows, commandName, isAlive, procStart } from "../shared/proc.ts";
 import { poke } from "./wakeup.ts";
 
 export type SessionRow = {
@@ -90,8 +90,9 @@ function knownNames(db: Database): string[] {
 
 /**
  * Bind session `sessionId` to `name`, moving it off `previous` (a rebind)
- * with its claims. `create` allows a name that has never existed; `explicit`
- * (a BUS_IDENTITY) creates one as startup always has. Refusals are logged.
+ * with its claims. `create` allows a name that has never existed (startup
+ * passes it for an explicit BUS_IDENTITY, as startup always created one).
+ * `detail` goes on the bound event (a restart's restore). Refusals are logged.
  *
  * The socket probe for a pre-upgrade holder (no row, live socket) runs before
  * the lock and is re-checked against the rows inside it, so the write lock is
@@ -101,7 +102,7 @@ export async function acquireName(
   db: Database,
   sessionId: string,
   name: string,
-  opts: { create: boolean; previous: string | null; allowHuman?: boolean },
+  opts: { create: boolean; previous: string | null; allowHuman?: boolean; detail?: string },
 ): Promise<AcquireResult> {
   const rowHolder = () => db.prepare(`SELECT * FROM bindings WHERE name = ? AND session_id != ?`).get(name, sessionId) as SessionRow | null;
   const sockLive = rowHolder() ? false : await poke(name);
@@ -132,9 +133,24 @@ export async function acquireName(
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
     const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
     if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
-    logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous, now);
+    logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? opts.detail ?? null, now);
     return { ok: true, name, moved };
   }).immediate();
+}
+
+/**
+ * Wait up to `ms` for the live session holding `name` from under the same
+ * harness (`harnessPid`) to exit: a restarted grayboard can start before the
+ * process it replaces has released the name. True once no such holder is left.
+ */
+export async function siblingGone(db: Database, name: string, harnessPid: number, ms = 5000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const row = db.prepare(`SELECT * FROM bindings WHERE name = ?`).get(name) as SessionRow | null;
+    if (!row || row.harness_pid !== harnessPid || !isAlive(row.pid, row.proc_start)) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(50);
+  }
 }
 
 /**

@@ -1,6 +1,6 @@
-// Process facts the local bus keys liveness on (#182): a pid is alive only if
-// it exists and started when the row says it did, so a reused pid never keeps
-// a dead session's name. Linux reads /proc; macOS asks ps.
+// Process facts that bindings rows and name records key liveness on (#182):
+// a pid is alive only if it exists and started when the row says it did, so a
+// reused pid never keeps a dead session's name. Linux reads /proc; macOS asks ps.
 import { readFileSync } from "node:fs";
 
 /** /proc/<pid>/stat fields, after the parenthesized command (which may hold spaces). */
@@ -99,4 +99,27 @@ export function commandName(pid: number): string | null {
   }
   const comm = ps("comm", [pid]).get(pid);
   return comm ? comm.split("/").pop() || null : null;
+}
+
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
+const LAUNCHERS = /(?:^|[\s/])(npx|bunx|pnpx|uvx|npm|pnpm|yarn)(?=\s|$)/;
+
+/**
+ * The launcher `pid` is (a shell, or a package runner such as npx or bunx),
+ * or null if it looks like the harness itself. A package runner's command
+ * name is often just "node", so its command line decides.
+ */
+export function launcherName(pid: number): string | null {
+  const comm = commandName(pid);
+  if (comm && SHELLS.has(comm)) return comm;
+  const args = process.platform === "linux"
+    ? (() => {
+        try {
+          return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
+        } catch {
+          return "";
+        }
+      })()
+    : (ps("args", [pid]).get(pid) ?? "");
+  return LAUNCHERS.exec(args)?.[1] ?? null;
 }

@@ -32,6 +32,9 @@ export type ClientOptions = {
   create?: boolean;
   // A read-only hello's suggested name, listed first among its candidates.
   suggested?: string | null;
+  // The session ID of the process this one restarted from, whose name it
+  // takes back (#182 decision 14): sent on the first hello only.
+  restoredFrom?: string;
   // The client stopped for good after it was ready: superseded, or its name
   // refused on a reconnect. It never exits the process; the session decides.
   onDead?: (reason: string) => void;
@@ -91,7 +94,7 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
-      const { sessionId, create, suggested } = this.opts;
+      const { sessionId, create, suggested, restoredFrom } = this.opts;
       this.send({
         type: "hello", req_id: this.helloId,
         ...(this.identity === null
@@ -99,7 +102,7 @@ export class GrayboardClient {
           : { identity: this.identity, ...(this.push ? {} : { push: false }), ...(create !== undefined ? { create } : {}) }),
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(where ? { where } : {}),
-        ...(this.wasReady ? { resume: true } : {}),
+        ...(this.wasReady ? { resume: true } : restoredFrom ? { restored_from: restoredFrom } : {}),
       });
     };
 

@@ -263,3 +263,29 @@ test("18: against a server without read-only hellos, unbound reads are unavailab
     rmSync(dir, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("11: a restart under the same harness takes its name back; a fresh harness starts unbound", async () => {
+  // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
+  let s = await session("be");
+  await s.call("bind", { name: "api", create: true });
+  await s.call("peer_status", { text: "mid-task" });
+  const peer = await session("fe");
+  for (const how of ["reconnect", "crash"] as const) {
+    const before = events("api").at(-1)!.session_id;
+    s = await s.restart(how);
+    expect(s.c.getInstructions()).toStartWith(`You are identity "api"`);
+    expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
+    const last = events("api").at(-1)!;
+    expect(last).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restored: restart of session ${before}` });
+    // The same session to its peers: its status stays, and its mail arrives.
+    expect((await peer.call("peer_list", {})).peers).toContainEqual(expect.objectContaining({ handle: `${A}/api`, status: "mid-task" }));
+    await peer.call("dm_send", { to: "api", body: how });
+    await until(() => contents(s).includes(how));
+  }
+
+  // A new harness process is a new session: unbound.
+  await stop(s.c);
+  const fresh = await session(null);
+  expect(fresh.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(fresh.c.getInstructions()).not.toContain("restarted");
+}, 60_000);
