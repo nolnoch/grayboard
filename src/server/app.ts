@@ -2,6 +2,7 @@ import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { createApplication } from "./application.ts";
+import { createHostedMcp } from "./mcp.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
@@ -22,6 +23,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
   const { revalidate, disconnectUser, stopExpiry, wake } = application;
   const { handlers, startPing } = createWsHandlers(application);
+  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin });
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -44,6 +46,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     fetch(req, server) {
+      if (new URL(req.url).pathname === "/mcp") return mcp.fetch(req);
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
         if (!raw) {
@@ -88,6 +91,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   return {
     server,
+    mcp,
     repo,
     db,
     // The heartbeat's auth re-check, for tests that run without it.
@@ -99,6 +103,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       for (const t of timers) clearInterval(t);
       stopExpiry();
       server.stop(true);
+      return mcp.close();
     },
   };
 }
