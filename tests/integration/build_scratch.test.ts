@@ -9,7 +9,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { ROOT } from "../support/paths.ts";
 
 const dirs: string[] = [];
@@ -49,15 +49,18 @@ test("builds to the absolute outfile; the invocation cwd and TMPDIR stay clean",
   ]);
   expect(code).toBe(0);
   expect(existsSync(join(repo, "out.bin"))).toBe(true);
-  // The scratch directory is removed: TMPDIR (repo) holds only the outfile.
-  expect(readdirSync(repo).filter((f) => f.endsWith(".bun-build"))).toEqual([]);
+  // The scratch directory is removed: TMPDIR (repo) holds ONLY the outfile.
+  // The whole listing, not a pattern: the scratch dir is named tmp.XXXXXX,
+  // which no *.bun-build filter would catch if the cleanup were dropped.
+  expect(readdirSync(repo).sort()).toEqual(["out.bin"]);
 });
 
 test("propagates a failed command's exit code and still cleans the scratch", async () => {
   const repo = mkdtempSync(join(tmpdir(), "gb-scratch-"));
   dirs.push(repo);
   expect(await scratchCwd(repo, ["sh", "-c", "exit 3"])).toBe(3);
-  expect(readdirSync(repo).filter((f) => f.endsWith(".bun-build"))).toEqual([]);
+  // Whole listing: a surviving scratch dir would be tmp.XXXXXX, not *.bun-build.
+  expect(readdirSync(repo)).toEqual([]);
 });
 
 // The old post-build sweep deleted ./.*.bun-build, unlinking a concurrent
@@ -69,6 +72,9 @@ test("a stage file already in the invocation cwd survives the build", async () =
   const concurrent = scratchFile(repo);
   expect(await scratchCwd(repo, ["true"])).toBe(0);
   expect(existsSync(concurrent)).toBe(true);
+  // And nothing else appeared in the invocation cwd: the whole listing, since
+  // a leftover scratch dir (tmp.XXXXXX under TMPDIR=repo) is not *.bun-build.
+  expect(readdirSync(repo).sort()).toEqual([basename(concurrent)]);
 });
 
 test("the real trigger: a 555-mode bun strands the scratch in its cwd; the wrapper keeps it out of the repo", async () => {
@@ -110,5 +116,7 @@ test("the real trigger: a 555-mode bun strands the scratch in its cwd; the wrapp
     ]),
   ).toBe(0);
   expect(existsSync(join(repo, "out"))).toBe(true);
-  expect(readdirSync(repo).filter((f) => f.endsWith(".bun-build"))).toEqual([]);
+  // Whole listing: with the trap gone, the scratch dir (tmp.XXXXXX under
+  // TMPDIR=repo) survives the build, and no *.bun-build filter would see it.
+  expect(readdirSync(repo).sort()).toEqual(["mini.ts", "out"]);
 });

@@ -16,7 +16,10 @@
 #
 # Usage: build_scratch.sh <command> [args...]
 set -eu
-scratch=$(mktemp -d)
+# Explicit template, not the no-argument form: BSD mktemp (macOS) ignores
+# TMPDIR without a template and always uses the per-user OS temp dir, which
+# would strand the scratch outside any TMPDIR-based cleanup or test.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 cd "$scratch"
 "$@"
