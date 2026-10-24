@@ -81,7 +81,8 @@ async function form(req: Request): Promise<URLSearchParams> {
 }
 
 export function createOAuthServer(repo: Repo, config: Config, options: OAuthOptions = {}) {
-  if (config.devAuth && config.googleClientSecret) throw new Error("dev auth must not coexist with a Google client secret");
+  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret)) throw new Error("dev auth must not coexist with a Google client secret");
+  const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
   const issuer = oauthPublicUrl(config.publicUrl, config.devAuth);
   const base = new URL(issuer);
   const prefix = base.pathname === "/" ? "" : base.pathname;
@@ -196,7 +197,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     return html(`<h1>Authorize ${escapeHTML(client.name)}</h1><p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`);
   };
   const exchange = options.exchangeGoogle ?? (async (input: { code: string; verifier: string; redirectUri: string; nonce: string }) =>
-    exchangeGoogleCode(input.code, input.verifier, input.redirectUri, config.googleClientId, config.googleClientSecret, config.orgDomain, input.nonce));
+    exchangeGoogleCode(input.code, input.verifier, input.redirectUri, googleClient.clientId, googleClient.clientSecret, config.orgDomain, input.nonce));
 
   async function route(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
     const u = new URL(req.url);
@@ -254,7 +255,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         f.upstream = { stateHash: hashToken(upstreamState), verifier, nonce };
         upstream.set(f.upstream.stateHash, id);
         const google = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-        google.search = new URLSearchParams({ client_id: config.googleClientId, redirect_uri: endpoint("/oauth/google/callback"), response_type: "code",
+        google.search = new URLSearchParams({ client_id: googleClient.clientId, redirect_uri: endpoint("/oauth/google/callback"), response_type: "code",
           scope: "openid email profile", state: upstreamState, nonce, code_challenge: challenge(verifier), code_challenge_method: "S256", hd: config.orgDomain }).toString();
         response = redirect(google.href);
       }

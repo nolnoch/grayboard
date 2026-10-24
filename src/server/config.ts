@@ -14,6 +14,7 @@ export type Config = {
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
+  mcpGoogle?: { clientId: string; clientSecret: string };
   orgDomain: string;
   publicUrl: string;
   messageRetentionDays: number;
@@ -42,9 +43,9 @@ export type Config = {
 export function loadConfig(): Config {
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
-  if (devAuth && process.env.GOOGLE_OAUTH_CLIENT_SECRET) {
+  if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET)) {
     throw new Error(
-      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET (prevents prod misconfig)",
+      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET or GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET (prevents prod misconfig)",
     );
   }
 
@@ -61,6 +62,7 @@ export function loadConfig(): Config {
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
+    ...mcpGoogleConfig(),
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
@@ -76,6 +78,16 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };
+}
+
+function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
+  const clientId = process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET;
+  if (clientId === undefined && clientSecret === undefined) return {};
+  if (!clientId || !clientSecret || !/^[\x21-\x7e]{1,4096}$/.test(clientId) || !/^[\x21-\x7e]{1,4096}$/.test(clientSecret)) {
+    throw new Error("set both GRAYBOARD_MCP_GOOGLE_CLIENT_ID and GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET to nonempty credentials without whitespace, or neither");
+  }
+  return { mcpGoogle: { clientId, clientSecret } };
 }
 
 // The most an operator may raise the caps to. An upload's body is held in

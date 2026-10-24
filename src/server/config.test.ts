@@ -4,6 +4,7 @@ import { loadConfig } from "./config.ts";
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
+  "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
    "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
@@ -31,6 +32,47 @@ describe("loadConfig", () => {
   test("dev auth refuses to start alongside a Google client secret", () => {
     process.env.GRAYBOARD_DEV_AUTH = "1";
     process.env.GOOGLE_OAUTH_CLIENT_SECRET = "secret";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_DEV_AUTH=1/);
+  });
+
+  function primary() {
+    process.env.GOOGLE_OAUTH_CLIENT_ID = "desktop-client";
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET = "desktop-secret";
+    process.env.GRAYBOARD_ORG_DOMAIN = "example.com";
+  }
+
+  test("MCP Google override is optional and never replaces the retained primary pair", () => {
+    primary();
+    expect(loadConfig().mcpGoogle).toBeUndefined();
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "web-secret";
+    expect(loadConfig()).toMatchObject({ googleClientId: "desktop-client", googleClientSecret: "desktop-secret", mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } });
+    for (const name of ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]) {
+      delete process.env[name];
+      expect(() => loadConfig()).toThrow(`Required env var ${name} is not set`);
+      primary();
+    }
+  });
+
+  test("half, empty and malformed MCP Google pairs fail without exposing credentials", () => {
+    primary();
+    for (const [id, secret] of [["web-client", undefined], [undefined, "private-secret"], ["", "private-secret"], ["web-client", ""], ["", ""], ["bad client", "private-secret"], ["web-client", "private-secret\n"], ["web-client", "x".repeat(4097)]]) {
+      delete process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID;
+      delete process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET;
+      if (id !== undefined) process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = id;
+      if (secret !== undefined) process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = secret;
+      let message = "";
+      try { loadConfig(); } catch (error) { message = (error as Error).message; }
+      expect(message).toContain("set both GRAYBOARD_MCP_GOOGLE_CLIENT_ID");
+      expect(message).not.toContain("private-secret");
+      expect(message).not.toContain("web-client");
+    }
+  });
+
+  test("dev auth rejects the independent MCP Google secret", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "private-secret";
     expect(() => loadConfig()).toThrow(/GRAYBOARD_DEV_AUTH=1/);
   });
 
