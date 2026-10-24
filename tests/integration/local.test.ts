@@ -57,16 +57,49 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   ]);
 }, 20_000);
 
-test("a session started in a linked worktree gets a suffixed handle", async () => {
+test("a worktree session's handle follows the explicit-identity rule", async () => {
   const wt = join(dir, "repo", ".wt", "stream");
   mkdirSync(join(dir, "repo", ".git", "worktrees"), { recursive: true });
   mkdirSync(wt, { recursive: true });
   writeFileSync(join(wt, ".git"), `gitdir: ${join(dir, "repo", ".git", "worktrees", "stream")}\n`);
 
+  // An explicit BUS_IDENTITY is literal: no worktree suffix. Two sessions
+  // in one checkout take two names (one live session per handle still applies).
   const main = await start("be", join(dir, "repo"));
+  const sim = await start("sim", wt);
+  expect((await call(sim, "peer_list")).you).toBe("sim");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "sim"]);
+
+  // A BUS_IDENTITY that re-delivers the repo's pin is derived: the suffix
+  // composes, so an existing worktree handle ("be-stream") keeps its name,
+  // mail and claims. The pin lives in the main checkout; the worktree
+  // session resolves it through the repo.
+  writeFileSync(join(dir, "repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
   const stream = await start("be", wt);
   expect((await call(stream, "peer_list")).you).toBe("be-stream");
-  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
+}, 20_000);
+
+test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", async () => {
+  // No repo pin: a BUS_IDENTITY from a user-level registration (claude mcp
+  // add -e, pi's user mcp.json) is a chosen task name, literal in every
+  // worktree. Both sessions resolve to "task": the second is refused at
+  // startup with the remedy in the message, and the first keeps the name
+  // (one live session per handle; #182 specifies an unbound start instead,
+  // which is not merged yet).
+  const repo = join(dir, "repo2");
+  mkdirSync(join(repo, ".git", "worktrees"), { recursive: true });
+  for (const wt of ["alpha", "beta"]) {
+    const path = join(repo, ".wt", wt);
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, ".git"), `gitdir: ${join(repo, ".git", "worktrees", wt)}\n`);
+  }
+
+  const first = await start("task", join(repo, ".wt", "alpha"));
+  expect((await call(first, "peer_list")).you).toBe("task");
+  await expect(session("task", join(repo, ".wt", "beta"))).rejects.toThrow(/already in use by a live session/);
+  // The first session still owns the name and answers calls.
+  expect((await call(first, "peer_list")).you).toBe("task");
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
