@@ -46,7 +46,11 @@ export class ReleaseServer {
         digest: this.digests?.[tag]?.[name] ?? `sha256:${new Bun.CryptoHasher("sha256").update(await Bun.file(file).arrayBuffer()).digest("hex")}`,
       })),
     );
-    return Response.json({ tag_name: tag, assets });
+    // Pretty-printed, like api.github.com serves: hand-rolled parsing in
+    // install.sh must survive GitHub's real shape, not just compact JSON (#173).
+    return new Response(JSON.stringify({ tag_name: tag, assets }, null, 2), {
+      headers: { "content-type": "application/json;charset=utf-8" },
+    });
   }
 
   get url(): string {

@@ -89,13 +89,15 @@ binary_sum() {
 
 # The digest the release's API response lists for asset $2 ($1 = the release's
 # API URL). GitHub's JSON is line-oriented, so split objects onto lines and
-# take the digest that follows the asset's name; validated before use.
+# take the digest that follows the asset's name. api.github.com pretty-prints
+# ("name": "x"), mirrors may serve compact ("name":"x"): the patterns allow
+# either. Validated against the live API before use (#173).
 asset_digest() {
   curl -fsSL -H "Accept: application/vnd.github+json" "$1" \
     | tr ',{}' '\n' \
     | awk -v name="$2" '
-        /"name":/ { seen = ($0 ~ "\"name\":\"" name "\"") }
-        seen && /"digest":/ { sub(/.*"digest": *"/, ""); sub(/".*/, ""); print; exit }
+        /"name":/ { seen = ($0 ~ "\"name\": ?\"" name "\"") }
+        seen && /"digest":/ { sub(/.*"digest": ?"/, ""); sub(/".*/, ""); print; exit }
       '
 }
 

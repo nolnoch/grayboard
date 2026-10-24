@@ -23,12 +23,18 @@ beforeEach(() => {
   mkdirSync(join(dir, "stubs"));
   mkdirSync(join(dir, "bin"));
   for (const [name, digest] of [["digests", STUB_SHA], ["digests-wrong", WRONG_SHA]] as const) {
+    // Pretty-printed, like api.github.com serves (#173: the awk parse must
+    // survive GitHub's real shape, not just compact JSON).
     writeFileSync(
       join(dir, `${name}.json`),
-      JSON.stringify({
-        tag_name: "v9.9.9",
-        assets: ["grayboard", "grayboard-server"].map((bin) => ({ name: `${bin}-${target}`, digest })),
-      }),
+      JSON.stringify(
+        {
+          tag_name: "v9.9.9",
+          assets: ["grayboard", "grayboard-server"].map((bin) => ({ name: `${bin}-${target}`, digest })),
+        },
+        null,
+        2,
+      ),
     );
   }
   writeStub("sleep", "exit 0");
@@ -118,7 +124,12 @@ test("a binary whose sha256 doesn't match the release's digest is refused; the o
 });
 
 test("a release that lists no digest for the asset is refused", () => {
-  writeFileSync(join(dir, "digests.json"), JSON.stringify({ tag_name: "v9.9.9", assets: [] }));
+  // Pretty-printed, like the real API: the refusal is about the missing asset,
+  // not a parse quirk.
+  writeFileSync(
+    join(dir, "digests.json"),
+    JSON.stringify({ tag_name: "v9.9.9", assets: [] }, null, 2),
+  );
   const r = install({});
   expect(r.code).toBe(1);
   expect(r.err).toContain("the release lists no sha256 digest; refusing to install unverified");
