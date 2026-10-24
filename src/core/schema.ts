@@ -160,4 +160,8 @@ export function initCoreSchema(db: Database): void {
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === "scope")) db.exec(`ALTER TABLE boards ADD COLUMN scope TEXT`);
+
+  // Queue boards deliver each post to exactly one subscriber (the claim IS the
+  // delivery); broadcast (the default) fans out to every push subscriber.
+  if (!cols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE boards ADD COLUMN kind TEXT NOT NULL DEFAULT 'broadcast'`);
 }
