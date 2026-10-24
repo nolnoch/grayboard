@@ -1,4 +1,4 @@
-import { McpServer, ProtocolError, ProtocolErrorCode, ResourceNotFoundError } from "@modelcontextprotocol/server";
+import { McpServer, ProtocolError, ProtocolErrorCode, ResourceNotFoundError, type ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { CoreError } from "../core/errors.ts";
 import { ApplicationError, type ApplicationSession } from "./application.ts";
@@ -42,17 +42,20 @@ function boardRead(uri: string) {
 }
 
 export function registerHostedResources(server: McpServer, context: {
-  role: HostedRole; principal: OAuthPrincipal; session: ApplicationSession; request: Request;
+  role: HostedRole;
+  current(ctx?: ServerContext): { principal: OAuthPrincipal; session: ApplicationSession; request: Request };
   issuer: string; resource: string; resources: Resources; delivery: Delivery;
   authorize(): void;
+  leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
 }) {
-  const { role, principal, session, request, resources, delivery } = context;
+  const { role, resources, delivery } = context;
   const authorize = (signal?: AbortSignal) => {
     if (signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     context.authorize();
   };
   const leaseCapability = (signal: AbortSignal) => {
     authorize(signal);
+    const { principal, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
         delivery.describe(principal, capability).identity.identity_full !== session.identityFull) {
@@ -62,6 +65,7 @@ export function registerHostedResources(server: McpServer, context: {
   };
   server.server.setRequestHandler("resources/list", async (request, ctx) => {
     const params = request.params ?? {};
+    const { session } = context.current(ctx);
     try {
       authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
@@ -84,6 +88,7 @@ export function registerHostedResources(server: McpServer, context: {
     } catch (error) { throw resourceError(error); }
   });
   server.server.setRequestHandler("resources/read", async ({ params }, ctx) => {
+    const { principal, session } = context.current(ctx);
     try {
       authorize(ctx.mcpReq.signal);
       if (params.uri === identityUri) return json(params.uri, {
@@ -103,9 +108,10 @@ export function registerHostedResources(server: McpServer, context: {
     }
   });
   if (role !== "subscriber") return;
-  const run = async (signal: AbortSignal, call: () => unknown | Promise<unknown>) => {
+  const run = async (ctx: ServerContext, call: () => unknown | Promise<unknown>) => {
     try {
-      authorize(signal);
+      context.current(ctx);
+      authorize(ctx.mcpReq.signal);
       const value = await call();
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
@@ -114,8 +120,11 @@ export function registerHostedResources(server: McpServer, context: {
   };
   server.registerTool("delivery_open", {
     description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx.mcpReq.signal, async () => {
-    const lease = await delivery.open(principal, session.identityName);
+  }, (_args, ctx) => run(ctx, async () => {
+    const { principal, session } = context.current();
+    const hooks = context.leaseHooks?.();
+    const lease = await delivery.open(principal, session.identityName, hooks);
+    hooks?.bind(lease.capability);
     try { authorize(ctx.mcpReq.signal); return lease; }
     catch (error) {
       try { delivery.release(principal, lease.capability); } catch {}
@@ -124,12 +133,12 @@ export function registerHostedResources(server: McpServer, context: {
   }));
   server.registerTool("delivery_renew", {
     description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx.mcpReq.signal, () => delivery.renew(principal, leaseCapability(ctx.mcpReq.signal))));
+  }, (_args, ctx) => run(ctx, () => delivery.renew(context.current().principal, leaseCapability(ctx.mcpReq.signal))));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
     inputSchema: z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") }),
-  }, (args, ctx) => run(ctx.mcpReq.signal, () => delivery.receipt(principal, leaseCapability(ctx.mcpReq.signal), args.ids)));
+  }, (args, ctx) => run(ctx, () => delivery.receipt(context.current().principal, leaseCapability(ctx.mcpReq.signal), args.ids)));
   server.registerTool("delivery_release", {
     description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx.mcpReq.signal, () => delivery.release(principal, leaseCapability(ctx.mcpReq.signal))));
+  }, (_args, ctx) => run(ctx, () => delivery.release(context.current().principal, leaseCapability(ctx.mcpReq.signal))));
 }

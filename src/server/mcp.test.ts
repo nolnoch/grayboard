@@ -3,12 +3,15 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication, type DeliveryEvent } from "./application.ts";
+import { createApplication, ApplicationError, type DeliveryEvent } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { randomBytes } from "node:crypto";
+import { hashToken } from "./auth.ts";
+import { OAUTH_TTL } from "./oauth-types.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -31,6 +34,12 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
   await hosted.close();
+  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeGetStreams).toBe(0);
+  expect(hosted.activeStreams).toBe(0);
+  expect(hosted.activeBusListeners).toBe(0);
+  expect(hosted.activeWatches).toBe(0);
+  expect(hosted.activeLegacySessions).toBe(0);
   oauth.close();
   application.stopExpiry();
   await Bun.sleep(0);
@@ -38,7 +47,7 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response) => Promise<void>) {
+async function connect(version = "2026-07-28", intercept?: (response: Response) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -46,7 +55,10 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Where": "tools" } },
     fetch: async (input, init) => {
-      const response = await hosted.fetch(new Request(input, init));
+      const request = new Request(input, init);
+      headers?.forEach((value, key) => request.headers.set(key, value));
+      observeRequest?.(request);
+      const response = await hosted.fetch(request);
       await intercept?.(response);
       return response;
     },
@@ -66,7 +78,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const peers = application.call(owner, "peer_list", {}) as { peers: unknown[] };
   expect(peers.peers).toMatchObject([{ handle: "alice@example.com/be", online: true, status: "working", where: "owner" }]);
   expect(store.repo.cursors.directFor(owner.identityFull)).toBe(0);
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   await expect(application.selectIdentity(user, "be", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "identity_in_use" });
 });
 
@@ -97,7 +109,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
   }
   expect(selections).toBe(0);
   expect(store.repo.identities.findByUserAndName(user.user_id, "refused")).toBeUndefined();
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
 test("legacy SSE context survives fetch return until SDK reader cancellation", async () => {
@@ -107,25 +119,24 @@ test("legacy SSE context survives fetch return until SDK reader cancellation", a
       cancelled = true;
       expect(hosted.activeContexts).toBe(1);
       await response.body!.cancel();
-      expect(hosted.activeContexts).toBe(0);
+      expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
       throw new Error("test cancelled response");
     }
   })).rejects.toThrow();
   expect(cancelled).toBe(true);
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
 test("shutdown closes outstanding legacy SSE products and refuses new contexts", async () => {
-  let shutdown = false;
-  await expect(connect("2025-11-25", async response => {
-    if (!shutdown && response.headers.get("content-type")?.includes("text/event-stream")) {
-      shutdown = true;
-      expect(hosted.activeContexts).toBe(1);
-      await hosted.close();
-      expect(hosted.activeContexts).toBe(0);
-    }
-  })).rejects.toThrow();
-  expect(shutdown).toBe(true);
+  await connect("2025-11-25");
+  await Bun.sleep(0);
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(hosted.activeContexts).toBe(1);
+  await hosted.close();
+  expect(hosted.activeGetStreams).toBe(0);
+  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.activeStreams).toBe(0);
   expect((await hosted.fetch(new Request("http://localhost/mcp"))).status).toBe(503);
 });
 
@@ -146,7 +157,7 @@ test("shutdown racing the factory cannot leave a selected context behind", async
   await hosted.close();
   release();
   await expect(pending).rejects.toThrow();
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
 test("internal operation failures are redacted, including paths and SQL", async () => {
@@ -157,7 +168,7 @@ test("internal operation failures are redacted, including paths and SQL", async 
     const result = await client.callTool({ name: "board_list", arguments: {} });
     expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: internal error" }] });
   } finally { application.call = original; }
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {
@@ -177,7 +188,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
     expect(response!.headers.get("WWW-Authenticate")).toContain(oauth.resourceMetadata);
     expect(checks).toBe(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-    expect(hosted.activeContexts).toBe(0);
+    expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { oauth.authenticate = original; }
 });
 
@@ -203,7 +214,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
     expect(response!.status).toBe(401);
     expect(response!.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${oauth.resourceMetadata}", scope="grayboard:tools", error="invalid_token"`);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-    expect(hosted.activeContexts).toBe(0);
+    expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { release(); application.selectIdentity = original; }
 });
 
@@ -232,7 +243,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     await response.arrayBuffer();
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-    expect(hosted.activeContexts).toBe(0);
+    expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { release(); application.selectIdentity = original; }
 });
 
@@ -251,7 +262,7 @@ test("actual access revocation between factory and dispatch prevents mutation", 
     expect(checks).toBe(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
   } finally { oauth.isAuthorized = original; }
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: factory and dispatch persistence errors are redacted`, async () => {
@@ -272,9 +283,211 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
       expect(encoded).toMatch(/internal|Internal/);
       expect(checks).toBe(stage);
       expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-      expect(hosted.activeContexts).toBe(0);
+      expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     } finally { store.repo.oauth.findActiveAccess = original; }
   }
+});
+
+for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent refreshed exchanges keep their own access after reversed awaits`, async () => {
+  const grant = issueOAuth(store.repo, oauth.resource);
+  const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
+  const client = await connect(version, undefined, headers);
+  await Bun.sleep(0);
+  let refreshToken = grant.refreshToken;
+  function rotate() {
+    const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
+    expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
+      ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
+    } }, now).status).toBe("ok");
+    refreshToken = refresh;
+    return access;
+  }
+  const firstAccess = rotate(), secondAccess = rotate();
+  store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
+  const select = application.selectIdentity;
+  const releases: Array<() => void> = [];
+  async function selected(count: number) {
+    const deadline = performance.now() + 1000;
+    while (releases.length < count && performance.now() < deadline) await Bun.sleep(1);
+    expect(releases.length).toBe(count);
+  }
+  application.selectIdentity = async (...args) => {
+    const selected = await select(...args);
+    await new Promise<void>(resolve => releases.push(resolve));
+    return selected;
+  };
+  try {
+    headers.set("Authorization", `Bearer ${firstAccess}`);
+    const first = client.readResource({ uri: "grayboard://identity" }).catch(error => error);
+    await selected(1);
+    headers.set("Authorization", `Bearer ${secondAccess}`);
+    const second = client.callTool({ name: "peer_list", arguments: { include_offline: true } });
+    await selected(2);
+    store.repo.oauth.revokeToken(hashToken(firstAccess), grant.binding.clientId, Date.now());
+    releases[1]!();
+    expect(JSON.stringify(await second)).toContain("alice@example.com/be");
+    releases[0]!();
+    expect(await first).toBeInstanceOf(Error);
+    expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
+  } finally { releases.forEach(release => release()); application.selectIdentity = select; }
+});
+
+test("modern listen capacity is reserved and reusable after cancellation", async () => {
+  const client = await connect();
+  await client.callTool({ name: "board_create", arguments: { name: "bounded", purpose: "listen quota" } });
+  const filter = { resourceSubscriptions: ["grayboard://boards/bounded"] };
+  const subscriptions = [];
+  for (let i = 0; i < 128; i++) subscriptions.push(await client.listen(filter));
+  expect(hosted.activeListens).toBe(128);
+  expect(hosted.activeBusListeners).toBe(128);
+  await expect(client.listen(filter)).rejects.toThrow();
+  await Promise.all(subscriptions.map(sub => sub.close()));
+  await Bun.sleep(0);
+  expect(hosted.activeListens).toBe(0);
+  expect(hosted.activeBusListeners).toBe(0);
+  const replacement = await client.listen(filter);
+  await replacement.close();
+});
+
+test("legacy registry is bounded and idle disconnected sessions are reclaimed", async () => {
+  await hosted.close();
+  let clock = Date.now();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => clock });
+  for (let i = 0; i < 256; i++) await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(256);
+  await expect(connect("2025-11-25")).rejects.toThrow();
+  await Promise.all(clients.splice(0).map(client => client.close()));
+  await Bun.sleep(0);
+  expect(hosted.activeGetStreams).toBe(0);
+  clock += 60_001;
+  await Bun.sleep(1100);
+  expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.activeContexts).toBe(0);
+  await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(1);
+});
+
+test("global board watch bound cleans partial acquisitions without retiring other listeners", async () => {
+  const client = await connect();
+  const uris = [];
+  for (let i = 0; i < 32; i++) {
+    await client.callTool({ name: "board_create", arguments: { name: `b${i}`, purpose: "bounded watches" } });
+    uris.push(`grayboard://boards/b${i}`);
+  }
+  await expect(client.listen({ resourceSubscriptions: [...uris, "grayboard://identity"] })).rejects.toThrow();
+  expect(hosted.activeWatches).toBe(0);
+  const subscriptions = [];
+  for (let i = 0; i < 32; i++) subscriptions.push(await client.listen({ resourceSubscriptions: uris }));
+  expect(hosted.activeWatches).toBe(1024);
+  await expect(client.listen({ resourceSubscriptions: uris })).rejects.toThrow();
+  expect(hosted.activeWatches).toBe(1024);
+  expect(hosted.activeListens).toBe(32);
+  await Promise.all(subscriptions.map(sub => sub.close()));
+  await Bun.sleep(0);
+  expect(hosted.activeWatches).toBe(0);
+});
+
+test("shutdown awaits pending original request source cancellation", async () => {
+  let release!: () => void, cancelStarted = false, closed = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const body = new ReadableStream<Uint8Array>({ cancel: async () => { cancelStarted = true; await gate; } });
+  const request = new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json" }, body });
+  const pending = hosted.fetch(request);
+  await Bun.sleep(0);
+  const closing = hosted.close().then(() => { closed = true; });
+  await Bun.sleep(0);
+  expect(cancelStarted).toBe(true); expect(closed).toBe(false);
+  release();
+  await closing; await pending;
+  expect(body.locked).toBe(false);
+  expect(hosted.activePosts).toBe(0);
+});
+
+async function untilHosted(predicate: () => boolean) {
+  const deadline = performance.now() + 1000;
+  while (!predicate() && performance.now() < deadline) await Bun.sleep(1);
+  expect(predicate()).toBe(true);
+}
+
+async function legacyWatchFixture(version: string, headers?: Headers) {
+  const gets: Request[] = [], hints: string[] = [];
+  const client = await connect(version, undefined, headers, request => { if (request.method === "GET") gets.push(request); });
+  client.setNotificationHandler("notifications/resources/updated", n => { hints.push(n.params.uri); });
+  expect((await client.callTool({ name: "board_create", arguments: { name: "rollback", purpose: "watch acquisition" } })).isError).not.toBe(true);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  return { client, gets, hints, uri: "grayboard://boards/rollback" };
+}
+
+for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["database", "internal"] as const) test(`${version}: ${kind} observer failure rolls back registration and retry installs exactly one watch`, async () => {
+  const { client, gets, hints, uri } = await legacyWatchFixture(version);
+  const original = application.observeBoard;
+  const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
+  let failing = true, attempts = 0;
+  application.observeBoard = (...args) => { attempts++; if (failing) throw fault; return original(...args); };
+  try {
+    await expect(client.subscribeResource({ uri: "grayboard://boards/missing" })).rejects.toMatchObject({ code: -32602 });
+    expect(attempts).toBe(0);
+    const failure = await client.subscribeResource({ uri }).catch(error => error);
+    expect(failure).toMatchObject({ code: -32603 });
+    expect(failure.message).toContain("internal error");
+    expect(failure.message).not.toContain("private_storage");
+    expect(hosted.activeWatches).toBe(0);
+    expect(hosted.activeGetStreams).toBe(1);
+    expect(gets).toHaveLength(1);
+    expect(attempts).toBe(1);
+    failing = false;
+    expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "unregistered" } })).isError).not.toBe(true);
+    expect(hints).toEqual([]);
+    expect(await client.subscribeResource({ uri })).toEqual({});
+    expect(hosted.activeWatches).toBe(1);
+    expect(await client.subscribeResource({ uri })).toEqual({});
+    expect(hosted.activeWatches).toBe(1);
+    expect(attempts).toBe(2);
+    expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "registered" } })).isError).not.toBe(true);
+    await untilHosted(() => hints.length === 1);
+    expect(hints).toEqual([uri]);
+    expect(gets).toHaveLength(1);
+    expect(gets[0]!.signal.aborted).toBe(false);
+    expect(store.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+    await client.unsubscribeResource({ uri });
+    expect(hosted.activeWatches).toBe(0);
+  } finally { application.observeBoard = original; }
+});
+
+for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["database", "internal"] as const) test(`${version}: ${kind} fault checking the old GET is an internal error, not a successful registration`, async () => {
+  const grant = issueOAuth(store.repo, oauth.resource);
+  const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
+  const { client, gets, hints, uri } = await legacyWatchFixture(version, headers);
+  const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
+  expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(grant.refreshToken), tokens: {
+    ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
+  } }, now).status).toBe("ok");
+  headers.set("Authorization", `Bearer ${access}`);
+  const original = store.repo.oauth.findActiveAccess;
+  const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
+  let oldChecks = 0;
+  store.repo.oauth.findActiveAccess = (...args) => {
+    if (args[0] === grant.tokens.accessHash) { oldChecks++; throw fault; }
+    return original(...args);
+  };
+  try {
+    const failure = await client.subscribeResource({ uri }).catch(error => error);
+    expect(failure).toMatchObject({ code: -32603 });
+    expect(failure.message).toContain("internal error");
+    expect(failure.message).not.toContain("private_storage");
+    expect(oldChecks).toBe(1);
+    expect(hosted.activeWatches).toBe(0);
+    expect(hosted.activeGetStreams).toBe(1);
+    expect(gets).toHaveLength(1);
+  } finally { store.repo.oauth.findActiveAccess = original; }
+  expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "unregistered" } })).isError).not.toBe(true);
+  expect(hints).toEqual([]);
+  expect(await client.subscribeResource({ uri })).toEqual({});
+  expect(hosted.activeWatches).toBe(1);
+  expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "recovered" } })).isError).not.toBe(true);
+  await untilHosted(() => hints.length === 1);
+  expect(hints).toEqual([uri]);
+  expect(gets).toHaveLength(1);
 });
 
 test("authentication storage errors return a redacted HTTP 500 before identity selection", async () => {
@@ -286,5 +499,5 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
     expect(store.repo.identities.findByUserAndName(user.user_id, "unselected")).toBeUndefined();
   } finally { store.repo.oauth.findActiveAccess = original; }
-  expect(hosted.activeContexts).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });

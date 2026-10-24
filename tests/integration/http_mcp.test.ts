@@ -59,12 +59,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   const post = tools.tools.find(t => t.name === "board_post")!;
   expect(post.inputSchema.properties).toHaveProperty("attachment_ids");
   expect(post.inputSchema.properties).not.toHaveProperty("attachments");
-  expect(client.getServerCapabilities()?.resources).toEqual({});
+  expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
   expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
   expect((await client.callTool({ name: "board_create", arguments: { name: "e2e", purpose: "fixtures" } })).isError).not.toBe(true);
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toMatchObject([{ name: "e2e" }]);
   expect(value(await client.callTool({ name: "dm_inbox", arguments: {} }))).toEqual({ unanswered: [] });
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {
@@ -102,7 +102,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
       expect(res.status).toBe(403);
     }
     expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, identity)).toBeUndefined();
-    expect(app.mcp.activeContexts).toBe(0);
+    expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   }
   origin = trustedOrigin;
   identity = "allowed";
@@ -122,7 +122,7 @@ test("all HTTP methods require a valid token and explicit own agent name", async
     }
   }
   expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "human")).toBeUndefined();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("concurrent requests are principal isolated; inbox reads never acknowledge delivery", async () => {
@@ -144,7 +144,7 @@ test("concurrent requests are principal isolated; inbox reads never acknowledge 
   expect(app.repo.cursors.directFor("bob@example.com/be")).toBe(0);
   expect((await a.callTool({ name: "dm_retract", arguments: { message_id: sent.message_id } })).isError).not.toBe(true);
   expect(value(await b.callTool({ name: "dm_history", arguments: {} }))).toEqual([]);
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("invalid schemas and local paths fail without mutation; application errors stay tool errors", async () => {
@@ -164,7 +164,7 @@ test("invalid schemas and local paths fail without mutation; application errors 
   const refused = await client.callTool({ name: "board_read", arguments: { board: "hidden" } });
   expect(refused.isError).toBe(true);
   expect(JSON.stringify(refused)).toContain("no such board");
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("attachment IDs bind only the caller's uploads and downloads stay access checked", async () => {
@@ -195,7 +195,7 @@ test("revocation is checked on subsequent calls, including legacy", async () => 
     app.repo.sessions.revokeAllForUser(app.repo.users.findByEmail("bob@example.com")!.id);
     await expect(c.listTools()).rejects.toThrow();
   }
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("OAuth challenges and actual scope precede identity validation on every method", async () => {
@@ -210,13 +210,13 @@ test("OAuth challenges and actual scope precede identity validation on every met
     }
   }
   expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "unselected")).toBeUndefined();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("combined shared native grant remains non-owning with read-only resources", async () => {
   const client = await connect(await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]));
   expect((await client.listTools()).tools.map(t => t.name)).toContain("board_list");
-  expect(client.getServerCapabilities()?.resources).toEqual({});
+  expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
   expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
 });
@@ -232,7 +232,7 @@ test("live access, family, disable and admin revocation never reuse a cached pri
       case "admin": app.repo.sessions.revokeAllForUser(issued.authed.user_id); break;
     }
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "revoked" } })).rejects.toThrow();
-    expect(app.mcp.activeContexts).toBe(0);
+    expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   }
 });
 
@@ -258,7 +258,7 @@ test("connected clients cannot dispatch after their actual access deadline", asy
   clock = Date.now() + 3_600_001;
   await expect(client.callTool({ name: "board_create", arguments: { name: "expired", purpose: "blocked" } })).rejects.toThrow();
   expect(app.db.query("SELECT name FROM boards WHERE name = 'expired'").get()).toBeNull();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("shutdown closes MCP before OAuth and refuses subsequent authentication", async () => {
@@ -267,7 +267,7 @@ test("shutdown closes MCP before OAuth and refuses subsequent authentication", a
   const original = app.oauth.close;
   let closed = false;
   app.oauth.close = () => {
-    expect(app.mcp.activeContexts).toBe(0);
+    expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
     closed = true;
     original();
   };
@@ -317,7 +317,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
     expect(checks).toBe(2);
     expect(app.repo.identities.findByUserAndName(issued.authed.user_id, "unselected")).toBeUndefined();
     expect(app.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-    expect(app.mcp.activeContexts).toBe(0);
+    expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   } finally { app.oauth.authenticate = original; }
 });
 
@@ -332,5 +332,5 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
   } finally { app.repo.oauth.findActiveAccess = original; }
   expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "unselected")).toBeUndefined();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });

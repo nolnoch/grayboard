@@ -24,9 +24,11 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
   await hosted.close();
-  expect(hosted.activeLeases).toBe(0);
+  expect(hosted.activeGetStreams).toBe(0);
   expect(hosted.activeContexts).toBe(0);
-  expect(hosted.activeResourceContexts).toBe(0);
+  expect(hosted.activeLeases).toBe(0);
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
+  expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
   oauth.close();
   application.stopExpiry();
   store.db.close();
@@ -72,8 +74,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     if (stop === "access") expect(result).toMatchObject({ isError: true });
     await Bun.sleep(0);
     expect(hosted.activeLeases).toBe(0);
-    expect(hosted.activeContexts).toBe(0);
-    expect(hosted.activeResourceContexts).toBe(0);
+    expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
+    expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     const replacement = await original(grant.authed, "be", { deliver() {}, probe: async () => true, closed() {} });
     application.close(replacement.session);
   } finally { resume(); application.selectIdentity = original; }
