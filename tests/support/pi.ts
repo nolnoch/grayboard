@@ -13,6 +13,7 @@ import { localEnv } from "./env.ts";
 import { onChannelDm, messageText, startFakeModel, type ChatRequest, type Reply, type Rule } from "./fake_model.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
+import { grayboardChildren } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
@@ -118,17 +119,6 @@ function toolNames(bin?: string): string[] {
 const requestTools = (req: ChatRequest): string[] => (req.tools ?? []).map((t) => t.function.name);
 const systemText = (req: ChatRequest): string =>
   req.messages.filter((m) => m.role === "system" || m.role === "developer").map(messageText).join("\n");
-
-// The grayboard processes whose parent is `pid`: the session's one process
-// runs under pi itself (#182 decision 13).
-function grayboardChildren(pid: number, bin?: string): string[] {
-  const r = Bun.spawnSync(["ps", "-A", "-o", "ppid=,command="]);
-  const marker = bin ?? CLI;
-  return r.stdout.toString().split("\n")
-    .map((l) => l.trim().match(/^(\d+)\s+(.*)$/))
-    .filter((m): m is RegExpMatchArray => !!m && Number(m[1]) === pid && m[2]!.includes(marker))
-    .map((m) => m[2]!);
-}
 
 // SIGTERM lets pi stop its own children; awaited (SIGKILL after 5 s) so the
 // caller's rmSync doesn't race a pi still writing in dir.
