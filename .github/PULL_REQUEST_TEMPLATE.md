@@ -1,21 +1,10 @@
-## Problem
-
-<!-- 2-5 bullets: what is wrong or missing. -->
-
-## Value
-
-<!-- 2-5 bullets: what merging this buys. -->
-
-## Solution
-
-<!-- 2-5 bullets: the approach. -->
-
-## Details
-
-<!-- Verbose detail for agents and reviewers: files, design notes, deviations, test notes. -->
-
-## Tests
+## Gates
 
 - [ ] `bun run typecheck` green
-- [ ] `bun test` green (file order)
-- [ ] CI `test` check green
+- [ ] Covering tests green (the tests that exercise this change)
+- [ ] e2e suite green if the change touches its tier (`scripts/e2e.sh <suite>`)
+- [ ] Docs reconciled (docs gate) or docs-only change
+
+## Evidence
+
+<!-- How each acceptance criterion from the linked issue is met. Link the issue; N/A if none. -->

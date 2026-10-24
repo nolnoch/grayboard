@@ -20,3 +20,9 @@ labels: enhancement
 ## Details
 
 <!-- Verbose detail for agent needs: examples, open questions, relations to other issues. -->
+
+## Acceptance criteria
+
+<!-- 2-5 checkable statements, each verifiable by a run. This section is the spec the work is audited against. -->
+
+<!-- Apply the surface label on filing: server, local, core, cli, adapters, bridge, or ci -->
