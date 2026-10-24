@@ -5,19 +5,28 @@
 import { existsSync } from "node:fs";
 import { ApiError, busMode, loadCredentials, makeClient, signInHint } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
-import { defaultIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
+import { defaultIdentity, isExplicitIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
 
-/** The identity this shell acts as, and which rule chose it. `as` is literal: no worktree suffix. */
+/**
+ * The identity this shell acts as, and which rule chose it. `as` is literal:
+ * no worktree suffix. A true explicit BUS_IDENTITY (differs from every repo
+ * pin) is literal too — the same rule sessions use (src/shared/identity.ts);
+ * anything else — no BUS_IDENTITY, or one that merely re-delivers a pin —
+ * is derived and keeps the worktree suffix, as sessions do.
+ */
 export function actingIdentity(as?: string, env = process.env, cwd = process.cwd()): { name: string; source: string } {
   if (as !== undefined) {
     if (!isValidIdentityName(as.toLowerCase())) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -`);
     return { name: as, source: "--as" };
   }
+  if (isExplicitIdentity(env, cwd)) return { name: env.BUS_IDENTITY!, source: "BUS_IDENTITY" };
   const pin = pinnedIdentity(cwd);
+  // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin, as in
+  // sessionIdentity — with `??` it skipped the pin and changed the handle.
   const base = env.BUS_IDENTITY || pin || defaultIdentity(cwd);
-  const rule = env.BUS_IDENTITY ? "BUS_IDENTITY" : pin ? "the repo's .mcp.json pin" : "the directory name";
+  const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
   const name = resolveIdentity(base, cwd);
   return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"` };
 }

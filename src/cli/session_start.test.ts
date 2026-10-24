@@ -15,13 +15,19 @@ test("the title is the handle grayboard mcp would claim for the hook's cwd", () 
   expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), {}))).toBe("fe");
 });
 
-test("a linked worktree gets the suffixed handle", () => {
+test("a linked worktree's handle follows the explicit-identity rule", () => {
   const root = mkdtempSync(join(tmpdir(), "gb-ss-"));
   mkdirSync(join(root, "api", ".git", "worktrees", "stream"), { recursive: true });
   const wt = join(root, "stream");
   mkdirSync(wt);
   writeFileSync(join(wt, ".git"), `gitdir: ${join(root, "api", ".git", "worktrees", "stream")}\n`);
+  writeFileSync(join(root, "api", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
+  // A BUS_IDENTITY equal to the pin is derived: the suffix composes, so
+  // an existing worktree handle ("be-stream") keeps its title, mail, claims.
   expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "be" }))).toBe("be-stream");
+  // An explicit BUS_IDENTITY (differs from the pin) is verbatim: no suffix,
+  // so a worktree session joins that identity instead of forking a look-alike.
+  expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "sim" }))).toBe("sim");
 });
 
 test("bad input prints nothing rather than failing the session", () => {

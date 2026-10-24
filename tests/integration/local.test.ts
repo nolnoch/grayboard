@@ -57,16 +57,27 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   ]);
 }, 20_000);
 
-test("a session started in a linked worktree gets a suffixed handle", async () => {
+test("a worktree session's handle follows the explicit-identity rule", async () => {
   const wt = join(dir, "repo", ".wt", "stream");
   mkdirSync(join(dir, "repo", ".git", "worktrees"), { recursive: true });
   mkdirSync(wt, { recursive: true });
   writeFileSync(join(wt, ".git"), `gitdir: ${join(dir, "repo", ".git", "worktrees", "stream")}\n`);
 
+  // An explicit BUS_IDENTITY is literal: no worktree suffix. Two sessions
+  // in one checkout take two names (one live session per handle still applies).
   const main = await start("be", join(dir, "repo"));
+  const sim = await start("sim", wt);
+  expect((await call(sim, "peer_list")).you).toBe("sim");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "sim"]);
+
+  // A BUS_IDENTITY that re-delivers the repo's pin is derived: the suffix
+  // composes, so an existing worktree handle ("be-stream") keeps its name,
+  // mail and claims. The pin lives in the main checkout; the worktree
+  // session resolves it through the repo.
+  writeFileSync(join(dir, "repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
   const stream = await start("be", wt);
   expect((await call(stream, "peer_list")).you).toBe("be-stream");
-  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
