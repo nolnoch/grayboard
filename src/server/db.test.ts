@@ -32,6 +32,14 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
 
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
+// auto_vacuum applies only before the file's first page is written (#170).
+test("a new database file gets auto_vacuum=INCREMENTAL", () => {
+  const { db } = openDatabase(join(mkdtempSync(join(tmpdir(), "gb-db-")), "bus.db"), { blobDir: join(tmpdir(), "gb-db-blobs") });
+  expect(db.prepare("PRAGMA auto_vacuum").get()).toEqual({ auto_vacuum: 2 });
+  expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+  db.close();
+});
+
 describe("Repo", () => {
   let repo: Repo;
 
