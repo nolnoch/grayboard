@@ -5,6 +5,7 @@ import { createApplication } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { createHostedMcp } from "./mcp.ts";
+import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer, createTouchQueue } from "./auth.ts";
@@ -14,9 +15,9 @@ import { SlackBridge } from "./slack.ts";
 export type StartOptions = WsOptions & {
   // Tests skip the nightly retention timer and heartbeat.
   background?: boolean;
-  // Test hook: ms until the first nightly retention run, instead of the next
-  // UTC midnight — so a test can hold the timer pending across a stop().
   retentionFirstDelayMs?: number;
+  // Trusted test dependency injection; never populated from configuration.
+  oauth?: OAuthOptions;
 };
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -37,7 +38,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
-  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin, touches, now: opts.now });
+  const oauth = createOAuthServer(repo, config, opts.oauth);
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now });
+  const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -62,14 +65,17 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // margin covers a JSON request carrying a full message body.
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
-    fetch(req, server) {
+    async fetch(req, server) {
       // First, before anything reads the database (#240).
       const caller = authGate.caller(req, server.requestIP(req)?.address);
       const path = new URL(req.url).pathname;
       const limited = authGate.refuse(caller, path);
       if (limited) return limited;
 
-      if (path === "/mcp") return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
+      const address = server.requestIP(req)?.address;
+      const response = await oauth.fetch(req, address ? { remoteAddress: address } : undefined);
+      if (response) return response;
+      if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
         // No token costs nothing: a page can open a WebSocket cross-origin (auth_gate.ts).
@@ -124,6 +130,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     server,
     application,
     mcp,
+    oauth,
     repo,
     db,
     handlers,
@@ -135,10 +142,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     authGate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
-    // The session-touch queue, for tests that schedule touches directly.
     touches,
-    // Owns everything startServer opened: idempotent, closes the database
-    // once the server and every user of it (bridge, timers, expiry) is down.
     stop() {
       if (stopPromise) return stopPromise;
       slack?.stop();
@@ -147,7 +151,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopExpiry();
       touches.cancelAll();
       server.stop(true);
-      stopPromise = mcp.close().finally(() => db.close());
+      stopPromise = mcp.close().finally(() => { oauth.close(); db.close(); });
       return stopPromise;
     },
   };

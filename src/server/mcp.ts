@@ -1,18 +1,13 @@
-import { AsyncLocalStorage } from "node:async_hooks";
-import { McpServer, createMcpHandler, fromJsonSchema, type McpServerFactory } from "@modelcontextprotocol/server";
+import { McpServer, createMcpHandler, fromJsonSchema } from "@modelcontextprotocol/server";
 import type { CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
 import { boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
-import { closestNames, unknownNameError } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
-import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
-import { extractBearer, verifySessionToken, type TouchQueue } from "./auth.ts";
-import type { Repo } from "./db.ts";
-import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
-import { RateLimiter } from "./rate_limit.ts";
+import type { createOAuthServer } from "./oauth.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import pkg from "../../package.json" with { type: "json" };
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
@@ -24,8 +19,7 @@ const text = (value: unknown): CallToolResult => ({
   content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
-// Bearer auth here is transitional; the retained HTTP/WS login contract is unchanged.
-export function createHostedMcp(application: Application, repo: Repo, opts: { trustedOrigin: string; touches: TouchQueue; now?: () => number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized">, opts: { trustedOrigin: string }) {
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   const permitsOrigin = (origin: string | null): boolean => {
     if (origin === null) return true;
@@ -38,38 +32,31 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   };
   let closed = false;
   const sessions = new Map<ApplicationSession, McpServer>();
-  // SDK legacy routing clones Requests; scope refusals to the serving exchange.
-  type Exchange = { select?: ReturnType<Application["admitIdentity"]>; refusal?: ApplicationError; failure?: ApplicationError; logged?: boolean; principal?: number; identity?: string; session?: string; tool?: string; protocol?: string; request?: Request; address?: string };
-  const admission = new AsyncLocalStorage<Exchange>();
-  const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, opts.now, 4096);
-  const report = (e: unknown, exchange = admission.getStore(), source: FailureSource = "hosted-sdk") => {
-    if (e instanceof ApplicationError || e instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
-    if (exchange) exchange.logged = true;
-    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source) })}`);
+  const exchanges = new AsyncLocalStorage<{ refusal?: Response }>();
+  const refuse = (response: Response): never => {
+    const exchange = exchanges.getStore();
+    if (exchange) exchange.refusal = response;
+    throw new Error("unauthenticated");
   };
-  const refuse = (reason: string, req: Request, address: string, exchange?: Exchange) => {
-    refusalLogs.sweep();
-    // At capacity, unknown addresses must not create an unbounded log stream.
-    if (refusalLogs.size >= 4096 || !refusalLogs.take(address).ok) return;
-    console.error(`[grayboard] hosted MCP refused: ${JSON.stringify({ reason, address, origin: diagnosticOrigin(req.headers.get("Origin")), public_origin: trustedOrigin, principal: exchange?.principal, identity: exchange?.identity, protocol: exchange?.protocol })}`);
-  };
-  const isRefusal = (e: unknown): e is ApplicationError => e instanceof ApplicationError && e.code === "rate_limited" && typeof e.extra.retry_after_ms === "number" && Number.isFinite(e.extra.retry_after_ms) && e.extra.retry_after_ms > 0;
-  const factory: McpServerFactory = async ({ requestInfo }) => {
-    if (!requestInfo || closed) throw new Error("MCP endpoint is closed");
-    const raw = extractBearer(requestInfo);
-    const authed = raw && verifySessionToken(raw, repo, opts.touches);
-    if (!authed) throw new ApplicationError("unauthenticated", "invalid or missing token");
-    const exchange = admission.getStore();
-    if (exchange?.refusal) throw exchange.refusal;
-    if (!exchange?.select) throw new Error("MCP identity admission is missing");
-    const { session, info } = await exchange.select({ deliver() {}, probe: async () => false, closed() {} }).catch((e: unknown) => {
-      if (isRefusal(e)) exchange.refusal = e;
-      throw e;
-    });
-    exchange.session = session.sessionId;
-    if (closed || requestInfo.signal.aborted) {
+  const handler = createMcpHandler(async ({ requestInfo }) => {
+    if (!requestInfo || closed || requestInfo.signal.aborted) throw new Error("MCP endpoint is closed");
+    const principal = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+    if (principal instanceof Response) return refuse(principal);
+    const { session, info } = await application.selectIdentity(
+      principal.authed, requestInfo.headers.get("X-Grayboard-Identity")!,
+      { deliver() {}, probe: async () => false, closed() {} },
+      { push: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
+    );
+    try {
+      if (closed || requestInfo.signal.aborted) throw new Error("MCP request is closed");
+      if (!oauth.isAuthorized(principal)) {
+        const current = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+        if (current instanceof Response) refuse(current);
+        throw new Error("unauthenticated");
+      }
+    } catch (e) {
       application.close(session);
-      throw new Error("MCP request is closed");
+      throw e;
     }
     const server = new McpServer({ name: "grayboard", version: pkg.version }, {
       supportedProtocolVersions: MCP_PROTOCOL_VERSIONS,
@@ -84,15 +71,13 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
     sessions.set(session, server);
     // SDK closes each instance on terminal response, stream cancellation, or shutdown.
     server.server.onclose = () => { application.close(session); sessions.delete(session); };
-    const run = (tool: string, call: () => unknown): CallToolResult => {
-      exchange.tool = tool;
+    const run = (call: () => unknown): CallToolResult => {
       try {
         if (requestInfo.signal.aborted) return { ...text("error: request cancelled"), isError: true };
         // Recheck the token at dispatch as well as at the HTTP boundary.
-        if (!verifySessionToken(raw, repo, opts.touches)) return { ...text("error: unauthenticated"), isError: true };
+        if (!oauth.isAuthorized(principal)) return { ...text("error: unauthenticated"), isError: true };
         return text(call() ?? "ok");
       } catch (e) {
-        report(e, exchange, "hosted-tool");
         const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
         return { ...text(`error: ${message}`), isError: true };
       }
@@ -107,33 +92,29 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
         description: tool.name === "board_post" ? tool.description.replace("attachments?", "attachment_ids?") : tool.description,
         ...(tool._meta ? { _meta: tool._meta } : {}),
         inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, properties, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-      }, args => run(tool.name, () => application.call(session, tool.name, args)));
+      }, args => run(() => application.call(session, tool.name, args)));
     }
     server.registerTool("dm_send", {
       description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
       inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional() }),
-    }, a => run("dm_send", () => application.send(session, a.to, a.body, a)));
-    server.registerTool(DELEGATE_TOOL.name, {
-      description: DELEGATE_TOOL.description,
-      inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-    }, a => run(DELEGATE_TOOL.name, () => application.delegate(session, a)));
+    }, a => run(() => application.send(session, a.to, a.body, a)));
     server.registerTool("dm_history", {
       description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
       inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
-    }, a => run("dm_history", () => application.history(session, a)));
+    }, a => run(() => application.history(session, a)));
     server.registerTool("dm_thread", {
       description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }),
-    }, a => run("dm_thread", () => application.thread(session, a.thread)));
+    }, a => run(() => application.thread(session, a.thread)));
     server.registerTool(DM_INBOX_TOOL.name, {
       description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta,
       inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }),
-    }, a => run(DM_INBOX_TOOL.name, () => application.inbox(session, a.days)));
+    }, a => run(() => application.inbox(session, a.days)));
     server.registerTool(DM_ACK_TOOL.name, {
       description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta,
       inputSchema: z.strictObject({ message_id: z.union([id, ids.min(1)]) }),
     }, a => {
       const acked: number[] = [], missing: number[] = [];
-      const result = run(DM_ACK_TOOL.name, () => {
+      const result = run(() => {
         for (const n of new Set(Array.isArray(a.message_id) ? a.message_id : [a.message_id])) {
           try { application.acknowledgeDm(session, n); acked.push(n); } catch (e) {
             if (!(e instanceof ApplicationError) || e.code !== "not_found") throw e;
@@ -146,78 +127,29 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
     });
     server.registerTool(DM_RETRACT_TOOL.name, {
       description: DM_RETRACT_TOOL.description, inputSchema: z.strictObject({ message_id: id }),
-    }, a => run(DM_RETRACT_TOOL.name, () => application.retract(session, a.message_id)));
+    }, a => run(() => application.retract(session, a.message_id)));
     return server;
-  };
-  const handler = createMcpHandler(async context => {
-    try {
-      return await factory(context);
-    } catch (e) {
-      const exchange = admission.getStore();
-      if (e instanceof ApplicationError && exchange) exchange.failure = e;
-      if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code) && exchange?.request) refuse(e.code, exchange.request, exchange.address ?? "unknown", exchange);
-      report(e, exchange, "hosted-factory");
-      throw new Error("internal error");
-    }
-  }, { legacy: "stateless", onerror: e => report(e) });
+  }, { legacy: "stateless" });
   return {
     get activeContexts() { return sessions.size; },
-    async fetch(req: Request, address = "unknown"): Promise<Response> {
-      const exchange: Exchange = { request: req, address, protocol: MCP_PROTOCOL_VERSIONS.includes(req.headers.get("MCP-Protocol-Version") ?? "") ? req.headers.get("MCP-Protocol-Version")! : "unspecified" };
+    async fetch(req: Request): Promise<Response> {
+      if (closed) return new Response("MCP endpoint is closed", { status: 503 });
+      if (!permitsOrigin(req.headers.get("Origin"))) return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
       try {
-        if (closed) return new Response("MCP endpoint is closed", { status: 503 });
-        if (!permitsOrigin(req.headers.get("Origin"))) {
-          refuse("origin", req, address, exchange);
-          return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
-        }
-        const token = extractBearer(req);
-        const authed = token && verifySessionToken(token, repo, opts.touches);
-        if (!authed) return Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 });
-        exchange.principal = authed.user_id;
+        const principal = oauth.authenticate(req, ["grayboard:tools"]);
+        if (principal instanceof Response) return principal;
         const name = req.headers.get("X-Grayboard-Identity");
         if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
-          refuse("identity", req, address, exchange);
           return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
         }
-        exchange.identity = name.toLowerCase();
-        try {
-          exchange.select = application.admitIdentity(authed, name, {
-            push: false, create: false, transport: "hosted", where: req.headers.get("X-Grayboard-Where") ?? undefined,
-            alive: () => !closed && !req.signal.aborted,
-          });
-        } catch (e) {
-          if (!isRefusal(e)) {
-            report(e, exchange, "hosted-admission");
-            return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
-          }
-          exchange.refusal = e;
-        }
-        if (!exchange.refusal && !repo.aliases.find(authed.user_email, name.toLowerCase())) {
-          refuse("identity_unknown", req, address, exchange);
-          const known = closestNames(name.toLowerCase(), repo.aliases.listFor(authed.user_email).map(i => i.name).filter(n => n !== HUMAN_NAME));
-          return Response.json({ code: "identity_unknown", message: unknownNameError(name.toLowerCase(), known), known }, { status: 400 });
-        }
-        return admission.run(exchange, async () => {
-          try {
-            const response = await handler.fetch(req);
-            if (exchange.failure?.code === "unauthenticated") return Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 });
-            const retryAfterMs = exchange.refusal?.extra.retry_after_ms;
-            if (typeof retryAfterMs === "number") {
-              const { id = null } = response.headers.get("Content-Type")?.includes("application/json")
-                ? await response.json().catch(() => ({})) as { id?: string | number | null } : {};
-              return Response.json({
-                jsonrpc: "2.0", id,
-                error: { code: -32000, message: "too many connections; retry after the indicated delay", data: { code: "rate_limited", retry_after_ms: retryAfterMs } },
-              }, { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } });
-            }
-            return response;
-          } catch (e) {
-            report(e, exchange, "hosted-fetch");
-            return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
-          }
+        return await exchanges.run({}, async () => {
+          const response = await handler.fetch(req);
+          const refusal = exchanges.getStore()?.refusal;
+          if (!refusal || closed || req.signal.aborted) return response;
+          await response.body?.cancel();
+          return refusal;
         });
-      } catch (e) {
-        report(e, exchange, "hosted-fetch");
+      } catch {
         return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
       }
     },
