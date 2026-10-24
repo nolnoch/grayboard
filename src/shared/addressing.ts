@@ -1,6 +1,8 @@
-const DIRECT_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\/[a-z0-9_-]{1,32}$/;
-const TEAM_RE   = /^team:[a-z0-9_-]{1,32}$/;
-const NAME_RE   = /^[a-z0-9_-]{1,32}$/;
+export const MAX_IDENTITY_LENGTH = 32;
+const NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
+const DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
+const TEAM_RE   = new RegExp(`^team:${NAME_CHARS}$`);
+const NAME_RE   = new RegExp(`^${NAME_CHARS}$`);
 
 export type DirectAddress = { kind: "user"; full: string; email: string; name: string };
 export type TeamAddress   = { kind: "team"; full: string; name: string };

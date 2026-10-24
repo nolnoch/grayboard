@@ -72,8 +72,12 @@ export type HelloOk     = {
   attachment_limits?: AttachmentLimits;
   // A read-only hello: the user's free names an unbound session can bind.
   candidates?: Candidate[];
-  // A rebind: the claim keys that moved from the session's previous name.
+  // A hello that holds its name: the claim keys that moved from the name the
+  // session left ([] when none did). A server from before #182 never sends
+  // it, which is how the client tells it can't move claims or refuse names.
   moved?: string[];
+  // A rebind whose claims stayed behind: why.
+  not_moved?: string;
 };
 export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;

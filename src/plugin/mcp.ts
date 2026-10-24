@@ -14,7 +14,7 @@ import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } f
 import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
-  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionKey, restoreNote, sessionIdOf, unboundInstruction,
+  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionKey, oldServerBindNote, restoreNote, sessionIdOf, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
@@ -598,7 +598,9 @@ function switchTo(next: GrayboardClient, name: string, previous: string | null, 
   lostNotice = null;
   old?.close();
   console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}${missed ? ` after ${missed}` : ""}`);
-  const r = bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general));
+  const notes = h.moved === undefined ? [oldServerBindNote(previous)] : h.not_moved ? [`${h.not_moved[0]!.toUpperCase()}${h.not_moved.slice(1)}.`] : [];
+  if (h.moved === undefined) console.error(`[grayboard] the server predates name binding: "${name}" was bound without its checks`);
+  const r = bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general), notes);
   if (missed) {
     missedBindNotice = bindMissed(name, missed, r.content[0]!.text);
     instructionsStale = true;

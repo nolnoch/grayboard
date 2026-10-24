@@ -151,15 +151,24 @@ export function launcherNote(launcher: string): string {
  * set, name and general alike, for adapters that replace their system-prompt
  * section with it (pi, opencode), so they never parse the text.
  */
-export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[]) {
+export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
+    ...notes,
     ...instructions(previous === null),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
+}
+
+/**
+ * bind's warning against a server from before #182 (its hello_ok has no
+ * `moved`): it creates any name it's given and moves no claims.
+ */
+export function oldServerBindNote(previous: string | null): string {
+  return `This server predates name binding: it created the name if it was new (check the spelling), ${previous ? `left your claims on "${previous}", ` : ""}and recorded nothing; ask your user to update it.`;
 }
 
 /** The notice for a bind that completed but whose result the agent never saw. */

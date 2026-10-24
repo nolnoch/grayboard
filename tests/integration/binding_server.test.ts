@@ -270,7 +270,7 @@ test("audit 3, 4: a rebind's from is checked against the record, a late resume i
   const other = srv.client(alice, "x", { hello: { session_key: "b2".repeat(32), session_id: sid, from: "fe2" } });
   const ok = await other.connect();
   expect(ok.type).toBe("hello_ok");
-  expect(ok.moved).toBeUndefined();
+  expect(ok).toMatchObject({ moved: [], not_moved: `claims not moved: this session doesn't hold "fe2"` });
   expect(events("x")).toEqual([{ session_id: sessionIdOf("b2".repeat(32)), event: "bound", detail: `claims not moved: this session doesn't hold "fe2"` }]);
   expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe2` }]);
   expect(events("fe2").map((e) => e.event)).toEqual(["moved"]);
@@ -477,9 +477,12 @@ test("18: against a server without read-only hellos, unbound reads are unavailab
     expect(s.c.getInstructions()).toContain("predates unbound sessions");
     expect(await refusal(s, "board_read", { board: "e2e" })).toContain("predates unbound sessions");
     expect(await refusal(s, "peer_list")).toContain("predates unbound sessions");
-    // Binding still works there, and the session reads once bound.
-    await s.call("bind", { name: "fe", create: true });
+    // Binding still works there, and the session reads once bound; the
+    // result says what the old server couldn't check or move (audit 20).
+    expect(await s.call("bind", { name: "fe", create: true })).toContain("predates name binding: it created the name if it was new");
     expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
+    await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
+    expect(await s.call("bind", { name: "fe2", create: true })).toContain(`left your claims on "fe"`);
   } finally {
     await closeSessions();
     await old.stop();
@@ -522,3 +525,13 @@ test("13 (decision 13): `grayboard tools` prints what the session serves; bind's
   expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
   expect((r.structuredContent as { instructions: string[] }).instructions[0]).toStartWith(`You are identity "api"`);
 }, 20_000);
+
+test("audit 19: a hello refused for an invalid or reserved name is logged as refused", async () => {
+  const long = `x${"y".repeat(40)}!`;
+  expect(await srv.client(alice, long).connect()).toMatchObject({ type: "error", code: "bad_request" });
+  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "bad_request" });
+  // A tools-only connection doesn't hold the name, so it doesn't log.
+  expect(await srv.client(alice, "human", { push: false }).connect()).toMatchObject({ type: "error", code: "bad_request" });
+  expect(events(long.slice(0, 32))).toEqual([{ session_id: expect.stringMatching(/^[0-9a-f]{16}$/), event: "refused", detail: "invalid name" }]);
+  expect(events("human")).toEqual([{ session_id: expect.stringMatching(/^[0-9a-f]{16}$/), event: "refused", detail: expect.stringContaining("human") }]);
+});

@@ -1,7 +1,7 @@
 import { participant, type MessageRow, type Repo } from "./db.ts";
 import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type ErrorCode } from "../shared/protocol.ts";
 import {
-  HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
+  HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
@@ -346,18 +346,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   ws.data.place = m.where ?? null;
   if (m.read_only) return helloReadOnly(hub, ws, reqId, sessionId, m.suggested);
 
-  const name = m.identity!.toLowerCase();
-  if (!isValidIdentityName(name)) {
-    err(ws, reqId, "bad_request", "invalid identity name");
-    ws.close();
-    return;
-  }
-  if ((name === HUMAN_NAME) !== (ws.data.human === true)) {
-    err(ws, reqId, "bad_request", name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities");
-    ws.close();
-    return;
-  }
-
+  // An invalid name is logged cut to the longest valid length: it's the
+  // client's text, and the event only has to show what was tried.
+  const name = m.identity!.toLowerCase().slice(0, MAX_IDENTITY_LENGTH);
   const { authed } = ws.data;
   const full = `${authed.user_email}/${name}`;
   // Only the connection that would hold the name logs: a tools-only one runs
@@ -367,6 +358,11 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     send(ws, { type: "error", req_id: reqId, code, message, ...extra });
     ws.close();
   };
+  if (!isValidIdentityName(m.identity!.toLowerCase())) return refuse("bad_request", "invalid identity name", "invalid name");
+  if ((name === HUMAN_NAME) !== (ws.data.human === true)) {
+    const why = name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities";
+    return refuse("bad_request", why, why);
+  }
 
   // A typo would otherwise create a fresh name, and the DMs queued for the
   // intended one would never arrive.
@@ -444,6 +440,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
 
   let moved: string[] | undefined;
   if (owns) {
+    moved = [];
     holders.set(full, ws);
     if (push) registry.set(full, ws);
     // A reconnect, or a restart taking its name back, is the same session: its status stays.
@@ -487,6 +484,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
     attachment_limits: repo.attachmentLimits,
     ...(moved ? { moved } : {}),
+    ...(notMoved ? { not_moved: notMoved } : {}),
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
