@@ -17,7 +17,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 beforeEach(() => {
   clock = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resources-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] }, { background: false, oauth: { now: () => clock } });
+  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

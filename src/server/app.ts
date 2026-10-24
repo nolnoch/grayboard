@@ -13,6 +13,7 @@ import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
 export type StartOptions = WsOptions & {
+  hostname?: string;
   // Tests skip the nightly retention timer and heartbeat.
   background?: boolean;
   // Trusted test dependency injection; never populated from configuration.
@@ -46,6 +47,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin });
 
   const server = Bun.serve<WsData>({
+    hostname: opts.hostname,
     port: config.httpPort,
     idleTimeout: 75,
     // The largest body is an attachment upload (src/server/http.ts); the

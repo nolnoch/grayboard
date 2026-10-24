@@ -20,7 +20,7 @@ beforeEach(() => {
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [],
     oauthClients: [{ clientId: "native", name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
-  }, { background: false, oauth: { exchangeGoogle: async input => {
+  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async input => {
     exchanges++;
     expect(input.redirectUri).toBe(issuer + "/oauth/google/callback");
     expect(input.verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
