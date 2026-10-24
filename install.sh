@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # grayboard installer — downloads release binaries and drops them into a bin dir.
+# Every download is verified against the sha256 digest the release API publishes
+# for the asset; a mismatch or a missing digest refuses the install (#173).
 #
 # Default install (developer machine):
 #   curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | bash
@@ -67,6 +69,36 @@ fi
 echo "grayboard: installing ${VERSION}"
 base_url="${RELEASES_URL}/${REPO}/releases/download/${VERSION}"
 
+# The GitHub release API publishes a sha256 digest per asset; the download
+# origin alone doesn't. On github.com the API lives on api.github.com; a
+# GRAYBOARD_RELEASES_URL mirror serves both paths on one origin (#173).
+case "${RELEASES_URL}" in
+  https://github.com) API_BASE="https://api.github.com" ;;
+  *) API_BASE="${RELEASES_URL}" ;;
+esac
+release_api="${API_BASE}/repos/${REPO}/releases/tags/${VERSION}"
+
+# ── sha256 helpers ───────────────────────────────────────────────────────────
+
+binary_sum() {
+  case "$(uname -s)" in
+    Darwin) shasum -a 256 "$1" | awk '{print $1}' ;;
+    *) sha256sum "$1" | awk '{print $1}' ;;
+  esac
+}
+
+# The digest the release's API response lists for asset $2 ($1 = the release's
+# API URL). GitHub's JSON is line-oriented, so split objects onto lines and
+# take the digest that follows the asset's name; validated before use.
+asset_digest() {
+  curl -fsSL -H "Accept: application/vnd.github+json" "$1" \
+    | tr ',{}' '\n' \
+    | awk -v name="$2" '
+        /"name":/ { seen = ($0 ~ "\"name\":\"" name "\"") }
+        seen && /"digest":/ { sub(/.*"digest": *"/, ""); sub(/".*/, ""); print; exit }
+      '
+}
+
 # ── pick binaries ────────────────────────────────────────────────────────────
 
 bins=(grayboard)
@@ -81,10 +113,21 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 for bin in "${bins[@]}"; do
-  url="${base_url}/${bin}-${target}"
+  asset="${bin}-${target}"
+  url="${base_url}/${asset}"
+  want="$(asset_digest "$release_api" "$asset")"
+  case "$want" in
+    sha256:????????????????????????????????????????????????????????????????) ;;
+    *) echo "grayboard: ${asset}: the release lists no sha256 digest; refusing to install unverified" >&2; exit 1 ;;
+  esac
   echo "grayboard: downloading ${url}"
   if ! curl -fsSL -o "${tmp}/${bin}" "$url"; then
     echo "grayboard: failed to download ${url}" >&2
+    exit 1
+  fi
+  got="$(binary_sum "${tmp}/${bin}")"
+  if [ "$got" != "${want#sha256:}" ]; then
+    echo "grayboard: ${url}: sha256 ${got}, but the release lists ${want}; not installing." >&2
     exit 1
   fi
   chmod +x "${tmp}/${bin}"

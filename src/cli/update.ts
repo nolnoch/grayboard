@@ -65,15 +65,28 @@ export async function selfUpdate(current: string): Promise<{ tag: string | null;
   const res = await get(`${api}/repos/${REPO}/releases/latest`, "the latest release", {
     headers: { accept: "application/vnd.github+json" },
   });
-  const tag = ((await res.json()) as { tag_name: string }).tag_name;
+  const release = (await res.json()) as { tag_name: string; assets?: { name: string; digest?: string | null }[] };
+  const tag = release.tag_name;
   if (!newer(tag, current)) return { tag: null, origin: downloads };
 
-  const bin = await get(`${downloads}/${REPO}/releases/download/${tag}/grayboard-${TARGET}`, `the ${tag} binary for ${TARGET}`);
+  const asset = `grayboard-${TARGET}`;
+  const digest = release.assets?.find((a) => a.name === asset)?.digest;
+  const bin = await get(`${downloads}/${REPO}/releases/download/${tag}/${asset}`, `the ${tag} binary for ${TARGET}`);
+  const body = new Uint8Array(await bin.arrayBuffer());
+
+  // Verified before it's ever written, let alone run: a wrong or missing
+  // digest refuses the update (#173).
+  const got = `sha256:${new Bun.CryptoHasher("sha256").update(body).digest("hex")}`;
+  if (digest !== got) {
+    throw new Error(
+      `the ${tag} binary failed verification: ${got}, but the release lists ${digest ?? "no digest"}; not updating`,
+    );
+  }
 
   // Download next to the binary so the rename stays on one filesystem.
   const tmp = join(dirname(self), `.grayboard-${tag}-${process.pid}`);
   try {
-    writeFileSync(tmp, new Uint8Array(await bin.arrayBuffer()));
+    writeFileSync(tmp, body);
     chmodSync(tmp, 0o755);
     const check = Bun.spawnSync([tmp, "--version"]);
     if (check.exitCode !== 0 || !check.stdout.toString().includes(tag.replace(/^v/, ""))) {
