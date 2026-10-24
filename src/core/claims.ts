@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { canSeeBoard, normalizeBoard, post } from "./boards.ts";
+import { canSeeBoard, normalizeBoard, post, redeliverQueuePost } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -121,6 +121,14 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
     logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
+    if (key.startsWith("queue:")) {
+      // A declined queue post goes to the next lane with the original post;
+      // the decline post would itself rotate as a new work item, so it isn't
+      // announced either (#192 review).
+      watchersCc(db, key, true);
+      const lane = redeliverQueuePost(db, key, cur.holder, Date.now());
+      return { wake: lane ? [lane] : [] };
+    }
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
@@ -138,6 +146,19 @@ export function moveClaims(db: Database, from: string, to: string, now = Date.no
   const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
   for (const c of moved) logEvent(db, "moved", to, c, now, from);
   return moved;
+}
+
+// A queue post's holder replied in its thread: the work is handled. Releases
+// the claim with an ack note - no redelivery (handled is handled), no board
+// post. A decline, by contrast, is claim_release, which redelivers. Runs
+// inside the caller's transaction; returns whether `handle` held it.
+export function ackQueueClaim(db: Database, handle: string, key: string, now = Date.now()): boolean {
+  const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
+  if (!cur || cur.expires_at <= now || cur.holder !== handle) return false;
+  db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
+  watchersCc(db, key, true);
+  logEvent(db, "release", handle, { ...cur, note: "ack" }, now);
+  return true;
 }
 
 // Be told when someone else's claim is updated or ends, whatever your mode on
@@ -182,6 +203,15 @@ function sweepIn(db: Database, now: number): string[] {
   const wake = new Set<string>();
   for (const c of gone) {
     logEvent(db, "expire", c.holder, c, now);
+    if (c.key.startsWith("queue:")) {
+      // A queue post's claim lapsed: re-offer the original post to the next
+      // lane instead of announcing - an expiry post on a queue board would
+      // itself rotate as a new work item (#192 review).
+      watchersCc(db, c.key, true);
+      const lane = redeliverQueuePost(db, c.key, c.holder, now);
+      if (lane) wake.add(lane);
+      continue;
+    }
     const cc = watchersCc(db, c.key, true);
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;

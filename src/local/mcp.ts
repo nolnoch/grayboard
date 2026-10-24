@@ -11,6 +11,7 @@ import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, m
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { isQueueBoard } from "../core/boards.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
@@ -413,9 +414,12 @@ async function dispatch(name: string, a: Record<string, any>, signal: AbortSigna
   }
 
   if (isBoardTool(name)) {
-    // Only a human can start an announcement, which reaches the sessions live now.
+    // Only a human can start an announcement, which reaches the sessions live
+    // now. A queue board's rotation prefers live lanes, so it needs the probe
+    // too; other posts don't pay for it.
+    const queuePost = name === "board_post" && isQueueBoard(db, typeof a.board === "string" ? a.board : "");
     const ctx = {
-      ...(name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles(IDENTITY) } : {}),
+      ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
       ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
     };
@@ -578,13 +582,17 @@ startLocalRetention(db, blobs, RETENTION_DAYS);
 const shutdown = () => {
   try {
     if (bound) touchHandle(db, bound);
-  } catch {}
+  } catch {
+    // The bus may already be closed at shutdown; exiting matters more.
+  }
   // The socket goes first, while the row still holds the name, so nobody
   // takes the name with this socket still in place.
   stopListening();
   try {
     if (PUSH) endSession(db, SESSION_ID);
-  } catch {}
+  } catch {
+    // Same: shutdown must not throw.
+  }
   if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   process.exit(0);
 };

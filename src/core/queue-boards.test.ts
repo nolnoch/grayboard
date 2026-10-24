@@ -2,11 +2,11 @@ import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import {
+  acknowledge,
   createBoard,
-  getBoard,
-  markDelivered,
   pendingFor,
   post,
+  setQueueParticipation,
   setStatus,
   subscribe,
   touchHandle,
@@ -61,24 +61,57 @@ test("the claim is atomic: a second claim for the same post is ignored", () => {
   expect(claims.map((c) => c.holder)).toEqual(["fe"]);
 });
 
-test("TTL takeover: an expired claim releases and the next post rotates", () => {
-  const r = post(db, "be", "work", "work item");
-  // fe holds it, never acks; the claim expires.
+test("TTL takeover redelivers the original post to the next lane, and the rotation continues", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims it, never acks
   sweepExpired(db, Date.now() + 31 * 60_000);
-  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id))).toBe(false);
-  // A later post rotates to the other subscriber (fe's wake is the most recent).
+  // The original post is re-offered to sim, not left unclaimed and undelivered.
+  const rows = db.prepare(`SELECT handle FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
+  expect(rows.map((x) => x.handle).sort()).toEqual(["fe", "sim"]);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id) && c.holder === "sim")).toBe(true);
+  // sim's re-offer is a waking, undelivered push.
+  expect(pendingFor(db, "sim", { all: true }).some((i) => i.kind === "push" && i.post.id === r.post.id)).toBe(true);
+  // The audit chain: take -> expire -> take (redelivered).
+  expect(claimEvents(claimKey(r.post.id)).map((e) => e.event)).toEqual(["take", "expire", "take"]);
+  // The redelivery re-woke sim, so the next post rotates to fe.
   const r2 = post(db, "be", "work", "second work item");
-  expect(r2.wake).toEqual(["sim"]);
-  // The audit chain: take -> expire.
-  expect(claimEvents(claimKey(r.post.id)).map((e) => e.event)).toEqual(["take", "expire"]);
+  expect(r2.wake).toEqual(["fe"]);
 });
 
-test("a decline releases the claim immediately, before TTL", () => {
-  const r = post(db, "be", "work", "work item");
+test("a declined queue post redelivers the original post to the next lane", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims it, declines
   release(db, "fe", claimKey(r.post.id), "not my lane");
+  const rows = db.prepare(`SELECT handle FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
+  expect(rows.map((x) => x.handle).sort()).toEqual(["fe", "sim"]);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id) && c.holder === "sim")).toBe(true);
+  // The audit chain: take -> release -> take (redelivered).
+  expect(claimEvents(claimKey(r.post.id)).map((e) => e.event)).toEqual(["take", "release", "take"]);
+});
+
+test("a redelivered post resets a lane's earlier delivery, so the re-offer reaches it", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims
+  acknowledge(db, "fe", { kind: "push", post_id: r.post.id });
+  sweepExpired(db, Date.now() + 31 * 60_000); // sim declines too
+  release(db, "sim", claimKey(r.post.id), "pass");
+  // Only two lanes: the post comes back to fe, whose first delivery is reset.
+  const pend = pendingFor(db, "fe", { all: true });
+  expect(pend.some((i) => i.kind === "push" && i.post.id === r.post.id)).toBe(true);
+});
+
+test("a reply by the claim holder acks and releases the claim", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims
+  const reply = post(db, "fe", "work", "done: landed", r.post.id);
+  expect(reply.wake).toEqual(["be"]); // the thread author learns it's handled
   expect(listClaims(db).some((c) => c.key === claimKey(r.post.id))).toBe(false);
-  // The audit chain: take -> release.
+  // The audit chain ends in a release (the ack), not an expire.
   expect(claimEvents(claimKey(r.post.id)).map((e) => e.event)).toEqual(["take", "release"]);
+  // One take only: the ack releases without redelivering.
+  expect(claimEvents(claimKey(r.post.id)).filter((e) => e.event === "take").length).toBe(1);
+});
+
+test("a reply by a different lane does not release the holder's claim", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims
+  post(db, "sim", "work", "chiming in", r.post.id);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id) && c.holder === "fe")).toBe(true);
 });
 
 test("a resolved @mention is direct addressing and bypasses the rotation", () => {
@@ -87,10 +120,37 @@ test("a resolved @mention is direct addressing and bypasses the rotation", () =>
   expect(rows.map((x) => x.handle)).toEqual(["sim"]);
 });
 
-test("a busy subscriber is skipped in the rotation", () => {
+test("status text is not a busy flag; only the explicit opt-out skips a lane", () => {
   setStatus(db, "fe", "heads-down on another task");
   const r = post(db, "be", "work", "work item");
-  expect(r.wake).toEqual(["sim"]);
+  expect(r.wake).toEqual(["fe"]); // status is free text; fe is still eligible
+  setQueueParticipation(db, "fe", false);
+  const r2 = post(db, "be", "work", "second work item");
+  expect(r2.wake).toEqual(["sim"]);
+  // The opt-out persists until the lane opts back in.
+  expect(db.prepare(`SELECT queue_off FROM handles WHERE name = 'fe'`).get()).toEqual({ queue_off: 1 });
+  setQueueParticipation(db, "fe", true);
+  const r3 = post(db, "be", "work", "third work item");
+  expect(r3.wake).toEqual(["fe"]);
+});
+
+test("the rotation prefers live lanes and falls back to offline ones", () => {
+  const r = post(db, "be", "work", "work item", null, { online: (h) => h === "sim" });
+  expect(r.wake).toEqual(["sim"]); // fe is offline; sim is live
+  const r2 = post(db, "be", "work", "second work item", null, { online: (h) => h === "fe" });
+  expect(r2.wake).toEqual(["fe"]); // the other lane is live now
+  // Nobody live: the fallback still delivers, to one lane in rotation order
+  // (same-millisecond posts tie, so only the count and membership are pinned).
+  const r3 = post(db, "be", "work", "third work item", null, { online: () => false });
+  expect(r3.wake.length).toBe(1);
+  expect(["fe", "sim"]).toContain(r3.wake[0]!);
+});
+
+test("a read-only viewer is never picked by the rotation", () => {
+  touchHandle(db, "~tail");
+  subscribe(db, "~tail", "work", "push");
+  const r = post(db, "be", "work", "work item");
+  expect(r.wake).not.toContain("~tail");
 });
 
 test("broadcast boards keep fanning out to every push subscriber", () => {

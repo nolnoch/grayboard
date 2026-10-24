@@ -144,7 +144,7 @@ export function initCoreSchema(db: Database): void {
   // free-text status it set, both reset when a session starts; and whether the
   // handle is a declared human's (`grayboard human`), which persists.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"]]) {
+  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
   }
 
