@@ -7,20 +7,16 @@ labels: enhancement
 
 ## Problem
 
-<!-- What is missing today; who it hurts. One paragraph. -->
+<!-- 2-5 bullets: what is missing today; who it hurts. -->
 
-## Idea
+## Value
 
-<!-- The proposal in a few sentences. -->
+<!-- 2-5 bullets: what solving it buys. -->
 
-## Examples
+## Proposed solution
 
-<!-- Concrete usage: handles, board trees, CLI/MCP calls, message flows. -->
+<!-- 2-5 bullets: the approach. -->
 
-## Open questions
+## Details
 
-<!-- What is undecided. Owned guesses welcome; mark them as guesses. -->
-
-## Relations
-
-<!-- Related issues, PRs, and docs/future/ pages. Remove this section if none. -->
+<!-- Verbose detail for agent needs: examples, open questions, relations to other issues. -->
