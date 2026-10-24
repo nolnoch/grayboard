@@ -2,7 +2,7 @@
 // connection, bind as a new hello, rebind, and what the server records.
 // Each numbered comment is the #182 acceptance criterion the test shows.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
@@ -107,6 +107,17 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
 
   // 14: bound, it's gone from the list.
   await until(async () => (await be.call("peer_list", {})).unbound_sessions === undefined);
+}, 30_000);
+
+test("15: an unbound exit removes its name record; a bound exit keeps it for a restart", async () => {
+  const records = join(srv.dir, "home", ".claude-bus");
+  const u = await session(null);
+  expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(true);
+  await stop(u.c);
+  expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(false);
+  const b = await session("api");
+  await stop(b.c);
+  expect(JSON.parse(readFileSync(join(records, `bind.${b.harnessPid}`), "utf8")).name).toBe("api");
 }, 30_000);
 
 test("2, 13: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {

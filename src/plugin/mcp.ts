@@ -14,7 +14,7 @@ import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } f
 import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
-import { freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../local/wakeup.ts";
@@ -543,7 +543,11 @@ async function bind(a: Record<string, unknown>) {
 
 await server.connect(new StdioServerTransport());
 
-const shutdown = () => { client?.close(); process.exit(0); };
+const shutdown = () => {
+  client?.close();
+  if (PUSH && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
+  process.exit(0);
+};
 process.on("SIGINT",  shutdown);
 process.on("SIGTERM", shutdown);
 // Exit when the MCP client goes away, so an orphan can't keep holding the identity.

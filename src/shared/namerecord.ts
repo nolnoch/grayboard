@@ -110,6 +110,22 @@ export function sweepRecords(dir: string): void {
   }
 }
 
+/**
+ * At exit: delete this session's record if it holds no name. A bound exit
+ * keeps its record, so a grayboard restarted under the same harness (`/mcp`
+ * reconnect) takes the name back; a record a successor already rewrote is left.
+ */
+export function dropUnboundRecord(dir: string, harnessPid: number, sessionId: string): void {
+  const path = recordPath(dir, harnessPid);
+  let r: NameRecord | null;
+  try {
+    r = parse(readFileSync(path, "utf8"));
+  } catch {
+    return;
+  }
+  if (r && r.session_id === sessionId && r.name === null) rm(path);
+}
+
 function rm(path: string): void {
   try {
     unlinkSync(path);

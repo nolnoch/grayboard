@@ -3,7 +3,7 @@
 // Each numbered comment is the #182 acceptance criterion the test shows.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
@@ -305,8 +305,11 @@ test("12: the human declaration and a bind of the same name: neither order lets 
 test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped by the next acquire", async () => {
   const u = await session();
   const uid = await sessionId(u);
+  const record = join(dir, `bind.${u.harnessPid}`);
+  expect(existsSync(record)).toBe(true);
   await stop(u.c);
   expect(rows(`SELECT 1 FROM bindings WHERE session_id = ?`, uid)).toEqual([]);
+  expect(existsSync(record)).toBe(false);
 
   await session("fe");
   process.kill(pidOf("fe"), "SIGKILL");
@@ -325,10 +328,11 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   const ev = events("fe");
   expect(ev.map((e) => e.event)).toEqual(["bound", "released", "bound"]);
   expect(ev[1]!.detail).toMatch(/^reaped: pid \d+ is gone$/);
-  // A clean exit logs its release.
+  // A clean exit logs its release, and keeps its name record for a restart under its harness.
   await stop(next.c);
   expect(events("fe").at(-1)!.event).toBe("released");
   expect(existsSync(join(dir, "sock.fe"))).toBe(false);
+  expect(JSON.parse(readFileSync(join(dir, `bind.${next.harnessPid}`), "utf8")).name).toBe("fe");
 }, 30_000);
 
 test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {

@@ -44,7 +44,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { listenForWakeup, poke, sockDir } from "./wakeup.ts";
 import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
-import { freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
@@ -560,6 +560,7 @@ const shutdown = () => {
   try {
     if (PUSH) endSession(db, SESSION_ID);
   } catch {}
+  if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
