@@ -12,7 +12,10 @@
     "server": "bun src/server/main.ts",
     "cli": "bun src/cli/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun test src tests",
+    "test:opencode": "cd adapters/opencode-v2 && bun install --frozen-lockfile && bun run typecheck && bun run test && bun run build",
+    "test:opencode:host": "cd adapters/opencode-v2 && bun run test:host",
+    "test:opencode:config": "cd adapters/opencode-v2 && bun run test:config",
     "build": "bun run build:cli && bun run build:server",
     "build:cli": "bash scripts/build_scratch.sh bun build --compile \"$PWD/src/cli/main.ts\"    --outfile \"$PWD/dist/grayboard\"",
     "build:server": "bash scripts/build_scratch.sh bun build --compile \"$PWD/src/server/main.ts\" --outfile \"$PWD/dist/grayboard-server\""

@@ -194,6 +194,7 @@ type Move = { path: string; backup: string; source: string };
 /** Adapter source is supplied by the CLI's existing build macro, not loaded from a checkout. */
 export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean } {
   const url = hostedEndpoint(opts.url);
+  if (!url.startsWith("https://")) fail("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
   if (!publicClientId(opts.clientId)) fail("Public OAuth client ID must be a literal 1–512 printable non-space ASCII string without OpenCode substitutions");
   if (!identity(opts.identity)) fail("Identity must be a lowercase simple agent name, not human or a full handle");
   const plugin = pluginDirectory(opts.plugin);

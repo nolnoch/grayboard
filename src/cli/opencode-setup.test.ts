@@ -73,6 +73,14 @@ for (const clientId of ["", " ", "has space", "line\nbreak", "a".repeat(513), "Ã
   expect(existsSync(f.config)).toBe(false);
 });
 
+test("hosted setup refuses HTTP loopback before writes while generic compatibility recognition remains", () => {
+  const f = fixture();
+  const before = readdirSync(f.root).sort();
+  expect(() => f.run({ url: "http://127.0.0.1:8080/mcp" })).toThrow("existing local adapter");
+  expect(readdirSync(f.root).sort()).toEqual(before);
+  expect(hostedEndpoint("http://127.0.0.1:8080/mcp")).toBe("http://127.0.0.1:8080/mcp");
+});
+
 test("installed-directory validation checks package name and direct loadable server/index entry", () => {
   const f = fixture();
   expect(() => f.run({ plugin: join(f.plugin, "index.js") })).toThrow();
