@@ -78,6 +78,9 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  // Pending bridge-down notices, by user id: armed when the bridge dies
+  // fatally, drained once at that user's next hello (any identity).
+  bridgeDown: Map<number, string[]>;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -114,6 +117,15 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
+// The bridge-down notices held for this user, drained once (their next hello,
+// any identity) and cleared — one notice per fatal stop, not per hello.
+function drainBridgeDown(hub: Hub, userId: number): string[] {
+  const held = hub.bridgeDown.get(userId);
+  if (!held?.length) return [];
+  hub.bridgeDown.delete(userId);
+  return held;
+}
+
 // Does the connection answer a ping within ms? The plugin pongs every ping.
 function probe(ws: Ws, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -141,6 +153,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), probing: new Map(), toolsOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    bridgeDown: new Map(),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -148,6 +161,13 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const handlers = {
     open(_ws: Ws) {
       // wait for hello
+    },
+    // The Slack bridge died fatally: hold the notice for the owner's next
+    // hello (any of their identities), drained once per user per stop.
+    bridgeDownNotice(userId: number, text: string): void {
+      const held = hub.bridgeDown.get(userId) ?? [];
+      held.push(text);
+      hub.bridgeDown.set(userId, held);
     },
 
     message(ws: Ws, rawData: string | Buffer) {
@@ -378,6 +398,7 @@ async function handleHello(
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
+    ...drainBridgeDown(hub, authed.user_id),
   ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);

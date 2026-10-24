@@ -29,6 +29,10 @@ const CODE_TTL_MS = 10 * 60_000;
 // guessing hopeless well before this.
 const MAX_TRIES = 5;
 const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+// A second bridge.stopped for the same user inside this window records the
+// audit row but skips the repeat hello notice: one flapping bridge must not
+// spam its owner per retry.
+const BRIDGE_NOTIFY_DEDUP_MS = 60 * 60_000;
 
 const NOT_LINKED =
   "This Slack account isn't linked to grayboard. In a terminal signed in to grayboard, run `grayboard slack link` and send me the code it prints.";
@@ -36,6 +40,8 @@ const NOT_LINKED =
 type Handlers = {
   message(ws: Conn, raw: string): void;
   close(ws: Conn): void;
+  // The hub holds a bridge-down notice for this user's next hello.
+  bridgeDownNotice(userId: number, text: string): void;
 };
 
 export type SlackBridgeOptions = {
@@ -137,7 +143,7 @@ export class SlackBridge implements SlackLinker {
       onEvent: (payload) => this.onEvent(payload),
       onFatal: (reason) => {
         this.log(`stopping: ${reason}`);
-        this.stop();
+        this.stop({ fatal: true, detail: reason });
       },
       log: this.log,
       debug: this.o.debug,
@@ -150,10 +156,30 @@ export class SlackBridge implements SlackLinker {
     return !this.stopped;
   }
 
-  stop(): void {
+  /**
+   * Deliberate teardown (app shutdown) passes no reason: the bridge goes down
+   * silently, because the operator knows. The fatal shape — Slack ended the
+   * connection, or startup failed — records one `bridge.stopped` audit row per
+   * linked user and arms a hello notice for each, deduped to one notice per
+   * user per BRIDGE_NOTIFY_DEDUP_MS so a flapping bridge can't spam its owner.
+   */
+  stop(reason?: { fatal: true; detail: string }): void {
     this.stopped = true;
     this.socket?.stop();
-    for (const userId of [...this.linked.keys()]) this.detach(userId);
+    const linked = [...this.linked.entries()];
+    for (const userId of this.linked.keys()) this.detach(userId);
+    if (!reason?.fatal) return;
+    const at = Date.now();
+    for (const [userId, { link }] of linked) {
+      const target = `${link.email}/${HUMAN_NAME}`;
+      writeAudit(this.o.repo, "bridge.stopped", null, target, {
+        reason: reason.detail,
+        at: new Date(at).toISOString(),
+      });
+      const last = this.o.repo.audit.last("bridge.stopped", target);
+      const prior = last && at - last.at < BRIDGE_NOTIFY_DEDUP_MS && last.at !== at;
+      if (!prior) this.o.handlers.bridgeDownNotice(userId, `your Slack bridge stopped at ${new Date(at).toISOString()} (${reason.detail}); linked humans are offline until it reconnects or the server restarts`);
+    }
   }
 
   // ── linking ────────────────────────────────────────────────────────────────
@@ -374,9 +400,9 @@ export class SlackBridge implements SlackLinker {
 
   // ── Slack → grayboard ──────────────────────────────────────────────────────
 
-  private async onEvent(payload: Record<string, any>): Promise<void> {
+  private async onEvent(payload: Record<string, unknown>): Promise<void> {
     if (payload.type !== "event_callback") return;
-    const e = payload.event as Record<string, any> | undefined;
+    const e = payload.event as Record<string, unknown> | undefined;
     // Only people's new messages in a DM with the app, with or without files:
     // no edits, deletes or bot posts, including our own.
     if (!e || e.type !== "message" || e.channel_type !== "im" || (e.subtype && e.subtype !== "file_share") || e.bot_id || !e.user) return;

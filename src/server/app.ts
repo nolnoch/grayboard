@@ -87,6 +87,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     server,
     repo,
     db,
+    handlers,
+    // Exposed for tests: the bridge instance, to drive fatal stops directly.
+    slack,
     // The heartbeat's auth re-check, for tests that run without it.
     revalidate,
     // Settles once the Slack bridge is up, or has given up.
