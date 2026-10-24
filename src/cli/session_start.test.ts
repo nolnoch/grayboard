@@ -30,6 +30,15 @@ test("a linked worktree's handle follows the explicit-identity rule", () => {
   expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "sim" }))).toBe("sim");
 });
 
+test("an explicit BUS_IDENTITY is lowercased, the server's rule (#181)", () => {
+  const repo = join(mkdtempSync(join(tmpdir(), "gb-ss-")), "api");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "Gray" }))).toBe("gray");
+  // A name invalid after lowercasing refuses `grayboard mcp` at startup, so
+  // the hook — which must never block a session — titles nothing.
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "Gray!" })).toBe("");
+});
+
 test("bad input prints nothing rather than failing the session", () => {
   expect(sessionStartOutput("not json", {})).toBe("");
 });

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sessionIdentity } from "../shared/identity.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
 
 // Claude Code's SessionStart hook: title the session with its grayboard
 // handle, so the name Claude Code shows (and its ListAgents lists) is the one
@@ -11,8 +12,11 @@ export function sessionStartOutput(stdin: string, env = process.env): string {
   try {
     const input = JSON.parse(stdin) as { cwd?: unknown };
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
-    const handle = sessionIdentity(env, cwd);
-    return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", sessionTitle: handle } });
+    const id = normalizeIdentityName(sessionIdentity(env, cwd));
+    // An invalid explicit identity refuses `grayboard mcp` at startup; the
+    // hook prints nothing rather than block the session (#181).
+    if (!id.ok) return "";
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", sessionTitle: id.name } });
   } catch {
     return "";
   }
