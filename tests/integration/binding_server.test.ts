@@ -5,6 +5,7 @@ import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runCli } from "../support/cli.ts";
 import { serverEnv } from "../support/env.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
@@ -289,3 +290,13 @@ test("11: a restart under the same harness takes its name back; a fresh harness 
   expect(fresh.c.getInstructions()).toStartWith("This session has no bus name yet.");
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 }, 60_000);
+
+test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
+  const s = await session(null);
+  const printed = await runCli(["tools", "--json"], { cwd: srv.dir, env: serverEnv(srv.dir, srv.base, alice, null) });
+  expect(printed.code).toBe(0);
+  expect(JSON.parse(printed.out)).toEqual((await s.c.listTools()).tools);
+  const r = await s.c.callTool({ name: "bind", arguments: { name: "api", create: true } });
+  expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
+  expect((r.structuredContent as { instructions: string[] }).instructions[0]).toStartWith(`You are identity "api"`);
+}, 20_000);

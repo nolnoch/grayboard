@@ -11,17 +11,18 @@ import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } 
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
-import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
+import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
-import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
 import { freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
+import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../local/wakeup.ts";
 import { testPause } from "../shared/testpause.ts";
-import { BOARD_INSTRUCTIONS, boardNotification, boardTools, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { BOARD_INSTRUCTIONS, boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
+  attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
   type AttachmentLimits,
 } from "../shared/attachments.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -291,57 +292,8 @@ server.oninitialized = markInitialized;
 
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 
-const TOOLS = [
-  BIND_TOOL,
-  {
-    name: "dm_send",
-    // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
-    // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
-    _meta: { "anthropic/alwaysLoad": true },
-    description:
-      `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        to:        { type: "string", description: "The peer's exact handle, user@your-org.com/name, as peer_list shows it." },
-        body:      { type: "string", description: "Message body (plain text, max 64 KiB)" },
-        parent_id: { type: "number", description: "Optional. message_id to reply to." },
-        pending:   PENDING_PARAM,
-        attachments: ATTACHMENTS_PARAM,
-      },
-      required: ["to", "body"],
-    },
-  },
-  {
-    name: "dm_history",
-    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        peer:      { type: "string", description: "Optional. Only messages with this address." },
-        limit:     { type: "number", description: "Max messages (default 20, max 200)." },
-        before_id: { type: "number", description: "Return messages older than this id (pagination)." },
-      },
-    },
-  },
-  {
-    name: "dm_thread",
-    _meta: { "anthropic/alwaysLoad": true },
-    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
-    inputSchema: {
-      type: "object",
-      properties: { thread: { type: "number", description: "Any message_id in the thread." } },
-      required: ["thread"],
-    },
-  },
-  DM_INBOX_TOOL,
-  DM_ACK_TOOL,
-  DM_RETRACT_TOOL,
-  ATTACHMENT_GET_TOOL,
-  ...boardTools({ teams: true }),
-];
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: SERVER_TOOLS }));
 
 const text = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
@@ -368,7 +320,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 async function call(name: string, a: Record<string, unknown>) {
-  const bad = checkArgs(TOOLS, name, a);
+  const bad = checkArgs(SERVER_TOOLS, name, a);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   if (name === "bind") return bind(a);
   if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
@@ -575,7 +527,7 @@ async function bind(a: Record<string, unknown>) {
     lostNotice = null;
     old?.close();
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return text(bindResult(n.name, previous, h.moved ?? [], boundInstructions(n.name, h, previous === null)));
+    return bindOk(n.name, previous, h.moved ?? [], boundInstructions(n.name, h, previous === null));
   } finally {
     binding = false;
   }

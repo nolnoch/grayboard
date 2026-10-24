@@ -99,15 +99,19 @@ export function launcherNote(launcher: string): string {
 /**
  * bind's result: what changed, then `instructions`, the startup text for the
  * name (instructions are fixed at initialize, so bind's result carries them).
+ * `structuredContent` repeats the name and instructions for adapters that put
+ * the instructions in the system prompt themselves (pi, opencode), so they
+ * never parse the text.
  */
-export function bindResult(name: string, previous: string | null, moved: string[], instructions: string[]): string {
-  return [
+export function bindOk(name: string, previous: string | null, moved: string[], instructions: string[]) {
+  const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
     ...instructions,
   ].join(" ");
+  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions } };
 }
 
 /** The refusal for a name that has never existed, without create: true. */

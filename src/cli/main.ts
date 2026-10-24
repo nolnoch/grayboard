@@ -418,6 +418,23 @@ program
     }
   });
 
+// The adapters that serve grayboard's tools themselves (pi, opencode; #182
+// decision 13) register them from this list at load. It's what `mcp` would
+// serve in the same mode, and printing it opens no bus and no connection.
+program
+  .command("tools", { hidden: true })
+  .description("Print the tools `grayboard mcp` serves, as JSON")
+  .option("--mode <mode>", "Force local or server mode, as for mcp")
+  .action(async (opts: { mode?: string }) => {
+    const mode = opts.mode ?? busMode();
+    if (mode !== "local" && mode !== "server") {
+      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
+      process.exit(1);
+    }
+    const tools = mode === "server" ? (await import("../plugin/tools.ts")).SERVER_TOOLS : (await import("../local/tools.ts")).LOCAL_TOOLS;
+    console.log(JSON.stringify(tools));
+  });
+
 const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard";
 
 program

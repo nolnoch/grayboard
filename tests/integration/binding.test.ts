@@ -345,3 +345,20 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(l.c.getInstructions()).toStartWith("This session has no bus name yet.");
   expect(l.c.getInstructions()).toContain(launcherNote);
 }, 60_000);
+
+test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
+  const s = await session();
+  const printed = await runCli(["tools", "--json"], { cwd: dir, env: localEnv(dir) });
+  expect(printed.code).toBe(0);
+  expect(JSON.parse(printed.out)).toEqual((await s.c.listTools()).tools);
+  // Printing the tools opened no bus.
+  const fresh = mkdtempSync(join(dir, "fresh-"));
+  expect((await runCli(["tools"], { cwd: fresh, env: localEnv(fresh) })).code).toBe(0);
+  expect(existsSync(join(fresh, "bus.db"))).toBe(false);
+
+  const r = await s.c.callTool({ name: "bind", arguments: { name: "api", create: true } });
+  expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
+  const { instructions } = r.structuredContent as { instructions: string[] };
+  expect(instructions[0]).toStartWith(`You are identity "api"`);
+  expect((r.content as { text: string }[])[0]!.text).toEndWith(instructions.join(" "));
+}, 20_000);
