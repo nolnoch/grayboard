@@ -39,7 +39,8 @@ function rows<T>(sql: string, ...args: (string | number)[]): T[] {
 
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, name);
 const contents = (s: Session) => s.pushes.map((p) => p.content);
-const sessionId = async (s: Session) => ((await s.call("peer_list", {})).you as string).slice(1);
+// An unbound session's own row in peer_list's unbound_sessions.
+const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
 const pidOf = (name: string) => rows<{ pid: number }>(`SELECT pid FROM bindings WHERE name = ?`, name)[0]!.pid;
 
 // A tool call's error text; a call that succeeds fails the test.

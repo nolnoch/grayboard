@@ -38,8 +38,8 @@ function rows<T>(sql: string, ...args: (string | number)[]): T[] {
 
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, `${A}/${name}`);
 const contents = (s: Session) => s.pushes.map((p) => p.content);
-// An unbound session's handle is <email>/~<session id>.
-const sessionId = async (s: Session) => /\/~([0-9a-f]{16})$/.exec((await s.call("peer_list", {})).you)![1]!;
+// An unbound session's own row in peer_list's unbound_sessions.
+const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
 
 // A tool call's error text; a call that succeeds fails the test.
 async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
@@ -368,7 +368,7 @@ async function expectLost(s: Session, name: string, reason: string) {
   await until(() => s.stderr().includes(`lost "${name}"`), 10_000);
   const r = await s.c.callTool({ name: "peer_list", arguments: {} });
   const texts = (r.content as { text: string }[]).map((c) => c.text);
-  expect(JSON.parse(texts[0]!).you).toMatch(/\/~[0-9a-f]{16}$/);
+  expect(JSON.parse(texts[0]!).you).toBeUndefined();
   const notice = texts.slice(1).join(" ");
   expect(notice).toContain(`This session lost its bus name "${name}" (${reason}`);
   expect(notice).toContain(`) and is unbound now: bind(name) to take a name again.`);
