@@ -172,12 +172,16 @@ export class SlackBridge implements SlackLinker {
     const at = Date.now();
     for (const [userId, { link }] of linked) {
       const target = `${link.email}/${HUMAN_NAME}`;
+      // Query BEFORE writing: `last()` must be the previous stop's row, or the
+      // guard races its own insert (same-ms -> duplicate notice; ticked-ms ->
+      // the first fatal silenced). The clamp rides out clock skew in both
+      // directions.
+      const last = this.o.repo.audit.last("bridge.stopped", target);
+      const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
       writeAudit(this.o.repo, "bridge.stopped", null, target, {
         reason: reason.detail,
         at: new Date(at).toISOString(),
       });
-      const last = this.o.repo.audit.last("bridge.stopped", target);
-      const prior = last && at - last.at < BRIDGE_NOTIFY_DEDUP_MS && last.at !== at;
       if (!prior) this.o.handlers.bridgeDownNotice(userId, `your Slack bridge stopped at ${new Date(at).toISOString()} (${reason.detail}); linked humans are offline until it reconnects or the server restarts`);
     }
   }

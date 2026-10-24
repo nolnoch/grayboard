@@ -398,8 +398,11 @@ async function handleHello(
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
-    ...drainBridgeDown(hub, authed.user_id),
   ];
+  // Bridge-down notices drain on agent-session hellos only: the bridge's own
+  // human hello (HumanConn) would steal the notice into a handshake nobody
+  // reads, leaving the owner uninformed.
+  if (!ws.data.human) notices.push(...drainBridgeDown(hub, authed.user_id));
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;

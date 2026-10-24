@@ -336,8 +336,8 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   second.stop({ fatal: true, detail: "second fatal" });
 
   const fe = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "fe");
-  await fe.connect();
-  const againNotices = ((fe.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  const hello = await fe.connect();
+  const againNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
   expect(againNotices).toHaveLength(0);
   const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
   expect(count.n).toBe(2);
@@ -365,3 +365,26 @@ test("a bridge that failed to start issues no codes", async () => {
     down.stop();
   }
 }, 30_000);
+
+test("a fatal stop with no linked users writes nothing user-facing", async () => {
+  const down = serve("http://127.0.0.1:1/api/");
+  try {
+    await down.app.slackReady;
+    // The start failure is fatal, but with zero linked users there is nobody
+    // to tell and no user-facing row to write: the notify loop never runs.
+    const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
+    expect(rows.n).toBe(0);
+  } finally {
+    down.stop();
+  }
+}, 30_000);
+
+test("helloOk.human.linked is false while the bridge is down", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "recheck" });
+  const { WsClient } = await import("../support/ws_client.ts");
+  const be = new WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  expect(hello.human?.linked).toBe(false);
+});
