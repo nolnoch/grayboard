@@ -5,6 +5,7 @@ import { createApplication } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { createHostedMcp } from "./mcp.ts";
+import { createMcpAttachments } from "./mcp-attachments.ts";
 import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
@@ -57,6 +58,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
+  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin });
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -75,6 +77,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const address = server.requestIP(req)?.address;
       const response = await oauth.fetch(req, address ? { remoteAddress: address } : undefined);
       if (response) return response;
+      const attachmentResponse = attachments.fetch(req);
+      if (attachmentResponse) return attachmentResponse;
       if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
@@ -151,7 +155,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopExpiry();
       touches.cancelAll();
       server.stop(true);
-      stopPromise = mcp.close().finally(() => { oauth.close(); db.close(); });
+      stopPromise = Promise.allSettled([mcp.close(), attachments.close()]).then(outcomes => {
+        const failure = outcomes.find(outcome => outcome.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      }).finally(() => { oauth.close(); db.close(); });
       return stopPromise;
     },
   };

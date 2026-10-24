@@ -93,6 +93,48 @@ function stalled(first: Uint8Array, length: number): Request {
   return new Request("http://x/", { method: "POST", body, headers: { "content-length": String(length) } });
 }
 
+for (const reason of ["timeout", "oversize", "abort"] as const) test(`guarded reader awaits source cancellation on ${reason}`, async () => {
+  let cancelStarted!: () => void, finishCancel!: () => void, pulled!: () => void;
+  const started = new Promise<void>(r => { cancelStarted = r; });
+  const cleanup = new Promise<void>(r => { finishCancel = r; });
+  const entered = new Promise<void>(r => { pulled = r; });
+  let cancels = 0, settled = false;
+  const controller = new AbortController();
+  const body = new ReadableStream<Uint8Array>({
+    pull(stream) { pulled(); if (reason === "oversize") stream.enqueue(new Uint8Array([1, 2])); },
+    async cancel() { cancels++; cancelStarted(); await cleanup; },
+  }, { highWaterMark: 0 });
+  const req = new Request("http://x/", { method: "POST", body });
+  const reading = readUploadBody(req, 1, reason === "timeout" ? 10 : 1000, controller.signal);
+  const outcome = reading.then(value => ({ value, error: undefined }), error => ({ value: undefined, error })).then(result => { settled = true; return result; });
+  try {
+    await entered;
+    if (reason === "abort") controller.abort();
+    await started;
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+    expect(cancels).toBe(1);
+    finishCancel();
+    const result = await outcome;
+    if (reason === "timeout") expect(result.error).toBeInstanceOf(UploadTimeout);
+    else if (reason === "abort") expect(result.error).toBe(controller.signal.reason);
+    else expect(result.error.message).toContain("longer than its Content-Length");
+    expect(body.locked).toBe(false);
+  } finally { finishCancel(); await outcome; }
+});
+
+test("guarded reader preserves source faults and does not cancel successful sources prematurely", async () => {
+  const fault = new Error("original source fault");
+  const broken = new ReadableStream<Uint8Array>({ pull(stream) { stream.error(fault); } });
+  await expect(readUploadBody(new Request("http://x/", { method: "POST", body: broken }), 1, 1000, never())).rejects.toBe(fault);
+  expect(broken.locked).toBe(false);
+  let cancels = 0;
+  const successful = new ReadableStream<Uint8Array>({ start(stream) { stream.enqueue(new Uint8Array([1])); stream.close(); }, cancel() { cancels++; } });
+  expect(await readUploadBody(new Request("http://x/", { method: "POST", body: successful }), 1, 1000, never())).toEqual(new Uint8Array([1]));
+  expect(cancels).toBe(0);
+  expect(successful.locked).toBe(false);
+});
+
 test("an upload body is read in full, or refused once its deadline passes", async () => {
   const data = new Uint8Array([1, 2, 3, 4]);
   expect(await readUploadBody(new Request("http://x/", { method: "POST", body: data }), 4, 1000)).toEqual(data);
