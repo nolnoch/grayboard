@@ -3,6 +3,7 @@ import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
+import { createMcpAttachments } from "./mcp-attachments.ts";
 import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
@@ -42,6 +43,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
+  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin });
 
   const server = Bun.serve<WsData>({
     port: config.httpPort,
@@ -54,6 +56,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const address = server.requestIP(req)?.address;
       const response = await oauth.fetch(req, address ? { remoteAddress: address } : undefined);
       if (response) return response;
+      const attachmentResponse = attachments.fetch(req);
+      if (attachmentResponse) return attachmentResponse;
       const path = new URL(req.url).pathname;
       if (path === "/mcp" || path === mcpPath) return mcp.fetch(req);
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -113,7 +117,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       for (const t of timers) clearInterval(t);
       stopExpiry();
       server.stop(true);
-      try { await mcp.close(); } finally { oauth.close(); }
+      try {
+        const outcomes = await Promise.allSettled([mcp.close(), attachments.close()]);
+        const failure = outcomes.find(outcome => outcome.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      } finally { oauth.close(); }
     },
   };
 }

@@ -24,13 +24,21 @@ export async function storeUpload(
   handle: string,
   file: AttachmentFile,
   detail: Record<string, unknown> = {},
+  guard?: () => void,
 ): Promise<AttachmentRow> {
   const quota = { prefix: `${email}/`, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
   const row = await storeAttachment(db, repo.blobs, handle, file, { quota });
-  writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
-    identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
-  });
-  return row;
+  try {
+    guard?.();
+    writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
+      identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
+    });
+    return row;
+  } catch (error) {
+    // Only this upload, and only while unbound; concurrent sends keep their bytes.
+    if (guard) await releaseUpload(db, repo.blobs, row.id, handle);
+    throw error;
+  }
 }
 
 // Drops one of `handle`'s unsent uploads and audits it, for a send that
