@@ -174,6 +174,7 @@ function lost(c: GrayboardClient, reason: string): void {
   if (c !== client) return;
   client = null;
   if (bound === null) return;
+  console.error(`[grayboard] session ${SESSION_ID} lost "${bound}": ${reason}`);
   lostNotice = `This session lost its bus name "${bound}" (${reason}) and is unbound now: bind(name) to take a name again.`;
   bound = null;
   instructionsStale = true;

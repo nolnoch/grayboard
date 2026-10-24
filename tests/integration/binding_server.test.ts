@@ -9,7 +9,7 @@ import { runCli } from "../support/cli.ts";
 import { serverEnv } from "../support/env.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
-import { sessionIdOf } from "../../src/core/bindings.ts";
+import { sessionIdOf, unboundInstruction } from "../../src/core/bindings.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -349,6 +349,61 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 20_000);
+
+// The session's grayboard process (the harness's child), to stop and resume it.
+function signalChild(s: Session, sig: "SIGSTOP" | "SIGCONT") {
+  const pid = Number(Bun.spawnSync(["pgrep", "-P", String(s.harnessPid)]).stdout.toString().trim());
+  process.kill(pid, sig);
+}
+
+// A lost name's next result says why, and carries the unbound instructions, once.
+async function expectLost(s: Session, name: string, reason: string) {
+  await until(() => s.stderr().includes(`lost "${name}"`), 10_000);
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(JSON.parse(texts[0]!).you).toMatch(/\/~[0-9a-f]{16}$/);
+  const notice = texts.slice(1).join(" ");
+  expect(notice).toContain(`This session lost its bus name "${name}" (${reason}`);
+  expect(notice).toContain(`) and is unbound now: bind(name) to take a name again.`);
+  expect((r.structuredContent as any).instructions).toEqual([unboundInstruction([], [])]);
+  expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
+  expect(await refusal(s, "claim_take", { key: "k" })).toContain("no bus name yet");
+}
+
+test("audit 15: a holder taken over while it can't answer the probe goes unbound and says why", async () => {
+  const s = await session("fe");
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
+  signalChild(s, "SIGSTOP");
+  const t = await session(null);
+  expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+  signalChild(s, "SIGCONT");
+  await expectLost(s, "fe", `"fe" was taken over: a newer session connected with this identity`);
+}, 30_000);
+
+test("audit 15: a holder whose reconnect is refused goes unbound and says why", async () => {
+  // A server restart on the same port and database: the sessions' env still points at it.
+  const dbDir = mkdtempSync(join(tmpdir(), "gb-db-"));
+  const dbPath = join(dbDir, "gb.db");
+  srv.stop();
+  srv = new TestServer({ dbPath });
+  alice = await srv.login(A);
+  const s = await session("fe");
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
+  signalChild(s, "SIGSTOP");
+  const port = srv.app.server.port!;
+  srv.app.stop();
+  const next = new TestServer({ dbPath, httpPort: port });
+  expect(next.base).toBe(srv.base);
+  try {
+    const t = await session(null);
+    expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+    signalChild(s, "SIGCONT");
+    await expectLost(s, "fe", `identity "fe" is already in use by`);
+  } finally {
+    next.stop();
+    rmSync(dbDir, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("16, 18: raw hellos: create: false, lazy create, and a read-only connection's limits", async () => {
   await srv.api(alice, "POST", "/api/teams", { name: "eng" });
