@@ -72,6 +72,25 @@ test("typed operations and delivery need no frames; receipts alone move the deli
   expect(application.inbox(a).promised).toBeUndefined();
 });
 
+test("board observers are independent hints with concealed access and explicit lifecycle cleanup", async () => {
+  const a = (await application.selectIdentity(alice, "be", delivery(sink()), { push: false })).session;
+  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  let changed = 0, closed = 0;
+  const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
+  application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
+  application.call(a, "board_post", { board: "e2e", body: "hello" });
+  expect(changed).toBe(1);
+  expect(application.boardSnapshot(a, "e2e").posts[0]!.body).toBe("hello");
+  expect(application.boardCatalog(a).boards.map(b => b.name)).toContain("e2e");
+  unsubscribe();
+  unsubscribe();
+  expect(closed).toBe(1);
+  application.call(a, "board_post", { board: "e2e", body: "later" });
+  expect(changed).toBe(1);
+  application.close(a);
+  expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
+});
+
 test("tools-only calls neither own nor drain deliveries nor reset the owner's status", async () => {
   const owner = sink();
   const a = (await application.selectIdentity(alice, "be", delivery(owner))).session;
@@ -144,6 +163,21 @@ test("board delivery is typed, replayable and acknowledged separately", async ()
   const b3 = (await application.selectIdentity(bob, "fe", delivery(final))).session;
   application.replay(b3);
   expect(final.events).toHaveLength(0);
+});
+
+test("bounded pending reads preserve pending flags and do not acknowledge or drain the owner", async () => {
+  const a = (await application.selectIdentity(alice, "be", delivery(sink()))).session;
+  const b = (await application.selectIdentity(bob, "fe", delivery(sink()), { push: false })).session;
+  const id = application.send(a, "bob@example.com/fe", "pending", { pending: true }).message_id;
+  application.send(a, "bob@example.com/fe", "second");
+  const pending = application.pending(b, 1);
+  expect(pending).toMatchObject([{ kind: "direct", message: { id, body: "pending", pending: true } }]);
+  expect(application.pending(b, 1)).toEqual(pending);
+  expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
+  expect(() => application.pending(b, 101)).toThrow();
+  expect(() => application.pending(b, 0)).toThrow();
+  store.repo.users.setDisabled(bob.user_id, true);
+  expect(() => application.pending(b)).toThrow("an admin signed this user out");
 });
 
 test("hosted Slack has no dependency on the transitional wire adapter", async () => {

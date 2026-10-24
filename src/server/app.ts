@@ -3,6 +3,8 @@ import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
+import { createMcpAttachments } from "./mcp-attachments.ts";
+import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
@@ -11,8 +13,11 @@ import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
 export type StartOptions = WsOptions & {
+  hostname?: string;
   // Tests skip the nightly retention timer and heartbeat.
   background?: boolean;
+  // Trusted test dependency injection; never populated from configuration.
+  oauth?: OAuthOptions;
 };
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -23,7 +28,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
   const { revalidate, disconnectUser, stopExpiry, wake } = application;
   const { handlers, startPing } = createWsHandlers(application);
-  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin });
+  const oauth = createOAuthServer(repo, config, opts.oauth);
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin });
+  const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -37,16 +44,24 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
+  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin });
 
   const server = Bun.serve<WsData>({
+    hostname: opts.hostname,
     port: config.httpPort,
     idleTimeout: 75,
     // The largest body is an attachment upload (src/server/http.ts); the
     // margin covers a JSON request carrying a full message body.
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
-    fetch(req, server) {
-      if (new URL(req.url).pathname === "/mcp") return mcp.fetch(req);
+    async fetch(req, server) {
+      const address = server.requestIP(req)?.address;
+      const response = await oauth.fetch(req, address ? { remoteAddress: address } : undefined);
+      if (response) return response;
+      const attachmentResponse = attachments.fetch(req);
+      if (attachmentResponse) return attachmentResponse;
+      const path = new URL(req.url).pathname;
+      if (path === "/mcp" || path === mcpPath) return mcp.fetch(req);
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
         if (!raw) {
@@ -69,7 +84,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser, application.boardsChanged);
     },
 
     websocket: handlers,
@@ -86,24 +101,29 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const timers: ReturnType<typeof setInterval>[] = [];
   if (opts.background !== false) {
     timers.push(startPing());
-    startRetentionJobs(repo, db, config);
+    startRetentionJobs(repo, db, config, application.boardsChanged);
   }
 
   return {
     server,
     mcp,
+    oauth,
     repo,
     db,
     // The heartbeat's auth re-check, for tests that run without it.
     revalidate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
-    stop() {
+    async stop() {
       slack?.stop();
       for (const t of timers) clearInterval(t);
       stopExpiry();
       server.stop(true);
-      return mcp.close();
+      try {
+        const outcomes = await Promise.allSettled([mcp.close(), attachments.close()]);
+        const failure = outcomes.find(outcome => outcome.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      } finally { oauth.close(); }
     },
   };
 }

@@ -3,7 +3,7 @@ import { HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isV
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, setPlace, startSession, touchHandle, type CoreDb, type Pending, type PendingRef } from "../core/boards.ts";
+import { acknowledge, age, boardCatalog, canSeeBoard, checkBody, lastSeen, normalizeBoard, pendingFor, refOf, setPlace, snapshot, startSession, touchHandle, type CoreDb, type Pending, type PendingRef, type SnapshotOptions } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
@@ -94,6 +94,14 @@ function refKey(r: PendingRef): string {
   return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
 }
 
+export type BoardObserver = {
+  changed(): void | Promise<void>;
+  closed?(): void | Promise<void>;
+};
+function notify(callback?: () => void | Promise<void>) {
+  try { void Promise.resolve(callback?.()).catch(() => {}); } catch {}
+}
+
 type Hub = {
   repo: Repo;
   db: CoreDb;
@@ -103,6 +111,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  boardChanged: (board: string) => void;
 };
 function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void {
   for (const item of pendingFor(db, session.identityFull, { all })) {
@@ -129,12 +138,35 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     probeMs: opts.probeMs ?? 2000,
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    boardChanged(board) {
+      for (const observer of [...observers]) {
+        if (observer.board === board && observerLive(observer)) notify(() => observer.hooks.changed());
+      }
+    },
   };
-  const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
+  type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
+  const observers = new Set<Observer>();
+  function removeObserver(observer: Observer) {
+    if (observers.delete(observer)) notify(observer.hooks.closed);
+  }
+  function observerLive(observer: Observer): boolean {
+    if (!observers.has(observer)) return false;
+    try {
+      valid(observer.session);
+      if (canSeeBoard(db, observer.session.identityFull, observer.board)) return true;
+    } catch {}
+    removeObserver(observer);
+    return false;
+  }
+  function boardsChanged(boards: string[]) {
+    for (const board of new Set(boards)) hub.boardChanged(board);
+  }
+  const expiry = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
   const revoked = new Map<number, number>();
   function close(session: ApplicationSession) {
     session.active = false;
     hub.sessions.delete(session);
+    for (const observer of [...observers]) if (observer.session === session) removeObserver(observer);
     if (hub.registry.get(session.identityFull) === session) {
       hub.registry.delete(session.identityFull);
       touchHandle(db, session.identityFull);
@@ -215,6 +247,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman: (authed: AuthedUser, sink: DeliverySink) => select(authed, HUMAN_NAME, sink, {}, true),
     close,
+    revalidateSession: valid,
     replay(session: ApplicationSession) {
       valid(session);
       if (!session.push || hub.registry.get(session.identityFull) !== session) return;
@@ -245,6 +278,38 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session);
       return handleInbox(hub, session, days);
     },
+    // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
+    pending(session: ApplicationSession, limit = 100): DeliveryEvent[] {
+      valid(session);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
+      const since = repo.cursors.get(session.identityId, "direct", session.identityFull);
+      const direct: DeliveryEvent[] = repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])
+        .slice(0, limit).map(message => ({ kind: "direct", message: showPending(message) }));
+      const boards = pendingFor(db, session.identityFull, { all: true });
+      return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
+    },
+    boardCatalog(session: ApplicationSession, after?: string) {
+      valid(session);
+      return boardCatalog(db, session.identityFull, after);
+    },
+    boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
+      valid(session);
+      return snapshot(db, session.identityFull, board, options);
+    },
+    observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
+      valid(session);
+      const board = normalizeBoard(boardInput);
+      // Snapshot performs the same concealed access check as content reads.
+      snapshot(db, session.identityFull, board, { limit: 1 });
+      if (observers.size >= 1024) fail("bad_request", "board observer capacity reached");
+      const observer = { session, board, hooks };
+      observers.add(observer);
+      return () => removeObserver(observer);
+    },
+    canReceiveBoard(session: ApplicationSession, board: string) {
+      valid(session);
+      return canSeeBoard(db, session.identityFull, board);
+    },
     receiptDirect(session: ApplicationSession, ids: number[]) {
       valid(session);
       handleAck(session, ids, repo);
@@ -272,7 +337,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       expiry.arm();
       return result;
     },
-    wake: (handles: string[]) => wake(hub, handles),
+    // Trusted committed domain operations, not client-supplied invalidations.
+    boardsChanged,
+    wake(handles: string[]) {
+      expiry.arm();
+      wake(hub, handles);
+    },
     disconnectUser(userId: number) {
       revoked.set(userId, (revoked.get(userId) ?? 0) + 1);
       for (const s of [...hub.sessions]) {
@@ -282,6 +352,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
     },
     revalidate() {
+      for (const observer of [...observers]) observerLive(observer);
       for (const s of [...hub.sessions]) {
         if (!s.human && repo.users.findById(s.authed.user_id)?.disabled_at != null) {
           application.disconnectUser(s.authed.user_id);
@@ -292,7 +363,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       application.revalidate();
       for (const s of hub.sessions) s.sink.keepAlive?.();
     },
-    stopExpiry: expiry.stop,
+    stopExpiry() {
+      expiry.stop();
+      for (const observer of [...observers]) removeObserver(observer);
+    },
   };
   return application;
 }
@@ -444,6 +518,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
       writeAudit(hub.repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, post_id: r.post_id, board: r.board });
     }
   }
+  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
   // The transitional adapter publishes its answer before the resulting deliveries.
   publish?.(outcome.result);
   wake(hub, outcome.wake);
