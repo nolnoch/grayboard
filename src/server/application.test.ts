@@ -146,6 +146,21 @@ test("board delivery is typed, replayable and acknowledged separately", async ()
   expect(final.events).toHaveLength(0);
 });
 
+test("bounded pending reads preserve pending flags and do not acknowledge or drain the owner", async () => {
+  const a = (await application.selectIdentity(alice, "be", delivery(sink()))).session;
+  const b = (await application.selectIdentity(bob, "fe", delivery(sink()), { push: false })).session;
+  const id = application.send(a, "bob@example.com/fe", "pending", { pending: true }).message_id;
+  application.send(a, "bob@example.com/fe", "second");
+  const pending = application.pending(b, 1);
+  expect(pending).toMatchObject([{ kind: "direct", message: { id, body: "pending", pending: true } }]);
+  expect(application.pending(b, 1)).toEqual(pending);
+  expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
+  expect(() => application.pending(b, 101)).toThrow();
+  expect(() => application.pending(b, 0)).toThrow();
+  store.repo.users.setDisabled(bob.user_id, true);
+  expect(() => application.pending(b)).toThrow("an admin signed this user out");
+});
+
 test("hosted Slack has no dependency on the transitional wire adapter", async () => {
   const source = await Bun.file(new URL("./slack.ts", import.meta.url)).text();
   expect(source).not.toContain("./ws.ts");
