@@ -12,6 +12,7 @@ import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
 import type { OAuthClient } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
 const s256 = (s: string) => createHash("sha256").update(s).digest("base64url");
@@ -152,6 +153,78 @@ function principal(tokens: Tokens, required?: string[]) {
   const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${tokens.access_token}` } }), required);
   expect(p).not.toBeInstanceOf(Response); return p as OAuthPrincipal;
 }
+
+test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
+  for (const credentials of [{ googleClientSecret: "primary-private" }, { mcpGoogle: { clientId: "web-client", clientSecret: "web-private" } }]) {
+    expect(() => createOAuthServer(storage.repo, { ...config, ...credentials })).toThrow("dev auth must not coexist with a Google client secret");
+  }
+});
+
+test("default Google exchange consistently selects the Web override or primary fallback and verifies its audience", async () => {
+  const { publicKey, privateKey } = await generateKeyPair("RS256");
+  const jwk = { ...await exportJWK(publicKey), kid: "mcp-web-config-fixture", alg: "RS256", use: "sig" };
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const mode of ["fallback", "override", "wrong-audience", "trusted-fixture"] as const) {
+      service.close();
+      const mcpGoogle = mode === "fallback" ? undefined : { clientId: "web-client", clientSecret: "web-private" };
+      const cfg = { ...config, publicUrl: "https://grayboard.example.com:443/hosted", devAuth: false, googleClientId: "desktop-client", googleClientSecret: "desktop-private", mcpGoogle };
+      let nonce = "", tokenCalls = 0, fixtureCalls = 0;
+      const selected = mcpGoogle ?? { clientId: cfg.googleClientId, clientSecret: cfg.googleClientSecret };
+      service = createOAuthServer(storage.repo, cfg, mode === "trusted-fixture" ? { exchangeGoogle: async input => {
+        fixtureCalls++;
+        expect(input.redirectUri).toBe(cfg.publicUrl + "/oauth/google/callback");
+        expect(input.nonce).toBe(nonce);
+        return { email: "you@example.com", displayName: "You" };
+      } } : {});
+      globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+        const req = new Request(input, init);
+        if (req.url === "https://www.googleapis.com/oauth2/v3/certs") return Response.json({ keys: [jwk] });
+        if (req.url !== "https://oauth2.googleapis.com/token") throw new Error("unexpected mocked network request");
+        tokenCalls++;
+        expect(req.method).toBe("POST");
+        const body = new URLSearchParams(await req.text());
+        expect(body.get("client_id")).toBe(selected.clientId);
+        expect(body.get("client_secret")).toBe(selected.clientSecret);
+        expect(body.get("redirect_uri")).toBe(cfg.publicUrl + "/oauth/google/callback");
+        expect(body.get("code_verifier")).toMatch(/^[\w-]{43}$/);
+        expect(body.get("code")).toBe("mock-google-code");
+        const id_token = await new SignJWT({ hd: "example.com", email: "you@example.com", email_verified: true, nonce })
+          .setProtectedHeader({ alg: "RS256", kid: jwk.kid }).setIssuer("https://accounts.google.com").setSubject("fixture-user")
+          .setAudience(mode === "wrong-audience" ? cfg.googleClientId : selected.clientId).setIssuedAt().setExpirationTime("5m").sign(privateKey);
+        return Response.json({ id_token });
+      }, { preconnect: originalFetch.preconnect });
+      let cookies = "";
+      const direct = async (url: string, init: RequestInit = {}) => {
+        const response = (await service.fetch(new Request(url, { ...init, headers: { Cookie: cookies, ...init.headers } })))!;
+        if (response.headers.getSetCookie().length) cookies += response.headers.getSetCookie().map(value => value.split(";")[0]).join("; ") + "; ";
+        return response;
+      };
+      const a = authorization();
+      const begin = await direct(cfg.publicUrl + "/oauth/authorize" + new URL(a.url).search);
+      expect(begin.status).toBe(303);
+      const upstream = new URL(begin.headers.get("Location")!);
+      expect(upstream.searchParams.get("client_id")).toBe(selected.clientId);
+      expect(upstream.searchParams.get("client_id")).not.toBe(a.clientId);
+      expect(upstream.searchParams.get("redirect_uri")).toBe(cfg.publicUrl + "/oauth/google/callback");
+      nonce = upstream.searchParams.get("nonce")!;
+      expect(nonce).toMatch(/^[\w-]{43}$/);
+      const callback = await direct(cfg.publicUrl + "/oauth/google/callback?" + new URLSearchParams({ state: upstream.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }));
+      expect(callback.status).toBe(mode === "wrong-audience" ? 403 : 303);
+      expect(tokenCalls).toBe(mode === "trusted-fixture" ? 0 : 1);
+      expect(fixtureCalls).toBe(mode === "trusted-fixture" ? 1 : 0);
+      if (mode !== "wrong-audience") {
+        const consent = await direct(callback.headers.get("Location")!);
+        expect(consent.status).toBe(200);
+        expect(await consent.text()).toContain("you@example.com");
+      } else expect(await callback.text()).not.toContain("private");
+      const metadata = await direct("https://grayboard.example.com/.well-known/oauth-authorization-server/hosted");
+      const text = await metadata.text();
+      expect(text).not.toContain("web-private"); expect(text).not.toContain("desktop-private");
+      expect(text).not.toContain("web-client"); expect(text).not.toContain("desktop-client");
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test("real HTTP metadata uses configured canonical issuer including prefix/default port, never Host/Forwarded", async () => {
   service.close();
