@@ -70,4 +70,24 @@ describe("actingIdentity", () => {
       rmSync(at("repo", ".mcp.json"));
     }
   });
+
+  test("names resolve by the server's rule: lowercased, invalid refused (#181)", () => {
+    // The shell must act as the handle the session claims: the same explicit
+    // name, lowercased, in both modes.
+    expect(actingIdentity("Gray", {}, at("repo", "src"))).toEqual({ name: "gray", source: "--as" });
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try {
+      expect(actingIdentity(undefined, { BUS_IDENTITY: "Sim" }, at("repo", "src"))).toEqual({
+        name: "sim",
+        source: "BUS_IDENTITY",
+      });
+    } finally {
+      rmSync(at("repo", ".mcp.json"));
+    }
+
+    // A name invalid after lowercasing refuses, with the reason.
+    expect(() => actingIdentity("Gray!", {}, at("repo", "src"))).toThrow(/invalid --as "Gray!"/);
+    expect(() => actingIdentity(undefined, { BUS_IDENTITY: "Gray!" }, at("repo", "src"))).toThrow(/invalid identity name/);
+  });
 });
