@@ -24,7 +24,7 @@ import {
 } from "../core/boards.ts";
 import {
   MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_TOOLS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
-  sessionIdOf, unknownNameError, type Candidate,
+  sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
@@ -554,11 +554,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
 function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
   return [...hub.readOnly]
     .filter((c) => c.data.authed.user_id === ws.data.authed.user_id)
-    .map((c) => ({
-      session_id: c.data.sessionId!, unbound: true as const, online: true as const,
-      ...(c.data.place ? { where: c.data.place } : {}),
-      ...(c.data.sessionId === ws.data.sessionId ? { self: true as const } : {}),
-    }));
+    .map((c) => unboundPeer(c.data.sessionId!, c.data.place ?? null, c.data.sessionId === ws.data.sessionId));
 }
 
 // A bare name means your own identity of that name, else the one identity

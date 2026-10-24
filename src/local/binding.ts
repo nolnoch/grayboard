@@ -83,12 +83,17 @@ export type AcquireResult =
   | { ok: true; name: string; moved: Claim[] }
   | { ok: false; error: string; holder?: string; known?: string[] };
 
-// Names that exist: the roster, minus viewers and humans.
-function knownNames(db: Database): string[] {
+// Whether a roster name is an agent's: not a viewer's, nor a human's.
+function agentName(db: Database): (name: string) => boolean {
   const humans = new Set(humanHandles(db));
+  return (n) => !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
+}
+
+// Names that exist: the roster's agent names.
+function knownNames(db: Database): string[] {
   return (db.prepare(`SELECT name FROM handles ORDER BY last_seen DESC`).all() as { name: string }[])
     .map((r) => r.name)
-    .filter((n) => !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME);
+    .filter(agentName(db));
 }
 
 /**
@@ -219,8 +224,8 @@ export async function candidateNames(db: Database, suggested: string | null): Pr
   const live = new Set(liveSessions(db).map((r) => r.name).filter((n): n is string => n !== null));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
-  const humans = new Set(humanHandles(db));
-  const ok = (n: string) => !live.has(n) && !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
+  const agent = agentName(db);
+  const ok = (n: string) => !live.has(n) && agent(n);
   const rows = (db.prepare(`SELECT name, last_seen, cwd FROM handles`).all() as { name: string; last_seen: number; cwd: string | null }[]).filter((r) => ok(r.name));
   const queued = new Map((db.prepare(QUEUED_FOR_SQL).all(JSON.stringify(rows.map((r) => r.name))) as { name: string; n: number }[]).map((r) => [r.name, r.n]));
   const pool = orderCandidates(

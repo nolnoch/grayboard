@@ -3,6 +3,10 @@
 // durable mailbox a session binds to once it knows its task.
 import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
+import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
+import { BOARD_INSTRUCTIONS } from "./tools.ts";
+import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
@@ -141,6 +145,48 @@ export function restoreNote(name: string, why: string): string {
  */
 export function launcherNote(launcher: string): string {
   return `Its parent process is a launcher (${launcher}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
+}
+
+/**
+ * What a session bound to `name` is told: at start, or in bind's result.
+ * `general` is everything not about the name, which a rebind already has;
+ * `modeGeneral` adds a mode's own general sentences. `named` goes last:
+ * variable length, so a client cut loses it, not the fixed text.
+ */
+export function boundInstructions(name: string, general: boolean, modeGeneral: () => string[], named: string[]): string[] {
+  return [
+    `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
+    ...(general
+      ? [
+          `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
+          DM_INBOX_INSTRUCTION,
+          ...BOARD_INSTRUCTIONS,
+          ...modeGeneral(),
+          `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
+        ]
+      : []),
+    ...named,
+  ];
+}
+
+type TextResult = { content: { type: "text"; text: string }[]; isError?: true };
+
+/**
+ * bind's checks before either mode acquires anything: the name to bind, or
+ * the call's result (a refusal, or "already bound").
+ */
+export function bindTarget(a: Record<string, unknown>, bound: string | null, push: boolean): { name: string } | { result: TextResult } {
+  const fail = (why: string): { result: TextResult } => ({ result: { content: [{ type: "text", text: `error: ${why}` }], isError: true } });
+  if (!push) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
+  const n = normalizeIdentityName(String(a.name));
+  if (!n.ok) return fail(n.error);
+  if (n.name === bound) return { result: { content: [{ type: "text", text: `already bound to "${n.name}"` }] } };
+  return { name: n.name };
+}
+
+/** peer_list's row for a live session with no name. */
+export function unboundPeer(sessionId: string, where: string | null, self: boolean): UnboundPeer {
+  return { session_id: sessionId, unbound: true, online: true, ...(where ? { where } : {}), ...(self ? { self: true } : {}) };
 }
 
 /**

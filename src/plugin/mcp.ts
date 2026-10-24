@@ -11,10 +11,10 @@ import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } 
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
-import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
+import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
-  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionKey, oldServerBindNote, restoreNote, sessionIdOf, unboundInstruction,
+  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, launcherNote, mintSessionKey, oldServerBindNote, restoreNote, sessionIdOf, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
@@ -23,7 +23,7 @@ import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
-import { BOARD_INSTRUCTIONS, boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
@@ -286,25 +286,19 @@ if (!bound) {
 writeName(bound);
 console.error(`[grayboard] server mode (${serverUrl}), session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
 
-// What a session bound to `name` is told: at start, or in bind's result.
-// `general` is everything not about the name; a rebind already has it.
-function boundInstructions(name: string, h: HelloOk, general: boolean): string[] {
-  return [
-    `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
-    ...(general
-      ? [
-          `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
-          DM_INBOX_INSTRUCTION,
-          ...BOARD_INSTRUCTIONS,
-          ...(h.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
-          ...(h.human?.linked ? ownHumanInstruction(h.human.handle) : []),
-          `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
-          `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
-        ]
-      : []),
-    // Last: variable length, so a client cut loses these, not fixed text.
-    ...(h.notices ?? []),
-  ];
+// What a session bound to `name` is told (core's boundInstructions), with
+// server mode's team, human and handle sentences, and the server's notices.
+function serverBoundInstructions(name: string, h: HelloOk, general: boolean): string[] {
+  return boundInstructions(
+    name,
+    general,
+    () => [
+      ...(h.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
+      ...(h.human?.linked ? ownHumanInstruction(h.human.handle) : []),
+      `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
+    ],
+    h.notices ?? [],
+  );
 }
 
 // Built after hello_ok; notify waits for `initialized`, which needs it.
@@ -320,7 +314,7 @@ const server = new Server(
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       ...(bound && hello
-        ? boundInstructions(bound, hello, true)
+        ? serverBoundInstructions(bound, hello, true)
         : [unboundInstruction(hello?.candidates ?? [], unboundNotes), ...(readsUnavailable ? [`(${readsUnavailable}.)`] : [])]),
     ].join(" "),
   },
@@ -380,7 +374,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId 
 
 // The full instructions for the name this session holds now.
 const currentInstructions = (): string[] =>
-  bound && boundHello ? boundInstructions(bound, boundHello, true) : [unboundInstruction([], [])];
+  bound && boundHello ? serverBoundInstructions(bound, boundHello, true) : [unboundInstruction([], [])];
 
 async function call(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   const bad = checkArgs(SERVER_TOOLS, name, a);
@@ -570,10 +564,8 @@ async function connection(): Promise<GrayboardClient> {
 const LATE_MS = 30_000;
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-  if (!PUSH) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
-  const n = normalizeIdentityName(String(a.name));
-  if (!n.ok) return fail(n.error);
-  if (n.name === bound) return text(`already bound to "${n.name}"`);
+  const n = bindTarget(a, bound, PUSH);
+  if ("result" in n) return n.result;
   const previous = bound;
   const next = connect(n.name, { push: DELIVER, create: a.create === true, ...(previous ? { from: previous } : {}) });
   let h: HelloOk;
@@ -606,7 +598,7 @@ function switchTo(next: GrayboardClient, name: string, previous: string | null, 
   console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}${missed ? ` after ${missed}` : ""}`);
   const notes = h.moved === undefined ? [oldServerBindNote(previous)] : h.not_moved ? [`${h.not_moved[0]!.toUpperCase()}${h.not_moved.slice(1)}.`] : [];
   if (h.moved === undefined) console.error(`[grayboard] the server predates name binding: "${name}" was bound without its checks`);
-  const r = bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general), notes);
+  const r = bindOk(name, previous, h.moved ?? [], (general) => serverBoundInstructions(name, h, general), notes);
   if (missed) {
     missedBindNotice = bindMissed(name, missed, r.content[0]!.text);
     instructionsStale = true;

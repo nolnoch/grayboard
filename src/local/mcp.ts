@@ -8,13 +8,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
-  BOARD_INSTRUCTIONS,
   announcementsInstruction,
   claimsInstruction,
   boardNotification,
@@ -56,7 +55,6 @@ import { normalizeIdentityName } from "../shared/addressing.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  DM_INBOX_INSTRUCTION,
   PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
   ackIds,
@@ -191,25 +189,19 @@ else {
 }
 console.error(`[grayboard] local mode, session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
 
-// What a session bound to `name` is told: at start, or in bind's result.
-// `general` is everything not about the name; a rebind already has it.
-function boundInstructions(name: string, general: boolean): string[] {
-  return [
-    `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
-    ...(general
-      ? [
-          `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
-          DM_INBOX_INSTRUCTION,
-          ...BOARD_INSTRUCTIONS,
-          ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
-          ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
-        ]
-      : []),
-    ...undeliveredInstruction(undeliveredFrom(name, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-    ...(general ? [`Messages are durable: if the peer is offline they'll receive it when their session starts.`] : []),
-    // Last: the longest, and the one to lose if the client cuts the text.
-    ...claimsInstruction(listClaims(db), name),
-  ];
+// What a session bound to `name` is told (core's boundInstructions), with
+// local mode's human and announcement sentences, and its claims last: the
+// longest, and the one to lose if the client cuts the text.
+function localBoundInstructions(name: string, general: boolean): string[] {
+  return boundInstructions(
+    name,
+    general,
+    () => [...humanInstruction(humanHandles(db).filter((h) => h !== name)), ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db)))],
+    [
+      ...undeliveredInstruction(undeliveredFrom(name, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+      ...claimsInstruction(listClaims(db), name),
+    ],
+  );
 }
 
 const mcp = new Server(
@@ -223,7 +215,7 @@ const mcp = new Server(
     // a name receives anything, so bind's result carries it.
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      ...(bound ? boundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
+      ...(bound ? localBoundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
     ].join(" "),
   },
 );
@@ -288,7 +280,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
   if (instructionsStale && !out.structuredContent && bound) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: bound, instructions: boundInstructions(bound, true) } };
+    out = { ...out, structuredContent: { name: bound, instructions: localBoundInstructions(bound, true) } };
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
@@ -451,10 +443,7 @@ async function liveHandles(self: string): Promise<(h: string) => boolean> {
 function unboundPeers(): UnboundPeer[] {
   return liveSessions(db)
     .filter((r) => r.name === null)
-    .map((r) => {
-      const where = r.cwd ? describeLocation(r.cwd) : null;
-      return { session_id: r.session_id, unbound: true, online: true, ...(where ? { where } : {}), ...(r.session_id === SESSION_ID ? { self: true } : {}) };
-    });
+    .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
 }
 
 // Drain: emit unread direct messages and pending board items as channel
@@ -529,10 +518,8 @@ let stopListening = () => {};
 // It runs behind the gate, so no tool call overlaps it (#182 audit 11).
 async function bind(a: Record<string, any>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-  if (!PUSH) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
-  const n = normalizeIdentityName(String(a.name));
-  if (!n.ok) return fail(n.error);
-  if (n.name === bound) return text(`already bound to "${n.name}"`);
+  const n = bindTarget(a, bound, PUSH);
+  if ("result" in n) return n.result;
   swapping = true;
   try {
     await inflight;
@@ -559,7 +546,7 @@ async function bind(a: Record<string, any>, signal: AbortSignal) {
       throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
     }
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => boundInstructions(n.name, general));
+    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => localBoundInstructions(n.name, general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
