@@ -76,6 +76,23 @@ describe("OAuth domain store", () => {
     expect(first.repo.oauth.findActiveAccess(input.tokens.accessHash, binding.resource, binding.scopes, start)).toBeUndefined();
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(false);
   });
+  test("code scope lookup is bound, durable, and retains spent replay recognition without exposing PKCE", () => {
+    issueCode();
+    const get = (time = start) => second.repo.oauth.findCodeScopes(code.codeHash, binding.clientId, binding.resource, binding.redirectUri, time);
+    expect(get()).toEqual(binding.scopes);
+    for (const [client, resource, redirect] of [["wrong", binding.resource, binding.redirectUri], [binding.clientId, "wrong", binding.redirectUri], [binding.clientId, binding.resource, "wrong"]]) {
+      expect(second.repo.oauth.findCodeScopes(code.codeHash, client!, resource!, redirect!, start)).toBeUndefined();
+    }
+    expect(get(start + OAUTH_TTL.code)).toBeUndefined();
+    expect(first.repo.oauth.redeemCode(redemption(), start).status).toBe("ok");
+    expect(get(start + OAUTH_TTL.code)).toEqual(binding.scopes);
+    expect(get(start + OAUTH_TTL.grant)).toBeUndefined();
+    const reopened = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+    expect(reopened.repo.oauth.findCodeScopes(code.codeHash, binding.clientId, binding.resource, binding.redirectUri, start + OAUTH_TTL.code)).toEqual(binding.scopes);
+    reopened.db.close();
+    first.repo.users.setDisabled(userId, true);
+    expect(get()).toBeUndefined();
+  });
   test("failed insertion rolls back code consumption and half-grant", () => {
     issueCode();
     const input = redemption();

@@ -781,6 +781,16 @@ function makeOAuthStore(db: Database): OAuthStore {
         return ok(c);
       }).immediate();
     },
+    findCodeScopes(h, clientId, resource, redirectUri, now) {
+      if (!time(now) || !hash(h)) return undefined;
+      const row = db.query<{ data: string; expires_at: number; grant_id: string | null }, [string]>(
+        "SELECT data, expires_at, grant_id FROM oauth_codes WHERE hash = ?").get(h);
+      if (!row) return undefined;
+      const c: OAuthCode = JSON.parse(row.data);
+      if (c.clientId !== clientId || c.resource !== resource || c.redirectUri !== redirectUri || !activeUser(c.userId)) return undefined;
+      if (row.grant_id === null ? row.expires_at <= now : !live(grant(row.grant_id), now)) return undefined;
+      return [...c.scopes];
+    },
     redeemCode(input, now) {
       return db.transaction(() => {
         if (!time(now) || !hash(input.codeHash)) return invalid;

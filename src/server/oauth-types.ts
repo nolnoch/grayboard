@@ -33,6 +33,8 @@ export interface OAuthStore {
   findBrowserSession(sessionHash: string, now: number): OAuthBrowserSession | undefined;
   revokeBrowserSession(sessionHash: string): void;
   decideRequest(input: { requestHash: string; browserHash: string; csrfHash: string; sessionHash: string; approve: boolean; code: OAuthCode }, now: number): OAuthResult<OAuthCode | null>;
+  // Resolves consented scopes without exposing the challenge; redemption still validates fresh PKCE atomically.
+  findCodeScopes(codeHash: string, clientId: string, resource: string, redirectUri: string, now: number): string[] | undefined;
   // codeChallenge must be freshly computed from the submitted verifier (S256); bound reuse revokes the family.
   redeemCode(input: OAuthAuthorization & { codeHash: string; grantId: string; grantExpiresAt: number; tokens: OAuthTokenPair }, now: number): OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>;
   // Resolves original scopes for an omitted refresh scope; rotation rechecks everything atomically.

@@ -1,4 +1,5 @@
 import { dirname, join } from "node:path";
+import { parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
@@ -18,6 +19,7 @@ export type Config = {
   devAuth: boolean;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
+  oauthClients?: OAuthClient[];
   // Who can reach another user's human; default "team".
   humanReach?: HumanReach;
   // Attachment size caps per file and per message; default local mode's.
@@ -56,6 +58,7 @@ export function loadConfig(): Config {
     auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
+    oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
     ...slackConfig(),
