@@ -30,11 +30,14 @@ export type SessionRow = {
 
 /** This process as a session row, unbound. */
 export function thisSession(sessionId: string, cwd = process.cwd()): SessionRow {
+  const proc_start = procStart(process.pid) ?? null;
+  // Without it, liveness falls back to the pid alone: a reused pid would keep this row's name.
+  if (proc_start === null) console.error(`[grayboard] can't read this process's start time; session ${sessionId}'s row records none`);
   return {
     session_id: sessionId,
     name: null,
     pid: process.pid,
-    proc_start: procStart(process.pid),
+    proc_start,
     harness: commandName(process.ppid),
     harness_pid: process.ppid,
     cwd,
@@ -58,7 +61,7 @@ export function describeHolder(r: SessionRow): string {
   return `the live session ${r.session_id} (pid ${r.pid}${what ? `, ${what}` : ""})`;
 }
 
-const NO_ROW_HOLDER = "a live session from an older grayboard (its wakeup socket answers; it has no bindings row)";
+const NO_ROW_HOLDER = "a live session from an older grayboard (its wakeup socket answers; no live bindings row holds the name)";
 
 // Reap rows whose process is gone. Callers are inside a transaction.
 function reap(db: Database, rows: SessionRow[], now: number): void {
@@ -94,9 +97,10 @@ function knownNames(db: Database): string[] {
  * passes it for an explicit BUS_IDENTITY, as startup always created one).
  * `detail` goes on the bound event (a restart's restore). Refusals are logged.
  *
- * The socket probe for a pre-upgrade holder (no row, live socket) runs before
- * the lock and is re-checked against the rows inside it, so the write lock is
- * never held across a probe.
+ * The socket probe for a pre-upgrade holder (no live row, live socket) runs
+ * before the lock and is re-checked against the rows inside it, so the write
+ * lock is never held across a probe. A dead row doesn't skip it: a settled
+ * pre-upgrade session can listen on a name whose new-code holder was killed.
  */
 export async function acquireName(
   db: Database,
@@ -105,7 +109,8 @@ export async function acquireName(
   opts: { create: boolean; previous: string | null; allowHuman?: boolean; detail?: string },
 ): Promise<AcquireResult> {
   const rowHolder = () => db.prepare(`SELECT * FROM bindings WHERE name = ? AND session_id != ?`).get(name, sessionId) as SessionRow | null;
-  const sockLive = rowHolder() ? false : await poke(name);
+  const before = rowHolder();
+  const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
   return db.transaction((): AcquireResult => {
     const now = Date.now();
@@ -127,7 +132,7 @@ export async function acquireName(
       return refuse(`"${name}" is held by ${who}`, { holder: who });
     }
     if (holder) reap(db, [holder], now);
-    else if (sockLive) return refuse(`"${name}" is held by ${NO_ROW_HOLDER}`, { holder: NO_ROW_HOLDER });
+    if (sockLive) return refuse(`"${name}" is held by ${NO_ROW_HOLDER}`, { holder: NO_ROW_HOLDER });
 
     const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
@@ -173,7 +178,7 @@ export function endSession(db: Database, sessionId: string): string | null {
 export function nameHolder(db: Database, name: string, sockLive: boolean): string | null {
   const row = db.prepare(`SELECT * FROM bindings WHERE name = ?`).get(name) as SessionRow | null;
   if (row && isAlive(row.pid, row.proc_start)) return describeHolder(row);
-  return row ? null : sockLive ? NO_ROW_HOLDER : null;
+  return sockLive ? NO_ROW_HOLDER : null;
 }
 
 /**

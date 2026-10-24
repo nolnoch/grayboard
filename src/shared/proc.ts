@@ -13,39 +13,66 @@ function statFields(pid: number): string[] | null {
   }
 }
 
-/** One ps call for many pids: `pid` → the rest of its line. */
-function ps(column: string, pids: number[]): Map<number, string> {
+/** One ps call for many pids: `pid` → the rest of its line. Null when ps itself failed. */
+function ps(column: string, pids: number[]): Map<number, string> | null {
   const out = new Map<number, string>();
   if (pids.length === 0) return out;
   try {
     // LC_ALL=C: lstart's text is locale-dependent, and it's compared as a string.
     const r = Bun.spawnSync(["ps", "-o", `pid=,${column}=`, "-p", pids.join(",")], { env: { ...process.env, LC_ALL: "C" } });
+    // Exit 1 only says some pid wasn't found; anything else is ps failing.
+    if (r.exitCode !== 0 && r.exitCode !== 1) {
+      warnOnce(`ps:${r.exitCode}`, `ps exited ${r.exitCode ?? r.signalCode}: ${r.stderr.toString().trim()}`);
+      return null;
+    }
     for (const line of r.stdout.toString().split("\n")) {
       const m = line.trim().match(/^(\d+)\s+(.*)$/);
       if (m) out.set(Number(m[1]), m[2]!.trim());
     }
-  } catch {}
-  return out;
-}
-
-/**
- * Each pid's start time, as an opaque string; pids that don't exist are
- * absent. Linux: field 22 (starttime, clock ticks since boot). macOS:
- * `ps -o lstart=`, one fork for the whole list.
- */
-export function procStarts(pids: number[]): Map<number, string> {
-  if (process.platform !== "linux") return ps("lstart", pids);
-  const out = new Map<number, string>();
-  for (const pid of pids) {
-    // Fields after the command start at field 3, so field 22 is index 19.
-    const start = statFields(pid)?.[19];
-    if (start) out.set(pid, start);
+  } catch (e) {
+    warnOnce("ps:spawn", `ps failed to run: ${(e as Error).message}`);
+    return null;
   }
   return out;
 }
 
-export function procStart(pid: number): string | null {
-  return procStarts([pid]).get(pid) ?? null;
+const warned = new Set<string>();
+function warnOnce(key: string, text: string): void {
+  if (warned.has(key)) return;
+  warned.add(key);
+  console.error(`[grayboard] ${text}`);
+}
+
+/**
+ * Each pid's start time, as an opaque string: absent when the pid doesn't
+ * exist, null when it does but its start time can't be read (an unknown, never
+ * evidence that it's gone). Linux: field 22 (starttime, clock ticks since
+ * boot). macOS: `ps -o lstart=`, one fork for the whole list.
+ */
+export function procStarts(pids: number[]): Map<number, string | null> {
+  const out = new Map<number, string | null>();
+  if (process.platform !== "linux") {
+    const starts = ps("lstart", pids);
+    for (const pid of pids) {
+      const start = starts ? starts.get(pid) : null;
+      if (start !== undefined) out.set(pid, start);
+      else if (pidExists(pid)) out.set(pid, null);
+    }
+    return out;
+  }
+  for (const pid of pids) {
+    // Fields after the command start at field 3, so field 22 is index 19.
+    const start = statFields(pid)?.[19];
+    if (start) out.set(pid, start);
+    else if (pidExists(pid)) out.set(pid, null);
+  }
+  return out;
+}
+
+/** `pid`'s start time; undefined when it doesn't exist, null when it does but can't be read. */
+export function procStart(pid: number): string | null | undefined {
+  const starts = procStarts([pid]);
+  return starts.has(pid) ? starts.get(pid)! : undefined;
 }
 
 /** Whether `pid` exists. EPERM means it does, under another user. */
@@ -58,17 +85,36 @@ export function pidExists(pid: number): boolean {
   }
 }
 
+/**
+ * Whether a process recorded as `pid` started at `recorded` is still that
+ * process, given `current`, its start time read now. Dead only on evidence:
+ * the pid is gone, or both start times are known and differ. An unknown on
+ * either side counts as alive, logged once per pid: a reused pid may then hold
+ * a dead session's name, which is safer than reaping a live one.
+ */
+function judge(pid: number, recorded: string | null, current: string | null | undefined): boolean {
+  if (current === undefined) return false;
+  if (recorded !== null && current !== null) return current === recorded;
+  warnOnce(
+    `unknown:${pid}`,
+    recorded === null
+      ? `pid ${pid}'s row has no start time; treating it as alive while the pid exists`
+      : `can't read pid ${pid}'s start time; treating it as alive`,
+  );
+  return true;
+}
+
 /** Whether `pid` is still the process that started at `start`. */
 export function isAlive(pid: number, start: string | null): boolean {
   if (!pidExists(pid)) return false;
-  return start === null || procStart(pid) === start;
+  return judge(pid, start, procStart(pid));
 }
 
 /** Which of `rows` are still their process, with one start-time read for all of them. */
 export function aliveRows<T extends { pid: number; proc_start: string | null }>(rows: T[]): { alive: T[]; dead: T[] } {
   const present = rows.filter((r) => pidExists(r.pid));
   const starts = procStarts(present.map((r) => r.pid));
-  const alive = present.filter((r) => r.proc_start === null || starts.get(r.pid) === r.proc_start);
+  const alive = present.filter((r) => judge(r.pid, r.proc_start, starts.has(r.pid) ? starts.get(r.pid)! : undefined));
   return { alive, dead: rows.filter((r) => !alive.includes(r)) };
 }
 
@@ -77,7 +123,7 @@ function parentOf(pid: number): number | null {
     const ppid = Number(statFields(pid)?.[1]);
     return ppid > 0 ? ppid : null;
   }
-  const ppid = Number(ps("ppid", [pid]).get(pid));
+  const ppid = Number(ps("ppid", [pid])?.get(pid));
   return ppid > 0 ? ppid : null;
 }
 
@@ -97,7 +143,7 @@ export function commandName(pid: number): string | null {
       return null;
     }
   }
-  const comm = ps("comm", [pid]).get(pid);
+  const comm = ps("comm", [pid])?.get(pid);
   return comm ? comm.split("/").pop() || null : null;
 }
 
@@ -120,6 +166,6 @@ export function launcherName(pid: number): string | null {
           return "";
         }
       })()
-    : (ps("args", [pid]).get(pid) ?? "");
+    : (ps("args", [pid])?.get(pid) ?? "");
   return LAUNCHERS.exec(args)?.[1] ?? null;
 }

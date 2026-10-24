@@ -39,7 +39,10 @@ export function recordPath(dir: string, harnessPid: number): string {
  */
 export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "at">, now = Date.now()): NameRecord | null {
   const harness_start = procStart(r.harness_pid);
-  if (harness_start === null) return null;
+  if (!harness_start) {
+    console.error(`[grayboard] can't read harness pid ${r.harness_pid}'s start time; no name record written, so a restart comes back unbound`);
+    return null;
+  }
   const rec: NameRecord = { ...r, harness_start, at: now };
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${recordPath(dir, r.harness_pid)}.${process.pid}.tmp`;
@@ -61,8 +64,8 @@ function parse(text: string): NameRecord | null {
 
 /**
  * The record for `harnessPid` on `bus`, if its harness is still the process
- * that wrote it. A stale or unreadable record is deleted; one for another bus
- * is kept and ignored.
+ * that wrote it. A stale or unreadable record is deleted; one for another bus,
+ * or one whose harness start time can't be read now, is kept and ignored.
  */
 export function freshRecord(dir: string, harnessPid: number, bus: string): NameRecord | null {
   const path = recordPath(dir, harnessPid);
@@ -73,14 +76,19 @@ export function freshRecord(dir: string, harnessPid: number, bus: string): NameR
     return null;
   }
   const r = parse(text);
-  if (!r || r.harness_pid !== harnessPid || procStart(harnessPid) !== r.harness_start) {
+  const start = procStart(harnessPid);
+  if (start === null) return null;
+  if (!r || r.harness_pid !== harnessPid || start !== r.harness_start) {
     rm(path);
     return null;
   }
   return r.bus === bus ? r : null;
 }
 
-/** Delete every record whose harness is gone, or isn't the process that wrote it. */
+/**
+ * Delete every record whose harness is gone, or isn't the process that wrote
+ * it. A harness whose start time can't be read keeps its record.
+ */
 export function sweepRecords(dir: string): void {
   let files: string[];
   try {
@@ -97,7 +105,8 @@ export function sweepRecords(dir: string): void {
   });
   const starts = procStarts(recs.flatMap(({ r }) => (r ? [r.harness_pid] : [])));
   for (const { f, r } of recs) {
-    if (!r || starts.get(r.harness_pid) !== r.harness_start) rm(join(dir, f));
+    const start = r ? starts.get(r.harness_pid) : undefined;
+    if (!r || (start !== null && start !== r.harness_start)) rm(join(dir, f));
   }
 }
 

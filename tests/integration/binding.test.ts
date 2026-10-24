@@ -204,6 +204,17 @@ test("7: a pre-upgrade session holding a name by socket alone keeps it", async (
   expect(s.c.getInstructions()).not.toContain("fe (");
 }, 30_000);
 
+test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the name since", async () => {
+  // s starts first: its startup reaps dead rows, and the row must still be there at its bind.
+  const s = await session();
+  await session("fe");
+  process.kill(pidOf("fe"), "SIGKILL");
+  await localSession(dir, "fe", { bin: rel.cli });
+  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toHaveLength(1);
+  expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
+  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toEqual([]);
+}, 30_000);
+
 test("8, 13: a rebind moves claims, frees the old name, and delivers the new name's mail", async () => {
   const s = await session("fe");
   const be = await session("be");
