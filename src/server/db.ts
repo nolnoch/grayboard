@@ -123,6 +123,17 @@ export interface Repo {
 
 export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
 
+// undeliveredFrom: messages a sender has sent that the recipient's read point
+// hasn't reached. The read point is the last delivered-and-handled message id
+// (cursors.last_seen_id); unread = `id > read point` — a message is counted
+// undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
+// plan of the exact statement the code executes, not a hand-copied drift.
+export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
+            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+            GROUP BY m.recipient ORDER BY m.recipient`;
+
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   // auto_vacuum first: it takes effect only before the file's first page is
@@ -199,6 +210,7 @@ function initSchema(db: Database): void {
       last_seen_id  INTEGER NOT NULL,
       PRIMARY KEY (identity_id, stream_type, stream_ref)
     );
+    CREATE INDEX IF NOT EXISTS idx_cursors_stream ON cursors(stream_type, stream_ref);
 
     CREATE TABLE IF NOT EXISTS access_log (
       id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -451,11 +463,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
-          `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
-            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
-            GROUP BY m.recipient ORDER BY m.recipient`,
+          UNDELIVERED_FROM_SQL,
         ).all(sender, olderThan);
       },
       receivedUnacked(reader, since) {

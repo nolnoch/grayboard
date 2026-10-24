@@ -115,19 +115,21 @@ function threadRows(id: number): Message[] {
 }
 
 // Messages `sender` sent that haven't reached the recipient's session yet
-// (past its cursor), per recipient. olderThan: only count those sent before it.
+// (past its read point), per recipient. olderThan: only count those sent before it.
+// The read point is the last delivered-and-handled message id (cursors.last_seen_id);
+// unread = `id > read point` — a message is counted undelivered iff `id > read point`.
+// Exported so the EXPLAIN pin asserts the plan of the exact statement the code executes.
+export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+        LEFT JOIN cursors c ON c.reader = m.recipient
+        WHERE m.sender = ? AND m.recipient != m.sender
+          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+        GROUP BY m.recipient ORDER BY m.recipient`;
 export function undeliveredFrom(
   sender: string,
   olderThan = Infinity,
 ): { recipient: string; n: number; oldest_id: number }[] {
   return db
-    .prepare(
-      `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-         LEFT JOIN cursors c ON c.reader = m.recipient
-        WHERE m.sender = ? AND m.recipient != m.sender
-          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
-        GROUP BY m.recipient ORDER BY m.recipient`,
-    )
+    .prepare(LOCAL_UNDELIVERED_FROM_SQL)
     .all(sender, Number.isFinite(olderThan) ? olderThan : Number.MAX_SAFE_INTEGER) as {
     recipient: string;
     n: number;

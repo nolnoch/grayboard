@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { openDatabase, type Repo } from "./db.ts";
+import { openDatabase, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -125,4 +125,21 @@ describe("Repo", () => {
     repo.audit.prune(Date.now()); // prune everything older than now
     // No assertion on rows (no SELECT on audit in Repo) but prune should not throw
   });
+});
+
+// ── #130: the undeliveredFrom plan ────────────────────────────────────────────
+
+test("undeliveredFrom uses the stream index, never a cursors scan", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const sender = repo.users.upsertByEmail("a@example.com", null);
+  repo.identities.create(sender.id, "fe");
+  const recip = repo.users.upsertByEmail("b@example.com", null);
+  const ri = repo.identities.create(recip.id, "be");
+  repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+  repo.cursors.advance(ri.id, "direct", "b@example.com/be", 1);
+  const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
+    .all("a@example.com/fe", Number.MAX_SAFE_INTEGER) as { detail: string }[];
+  const detail = plan.map(p => p.detail).join(" ");
+  expect(detail).toContain("USING INDEX idx_cursors_stream");
+  expect(detail).not.toContain("SCAN cursors");
 });
