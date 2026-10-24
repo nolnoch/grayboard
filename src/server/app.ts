@@ -4,6 +4,7 @@ import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { createApplication } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
+import { createHostedMcp } from "./mcp.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer, createTouchQueue } from "./auth.ts";
@@ -26,6 +27,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
   const { revalidate, disconnectUser, stopExpiry, wake } = application;
   const { handlers, startPing } = createWsHandlers(application);
+  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin });
 
   const authGate = new AuthGate(repo, {
     trustedProxies: config.trustedProxies, limit: config.authFailLimit,
@@ -67,6 +69,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const limited = authGate.refuse(caller, path);
       if (limited) return limited;
 
+      if (new URL(req.url).pathname === "/mcp") return mcp.fetch(req);
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
         // No token costs nothing: a page can open a WebSocket cross-origin (auth_gate.ts).
@@ -119,6 +122,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   return {
     server,
+    mcp,
     repo,
     db,
     handlers,
@@ -143,7 +147,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopExpiry();
       touches.cancelAll();
       server.stop(true);
-      db.close();
+      return mcp.close().finally(() => db.close());
     },
   };
 }
