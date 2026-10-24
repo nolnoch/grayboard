@@ -1,10 +1,5 @@
 import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
-
-/** Where a bus's wakeup sockets live. */
-export function sockDir(env: Record<string, string | undefined> = process.env): string {
-  return env.BUS_SOCK_DIR ?? `${homedir()}/.claude-bus`;
-}
+import { sockDir } from "../shared/sockdir.ts";
 
 const SOCK_DIR = sockDir();
 

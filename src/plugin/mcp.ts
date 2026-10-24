@@ -19,7 +19,7 @@ import {
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
-import { sockDir } from "../local/wakeup.ts";
+import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
@@ -200,6 +200,12 @@ const helloWithin = (c: GrayboardClient): Promise<HelloOk> => Promise.race([
 ]);
 
 const OLD_SERVER = "this grayboard server predates unbound sessions, so reads are unavailable until you bind a name; the server needs updating";
+// A bad_request on a read-only hello is taken for an old server; its message
+// is logged, so another cause shows.
+function readOnlyRefused(e: HelloRefused): void {
+  console.error(`[grayboard] the server refused a read-only hello (${e.message}); taking it for a server from before unbound sessions`);
+  readsUnavailable = OLD_SERVER;
+}
 
 // Why this session started unbound, for its instructions.
 const unboundNotes: string[] = [];
@@ -274,7 +280,7 @@ if (!bound) {
   } catch (e) {
     c.close();
     if (!(e instanceof HelloRefused && e.code === "bad_request")) fatal(e as Error);
-    readsUnavailable = OLD_SERVER;
+    readOnlyRefused(e as HelloRefused);
   }
 }
 writeName(bound);
@@ -546,7 +552,7 @@ async function connection(): Promise<GrayboardClient> {
   } catch (e) {
     if (client === c) client = null;
     c.close();
-    if (e instanceof HelloRefused && e.code === "bad_request") readsUnavailable = OLD_SERVER;
+    if (e instanceof HelloRefused && e.code === "bad_request") readOnlyRefused(e);
     throw new Error(readsUnavailable ?? (e as Error).message);
   }
 }

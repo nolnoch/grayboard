@@ -42,7 +42,8 @@ import {
   withUploads,
 } from "./db.ts";
 import { localDbPath } from "./open.ts";
-import { listenForWakeup, poke, sockDir } from "./wakeup.ts";
+import { listenForWakeup, poke } from "./wakeup.ts";
+import { sockDir } from "../shared/sockdir.ts";
 import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";

@@ -199,10 +199,15 @@ export async function declareLocalHuman(db: Database, handle: string, socks?: st
   });
 }
 
-const queuedSql = `SELECT m.recipient AS name, COUNT(*) AS n FROM messages m
-  LEFT JOIN cursors c ON c.reader = m.recipient
-  WHERE m.id > COALESCE(c.last_seen_id, 0) AND m.recipient != m.sender
-  GROUP BY m.recipient`;
+// DMs queued for each of the names in ?1 (a JSON array): one index search per
+// name past its read point, never a pass over the whole table. It lives here,
+// not in db.ts, because this module takes its database (the Slack bridge
+// opens its own). Exported for the plan pin in db.test.ts.
+export const QUEUED_FOR_SQL = `SELECT j.value AS name,
+    (SELECT COUNT(*) FROM messages m
+      WHERE m.recipient = j.value AND m.sender != j.value
+        AND m.id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = j.value), 0)) AS n
+  FROM json_each(?1) j`;
 
 /**
  * The names an unbound session is offered: `suggested` (the checkout's
@@ -212,14 +217,14 @@ const queuedSql = `SELECT m.recipient AS name, COUNT(*) AS n FROM messages m
  */
 export async function candidateNames(db: Database, suggested: string | null): Promise<Candidate[]> {
   const live = new Set(liveSessions(db).map((r) => r.name).filter((n): n is string => n !== null));
-  const queued = new Map((db.prepare(queuedSql).all() as { name: string; n: number }[]).map((r) => [r.name, r.n]));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const humans = new Set(humanHandles(db));
-  const rows = db.prepare(`SELECT name, last_seen, cwd FROM handles`).all() as { name: string; last_seen: number; cwd: string | null }[];
   const ok = (n: string) => !live.has(n) && !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
+  const rows = (db.prepare(`SELECT name, last_seen, cwd FROM handles`).all() as { name: string; last_seen: number; cwd: string | null }[]).filter((r) => ok(r.name));
+  const queued = new Map((db.prepare(QUEUED_FOR_SQL).all(JSON.stringify(rows.map((r) => r.name))) as { name: string; n: number }[]).map((r) => [r.name, r.n]));
   const pool = orderCandidates(
-    rows.filter((r) => ok(r.name)).map((r) => ({
+    rows.map((r) => ({
       name: r.name, queued: queued.get(r.name) ?? 0, claims: claims.get(r.name) ?? 0, last_seen: r.last_seen,
       where: r.cwd ? describeLocation(r.cwd) : null,
     })),

@@ -475,6 +475,7 @@ test("18: against a server without read-only hellos, unbound reads are unavailab
     const token = await old.login(A);
     const s = await mcpSession({ env: serverEnv(dir, old.base, token, null), cwd: dir, args: ["mcp", "--mode", "server"] });
     expect(s.c.getInstructions()).toContain("predates unbound sessions");
+    expect(s.stderr()).toContain("[grayboard] the server refused a read-only hello (");
     expect(await refusal(s, "board_read", { board: "e2e" })).toContain("predates unbound sessions");
     expect(await refusal(s, "peer_list")).toContain("predates unbound sessions");
     // Binding still works there, and the session reads once bound; the

@@ -16,7 +16,7 @@ import { busMode } from "../cli/api.ts";
 import { humanHandles } from "../core/boards.ts";
 import { declareLocalHuman } from "../local/binding.ts";
 import { localDbPath, openLocalDb } from "../local/open.ts";
-import { sockDir } from "../local/wakeup.ts";
+import { sockDir } from "../shared/sockdir.ts";
 import { ConfigError, configPath, loadConfig } from "./config.ts";
 import { Relay, type Bus, type ChannelParams } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
