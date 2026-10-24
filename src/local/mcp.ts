@@ -530,7 +530,7 @@ async function bind(a: Record<string, any>) {
       throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
     }
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return bindOk(n.name, previous, r.moved.map((c) => c.key), boundInstructions(n.name, previous === null));
+    return bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => boundInstructions(n.name, general));
   } finally {
     swapping = false;
     binding = false;

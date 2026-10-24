@@ -87,7 +87,7 @@ for (const mode of ["local", "server"] as const) {
   });
 }
 
-test("opencode: unbound reads work, writes are refused; bind moves the one grayboard process and the system prompt follows", async () => {
+test("opencode: unbound reads work, writes are refused; bind and rebind move the one grayboard process and the system prompt follows in full", async () => {
   const peer = await localSession(dir, "peer");
   const oc = driver(undefined, entry("local"));
   await oc.send("init");
@@ -98,9 +98,14 @@ test("opencode: unbound reads work, writes are refused; bind moves the one grayb
 
   expect(await oc.send("call", { tool: "grayboard_board_list", args: {} })).toBeString();
   await expect(oc.send("call", { tool: "grayboard_dm_send", args: { to: "peer", body: "too early" } })).rejects.toThrow("no bus name yet");
-  expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-task", create: true } })).toContain('Bound to "oc-task"');
+  expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-tmp", create: true } })).toContain('Bound to "oc-tmp"');
+  // A rebind replaces the prompt section with the full set, not just the name's part.
+  expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-task", create: true } })).toContain('Bound to "oc-task" (was "oc-tmp")');
   const system = (await oc.send("system", { sessionID: "s1" })).join("\n");
   expect(system).toContain('You are identity "oc-task" on the grayboard bus');
+  expect(system).toContain('Direct messages arrive as <channel source="grayboard"');
+  expect(system).toContain("Messages are durable");
+  expect(system).not.toContain("oc-tmp");
   expect(system).not.toContain("no bus name yet");
 
   // The bound name receives, into the session the user wrote in.

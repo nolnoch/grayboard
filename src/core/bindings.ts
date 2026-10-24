@@ -102,21 +102,22 @@ export function launcherNote(launcher: string): string {
 }
 
 /**
- * bind's result: what changed, then `instructions`, the startup text for the
- * name (instructions are fixed at initialize, so bind's result carries them).
- * `structuredContent` repeats the name and instructions for adapters that put
- * the instructions in the system prompt themselves (pi, opencode), so they
- * never parse the text.
+ * bind's result: what changed, then the startup text for the name
+ * (instructions are fixed at initialize, so bind's result carries them).
+ * `instructions(general)` builds it; the text leaves out the general part on
+ * a rebind, which the model already has. `structuredContent` carries the full
+ * set, name and general alike, for adapters that replace their system-prompt
+ * section with it (pi, opencode), so they never parse the text.
  */
-export function bindOk(name: string, previous: string | null, moved: string[], instructions: string[]) {
+export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[]) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
-    ...instructions,
+    ...instructions(previous === null),
   ].join(" ");
-  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions } };
+  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }
 
 /** The refusal for a name that has never existed, without create: true. */

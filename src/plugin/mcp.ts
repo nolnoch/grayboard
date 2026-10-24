@@ -533,7 +533,7 @@ async function bind(a: Record<string, unknown>) {
     lostNotice = null;
     old?.close();
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return bindOk(n.name, previous, h.moved ?? [], boundInstructions(n.name, h, previous === null));
+    return bindOk(n.name, previous, h.moved ?? [], (general) => boundInstructions(n.name, h, general));
   } finally {
     binding = false;
   }

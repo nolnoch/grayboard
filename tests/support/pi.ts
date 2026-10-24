@@ -231,10 +231,11 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
   let model: ReturnType<typeof startFakeModel> | undefined;
   try {
     const p = await localSession(dir, "peer", { bin });
-    // After the prompt, one step per tool result: a read, a refused write, bind.
+    // After the prompt, one step per tool result: a read, a refused write, bind, rebind.
     const steps: Reply[] = [
       { tool: "mcp__grayboard__board_list", args: {} },
       { tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "too early" } },
+      { tool: "mcp__grayboard__bind", args: { name: "pi-tmp", create: true } },
       { tool: "mcp__grayboard__bind", args: { name: "pi-task", create: true } },
     ];
     const scripted: Rule = (req) => {
@@ -251,20 +252,23 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
     const pi = startPi(dir, model.port, procs, { bin, identity: null });
     await pi.command({ type: "get_state" });
     await pi.command({ type: "prompt", message: "start" });
-    await until(() => requests.length >= 4 && pi.events.some((e) => e.type === "agent_settled"), 30_000, "scripted turn");
+    await until(() => requests.length >= 5 && pi.events.some((e) => e.type === "agent_settled"), 30_000, "scripted turn");
 
     const results = (await pi.messages()).filter((m) => m.role === "toolResult");
     expect(results.map((m) => [m.toolName, !!m.isError])).toEqual([
       ["mcp__grayboard__board_list", false],
       ["mcp__grayboard__dm_send", true],
       ["mcp__grayboard__bind", false],
+      ["mcp__grayboard__bind", false],
     ]);
     expect(JSON.stringify(results[1]!.content)).toContain("no bus name yet");
-    expect(JSON.stringify(results[2]!.content)).toContain('Bound to \\"pi-task\\"');
+    expect(JSON.stringify(results[2]!.content)).toContain('Bound to \\"pi-tmp\\"');
+    expect(JSON.stringify(results[3]!.content)).toContain('Bound to \\"pi-task\\" (was \\"pi-tmp\\")');
     expect(systemText(requests[0]!.body)).toContain("This session has no bus name yet");
     expect(grayboardChildren(pi.pid, bin)).toHaveLength(1);
 
-    // The bound name receives: a DM triggers a turn whose system prompt is the bound one.
+    // The bound name receives: a DM triggers a turn whose system prompt is the
+    // bound one, in full after the rebind.
     const before = requests.length;
     const sent = await p.call("dm_send", { to: "pi-task", body: "ping" });
     await until(() => p.pushes.find((x) => x.content.includes("pong")), 30_000, "pong at peer");
@@ -272,6 +276,8 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
     expect(thread.map((m: any) => [m.sender, m.body])).toEqual([["peer", "ping"], ["pi-task", "pong"]]);
     const woken = requests[before]!.body;
     expect(systemText(woken)).toContain('You are identity "pi-task" on the grayboard bus');
+    expect(systemText(woken)).toContain('Direct messages arrive as <channel source="grayboard"');
+    expect(systemText(woken)).not.toContain("pi-tmp");
     expect(systemText(woken)).not.toContain("no bus name yet");
     expect(model.unhandled).toEqual([]);
     expect(grayboardChildren(pi.pid, bin)).toHaveLength(1);
