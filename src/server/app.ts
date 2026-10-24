@@ -1,6 +1,7 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
+import { createApplication } from "./application.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
@@ -16,13 +17,15 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
+  const application = createApplication(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts,
   });
+  const { revalidate, disconnectUser, stopExpiry, wake } = application;
+  const { handlers, startPing } = createWsHandlers(application);
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
-    repo, db, handlers, ...config.slack,
+    repo, db, application, ...config.slack,
     ...(process.env.GRAYBOARD_SLACK_DEBUG ? { debug: (msg: string) => console.error(`[grayboard slack] debug: ${msg}`) } : {}),
   }) : undefined;
   const slackReady = slack?.start().catch((e) => {

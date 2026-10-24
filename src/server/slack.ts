@@ -1,9 +1,8 @@
 // The org Slack bridge: one Slack app for the whole server, enabled by
 // SLACK_APP_TOKEN + SLACK_BOT_TOKEN. Each linked user talks to the app in
 // their own DM with it, as their human identity "<email>/human". That identity
-// is an in-process connection in the hub, speaking the same frames a client
-// does, so delivery, cursors, canSend and board access are the paths agents'
-// sessions take. See docs/slack-bridge.md.
+// uses the hosted application directly, sharing delivery, cursors, canSend
+// and board access with agents. See docs/slack-bridge.md.
 //
 // Linking proves both sides: `grayboard slack link` (a signed-in grayboard
 // user) gets a one-time code, and only the Slack account that sends it to the
@@ -13,7 +12,6 @@ import { randomInt } from "node:crypto";
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
 import { boardNotification, dmNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, ServerMessage, ThreadOk } from "../shared/protocol.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackWeb } from "../bridge/web.ts";
@@ -22,7 +20,7 @@ import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
 import { onIdentityCreated } from "./teams.ts";
-import type { Conn, WsData } from "./ws.ts";
+import type { Application, ApplicationSession, DeliverySink } from "./application.ts";
 
 const CODE_TTL_MS = 10 * 60_000;
 // Wrong codes a Slack account may send per CODE_TTL_MS; 8 chars from 31 make
@@ -33,15 +31,10 @@ const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const NOT_LINKED =
   "This Slack account isn't linked to grayboard. In a terminal signed in to grayboard, run `grayboard slack link` and send me the code it prints.";
 
-type Handlers = {
-  message(ws: Conn, raw: string): void;
-  close(ws: Conn): void;
-};
-
 export type SlackBridgeOptions = {
   repo: Repo;
   db: CoreDb;
-  handlers: Handlers;
+  application: Application;
   appToken: string;
   botToken: string;
   apiUrl?: string;
@@ -61,56 +54,7 @@ export type SlackLinker = {
   userChanged(userId: number): Promise<void>;
 };
 
-/**
- * A human identity's connection: frames the hub sends arrive in send(), and
- * request() sends one the way a client would and resolves with its answer.
- */
-class HumanConn implements Conn {
-  readyState = 1;
-  data: WsData;
-  private n = 0;
-  private readonly waiting = new Map<string, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
-
-  constructor(
-    private readonly hub: Handlers,
-    authed: AuthedUser,
-    private readonly onItem: (m: PushMessage | BoardPush) => void,
-  ) {
-    this.data = { authed, identityId: 0, identityName: "", identityFull: "", ready: false, human: true };
-  }
-
-  send(raw: string): void {
-    const m = JSON.parse(raw) as ServerMessage;
-    const req = "req_id" in m && m.req_id ? this.waiting.get(m.req_id) : undefined;
-    if (req) {
-      this.waiting.delete((m as { req_id: string }).req_id);
-      if (m.type === "error") req.reject(new Error(m.message));
-      else req.resolve(m);
-      return;
-    }
-    if (m.type === "push" || m.type === "board_push") this.onItem(m);
-    // Pings and unsolicited errors need nothing from a connection that can't drop.
-  }
-
-  close(): void {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    this.hub.close(this);
-    for (const r of this.waiting.values()) r.reject(new Error("the Slack link was closed"));
-    this.waiting.clear();
-  }
-
-  request<T extends ServerMessage>(frame: Record<string, unknown> & { type: ClientMessage["type"] }): Promise<T> {
-    if (this.readyState !== 1) return Promise.reject(new Error("the Slack link was closed"));
-    const req_id = `slack-${++this.n}`;
-    return new Promise<T>((resolve, reject) => {
-      this.waiting.set(req_id, { resolve: resolve as (m: ServerMessage) => void, reject });
-      this.hub.message(this, JSON.stringify({ ...frame, req_id }));
-    });
-  }
-}
-
-type Linked = { link: SlackLink; conn: HumanConn; relay: Relay };
+type Linked = { link: SlackLink; session: ApplicationSession; relay: Relay };
 
 export class SlackBridge implements SlackLinker {
   private readonly web: SlackWeb;
@@ -242,16 +186,19 @@ export class SlackBridge implements SlackLinker {
     const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, session_id: 0 };
 
     let relay!: Relay;
-    const conn = new HumanConn(this.o.handlers, authed, (m) => {
-      if (m.type === "push") {
-        relay.notify(dmNotification(m.message));
-      } else if (m.item.kind === "digest") {
-        // Only says a board has unread posts; on a phone that's noise.
-        void conn.request({ type: "board_ack", refs: [refOf(m.item)] }).catch(() => {});
-      } else {
-        relay.notify(boardNotification(m.item));
-      }
-    });
+    const application = this.o.application;
+    let session!: ApplicationSession;
+    const sink: DeliverySink = {
+      probe: async () => true,
+      closed: () => this.detach(link.user_id),
+      deliver(m) {
+        if (m.kind === "direct") relay.notify(dmNotification(m.message));
+        else if (m.item.kind === "digest") {
+          try { application.receiptBoards(session, [refOf(m.item)]); } catch {}
+        }
+        else relay.notify(boardNotification(m.item));
+      },
+    };
 
     // The outbox is memory: an item is acked to the hub only once Slack has
     // it, so one that never made it is resent at the next start. How far it
@@ -279,11 +226,11 @@ export class SlackBridge implements SlackLinker {
         const p = outbox.get(id);
         outbox.delete(id);
         const m = p?.meta ?? {};
-        const ack: Record<string, unknown> & { type: ClientMessage["type"] } | null =
-          m.board && m.post_id ? { type: "board_ack", refs: [{ kind: "push", post_id: Number(m.post_id) }] }
-          : m.message_id ? { type: "ack", message_ids: [Number(m.message_id)] }
-          : null;
-        if (ack) void conn.request(ack).catch(() => {});
+        if (!session.active) return;
+        try {
+          if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)]);
+        } catch {}
       },
     };
 
@@ -291,17 +238,15 @@ export class SlackBridge implements SlackLinker {
       async call(name, args) {
         try {
           if (name === "dm_send") {
-            const { type: _t, req_id: _r, ...v } = await conn.request<SendOk>({
-              type: "send", recipient: args.to, body: args.body,
-              ...(args.parent_id !== undefined ? { parent_id: args.parent_id } : {}),
-              ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids } : {}),
-            });
-            return { ok: true, value: v };
+            return { ok: true, value: application.send(session, String(args.to), String(args.body), {
+              ...(args.parent_id !== undefined ? { parent_id: Number(args.parent_id) } : {}),
+              ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids as number[] } : {}),
+            }) };
           }
           if (name === "dm_thread") {
-            return { ok: true, value: (await conn.request<ThreadOk>({ type: "thread", message_id: args.thread })).messages };
+            return { ok: true, value: application.thread(session, Number(args.thread)) };
           }
-          return { ok: true, value: (await conn.request<CallOk>({ type: "call", tool: name, args })).result };
+          return { ok: true, value: application.call(session, name, args) };
         } catch (e) {
           return { ok: false, error: (e as Error).message };
         }
@@ -355,9 +300,10 @@ export class SlackBridge implements SlackLinker {
           identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
         }),
     });
-    this.linked.set(link.user_id, { link, conn, relay });
     try {
-      await conn.request<HelloOk>({ type: "hello", identity: HUMAN_NAME });
+      ({ session } = await application.attachHuman(authed, sink));
+      this.linked.set(link.user_id, { link, session, relay });
+      application.replay(session);
     } catch (e) {
       this.log(`${link.email}: couldn't bring the human online: ${(e as Error).message}`);
       this.detach(link.user_id);
@@ -369,7 +315,7 @@ export class SlackBridge implements SlackLinker {
     if (!l) return;
     this.linked.delete(userId);
     l.relay.stop();
-    l.conn.close();
+    this.o.application.close(l.session);
   }
 
   // ── Slack → grayboard ──────────────────────────────────────────────────────

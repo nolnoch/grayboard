@@ -77,7 +77,7 @@ async function session(token: string, identity: string) {
   const env = { ...process.env, GRAYBOARD_TOKEN: token, GRAYBOARD_SERVER: base, BUS_IDENTITY: identity, BUS_ATTACH_ROOTS: tmpdir() } as Record<string, string>;
   delete env.BUS_HUMAN;
   await c.connect(
-    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], env, stderr: "ignore" }),
+    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "server"], cwd: tmpdir(), env, stderr: "ignore" }),
   );
   open.push(c);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
@@ -229,12 +229,15 @@ test("a post Slack refuses is retried and lands once", async () => {
   await link(alice);
   const be = await session(alice, "be");
   slack.failPosts = 1;
-  await be.call("dm_send", { to: "human", body: "flaky" });
+  const sent = await be.call("dm_send", { to: "human", body: "flaky" });
+  await until(() => slack.posts().find((p) => p.markdown_text === "**be** flaky"));
+  expect(app.repo.cursors.directFor("alice@example.com/human")).toBeLessThan(sent.message_id);
   // The relay retries after 5s; the refused attempt is in posts() but got no ts.
   const landed = () => slack.posts().filter((p) => p.markdown_text === "**be** flaky" && slack.postTs.has(p));
   await until(() => landed().length > 0, 10_000);
   await Bun.sleep(300);
   expect(landed()).toHaveLength(1);
+  expect(app.repo.cursors.directFor("alice@example.com/human")).toBe(sent.message_id);
   expect(slack.posts().filter((p) => p.markdown_text === "**be** flaky")).toHaveLength(2);
 }, 30_000);
 
