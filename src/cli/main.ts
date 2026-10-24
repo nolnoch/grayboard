@@ -124,6 +124,11 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
     args:    plugin.args,
     env:     { BUS_IDENTITY: identityName },
   };
+  // A pin is a suggestion: sessions start unbound and bind it by choice (#182).
+  const wrote = (verb: string) => console.log(
+    `${verb} ${targetPath}: "${identityName}" is pinned as this checkout's default. ` +
+    `Sessions start unbound and list it first; set BUS_IDENTITY in the launch command to bind at start.`,
+  );
 
   if (force) {
     const old = existsSync(targetPath) ? JSON.parse(readFileSync(targetPath, "utf8")) : null;
@@ -134,14 +139,14 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
       }
     }
     writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
-    console.log(`Wrote ${targetPath}`);
+    wrote("Wrote");
     return;
   }
 
   // Merge mode
   if (!existsSync(targetPath)) {
     writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
-    console.log(`Created ${targetPath}`);
+    wrote("Created");
     return;
   }
 
@@ -158,7 +163,7 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
   }
   existing.mcpServers["grayboard"] = entry;
   writeFileSync(targetPath, JSON.stringify(existing, null, 2) + "\n");
-  console.log(`Updated ${targetPath}`);
+  wrote("Updated");
 }
 
 // ── program ───────────────────────────────────────────────────────────────────
@@ -612,8 +617,8 @@ program
     console.log(
       `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
-      `Each session is named after its repo (in ~/code/api you're "api"). ` +
-      `To pick a name, set BUS_IDENTITY in that repo's .mcp.json (grayboard identity create <name> --mcp).`,
+      `Each session starts unbound and binds a name with bind once it knows its task; the repo's name (in ~/code/api, "api") is suggested first. ` +
+      `To bind a name at start, set BUS_IDENTITY in the launch command.`,
     );
   });
 

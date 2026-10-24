@@ -77,10 +77,10 @@ const resolved = (() => {
 })();
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
-// BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
+// BUS_PUSH=off: tools only, for a harness without an adapter.
 const PUSH = process.env.BUS_PUSH !== "off";
-// A tools-only process uses the resolved name as it always has; the session
-// that owns delivery runs beside it (until #182's name record).
+// A tools-only process (a harness without an adapter) uses the resolved name
+// as it always has, without acquiring it.
 if (!resolved.ok && (EXPLICIT || !PUSH)) {
   console.error(`[grayboard] ${resolved.error}`);
   process.exit(1);

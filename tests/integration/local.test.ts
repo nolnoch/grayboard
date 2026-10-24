@@ -317,7 +317,11 @@ test("identity create --mcp names a missing directory instead of failing with EN
   const bad = await create("nope/.mcp.json");
   expect(bad.code).toBe(1);
   expect(bad.err).toMatch(/directory \S*\/nope doesn't exist/);
-  expect((await create(".mcp.json")).code).toBe(0);
+  const ok = await create(".mcp.json");
+  expect(ok.code).toBe(0);
+  // The pin is a suggestion; the output says how to bind at start (#182).
+  expect(ok.out).toContain(`"be" is pinned as this checkout's default`);
+  expect(ok.out).toContain("set BUS_IDENTITY in the launch command to bind at start");
 }, 20_000);
 
 test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {

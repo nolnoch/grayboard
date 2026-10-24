@@ -81,9 +81,8 @@ if (RETENTION_DAYS === null) {
   process.exit(1);
 }
 
-// BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
-// separate adapter owns the wakeup socket and delivery. Draining here would
-// consume messages into a void.
+// BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
+// has no adapter. Draining here would consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
@@ -105,8 +104,8 @@ const resolved = (() => {
     return { ok: false as const, error: (e as Error).message };
   }
 })();
-// A tools-only process uses the resolved name as it always has; the session
-// that owns delivery runs beside it (until #182's name record).
+// A tools-only process (a harness without an adapter) uses the resolved name
+// as it always has, without acquiring it.
 const NAMED = EXPLICIT || !PUSH;
 if (!resolved.ok && NAMED) {
   console.error(`[grayboard] ${resolved.error}`);
