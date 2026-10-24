@@ -41,16 +41,60 @@ const PI_DIR  = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
-const ADAPTERS = [
+// The opencode and pi adapters serve grayboard's tools themselves and read
+// their command from the harness's grayboard MCP entry, so that entry is
+// kept disabled (else the harness registers the tools twice), with
+// BUS_PUSH=off so a re-enabled one never adds a second delivery owner.
+type Entry = Record<string, unknown>;
+type HarnessConfig = { path: string; section: "mcp" | "mcpServers"; disable: (e: Entry) => Entry };
+const pushOff = (e: Entry, key: string) => ({ ...(e[key] as Record<string, string> | undefined), BUS_PUSH: "off" });
+const OC_CONFIG: HarnessConfig = {
+  path: join(OC_DIR, "opencode.json"),
+  section: "mcp",
+  disable: e => ({ ...e, enabled: false, environment: pushOff(e, "environment") }),
+};
+const PI_CONFIG: HarnessConfig = {
+  path: join(PI_DIR, "mcp.json"),
+  section: "mcpServers",
+  disable: ({ exposure: _, ...e }) => ({ ...e, enabled: false, env: pushOff(e, "env") }),
+};
+
+const ADAPTERS: { path: string; source: string; config?: HarnessConfig }[] = [
   { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
-  { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode") },
-  { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi") },
+  { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode"), config: OC_CONFIG },
+  { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi"), config: PI_CONFIG },
 ];
 
 function writeAdapter(path: string, source: string): void {
   mkdirSync(dirname(path), { recursive: true });
   rmSync(path, { force: true }); // replace, never write through, an existing symlink
   writeFileSync(path, source);
+}
+
+/** A harness's JSON config, or `empty` when the file doesn't exist. Throws when it can't be parsed. */
+function readConfig<T extends object>(path: string, empty: T): T {
+  if (!existsSync(path)) return empty;
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+    throw new Error(`Can't parse ${path}: ${(e as Error).message}`);
+  }
+}
+
+function writeConfig(path: string, cfg: object): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+}
+
+/** Write `entry` (or disable the existing one) as the harness's grayboard entry; true when the file changed. */
+function putEntry(c: HarnessConfig, entry?: Entry): boolean {
+  const cfg = readConfig<Record<string, Record<string, Entry> | undefined>>(c.path, {});
+  const old = cfg[c.section]?.grayboard;
+  const base = entry ?? old;
+  if (!base) return false;
+  const next = c.disable(base);
+  if (JSON.stringify(next) === JSON.stringify(old)) return false;
+  cfg[c.section] = { ...cfg[c.section], grayboard: next };
+  writeConfig(c.path, cfg);
+  return true;
 }
 
 // ── MCP server command ────────────────────────────────────────────────────────
@@ -532,51 +576,36 @@ program
     if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
       const cfgPath = join(OMP_DIR, "mcp.json");
       let cfg: { mcpServers?: Record<string, unknown> } = {};
-      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-      }
+      try { cfg = readConfig(cfgPath, cfg); } catch (e) { console.error((e as Error).message); process.exit(1); }
       cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
-      mkdirSync(OMP_DIR, { recursive: true });
-      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      writeConfig(cfgPath, cfg);
       const ext = ADAPTERS[0]!;
       writeAdapter(ext.path, ext.source);
       console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
     }
 
-    // 4. opencode: it drops MCP notifications, so its entry is tools only
-    // (BUS_PUSH=off) and the plugin runs the push side. opencode merges
-    // opencode.json and opencode.jsonc, so this leaves a commented .jsonc alone.
+    // 4. opencode: it drops MCP notifications, so the plugin runs one
+    // grayboard process, serves its tools and delivers its pushes; the
+    // entry, disabled, is the plugin's config. opencode merges opencode.json
+    // and opencode.jsonc, so this leaves a commented .jsonc alone.
     const opencode = !!Bun.which("opencode");
     if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
-      const cfgPath = join(OC_DIR, "opencode.json");
-      let cfg: { $schema?: string; mcp?: Record<string, unknown> } = { $schema: "https://opencode.ai/config.json" };
-      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-      }
-      cfg.mcp = { ...cfg.mcp, grayboard: { type: "local", command: [command, ...args], environment: { BUS_PUSH: "off" } } };
-      mkdirSync(OC_DIR, { recursive: true });
-      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
+      try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       const plugin = ADAPTERS[1]!;
       writeAdapter(plugin.path, plugin.source);
-      console.log(`Registered in ${cfgPath}; installed ${plugin.path}`);
+      console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${plugin.path}`);
     }
 
     // 5. pi: its MCP client drops notifications and, for direct tools, the
-    // server's instructions, so like opencode its entry is tools only and
-    // the extension runs the push side and supplies the instructions.
+    // server's instructions, so like opencode the extension serves the tools,
+    // runs the push side and supplies the instructions.
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
-      const cfgPath = join(PI_DIR, "mcp.json");
-      let cfg: { mcpServers?: Record<string, unknown> } = {};
-      try { cfg = JSON.parse(readFileSync(cfgPath, "utf8")); } catch (e) {
-        if (existsSync(cfgPath)) { console.error(`Can't parse ${cfgPath}: ${(e as Error).message}`); process.exit(1); }
-      }
-      cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args, env: { BUS_PUSH: "off" }, exposure: "direct" } };
-      mkdirSync(PI_DIR, { recursive: true });
-      writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+      try { putEntry(PI_CONFIG, { command, args }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       const ext = ADAPTERS[2]!;
       writeAdapter(ext.path, ext.source);
-      console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
+      console.log(`Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools); installed ${ext.path}`);
     }
 
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
@@ -622,10 +651,19 @@ program
   .description("Rewrite installed omp/opencode/pi push adapters from this binary")
   .action(() => {
     for (const a of ADAPTERS) {
-      // A symlink means a checkout is installed there on purpose: leave it.
+      // A symlink means a checkout is installed there on purpose: leave it,
+      // and the entry its version expects.
       if (!existsSync(a.path) || lstatSync(a.path).isSymbolicLink()) continue;
       writeAdapter(a.path, a.source);
       console.log(`Refreshed ${a.path}`);
+      if (!a.config) continue;
+      // `update` drops this command's stderr, so failures go to stdout.
+      try {
+        if (putEntry(a.config)) console.log(`Disabled the grayboard entry in ${a.config.path} (the adapter serves the tools)`);
+      } catch (e) {
+        console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
+        process.exitCode = 1;
+      }
     }
   });
 
