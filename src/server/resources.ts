@@ -66,6 +66,7 @@ export function createResources(application: Application, options: ResourceOptio
     return false;
   }
   const service = {
+    get activeWatchCount() { return watches.size; },
     list(session: ApplicationSession, after?: string) {
       requireSession(session);
       const page = application.boardCatalog(session, after);

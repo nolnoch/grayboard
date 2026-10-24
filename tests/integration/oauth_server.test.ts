@@ -32,7 +32,7 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   app.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -128,10 +128,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   await client.connect(new StreamableHTTPClientTransport(new URL(resource), { authProvider: provider, requestInit: { headers: { "X-Grayboard-Identity": "be" } }, fetch: fetchFn }));
   expect(client.getNegotiatedProtocolVersion()).toBe(version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("board_create");
-  expect(client.getServerCapabilities()?.resources).toEqual({});
+  expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
   const result = await client.callTool({ name: "peer_list", arguments: {} });
   expect(result.isError).not.toBe(true);
   expect(JSON.stringify(result)).toContain("alice@example.com/be");
   expect(exchanges).toBe(1);
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });

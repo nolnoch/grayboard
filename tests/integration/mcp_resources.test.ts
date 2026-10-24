@@ -23,8 +23,9 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
-  expect(app.mcp.activeContexts).toBe(0);
-  expect(app.mcp.activeResourceContexts).toBe(0);
+  expect(app.mcp.activeGetStreams).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
+  expect(app.mcp.activeResourceContexts).toBe(app.mcp.activeGetStreams);
   expect(app.mcp.activeLeases).toBe(0);
   app.db.close();
   rmSync(dir, { recursive: true, force: true });
@@ -70,7 +71,7 @@ async function open(client: Client, headers: Headers) {
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscriber catalogs, reads and explicit control on one grant`, async () => {
   const grant = issue();
   const native = await connect(grant.token, version);
-  expect(native.client.getServerCapabilities()?.resources).toEqual({});
+  expect(native.client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
   expect(native.client.getServerCapabilities()?.tools?.listChanged).toBe(false);
   expect(native.client.getServerCapabilities()).not.toHaveProperty("experimental");
   expect((await native.client.listTools()).tools.some(t => t.name.startsWith("delivery_"))).toBe(false);
@@ -119,8 +120,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   value(await call(sub.client, "delivery_release"));
   expect(app.mcp.activeLeases).toBe(0);
   expect((await call(sub.client, "delivery_renew")).isError).toBe(true);
-  expect(app.mcp.activeContexts).toBe(0);
-  expect(app.mcp.activeResourceContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
+  expect(app.mcp.activeResourceContexts).toBe(app.mcp.activeGetStreams);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: lease header binds identity, user, grant and role on every read/control`, async () => {
@@ -177,11 +178,13 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: role scopes and s
   for (const args of [{ ids: ["x", "x"] }, { ids: Array.from({ length: 101 }, (_, i) => String(i)) }, { ids: [], capability: "x" }]) {
     expect((await call(sub.client, "delivery_receipt", args)).isError).toBe(true);
   }
-  await expect(sub.client.subscribeResource({ uri: "grayboard://inbox" })).rejects.toThrow();
   if (version === "2026-07-28") {
-    const unsupported = await sub.client.listen({ resourceSubscriptions: ["grayboard://inbox"] });
-    expect(unsupported.honoredFilter).toEqual({});
-    await unsupported.close();
+    await expect(sub.client.subscribeResource({ uri: "grayboard://inbox" })).rejects.toThrow();
+    const subscription = await sub.client.listen({ resourceSubscriptions: ["grayboard://inbox"] });
+    expect(subscription.honoredFilter).toEqual({ resourceSubscriptions: ["grayboard://inbox"] });
+    await subscription.close();
+  } else {
+    expect(await sub.client.subscribeResource({ uri: "grayboard://inbox" })).toEqual({});
   }
 });
 
@@ -292,7 +295,7 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   await expect(sub.client.listResources()).rejects.toThrow();
   await expect(read(sub.client, "grayboard://identity")).rejects.toThrow();
   await expect(call(sub.client, "delivery_renew")).rejects.toThrow();
-  expect(app.mcp.activeContexts).toBe(0);
+  expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
 test("explicit open conflicts with an existing live WS-style owner; native and subscriber reads do not", async () => {
