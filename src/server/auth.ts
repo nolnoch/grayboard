@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import type { Repo } from "./db.ts";
 
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
@@ -64,19 +64,25 @@ export async function verifyGoogleIdToken(
   idToken: string,
   clientId: string,
   allowedDomain: string,
+  options: { expectedNonce?: string; keyResolver?: JWTVerifyGetKey } = {},
 ): Promise<{ email: string; displayName: string | null }> {
-  const { payload } = await jwtVerify(idToken, googleJwks, {
+  const { payload } = await jwtVerify(idToken, options.keyResolver ?? googleJwks, {
     issuer: GOOGLE_ISSUERS,
     audience: clientId,
   });
+  if (typeof payload.exp !== "number" || typeof payload.iat !== "number" || typeof payload.sub !== "string" || !payload.sub ||
+      (payload.azp !== undefined && payload.azp !== clientId) ||
+      (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== clientId)) throw new Error("invalid Google ID token claims");
   if (payload["hd"] !== allowedDomain) {
     throw new Error(`account must be from @${allowedDomain}`);
   }
-  if (!payload["email_verified"]) {
+  if (options.expectedNonce !== undefined && payload["nonce"] !== options.expectedNonce) throw new Error("invalid Google nonce");
+  if (typeof payload["email"] !== "string" || !payload["email"].trim()) throw new Error("invalid Google email");
+  if (payload["email_verified"] !== true) {
     throw new Error("email is not verified");
   }
   const email = (payload["email"] as string).toLowerCase();
-  const displayName = (payload["name"] as string | undefined) ?? null;
+  const displayName = typeof payload["name"] === "string" ? payload["name"] : null;
   return { email, displayName };
 }
 
@@ -87,10 +93,12 @@ export async function exchangeGoogleCode(
   clientId: string,
   clientSecret: string,
   allowedDomain: string,
+  expectedNonce?: string,
 ): Promise<{ email: string; displayName: string | null }> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    signal: AbortSignal.timeout(10_000),
     body: new URLSearchParams({
       client_id:     clientId,
       client_secret: clientSecret,
@@ -105,7 +113,7 @@ export async function exchangeGoogleCode(
     throw new Error(`Google token exchange failed (${res.status}): ${body}`);
   }
   const { id_token } = (await res.json()) as { id_token: string };
-  return verifyGoogleIdToken(id_token, clientId, allowedDomain);
+  return verifyGoogleIdToken(id_token, clientId, allowedDomain, { expectedNonce });
 }
 
 export function extractBearer(req: Request): string | null {
