@@ -8,7 +8,7 @@ import type { Database } from "bun:sqlite";
 
 import { declareHuman, humanHandles, isHuman, isViewer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -61,13 +61,23 @@ export function describeHolder(r: SessionRow): string {
   return `the live session ${r.session_id} (pid ${r.pid}${what ? `, ${what}` : ""})`;
 }
 
-const NO_ROW_HOLDER = "a live session from an older grayboard (its wakeup socket answers; no live bindings row holds the name)";
+// A live socket with no live row: a session from before #182, or one that
+// has just rebound off the name and hasn't closed its socket yet. That one
+// left no row (dead or alive) on the name, and its release is the name's last
+// event. `deadRow`: a dead holder's row was found, so it isn't that.
+function noRowHolder(db: Database, name: string, deadRow: boolean): string {
+  return !deadRow && lastWasRelease(db, name)
+    ? "a session that has just rebound off it (its wakeup socket still answers); try again in a moment"
+    : "a live session from an older grayboard (its wakeup socket answers; no live bindings row holds the name)";
+}
 
-// Reap rows whose process is gone. Callers are inside a transaction.
-function reap(db: Database, rows: SessionRow[], now: number): void {
+// Reap rows whose process is gone. Callers are inside a transaction. The
+// rows were read before it, so another process may have reaped one already:
+// only the process whose delete removed the row logs its release.
+export function reap(db: Database, rows: SessionRow[], now: number): void {
   for (const r of rows) {
-    db.prepare(`DELETE FROM bindings WHERE session_id = ?`).run(r.session_id);
-    if (r.name) logBinding(db, r.session_id, r.name, "released", `reaped: pid ${r.pid} is gone`, now);
+    const gone = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(r.session_id) as { name: string | null } | null;
+    if (gone?.name) logBinding(db, r.session_id, gone.name, "released", `reaped: pid ${r.pid} is gone`, now);
   }
 }
 
@@ -138,7 +148,10 @@ export async function acquireName(
       return refuse(`"${name}" is held by ${who}`, { holder: who });
     }
     if (holder) reap(db, [holder], now);
-    if (sockLive) return refuse(`"${name}" is held by ${NO_ROW_HOLDER}`, { holder: NO_ROW_HOLDER });
+    if (sockLive) {
+      const who = noRowHolder(db, name, before !== null || holder !== null);
+      return refuse(`"${name}" is held by ${who}`, { holder: who });
+    }
 
     const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
@@ -184,7 +197,7 @@ export function endSession(db: Database, sessionId: string): string | null {
 export function nameHolder(db: Database, name: string, sockLive: boolean): string | null {
   const row = db.prepare(`SELECT * FROM bindings WHERE name = ?`).get(name) as SessionRow | null;
   if (row && isAlive(row.pid, row.proc_start)) return describeHolder(row);
-  return sockLive ? NO_ROW_HOLDER : null;
+  return sockLive ? noRowHolder(db, name, row !== null) : null;
 }
 
 /**

@@ -117,6 +117,9 @@ describe("the local rule: the shell's bound session (#182 decision 18)", () => {
     expect(() => actingIdentity(undefined, {}, at("repo"), { sessions: [], ancestors: [] })).toThrow(/no live session.*pass --as/);
     const unbound = { sessions: [row(null, 40, "repo")], ancestors: [40] };
     expect(() => actingIdentity(undefined, {}, at("repo"), unbound)).toThrow(/hasn't bound a name yet/);
+    // Several under this shell's harness, none in this checkout: says so (#182 audit 29).
+    const elsewhere = { sessions: [row("main", 40, "repo"), row("stream", 40, "repo", ".wt", "stream")], ancestors: [40] };
+    expect(() => actingIdentity(undefined, {}, root, elsewhere)).toThrow(/2 live sessions run this shell \(main, stream\), none in this checkout; pass --as/);
   });
 
   test("--as and an explicit BUS_IDENTITY still win", () => {

@@ -265,7 +265,13 @@ test("9: a DM sent mid-swap is never consumed under the new name", async () => {
   const be = await session("be");
   const binding = s.c.callTool({ name: "bind", arguments: { name: "fe2", create: true } });
   await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
-  await be.call("dm_send", { to: "fe", body: "mid-swap" });
+  // fe's socket still answers, but fe is released: the sender is told it's queued (audit 29).
+  expect(await be.call("dm_send", { to: "fe", body: "mid-swap" })).toMatchObject({ delivered_now: false });
+  // A bind of fe in the window is refused as a rebind in progress, not an older grayboard.
+  const third = await session();
+  const refused = await third.c.callTool({ name: "bind", arguments: { name: "fe" } });
+  expect((refused.content as { text: string }[])[0]!.text).toContain(`"fe" is held by a session that has just rebound off it`);
+  await stop(third.c);
   release("bind:after-acquire");
   expect((await binding).isError).toBeFalsy();
   await Bun.sleep(300);

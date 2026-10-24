@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
@@ -335,7 +335,9 @@ async function dispatch(name: string, a: Record<string, any>, signal: AbortSigna
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
-    const delivered = await poke(recipient);
+    // A socket that answers for a released name is a bind's swap window: the
+    // DM stays queued for the name's next holder (#182 audit 29).
+    const delivered = (await poke(recipient)) && !lastWasRelease(db, recipient);
     if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
     return text(JSON.stringify({

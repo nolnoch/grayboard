@@ -66,8 +66,10 @@ export function lastWasRelease(db: Database, name: string): boolean {
 export const UNBOUND_ERROR =
   "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
 
-/** What an unbound session may call: reads that need no name. */
-export const UNBOUND_TOOLS = new Set(["bind", "board_list", "board_read", "peer_list", "claim_list"]);
+/** The reads that need no name: what a server lets a read-only connection call. */
+export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
+/** What an unbound session may call: those reads, and bind (which never reaches a server as a call). */
+export const UNBOUND_TOOLS = new Set(["bind", ...UNBOUND_READS]);
 
 export const BIND_TOOL = {
   name: "bind",

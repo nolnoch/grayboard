@@ -11,15 +11,13 @@ export type PushCallback = (msg: Message) => Promise<void>;
 export type BoardPushCallback = (item: Pending) => Promise<void>;
 export type ReadyCallback = (data: HelloOk) => void;
 
-/** The server refused this client's hello: its code, and with it the closest names or the holder. */
+/** The server refused this client's hello: its code, and with it the holder (the closest names are in the message). */
 export class HelloRefused extends Error {
   readonly code: ErrorMessage["code"];
-  readonly known?: string[];
   readonly holder?: string;
   constructor(m: ErrorMessage) {
     super(m.message);
     this.code = m.code;
-    this.known = m.known;
     this.holder = m.holder;
   }
 }

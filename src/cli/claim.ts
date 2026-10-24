@@ -41,6 +41,9 @@ export function boundSession(view: LocalView, cwd: string): { name: string; sour
   const under = view.sessions.filter((r) => r.harness_pid !== null && mine.has(r.harness_pid));
   const pick = under.length > 1 ? under.filter(inHere) : under.length ? under : view.sessions.filter(inHere);
   const source = under.length ? "the session this shell runs under" : "the session in this checkout";
+  if (pick.length === 0 && under.length > 1) {
+    throw new Error(`${under.length} live sessions run this shell (${under.map((r) => r.name ?? "an unbound session").join(", ")}), none in this checkout; pass --as <name>`);
+  }
   if (pick.length === 0) throw new Error("no live session runs this shell or this checkout; pass --as <name>");
   if (pick.length > 1) {
     const names = pick.map((r) => r.name ?? "an unbound session").join(", ");

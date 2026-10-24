@@ -23,7 +23,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_TOOLS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
   sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -214,7 +214,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 
       // Every handler below reads ws.data.identityFull as a name's: a
       // read-only connection has none, so it gets only the unbound reads.
-      if (ws.data.readOnly && !(msg.type === "call" && UNBOUND_TOOLS.has(msg.tool))) {
+      if (ws.data.readOnly && !(msg.type === "call" && UNBOUND_READS.has(msg.tool))) {
         err(ws, msg.req_id, "unbound", UNBOUND_ERROR);
         return;
       }
