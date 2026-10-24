@@ -22,7 +22,7 @@ const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
   clock = undefined;
   blobDir = mkdtempSync(join(tmpdir(), "gb-http-mcp-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { background: false, oauth: { now: () => clock ?? Date.now() } });
+  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock ?? Date.now() } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
