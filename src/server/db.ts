@@ -72,6 +72,9 @@ export interface Repo {
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    // Direct messages to each of recipients still past its cursor, sent by
+    // someone else; recipients with none are absent.
+    queuedTo(recipients: string[]): Map<string, number>;
     // Direct messages from sender still past each recipient's cursor, per recipient.
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
     // Direct messages to reader since `since` that it hasn't acked, oldest first.
@@ -460,6 +463,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }
         all.sort((a, b) => a.id - b.id);
         return att(all);
+      },
+      queuedTo(recipients) {
+        const rows = db.query<{ recipient: string; n: number }, [string]>(
+          `SELECT m.recipient, COUNT(*) AS n FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
+              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c WHERE c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
+            GROUP BY m.recipient`,
+        ).all(JSON.stringify(recipients));
+        return new Map(rows.map((r) => [r.recipient, r.n]));
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(

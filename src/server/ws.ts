@@ -1,5 +1,5 @@
 import { participant, type MessageRow, type Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
+import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type ErrorCode } from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
@@ -14,17 +14,22 @@ import {
   pendingFor,
   post,
   refOf,
+  sessionsSeen,
   setPlace,
   startSession,
   touchHandle,
   type CoreDb,
   type PendingRef,
+  type UnboundPeer,
 } from "../core/boards.ts";
+import {
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_TOOLS, closestNames, logBinding, mintSessionId, orderCandidates, unknownNameError, type Candidate,
+} from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
-import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
   PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
@@ -44,6 +49,16 @@ export type WsData = {
   // The server's Slack bridge holding a user's human identity: the only
   // connection allowed the reserved name, and drained like a human's session.
   human?: true;
+  // The client process's session ID (#182): its own, or minted here for a
+  // client from before session IDs. Keys binding_events.
+  sessionId?: string;
+  // Where the client runs, from its hello.
+  place?: string | null;
+  // An unbound session's read-only connection: its handle is
+  // <email>/~<session id>, which no hello can name, and it may only read.
+  readOnly?: true;
+  // This connection holds its name: its close logs the release.
+  owner?: true;
 };
 
 // What the hub needs of a connection: a client's WebSocket, or an in-process
@@ -73,6 +88,8 @@ type Hub = {
   probing: Map<string, Promise<boolean>>;
   // Tools-only connections (hello push: false): pinged, never pushed to.
   toolsOnly: Set<Ws>;
+  // Unbound sessions' read-only connections: pinged, shown by peer_list.
+  readOnly: Set<Ws>;
   repo: Repo;
   db: CoreDb;
   probeMs: number;
@@ -138,7 +155,7 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
-    registry: new Map(), probing: new Map(), toolsOnly: new Set(), repo, db,
+    registry: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
   };
@@ -182,11 +199,18 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true).catch((e) => {
+        handleHello(hub, ws, msg).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
         });
+        return;
+      }
+
+      // Every handler below reads ws.data.identityFull as a name's: a
+      // read-only connection has none, so it gets only the unbound reads.
+      if (ws.data.readOnly && !(msg.type === "call" && UNBOUND_TOOLS.has(msg.tool))) {
+        err(ws, msg.req_id, "unbound", UNBOUND_ERROR);
         return;
       }
 
@@ -246,11 +270,13 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 
     close(ws: Ws) {
       hub.toolsOnly.delete(ws);
+      hub.readOnly.delete(ws);
       const full = ws.data.identityFull;
       if (full && hub.registry.get(full) === ws) {
         hub.registry.delete(full);
         touchHandle(hub.db, full);
       }
+      if (ws.data.owner) release(hub, ws, "connection closed");
       ws.data.onPong = undefined;
     },
   };
@@ -258,7 +284,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   // Auth is checked at the upgrade only. When an admin revokes or disables a
   // user, close their connections (#70): reconnecting then fails auth. The
   // Slack bridge's humans have their own path (SlackBridge.userChanged).
-  const conns = () => [...hub.registry.values(), ...hub.toolsOnly].filter((ws) => !ws.data.human);
+  const conns = () => [...hub.registry.values(), ...hub.toolsOnly, ...hub.readOnly].filter((ws) => !ws.data.human);
   const disconnectUser = (userId: number) => {
     for (const ws of conns()) {
       if (ws.data.authed.user_id !== userId) continue;
@@ -277,7 +303,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
-      for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
+      for (const ws of [...hub.registry.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
     }, 30_000);
@@ -288,11 +314,28 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   };
 }
 
-async function handleHello(
-  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false,
-): Promise<void> {
+// A connection that held its name gives it up: logged once, by whichever of
+// close, supersede or rebind comes first.
+function release(hub: Hub, ws: Ws, why: string): void {
+  ws.data.owner = undefined;
+  logBinding(hub.db, ws.data.sessionId!, ws.data.identityFull, "released", why);
+}
+
+function describeHolder(ws: Ws): string {
+  return `the live session ${ws.data.sessionId}${ws.data.place ? `, in ${ws.data.place}` : ""}`;
+}
+
+async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const { repo, db, registry } = hub;
-  const name = identityInput.toLowerCase();
+  const reqId = m.req_id;
+  const push = m.push !== false;
+  // A client from before session IDs gets one here, so its events have a key.
+  const sessionId = m.session_id ?? mintSessionId();
+  ws.data.sessionId = sessionId;
+  ws.data.place = m.where ?? null;
+  if (m.read_only) return helloReadOnly(hub, ws, reqId, sessionId, m.suggested);
+
+  const name = m.identity!.toLowerCase();
   if (!isValidIdentityName(name)) {
     err(ws, reqId, "bad_request", "invalid identity name");
     ws.close();
@@ -306,6 +349,22 @@ async function handleHello(
 
   const { authed } = ws.data;
   const full = `${authed.user_email}/${name}`;
+  // Only the connection that would hold the name logs: a tools-only one runs
+  // beside the session that owns it.
+  const refuse = (code: ErrorCode, message: string, detail: string, extra: { known?: string[]; holder?: string } = {}) => {
+    if (push) logBinding(db, sessionId, full, "refused", detail);
+    send(ws, { type: "error", req_id: reqId, code, message, ...extra });
+    ws.close();
+  };
+
+  // A typo would otherwise create a fresh name, and the DMs queued for the
+  // intended one would never arrive.
+  if (m.create === false && !repo.identities.findByUserAndName(authed.user_id, name)) {
+    const known = closestNames(name, repo.identities.listForUser(authed.user_id).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+    const message = unknownNameError(name, known);
+    refuse("identity_unknown", message, message, { known });
+    return;
+  }
 
   // One live connection per identity. If the current holder still answers,
   // refuse the newcomer: taking over would let a stray second session (e.g.
@@ -329,14 +388,14 @@ async function handleHello(
     });
     hub.probing.set(full, probing);
     if (await probing) {
-      err(ws, reqId, "identity_in_use",
-        `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
-      ws.close();
+      const who = describeHolder(holder);
+      refuse("identity_in_use", `identity "${name}" is already in use by ${who}; bind another name.`, who, { holder: who });
       return;
     }
     if (ws.readyState !== 1 /* OPEN */) return;
     if (registry.get(full) === holder) {
       err(holder, undefined, "superseded", "a newer session connected with this identity");
+      if (holder.data.owner) release(hub, holder, `superseded by session ${sessionId}`);
       holder.close();
       registry.delete(full);
     }
@@ -349,11 +408,23 @@ async function handleHello(
     onIdentityCreated(db, repo, authed.user_id, full);
   }
 
+  let moved: string[] | undefined;
   if (push) {
+    // The same session on another name is a rebind: its claims follow it, and
+    // the old connection, which the client closes next, no longer holds that name.
+    const previous = m.session_id === undefined ? undefined : [...registry.values()].find((c) =>
+      c !== ws && c.data.sessionId === sessionId && c.data.authed.user_id === authed.user_id && c.data.identityFull !== full);
     registry.set(full, ws);
-    if (resume) touchHandle(db, full);
+    if (m.resume) touchHandle(db, full);
     else startSession(db, full, null);
-    setPlace(db, full, where ?? null);
+    setPlace(db, full, m.where ?? null);
+    ws.data.owner = true;
+    if (previous) {
+      const from = previous.data.identityFull;
+      moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
+      if (previous.data.owner) release(hub, previous, `rebound to ${full}`);
+      logBinding(db, sessionId, full, "moved", from);
+    } else logBinding(db, sessionId, full, "bound", m.resume ? "reconnect" : null);
   } else {
     hub.toolsOnly.add(ws);
     touchHandle(db, full);
@@ -373,6 +444,7 @@ async function handleHello(
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
     attachment_limits: repo.attachmentLimits,
+    ...(moved ? { moved } : {}),
   };
   const notices = [
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -389,6 +461,64 @@ async function handleHello(
     send(ws, { type: "push", message: showPending(message) });
   }
   drainBoards(ws, db, true);
+}
+
+// An unbound session's connection: reads only, as <email>/~<session id>.
+// It writes no handles row (that would put it in dm_send's roster); the hub's
+// readOnly set is its presence.
+function helloReadOnly(hub: Hub, ws: Ws, reqId: string, sessionId: string, suggested?: string): void {
+  const { repo, readOnly } = hub;
+  const { authed } = ws.data;
+  readOnly.add(ws);
+  ws.data.readOnly     = true;
+  ws.data.identityId   = 0;
+  ws.data.identityName = `~${sessionId}`;
+  ws.data.identityFull = `${authed.user_email}/~${sessionId}`;
+  ws.data.ready        = true;
+  send(ws, {
+    type: "hello_ok",
+    req_id: reqId,
+    identity_full: ws.data.identityFull,
+    user_email: authed.user_email,
+    teams: repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name)),
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    attachment_limits: repo.attachmentLimits,
+    candidates: candidates(hub, authed, suggested),
+  });
+}
+
+// The user's free names, for an unbound session to bind: `suggested` (the
+// checkout's default) first, then the most pending work. Live names and the
+// human are left out.
+function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
+  const { repo, db, registry } = hub;
+  const full = (n: string) => `${authed.user_email}/${n}`;
+  const free = (n: string) => n !== HUMAN_NAME && !registry.has(full(n));
+  const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
+  const queued = repo.messages.queuedTo(names.map(full));
+  const seen = sessionsSeen(db, names.map(full));
+  const claims = new Map<string, number>();
+  for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
+  const s = suggestedInput?.toLowerCase();
+  const suggested = s !== undefined && isValidIdentityName(s) && free(s) ? s : null;
+  return orderCandidates(
+    names.map((n) => ({
+      name: n, queued: queued.get(full(n)) ?? 0, claims: claims.get(full(n)) ?? 0,
+      last_seen: seen.get(full(n))?.last_seen ?? 0, where: seen.get(full(n))?.where ?? null,
+    })),
+    suggested,
+  ).slice(0, MAX_CANDIDATES);
+}
+
+// The user's live unbound sessions, for peer_list: never another user's.
+function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
+  return [...hub.readOnly]
+    .filter((c) => c.data.authed.user_id === ws.data.authed.user_id)
+    .map((c) => ({
+      session_id: c.data.sessionId!, unbound: true as const, online: true as const,
+      ...(c.data.place ? { where: c.data.place } : {}),
+      ...(c.data.sessionId === ws.data.sessionId ? { self: true as const } : {}),
+    }));
 }
 
 // A bare name means your own identity of that name, else the one identity
@@ -542,6 +672,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
       online: (h) => hub.registry.get(h)?.data.ready === true,
       attachmentLimits: hub.repo.attachmentLimits,
+      ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
     });
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);

@@ -40,6 +40,25 @@ export const BIND_TOOL = {
 
 export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true };
 
+/** What a name has waiting, for ranking candidates. */
+export type NameStats = { name: string; queued: number; claims: number; last_seen: number; where: string | null };
+
+/**
+ * Candidates in offer order: `suggested` (the checkout's default) first, then
+ * the most pending work (queued DMs plus held claims), then the most recently
+ * used. The caller has already dropped names that aren't free; `suggested` is
+ * listed even if it has never been used, when the caller passes it.
+ */
+export function orderCandidates(pool: NameStats[], suggested: string | null): Candidate[] {
+  const work = (s: NameStats) => s.queued + s.claims;
+  const rest = pool.filter((s) => s.name !== suggested).sort((a, b) => work(b) - work(a) || b.last_seen - a.last_seen);
+  const first = suggested === null ? [] : [{ ...(pool.find((s) => s.name === suggested) ?? { name: suggested, queued: 0, claims: 0, where: null }), suggested: true as const }];
+  return [...first, ...rest].map((s) => ({
+    name: s.name, queued: s.queued, claims: s.claims, where: s.where,
+    ...("suggested" in s ? { suggested: true as const } : {}),
+  }));
+}
+
 /** At most this many candidates in the unbound instructions: their cost is paid by every unbound session. */
 export const MAX_CANDIDATES = 5;
 
@@ -58,6 +77,25 @@ export function unboundInstruction(candidates: Candidate[], held?: { name: strin
   const heldNote = held ? ` BUS_IDENTITY asked for "${held.name}", but ${held.holder} holds it, so this session started without a name.` : "";
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
   return `This session has no bus name yet.${heldNote} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+}
+
+/**
+ * bind's result: what changed, then `instructions`, the startup text for the
+ * name (instructions are fixed at initialize, so bind's result carries them).
+ */
+export function bindResult(name: string, previous: string | null, moved: string[], instructions: string[]): string {
+  return [
+    previous
+      ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
+      : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
+    ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
+    ...instructions,
+  ].join(" ");
+}
+
+/** The refusal for a name that has never existed, without create: true. */
+export function unknownNameError(name: string, known: string[]): string {
+  return `no name "${name}" has ever been used${known.length ? `; closest: ${known.join(", ")}` : ""}. Pass create: true to make a new one.`;
 }
 
 /** Edit distance, for "did you mean" on a name that has never existed. */

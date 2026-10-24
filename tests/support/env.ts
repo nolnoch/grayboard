@@ -41,15 +41,16 @@ export function localEnv(dir: string, identity?: string, extra: Record<string, s
 }
 
 // A server-mode child signed in with `token`, whose files live in `dir`: its
-// home, its saved attachments, and the one root it may attach from.
+// home, its saved attachments, and the one root it may attach from. A null
+// identity sets no BUS_IDENTITY: the session starts unbound (#182).
 export function serverEnv(
-  dir: string, base: string, token: string, identity: string, extra: Record<string, string> = {},
+  dir: string, base: string, token: string, identity: string | null, extra: Record<string, string> = {},
 ): Record<string, string> {
   return cleanEnv({
     ...home(dir),
     GRAYBOARD_TOKEN: token,
     GRAYBOARD_SERVER: base,
-    BUS_IDENTITY: identity,
+    ...(identity ? { BUS_IDENTITY: identity } : {}),
     BUS_ATTACH_ROOTS: dir,
     ...extra,
   });

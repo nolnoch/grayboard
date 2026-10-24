@@ -8,7 +8,7 @@ import type { Database } from "bun:sqlite";
 
 import { declareHuman, humanHandles, isHuman, isViewer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { logBinding, closestNames, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -118,10 +118,7 @@ export async function acquireName(
     }
     if (!opts.create && !db.prepare(`SELECT 1 FROM handles WHERE name = ?`).get(name)) {
       const known = closestNames(name, knownNames(db));
-      return refuse(
-        `no name "${name}" has ever been used${known.length ? `; closest: ${known.join(", ")}` : ""}. Pass create: true to make a new one.`,
-        { known },
-      );
+      return refuse(unknownNameError(name, known), { known });
     }
     const holder = rowHolder();
     if (holder && isAlive(holder.pid, holder.proc_start)) {
@@ -134,6 +131,7 @@ export async function acquireName(
     const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
     const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
+    if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
     logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous, now);
     return { ok: true, name, moved };
   }).immediate();
@@ -197,24 +195,19 @@ export async function candidateNames(db: Database, suggested: string | null): Pr
   const humans = new Set(humanHandles(db));
   const rows = db.prepare(`SELECT name, last_seen, cwd FROM handles`).all() as { name: string; last_seen: number; cwd: string | null }[];
   const ok = (n: string) => !live.has(n) && !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
-  const work = (n: string) => (queued.get(n) ?? 0) + (claims.get(n) ?? 0);
-  const ranked = rows
-    .filter((r) => ok(r.name) && r.name !== suggested)
-    .sort((a, b) => work(b.name) - work(a.name) || b.last_seen - a.last_seen);
-  const first = suggested && ok(suggested) ? [{ name: suggested, cwd: rows.find((r) => r.name === suggested)?.cwd ?? null, suggested: true as const }] : [];
-  const pool = [...first, ...ranked];
+  const pool = orderCandidates(
+    rows.filter((r) => ok(r.name)).map((r) => ({
+      name: r.name, queued: queued.get(r.name) ?? 0, claims: claims.get(r.name) ?? 0, last_seen: r.last_seen,
+      where: r.cwd ? describeLocation(r.cwd) : null,
+    })),
+    suggested && ok(suggested) ? suggested : null,
+  );
   // A pre-upgrade session holds its name by socket alone; drop those too.
-  const free: typeof pool = [];
+  const free: Candidate[] = [];
   for (let i = 0; i < pool.length && free.length < MAX_CANDIDATES; i += MAX_CANDIDATES) {
     const batch = pool.slice(i, i + MAX_CANDIDATES);
     const held = await Promise.all(batch.map((r) => poke(r.name)));
     free.push(...batch.filter((_, j) => !held[j]));
   }
-  return free.slice(0, MAX_CANDIDATES).map((r) => ({
-    name: r.name,
-    queued: queued.get(r.name) ?? 0,
-    claims: claims.get(r.name) ?? 0,
-    where: r.cwd ? describeLocation(r.cwd) : null,
-    ...("suggested" in r ? { suggested: true as const } : {}),
-  }));
+  return free.slice(0, MAX_CANDIDATES);
 }

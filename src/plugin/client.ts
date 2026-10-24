@@ -1,4 +1,4 @@
-import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/protocol.ts";
+import type { ServerMessage, ClientMessage, ErrorMessage, HelloOk, Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { describeLocation } from "../shared/identity.ts";
 
@@ -11,12 +11,38 @@ export type PushCallback = (msg: Message) => Promise<void>;
 export type BoardPushCallback = (item: Pending) => Promise<void>;
 export type ReadyCallback = (data: HelloOk) => void;
 
+/** The server refused this client's hello: its code, and with it the closest names or the holder. */
+export class HelloRefused extends Error {
+  readonly code: ErrorMessage["code"];
+  readonly known?: string[];
+  readonly holder?: string;
+  constructor(m: ErrorMessage) {
+    super(m.message);
+    this.code = m.code;
+    this.known = m.known;
+    this.holder = m.holder;
+  }
+}
+
+export type ClientOptions = {
+  // This process's session ID (#182): the server keys binding events on it,
+  // and a hello from the same session on another name is a rebind.
+  sessionId?: string;
+  // false: refuse a name that has never existed (identity_unknown).
+  create?: boolean;
+  // A read-only hello's suggested name, listed first among its candidates.
+  suggested?: string | null;
+  // The client stopped for good after it was ready: superseded, or its name
+  // refused on a reconnect. It never exits the process; the session decides.
+  onDead?: (reason: string) => void;
+};
+
 export class GrayboardClient {
   private ws: WebSocket | null = null;
   private backoffMs = 1000;
   private counter   = 0;
   private pending   = new Map<string, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
-  private dead      = false; // set on superseded; do not reconnect
+  private dead      = false; // set on superseded, refusal or close; do not reconnect
 
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
@@ -28,7 +54,8 @@ export class GrayboardClient {
     private readonly serverUrl: string,
     // Read on each connect, so signing in again takes effect on the next reconnect.
     private readonly token: () => string,
-    private readonly identity: string,
+    // null: an unbound session's read-only connection, with no name.
+    private readonly identity: string | null,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
     // false: a tools-only connection that never receives pushes.
@@ -36,6 +63,7 @@ export class GrayboardClient {
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
+    private readonly opts: ClientOptions = {},
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -63,9 +91,13 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
+      const { sessionId, create, suggested } = this.opts;
       this.send({
-        type: "hello", req_id: this.helloId, identity: this.identity,
-        ...(this.push ? {} : { push: false }),
+        type: "hello", req_id: this.helloId,
+        ...(this.identity === null
+          ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
+          : { identity: this.identity, ...(this.push ? {} : { push: false }), ...(create !== undefined ? { create } : {}) }),
+        ...(sessionId ? { session_id: sessionId } : {}),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : {}),
       });
@@ -94,6 +126,9 @@ export class GrayboardClient {
   }
 
   private handleServerMessage(msg: ServerMessage): void {
+    // A dead client hands nothing to the agent and acks nothing: what was
+    // pushed to it stays queued for its name's next holder (#182 decision 6).
+    if (this.dead) return;
     switch (msg.type) {
       case "hello_ok":
         this.helloData = msg;
@@ -137,23 +172,22 @@ export class GrayboardClient {
 
       case "error":
         if (msg.code === "superseded") {
-          this.dead = true;
-          console.error("[grayboard] connection superseded by a newer session — exiting");
-          process.exit(1);
+          this.die(`${this.identity ? `"${this.identity}" was taken over: ` : ""}${msg.message}`);
+          break;
         }
         // The server refused the hello itself (e.g. a reserved or invalid
         // name): retrying gets the same answer, so give up with its reason (#74).
         const helloRefused = !this.helloData && msg.req_id === this.helloId && msg.code === "bad_request";
-        if (msg.code === "identity_in_use" || helloRefused) {
+        if (msg.code === "identity_in_use" || msg.code === "identity_unknown" || helloRefused) {
           // Another live session holds this identity, or can't have it. Don't retry.
-          this.dead = true;
           if (this.readyResolvers.length) {
-            const err = new Error(msg.message);
+            this.dead = true;
+            this.ws?.close();
+            const err = new HelloRefused(msg);
             for (const r of this.readyResolvers.splice(0)) r(err);
           } else {
             // Refused while reconnecting: e.g. another session owns it now.
-            console.error(`[grayboard] ${msg.message} — exiting`);
-            process.exit(1);
+            this.die(msg.message);
           }
           break;
         }
@@ -242,5 +276,17 @@ export class GrayboardClient {
   close(): void {
     this.dead = true;
     this.ws?.close();
+    const err = new Error("closed");
+    for (const r of this.readyResolvers.splice(0)) r(err);
+  }
+
+  private die(reason: string): void {
+    this.dead = true;
+    this.ws?.close();
+    this.helloData = null;
+    const err = new Error(reason);
+    for (const r of this.readyResolvers.splice(0)) r(err);
+    console.error(`[grayboard] ${reason}`);
+    this.opts.onDead?.(reason);
   }
 }

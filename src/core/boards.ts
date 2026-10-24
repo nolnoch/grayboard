@@ -588,6 +588,14 @@ export function lastSeen(db: Database, handle: string): number | null {
   return row?.last_seen ?? null;
 }
 
+/** When and where each of `handles` last had a session; those that never connected are absent. */
+export function sessionsSeen(db: Database, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
+  const rows = db
+    .prepare(`SELECT name, last_seen, cwd, place FROM handles WHERE name IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify(handles)) as { name: string; last_seen: number; cwd: string | null; place: string | null }[];
+  return new Map(rows.map((r) => [r.name, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
+}
+
 /** Every handle in the roster, for a mode that must check liveness up front. */
 export function rosterHandles(db: Database): string[] {
   return (db.prepare(`SELECT name FROM handles`).all() as { name: string }[]).map((r) => r.name);

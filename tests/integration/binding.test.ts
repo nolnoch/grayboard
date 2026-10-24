@@ -225,6 +225,7 @@ test("8, 13: a rebind moves claims, frees the old name, and delivers the new nam
 
   expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "moved"]);
   expect(events("fe2").at(-1)!.detail).toBe("fe");
+  expect(events("fe").at(-1)).toMatchObject({ event: "released", detail: "rebound to fe2" });
 
   const other = await session();
   await other.call("bind", { name: "fe" });

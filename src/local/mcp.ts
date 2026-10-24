@@ -8,9 +8,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, mintSessionId, unboundInstruction } from "../core/bindings.ts";
+import { BIND_TOOL, UNBOUND_ERROR, UNBOUND_TOOLS, bindResult, mintSessionId, unboundInstruction } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
-import { claimExpiryTimer, listClaims, type Claim } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
@@ -562,7 +562,7 @@ async function bind(a: Record<string, any>) {
     bound = n.name;
     firstDrain = true;
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return text(bindResult(n.name, previous, r.moved));
+    return text(bindResult(n.name, previous, r.moved.map((c) => c.key), boundInstructions(n.name, previous === null)));
   } finally {
     swapping = false;
     binding = false;
@@ -570,15 +570,6 @@ async function bind(a: Record<string, any>) {
   }
 }
 
-function bindResult(name: string, previous: string | null, moved: Claim[]): string {
-  return [
-    previous
-      ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
-      : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
-    ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.map((c) => c.key).join(", ")}.`] : []),
-    ...boundInstructions(name, previous === null),
-  ].join(" ");
-}
 
 // Startup: the name (if any) is already acquired. Connect MCP so
 // notifications are accepted, listen on the name's wakeup socket, and replay

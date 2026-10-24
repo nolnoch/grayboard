@@ -1,6 +1,7 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
+import type { Candidate } from "../core/bindings.ts";
 
 export type Message = {
   id: number;
@@ -21,7 +22,18 @@ export type Message = {
 // identity (a harness that can't show pushes): no pushes, not "online".
 // where: the client's describeLocation (the server can't see its files).
 // resume: a reconnect within one session, so its peer_status stays.
-export type HelloRequest   = { type: "hello";   req_id: string; identity: string; push?: boolean; where?: string; resume?: boolean };
+// session_id: the client process's session ID (#182), the key of its
+// binding_events; a hello from the same session under another name is a
+// rebind, and the session's claims move to the new name.
+// create: false refuses a name that has never existed (identity_unknown);
+// absent, the name is created lazily, as before #182.
+// read_only: an unbound session's connection (no identity; push must be
+// false): board_list, board_read, peer_list and claim_list only. suggested:
+// the checkout's default name, listed first among hello_ok.candidates.
+export type HelloRequest = {
+  type: "hello"; req_id: string; identity?: string; push?: boolean; where?: string; resume?: boolean;
+  session_id?: string; create?: boolean; read_only?: boolean; suggested?: string;
+};
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
@@ -51,6 +63,10 @@ export type HelloOk     = {
   human?: { handle: string; linked: boolean };
   // This server's attachment size caps, for the client's checks before upload.
   attachment_limits?: AttachmentLimits;
+  // A read-only hello: the user's free names an unbound session can bind.
+  candidates?: Candidate[];
+  // A rebind: the claim keys that moved from the session's previous name.
+  moved?: string[];
 };
 export type SendOk      = {
   type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
@@ -73,7 +89,9 @@ export type PushMessage = { type: "push"; message: Message };
 export type PingMessage = { type: "ping" };
 export type CallOk      = { type: "call_ok";    req_id: string; result: unknown };
 export type BoardPush   = { type: "board_push"; item: Pending };
-export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string };
+// known: with identity_unknown, the user's names closest to the one asked for.
+// holder: with identity_in_use, the live session that holds the name.
+export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string };
 
 export type ServerMessage =
   | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
@@ -83,7 +101,13 @@ export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
   | "rate_limited" | "internal" | "superseded"
   // hello refused: another live connection holds this identity
-  | "identity_in_use";
+  | "identity_in_use"
+  // hello refused: create: false and the name has never existed
+  | "identity_unknown"
+  // a read-only connection asked for something that needs a name
+  | "unbound";
+
+const SESSION_ID = /^[0-9a-f]{16}$/;
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
@@ -91,8 +115,17 @@ export function parseClientMessage(raw: unknown): ClientMessage {
 
   switch (m.type) {
     case "hello":
-      assertStr(m, "req_id"); assertStr(m, "identity");
+      assertStr(m, "req_id");
+      if (m.read_only !== undefined && typeof m.read_only !== "boolean") throw new Error("read_only must be boolean");
+      if (m.read_only === true) {
+        if (m.identity !== undefined) throw new Error("a read_only hello has no identity");
+        if (m.push !== false) throw new Error("a read_only hello needs push: false");
+      } else assertStr(m, "identity");
       if (m.push !== undefined && typeof m.push !== "boolean") throw new Error("push must be boolean");
+      if (m.create !== undefined && typeof m.create !== "boolean") throw new Error("create must be boolean");
+      if (m.session_id !== undefined && (typeof m.session_id !== "string" || !SESSION_ID.test(m.session_id)))
+        throw new Error("session_id must be 16 lowercase hex characters");
+      if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");
       return m as unknown as HelloRequest;
