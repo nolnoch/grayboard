@@ -9,7 +9,7 @@ import { HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, f
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, touchAlias, touchId, registerId, idPrincipal, idCollisionText, inheritStatus, normalizeBoard, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
+import { acknowledge, age, canSeeBoard, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, touchAlias, touchId, registerId, idPrincipal, idCollisionText, inheritStatus, normalizeBoard, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs } from "../core/attachments.ts";
@@ -449,6 +449,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman: (authed: AuthedUser, sink: DeliverySink) => select(authed, HUMAN_NAME, sink, {}, true),
     close,
+    revalidateSession: valid,
     replay(session: ApplicationSession) {
       valid(session, true);
       if (session.readOnly || !session.push || hub.registry.get(session.identityFull) !== session) return;
@@ -482,6 +483,20 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     inbox(session: ApplicationSession, days?: number) {
       valid(session);
       return handleInbox(hub, session, days);
+    },
+    // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
+    pending(session: ApplicationSession, limit = 100): DeliveryEvent[] {
+      valid(session);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
+      const since = repo.cursors.get(session.identityId, "direct", session.identityFull);
+      const direct: DeliveryEvent[] = repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])
+        .slice(0, limit).map(message => ({ kind: "direct", message: showPending(message) }));
+      const boards = pendingFor(db, session.identityFull, { all: true });
+      return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
+    },
+    canReceiveBoard(session: ApplicationSession, board: string) {
+      valid(session);
+      return canSeeBoard(db, session.identityFull, board);
     },
     receiptDirect(session: ApplicationSession, ids: number[]) {
       valid(session);
