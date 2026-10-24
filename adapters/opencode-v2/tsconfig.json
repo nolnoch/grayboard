@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext", "strict": true, "skipLibCheck": true, "types": ["bun"], "noEmit": true },
+  "include": ["src/**/*.ts", "tests/unit.test.ts", "tests/binding.test.ts"]
+}
