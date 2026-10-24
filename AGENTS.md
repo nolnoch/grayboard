@@ -22,6 +22,13 @@ Install once per clone: `git config core.hooksPath scripts/hooks`. `scripts/hook
 
 `docs-baseline` is a local tag (never pushed); a fresh clone's gate is inert until its first reconcile. Reconcile: follow `.claude/commands/reconcile-docs.md` (Claude Code: `/reconcile-docs`). The tag moves only through `scripts/advance_docs_baseline.sh`. CI (`.github/workflows/test.yml`) is the universal gate; the hook is local protection.
 
+## Contributions
+
+- Commits are signed — `commit.gpgsign` is on in these checkouts; unsigned commits don't merge.
+- Commit and PR subjects carry the issue key; conventional prefixes (`feat:`, `fix:`, `chore:`…) on commits and PR titles.
+- Issues and PRs open with the concise front — the problem, the value of solving it, the proposed solution — 2–5 bullets each; verbose detail after, for agents. Templates live in `.github/`; the filer applies the surface label (server, local, core, cli, adapters, bridge, ci).
+- Reviews block on medium-and-up findings; file lower ones as `follow-up` issues rather than chasing them in review rounds. A PR merges when each in-scope item is fixed or deferred to a filed issue.
+
 ## Load-bearing gotchas
 
 - **Public repo.** Don't name employers, clients or private projects (repos, ticket prefixes, people) in committed files. Use stand-ins: `ticket:ENG-142`, `#e2e`, `be`/`fe`/`sim`, `you@example.com`. Grep the staged diff before every commit.
