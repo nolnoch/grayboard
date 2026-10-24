@@ -26,11 +26,15 @@ function isFirstSundayOfMonth(d: Date): boolean {
 
 // The nightly job: messages, posts and audit rows past retention, uploads
 // left unbound, then the bytes nothing names any more.
-export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now()): Promise<void> {
+type BoardsChanged = (boards: string[]) => void | Promise<void>;
+export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now(), onBoardsChanged?: BoardsChanged): Promise<void> {
   try {
     // Board posts share the message retention window.
     pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
-    prunePosts(db, now - config.messageRetentionDays * 86_400_000);
+    const boards = prunePosts(db, now - config.messageRetentionDays * 86_400_000);
+    if (boards.length) {
+      try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
+    }
     pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
     pruneUnbound(db, now - UNBOUND_TTL_MS);
   } catch (e) {
@@ -41,8 +45,8 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
 }
 
-export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void {
-  const runNightly = () => void runRetention(repo, db, config);
+export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, onBoardsChanged?: BoardsChanged): void {
+  const runNightly = () => void runRetention(repo, db, config, Date.now(), onBoardsChanged);
 
   const runVacuumIfNeeded = () => {
     const d = new Date();

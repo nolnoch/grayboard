@@ -72,6 +72,25 @@ test("typed operations and delivery need no frames; receipts alone move the deli
   expect(application.inbox(a).promised).toBeUndefined();
 });
 
+test("board observers are independent hints with concealed access and explicit lifecycle cleanup", async () => {
+  const a = (await application.selectIdentity(alice, "be", delivery(sink()), { push: false })).session;
+  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  let changed = 0, closed = 0;
+  const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
+  application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
+  application.call(a, "board_post", { board: "e2e", body: "hello" });
+  expect(changed).toBe(1);
+  expect(application.boardSnapshot(a, "e2e").posts[0]!.body).toBe("hello");
+  expect(application.boardCatalog(a).boards.map(b => b.name)).toContain("e2e");
+  unsubscribe();
+  unsubscribe();
+  expect(closed).toBe(1);
+  application.call(a, "board_post", { board: "e2e", body: "later" });
+  expect(changed).toBe(1);
+  application.close(a);
+  expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
+});
+
 test("tools-only calls neither own nor drain deliveries nor reset the owner's status", async () => {
   const owner = sink();
   const a = (await application.selectIdentity(alice, "be", delivery(owner))).session;

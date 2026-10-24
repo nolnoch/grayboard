@@ -284,7 +284,7 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
   return v;
 }
 
-export type ToolOutcome = { result: unknown; wake: string[] };
+export type ToolOutcome = { result: unknown; wake: string[]; boards?: string[] };
 
 // What only the mode knows. online: does this handle have a live session?
 // attachmentLimits: the caps a post's files are bound under; a mode without
@@ -306,7 +306,7 @@ export function callBoardTool(
     case "board_create": {
       const team = optStr(a, "team");
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null);
-      return { result: b, wake: [] };
+      return { result: b, wake: [], boards: [b.name] };
     }
 
     case "board_post": {
@@ -331,6 +331,7 @@ export function callBoardTool(
           ...(unresolved.length ? { unresolved } : {}),
         },
         wake,
+        boards: [p.board],
       };
     }
 
@@ -378,14 +379,14 @@ export function callBoardTool(
         note: optStr(a, "note"),
         board: optStr(a, "board"),
       });
-      const { wake, ...rest } = r;
-      return { result: rest, wake };
+      const { wake, boards, ...rest } = r;
+      return { result: rest, wake, boards };
     }
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake } = release(db, handle, key, optStr(a, "note"));
-      return { result: `released ${key}`, wake };
+      const { wake, boards } = release(db, handle, key, optStr(a, "note"));
+      return { result: `released ${key}`, wake, boards };
     }
 
     case "claim_watch":

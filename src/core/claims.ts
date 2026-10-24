@@ -12,9 +12,11 @@ export type Claim = {
   expires_at: number;
 };
 
-export type ClaimResult =
-  | { ok: true; claim: Claim; renewed: boolean; wake: string[] }
-  | { ok: false; held_by: string; note: string | null; expires_at: number; wake: string[] };
+type ClaimChanges = { wake: string[]; boards: string[] };
+export type ClaimResult = ClaimChanges & (
+  | { ok: true; claim: Claim; renewed: boolean }
+  | { ok: false; held_by: string; note: string | null; expires_at: number }
+);
 
 const DEFAULT_TTL_MIN = 30;
 const MAX_TTL_MIN = 7 * 24 * 60;
@@ -49,9 +51,10 @@ function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Cl
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
-function announce(db: Database, handle: string, board: string | null, text: string): string[] {
-  if (!board) return [];
-  return post(db, handle, board, text).wake;
+function announce(db: Database, handle: string, board: string | null, text: string): ClaimChanges {
+  if (!board) return { wake: [], boards: [] };
+  const result = post(db, handle, board, text);
+  return { wake: result.wake, boards: [result.post.board] };
 }
 
 // The claim's watchers as @mentions for a post about it. An end post takes
@@ -85,7 +88,7 @@ export function claim(
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     if (cur && cur.expires_at > now && cur.holder !== handle) {
       logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
-      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
+      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, ...lapsed };
     }
     const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
     if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
@@ -104,16 +107,20 @@ export function claim(
       )
       .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
     logEvent(db, renewed ? "renew" : "take", handle, row, now);
-    const wake = !renewed
+    const changed = !renewed
       ? announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, handle, row.board)
         ? announce(db, handle, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`)
-        : [];
-    return { ok: true, claim: row, renewed, wake: [...new Set([...lapsed, ...wake])] };
+        : { wake: [], boards: [] };
+    return {
+      ok: true, claim: row, renewed,
+      wake: [...new Set([...lapsed.wake, ...changed.wake])],
+      boards: [...new Set([...lapsed.boards, ...changed.boards])],
+    };
   }).immediate();
 }
 
-export function release(db: Database, handle: string, keyInput: string, note?: string): { wake: string[] } {
+export function release(db: Database, handle: string, keyInput: string, note?: string): ClaimChanges {
   const key = validKey(keyInput);
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
@@ -125,7 +132,7 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
     const board = cur.board && canSeeBoard(db, handle, cur.board) ? cur.board : null;
-    return { wake: announce(db, handle, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`) };
+    return announce(db, handle, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`);
   }).immediate();
 }
 
@@ -166,45 +173,55 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
 // the work was done, so the post says to check with them. Runs inside the
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
-function sweepIn(db: Database, now: number): string[] {
+function sweepIn(db: Database, now: number): ClaimChanges {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
+  const boards = new Set<string>();
   for (const c of gone) {
     logEvent(db, "expire", c.holder, c, now);
     const cc = watchersCc(db, c.key, true);
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
     const text = `[expired] ${c.key}: not released by ${c.holder}; check with them before relying on it${cc}`;
-    for (const h of announce(db, c.holder, c.board, text)) wake.add(h);
+    const changed = announce(db, c.holder, c.board, text);
+    for (const h of changed.wake) wake.add(h);
+    for (const board of changed.boards) boards.add(board);
   }
-  return [...wake];
+  return { wake: [...wake], boards: [...boards] };
 }
 
-export function sweepExpired(db: Database, now = Date.now()): { wake: string[] } {
-  return db.transaction(() => ({ wake: sweepIn(db, now) })).immediate();
+export function sweepExpired(db: Database, now = Date.now()): ClaimChanges {
+  return db.transaction(() => sweepIn(db, now)).immediate();
 }
 
 // One timer, armed for the next expiry of a claim with a board, so a lapse is
 // announced when it happens. Call arm() after anything that may have added a
-// claim (a tool call, a wakeup); it only ever moves the timer earlier.
+// claim (a tool call, a wakeup); it only ever moves the timer earlier. stop() is terminal.
 export function claimExpiryTimer(
   db: Database,
   onWake: (handles: string[]) => void,
+  onBoardsChanged?: (boards: string[]) => void | Promise<void>,
 ): { arm(): void; stop(): void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
+  let stopped = false;
   const set = (when: number) => {
+    if (stopped) return;
     clearTimeout(timer);
     at = when;
     timer = setTimeout(fire, Math.max(0, when - Date.now()));
     timer.unref?.();
   };
   const fire = () => {
+    if (stopped) return;
     timer = undefined;
     at = Infinity;
     try {
-      const { wake } = sweepExpired(db);
-      if (wake.length) onWake(wake);
+      const { wake, boards } = sweepExpired(db);
+      if (boards.length) {
+        try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
+      }
+      if (!stopped && wake.length) onWake(wake);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
       return set(Date.now() + 5_000);
@@ -212,6 +229,7 @@ export function claimExpiryTimer(
     arm();
   };
   const arm = () => {
+    if (stopped) return;
     const row = db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as {
       next: number | null;
     };
@@ -221,6 +239,7 @@ export function claimExpiryTimer(
   return {
     arm,
     stop: () => {
+      stopped = true;
       clearTimeout(timer);
       timer = undefined;
       at = Infinity;

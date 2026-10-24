@@ -69,7 +69,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser);
+      return handleHttp(req, repo, db, config, uploads, wake, slack, disconnectUser, application.boardsChanged);
     },
 
     websocket: handlers,
@@ -86,7 +86,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const timers: ReturnType<typeof setInterval>[] = [];
   if (opts.background !== false) {
     timers.push(startPing());
-    startRetentionJobs(repo, db, config);
+    startRetentionJobs(repo, db, config, application.boardsChanged);
   }
 
   return {
