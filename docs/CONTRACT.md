@@ -64,6 +64,7 @@ Placement: server-only mechanics → `architecture.md`; anything both modes shar
 
 ## 5. Maintenance
 
+- **Rules are a point of governance.** grayboard is inherently distributed, so governance cannot live isolated on one machine — a rule that exists only in a session, a local memory file, or a conversation does not exist for the next checkout. Rules live in the repo (this file, AGENTS.md, the owner docs) or they don't exist; local copies are caches, not the record.
 - **One fact, one place, across tiers.** A fact lives in exactly one of: code (derivable, so undocumented), `AGENTS.md`, a Tier-2 doc, `README.md` (human steps), or a GitHub issue. Pick the most specific owner and link from the rest.
 - **The baseline tag drives refresh.** `docs-baseline` (a local tag) marks the last commit where docs matched code. The push gate (`scripts/docs_gate.sh`) refuses pushes that change non-doc files since `docs-baseline...<sha>`. A reconcile (`.claude/commands/reconcile-docs.md`) reviews that range, updates only drifted concepts, commits, then advances the tag with `scripts/advance_docs_baseline.sh` (commit-then-tag). A reviewed range with no doc-relevant drift still advances the tag, so bug-fix ranges don't trip the gate forever.
 - **Update only what drifted.** A reconcile edits stale sections; it doesn't rewrite accurate ones.
