@@ -54,22 +54,38 @@ export function createDelivery(application: Application, options: DeliveryOption
     if (!lease.active) return;
     lease.active = false;
     leases.delete(lease.capability);
-    if (lease.session) application.close(lease.session);
-    lease.issued.clear();
-    notify(lease.hooks.closed);
+    try { if (lease.session) application.close(lease.session); }
+    finally { lease.issued.clear(); notify(lease.hooks.closed); }
+  }
+  function finishQuietly(lease: Lease) {
+    try { finish(lease); } catch {}
+  }
+  function authorized(principal: DeliveryPrincipal): boolean {
+    try { return options.isAuthorized(principal); }
+    catch (error) {
+      if (error instanceof ApplicationError && error.code === "unauthenticated") return false;
+      throw error;
+    }
   }
   function live(lease: Lease): boolean {
-    let authorized = false;
-    try { authorized = options.isAuthorized(lease.principal); } catch {}
-    if (stopped || !lease.active || now() >= lease.expiresAt || !authorized) {
+    if (stopped || !lease.active || now() >= lease.expiresAt || !authorized(lease.principal)) {
       finish(lease);
       return false;
     }
     // Includes disabled-user checks through the application's persistence boundary.
     if (lease.session) {
-      try { application.revalidateSession(lease.session); } catch { finish(lease); return false; }
+      try { application.revalidateSession(lease.session); }
+      catch (error) {
+        if (!(error instanceof ApplicationError && error.code === "unauthenticated")) throw error;
+        finish(lease);
+        return false;
+      }
     }
     return true;
+  }
+  function backgroundLive(lease: Lease): boolean {
+    try { return live(lease); }
+    catch { finishQuietly(lease); return false; }
   }
   function get(principal: DeliveryPrincipal, capability: string): Lease {
     const lease = leases.get(capability);
@@ -77,15 +93,15 @@ export function createDelivery(application: Application, options: DeliveryOption
       lease.principal.authed.user_email !== principal.authed.user_email || lease.principal.grantId !== principal.grantId) denied();
     if (!live(lease)) denied();
     // Revalidate the caller too, even if its grant matches an older principal object.
-    let authorized = false;
-    try { authorized = options.isAuthorized(principal); } catch {}
-    if (!authorized) { finish(lease); denied(); }
+    if (!authorized(principal)) { finish(lease); denied(); }
     return lease;
   }
   function describe(lease: Lease): DeliveryLease {
-    return { capability: lease.capability, identity: lease.identity!, expiresAt: lease.expiresAt };
+    return { capability: lease.capability, identity: structuredClone(lease.identity!), expiresAt: lease.expiresAt };
   }
   const service = {
+    get activeLeaseCount() { return leases.size; },
+    describe(principal: DeliveryPrincipal, capability: string): DeliveryLease { return describe(get(principal, capability)); },
     async open(principal: DeliveryPrincipal, identity: string, hooks: DeliveryHooks = {}): Promise<DeliveryLease> {
       const lease: Lease = {
         principal: { authed: { ...principal.authed }, grantId: principal.grantId },
@@ -93,21 +109,24 @@ export function createDelivery(application: Application, options: DeliveryOption
         hooks, issued: new Map(), active: true,
       };
       if (!live(lease)) denied();
+      if (leases.size >= 256 || [...leases.values()].filter(l => l.principal.authed.user_id === principal.authed.user_id).length >= 32) {
+        throw new ApplicationError("bad_request", "delivery lease capacity reached");
+      }
       leases.set(lease.capability, lease);
       try {
         const selected = await application.selectIdentity(lease.principal.authed, identity, {
           deliver: () => {
             if (lease.session) lease.session.inflight.clear();
-            if (live(lease)) notify(lease.hooks.changed);
+            if (backgroundLive(lease)) notify(lease.hooks.changed);
           },
-          probe: async () => live(lease),
-          closed: () => finish(lease),
+          probe: async () => backgroundLive(lease),
+          closed: () => finishQuietly(lease),
         }, { push: true, alive: () => live(lease) });
         lease.session = selected.session;
         lease.identity = selected.info;
         if (!live(lease)) { application.close(selected.session); denied(); }
         return describe(lease);
-      } catch (error) { finish(lease); throw error; }
+      } catch (error) { finishQuietly(lease); throw error; }
     },
     renew(principal: DeliveryPrincipal, capability: string, hooks?: DeliveryHooks): DeliveryLease {
       const lease = get(principal, capability);
@@ -152,11 +171,11 @@ export function createDelivery(application: Application, options: DeliveryOption
       for (const record of records) record.acked = true;
     },
     release(principal: DeliveryPrincipal, capability: string): void { finish(get(principal, capability)); },
-    revalidate(): void { for (const lease of [...leases.values()]) live(lease); },
+    revalidate(): void { for (const lease of [...leases.values()]) backgroundLive(lease); },
     close(): void {
       stopped = true;
       clearInterval(timer);
-      for (const lease of [...leases.values()]) finish(lease);
+      for (const lease of [...leases.values()]) finishQuietly(lease);
     },
   };
   const timer = setInterval(() => service.revalidate(), Math.min(1000, Math.max(1, ttl / 3)));

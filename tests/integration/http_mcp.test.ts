@@ -59,7 +59,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   const post = tools.tools.find(t => t.name === "board_post")!;
   expect(post.inputSchema.properties).toHaveProperty("attachment_ids");
   expect(post.inputSchema.properties).not.toHaveProperty("attachments");
-  expect(client.getServerCapabilities()).not.toHaveProperty("resources");
+  expect(client.getServerCapabilities()?.resources).toEqual({});
   expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
   expect((await client.callTool({ name: "board_create", arguments: { name: "e2e", purpose: "fixtures" } })).isError).not.toBe(true);
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toMatchObject([{ name: "e2e" }]);
@@ -213,10 +213,10 @@ test("OAuth challenges and actual scope precede identity validation on every met
   expect(app.mcp.activeContexts).toBe(0);
 });
 
-test("combined shared native grant is tools-only until resources are adopted", async () => {
+test("combined shared native grant remains non-owning with read-only resources", async () => {
   const client = await connect(await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]));
   expect((await client.listTools()).tools.map(t => t.name)).toContain("board_list");
-  expect(client.getServerCapabilities()).not.toHaveProperty("resources");
+  expect(client.getServerCapabilities()?.resources).toEqual({});
   expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
 });

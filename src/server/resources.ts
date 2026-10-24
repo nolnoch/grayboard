@@ -36,27 +36,33 @@ export function createResources(application: Application, options: ResourceOptio
   let stopped = false;
   function finish(watch: Watch) {
     if (!watches.delete(watch.id)) return;
-    watch.unsubscribe?.();
-    notify(watch.hooks.closed);
+    try { watch.unsubscribe?.(); } finally { notify(watch.hooks.closed); }
+  }
+  function finishQuietly(watch: Watch) {
+    try { finish(watch); } catch {}
   }
   function authorized(session: ApplicationSession): boolean {
     try {
       if (stopped || !options.isAuthorized(session)) return false;
       application.revalidateSession(session);
       return true;
-    } catch { return false; }
+    } catch (error) {
+      if (error instanceof ApplicationError && error.code === "unauthenticated") return false;
+      throw error;
+    }
   }
   function requireSession(session: ApplicationSession) {
     if (authorized(session)) return;
-    for (const watch of [...watches.values()]) if (watch.session === session) finish(watch);
+    for (const watch of [...watches.values()]) if (watch.session === session) finishQuietly(watch);
     throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
   }
   function live(watch: Watch): boolean {
     if (!watches.has(watch.id)) return false;
-    if (authorized(watch.session)) {
-      try { if (application.canReceiveBoard(watch.session, watch.board)) return true; } catch {}
-    }
-    finish(watch);
+    // Background faults close the watch without failing a committed mutation.
+    try {
+      if (authorized(watch.session) && application.canReceiveBoard(watch.session, watch.board)) return true;
+    } catch {}
+    finishQuietly(watch);
     return false;
   }
   const service = {
@@ -81,7 +87,7 @@ export function createResources(application: Application, options: ResourceOptio
       try {
         watch.unsubscribe = application.observeBoard(session, board, {
           changed: () => { if (live(watch)) notify(() => hooks.changed()); },
-          closed: () => finish(watch),
+          closed: () => finishQuietly(watch),
         });
       } catch (error) { watches.delete(watch.id); throw error; }
       return watch.id;
@@ -98,7 +104,7 @@ export function createResources(application: Application, options: ResourceOptio
     close(): void {
       stopped = true;
       clearInterval(timer);
-      for (const watch of [...watches.values()]) finish(watch);
+      for (const watch of [...watches.values()]) finishQuietly(watch);
     },
   };
   const timer = setInterval(() => service.revalidate(), 1000);

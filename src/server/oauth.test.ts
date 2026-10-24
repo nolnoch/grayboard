@@ -11,6 +11,7 @@ import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
 import type { OAuthClient } from "./oauth-config.ts";
+import { issueOAuth } from "../../tests/helpers/oauth.ts";
 
 const random = () => randomBytes(32).toString("base64url");
 const s256 = (s: string) => createHash("sha256").update(s).digest("base64url");
@@ -66,6 +67,32 @@ afterEach(async () => {
   await Promise.all(liveClients.splice(0).map(c => c.close()));
   await mcp.close(); service.close(); await server.stop(true); storage.db.close(); rmSync(dir, { recursive: true, force: true });
 });
+test("internal grant liveness survives individual access revocation but never authorizes that access", () => {
+  const grant = issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery", "grayboard:tools"], clock);
+  const request = new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } });
+  const principal = service.authenticate(request);
+  if (principal instanceof Response) throw new Error("expected fixture principal");
+  expect(service.isGrantActive(grant.grantId)).toBe(true);
+  storage.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  expect(service.isGrantActive(grant.grantId)).toBe(true);
+  expect(service.isAuthorized(principal)).toBe(false);
+  expect(service.authenticate(request)).toBeInstanceOf(Response);
+  expect(service.isGrantActive("unknown")).toBe(false);
+  const active = storage.repo.oauth.isGrantActive;
+  storage.repo.oauth.isGrantActive = () => { throw new Error("storage unavailable"); };
+  try { expect(() => service.isGrantActive(grant.grantId)).toThrow("storage unavailable"); }
+  finally { storage.repo.oauth.isGrantActive = active; }
+  storage.repo.users.setDisabled(grant.authed.user_id, true);
+  expect(service.isGrantActive(grant.grantId)).toBe(false);
+  storage.repo.users.setDisabled(grant.authed.user_id, false);
+  expect(service.isGrantActive(grant.grantId)).toBe(false);
+  const next = issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
+  clock += OAUTH_TTL.grant;
+  expect(service.isGrantActive(next.grantId)).toBe(false);
+  service.close();
+  expect(service.isGrantActive(grant.grantId)).toBe(false);
+});
+
 class Browser {
   jar = new Map<string, string>();
   get cookie() { return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "); }
