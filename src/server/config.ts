@@ -47,13 +47,13 @@ export function loadConfig(): Config {
   return {
     dbPath,
     blobDir: process.env.GRAYBOARD_BLOB_DIR || join(dirname(dbPath), "blobs"),
-    httpPort: parseInt(process.env.GRAYBOARD_HTTP_PORT ?? "8080", 10),
+    httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
-    messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS), 10),
-    auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
+    messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
+    auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
@@ -108,4 +108,23 @@ function requireEnv(name: string): string {
   const val = process.env[name];
   if (!val) throw new Error(`Required env var ${name} is not set`);
   return val;
+}
+
+// Retention days parse like local mode's BUS_RETENTION_DAYS (src/local/retention.ts):
+// a positive whole number of days, or unset for the default. NaN here would make
+// every `created_at < cutoff` false and silently prune nothing.
+function retentionDays(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^[1-9]\d*$/.test(raw)) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
+  return Number(raw);
+}
+
+// Port 0 (an ephemeral port, what tests use) through 65535.
+function parsePort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 8080;
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "${raw}"`);
+  }
+  return port;
 }
