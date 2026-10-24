@@ -3,7 +3,7 @@
 // Each numbered comment is the #182 acceptance criterion the test shows.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
@@ -213,6 +213,22 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toHaveLength(1);
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
   expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toEqual([]);
+}, 30_000);
+
+test("8: a bind whose setup fails after the acquire leaves the session on the new name, and says so", async () => {
+  const s = await session("fe");
+  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
+  // The wakeup socket can't be renamed onto a non-empty directory.
+  mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
+  const err = await refusal(s, "bind", { name: "fe2", create: true });
+  expect(err).toContain('bound "fe2" (was "fe"); claims moved: ticket:ENG-142, but setting it up failed');
+  expect(rows(`SELECT name FROM bindings WHERE name LIKE 'fe%'`)).toEqual([{ name: "fe2" }]);
+  expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
+  // fe is free: no listener left on it, and another session takes it.
+  expect(existsSync(join(dir, "sock.fe"))).toBe(false);
+  const other = await session();
+  expect(await other.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+  expect(readdirSync(dir).filter((f) => f.startsWith(".w"))).toEqual([]);
 }, 30_000);
 
 test("8, 13: a rebind moves claims, frees the old name, and delivers the new name's mail", async () => {

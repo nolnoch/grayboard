@@ -140,8 +140,14 @@ let restored = false;
 // its name is fixed, and a restart that can't have it must fail loudly.
 const RECORD_DIR = sockDir();
 const RECORDS = PUSH && !HUMAN;
+// A failed write costs only the restore after a restart; the bind itself stands.
 const writeName = (name: string | null) => {
-  if (RECORDS) writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+  if (!RECORDS) return;
+  try {
+    writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+  } catch (e) {
+    console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
+  }
 };
 if (!PUSH) bound = SUGGESTED;
 else {
@@ -504,16 +510,25 @@ async function bind(a: Record<string, any>) {
     const previous = bound;
     const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
     if (!r.ok) return fail(r.error);
-    testPause("bind:after-acquire");
-    if (DELIVER) {
-      stopListening();
-      stopListening = listenForWakeup(n.name, onWake);
-    }
-    if (previous) touchHandle(db, previous);
-    startSession(db, n.name, process.cwd());
+    // The row holds the new name from here: so does this process, whatever
+    // follows fails, or the finally's drain would read a name it no longer holds.
     bound = n.name;
     writeName(bound);
     firstDrain = true;
+    testPause("bind:after-acquire");
+    try {
+      if (DELIVER) {
+        stopListening();
+        stopListening = () => {};
+        stopListening = listenForWakeup(n.name, onWake);
+      }
+      if (previous) touchHandle(db, previous);
+      startSession(db, n.name, process.cwd());
+    } catch (e) {
+      const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
+      console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
+      throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
+    }
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
     return bindOk(n.name, previous, r.moved.map((c) => c.key), boundInstructions(n.name, previous === null));
   } finally {

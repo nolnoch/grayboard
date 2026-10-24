@@ -187,8 +187,14 @@ const fatal = (e: Error): never => {
 // delivery whenever its name changes, so a restart under the same harness
 // takes the name back.
 const RECORD_DIR = sockDir();
+// A failed write costs only the restore after a restart; the bind itself stands.
 function writeName(name: string | null): void {
-  if (PUSH) writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: serverUrl });
+  if (!PUSH) return;
+  try {
+    writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: serverUrl });
+  } catch (e) {
+    console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
+  }
 }
 
 // A bound connection for `name`, or why the server refused it. A restore

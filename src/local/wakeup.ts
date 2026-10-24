@@ -44,8 +44,17 @@ export function listenForWakeup(identity: string, onWake: WakeupHandler): () => 
       error() {},
     },
   });
-  const ino = statSync(own).ino;
-  renameSync(own, path);
+  let ino: number;
+  try {
+    ino = statSync(own).ino;
+    renameSync(own, path);
+  } catch (e) {
+    server.stop(true);
+    try {
+      unlinkSync(own);
+    } catch {}
+    throw e;
+  }
 
   return () => {
     try {
