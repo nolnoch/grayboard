@@ -4,7 +4,7 @@ import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp } from "./http.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
-import { verifySessionToken, extractBearer } from "./auth.ts";
+import { verifySessionToken, extractBearer, cancelPendingTouches } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
@@ -102,6 +102,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       for (const t of timers) clearInterval(t);
       stopRetention?.();
       stopExpiry();
+      cancelPendingTouches();
       server.stop(true);
       db.close();
     },
