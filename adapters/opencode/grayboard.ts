@@ -240,6 +240,8 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     });
     proc.on("error", (e) => fail(`grayboard process failed to start: ${e.message}`));
     proc.on("exit", (code, signal) => fail(`grayboard process exited (${code ?? signal})`));
+    // A write after grayboard closed its end (EPIPE); unhandled, the error event would crash the host.
+    proc.stdin!.on("error", (e) => fail(`grayboard process stopped reading: ${e.message}`));
     // stdin stays open: grayboard exits when it closes, releasing the name.
     const ready = call("initialize", {
       protocolVersion: "2025-06-18",

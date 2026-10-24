@@ -319,3 +319,25 @@ export function piMissingBinaryScenario(dir: string): Promise<void> {
     }
   });
 }
+
+// A grayboard that stops reading while it still runs (tests/support/stdin_closed.sh):
+// the extension's next write fails with EPIPE, which pi survives and reports.
+export function piStdinClosedScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([]);
+    try {
+      const stub = join(ROOT, "tests/support/stdin_closed.sh");
+      const pi = startPi(dir, model.port, procs, { entry: { command: stub, args: [process.execPath, CLI, "mcp", "--mode", "local"] } });
+      await pi.command({ type: "get_state" });
+      const notice = await until(() => pi.notices().find((n) => n.includes("stopped reading")), 15_000, "EPIPE notice");
+      expect(notice).toContain("grayboard process stopped reading: ");
+      expect(notice).toContain("restart pi to reconnect");
+      await pi.command({ type: "get_state" });
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
