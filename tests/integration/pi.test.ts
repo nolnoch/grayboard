@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
-import { piScenario } from "../support/pi.ts";
+import { piMissingBinaryScenario, piReenabledScenario, piScenario, piUnboundScenario } from "../support/pi.ts";
 
 let dir: string;
 
@@ -19,3 +19,6 @@ afterEach(async () => {
 });
 
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
+test("pi unbound: reads work, writes are refused; bind through the extension's tool binds the session's one grayboard", () => piUnboundScenario(dir), 90_000);
+test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
+test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
