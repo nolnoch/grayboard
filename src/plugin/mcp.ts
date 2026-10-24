@@ -14,12 +14,13 @@ import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } f
 import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
-  UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionKey, restoreNote, sessionIdOf, unboundInstruction,
+  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionKey, restoreNote, sessionIdOf, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../local/wakeup.ts";
+import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
@@ -333,8 +334,11 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
+// What a result the client dropped carried, for the next one.
+const requeued: string[] = [];
 const notices = (): string[] => {
-  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  const out = requeued.splice(0);
+  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
   if (lostNotice) out.push(lostNotice);
   lostNotice = null;
@@ -345,7 +349,8 @@ const notices = (): string[] => {
 };
 
 const gate = new BindGate();
-server.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
+const late = new LateCancels();
+server.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   const run = () => call(name, args as Record<string, unknown>, signal);
   const r: { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: unknown } =
@@ -353,10 +358,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
   // A cancelled call's result is dropped: its notices wait for the next one.
   if (signal.aborted) return r;
   const extra = notices();
-  const out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
-  if (!instructionsStale || out.structuredContent) return out;
-  instructionsStale = false;
-  return { ...out, structuredContent: { name: bound, instructions: currentInstructions() } };
+  let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
+  if (instructionsStale && !out.structuredContent) {
+    instructionsStale = false;
+    out = { ...out, structuredContent: { name: bound, instructions: currentInstructions() } };
+  }
+  late.answer(requestId, () => {
+    if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    requeued.push(...extra);
+    if (out.structuredContent) instructionsStale = true;
+  });
+  return out;
 });
 
 // The full instructions for the name this session holds now.
@@ -587,7 +599,7 @@ function switchTo(next: GrayboardClient, name: string, previous: string | null, 
   console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}${missed ? ` after ${missed}` : ""}`);
   const r = bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general));
   if (missed) {
-    missedBindNotice = `bind("${name}") completed after ${missed}. ${r.content[0]!.text}`;
+    missedBindNotice = bindMissed(name, missed, r.content[0]!.text);
     instructionsStale = true;
   }
   return r;
@@ -595,7 +607,9 @@ function switchTo(next: GrayboardClient, name: string, previous: string | null, 
 
 // ── start stdio transport ─────────────────────────────────────────────────────
 
-await server.connect(new StdioServerTransport());
+const transport = new StdioServerTransport();
+await server.connect(transport);
+late.watch(transport);
 
 const shutdown = () => {
   client?.close();

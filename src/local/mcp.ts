@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
@@ -48,6 +48,7 @@ import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../sh
 import { launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
+import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
@@ -252,8 +253,11 @@ let channelsNoticePending = CHANNELS_OFF;
 // that keep them in the system prompt.
 let missedBindNotice: string | null = null;
 let instructionsStale = false;
+// What a result the client dropped carried, for the next one.
+const requeued: string[] = [];
 const notices = (): string[] => {
-  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  const out = requeued.splice(0);
+  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
   if (missedBindNotice) out.push(missedBindNotice);
   missedBindNotice = null;
@@ -266,7 +270,8 @@ const notices = (): string[] => {
 const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 
 const gate = new BindGate();
-mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
+const late = new LateCancels();
+mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   const run = async () => {
     // An unbound session writes no handles row: it would join dm_send's roster.
@@ -279,10 +284,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
   // A cancelled call's result is dropped: its notices wait for the next one.
   if (signal.aborted) return r;
   const extra = notices();
-  const out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
-  if (!instructionsStale || out.structuredContent || !bound) return out;
-  instructionsStale = false;
-  return { ...out, structuredContent: { name: bound, instructions: boundInstructions(bound, true) } };
+  let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  if (instructionsStale && !out.structuredContent && bound) {
+    instructionsStale = false;
+    out = { ...out, structuredContent: { name: bound, instructions: boundInstructions(bound, true) } };
+  }
+  late.answer(requestId, () => {
+    if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    requeued.push(...extra);
+    if (out.structuredContent) instructionsStale = true;
+  });
+  return out;
 });
 
 async function call(name: string, args: Record<string, any>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
@@ -549,7 +561,7 @@ async function bind(a: Record<string, any>, signal: AbortSignal) {
     const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => boundInstructions(n.name, general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
-      missedBindNotice = `bind("${n.name}") completed after it was cancelled. ${ok.content[0]!.text}`;
+      missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
       instructionsStale = true;
     }
     return ok;
@@ -567,7 +579,9 @@ async function bind(a: Record<string, any>, signal: AbortSignal) {
 // restored name is the same session restarted: leave their status alone.
 if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
 else if (bound) touchHandle(db, bound);
-await mcp.connect(new StdioServerTransport());
+const transport = new StdioServerTransport();
+await mcp.connect(transport);
+late.watch(transport);
 // Prunes the bus at most once a day across the sessions that share it.
 startLocalRetention(db, blobs, RETENTION_DAYS);
 

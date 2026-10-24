@@ -112,6 +112,7 @@ export async function acquireName(
   const before = rowHolder();
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
+  testPause("bind:before-txn");
   return db.transaction((): AcquireResult => {
     const now = Date.now();
     const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
@@ -189,6 +190,7 @@ export function nameHolder(db: Database, name: string, sockLive: boolean): strin
  */
 export async function declareLocalHuman(db: Database, handle: string, socks?: string): Promise<void> {
   const sockLive = isHuman(db, handle) ? false : await poke(handle, socks);
+  testPause("human:before-txn");
   declareHuman(db, handle, () => {
     testPause("human:in-txn");
     if (isHuman(db, handle)) return;

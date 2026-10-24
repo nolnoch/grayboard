@@ -162,6 +162,11 @@ export function bindOk(name: string, previous: string | null, moved: string[], i
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }
 
+/** The notice for a bind that completed but whose result the agent never saw. */
+export function bindMissed(name: string, why: string, result: string): string {
+  return `bind("${name}") completed after ${why}. ${result}`;
+}
+
 /** The refusal for a name that has never existed, without create: true. */
 export function unknownNameError(name: string, known: string[]): string {
   return `no name "${name}" has ever been used${known.length ? `; closest: ${known.join(", ")}` : ""}. Pass create: true to make a new one.`;

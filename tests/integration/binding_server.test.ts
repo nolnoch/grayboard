@@ -333,6 +333,23 @@ test("audit 7: a bind cancelled before it completes still says so, with the inst
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 20_000);
 
+test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
+  const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
+  const abort = new AbortController();
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
+  // The process is stopped past its last cancel check, so it reads the cancel only after it answers.
+  abort.abort();
+  await expect(bind).rejects.toThrow();
+  release("bind:after-acquire");
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(JSON.parse(texts[0]!).you).toBe(`${A}/fe`);
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe" (was "old")`);
+  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
+  expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
+}, 20_000);
+
 test("16, 18: raw hellos: create: false, lazy create, and a read-only connection's limits", async () => {
   await srv.api(alice, "POST", "/api/teams", { name: "eng" });
   const be = srv.client(alice, "be");

@@ -277,14 +277,35 @@ test("9: a DM sent mid-swap is never consumed under the new name", async () => {
   }
 }, 30_000);
 
+test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
+  const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
+  const abort = new AbortController();
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
+  // The process is stopped past its last cancel check, so it reads the cancel only after it answers.
+  abort.abort();
+  await expect(bind).rejects.toThrow();
+  release("bind:after-acquire");
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(JSON.parse(texts[0]!).you).toBe("fe");
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe" (was "old")`);
+  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
+  expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
+}, 30_000);
+
 test("12: the human declaration and a bind of the same name: neither order lets both win", async () => {
   // The declaration holds its transaction while a bind starts: the bind waits, then is refused.
-  const s = await session();
+  // Each waiter opens first and parks just before its transaction; "pause released" is logged
+  // right before its BEGIN IMMEDIATE, so a run where the two didn't overlap can't pass.
+  const s = await session(undefined, { extra: pauseEnv("bind:before-txn") });
   await stop((await session("alex")).c);
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "alex" } });
+  await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
   const human = spawnCli(["human", "alex"], pauseEnv("human:in-txn"));
   await until(() => human.stderr().includes("test pause hit: human:in-txn"));
-  const bind = s.c.callTool({ name: "bind", arguments: { name: "alex" } });
-  await Bun.sleep(200);
+  release("bind:before-txn");
+  await until(() => s.stderr().includes("test pause released: bind:before-txn"));
   release("human:in-txn");
   expect(await human.p.exited).toBe(0);
   expect(((await bind).content as { text: string }[])[0]!.text).toContain(`"alex" is your user's handle`);
@@ -292,10 +313,12 @@ test("12: the human declaration and a bind of the same name: neither order lets 
   // A bind holds its transaction while a declaration starts: the declaration waits, then is refused.
   const t = await session(undefined, { extra: pauseEnv("bind:in-txn") });
   await stop((await session("sam")).c);
+  const human2 = spawnCli(["human", "sam"], pauseEnv("human:before-txn"));
+  await until(() => human2.stderr().includes("test pause hit: human:before-txn"));
   const bind2 = t.c.callTool({ name: "bind", arguments: { name: "sam" } });
   await until(() => t.stderr().includes("test pause hit: bind:in-txn"));
-  const human2 = spawnCli(["human", "sam"], {});
-  await Bun.sleep(200);
+  release("human:before-txn");
+  await until(() => human2.stderr().includes("test pause released: human:before-txn"));
   release("bind:in-txn");
   expect((await bind2).isError).toBeFalsy();
   expect(await human2.p.exited).toBe(1);
