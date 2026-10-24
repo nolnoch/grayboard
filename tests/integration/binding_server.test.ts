@@ -350,10 +350,17 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 20_000);
 
-// The session's grayboard process (the harness's child), to stop and resume it.
-function signalChild(s: Session, sig: "SIGSTOP" | "SIGCONT") {
+// Stop the session's grayboard process (the harness's child) for the length of
+// `during`. It resumes even when `during` throws: a stopped child outlives its
+// harness, as an orphan nothing can resume.
+async function whileStopped(s: Session, during: () => Promise<void>) {
   const pid = Number(Bun.spawnSync(["pgrep", "-P", String(s.harnessPid)]).stdout.toString().trim());
-  process.kill(pid, sig);
+  process.kill(pid, "SIGSTOP");
+  try {
+    await during();
+  } finally {
+    process.kill(pid, "SIGCONT");
+  }
 }
 
 // A lost name's next result says why, and carries the unbound instructions, once.
@@ -373,10 +380,10 @@ async function expectLost(s: Session, name: string, reason: string) {
 test("audit 15: a holder taken over while it can't answer the probe goes unbound and says why", async () => {
   const s = await session("fe");
   expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
-  signalChild(s, "SIGSTOP");
-  const t = await session(null);
-  expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
-  signalChild(s, "SIGCONT");
+  await whileStopped(s, async () => {
+    const t = await session(null);
+    expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+  });
   await expectLost(s, "fe", `"fe" was taken over: a newer session connected with this identity`);
 }, 30_000);
 
@@ -389,18 +396,19 @@ test("audit 15: a holder whose reconnect is refused goes unbound and says why", 
   alice = await srv.login(A);
   const s = await session("fe");
   expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
-  signalChild(s, "SIGSTOP");
-  const port = srv.app.server.port!;
-  srv.app.stop();
-  const next = new TestServer({ dbPath, httpPort: port });
-  expect(next.base).toBe(srv.base);
+  let next: TestServer | undefined;
   try {
-    const t = await session(null);
-    expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
-    signalChild(s, "SIGCONT");
+    await whileStopped(s, async () => {
+      const port = srv.app.server.port!;
+      srv.app.stop();
+      next = new TestServer({ dbPath, httpPort: port });
+      expect(next.base).toBe(srv.base);
+      const t = await session(null);
+      expect(await t.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+    });
     await expectLost(s, "fe", `identity "fe" is already in use by`);
   } finally {
-    next.stop();
+    next?.stop();
     rmSync(dbDir, { recursive: true, force: true });
   }
 }, 30_000);
