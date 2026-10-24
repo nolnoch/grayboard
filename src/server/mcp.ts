@@ -6,7 +6,10 @@ import { CoreError } from "../core/errors.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
-import type { createOAuthServer } from "./oauth.ts";
+import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
+import { createResources } from "./resources.ts";
+import { createDelivery } from "./delivery.ts";
+import { hostedRole, roleScopes, registerHostedResources } from "./mcp-resources.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -19,7 +22,7 @@ const text = (value: unknown): CallToolResult => ({
   content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized">, opts: { trustedOrigin: string }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string }) {
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   const permitsOrigin = (origin: string | null): boolean => {
     if (origin === null) return true;
@@ -32,6 +35,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
   let closed = false;
   const sessions = new Map<ApplicationSession, McpServer>();
+  const principals = new Map<ApplicationSession, OAuthPrincipal>();
+  const resources = createResources(application, { isAuthorized: session => {
+    const principal = principals.get(session);
+    return !closed && !!principal && oauth.isAuthorized(principal);
+  } });
+  const delivery = createDelivery(application, { isAuthorized: principal => oauth.isGrantActive(principal.grantId) });
   const exchanges = new AsyncLocalStorage<{ refusal?: Response }>();
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
@@ -40,7 +49,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
   const handler = createMcpHandler(async ({ requestInfo }) => {
     if (!requestInfo || closed || requestInfo.signal.aborted) throw new Error("MCP endpoint is closed");
-    const principal = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+    const role = hostedRole(requestInfo);
+    const scopes = roleScopes(role);
+    const principal = oauth.authenticate(requestInfo, scopes);
     if (principal instanceof Response) return refuse(principal);
     const { session, info } = await application.selectIdentity(
       principal.authed, requestInfo.headers.get("X-Grayboard-Identity")!,
@@ -50,7 +61,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
       if (closed || requestInfo.signal.aborted) throw new Error("MCP request is closed");
       if (!oauth.isAuthorized(principal)) {
-        const current = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+        const current = oauth.authenticate(requestInfo, scopes);
         if (current instanceof Response) refuse(current);
         throw new Error("unauthenticated");
       }
@@ -60,17 +71,31 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     const server = new McpServer({ name: "grayboard", version: pkg.version }, {
       supportedProtocolVersions: MCP_PROTOCOL_VERSIONS,
-      instructions: [
-        `You are "${info.identity_full}" on grayboard. This connection supplies tools only; poll dm_inbox and board_list for pending work.`,
+      capabilities: { tools: { listChanged: false } },
+      cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
+      instructions: role === "subscriber" ? undefined : [
+        `You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`,
         ...BOARD_INSTRUCTIONS.slice(1),
         ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
         ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []),
         ...(info.notices ?? []),
       ].join(" "),
     });
+    // Avoid McpServer's resource-registration default of listChanged: true.
+    server.server.registerCapabilities({ resources: {} });
     sessions.set(session, server);
+    principals.set(session, principal);
     // SDK closes each instance on terminal response, stream cancellation, or shutdown.
-    server.server.onclose = () => { application.close(session); sessions.delete(session); };
+    server.server.onclose = () => { application.close(session); sessions.delete(session); principals.delete(session); };
+    registerHostedResources(server, {
+      role, principal, session, request: requestInfo, issuer: oauth.issuer, resource: oauth.resource, resources, delivery,
+      authorize() {
+        if (closed || requestInfo.signal.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
+        if (!oauth.isAuthorized(principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
+        application.revalidateSession(session);
+      },
+    });
+    if (role === "subscriber") return server;
     const run = (call: () => unknown): CallToolResult => {
       try {
         if (requestInfo.signal.aborted) return { ...text("error: request cancelled"), isError: true };
@@ -132,11 +157,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }, { legacy: "stateless" });
   return {
     get activeContexts() { return sessions.size; },
+    get activeLeases() { return delivery.activeLeaseCount; },
+    get activeResourceContexts() { return principals.size; },
     async fetch(req: Request): Promise<Response> {
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
       if (!permitsOrigin(req.headers.get("Origin"))) return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
       try {
-        const principal = oauth.authenticate(req, ["grayboard:tools"]);
+        let role;
+        try { role = hostedRole(req); } catch {
+          return Response.json({ code: "bad_request", message: "unknown X-Grayboard-Client role" }, { status: 400 });
+        }
+        const principal = oauth.authenticate(req, roleScopes(role));
         if (principal instanceof Response) return principal;
         const name = req.headers.get("X-Grayboard-Identity");
         if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
@@ -144,6 +175,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         }
         return await exchanges.run({}, async () => {
           const response = await handler.fetch(req);
+          response.headers.set("Cache-Control", "private, no-store");
           const refusal = exchanges.getStore()?.refusal;
           if (!refusal || closed || req.signal.aborted) return response;
           await response.body?.cancel();
@@ -155,10 +187,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     },
     async close() {
       closed = true;
+      resources.close();
+      delivery.close();
       await handler.close();
       await Promise.all([...sessions.values()].map(server => server.close()));
       for (const session of sessions.keys()) application.close(session);
       sessions.clear();
+      principals.clear();
     },
   };
 }

@@ -393,6 +393,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       return { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
         scopes: access.scopes, accessHash, accessExpiry: access.expiresAt };
     },
+    isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(grantId, now()); },
     isAuthorized(principal: OAuthPrincipal): boolean {
       if (closed || principal.accessExpiry <= now()) return false;
       const a = repo.oauth.findActiveAccess(principal.accessHash, resource, principal.scopes, now());

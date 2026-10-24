@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { ApplicationError, createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
 import { openDatabase } from "./db.ts";
 import { storeUpload } from "./attachments.ts";
@@ -269,4 +269,179 @@ test("bounded batches progress by receipt and issued receipt storage backpressur
 
 test("human selection remains a separate trusted capability", async () => {
   await expect(delivery.open(bob, "human")).rejects.toMatchObject({ code: "bad_request" });
+});
+
+test("readonly lease descriptors validate the principal without renewal or mutable identity aliases", async () => {
+  const lease = await delivery.open(bob, "fe");
+  now += 10_000;
+  const descriptor = delivery.describe(bob, lease.capability);
+  expect(descriptor.expiresAt).toBe(lease.expiresAt);
+  descriptor.identity.identity_full = "other@example.com/be";
+  descriptor.identity.teams.push("#other");
+  expect(delivery.describe(bob, lease.capability)).toEqual(lease);
+  expect(() => delivery.describe(alice, lease.capability)).toThrow();
+  expect(() => delivery.describe({ ...bob, grantId: "other" }, lease.capability)).toThrow();
+  expect(delivery.activeLeaseCount).toBe(1);
+  now = lease.expiresAt;
+  expect(() => delivery.describe(bob, lease.capability)).toThrow();
+  expect(delivery.activeLeaseCount).toBe(0);
+});
+
+test("per-user lease capacity frees on release and refuses before selecting another owner", async () => {
+  const leases = [];
+  for (let i = 0; i < 32; i++) leases.push(await delivery.open(bob, `lease${i}`));
+  expect(delivery.activeLeaseCount).toBe(32);
+  await expect(delivery.open(bob, "overflow")).rejects.toThrow("capacity");
+  expect(store.repo.identities.findByUserAndName(bob.authed.user_id, "overflow")).toBeUndefined();
+  delivery.release(bob, leases[0]!.capability);
+  await delivery.open(bob, "overflow");
+  expect(delivery.activeLeaseCount).toBe(32);
+  delivery.close();
+  expect(delivery.activeLeaseCount).toBe(0);
+  const replacement = (await application.selectIdentity(bob.authed, "overflow", sink)).session;
+  application.close(replacement);
+});
+
+test("global capacity includes pending async acquisitions and shutdown removes all reservations", async () => {
+  const select = application.selectIdentity;
+  let resume!: () => void;
+  const gate = new Promise<void>(r => { resume = r; });
+  let selections = 0;
+  application.selectIdentity = async (...args) => { selections++; await gate; return select(...args); };
+  const users = [alice, bob];
+  for (let i = 0; i < 7; i++) {
+    const u = store.repo.users.upsertByEmail(`user${i}@example.com`, null);
+    users.push({ authed: { user_id: u.id, user_email: u.email, session_id: 0 }, grantId: `grant:${u.id}` });
+  }
+  const pending = [];
+  try {
+    for (const p of users.slice(0, 8)) for (let i = 0; i < 32; i++) pending.push(delivery.open(p, `lease${i}`));
+    const settled = Promise.allSettled(pending);
+    expect(delivery.activeLeaseCount).toBe(256);
+    expect(selections).toBe(256);
+    await expect(delivery.open(users[8]!, "overflow")).rejects.toThrow("capacity");
+    expect(selections).toBe(256);
+    delivery.close();
+    expect(delivery.activeLeaseCount).toBe(0);
+    resume();
+    expect((await settled).every(r => r.status === "rejected")).toBe(true);
+    expect(store.repo.identities.findByUserAndName(bob.authed.user_id, "lease0")).toBeUndefined();
+    const replacement = (await select(bob.authed, "lease0", sink)).session;
+    application.close(replacement);
+  } finally { resume(); application.selectIdentity = select; }
+});
+
+for (const boundary of ["grant", "caller", "session"] as const) for (const internal of [false, true]) test(`strict delivery ${boundary} faults preserve ownership, TTL and receipts (application error: ${internal})`, async () => {
+  delivery.close();
+  const failure = internal ? new ApplicationError("internal", "storage unavailable") : new Error("storage unavailable");
+  let failed = false;
+  delivery = createDelivery(application, { now: () => now, isAuthorized: principal => {
+    if (failed && (boundary === "grant" || boundary === "caller" && principal === bob)) throw failure;
+    return true;
+  } });
+  const validate = application.revalidateSession;
+  application.revalidateSession = session => {
+    if (failed && boundary === "session" && session.push) throw failure;
+    validate(session);
+  };
+  const lease = await delivery.open(bob, "fe");
+  const first = send("first");
+  const issued = delivery.pending(bob, lease.capability);
+  const second = send("second");
+  now += 10_000;
+  failed = true;
+  try {
+    for (const call of [() => delivery.describe(bob, lease.capability), () => delivery.renew(bob, lease.capability), () => delivery.pending(bob, lease.capability), () => delivery.receipt(bob, lease.capability, [issued[0]!.id]), () => delivery.release(bob, lease.capability)]) {
+      try { call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
+      expect(delivery.activeLeaseCount).toBe(1);
+      expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+    }
+  } finally { failed = false; application.revalidateSession = validate; }
+  expect(delivery.describe(bob, lease.capability).expiresAt).toBe(lease.expiresAt);
+  await expect(application.selectIdentity(bob.authed, "fe", sink)).rejects.toMatchObject({ code: "identity_in_use" });
+  expect(() => delivery.receipt(bob, lease.capability, [`direct:${second}`])).toThrow("not found");
+  expect(delivery.renew(bob, lease.capability).expiresAt).toBe(now + 30_000);
+  delivery.receipt(bob, lease.capability, [issued[0]!.id]);
+  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(first);
+  expect(delivery.pending(bob, lease.capability).map(item => item.id)).toEqual([`direct:${second}`]);
+});
+
+for (const phase of ["initial", "selected"] as const) test(`failed ${phase} open preserves the original fault and frees capacity and ownership`, async () => {
+  delivery.close();
+  const failure = new Error("original storage failure");
+  let failed = true;
+  delivery = createDelivery(application, { now: () => now, isAuthorized: () => {
+    if (failed && phase === "initial") throw failure;
+    return true;
+  } });
+  const validate = application.revalidateSession, close = application.close;
+  application.revalidateSession = session => {
+    if (failed && phase === "selected") throw failure;
+    validate(session);
+  };
+  application.close = session => { close(session); throw new Error("cleanup storage failure"); };
+  try {
+    await expect(delivery.open(bob, "fe")).rejects.toBe(failure);
+    expect(delivery.activeLeaseCount).toBe(0);
+  } finally { failed = false; application.revalidateSession = validate; application.close = close; }
+  const lease = await delivery.open(bob, "fe");
+  expect(delivery.activeLeaseCount).toBe(1);
+  delivery.release(bob, lease.capability);
+  expect(delivery.activeLeaseCount).toBe(0);
+});
+
+for (const background of ["revalidate", "hint", "probe", "closed", "timer"] as const) test(`background delivery ${background} faults fail closed without poisoning commits or cleanup`, async () => {
+  delivery.close();
+  let failed = false, changed = 0, closed = 0;
+  delivery = createDelivery(application, { now: () => now, isAuthorized: () => {
+    if (failed) throw new Error("grant storage unavailable");
+    return true;
+  } });
+  const select = application.selectIdentity, close = application.close;
+  await delivery.open(bob, "fe", { changed() { changed++; }, closed() { closed++; throw new Error("callback failed"); } });
+  application.close = session => { close(session); throw new Error("cleanup storage failure"); };
+  failed = true;
+  try {
+    if (background === "revalidate") expect(() => delivery.revalidate()).not.toThrow();
+    if (background === "hint") {
+      const id = send("committed");
+      expect(store.repo.messages.getById(id)?.body).toBe("committed");
+    }
+    if (background === "probe") {
+      const replacement = await select(bob.authed, "fe", sink);
+      close(replacement.session);
+    }
+    if (background === "closed") expect(() => application.disconnectUser(bob.authed.user_id)).not.toThrow();
+    if (background === "timer") {
+      const deadline = Date.now() + 2_000;
+      while (closed === 0 && Date.now() < deadline) await Bun.sleep(10);
+    }
+    expect({ changed, closed }).toEqual({ changed: 0, closed: 1 });
+    expect(delivery.activeLeaseCount).toBe(0);
+    expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+    expect(() => delivery.revalidate()).not.toThrow();
+  } finally { failed = false; application.close = close; }
+  const replacement = await select(bob.authed, "fe", sink);
+  close(replacement.session);
+});
+
+test("background application session storage faults close leases, while actual revocation still releases owners", async () => {
+  let closed = 0;
+  await delivery.open(bob, "fe", { closed() { closed++; } });
+  const validate = application.revalidateSession;
+  application.revalidateSession = () => { throw new Error("session storage failure"); };
+  try { expect(() => delivery.revalidate()).not.toThrow(); }
+  finally { application.revalidateSession = validate; }
+  expect(delivery.activeLeaseCount).toBe(0);
+  expect(closed).toBe(1);
+  const lease = await delivery.open(bob, "fe");
+  authorized = false;
+  expect(() => delivery.renew(bob, lease.capability)).toThrow("not found");
+  expect(delivery.activeLeaseCount).toBe(0);
+  authorized = true;
+  const again = await delivery.open(bob, "fe");
+  application.revalidateSession = () => { throw new ApplicationError("unauthenticated", "closed session"); };
+  try { expect(() => delivery.describe(bob, again.capability)).toThrow("not found"); }
+  finally { application.revalidateSession = validate; }
+  expect(delivery.activeLeaseCount).toBe(0);
 });

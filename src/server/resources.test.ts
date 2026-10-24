@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication, type ApplicationSession, type DeliveryEvent, type DeliverySink } from "./application.ts";
+import { ApplicationError, createApplication, type ApplicationSession, type DeliveryEvent, type DeliverySink } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import { boardResourceUri, createResources, parseBoardResourceUri } from "./resources.ts";
 import { isSubscribed, subscribe } from "../core/boards.ts";
@@ -374,4 +374,91 @@ test("revocation, disabled users, application disconnect and stop close watchers
   expect(stopped.counts.closed).toBe(1);
   resources.close();
   expect(() => resources.watch(c, boardResourceUri("e2e"), hooks())).toThrow("unauthorized");
+});
+
+for (const boundary of ["grant", "session"] as const) for (const internal of [false, true]) test(`strict resource ${boundary} faults preserve provenance and watches (application error: ${internal})`, async () => {
+  const a = await select(alice), b = await select(bob);
+  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  resources.close();
+  const failure = internal ? new ApplicationError("internal", "storage unavailable") : new Error("storage unavailable");
+  let failed = false;
+  resources = createResources(application, { isAuthorized: () => {
+    if (failed && boundary === "grant") throw failure;
+    return true;
+  } });
+  const validate = application.revalidateSession;
+  application.revalidateSession = session => {
+    if (failed && boundary === "session") throw failure;
+    validate(session);
+  };
+  const uri = boardResourceUri("e2e"), h = hooks();
+  const watch = resources.watch(b, uri, h);
+  failed = true;
+  try {
+    for (const call of [() => resources.list(b), () => resources.read(b, uri), () => resources.watch(b, uri, hooks()), () => resources.unwatch(b, watch)]) {
+      try { call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
+    }
+    expect(h.counts).toEqual({ changed: 0, closed: 0 });
+    expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
+  } finally { failed = false; application.revalidateSession = validate; }
+  application.call(a, "board_post", { board: "e2e", body: "healthy" });
+  expect(h.counts).toEqual({ changed: 1, closed: 0 });
+  expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["healthy"]);
+  expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
+  resources.unwatch(b, watch);
+  expect(h.counts.closed).toBe(1);
+});
+
+for (const background of ["revalidate", "hint", "closed", "timer"] as const) test(`background resource ${background} faults isolate cleanup and close callbacks`, async () => {
+  const a = await select(alice), b = await select(bob);
+  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  resources.close();
+  let failed = false;
+  resources = createResources(application, { isAuthorized: () => {
+    if (failed) throw new Error("grant storage unavailable");
+    return true;
+  } });
+  const observe = application.observeBoard;
+  application.observeBoard = (...args) => {
+    const unsubscribe = observe(...args);
+    return () => { unsubscribe(); throw new Error("cleanup failed"); };
+  };
+  let changed = 0, closed = 0;
+  try {
+    resources.watch(b, boardResourceUri("e2e"), {
+      changed() { changed++; }, closed() { closed++; throw new Error("closed callback failed"); },
+    });
+    failed = true;
+    if (background === "revalidate") expect(() => resources.revalidate()).not.toThrow();
+    if (background === "hint") expect(() => application.call(a, "board_post", { board: "e2e", body: "committed" })).not.toThrow();
+    if (background === "closed") expect(() => application.close(b)).not.toThrow();
+    if (background === "timer") {
+      const deadline = Date.now() + 2_000;
+      while (closed === 0 && Date.now() < deadline) await Bun.sleep(10);
+    }
+    expect({ changed, closed }).toEqual({ changed: 0, closed: 1 });
+    failed = false;
+    if (background === "hint") expect(resources.read(a, boardResourceUri("e2e")).posts[0]!.body).toBe("committed");
+    expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
+    expect(() => resources.close()).not.toThrow();
+    expect(closed).toBe(1);
+  } finally { failed = false; application.observeBoard = observe; }
+});
+
+test("resource background session storage faults fail closed, but authoritative refusals still refuse requests", async () => {
+  const a = await select(alice);
+  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  const h = hooks();
+  resources.watch(a, boardResourceUri("e2e"), h);
+  const validate = application.revalidateSession;
+  application.revalidateSession = () => { throw new Error("session storage unavailable"); };
+  try {
+    expect(() => resources.revalidate()).not.toThrow();
+    expect(h.counts).toEqual({ changed: 0, closed: 1 });
+  } finally { application.revalidateSession = validate; }
+  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
+  application.revalidateSession = () => { throw new ApplicationError("unauthenticated", "closed session"); };
+  try { expect(() => resources.list(a)).toThrow("unauthorized"); }
+  finally { application.revalidateSession = validate; }
+  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
 });
