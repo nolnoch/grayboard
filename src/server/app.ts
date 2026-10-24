@@ -78,9 +78,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   });
 
   const timers: ReturnType<typeof setInterval>[] = [];
+  let stopRetention: (() => void) | undefined;
+  let stopped = false;
   if (opts.background !== false) {
     timers.push(startPing());
-    startRetentionJobs(repo, db, config);
+    stopRetention = startRetentionJobs(repo, db, config);
   }
 
   return {
@@ -91,11 +93,17 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     revalidate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
+    // Owns everything startServer opened: idempotent, closes the database
+    // once the server and every user of it (bridge, timers, expiry) is down.
     stop() {
+      if (stopped) return;
+      stopped = true;
       slack?.stop();
       for (const t of timers) clearInterval(t);
+      stopRetention?.();
       stopExpiry();
       server.stop(true);
+      db.close();
     },
   };
 }
