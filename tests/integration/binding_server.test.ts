@@ -2,13 +2,14 @@
 // connection, bind as a new hello, rebind, and what the server records.
 // Each numbered comment is the #182 acceptance criterion the test shows.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { serverEnv } from "../support/env.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { sessionIdOf } from "../../src/core/bindings.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -208,6 +209,93 @@ test("9: a DM sent mid-swap is never consumed under the new name, and the old co
   }
 }, 30_000);
 
+// A server-mode child that Claude Code started without a channels flag: its
+// harness runs as `claude`, with CLAUDECODE=1.
+async function channelsOffSession(identity: string | null): Promise<Session> {
+  const claude = join(srv.dir, "claude");
+  if (!existsSync(claude)) symlinkSync(process.execPath, claude);
+  const s = await mcpSession({
+    env: serverEnv(srv.dir, srv.base, alice, identity, { CLAUDECODE: "1" }), cwd: srv.dir, args: ["mcp", "--mode", "server"], harness: claude,
+  });
+  expect(s.stderr()).toContain("no channels flag: tools only");
+  return s;
+}
+
+test("audit 2: a channels-off session holds its name: probed, never online, and its rebind moves claims", async () => {
+  const s = await channelsOffSession("fe");
+  const be = await session("be");
+  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
+  expect(await refusal(await channelsOffSession(null), "bind", { name: "fe" })).toContain("in use");
+  expect(await refusal(await session(null), "bind", { name: "fe" })).toContain("in use");
+  // It holds the name without taking pushes: not online, and DMs wait.
+  const fe = () => be.call("peer_list", { include_offline: true }).then((r) => r.peers.find((p: any) => p.handle === `${A}/fe`));
+  expect((await fe()).online).toBe(false);
+
+  const result = await s.call("bind", { name: "fe2", create: true });
+  expect(result).toContain(`Your claims moved from "fe" to "fe2": ticket:ENG-142.`);
+  expect((await be.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe2`]);
+  const sid = events("fe")[0]!.session_id;
+  expect(events("fe").map((e) => e.event)).toEqual(["bound", "refused", "refused", "released"]);
+  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: `rebound to ${A}/fe2` });
+  expect(events("fe2")).toEqual([{ session_id: sid, event: "moved", detail: `${A}/fe` }]);
+  // fe is free now.
+  const other = await session(null);
+  await other.call("bind", { name: "fe" });
+}, 40_000);
+
+test("audit 3, 4: a rebind's from is checked against the record, a late resume is refused, and a session key can't be borrowed", async () => {
+  const key = "a1".repeat(32);
+  const sid = sessionIdOf(key);
+  const fe = srv.client(alice, "fe", { hello: { session_key: key } });
+  expect((await fe.connect()).type).toBe("hello_ok");
+  await fe.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
+  // 3a: the old connection is gone (reconnect backoff) when the bind arrives.
+  fe.close();
+  await until(() => events("fe").at(-1)!.event === "released");
+  const fe2 = srv.client(alice, "fe2", { hello: { session_key: key, from: "fe" } });
+  expect(await fe2.connect()).toMatchObject({ type: "hello_ok", moved: ["ticket:ENG-142"] });
+  expect(events("fe")).toEqual([
+    { session_id: sid, event: "bound", detail: null },
+    { session_id: sid, event: "released", detail: "connection closed" },
+  ]);
+  expect(events("fe2")).toEqual([{ session_id: sid, event: "moved", detail: `${A}/fe` }]);
+
+  // 3b: the old client's resume lands after the bind: refused, nothing moves.
+  const stale = await srv.client(alice, "fe", { hello: { session_key: key, resume: true } }).connect();
+  expect(stale).toMatchObject({ type: "error", code: "identity_in_use", message: expect.stringContaining(`holds "fe2" now`) });
+  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "refused", detail: `stale: the session holds "fe2"` });
+
+  // 4: another connection of the same user names fe2 as its from, with the
+  // session ID it saw (an unknown field) and its own key: nothing moves.
+  const other = srv.client(alice, "x", { hello: { session_key: "b2".repeat(32), session_id: sid, from: "fe2" } });
+  const ok = await other.connect();
+  expect(ok.type).toBe("hello_ok");
+  expect(ok.moved).toBeUndefined();
+  expect(events("x")).toEqual([{ session_id: sessionIdOf("b2".repeat(32)), event: "bound", detail: `claims not moved: this session doesn't hold "fe2"` }]);
+  expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe2` }]);
+  expect(events("fe2").map((e) => e.event)).toEqual(["moved"]);
+}, 20_000);
+
+test("audit 5: a bind whose hello_ok comes after its timeout completes, and the next result says so", async () => {
+  // fe's holder never answers the probe, so the server answers the bind only
+  // after probeMs (2s), past the client's shortened hello timeout.
+  const silent = srv.client(alice, "fe", { pong: false });
+  expect((await silent.connect()).type).toBe("hello_ok");
+  const s = await session("old", { extra: { BUS_TEST_HELLO_MS: "500" } });
+  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
+  expect(await refusal(s, "bind", { name: "fe" })).toContain("the bind may still complete");
+  await until(() => events("fe").some((e) => e.event === "moved"));
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(JSON.parse(texts[0]!).you).toBe(`${A}/fe`);
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after its result timed out. Bound to "fe" (was "old")`);
+  expect(texts.slice(1).join(" ")).toContain(`Your claims moved from "old" to "fe": ticket:ENG-142.`);
+  // The old connection is closed, and fe stays this session's.
+  await Bun.sleep(300);
+  expect(events("fe").at(-1)!.event).toBe("moved");
+  expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
+}, 30_000);
+
 test("16, 18: raw hellos: create: false, lazy create, and a read-only connection's limits", async () => {
   await srv.api(alice, "POST", "/api/teams", { name: "eng" });
   const be = srv.client(alice, "be");
@@ -230,12 +318,14 @@ test("16, 18: raw hellos: create: false, lazy create, and a read-only connection
   expect(await srv.client(alice, "be", { push: false, hello: { read_only: true } }).connect()).toMatchObject({ type: "error", code: "bad_request" });
 
   // 18: a read-only connection: open boards and its user's team boards.
-  let ro = srv.client(alice, null, { hello: { session_id: "0123456789abcdef" } });
+  const key = "0123456789abcdef".repeat(4);
+  const id = sessionIdOf(key);
+  let ro = srv.client(alice, null, { hello: { session_key: key } });
   // Once lazy's close lands, it's a candidate.
   await until(async () => {
-    ro = srv.client(alice, null, { hello: { session_id: "0123456789abcdef" } });
+    ro = srv.client(alice, null, { hello: { session_key: key } });
     const ok = await ro.connect();
-    expect(ok).toMatchObject({ type: "hello_ok", identity_full: `${A}/~0123456789abcdef` });
+    expect(ok).toMatchObject({ type: "hello_ok", identity_full: `${A}/~${id}` });
     return ok.candidates.length === 1 && ok.candidates[0].name === "lazy";
   });
   const boards = (await ro.call("board_list")).result.map((b: any) => b.name);
@@ -251,8 +341,8 @@ test("16, 18: raw hellos: create: false, lazy create, and a read-only connection
     await ro.request({ type: "send", recipient: "be", body: "x" }),
     await ro.request({ type: "board_ack", refs: [] }),
   ]) expect(r).toMatchObject({ type: "error", code: "unbound" });
-  expect(cellsContaining("~0123456789abcdef")).toEqual([]);
-  // A hello with no session_id (an old client) gets one minted.
+  expect(cellsContaining(`~${id}`)).toEqual([]);
+  // A hello with no session_key (an old client) gets a session ID minted.
   expect((await srv.client(alice, null).connect()).identity_full).toMatch(new RegExp(`^${A}/~[0-9a-f]{16}$`));
 }, 20_000);
 

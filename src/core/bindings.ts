@@ -1,6 +1,7 @@
 // Session IDs, binding history and the unbound session's text (#182), shared
 // by both modes. A session ID names one grayboard mcp process; a name is the
 // durable mailbox a session binds to once it knows its task.
+import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -12,9 +13,50 @@ export function mintSessionId(): string {
   return Buffer.from(b).toString("hex");
 }
 
+/** A session ID's shape: 16 lowercase hex characters. */
+export const SESSION_ID = /^[0-9a-f]{16}$/;
+
+/**
+ * A server-mode session's secret (#182 audit 4): 32 random bytes, hex. Its
+ * hello carries the key, never the ID, and the server derives the ID from
+ * it, so a session ID seen in peer_list or a refusal can't be presented by
+ * another connection.
+ */
+export function mintSessionKey(): string {
+  return randomBytes(32).toString("hex");
+}
+
+/** A session key's shape: 64 lowercase hex characters. */
+export const SESSION_KEY = /^[0-9a-f]{64}$/;
+
+/** The session ID a key stands for: the first 16 hex characters of its SHA-256. */
+export function sessionIdOf(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
 /** One binding_events row. */
 export function logBinding(db: Database, sessionId: string, name: string, event: BindingEvent, detail: string | null = null, at = Date.now()): void {
   db.prepare(`INSERT INTO binding_events (session_id, name, event, at, detail) VALUES (?, ?, ?, ?, ?)`).run(sessionId, name, event, at, detail);
+}
+
+/**
+ * Whether `sessionId` holds `name` by the record: the latest bound or moved
+ * event for the name is its own. A rebind moves claims from the name it
+ * leaves only then (#182 audit 3).
+ */
+export function lastBoundBy(db: Database, name: string, sessionId: string): boolean {
+  const row = db.prepare(
+    `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
+  ).get(name) as { session_id: string } | null;
+  return row?.session_id === sessionId;
+}
+
+/** Whether the name's latest bound, moved or released event is a release. */
+export function lastWasRelease(db: Database, name: string): boolean {
+  const row = db.prepare(
+    `SELECT event FROM binding_events WHERE name = ? AND event IN ('bound', 'moved', 'released') ORDER BY id DESC LIMIT 1`,
+  ).get(name) as { event: string } | null;
+  return row?.event === "released";
 }
 
 export const UNBOUND_ERROR =

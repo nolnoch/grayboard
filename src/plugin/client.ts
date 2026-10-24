@@ -25,9 +25,15 @@ export class HelloRefused extends Error {
 }
 
 export type ClientOptions = {
-  // This process's session ID (#182): the server keys binding events on it,
-  // and a hello from the same session on another name is a rebind.
-  sessionId?: string;
+  // This process's session key (#182 audit 4): the server derives the
+  // session ID it keys binding events on from it.
+  sessionKey?: string;
+  // With push false: hold the name all the same (probed, claims move), for a
+  // harness that can't show pushes (#182 audit 2).
+  hold?: boolean;
+  // The name a bind leaves, whose claims move to this one: sent on the first
+  // hello only, as a reconnect leaves nothing.
+  from?: string;
   // false: refuse a name that has never existed (identity_unknown).
   create?: boolean;
   // A read-only hello's suggested name, listed first among its candidates.
@@ -94,15 +100,15 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
-      const { sessionId, create, suggested, restoredFrom } = this.opts;
+      const { sessionKey, hold, from, create, suggested, restoredFrom } = this.opts;
       this.send({
         type: "hello", req_id: this.helloId,
         ...(this.identity === null
           ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
-          : { identity: this.identity, ...(this.push ? {} : { push: false }), ...(create !== undefined ? { create } : {}) }),
-        ...(sessionId ? { session_id: sessionId } : {}),
+          : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
+        ...(sessionKey ? { session_key: sessionKey } : {}),
         ...(where ? { where } : {}),
-        ...(this.wasReady ? { resume: true } : restoredFrom ? { restored_from: restoredFrom } : {}),
+        ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
       });
     };
 

@@ -34,12 +34,13 @@ const open = new Set<Client>();
 // drops any that arrive before it has sent `initialized`. `via` runs the CLI
 // under a launcher (its command and leading args) between the harness and
 // grayboard. `bin` runs a compiled grayboard (a release) instead of the source.
+// `harness` is the executable that runs the stand-in (default: this bun).
 export async function mcpSession(
-  o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[]; bin?: string },
+  o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[]; bin?: string; harness?: string },
 ): Promise<Session> {
   const args = o.args ?? ["mcp"];
   const cmd = o.bin ? [o.bin, ...args] : [...(o.via ?? [process.execPath]), CLI, ...args];
-  const t = new HarnessTransport([process.execPath, HARNESS, ...cmd], o.env, o.cwd);
+  const t = new HarnessTransport([o.harness ?? process.execPath, HARNESS, ...cmd], o.env, o.cwd);
   return handshake(t);
 }
 

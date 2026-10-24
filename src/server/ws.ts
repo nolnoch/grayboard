@@ -23,7 +23,8 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_TOOLS, closestNames, logBinding, mintSessionId, orderCandidates, unknownNameError, type Candidate,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_TOOLS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
+  sessionIdOf, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
@@ -49,8 +50,8 @@ export type WsData = {
   // The server's Slack bridge holding a user's human identity: the only
   // connection allowed the reserved name, and drained like a human's session.
   human?: true;
-  // The client process's session ID (#182): its own, or minted here for a
-  // client from before session IDs. Keys binding_events.
+  // The client process's session ID (#182): derived from its session key, or
+  // minted here for a client from before session IDs. Keys binding_events.
   sessionId?: string;
   // Where the client runs, from its hello.
   place?: string | null;
@@ -82,8 +83,12 @@ export type WsOptions = {
 
 // Per server instance.
 type Hub = {
-  // identity_full -> open WebSocket
+  // identity_full -> the connection pushes go to (hello push: true)
   registry: Map<string, Ws>;
+  // identity_full -> the connection that holds the name: registry's, or a
+  // hold connection (push: false, hold: true), which is pinged and probed
+  // but never pushed to and not online (#182 audit 2).
+  holders: Map<string, Ws>;
   // identity_full -> the probe a hello is running against its holder
   probing: Map<string, Promise<boolean>>;
   // Tools-only connections (hello push: false): pinged, never pushed to.
@@ -155,7 +160,7 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
-    registry: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
+    registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
   };
@@ -272,8 +277,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       hub.toolsOnly.delete(ws);
       hub.readOnly.delete(ws);
       const full = ws.data.identityFull;
-      if (full && hub.registry.get(full) === ws) {
-        hub.registry.delete(full);
+      if (full && hub.registry.get(full) === ws) hub.registry.delete(full);
+      if (full && hub.holders.get(full) === ws) {
+        hub.holders.delete(full);
         touchHandle(hub.db, full);
       }
       if (ws.data.owner) release(hub, ws, "connection closed");
@@ -284,7 +290,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   // Auth is checked at the upgrade only. When an admin revokes or disables a
   // user, close their connections (#70): reconnecting then fails auth. The
   // Slack bridge's humans have their own path (SlackBridge.userChanged).
-  const conns = () => [...hub.registry.values(), ...hub.toolsOnly, ...hub.readOnly].filter((ws) => !ws.data.human);
+  const conns = () => [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly].filter((ws) => !ws.data.human);
   const disconnectUser = (userId: number) => {
     for (const ws of conns()) {
       if (ws.data.authed.user_id !== userId) continue;
@@ -303,7 +309,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
-      for (const ws of [...hub.registry.values(), ...hub.toolsOnly, ...hub.readOnly]) {
+      for (const ws of [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
     }, 30_000);
@@ -326,11 +332,16 @@ function describeHolder(ws: Ws): string {
 }
 
 async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
-  const { repo, db, registry } = hub;
+  const { repo, db, registry, holders } = hub;
   const reqId = m.req_id;
   const push = m.push !== false;
-  // A client from before session IDs gets one here, so its events have a key.
-  const sessionId = m.session_id ?? mintSessionId();
+  // Whether this connection holds its name: a push one, or a hold one, whose
+  // harness can't show pushes (#182 audit 2). A tools-only one doesn't.
+  const owns = push || m.hold === true;
+  // Derived from the client's secret, so no connection can present another
+  // session's ID (#182 audit 4). A client from before session IDs gets one
+  // here, so its events have a key.
+  const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
   ws.data.sessionId = sessionId;
   ws.data.place = m.where ?? null;
   if (m.read_only) return helloReadOnly(hub, ws, reqId, sessionId, m.suggested);
@@ -352,7 +363,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // Only the connection that would hold the name logs: a tools-only one runs
   // beside the session that owns it.
   const refuse = (code: ErrorCode, message: string, detail: string, extra: { known?: string[]; holder?: string } = {}) => {
-    if (push) logBinding(db, sessionId, full, "refused", detail);
+    if (owns) logBinding(db, sessionId, full, "refused", detail);
     send(ws, { type: "error", req_id: reqId, code, message, ...extra });
     ws.close();
   };
@@ -373,7 +384,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // can change the registry (a close, another hello), so after one, check
   // again from the top; between the last check and registry.set below
   // nothing awaits (#69).
-  while (push) {
+  while (owns) {
     const inFlight = hub.probing.get(full);
     if (inFlight) {
       // Another hello is probing the holder: whoever wins, it's settled after.
@@ -381,7 +392,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       if (ws.readyState !== 1 /* OPEN */) return;
       continue;
     }
-    const holder = registry.get(full);
+    const holder = holders.get(full);
     if (!holder || holder === ws) break;
     const probing = probe(holder, hub.probeMs).finally(() => {
       if (hub.probing.get(full) === probing) hub.probing.delete(full);
@@ -393,11 +404,34 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       return;
     }
     if (ws.readyState !== 1 /* OPEN */) return;
-    if (registry.get(full) === holder) {
+    if (holders.get(full) === holder) {
       err(holder, undefined, "superseded", "a newer session connected with this identity");
       if (holder.data.owner) release(hub, holder, `superseded by session ${sessionId}`);
       holder.close();
-      registry.delete(full);
+      holders.delete(full);
+      if (registry.get(full) === holder) registry.delete(full);
+    }
+  }
+
+  // A rebind names the name it leaves (#182 audit 3). Its claims move only
+  // if this session holds that name by the record and no other connection
+  // holds it live; that holds whether or not the old connection is open. A
+  // session holding another name live must name it: a late reconnect of a
+  // name it has left is refused, never taken for a rebind.
+  let from: string | null = null;
+  let notMoved: string | null = null;
+  if (owns) {
+    const fromFull = m.from === undefined ? null : `${authed.user_email}/${m.from.toLowerCase()}`;
+    const held = [...holders.values()].find((c) => c !== ws && c.data.sessionId === sessionId && c.data.identityFull !== full);
+    if (held && held.data.identityFull !== fromFull) {
+      const was = held.data.identityName;
+      refuse("identity_in_use", `this session holds "${was}" now; a hello for "${name}" that doesn't leave it is refused.`, `stale: the session holds "${was}"`);
+      return;
+    }
+    if (fromFull !== null && fromFull !== full) {
+      const h = holders.get(fromFull);
+      if ((!h || h.data.sessionId === sessionId) && lastBoundBy(db, fromFull, sessionId)) from = fromFull;
+      else notMoved = `claims not moved: this session doesn't hold "${m.from}"`;
     }
   }
 
@@ -409,23 +443,30 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   }
 
   let moved: string[] | undefined;
-  if (push) {
-    // The same session on another name is a rebind: its claims follow it, and
-    // the old connection, which the client closes next, no longer holds that name.
-    const previous = m.session_id === undefined ? undefined : [...registry.values()].find((c) =>
-      c !== ws && c.data.sessionId === sessionId && c.data.authed.user_id === authed.user_id && c.data.identityFull !== full);
-    registry.set(full, ws);
+  if (owns) {
+    holders.set(full, ws);
+    if (push) registry.set(full, ws);
     // A reconnect, or a restart taking its name back, is the same session: its status stays.
     if (m.resume || m.restored_from) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     ws.data.owner = true;
-    if (previous) {
-      const from = previous.data.identityFull;
+    if (from) {
+      // The old connection, which the client closes next, holds nothing now.
+      const prev = holders.get(from);
+      if (prev) {
+        holders.delete(from);
+        if (registry.get(from) === prev) registry.delete(from);
+        touchHandle(db, from);
+      }
       moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
-      if (previous.data.owner) release(hub, previous, `rebound to ${full}`);
+      if (prev?.data.owner) release(hub, prev, `rebound to ${full}`);
+      else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
       logBinding(db, sessionId, full, "moved", from);
-    } else logBinding(db, sessionId, full, "bound", m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null);
+    } else {
+      const how = m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null;
+      logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
+    }
   } else {
     hub.toolsOnly.add(ws);
     touchHandle(db, full);
@@ -492,9 +533,9 @@ function helloReadOnly(hub: Hub, ws: Ws, reqId: string, sessionId: string, sugge
 // checkout's default) first, then the most pending work. Live names and the
 // human are left out.
 function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
-  const { repo, db, registry } = hub;
+  const { repo, db, holders } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
-  const free = (n: string) => n !== HUMAN_NAME && !registry.has(full(n));
+  const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
   const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
   const queued = repo.messages.queuedTo(names.map(full));
   const seen = sessionsSeen(db, names.map(full));

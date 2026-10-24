@@ -13,7 +13,9 @@ import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_INBOX_INSTRUCTION, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionId, restoreNote, unboundInstruction } from "../core/bindings.ts";
+import {
+  UNBOUND_ERROR, UNBOUND_TOOLS, bindOk, heldNote, launcherNote, mintSessionKey, restoreNote, sessionIdOf, unboundInstruction,
+} from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
@@ -63,7 +65,9 @@ function loadCredentials(): Credentials {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-const SESSION_ID = mintSessionId();
+// The secret the server derives this session's ID from (#182 audit 4).
+const SESSION_KEY = mintSessionKey();
+const SESSION_ID = sessionIdOf(SESSION_KEY);
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY, not a harness re-delivering the repo's pin. Otherwise the
 // resolved name is only the first suggestion, and the session starts unbound.
@@ -90,9 +94,9 @@ const SUGGESTED = resolved.ok ? resolved.name : null;
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
 if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
 // Notifications such a session drops would still count as delivered, so it
-// runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
-// Unlike local mode, such a session doesn't hold its name: a push: false
-// connection is never the name's holder on the server.
+// gets no pushes, as BUS_PUSH=off does, and what's pending waits (#71). It
+// still holds its name, as in local mode (decision 9): its connections say
+// hold (#182 audit 2).
 const DELIVER = PUSH && !CHANNELS_OFF;
 const creds = loadCredentials();
 const serverUrl = process.env.GRAYBOARD_SERVER ?? creds.server;
@@ -123,11 +127,13 @@ let client: GrayboardClient | null = null;
 let readsUnavailable: string | null = null;
 // Why this session lost its name, for the next tool result.
 let lostNotice: string | null = null;
+// A bind that completed after its result timed out, for the next tool result.
+let lateBindNotice: string | null = null;
 
 // A connection for `identity` (null: read-only). Its pushes go to the agent
 // only while it's live; a client that's been replaced or refused is dead and
 // hands nothing on, so its unacked messages stay queued for the name.
-function connect(identity: string | null, opts: { push: boolean; create?: boolean; restoredFrom?: string }): GrayboardClient {
+function connect(identity: string | null, opts: { push: boolean; create?: boolean; restoredFrom?: string; from?: string }): GrayboardClient {
   const c: GrayboardClient = new GrayboardClient(
     serverUrl,
     currentToken,
@@ -144,7 +150,10 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     },
     opts.push,
     (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
-    { sessionId: SESSION_ID, create: opts.create, suggested: SUGGESTED, restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason) },
+    {
+      sessionKey: SESSION_KEY, hold: identity !== null && CHANNELS_OFF, from: opts.from, create: opts.create, suggested: SUGGESTED,
+      restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason),
+    },
   );
   c.connect();
   return c;
@@ -165,12 +174,17 @@ function lost(c: GrayboardClient, reason: string): void {
 // that handle provably your user (an older server would let an agent take it).
 const fromOwnHuman = async (c: GrayboardClient, handle: string): Promise<boolean> => handle === (await c.ready()).human?.handle;
 
+// No hello_ok in time: the connection may still get one.
+class HelloTimeout extends Error {}
+
 // Keep this well under the client's own startup timeout (30s in Claude Code),
-// so a stuck server is an error, not a timeout.
+// so a stuck server is an error, not a timeout. BUS_TEST_HELLO_MS shortens it
+// for tests.
+const HELLO_MS = Number(process.env.BUS_TEST_HELLO_MS) || 10_000;
 const helloWithin = (c: GrayboardClient): Promise<HelloOk> => Promise.race([
   c.ready(),
   new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error(`no answer from grayboard server at ${serverUrl} within 10s`)), 10_000),
+    setTimeout(() => reject(new HelloTimeout(`no answer from grayboard server at ${serverUrl} within ${HELLO_MS / 1000}s`)), HELLO_MS),
   ),
 ]);
 
@@ -314,6 +328,8 @@ const notices = (): string[] => {
   channelsNoticePending = false;
   if (lostNotice) out.push(lostNotice);
   lostNotice = null;
+  if (lateBindNotice) out.push(lateBindNotice);
+  lateBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -501,42 +517,63 @@ async function connection(): Promise<GrayboardClient> {
 }
 
 // bind(name, create?): take a name, or move to another (#182). A fresh
-// connection says hello for the new name; only once the server accepts it
-// (moving this session's claims) is the old connection marked dead and
-// closed, so it can't reconnect and re-register the old name. A DM pushed to
-// the old connection after that is never acked: it stays queued for the old
-// name's next holder, never consumed under the new one.
-let binding = false;
+// connection says hello for the new name, naming the one it leaves; only once
+// the server accepts it (moving this session's claims) is the old connection
+// marked dead and closed, so it can't reconnect and re-register the old name.
+// A DM pushed to the old connection after that is never acked: it stays
+// queued for the old name's next holder, never consumed under the new one.
+// The server commits on its hello_ok, so a hello_ok after the result timed
+// out still completes the bind (#182 audit 5): the old name's claims have
+// moved, and the next tool result says so.
+let binding: string | null = null;
 async function bind(a: Record<string, unknown>) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
   const n = normalizeIdentityName(String(a.name));
   if (!n.ok) return fail(n.error);
   if (n.name === bound) return text(`already bound to "${n.name}"`);
-  if (binding) return fail("another bind is in progress");
-  binding = true;
+  if (binding) return fail(`a bind of "${binding}" is in progress`);
+  binding = n.name;
+  const previous = bound;
+  const next = connect(n.name, { push: DELIVER, create: a.create === true, ...(previous ? { from: previous } : {}) });
+  let h: HelloOk;
   try {
-    const previous = bound;
-    const next = connect(n.name, { push: DELIVER, create: a.create === true });
-    let h: HelloOk;
-    try {
-      h = await helloWithin(next);
-    } catch (e) {
+    h = await helloWithin(next);
+  } catch (e) {
+    if (!(e instanceof HelloTimeout)) {
       next.close();
+      binding = null;
       return fail((e as Error).message);
     }
-    testPause("bind:after-acquire");
-    const old = client;
-    client = next;
-    bound = n.name;
-    writeName(bound);
-    lostNotice = null;
-    old?.close();
-    console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return bindOk(n.name, previous, h.moved ?? [], (general) => boundInstructions(n.name, h, general));
-  } finally {
-    binding = false;
+    next.ready().then(
+      (late) => {
+        const r = switchTo(next, n.name, previous, late);
+        lateBindNotice = `bind("${n.name}") completed after its result timed out. ${r.content[0]!.text}`;
+      },
+      () => next.close(),
+    ).finally(() => {
+      binding = null;
+    });
+    return fail(`${e.message}; the bind may still complete, and if it does, a later tool result says so`);
   }
+  try {
+    return switchTo(next, n.name, previous, h);
+  } finally {
+    binding = null;
+  }
+}
+
+// The server accepted `next` for `name`: it's this session's connection now.
+function switchTo(next: GrayboardClient, name: string, previous: string | null, h: HelloOk) {
+  testPause("bind:after-acquire");
+  const old = client;
+  client = next;
+  bound = name;
+  writeName(bound);
+  lostNotice = null;
+  old?.close();
+  console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}`);
+  return bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general));
 }
 
 // ── start stdio transport ─────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
-import type { Candidate } from "../core/bindings.ts";
+import { SESSION_ID, SESSION_KEY, type Candidate } from "../core/bindings.ts";
 
 export type Message = {
   id: number;
@@ -22,9 +22,14 @@ export type Message = {
 // identity (a harness that can't show pushes): no pushes, not "online".
 // where: the client's describeLocation (the server can't see its files).
 // resume: a reconnect within one session, so its peer_status stays.
-// session_id: the client process's session ID (#182), the key of its
-// binding_events; a hello from the same session under another name is a
-// rebind, and the session's claims move to the new name.
+// session_key: the client process's secret (#182 audit 4); the server
+// derives the session ID, the key of its binding_events, from it
+// (sessionIdOf), so no connection can present another session's ID.
+// hold: with push: false, the connection holds its name as push does (the
+// probe, binding events, claim moves) but gets no pushes and isn't online:
+// a session whose harness can't show pushes (Claude Code without channels).
+// from: the name a rebind leaves; its claims move to the new name if this
+// session holds it by the record. Sent on a bind's first hello only.
 // restored_from: the session ID of the process this one restarted from,
 // taking back its name (#182 decision 14): logged, and its status stays.
 // create: false refuses a name that has never existed (identity_unknown);
@@ -34,7 +39,7 @@ export type Message = {
 // the checkout's default name, listed first among hello_ok.candidates.
 export type HelloRequest = {
   type: "hello"; req_id: string; identity?: string; push?: boolean; where?: string; resume?: boolean;
-  session_id?: string; create?: boolean; read_only?: boolean; suggested?: string; restored_from?: string;
+  session_key?: string; hold?: boolean; from?: string; create?: boolean; read_only?: boolean; suggested?: string; restored_from?: string;
 };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
@@ -109,8 +114,6 @@ export type ErrorCode =
   // a read-only connection asked for something that needs a name
   | "unbound";
 
-const SESSION_ID = /^[0-9a-f]{16}$/;
-
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
   const m = raw as Record<string, unknown>;
@@ -125,8 +128,11 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       } else assertStr(m, "identity");
       if (m.push !== undefined && typeof m.push !== "boolean") throw new Error("push must be boolean");
       if (m.create !== undefined && typeof m.create !== "boolean") throw new Error("create must be boolean");
-      if (m.session_id !== undefined && (typeof m.session_id !== "string" || !SESSION_ID.test(m.session_id)))
-        throw new Error("session_id must be 16 lowercase hex characters");
+      if (m.session_key !== undefined && (typeof m.session_key !== "string" || !SESSION_KEY.test(m.session_key)))
+        throw new Error("session_key must be 64 lowercase hex characters");
+      if (m.hold !== undefined && typeof m.hold !== "boolean") throw new Error("hold must be boolean");
+      if (m.hold === true && (m.push !== false || m.read_only === true)) throw new Error("hold needs push: false and a name");
+      if (m.from !== undefined && (typeof m.from !== "string" || m.read_only === true)) throw new Error("from must be a string, on a hello with a name");
       if (m.restored_from !== undefined && (typeof m.restored_from !== "string" || !SESSION_ID.test(m.restored_from)))
         throw new Error("restored_from must be 16 lowercase hex characters");
       if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
