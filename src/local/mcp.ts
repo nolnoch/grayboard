@@ -44,6 +44,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
 import { sessionIdentity } from "../shared/identity.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
@@ -67,7 +68,12 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-const IDENTITY: string = sessionIdentity();
+const resolved = normalizeIdentityName(sessionIdentity());
+if (!resolved.ok) {
+  console.error(`[grayboard] ${resolved.error}`);
+  process.exit(1);
+}
+const IDENTITY: string = resolved.name;
 console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();

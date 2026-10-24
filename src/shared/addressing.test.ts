@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseAddress, formatDirectAddress, formatTeamAddress, isValidIdentityName } from "./addressing.ts";
+import { parseAddress, formatDirectAddress, formatTeamAddress, isValidIdentityName, normalizeIdentityName } from "./addressing.ts";
 
 describe("parseAddress — valid inputs", () => {
   test("direct address", () => {
@@ -91,5 +91,21 @@ describe("isValidIdentityName", () => {
     expect(isValidIdentityName("a".repeat(33))).toBe(false);
     expect(isValidIdentityName("MY NAME")).toBe(false);
     expect(isValidIdentityName("name@bad")).toBe(false);
+  });
+});
+
+describe("normalizeIdentityName", () => {
+  test("lowercases and keeps a valid name", () => {
+    expect(normalizeIdentityName("Gray")).toEqual({ ok: true, name: "gray" });
+    expect(normalizeIdentityName("be-stream")).toEqual({ ok: true, name: "be-stream" });
+    expect(normalizeIdentityName("My_IDE_1")).toEqual({ ok: true, name: "my_ide_1" });
+  });
+
+  test("refuses what the server would, with the reason", () => {
+    for (const raw of ["", "Gray!", "a".repeat(33), "my name"]) {
+      const r = normalizeIdentityName(raw);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain(`"${raw}"`);
+    }
   });
 });

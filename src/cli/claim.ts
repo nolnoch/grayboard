@@ -4,7 +4,7 @@
 // Exit 2 when the claim is held by someone else, like `grayboard claims`.
 import { existsSync } from "node:fs";
 import { ApiError, busMode, loadCredentials, makeClient, signInHint } from "./api.ts";
-import { isValidIdentityName } from "../shared/addressing.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
 import { defaultIdentity, isExplicitIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
@@ -18,10 +18,17 @@ export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
  */
 export function actingIdentity(as?: string, env = process.env, cwd = process.cwd()): { name: string; source: string } {
   if (as !== undefined) {
-    if (!isValidIdentityName(as.toLowerCase())) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -`);
-    return { name: as, source: "--as" };
+    // Same rule the session itself resolves by (#181): lowercased, then
+    // validated — so --as Gray acts as "gray", the handle both modes agree on.
+    const n = normalizeIdentityName(as);
+    if (!n.ok) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -`);
+    return { name: n.name, source: "--as" };
   }
-  if (isExplicitIdentity(env, cwd)) return { name: env.BUS_IDENTITY!, source: "BUS_IDENTITY" };
+  if (isExplicitIdentity(env, cwd)) {
+    const n = normalizeIdentityName(env.BUS_IDENTITY!);
+    if (!n.ok) throw new Error(n.error);
+    return { name: n.name, source: "BUS_IDENTITY" };
+  }
   const pin = pinnedIdentity(cwd);
   // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin, as in
   // sessionIdentity — with `??` it skipped the pin and changed the handle.

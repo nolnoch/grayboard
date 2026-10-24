@@ -80,6 +80,16 @@ test("a worktree session's handle follows the explicit-identity rule", async () 
   expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
 }, 20_000);
 
+test("an explicit identity is lowercased, the server's rule (#181); an invalid one refuses startup", async () => {
+  // The server lowercases and validates at hello; local now does at startup,
+  // so one configuration yields one handle in both modes (#181).
+  const upper = await start("Gray");
+  expect((await call(upper, "peer_list")).you).toBe("gray");
+
+  // A name invalid after lowercasing refuses to start, with the reason.
+  await expect(session("Gray!")).rejects.toThrow(/invalid identity name/);
+}, 20_000);
+
 test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", async () => {
   // No repo pin: a BUS_IDENTITY from a user-level registration (claude mcp
   // add -e, pi's user mcp.json) is a chosen task name, literal in every

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { GrayboardClient } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { sessionIdentity } from "../shared/identity.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { DM_ACK_TOOL, DM_INBOX_INSTRUCTION, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM, ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
@@ -56,7 +57,12 @@ function loadCredentials(): Credentials {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-const identity = sessionIdentity();
+const resolvedIdentity = normalizeIdentityName(sessionIdentity());
+if (!resolvedIdentity.ok) {
+  console.error(`[grayboard] ${resolvedIdentity.error}`);
+  process.exit(1);
+}
+const identity = resolvedIdentity.name;
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
 // BUS_PUSH=off: tools only, beside a harness plugin that owns delivery (opencode).
