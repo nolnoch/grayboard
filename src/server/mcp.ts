@@ -6,8 +6,8 @@ import { CoreError } from "../core/errors.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
-import { extractBearer, verifySessionToken } from "./auth.ts";
-import type { Repo } from "./db.ts";
+import type { createOAuthServer } from "./oauth.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import pkg from "../../package.json" with { type: "json" };
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
@@ -19,8 +19,7 @@ const text = (value: unknown): CallToolResult => ({
   content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
-// Bearer auth here is transitional; the retained HTTP/WS login contract is unchanged.
-export function createHostedMcp(application: Application, repo: Repo, opts: { trustedOrigin: string }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized">, opts: { trustedOrigin: string }) {
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   const permitsOrigin = (origin: string | null): boolean => {
     if (origin === null) return true;
@@ -33,19 +32,31 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   };
   let closed = false;
   const sessions = new Map<ApplicationSession, McpServer>();
+  const exchanges = new AsyncLocalStorage<{ refusal?: Response }>();
+  const refuse = (response: Response): never => {
+    const exchange = exchanges.getStore();
+    if (exchange) exchange.refusal = response;
+    throw new Error("unauthenticated");
+  };
   const handler = createMcpHandler(async ({ requestInfo }) => {
-    if (!requestInfo || closed) throw new Error("MCP endpoint is closed");
-    const raw = extractBearer(requestInfo);
-    const authed = raw && verifySessionToken(raw, repo);
-    if (!authed) throw new Error("unauthenticated");
+    if (!requestInfo || closed || requestInfo.signal.aborted) throw new Error("MCP endpoint is closed");
+    const principal = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+    if (principal instanceof Response) return refuse(principal);
     const { session, info } = await application.selectIdentity(
-      authed, requestInfo.headers.get("X-Grayboard-Identity")!,
+      principal.authed, requestInfo.headers.get("X-Grayboard-Identity")!,
       { deliver() {}, probe: async () => false, closed() {} },
       { push: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
     );
-    if (closed || requestInfo.signal.aborted) {
+    try {
+      if (closed || requestInfo.signal.aborted) throw new Error("MCP request is closed");
+      if (!oauth.isAuthorized(principal)) {
+        const current = oauth.authenticate(requestInfo, ["grayboard:tools"]);
+        if (current instanceof Response) refuse(current);
+        throw new Error("unauthenticated");
+      }
+    } catch (e) {
       application.close(session);
-      throw new Error("MCP request is closed");
+      throw e;
     }
     const server = new McpServer({ name: "grayboard", version: pkg.version }, {
       supportedProtocolVersions: MCP_PROTOCOL_VERSIONS,
@@ -64,7 +75,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       try {
         if (requestInfo.signal.aborted) return { ...text("error: request cancelled"), isError: true };
         // Recheck the token at dispatch as well as at the HTTP boundary.
-        if (!verifySessionToken(raw, repo)) return { ...text("error: unauthenticated"), isError: true };
+        if (!oauth.isAuthorized(principal)) return { ...text("error: unauthenticated"), isError: true };
         return text(call() ?? "ok");
       } catch (e) {
         const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
@@ -124,13 +135,21 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
     async fetch(req: Request): Promise<Response> {
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
       if (!permitsOrigin(req.headers.get("Origin"))) return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
-      const token = extractBearer(req);
-      if (!token || !verifySessionToken(token, repo)) return Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 });
-      const name = req.headers.get("X-Grayboard-Identity");
-      if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
-        return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
-      }
-      try { return await handler.fetch(req); } catch {
+      try {
+        const principal = oauth.authenticate(req, ["grayboard:tools"]);
+        if (principal instanceof Response) return principal;
+        const name = req.headers.get("X-Grayboard-Identity");
+        if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
+          return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
+        }
+        return await exchanges.run({}, async () => {
+          const response = await handler.fetch(req);
+          const refusal = exchanges.getStore()?.refusal;
+          if (!refusal || closed || req.signal.aborted) return response;
+          await response.body?.cancel();
+          return refusal;
+        });
+      } catch {
         return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
       }
     },
