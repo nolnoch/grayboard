@@ -2,7 +2,8 @@ import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
 import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
-import { CoreError, TooLargeError } from "./errors.ts";
+import { CoreError } from "./errors.ts";
+import { logEvent } from "./claims.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -33,6 +34,7 @@ export type Board = {
   scope: string | null;
   created_by: string;
   created_at: number;
+  kind?: string;
 };
 export type Post = {
   id: number;
@@ -196,17 +198,20 @@ export function createBoard(
   name: string,
   purpose: string,
   scope: string | null = null,
+  opts: { kind?: string } = {},
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  const kind = opts.kind ?? "broadcast";
+  if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
   if (denied) throw new CoreError(denied);
   const res = db
     .prepare(
-      `INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO boards (name, purpose, scope, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
     )
-    .run(board, purpose.trim(), scope, handle, Date.now());
+    .run(board, purpose.trim(), scope, handle, Date.now(), kind);
   if (res.changes === 0) throw new CoreError(`board #${board} already exists`);
   subscribe(db, handle, board, "push");
   return getBoard(db, board)!;
@@ -363,6 +368,12 @@ function resolveMentions(
 
 // wake: handles to wake now. deferred: thread participants whose push waits
 // for their next wake. post.attachments: those bound to the post.
+
+// A queue-kind board's claim TTL: how long a lane holds a post before
+// sweepExpired releases it to the next wake. Matches the claims default
+// (claims.ts DEFAULT_TTL_MIN).
+const QUEUE_CLAIM_TTL_MS = 30 * 60_000;
+
 export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
 
 // online: which handles have a live session (the mode knows); a human's
@@ -436,29 +447,80 @@ export function post(
         mode: SubMode;
       }[]
     ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
-    for (const s of subs) if (s.mode === "push") targets.set(s.handle, { reason: "subscription", wake: true });
-    if (announcement) {
-      for (const h of rosterHandles(db)) {
-        if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
+    // A queue-kind board delivers each top-level post to exactly ONE
+    // subscriber: the claim IS the delivery. A resolved @mention is direct
+    // addressing (it bypasses the rotation); with none, the rotation picks the
+    // least-recently-woken eligible subscriber and claims the post (TTL
+    // takeover releases it to the next wake). Replies follow thread semantics
+    // and release the claimer's claim.
+    const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
+    let unresolved: string[] = [];
+    if (queue) {
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      unresolved = u;
+      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
+      if (mentioned.length === 0) {
+        // Eligible: a push subscriber (lanes that wake), not the poster, not
+        // busy (a set peer_status), not a read-only viewer - and the
+        // least-recently-woken first, so work rotates across the fleet.
+        const picked = db
+          .prepare(
+            `SELECT s.handle FROM subscriptions s JOIN handles h ON h.name = s.handle
+             WHERE s.board = ? AND s.mode = 'push' AND s.handle != ? AND h.status IS NULL
+               AND h.name NOT LIKE '~%'
+             ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
+                        WHERE o2.handle = s.handle AND p2.board = s.board) ASC NULLS FIRST, s.handle ASC`,
+          )
+          .all(board, handle)
+          .map((r) => (r as { handle: string }).handle)
+          .find((h) => a.canSee(h, b));
+        if (picked) {
+          targets.set(picked, { reason: "subscription", wake: true });
+          // The claim IS the delivery: the picked lane holds the post until it
+          // acks (a reply), declines (claim release), or the TTL lapses
+          // (sweepExpired releases it to the next wake). At-least-once: the
+          // claim key is the idempotency token. The claim does not announce on
+          // the board - the delivery IS the visibility, and an announce would
+          // cascade back through the queue rotation.
+          db.prepare(
+            `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          ).run(`queue:${board}:${p.id}`, picked, "queue post", board, now, now + QUEUE_CLAIM_TTL_MS);
+          logEvent(db, "take", picked, { key: `queue:${board}:${p.id}`, note: "queue post", board, expires_at: now + QUEUE_CLAIM_TTL_MS }, now);
+        }
+        // No eligible subscriber: the post sits on the board (readable there)
+        // until a lane subscribes; documented v1 behavior.
       }
-    } else if (parentId !== null) {
-      const root = threadRoot(db, parentId);
-      const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
-      const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
-      for (const author of authors) {
-        if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
-        // Your user's replies wake the whole thread; a push-mode subscriber
-        // still gets every post as it lands.
-        const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
-        targets.set(author, { reason: "thread", wake });
+    } else {
+      // The announce board ignores agents' subscriptions (viewers like `tail`
+      // still get it): an announcement reaches the sessions live now, as a
+      // mention so it doesn't read as subscribed traffic, and an agent's ack
+      // reaches only the announcer, not every earlier acker.
+      for (const s of subs) if (s.mode === "push") targets.set(s.handle, { reason: "subscription", wake: true });
+      if (announcement) {
+        for (const h of rosterHandles(db)) {
+          if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
+        }
+      } else if (parentId !== null) {
+        const root = threadRoot(db, parentId);
+        const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
+        const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
+        for (const author of authors) {
+          if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
+          // Your user's replies wake the whole thread; a push-mode subscriber
+          // still gets every post as it lands.
+          const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
+          targets.set(author, { reason: "thread", wake });
+        }
+        // Muting drops thread and subscription pushes; the mention pass below
+        // runs after this, so an @mention still lands.
+        const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
+        for (const m of muted) targets.delete(m.handle);
       }
-      // Muting drops thread and subscription pushes; the mention pass below
-      // runs after this, so an @mention still lands.
-      const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
-      for (const m of muted) targets.delete(m.handle);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      unresolved = u;
+      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
-    const { handles: mentioned, unresolved } = resolveMentions(db, body, handle, b);
-    for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     targets.delete(handle);
 
     const ins = db.prepare(
@@ -714,6 +776,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 
   // Digest: unread exists and nothing has been sent since the last catch-up.
+  // Queue-kind boards are excluded: their posts deliver to exactly one
+  // subscriber, so they never count as digest unread for the others.
   const digests = db
     .prepare(
       `SELECT s.board, s.cursor,
@@ -721,7 +785,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
                  AND p.author != ? AND ${NOT_PUSHED}) AS unread,
               (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ? AND ${NOT_PUSHED}) AS latest_id
          FROM subscriptions s
-        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor`,
+        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
+          AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
     )
     .all(handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
