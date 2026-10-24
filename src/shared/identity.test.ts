@@ -125,6 +125,35 @@ describe("sessionIdentity", () => {
     }
   });
 
+  test("a repo with only an omp pin keeps the directory default: echo detection, not default naming", () => {
+    // The omp pin participates in isExplicitIdentity only (a BUS_IDENTITY
+    // re-delivering it stays derived). Default naming with no BUS_IDENTITY
+    // stays .mcp.json alone, as before this PR: a repo that pins only
+    // .omp/mcp.json keeps its directory-derived handles (#182 specifies
+    // default resolution further).
+    const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+    mkdirSync(at("repo", ".omp"), { recursive: true });
+    writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(ompPin));
+    try {
+      expect(sessionIdentity({}, at("repo", "src"))).toBe("repo");
+      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream");
+    } finally {
+      rmSync(at("repo", ".omp"), { recursive: true, force: true });
+    }
+  });
+
+  test("a user-scope BUS_IDENTITY is one name across worktrees: the collision is loud", () => {
+    // No repo pin: an env value from a user-level registration (claude mcp
+    // add -e, pi's user mcp.json) is a chosen task name, used verbatim in
+    // every worktree. Two worktree sessions then resolve to the same name;
+    // the second is refused at startup (identity_in_use / the local refusal),
+    // which keeps one live session per name instead of the silent push-loss
+    // the suffix used to paper over. #182 specifies an unbound start instead
+    // of a refusal; until it lands, the refusal is today's behavior.
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be");
+    expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "be-throughput"))).toBe("be");
+  });
+
   test("unset BUS_IDENTITY uses the repo's .mcp.json pin, worktrees included", () => {
     const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
     writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));

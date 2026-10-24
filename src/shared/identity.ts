@@ -110,6 +110,10 @@ export function resolveIdentity(base: string, cwd = process.cwd()): string {
  * a harness re-delivering that pin, not an explicit override — comparing
  * against the first pin alone would treat omp's own pin as explicit and
  * drop its worktree suffix, orphaning that handle's mail and claims.
+ *
+ * Echo detection only: `isExplicitIdentity` alone reads this. Default
+ * naming stays `pinnedIdentity`'s `.mcp.json` alone, unchanged from before
+ * the PR (#182 is where default resolution is specified further).
  */
 export function pinnedIdentities(cwd = process.cwd()): string[] {
   const pins: string[] = [];
@@ -126,11 +130,21 @@ export function pinnedIdentities(cwd = process.cwd()): string[] {
 }
 
 /**
- * The name pinned in the repo's `.mcp.json`, or omp's `.omp/mcp.json` when
- * only that one exists (mcpServers.grayboard.env.BUS_IDENTITY).
+ * The name pinned in the repo's `.mcp.json` (mcpServers.grayboard.env.
+ * BUS_IDENTITY); `.mcp.json` alone, as before this PR: a repo with only an
+ * omp pin keeps its directory-derived default. Harnesses disagree on
+ * whether a repo's `.mcp.json` beats a user-level entry (omp's user config
+ * wins), so grayboard reads the pin itself. Worktrees use the main
+ * checkout's file, since .mcp.json is usually untracked.
  */
 export function pinnedIdentity(cwd = process.cwd()): string | undefined {
-  return pinnedIdentities(cwd)[0];
+  try {
+    const file = join(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
+    const pin = JSON.parse(readFileSync(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    return typeof pin === "string" && pin ? pin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
