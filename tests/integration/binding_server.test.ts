@@ -290,11 +290,48 @@ test("audit 5: a bind whose hello_ok comes after its timeout completes, and the 
   expect(JSON.parse(texts[0]!).you).toBe(`${A}/fe`);
   expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after its result timed out. Bound to "fe" (was "old")`);
   expect(texts.slice(1).join(" ")).toContain(`Your claims moved from "old" to "fe": ticket:ENG-142.`);
+  // For adapters, which keep the instructions in the system prompt.
+  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
   // The old connection is closed, and fe stays this session's.
   await Bun.sleep(300);
   expect(events("fe").at(-1)!.event).toBe("moved");
   expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
 }, 30_000);
+
+test("audit 11: a call issued during a bind waits for it, and runs as the new name", async () => {
+  // fe's holder never answers the probe, so the bind takes probeMs (2s).
+  const silent = srv.client(alice, "fe", { pong: false });
+  expect((await silent.connect()).type).toBe("hello_ok");
+  const s = await session("old");
+  const order: string[] = [];
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe" } }).then((r) => (order.push("bind"), r));
+  // The server is probing fe's holder: the bind's hello is in.
+  await silent.next((m) => m.type === "ping", 3000);
+  const take = s.c.callTool({ name: "claim_take", arguments: { key: "ticket:ENG-142", ttl_minutes: 60 } }).then((r) => (order.push("claim_take"), r));
+  expect((await bind).isError).toBeFalsy();
+  expect((await take).isError).toBeFalsy();
+  expect(order).toEqual(["bind", "claim_take"]);
+  expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe` }]);
+}, 20_000);
+
+test("audit 7: a bind cancelled before it completes still says so, with the instructions, in the next result", async () => {
+  const silent = srv.client(alice, "fe", { pong: false });
+  expect((await silent.connect()).type).toBe("hello_ok");
+  const s = await session("old");
+  const abort = new AbortController();
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe" } }, undefined, { signal: abort.signal });
+  await silent.next((m) => m.type === "ping", 3000);
+  abort.abort();
+  await expect(bind).rejects.toThrow();
+  await until(() => events("fe").some((e) => e.event === "moved"));
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(JSON.parse(texts[0]!).you).toBe(`${A}/fe`);
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe" (was "old")`);
+  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
+  // Only once.
+  expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
+}, 20_000);
 
 test("16, 18: raw hellos: create: false, lazy create, and a read-only connection's limits", async () => {
   await srv.api(alice, "POST", "/api/teams", { name: "eng" });

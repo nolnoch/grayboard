@@ -49,6 +49,7 @@ import { launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
+import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
@@ -246,9 +247,16 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
+// A bind that completed after it was cancelled, for the next tool result; it
+// carries the instructions too, as the bind's result would have, for adapters
+// that keep them in the system prompt.
+let missedBindNotice: string | null = null;
+let instructionsStale = false;
 const notices = (): string[] => {
   const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
   channelsNoticePending = false;
+  if (missedBindNotice) out.push(missedBindNotice);
+  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -257,21 +265,31 @@ const notices = (): string[] => {
 // sweep's delete makes each lapse post once.
 const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+const gate = new BindGate();
+mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
   const { name, arguments: args = {} } = req.params;
-  // An unbound session writes no handles row: it would join dm_send's roster.
-  if (bound) touchHandle(db, bound);
-  const r = await call(name, args as Record<string, any>);
+  const run = async () => {
+    // An unbound session writes no handles row: it would join dm_send's roster.
+    if (bound) touchHandle(db, bound);
+    return call(name, args as Record<string, any>, signal);
+  };
+  const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
+    await (name === "bind" ? gate.bind(run) : gate.call(run));
   expiry.arm();
+  // A cancelled call's result is dropped: its notices wait for the next one.
+  if (signal.aborted) return r;
   const extra = notices();
-  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  const out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  if (!instructionsStale || out.structuredContent || !bound) return out;
+  instructionsStale = false;
+  return { ...out, structuredContent: { name: bound, instructions: boundInstructions(bound, true) } };
 });
 
-async function call(name: string, args: Record<string, any>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+async function call(name: string, args: Record<string, any>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
   const bad = checkArgs(LOCAL_TOOLS, name, args);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
-    return await dispatch(name, args);
+    return await dispatch(name, args, signal);
   } catch (err) {
     if (err instanceof CoreError) {
       return { ...text(`error: ${err.message}`), isError: true };
@@ -280,8 +298,8 @@ async function call(name: string, args: Record<string, any>): Promise<{ content:
   }
 }
 
-async function dispatch(name: string, a: Record<string, any>) {
-  if (name === "bind") return bind(a);
+async function dispatch(name: string, a: Record<string, any>, signal: AbortSignal) {
+  if (name === "bind") return bind(a, signal);
   if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
   // Unbound reads go as this session's viewer handle: "~" handles are never
   // identities and own no subscriptions, so a read advances no cursor.
@@ -495,15 +513,13 @@ let stopListening = () => {};
 // moved to it); only then does the old name's socket close. Drains stop for
 // the swap, so a DM to the old name is either delivered under it before the
 // swap or stays queued for its next holder; never consumed under the new one.
-let binding = false;
-async function bind(a: Record<string, any>) {
+// It runs behind the gate, so no tool call overlaps it (#182 audit 11).
+async function bind(a: Record<string, any>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
   const n = normalizeIdentityName(String(a.name));
   if (!n.ok) return fail(n.error);
   if (n.name === bound) return text(`already bound to "${n.name}"`);
-  if (binding) return fail("another bind is in progress");
-  binding = true;
   swapping = true;
   try {
     await inflight;
@@ -530,10 +546,15 @@ async function bind(a: Record<string, any>) {
       throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
     }
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    return bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => boundInstructions(n.name, general));
+    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => boundInstructions(n.name, general));
+    // A cancelled call's result is dropped (pi and opencode cancel on abort).
+    if (signal.aborted) {
+      missedBindNotice = `bind("${n.name}") completed after it was cancelled. ${ok.content[0]!.text}`;
+      instructionsStale = true;
+    }
+    return ok;
   } finally {
     swapping = false;
-    binding = false;
     if (DELIVER && bound) onWake();
   }
 }

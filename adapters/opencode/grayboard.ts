@@ -282,12 +282,12 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
           await c.ready;
           const result = (await c.call("tools/call", { name: t.name, arguments: args }, ctx.abort)) as CallResult;
           const text = (result.content ?? []).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
+          // A result carries the instructions when the name changed (#182
+          // decision 13): bind's, or the next one after a bind whose result
+          // was lost (cancelled, timed out) or a lost name. Errors included.
+          if (result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           // A thrown error is opencode's tool error.
           if (result.isError) throw new Error(text || `MCP tool ${SERVER}/${t.name} returned an error`);
-          // bind's result carries the bound name's instructions (#182 decision 13).
-          if (t.name === "bind" && result.structuredContent?.instructions) {
-            instructions = result.structuredContent.instructions.join(" ");
-          }
           return text;
         },
       }),

@@ -21,6 +21,7 @@ import { launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../local/wakeup.ts";
 import { testPause } from "../shared/testpause.ts";
+import { BindGate } from "../shared/bindgate.ts";
 import { BOARD_INSTRUCTIONS, boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
@@ -127,8 +128,15 @@ let client: GrayboardClient | null = null;
 let readsUnavailable: string | null = null;
 // Why this session lost its name, for the next tool result.
 let lostNotice: string | null = null;
-// A bind that completed after its result timed out, for the next tool result.
-let lateBindNotice: string | null = null;
+// A bind whose result never reached the agent (it timed out, or was
+// cancelled) but that completed, for the next tool result.
+let missedBindNotice: string | null = null;
+// The name changed without a bind result saying so (a missed bind, a lost
+// name): the next tool result carries the instructions for the name now, as
+// a bind result does, for adapters that keep them in the system prompt.
+let instructionsStale = false;
+// The hello_ok of the bound connection, for its instructions.
+let boundHello: HelloOk | null = null;
 
 // A connection for `identity` (null: read-only). Its pushes go to the agent
 // only while it's live; a client that's been replaced or refused is dead and
@@ -167,6 +175,7 @@ function lost(c: GrayboardClient, reason: string): void {
   if (bound === null) return;
   lostNotice = `This session lost its bus name "${bound}" (${reason}) and is unbound now: bind(name) to take a name again.`;
   bound = null;
+  instructionsStale = true;
   writeName(null);
 }
 
@@ -244,6 +253,7 @@ if (startName) {
   const r = await helloAs(startName, want?.ok ? { create: false, restoredFrom: rec!.session_id } : { create: true }).catch(fatal);
   if ("hello" in r) {
     hello = r.hello;
+    boundHello = r.hello;
     client = r.c;
     bound = startName;
   } else if (want?.ok) unboundNotes.push(restoreNote(startName, r.refused.message));
@@ -328,23 +338,35 @@ const notices = (): string[] => {
   channelsNoticePending = false;
   if (lostNotice) out.push(lostNotice);
   lostNotice = null;
-  if (lateBindNotice) out.push(lateBindNotice);
-  lateBindNotice = null;
+  if (missedBindNotice) out.push(missedBindNotice);
+  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+const gate = new BindGate();
+server.setRequestHandler(CallToolRequestSchema, async (req, { signal }) => {
   const { name, arguments: args = {} } = req.params;
-  const r = await call(name, args as Record<string, unknown>);
+  const run = () => call(name, args as Record<string, unknown>, signal);
+  const r: { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: unknown } =
+    await (name === "bind" ? gate.bind(run) : gate.call(run));
+  // A cancelled call's result is dropped: its notices wait for the next one.
+  if (signal.aborted) return r;
   const extra = notices();
-  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
+  const out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
+  if (!instructionsStale || out.structuredContent) return out;
+  instructionsStale = false;
+  return { ...out, structuredContent: { name: bound, instructions: currentInstructions() } };
 });
 
-async function call(name: string, a: Record<string, unknown>) {
+// The full instructions for the name this session holds now.
+const currentInstructions = (): string[] =>
+  bound && boundHello ? boundInstructions(bound, boundHello, true) : [unboundInstruction([], [])];
+
+async function call(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   const bad = checkArgs(SERVER_TOOLS, name, a);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
-  if (name === "bind") return bind(a);
+  if (name === "bind") return bind(a, signal);
   if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
   try {
     const client = await connection();
@@ -522,18 +544,17 @@ async function connection(): Promise<GrayboardClient> {
 // marked dead and closed, so it can't reconnect and re-register the old name.
 // A DM pushed to the old connection after that is never acked: it stays
 // queued for the old name's next holder, never consumed under the new one.
-// The server commits on its hello_ok, so a hello_ok after the result timed
-// out still completes the bind (#182 audit 5): the old name's claims have
-// moved, and the next tool result says so.
-let binding: string | null = null;
-async function bind(a: Record<string, unknown>) {
+// It runs behind the gate, so no tool call overlaps it. The server commits on
+// its hello_ok, so one that arrives after the result timed out still
+// completes the bind (#182 audit 5), and the gate holds other calls until it
+// does or LATE_MS passes.
+const LATE_MS = 30_000;
+async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
   const n = normalizeIdentityName(String(a.name));
   if (!n.ok) return fail(n.error);
   if (n.name === bound) return text(`already bound to "${n.name}"`);
-  if (binding) return fail(`a bind of "${binding}" is in progress`);
-  binding = n.name;
   const previous = bound;
   const next = connect(n.name, { push: DELIVER, create: a.create === true, ...(previous ? { from: previous } : {}) });
   let h: HelloOk;
@@ -542,38 +563,34 @@ async function bind(a: Record<string, unknown>) {
   } catch (e) {
     if (!(e instanceof HelloTimeout)) {
       next.close();
-      binding = null;
       return fail((e as Error).message);
     }
-    next.ready().then(
-      (late) => {
-        const r = switchTo(next, n.name, previous, late);
-        lateBindNotice = `bind("${n.name}") completed after its result timed out. ${r.content[0]!.text}`;
-      },
-      () => next.close(),
-    ).finally(() => {
-      binding = null;
-    });
+    const late = Promise.race([next.ready(), Bun.sleep(LATE_MS).then(() => Promise.reject(e))]);
+    gate.holdUntil(late.then((h) => switchTo(next, n.name, previous, h, "its result timed out"), () => next.close()));
     return fail(`${e.message}; the bind may still complete, and if it does, a later tool result says so`);
   }
-  try {
-    return switchTo(next, n.name, previous, h);
-  } finally {
-    binding = null;
-  }
+  // A cancelled call's result is dropped (pi and opencode cancel on abort).
+  return switchTo(next, n.name, previous, h, signal.aborted ? "it was cancelled" : null);
 }
 
 // The server accepted `next` for `name`: it's this session's connection now.
-function switchTo(next: GrayboardClient, name: string, previous: string | null, h: HelloOk) {
+// `missed`: why the agent never saw the bind's result.
+function switchTo(next: GrayboardClient, name: string, previous: string | null, h: HelloOk, missed: string | null) {
   testPause("bind:after-acquire");
   const old = client;
   client = next;
   bound = name;
+  boundHello = h;
   writeName(bound);
   lostNotice = null;
   old?.close();
-  console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}`);
-  return bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general));
+  console.error(`[grayboard] session ${SESSION_ID} bound "${name}"${previous ? ` (was "${previous}")` : ""}${missed ? ` after ${missed}` : ""}`);
+  const r = bindOk(name, previous, h.moved ?? [], (general) => boundInstructions(name, h, general));
+  if (missed) {
+    missedBindNotice = `bind("${name}") completed after ${missed}. ${r.content[0]!.text}`;
+    instructionsStale = true;
+  }
+  return r;
 }
 
 // ── start stdio transport ─────────────────────────────────────────────────────

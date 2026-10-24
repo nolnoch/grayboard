@@ -243,10 +243,10 @@ export default function grayboard(pi: ExtensionAPI) {
           if (result.isError && !content.some((b) => b.type === "text" && b.text)) {
             content.push({ type: "text", text: `MCP tool ${SERVER}/${tool.name} returned an error` });
           }
-          // bind's result carries the bound name's instructions (#182 decision 13).
-          if (tool.name === "bind" && !result.isError && result.structuredContent?.instructions) {
-            instructions = result.structuredContent.instructions.join(" ");
-          }
+          // A result carries the instructions when the name changed (#182
+          // decision 13): bind's, or the next one after a bind whose result
+          // was lost (cancelled, timed out) or a lost name. Errors included.
+          if (result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           return { content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true } : {}) };
         },
       });
