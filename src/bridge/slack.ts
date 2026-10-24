@@ -13,8 +13,10 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { busMode } from "../cli/api.ts";
-import { declareHuman, humanHandles } from "../core/boards.ts";
+import { humanHandles } from "../core/boards.ts";
+import { declareLocalHuman } from "../local/binding.ts";
 import { localDbPath, openLocalDb } from "../local/open.ts";
+import { sockDir } from "../local/wakeup.ts";
 import { ConfigError, configPath, loadConfig } from "./config.ts";
 import { Relay, type Bus, type ChannelParams } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
@@ -30,11 +32,11 @@ export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
 // The child's BUS_HUMAN=1 only asserts that its handle is the declared human,
 // so declare it here, on the human's side of the tool boundary: on first run
 // if nobody is declared, refused if someone else is.
-function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): void {
+async function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): Promise<void> {
   const db = openLocalDb(localDbPath(env));
   try {
     const humans = humanHandles(db);
-    if (humans.length === 0) declareHuman(db, handle);
+    if (humans.length === 0) await declareLocalHuman(db, handle, sockDir(env));
     else if (!humans.includes(handle)) {
       throw new ConfigError(`"${humans[0]}" is the declared human handle, but ${configPath(env)} says "${handle}"; fix one (grayboard human <handle>)`);
     }
@@ -59,7 +61,7 @@ export async function startSlackBridge(
     throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server, use its Slack app instead (grayboard slack link). To relay this machine's local bus instead, pass --mode local");
   }
   const cfg = loadConfig(env);
-  declareBridgeHuman(cfg.handle, env);
+  await declareBridgeHuman(cfg.handle, env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
   const app = new SlackWeb(cfg.appToken, cfg.apiUrl);
 

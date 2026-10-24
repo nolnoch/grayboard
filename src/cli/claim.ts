@@ -1,22 +1,66 @@
 // `grayboard claim take|release|watch` and `grayboard whoami`'s handle: a shell
-// or script acting as the handle its directory's agent session uses, so a claim
-// it takes is held by that session. Results are the claim tools' own JSON.
+// or script acting as the handle its agent session uses, so a claim it takes
+// is held by that session. Results are the claim tools' own JSON.
 // Exit 2 when the claim is held by someone else, like `grayboard claims`.
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { ApiError, busMode, loadCredentials, makeClient, signInHint } from "./api.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
-import { defaultIdentity, isExplicitIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
+import { defaultIdentity, gitLocation, isExplicitIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
+
+/** A live local session, as its bindings row records it (src/local/binding.ts). */
+export type LiveSession = { name: string | null; harness_pid: number | null; cwd: string | null };
+
+/** The local sessions alive now and this process's ancestors: what decides a local shell's name. */
+export type LocalView = { sessions: LiveSession[]; ancestors: number[] };
+
+// The checkout `cwd` is in: the repo plus its linked worktree, or the
+// directory itself outside git.
+function checkoutOf(cwd: string): string {
+  const loc = gitLocation(cwd);
+  if (loc) return loc.worktree ? `${loc.repo}\0${loc.worktree}` : loc.repo;
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
+}
+
+/**
+ * The live session this shell belongs to (#182 decision 18): the one whose
+ * harness is an ancestor of this process, else the one in this checkout. One
+ * harness can host several sessions (a launcher, a test runner); the checkout
+ * narrows those. None, several, or an unbound one refuses, pointing at --as:
+ * a claim on a guessed name would land on the wrong handle silently.
+ */
+export function boundSession(view: LocalView, cwd: string): { name: string; source: string } {
+  const here = checkoutOf(cwd);
+  const inHere = (r: LiveSession) => r.cwd !== null && checkoutOf(r.cwd) === here;
+  const mine = new Set(view.ancestors);
+  const under = view.sessions.filter((r) => r.harness_pid !== null && mine.has(r.harness_pid));
+  const pick = under.length > 1 ? under.filter(inHere) : under.length ? under : view.sessions.filter(inHere);
+  const source = under.length ? "the session this shell runs under" : "the session in this checkout";
+  if (pick.length === 0) throw new Error("no live session runs this shell or this checkout; pass --as <name>");
+  if (pick.length > 1) {
+    const names = pick.map((r) => r.name ?? "an unbound session").join(", ");
+    throw new Error(`${pick.length} live sessions could own this shell (${names}); pass --as <name>`);
+  }
+  const name = pick[0]!.name;
+  if (!name) throw new Error(`${source} hasn't bound a name yet; bind one there, or pass --as <name>`);
+  return { name, source };
+}
 
 /**
  * The identity this shell acts as, and which rule chose it. `as` is literal:
  * no worktree suffix. A true explicit BUS_IDENTITY (differs from every repo
- * pin) is literal too — the same rule sessions use (src/shared/identity.ts);
- * anything else — no BUS_IDENTITY, or one that merely re-delivers a pin —
- * is derived and keeps the worktree suffix, as sessions do.
+ * pin) is literal too — the same rule sessions use (src/shared/identity.ts).
+ * Otherwise, in local mode (`local` given), the live session this shell
+ * belongs to, since sessions bind their names (#182). Server mode has no
+ * local rows, so it keeps the derived rule: no BUS_IDENTITY, or one that
+ * merely re-delivers a pin, keeps the worktree suffix, as sessions did.
  */
-export function actingIdentity(as?: string, env = process.env, cwd = process.cwd()): { name: string; source: string } {
+export function actingIdentity(as?: string, env = process.env, cwd = process.cwd(), local?: LocalView): { name: string; source: string } {
   if (as !== undefined) {
     // Same rule the session itself resolves by (#181): lowercased, then
     // validated — so --as Gray acts as "gray", the handle both modes agree on.
@@ -29,6 +73,7 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
     if (!n.ok) throw new Error(n.error);
     return { name: n.name, source: "BUS_IDENTITY" };
   }
+  if (local) return boundSession(local, cwd);
   const pin = pinnedIdentity(cwd);
   // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin, as in
   // sessionIdentity — with `??` it skipped the pin and changed the handle.
@@ -36,6 +81,26 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
   const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
   const name = resolveIdentity(base, cwd);
   return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"` };
+}
+
+// The local bus's live sessions; none when no session has created the bus.
+async function localView(): Promise<LocalView> {
+  const { ancestors } = await import("../local/proc.ts");
+  const { localDbPath, openLocalDb } = await import("../local/open.ts");
+  if (!existsSync(localDbPath())) return { sessions: [], ancestors: ancestors() };
+  const { liveSessions } = await import("../local/binding.ts");
+  const db = openLocalDb();
+  try {
+    return { sessions: liveSessions(db), ancestors: ancestors() };
+  } finally {
+    db.close();
+  }
+}
+
+/** actingIdentity for this process, reading the local bus's sessions when the rule needs them. */
+export async function actingName(as?: string, mode = busMode()): Promise<{ name: string; source: string }> {
+  const needsLocal = mode === "local" && as === undefined && !isExplicitIdentity();
+  return actingIdentity(as, process.env, process.cwd(), needsLocal ? await localView() : undefined);
 }
 
 /** The bus handle for `name`: as-is in local mode, `<email>/<name>` (lowercased, as the server stores it) in server mode. */
@@ -79,7 +144,7 @@ export async function runClaimTool(tool: ClaimTool, args: Record<string, unknown
   let result: unknown;
   try {
     const mode = busMode();
-    const { name } = actingIdentity(opts.as);
+    const { name } = await actingName(opts.as, mode);
     result = mode === "server" ? await serverCall(name, tool, args) : await localCall(name, tool, args);
   } catch (e) {
     console.error(`[grayboard] ${tool.replace("_", " ")}: ${(e as Error).message}`);

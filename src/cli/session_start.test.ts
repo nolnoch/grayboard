@@ -6,27 +6,24 @@ import { installSessionStartHook, sessionStartOutput } from "./session_start.ts"
 
 const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
 
-test("the title is the handle grayboard mcp would claim for the hook's cwd", () => {
+test("only an explicit BUS_IDENTITY titles the session: the rest start unbound (#182)", () => {
   const repo = join(mkdtempSync(join(tmpdir(), "gb-ss-")), "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
-  expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), {}))).toBe("api");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBe("");
   expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "be" }))).toBe("be");
+  // A pin, alone or re-delivered as BUS_IDENTITY, is a candidate, not a binding.
   writeFileSync(join(repo, ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "fe" } } } }));
-  expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), {}))).toBe("fe");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBe("");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "fe" })).toBe("");
 });
 
-test("a linked worktree's handle follows the explicit-identity rule", () => {
+test("an explicit BUS_IDENTITY titles a linked worktree verbatim: no suffix", () => {
   const root = mkdtempSync(join(tmpdir(), "gb-ss-"));
   mkdirSync(join(root, "api", ".git", "worktrees", "stream"), { recursive: true });
   const wt = join(root, "stream");
   mkdirSync(wt);
   writeFileSync(join(wt, ".git"), `gitdir: ${join(root, "api", ".git", "worktrees", "stream")}\n`);
   writeFileSync(join(root, "api", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
-  // A BUS_IDENTITY equal to the pin is derived: the suffix composes, so
-  // an existing worktree handle ("be-stream") keeps its title, mail, claims.
-  expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "be" }))).toBe("be-stream");
-  // An explicit BUS_IDENTITY (differs from the pin) is verbatim: no suffix,
-  // so a worktree session joins that identity instead of forking a look-alike.
   expect(title(sessionStartOutput(JSON.stringify({ cwd: wt }), { BUS_IDENTITY: "sim" }))).toBe("sim");
 });
 
@@ -69,7 +66,7 @@ test("the CLI command reads the hook input from stdin", () => {
   mkdirSync(join(repo, ".git"), { recursive: true });
   const r = Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "session-start"], {
     stdin: new TextEncoder().encode(JSON.stringify({ cwd: repo, source: "startup" })),
-    env: { ...process.env, BUS_IDENTITY: "" },
+    env: { ...process.env, BUS_IDENTITY: "web" },
   });
   expect(title(r.stdout.toString())).toBe("web");
 });

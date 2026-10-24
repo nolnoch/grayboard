@@ -40,7 +40,7 @@ function validKey(key: string): string {
   return k;
 }
 
-type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
+type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire" | "moved";
 
 // One claim_events row; callers are inside the claim's transaction.
 function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
@@ -127,6 +127,17 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     const board = cur.board && canSeeBoard(db, handle, cur.board) ? cur.board : null;
     return { wake: announce(db, handle, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`) };
   }).immediate();
+}
+
+// A session that rebinds takes its claims to the new name (#182): renew and
+// release compare the holder, so claims left on the old name could be neither
+// renewed nor released by the session doing the work. Runs inside the
+// caller's transaction (the bind's), so the claims move with the name. Each
+// move is a "moved" event under the new holder, held_by naming the old one.
+export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {
+  const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
+  for (const c of moved) logEvent(db, "moved", to, c, now, from);
+  return moved;
 }
 
 // Be told when someone else's claim is updated or ends, whatever your mode on

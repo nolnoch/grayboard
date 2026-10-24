@@ -131,12 +131,17 @@ export function startSession(db: Database, handle: string, cwd: string | null, n
     .run(cwd, handle);
 }
 
-/** Make `handle` the one declared human handle (`grayboard human`). */
-export function declareHuman(db: Database, handle: string): void {
+/**
+ * Make `handle` the one declared human handle (`grayboard human`). `guard`
+ * runs first inside the same write transaction and throws to refuse: local
+ * mode checks there that no live agent session holds the handle (#79).
+ */
+export function declareHuman(db: Database, handle: string, guard?: () => void): void {
   db.transaction(() => {
+    guard?.();
     touchHandle(db, handle);
     db.prepare(`UPDATE handles SET human = (name = ?)`).run(handle);
-  })();
+  }).immediate();
 }
 
 /** Server mode: one handle per linked user is a human; set or clear one. */
@@ -520,7 +525,11 @@ export type Peer = {
 // identity can have. They aren't agents: keep them out of the roster.
 export const isViewer = (handle: string): boolean => handle.startsWith("~");
 
-export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
+// A live session with no name yet (#182): shown so the user and other agents
+// see what's running, never messageable, so it has no handle.
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; self?: true };
+
+export type WhoResult = { you: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The roster: every handle that has connected (the `handles` table), or a
 // board's subscribers. `online` comes from the mode: a live session that will
@@ -530,6 +539,7 @@ export function who(
   handle: string,
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
+  unbound: UnboundPeer[] = [],
 ): WhoResult {
   type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null };
   let rows: Row[];
@@ -564,10 +574,12 @@ export function who(
       ...(r.human ? { human: true as const } : {}),
     };
   });
-  if (opts.include_offline) return { you: handle, peers: all };
+  // Unbound sessions subscribe to nothing, so a board's roster has none.
+  const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
+  if (opts.include_offline) return { you: handle, peers: all, ...sessions };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
-  return { you: handle, peers, ...(hidden ? { offline_hidden: hidden } : {}) };
+  return { you: handle, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
 // When a handle last had a session, or null if it never connected.
@@ -786,6 +798,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
+    db.prepare(`DELETE FROM binding_events WHERE at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();
 }

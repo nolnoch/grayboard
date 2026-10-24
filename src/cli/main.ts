@@ -214,10 +214,10 @@ program
   .command("whoami")
   .description("Show the handle this shell acts as; in server mode, also your user and identities")
   .action(async () => {
-    const { actingIdentity, busHandle } = await import("./claim.ts");
+    const { actingName, busHandle } = await import("./claim.ts");
     let acting;
     try {
-      const { name, source } = actingIdentity(globalAs());
+      const { name, source } = await actingName(globalAs());
       acting = { handle: busHandle(name), source };
     } catch (e) { console.error(`[grayboard] whoami: ${(e as Error).message}`); process.exit(1); }
     if (busMode() === "local") {

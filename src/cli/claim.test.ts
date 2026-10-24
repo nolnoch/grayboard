@@ -17,7 +17,7 @@ beforeAll(() => {
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-describe("actingIdentity", () => {
+describe("actingIdentity: --as, an explicit BUS_IDENTITY, and server mode's derived rule", () => {
   test("--as is literal: no worktree suffix", () =>
     expect(actingIdentity("sim", {}, at("repo", ".wt", "stream"))).toEqual({ name: "sim", source: "--as" }));
 
@@ -89,5 +89,39 @@ describe("actingIdentity", () => {
     // A name invalid after lowercasing refuses, with the reason.
     expect(() => actingIdentity("Gray!", {}, at("repo", "src"))).toThrow(/invalid --as "Gray!"/);
     expect(() => actingIdentity(undefined, { BUS_IDENTITY: "Gray!" }, at("repo", "src"))).toThrow(/invalid identity name/);
+  });
+});
+
+describe("the local rule: the shell's bound session (#182 decision 18)", () => {
+  const row = (name: string | null, harness_pid: number | null, ...cwd: string[]) => ({ name, harness_pid, cwd: at(...cwd) });
+
+  test("the session whose harness is an ancestor, wherever it runs", () => {
+    const view = { sessions: [row("eng-142", 40, "repo"), row("other", 50, "repo", "src")], ancestors: [99, 40, 7] };
+    expect(actingIdentity(undefined, {}, at("repo", "src"), view)).toEqual({ name: "eng-142", source: "the session this shell runs under" });
+  });
+
+  test("several under one harness: the checkout narrows them; a linked worktree is its own checkout", () => {
+    const view = { sessions: [row("main", 40, "repo"), row("stream", 40, "repo", ".wt", "stream")], ancestors: [40] };
+    expect(actingIdentity(undefined, {}, at("repo", "src"), view).name).toBe("main");
+    expect(actingIdentity(undefined, {}, at("repo", ".wt", "stream", "src"), view).name).toBe("stream");
+  });
+
+  test("no ancestor match: the one session in this checkout", () => {
+    const view = { sessions: [row("main", 40, "repo", "src"), row("stream", 41, "repo", ".wt", "stream")], ancestors: [99] };
+    expect(actingIdentity(undefined, {}, at("repo"), view)).toEqual({ name: "main", source: "the session in this checkout" });
+  });
+
+  test("none, several, or an unbound one refuses and points at --as", () => {
+    const two = { sessions: [row("a", 40, "repo"), row("b", 41, "repo", "src")], ancestors: [99] };
+    expect(() => actingIdentity(undefined, {}, at("repo"), two)).toThrow(/2 live sessions could own this shell \(a, b\); pass --as/);
+    expect(() => actingIdentity(undefined, {}, at("repo"), { sessions: [], ancestors: [] })).toThrow(/no live session.*pass --as/);
+    const unbound = { sessions: [row(null, 40, "repo")], ancestors: [40] };
+    expect(() => actingIdentity(undefined, {}, at("repo"), unbound)).toThrow(/hasn't bound a name yet/);
+  });
+
+  test("--as and an explicit BUS_IDENTITY still win", () => {
+    const view = { sessions: [row("eng-142", 40, "repo")], ancestors: [40] };
+    expect(actingIdentity("sim", {}, at("repo"), view).name).toBe("sim");
+    expect(actingIdentity(undefined, { BUS_IDENTITY: "sim" }, at("repo"), view).name).toBe("sim");
   });
 });
