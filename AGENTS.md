@@ -28,6 +28,7 @@ Install once per clone: `git config core.hooksPath scripts/hooks`. `scripts/hook
 - Commit and PR subjects carry the issue key; conventional prefixes (`feat:`, `fix:`, `chore:`…) on commits and PR titles.
 - Issues and PRs open with the concise front — the problem, the value of solving it, the proposed solution — 2–5 bullets each; verbose detail after, for agents. Templates live in `.github/`; the filer applies the surface label (server, local, core, cli, adapters, bridge, ci).
 - Reviews block on medium-and-up findings; file lower ones as `follow-up` issues rather than chasing them in review rounds. A PR merges when each in-scope item is fixed or deferred to a filed issue.
+- Issues with a human audience get a Jira render, generated with `scripts/jira-format.mjs` from the issue's spec; the Jira ticket is a render, not the spec — the GitHub issue stays the source of truth.
 - Jira tickets lead with the same concise front — the problem, the value, the solution — 2–5 bullets each; verbose detail after.
 
 ## Load-bearing gotchas
