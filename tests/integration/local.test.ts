@@ -126,7 +126,8 @@ test("grayboard mcp: local mode when signed out, named after the repo", async ()
   // No BUS_IDENTITY: unbound, the repo's name its first candidate (#182).
   const api = await start(undefined, repo, ["mcp"]);
   const be = await start("be", dir, ["mcp"]);
-  expect(api.getInstructions()).toContain("Candidates (free now): api (this checkout's default:");
+  // api has never existed: the candidate says binding it needs create.
+  expect(api.getInstructions()).toContain("Candidates (free now): api (this checkout's default: new: bind with create: true)");
   await call(api, "bind", { name: "api", create: true });
   expect((await call(api, "peer_list")).you).toBe("api");
   expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);

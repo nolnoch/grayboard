@@ -109,9 +109,13 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   await until(async () => (await be.call("peer_list", {})).unbound_sessions === undefined);
 }, 30_000);
 
-test("15: an unbound exit removes its name record; a bound exit keeps it for a restart", async () => {
+test("13, 15: a never-used default is offered as new; an unbound exit removes its name record, a bound exit keeps it", async () => {
   const records = join(srv.dir, "home", ".claude-bus");
-  const u = await session(null);
+  const repo = join(srv.dir, "web");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const u = await session(null, { cwd: repo });
+  // 13: web has never existed: the candidate says binding it needs create.
+  expect(u.c.getInstructions()).toContain("Candidates (free now): web (this checkout's default: new: bind with create: true)");
   expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(true);
   await stop(u.c);
   expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(false);

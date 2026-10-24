@@ -38,7 +38,8 @@ export const BIND_TOOL = {
   },
 };
 
-export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true };
+// `fresh`: the name has never existed, so binding it needs create: true.
+export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true };
 
 /** What a name has waiting, for ranking candidates. */
 export type NameStats = { name: string; queued: number; claims: number; last_seen: number; where: string | null };
@@ -52,10 +53,12 @@ export type NameStats = { name: string; queued: number; claims: number; last_see
 export function orderCandidates(pool: NameStats[], suggested: string | null): Candidate[] {
   const work = (s: NameStats) => s.queued + s.claims;
   const rest = pool.filter((s) => s.name !== suggested).sort((a, b) => work(b) - work(a) || b.last_seen - a.last_seen);
-  const first = suggested === null ? [] : [{ ...(pool.find((s) => s.name === suggested) ?? { name: suggested, queued: 0, claims: 0, where: null }), suggested: true as const }];
+  const known = suggested === null ? undefined : pool.find((s) => s.name === suggested);
+  const first = suggested === null ? [] : [{ ...(known ?? { name: suggested, queued: 0, claims: 0, where: null, fresh: true as const }), suggested: true as const }];
   return [...first, ...rest].map((s) => ({
     name: s.name, queued: s.queued, claims: s.claims, where: s.where,
     ...("suggested" in s ? { suggested: true as const } : {}),
+    ...("fresh" in s ? { fresh: true as const } : {}),
   }));
 }
 
@@ -63,7 +66,9 @@ export function orderCandidates(pool: NameStats[], suggested: string | null): Ca
 export const MAX_CANDIDATES = 5;
 
 function describe(c: Candidate): string {
-  const parts = [`${c.queued} queued DM${c.queued === 1 ? "" : "s"}`, `${c.claims} claim${c.claims === 1 ? "" : "s"}`];
+  const parts = c.fresh
+    ? ["new: bind with create: true"]
+    : [`${c.queued} queued DM${c.queued === 1 ? "" : "s"}`, `${c.claims} claim${c.claims === 1 ? "" : "s"}`];
   if (c.where) parts.push(`last in ${c.where}`);
   return `${c.name} (${c.suggested ? "this checkout's default: " : ""}${parts.join(", ")})`;
 }
