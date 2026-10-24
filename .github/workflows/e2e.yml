@@ -1,0 +1,96 @@
+name: E2E
+
+# The slow and release-gating e2e suites, through scripts/e2e.sh: nightly, by
+# hand, and from release.yml before a release publishes. A scheduled run that
+# fails opens (or comments on) one tracking issue per suite.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite to run"
+        type: choice
+        options: [upgrade-matrix]
+        default: upgrade-matrix
+  workflow_call:
+    inputs:
+      suite:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix"]' || format('["{0}"]', inputs.suite)) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+
+      - name: Run ${{ matrix.suite }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # lifts the releases API's anonymous rate limit
+          GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
+          SUITE: ${{ matrix.suite }}
+        run: scripts/e2e.sh "$SUITE"
+
+      - name: Upload run dir
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: e2e-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-run
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Its own job, so the tests never run with a token that can write issues.
+  # scripts/e2e.sh leaves its verdict in the run dir's `result`; a run that
+  # left none (it failed before the suite ran) counts as failed.
+  tracking-issue:
+    name: Tracking issue ${{ matrix.suite }}
+    needs: e2e
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ["upgrade-matrix"]   # the schedule's suites, as in e2e's matrix
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        continue-on-error: true
+        with:
+          name: e2e-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: run
+
+      - name: Open or comment on the tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SUITE: ${{ matrix.suite }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          result="$(cat run/result 2>/dev/null || echo "failed: no result (the job failed before the suite finished)")"
+          case "$result" in passed*) echo "$result"; exit 0 ;; esac
+          title="Nightly e2e failing: $SUITE"
+          body="Nightly \`scripts/e2e.sh $SUITE\` on ${SHA:0:7}: $result. $RUN_URL (the run dir is attached as an artifact for 7 days)."
+          issue="$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

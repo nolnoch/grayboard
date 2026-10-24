@@ -456,10 +456,10 @@ Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. I
 ```bash
 curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
   | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-curl -s https://grayboard.example.com/healthz   # "version" is the new release
+scripts/deploy_check.sh https://grayboard.example.com v1.11.0   # from a checkout, anywhere
 ```
 
-The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. The `curl` above repeats the check through Caddy.
+The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v1.1.3` after `sudo`. Clients reconnect on their own after the restart, which drops them for a few seconds. `scripts/deploy_check.sh` repeats the check from outside the host, through Caddy: it exits 1 unless `/healthz` answers ok with the release you name.
 
 ### Per-developer setup (one-time)
 
@@ -472,7 +472,7 @@ grayboard setup --server https://grayboard.example.com
 
 `setup` signs you in through your browser and registers grayboard with Claude Code (and omp, opencode, and pi, if they're installed). The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
 
-`install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.1.3`.
+`install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.1.3`. To install from a mirror, set `GRAYBOARD_RELEASES_URL=https://mirror.example.com` to one origin that serves GitHub's release paths (`/<repo>/releases/latest` and `/<repo>/releases/download/<tag>/<asset>`); `grayboard update` honours it too and also needs the API path `/repos/<repo>/releases/latest` there. The origin must be `https://` (plain `http://` only to this machine: `localhost`, `127.0.0.1` or `[::1]`), and an empty value means GitHub.
 
 <details>
 <summary>Alternative: source-tree install (for hacking on grayboard itself)</summary>

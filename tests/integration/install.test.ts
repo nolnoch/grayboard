@@ -54,7 +54,7 @@ function writeStub(name: string, body: string) {
   chmodSync(p, 0o755);
 }
 
-type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number };
+type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string };
 
 function install(s: Scenario) {
   const p = Bun.spawnSync(["bash", INSTALL], {
@@ -68,6 +68,7 @@ function install(s: Scenario) {
       STUB_STATE: s.state ?? "active",
       STUB_HEALTH: s.health ?? "ok",
       STUB_RESTART_RC: String(s.restartRc ?? 0),
+      ...(s.releasesUrl !== undefined ? { GRAYBOARD_RELEASES_URL: s.releasesUrl } : {}),
     },
   });
   return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
@@ -129,4 +130,19 @@ test("with no unit, the installer gives first-install steps and restarts nothing
   expect(r.code).toBe(0);
   expect(r.out).toContain("no grayboard systemd unit found");
   expect(restarts()).toBe(0);
+});
+
+test("GRAYBOARD_RELEASES_URL: http only to this machine, trailing slashes dropped, empty means GitHub", () => {
+  const refused = install({ releasesUrl: "http://mirror.example.com" });
+  expect(refused.code).toBe(1);
+  expect(refused.err).toContain("GRAYBOARD_RELEASES_URL must be https (or http to localhost): http://mirror.example.com");
+  expect(existsSync(join(dir, "healthz.log"))).toBe(false);
+
+  const local = install({ releasesUrl: "http://127.0.0.1:8080//" });
+  expect(local.code).toBe(0);
+  expect(local.out).toMatch(/downloading http:\/\/127\.0\.0\.1:8080\/[^/]+\/[^/]+\/releases\/download\/v9\.9\.9\//);
+
+  const empty = install({ releasesUrl: "" });
+  expect(empty.code).toBe(0);
+  expect(empty.out).toContain("downloading https://github.com/");
 });

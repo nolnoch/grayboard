@@ -5,26 +5,58 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@v7.0.1
         with:
-          bun-version: 1.4.4
+          persist-credentials: false
 
-      # The pi end-to-end test runs the real pi CLI, which needs Node >= 22.19.
-      - uses: actions/setup-node@v7
+      - uses: ./.github/actions/setup
         with:
-          node-version: lts/*
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+          node: "true"
+          release-cache: "true"
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
         run: bun run typecheck
 
       - name: Test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
         run: bun test
+
+  # deploy/grayboard.service as systemd reads it. verify also checks that the
+  # user, env file and binary it names exist, so stand-ins go in first. It
+  # exits 0 on some warnings, so any output about our unit fails the job;
+  # lines about the runner's own units (/usr/lib, /lib, /etc/systemd) don't.
+  # A copy with an unknown key must fail, so the lint can't go quiet.
+  deploy-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: systemd-analyze verify
+        run: |
+          sudo useradd --system grayboard
+          sudo install -D -m 600 /dev/null /etc/grayboard/env
+          sudo install -m 755 /bin/true /usr/local/bin/grayboard-server
+          lint() {
+            local out code=0
+            out="$(systemd-analyze verify "$1" 2>&1)" || code=$?
+            out="$(printf '%s\n' "$out" | grep -v -E '^/(usr/lib|lib|etc)/systemd/' || true)"
+            [ -n "$out" ] && printf '%s\n' "$out"
+            [ "$code" -eq 0 ] && [ -z "$out" ]
+          }
+          lint deploy/grayboard.service
+          bad="$RUNNER_TEMP/grayboard.service"
+          sed 's/^Restart=always$/Restart=always\nRestartBogus=1/' deploy/grayboard.service > "$bad"
+          grep -q RestartBogus "$bad"
+          if lint "$bad"; then echo "::error::the lint passed a unit with an unknown key"; exit 1; fi

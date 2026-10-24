@@ -4,10 +4,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
-import { serverEnv } from "./env.ts";
+import { cleanEnv, serverEnv } from "./env.ts";
 import { mcpSession, type Session } from "./mcp.ts";
 import { WsClient, type WsClientOptions } from "./ws_client.ts";
 
@@ -28,6 +29,13 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
   };
 }
 
+// A dev-auth session token for `email` on the server at `base`.
+export async function devLogin(base: string, email: string): Promise<string> {
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
+  return ((await r.json()) as { session_token: string }).session_token;
+}
+
 export class TestServer {
   readonly app: ReturnType<typeof startServer>;
   readonly base: string;
@@ -42,11 +50,8 @@ export class TestServer {
     this.base = `http://localhost:${this.app.server.port}`;
   }
 
-  // A dev-auth session token for `email`.
-  async login(email: string): Promise<string> {
-    const r = await fetch(`${this.base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
-    if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
-    return ((await r.json()) as { session_token: string }).session_token;
+  login(email: string): Promise<string> {
+    return devLogin(this.base, email);
   }
 
   async api(token: string, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
@@ -85,5 +90,77 @@ export class TestServer {
     for (const c of this.clients.splice(0)) c.close();
     this.app.stop();
     rmSync(this.dir, { recursive: true, force: true });
+  }
+}
+
+// A compiled grayboard-server (a release, or the build under test) as its own
+// process: dev auth, port 0, its DB at `dbPath` and its blobs beside it. Ready
+// once it prints the port it listens on. Its stdout and stderr are drained
+// into one log as they arrive, so it never blocks on a full pipe and log()
+// mid-run has both.
+export class ServerProcess {
+  private constructor(
+    readonly proc: Subprocess<"ignore", "pipe", "pipe">,
+    readonly base: string,
+    private readonly out: { text: string },
+    private readonly drained: Promise<unknown>,
+  ) {}
+
+  static async start(bin: string, dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
+    const proc = Bun.spawn([bin], {
+      env: cleanEnv({ GRAYBOARD_DEV_AUTH: "1", GRAYBOARD_DB_PATH: dbPath, GRAYBOARD_PUBLIC_URL: "http://localhost", GRAYBOARD_HTTP_PORT: "0", ...extra }),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = { text: "" };
+    const drain = async (stream: ReadableStream<Uint8Array>) => {
+      const decoder = new TextDecoder();
+      for await (const chunk of stream) out.text += decoder.decode(chunk, { stream: true });
+      out.text += decoder.decode();
+    };
+    const drained = Promise.all([drain(proc.stdout), drain(proc.stderr)]);
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, 10_000);
+    const exited = proc.exited.then((code) => ({ code }));
+    try {
+      for (;;) {
+        const port = /listening on port (\d+)\n/.exec(out.text)?.[1];
+        if (port) return new ServerProcess(proc, `http://localhost:${port}`, out, drained);
+        const done = await Promise.race([exited, Bun.sleep(20)]);
+        if (done) {
+          await drained;
+          throw new Error(timedOut ? `${bin} didn't listen within 10 s; killed\n${out.text}` : `${bin} exited before listening (code ${done.code})\n${out.text}`);
+        }
+      }
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
+  // Everything it has printed so far, stdout and stderr interleaved.
+  log(): string {
+    return this.out.text;
+  }
+
+  login(email: string): Promise<string> {
+    return devLogin(this.base, email);
+  }
+
+  // SIGTERM runs the server's own shutdown (it doesn't close its database,
+  // #168: a copy needs the -wal and -shm files beside it); SIGKILL after 5 s.
+  // Resolves once it has exited and its output is all in log().
+  async stop(): Promise<void> {
+    this.proc.kill("SIGTERM");
+    const force = setTimeout(() => this.proc.kill("SIGKILL"), 5_000);
+    try {
+      await this.proc.exited;
+      await this.drained;
+    } finally {
+      clearTimeout(force);
+    }
   }
 }

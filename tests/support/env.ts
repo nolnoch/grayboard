@@ -4,15 +4,17 @@ import { join } from "node:path";
 // Variables a developer's shell (or a grayboard-launched session) may carry
 // that would point a test's child at real state or a real identity: every
 // grayboard, bus and Slack setting, and the config-directory overrides that
-// would send `setup` and the hooks past the temp HOME.
+// would send `setup` and the hooks past the temp HOME. And CI's GitHub token,
+// which the test process uses to list releases and no child needs (they
+// include old release binaries, install.sh and pi's npm dependencies).
 const INHERITED = /^(BUS|GRAYBOARD|SLACK)_/;
-const CONFIG_DIRS = ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR"];
+const DROPPED = ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "GITHUB_TOKEN", "GH_TOKEN"];
 
 // This process's env without those, plus `extra`.
 export function cleanEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !INHERITED.test(k) && !CONFIG_DIRS.includes(k)) env[k] = v;
+    if (v !== undefined && !INHERITED.test(k) && !DROPPED.includes(k)) env[k] = v;
   }
   return { ...env, ...extra };
 }
