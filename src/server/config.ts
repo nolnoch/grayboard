@@ -2,7 +2,7 @@ import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
-import { DEFAULT_RETENTION_DAYS } from "../core/boards.ts";
+import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
 export type Config = {
   dbPath: string;
@@ -110,21 +110,22 @@ function requireEnv(name: string): string {
   return val;
 }
 
-// Retention days parse like local mode's BUS_RETENTION_DAYS (src/local/retention.ts):
-// a positive whole number of days, or unset for the default. NaN here would make
-// every `created_at < cutoff` false and silently prune nothing.
+// Retention days parse through the shared rule (src/core/boards.ts's parseRetentionDays,
+// the same one local mode's BUS_RETENTION_DAYS uses): a positive whole number of days, or
+// unset for the default — refusing to start otherwise. NaN here would make every
+// `created_at < cutoff` false and silently prune nothing.
 function retentionDays(name: string, raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw === "") return fallback;
-  if (!/^[1-9]\d*$/.test(raw)) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
-  return Number(raw);
+  const days = parseRetentionDays(raw, fallback);
+  if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
+  return days;
 }
 
-// Port 0 (an ephemeral port, what tests use) through 65535.
+// Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so
+// "1e3", "0x1F90" and " 8080 " don't slip through Number().
 function parsePort(raw: string | undefined): number {
   if (raw === undefined || raw === "") return 8080;
-  const port = Number(raw);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  if (!/^\d+$/.test(raw) || Number(raw) > 65535) {
     throw new Error(`GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "${raw}"`);
   }
-  return port;
+  return Number(raw);
 }

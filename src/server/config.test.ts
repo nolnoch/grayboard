@@ -88,6 +88,11 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "notaport"/);
     process.env.GRAYBOARD_HTTP_PORT = "70000";
     expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "70000"/);
+    // Number() would accept these; the digit gate refuses them like local's day rule.
+    for (const weird of ["1e3", "0x1F90", " 8080 ", "8080.0", "+8080", "-1"]) {
+      process.env.GRAYBOARD_HTTP_PORT = weird;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535/);
+    }
   });
 
   test("attachment caps have ceilings, and the per-user quota holds at least one message", () => {
