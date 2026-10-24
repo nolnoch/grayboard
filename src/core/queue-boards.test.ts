@@ -6,12 +6,13 @@ import {
   createBoard,
   pendingFor,
   post,
+  setAccess,
   setQueueParticipation,
   setStatus,
   subscribe,
   touchHandle,
 } from "./boards.ts";
-import { release, sweepExpired, listClaims } from "./claims.ts";
+import { claim, release, sweepExpired, listClaims } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -151,6 +152,65 @@ test("a read-only viewer is never picked by the rotation", () => {
   subscribe(db, "~tail", "work", "push");
   const r = post(db, "be", "work", "work item");
   expect(r.wake).not.toContain("~tail");
+});
+
+test("claim_take refuses the reserved queue: keyspace", () => {
+  // Only the queue machinery mints queue: keys - claimQueuePost, against a
+  // post that exists on a board the lane can see. A public take would squat
+  // a future post's delivery claim: the audit would record a delivery that
+  // never happened, and the lane's reply-ack would fail (#192 review).
+  expect(() => claim(db, "sim", claimKey(999))).toThrow(/queue:/);
+  // The refusal is unconditional, so a key on a board the caller can't see
+  // is closed at the same entry point - visibility never even comes into it.
+  expect(() => claim(db, "sim", "queue:secret:1")).toThrow(/queue:/);
+  // No claim row, no audit row: the take never happened.
+  expect(listClaims(db).some((c) => c.key.startsWith("queue:"))).toBe(false);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events WHERE key LIKE 'queue:%'`).get()).toEqual({ n: 0 });
+});
+
+test("a claim row that already holds the key is not logged as the lane's take", () => {
+  // The review's race: a squatter holds the key of a post before it's made.
+  // The delivery push still goes out, but the audit records no take for the
+  // picked lane - the claim (and its reply-ack) belong to the squatter.
+  const next = ((db.prepare(`SELECT MAX(id) AS m FROM posts`).get() as { m: number | null }).m ?? 0) + 1;
+  db.prepare(
+    `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(claimKey(next), "sim", "squat", "work", Date.now(), Date.now() + 60_000);
+  const r = post(db, "be", "work", "work item");
+  expect(r.post.id).toBe(next);
+  expect(claimEvents(claimKey(next)).filter((e) => e.event === "take")).toEqual([]);
+  // The picked lane's push went out (at-least-once), but the claim is the
+  // squatter's - so the lane's reply does not ack it.
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM outbox WHERE post_id = ?`).get(r.post.id)).toEqual({ n: 1 });
+  post(db, "fe", "work", "on it", r.post.id);
+  expect((db.prepare(`SELECT holder FROM claims WHERE key = ?`).get(claimKey(next)) as { holder: string }).holder).toBe("sim");
+});
+
+test("a decline's redelivery skips a lane that lost access to the board", () => {
+  // A subscription row outlives access: fe subscribes while a member, then
+  // leaves the team. The rotation must re-check visibility at delivery time,
+  // or a manual release fans the private post to a handle that can't see it.
+  const members = new Set(["be", "sim", "fe"]);
+  setAccess(db, {
+    canSee: (h, b) => b.scope === null || members.has(h),
+    checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
+    resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+    announceBoard: null,
+  });
+  createBoard(db, "be", "eng", "team queue", "team:eng", { kind: "queue" });
+  subscribe(db, "sim", "eng", "push");
+  subscribe(db, "fe", "eng", "push");
+  members.delete("fe");
+  const r = post(db, "be", "eng", "team work item"); // sim claims; fe is invisible now
+  expect(r.wake).toEqual(["sim"]);
+  const key = `queue:eng:${r.post.id}`; // not the work-board helper
+  release(db, "sim", key, "pass"); // decline: redelivery would be next
+  // The only remaining rotation lane is fe, who can no longer see the board:
+  // the re-offer must not reach fe. No lane is left, so the post sits
+  // readable on the board (the documented empty-rotation behavior).
+  const rows = db.prepare(`SELECT handle FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
+  expect(rows.map((x) => x.handle)).toEqual(["sim"]);
+  expect(listClaims(db).some((c) => c.key === key)).toBe(false);
 });
 
 test("broadcast boards keep fanning out to every push subscriber", () => {

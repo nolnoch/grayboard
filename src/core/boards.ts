@@ -453,11 +453,17 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
     `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, 'subscription', 1)
      ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
   ).run(lane, p.id);
-  db.prepare(
-    `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(key, lane, note, board, now, expires);
-  logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
+  const res = db
+    .prepare(
+      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(key, lane, note, board, now, expires);
+  // The claim is the idempotency token: when a row already holds the key,
+  // this run isn't the lane's delivery and must not read as one in the
+  // audit - the lane's reply-ack checks the claim's holder, not the outbox
+  // (#192 review).
+  if (res.changes > 0) logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
 }
 
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):

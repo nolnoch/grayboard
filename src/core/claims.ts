@@ -74,6 +74,15 @@ export function claim(
   opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } = {},
 ): ClaimResult {
   const key = validKey(keyInput);
+  // The queue: keyspace is the delivery machinery's: only claimQueuePost
+  // mints these keys, against a post that exists on a board the lane can
+  // see. A public take would let any handle squat a future post's key - the
+  // audit would record a delivery that never happened, and the lane's
+  // reply-ack would fail (#192 review).
+  if (key.startsWith("queue:"))
+    throw new CoreError(
+      `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
+    );
   expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
   const board = opts.board ? normalizeBoard(opts.board) : null;
 
