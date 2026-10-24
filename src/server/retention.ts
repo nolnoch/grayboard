@@ -29,11 +29,15 @@ function isFirstSundayOfMonth(d: Date): boolean {
 // left unbound, write receipts past the dedup window (each write prunes its
 // own session's; this is the backstop for sessions that stopped writing),
 // then the bytes nothing names any more.
-export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now()): Promise<void> {
+type BoardsChanged = (boards: string[]) => void | Promise<void>;
+export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now(), onBoardsChanged?: BoardsChanged): Promise<void> {
   try {
     // Board posts share the message retention window.
     pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
-    prunePosts(db, now - config.messageRetentionDays * 86_400_000);
+    const boards = prunePosts(db, now - config.messageRetentionDays * 86_400_000);
+    if (boards.length) {
+      try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
+    }
     pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
     pruneUnbound(db, now - UNBOUND_TTL_MS);
     repo.writeReceipts.prune(now - WRITE_DEDUP_WINDOW_MS);
@@ -45,12 +49,8 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
 }
 
-// Returns a stop function that cancels the pending nightly run and the daily
-// sweep, so a server stop() can close the db without them firing afterwards.
-// `firstDelayMs` replaces the next-UTC-midnight delay for the first run — a
-// test hook that lets a test hold the nightly timer pending across a stop().
-export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}): () => void {
-  const runNightly = () => void runRetention(repo, db, config);
+export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}, onBoardsChanged?: BoardsChanged): () => void {
+  const runNightly = () => void runRetention(repo, db, config, Date.now(), onBoardsChanged);
 
   const runVacuumIfNeeded = () => {
     const d = new Date();

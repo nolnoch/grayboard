@@ -27,6 +27,8 @@ import {
   lastSeen,
   liveAddresses,
   registerId,
+  snapshot,
+  boardCatalog,
   subscribe,
   touchAlias,
   who,
@@ -58,6 +60,82 @@ const drain = (h: string, all = false) => {
   for (const i of items) markDelivered(db, h, i);
   return items;
 };
+
+test("committed board changes are explicit and separate from attention wake handles and public tool results", () => {
+  subscribe(db, "be", "e2e", "off");
+  const taken = callBoardTool(db, "be", "claim_take", { key: "ticket:ENG-142", board: "#E2E" });
+  expect(taken.boards).toEqual(["e2e"]);
+  expect(taken.wake).toEqual([]);
+  expect(taken.result).not.toHaveProperty("boards");
+  expect(callBoardTool(db, "be", "claim_take", { key: "ticket:ENG-142" }).boards).toEqual([]);
+  expect(callBoardTool(db, "be", "claim_release", { key: "ticket:ENG-142" })).toEqual({
+    result: "released ticket:ENG-142", wake: [], boards: ["e2e"],
+  });
+  claim(db, "be", "expire", { board: "e2e" });
+  db.run("UPDATE claims SET expires_at = 0");
+  expect(sweepExpired(db)).toEqual({ wake: [], boards: ["e2e"] });
+  expect(sweepExpired(db)).toEqual({ wake: [], boards: [] });
+  expect(callBoardTool(db, "be", "board_post", { board: "#E2E", body: "post" }).boards).toEqual(["e2e"]);
+  expect(callBoardTool(db, "be", "board_create", { name: "extra", purpose: "test" }).boards).toEqual(["extra"]);
+});
+
+test("prunePosts reports only boards with committed deleted posts", () => {
+  createBoard(db, "be", "kept", "test");
+  post(db, "be", "e2e", "old one");
+  post(db, "be", "e2e", "old two");
+  db.run("UPDATE posts SET created_at = 0 WHERE board = 'e2e'");
+  post(db, "be", "kept", "new");
+  expect(prunePosts(db, 1)).toEqual(["e2e"]);
+  expect(prunePosts(db, 1)).toEqual([]);
+  db.run(`CREATE TRIGGER fail_prune BEFORE DELETE ON posts BEGIN SELECT RAISE(ABORT, 'rollback prune'); END`);
+  expect(() => prunePosts(db, Date.now() + 1)).toThrow("rollback prune");
+  expect(snapshot(db, "be", "kept").posts.map(p => p.body)).toEqual(["new"]);
+});
+
+test("snapshots page bounded history without touching cursor, notified_id, or outbox", () => {
+  subscribe(db, "fe", "e2e", "push");
+  subscribe(db, "sim", "e2e", "digest");
+  for (let n = 0; n < 125; n++) post(db, "be", "e2e", `post ${n}`);
+  const state = () => ({
+    subscriptions: db.prepare(`SELECT * FROM subscriptions ORDER BY handle, board`).all(),
+    outbox: db.prepare(`SELECT * FROM outbox ORDER BY handle, post_id`).all(),
+  });
+  const before = state();
+  const page = snapshot(db, "fe", "#E2E");
+  expect(page.board.name).toBe("e2e");
+  expect(page.posts).toHaveLength(20);
+  expect(page.posts[0]!.body).toBe("post 105");
+  const next = snapshot(db, "fe", "e2e", { limit: 100, before_id: page.next_before_id! });
+  expect(next.posts).toHaveLength(100);
+  expect(next.posts[0]!.body).toBe("post 5");
+  const last = snapshot(db, "sim", "e2e", { limit: 100, before_id: next.next_before_id! });
+  expect(last.posts).toHaveLength(5);
+  expect(last.next_before_id).toBeNull();
+  expect(snapshot(db, "fe", "e2e", { before_id: 1 }).posts).toEqual([]);
+  expect(state()).toEqual(before);
+  for (const limit of [0, -1, 101, 1.5, NaN, Infinity, null, "2"]) {
+    expect(() => snapshot(db, "fe", "e2e", { limit: limit as number })).toThrow("snapshot limit");
+  }
+  for (const before_id of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null, "2"]) {
+    expect(() => snapshot(db, "fe", "e2e", { before_id: before_id as number })).toThrow("snapshot before_id");
+  }
+  expect(state()).toEqual(before);
+});
+
+test("snapshot and catalog conceal private boards with bounded authorized catalog cursors", () => {
+  setAccess(db, { ...openAccess(db), canSee: (h, b) => !b.scope || h === "be", checkCreate: () => null });
+  createBoard(db, "be", "private", "private", "team:private");
+  post(db, "be", "private", "hidden");
+  expect(() => snapshot(db, "fe", "private")).toThrow("no such board #private; see board_list");
+  expect(() => snapshot(db, "fe", "missing")).toThrow("no such board #missing; see board_list");
+  for (let i = 0; i < 105; i++) ensureBoard(db, `b${String(i).padStart(3, "0")}`, "catalog", null, "be");
+  const first = boardCatalog(db, "fe");
+  expect(first.boards).toHaveLength(100);
+  const last = boardCatalog(db, "fe", first.next_after!);
+  expect(last.boards.map(b => b.name)).not.toContain("private");
+  expect(last.next_after).toBeNull();
+  expect([...first.boards, ...last.boards]).toHaveLength(106);
+});
 
 test("a declared human handle persists across sessions; declaring another moves it", () => {
   expect(humanHandles(db)).toEqual([]);
@@ -466,6 +544,73 @@ test("the expiry timer fires at the next lapse without anyone asking", async () 
   expect(woken).toEqual([["sim"]]);
   expect(listClaims(db)).toEqual([]);
 });
+
+test("expiry board callbacks observe commits and failures cannot poison wake or rearming", async () => {
+  subscribe(db, "sim", "e2e", "push");
+  const woken: string[][] = [], changed: string[][] = [], bodies: string[][] = [];
+  const timer = claimExpiryTimer(db, h => { woken.push(h); }, boards => {
+    changed.push(boards);
+    bodies.push(snapshot(db, "sim", "e2e").posts.map(p => p.body));
+    if (changed.length === 1) throw new Error("sync hint failure");
+    return Promise.reject(new Error("async hint failure"));
+  });
+  try {
+    for (const key of ["first", "second"]) {
+      claim(db, "be", key, { board: "e2e", ttl_minutes: 0.001 });
+      timer.arm();
+      await Bun.sleep(150);
+    }
+    expect(changed).toEqual([["e2e"], ["e2e"]]);
+    expect(woken).toEqual([["sim"], ["sim"]]);
+    expect(bodies[0]!.at(-1)).toStartWith("[expired] first:");
+    expect(bodies[1]!.at(-1)).toStartWith("[expired] second:");
+  } finally { timer.stop(); }
+});
+
+for (const failure of ["none", "sync", "async"] as const) {
+  test(`stopping in an expiry board callback is terminal (${failure})`, async () => {
+    subscribe(db, "sim", "e2e", "push");
+    claim(db, "be", "first", { board: "e2e", ttl_minutes: 0.001 });
+    claim(db, "be", "second", { board: "e2e", ttl_minutes: 0.004 });
+    let changed = 0, woken = 0;
+    const timer = claimExpiryTimer(db, () => { woken++; }, () => {
+      changed++;
+      timer.stop();
+      timer.arm();
+      if (failure === "sync") throw new Error("stopped board callback");
+      if (failure === "async") return Promise.reject(new Error("stopped board callback"));
+    });
+    try {
+      await Bun.sleep(400);
+      expect(changed).toBe(1);
+      expect(woken).toBe(0);
+      expect(db.query("SELECT key FROM claims").all()).toEqual([{ key: "second" }]);
+      expect(snapshot(db, "sim", "e2e").posts.filter(p => p.body.startsWith("[expired]"))).toHaveLength(1);
+    } finally { timer.stop(); }
+  });
+}
+
+for (const fail of [false, true]) {
+  test(`stopping in an expiry wake callback prevents rearm and retry (throws=${fail})`, async () => {
+    subscribe(db, "sim", "e2e", "push");
+    claim(db, "be", "first", { board: "e2e", ttl_minutes: 0.001 });
+    claim(db, "be", "second", { board: "e2e", ttl_minutes: 0.004 });
+    let changed = 0, woken = 0;
+    const timer = claimExpiryTimer(db, () => {
+      woken++;
+      timer.stop();
+      timer.arm();
+      if (fail) throw new Error("stopped wake callback");
+    }, () => { changed++; });
+    try {
+      await Bun.sleep(fail ? 5_400 : 400);
+      expect(changed).toBe(1);
+      expect(woken).toBe(1);
+      expect(db.query("SELECT key FROM claims").all()).toEqual([{ key: "second" }]);
+      expect(snapshot(db, "sim", "e2e").posts.filter(p => p.body.startsWith("[expired]"))).toHaveLength(1);
+    } finally { timer.stop(); }
+  }, 8_000);
+}
 
 test("the session-start claims list puts the session's own first and stays bounded", () => {
   const at = Date.parse("2026-10-21T21:00:00Z");

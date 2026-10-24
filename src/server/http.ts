@@ -176,13 +176,16 @@ function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: 
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
-async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void): Promise<Response> {
+async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
   const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
   const handle = ownIdentity(body.identity, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
   try {
     const outcome = callBoardTool(db, handle, body.tool, body.args ?? {});
+    if (outcome.boards?.length) {
+      try { void Promise.resolve(onBoardsChanged?.(outcome.boards)).catch(() => {}); } catch {}
+    }
     wake(outcome.wake);
     return json(outcome.result);
   } catch (e) {
@@ -456,6 +459,7 @@ export async function handleHttp(
   disconnectUser: (userId: number) => void,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
+  onBoardsChanged?: (boards: string[]) => void | Promise<void>,
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -473,7 +477,7 @@ export async function handleHttp(
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
-  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake);
+  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
 
   if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
   if (path.startsWith("/api/attachments/") && method === "GET") {

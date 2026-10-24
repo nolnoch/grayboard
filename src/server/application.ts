@@ -9,7 +9,7 @@ import { HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, f
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { acknowledge, age, canSeeBoard, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, touchAlias, touchId, registerId, idPrincipal, idCollisionText, inheritStatus, normalizeBoard, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
+import { acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, touchAlias, touchId, registerId, idPrincipal, idCollisionText, inheritStatus, normalizeBoard, type CoreDb, type Pending, type PendingRef, type SnapshotOptions, type UnboundPeer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs } from "../core/attachments.ts";
@@ -115,6 +115,14 @@ function refKey(r: PendingRef): string {
   return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
 }
 
+export type BoardObserver = {
+  changed(): void | Promise<void>;
+  closed?(): void | Promise<void>;
+};
+function notify(callback?: () => void | Promise<void>) {
+  try { void Promise.resolve(callback?.()).catch(() => {}); } catch {}
+}
+
 type Hub = {
   repo: Repo;
   db: CoreDb;
@@ -126,6 +134,7 @@ type Hub = {
   humanReach: HumanReach;
   slackRunning: () => boolean;
   now: () => number;
+  boardChanged: (board: string) => void;
 };
 function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void {
   for (const item of pendingFor(db, session.identityFull, { all })) {
@@ -173,6 +182,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
     now: opts.now ?? Date.now,
+    boardChanged(board) {
+      for (const observer of [...observers]) {
+        if (observer.board === board && observerLive(observer)) notify(() => observer.hooks.changed());
+      }
+    },
   };
   const helloLimiter = new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
     start: (email, ctx, retryAfterMs) => {
@@ -195,7 +209,24 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
   }, opts.now);
   clearHolds(db);
-  const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
+  type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
+  const observers = new Set<Observer>();
+  function removeObserver(observer: Observer) {
+    if (observers.delete(observer)) notify(observer.hooks.closed);
+  }
+  function observerLive(observer: Observer): boolean {
+    if (!observers.has(observer)) return false;
+    try {
+      valid(observer.session);
+      if (canSeeBoard(db, observer.session.identityFull, observer.board)) return true;
+    } catch {}
+    removeObserver(observer);
+    return false;
+  }
+  function boardsChanged(boards: string[]) {
+    for (const board of new Set(boards)) hub.boardChanged(board);
+  }
+  const expiry = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
   const revoked = new Map<number, number>();
   function release(session: ApplicationSession, why: string) {
     if (!session.owner) return;
@@ -205,6 +236,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   function close(session: ApplicationSession, why = "connection closed") {
     session.active = false;
     hub.sessions.delete(session);
+    for (const observer of [...observers]) if (observer.session === session) removeObserver(observer);
     if (hub.registry.get(session.identityFull) === session) hub.registry.delete(session.identityFull);
     if (hub.holders.get(session.identityFull) === session) {
       hub.holders.delete(session.identityFull);
@@ -494,6 +526,24 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const boards = pendingFor(db, session.identityFull, { all: true });
       return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
     },
+    boardCatalog(session: ApplicationSession, after?: string) {
+      valid(session);
+      return boardCatalog(db, session.identityFull, after);
+    },
+    boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
+      valid(session);
+      return snapshot(db, session.identityFull, board, options);
+    },
+    observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
+      valid(session);
+      const board = normalizeBoard(boardInput);
+      // Snapshot performs the same concealed access check as content reads.
+      snapshot(db, session.identityFull, board, { limit: 1 });
+      if (observers.size >= 1024) fail("bad_request", "board observer capacity reached");
+      const observer = { session, board, hooks };
+      observers.add(observer);
+      return () => removeObserver(observer);
+    },
     canReceiveBoard(session: ApplicationSession, board: string) {
       valid(session);
       return canSeeBoard(db, session.identityFull, board);
@@ -525,7 +575,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       expiry.arm();
       return result;
     },
-    wake: (handles: string[]) => wake(hub, handles),
+    // Trusted committed domain operations, not client-supplied invalidations.
+    boardsChanged,
+    wake(handles: string[]) {
+      expiry.arm();
+      wake(hub, handles);
+    },
     disconnectUser(userId: number) {
       revoked.set(userId, (revoked.get(userId) ?? 0) + 1);
       for (const s of [...hub.sessions]) {
@@ -535,6 +590,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
     },
     revalidate() {
+      for (const observer of [...observers]) observerLive(observer);
       for (const s of [...hub.sessions]) {
         if (!s.human && repo.users.findById(s.authed.user_id)?.disabled_at != null) {
           application.disconnectUser(s.authed.user_id);
@@ -547,7 +603,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const s of hub.sessions) s.sink.keepAlive?.();
     },
     sweepHellos: () => { helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
-    stopExpiry: expiry.stop,
+    stopExpiry() {
+      expiry.stop();
+      for (const observer of [...observers]) removeObserver(observer);
+    },
   };
   return application;
 }
@@ -795,6 +854,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
+  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
   publish?.(outcome.result);
   wake(hub, outcome.wake);
   return outcome.result;

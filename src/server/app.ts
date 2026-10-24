@@ -98,7 +98,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: handlers,
@@ -117,7 +117,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
     timers.push(startPing(), setInterval(sweepLimits, 30_000));
-    stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined);
+    stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
 
   return {
