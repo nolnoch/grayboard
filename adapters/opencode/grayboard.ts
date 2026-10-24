@@ -13,7 +13,9 @@
 // Install: copy into ~/.config/opencode/plugin/ (grayboard setup does this).
 // The command and environment come from the `mcp.grayboard` entry in
 // ~/.config/opencode/opencode.json, which setup writes with "enabled": false
-// so opencode's MCP client doesn't serve a second set of the same tools.
+// so opencode's MCP client doesn't serve a second set of the same tools. Only
+// that user-level entry is run: a project's opencode.json (a cloned repo's)
+// can disable or enable the entry, never choose the command.
 // `@opencode-ai/plugin` is the package opencode installs into its config
 // directory for local plugins; its `tool.schema` is the zod opencode reads.
 import type { Plugin } from "@opencode-ai/plugin";
@@ -141,9 +143,9 @@ type Child = {
 };
 
 export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
-  const tools = loadTools(userEntry());
-  // The effective entry, from the config hook: the child runs its command.
-  let entry: McpEntry | undefined = userEntry();
+  // The user-level entry: the only one whose command and environment run.
+  const entry = userEntry();
+  const tools = loadTools(entry);
   let child: Child | undefined;
   let exitReason: string | undefined;
   let instructions: string | undefined;
@@ -299,8 +301,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     // these ids. The tool record is already returned, so every call fails
     // with the fix, and nothing starts.
     config: async (cfg) => {
-      entry = (cfg.mcp as Record<string, McpEntry> | undefined)?.[SERVER] ?? entry;
-      if (entry && entry.enabled !== false) {
+      // The effective entry, merged over project configs, decides only whether it's enabled.
+      const effective = (cfg.mcp as Record<string, McpEntry> | undefined)?.[SERVER] ?? entry;
+      if (effective && effective.enabled !== false) {
         refused = `grayboard: the "${SERVER}" MCP server in opencode's config is enabled, so opencode would run a second grayboard with the same tool ids. Set "enabled": false on it (grayboard setup writes it that way in ${CONFIG}); until then grayboard's tools fail and it receives nothing.`;
         report(refused);
       }
