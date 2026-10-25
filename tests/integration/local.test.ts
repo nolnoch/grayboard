@@ -5,15 +5,15 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { call, closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
 
-// Both test styles stop sessions: the PR's fleet tests hold the raw Client,
-// master's bind-era tests hold the Session. One stop for both. (Duck-typed:
-// Client is a type-only import.)
+// Both test styles stop sessions: the fleet tests hold the raw SDK Client,
+// master's bind-era tests hold the Session. One stop for both (duck-typed).
 const stop = async (x: Client | Session): Promise<void> => {
   if (typeof (x as Client).close === "function" && !("harnessPid" in x)) {
     await (x as Client).close();
@@ -32,26 +32,61 @@ beforeEach(() => {
 
 afterEach(async () => {
   await closeSessions();
+  for (const c of open.splice(0)) {
+    try { c.close(); } catch (e) { console.error("[test] direct client close:", e); }
+  }
+  await Bun.sleep(150); // the direct children exit at stdin/stderr close
   rmSync(dir, { recursive: true, force: true });
 });
 
 // Local-mode env for a session in `dir`; no credentials file, so `grayboard mcp` picks local.
-function busEnv(identity?: string, lane?: string): Record<string, string> {
-  const env = { ...process.env, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir, GRAYBOARD_CREDENTIALS: join(dir, "credentials") };
+// The second parameter is a LANE name (a string → BUS_LANE, the fleet call
+// sites) or an extra-env object (→ spread, master's call sites' convention:
+// exitOf passes BUS_HUMAN and friends there).
+function busEnv(identity?: string, laneOrExtra?: string | Record<string, string>): Record<string, string> {
+  const env = { ...process.env, BUS_DB_PATH: join(dir, "bus.db"), BUS_SOCK_DIR: dir, GRAYBOARD_CREDENTIALS: join(dir, "credentials") } as Record<string, string>;
   delete env.BUS_IDENTITY;
   delete env.BUS_LANE;
   delete env.GRAYBOARD_TOKEN;
-  return { ...env, ...(identity ? { BUS_IDENTITY: identity } : {}), ...(lane ? { BUS_LANE: lane } : {}) } as Record<string, string>;
+  const extra = typeof laneOrExtra === "object" && laneOrExtra !== null ? laneOrExtra : undefined;
+  return {
+    ...env,
+    ...(identity ? { BUS_IDENTITY: identity } : {}),
+    ...(typeof laneOrExtra === "string" ? { BUS_LANE: laneOrExtra } : {}),
+    ...(extra ?? {}),
+  } as Record<string, string>;
 }
 
 // Fleet helpers (#124): a session on a named lane of its identity. The
-// collecting form returns its channel pushes as strings.
+// collecting form returns a LIVE content view of the session's pushes:
+// `pushes` maps the session's Push objects fresh on EVERY access, so tests
+// reading `x.pushes` see what has arrived so far (a copied array would
+// snapshot the empty startup state and never move).
 const startCollecting = async (identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> => {
   const s = await localSession(dir, identity, { args: ["mcp"], extra: lane ? { BUS_LANE: lane } : {} });
-  return { c: s.c, pushes: s.pushes.map((p) => p.content) };
+  return new Proxy({ c: s.c, pushes: [] as string[] }, {
+    get(t, k) {
+      if (k === "pushes") return s.pushes.map((p) => p.content);
+      return (t as Record<PropertyKey, unknown>)[k];
+    },
+  }) as { c: Client; pushes: string[] };
 };
-const start = async (identity: string | undefined, cwd = dir, args?: string[], lane?: string): Promise<Client> =>
-  (await localSession(dir, identity, { cwd, args, extra: lane ? { BUS_LANE: lane } : {} })).c;
+const start = async (identity: string | undefined, cwd = dir, args?: string[], lane?: string): Promise<Client> => {
+  // Two conventions meet here: master's call sites pass grayboard ARGS
+  // ("mcp", …) for the harness-wrapped localSession; the fleet call sites
+  // pass the FULL transport args ([CLI, "mcp", …]) for a direct stdio child.
+  if (args?.[0] === CLI) {
+    const c = new Client({ name: "test", version: "0" });
+    await c.connect(new StdioClientTransport({ command: process.execPath, args, cwd, env: busEnv(identity, lane), stderr: "ignore" }));
+    open.push(c);
+    return c;
+  }
+  return (await localSession(dir, identity, { cwd, args, extra: lane ? { BUS_LANE: lane } : {} })).c;
+};
+
+// The direct-transport sessions from start()'s fleet branch: closeSessions()
+// ends the harness-wrapped ones; these need an explicit close.
+const open: Client[] = [];
 
 const session = (identity: string | undefined, cwd = dir, args?: string[]): Promise<Session> => localSession(dir, identity, { cwd, args });
 
@@ -604,7 +639,7 @@ test("a pre-delivered_at dm_claims row is backfilled as delivered, not clamped f
             CREATE TABLE cursors (reader TEXT PRIMARY KEY, last_seen_id INTEGER NOT NULL);
             CREATE TABLE dm_claims (message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
               claimer TEXT NOT NULL, claimed_at INTEGER NOT NULL);
-            INSERT INTO messages (sender, recipient, body, created_at) VALUES ('sim', 'be', 'old-claim', 1);
+            INSERT INTO messages (sender, recipient, body, created_at) VALUES ('sim', 'be', 'old-claim', ${Date.now()});
             INSERT INTO dm_claims (message_id, claimer, claimed_at) VALUES (1, 'be#ghost', 1111);`);
   old.close();
   const be = await startCollecting("be", "research");

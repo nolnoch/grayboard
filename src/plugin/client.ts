@@ -368,6 +368,11 @@ export class GrayboardClient {
   }
 
   private die(reason: string): void {
+    // Idempotent: a taken-over socket can collect a second superseded frame
+    // (the taker's probe-supersede and the heartbeat's miss-limit close both
+    // write one before the displaced client reads either). The session dies
+    // once; the reason is said once.
+    if (this.dead) return;
     this.dead = true;
     this.ws?.close();
     this.helloData = null;

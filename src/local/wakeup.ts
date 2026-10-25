@@ -93,19 +93,23 @@ export async function assertLaneFree(identity: string, lane: string): Promise<vo
 // Connecting is the wakeup: every live lane listener of the identity drains
 // on open, so a probe also nudges them — each lane claims what it delivers
 // (dm_claims), so a probe-woken sibling competes for messages, never
-// duplicates one. True when any lane answered.
+// duplicates one. The pre-lanes shape (sock.<identity>, no lane) is probed
+// too: a session still on an older binary is the identity's live delivery
+// owner until it exits, and both the liveness probe (binding.ts's sockLive,
+// which refuses a bind) and a DM's delivery must reach it.
 export async function poke(identity: string, dir = SOCK_DIR): Promise<boolean> {
   return (await pokeLanes(identity, dir)).any;
 }
 
-// The counted form of poke: how many of the identity's lanes answered (the
-// local-mode counterpart of the server's live_lanes). Probing is still a
+// The counted form of poke: how many of the identity's lane sockets answered
+// (the local-mode counterpart of the server's live_lanes). Probing is still a
 // wakeup for each lane it reaches.
 export async function pokeLanes(identity: string, dir = SOCK_DIR): Promise<{ live: number; any: boolean }> {
   let live = 0;
   for (const path of laneSocketPaths(identity, dir)) {
     if (await canConnect(path)) live++;
   }
+  if (await canConnect(legacySocketPath(identity, dir))) live++;
   return { live, any: live > 0 };
 }
 
@@ -120,6 +124,14 @@ function laneSocketPaths(identity: string, dir = SOCK_DIR): string[] {
   } catch {
     return [];
   }
+}
+
+// The pre-lanes shape: exactly sock.<identity>, no lane suffix. A session on
+// an older binary listens there and owns the identity's delivery until it
+// exits; the probe and the acquire guard must see it (the pre-upgrade
+// guarantee: the old holder keeps the name, a new bind refuses).
+function legacySocketPath(identity: string, dir = SOCK_DIR): string {
+  return join(dir, `sock.${identity}`);
 }
 
 /** Whether one lane's wakeup socket answers (liveness, and a nudge). */

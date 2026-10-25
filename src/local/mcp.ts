@@ -1,13 +1,14 @@
 // Local-mode MCP server: SQLite + Unix-socket wakeup. `grayboard mcp` imports
 // this; it starts on import.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Database } from "bun:sqlite";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { activeAnnouncements, checkBody, age, endLane, humanHandles, isHuman, lastSeen, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef, type UnboundPeer } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, endLane, humanHandles, isHuman, lastSeen, lanesFor, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
@@ -94,13 +95,6 @@ if (RETENTION_DAYS === null) {
   console.error(`[grayboard] BUS_RETENTION_DAYS must be a whole number of days, not "${process.env.BUS_RETENTION_DAYS}"`);
   process.exit(1);
 }
-// This session's lane within the identity's fleet: BUS_LANE, else the
-// worktree's name when the identity was explicit, else the default. Several
-// sessions of one identity run side by side, one per lane. The NAME comes
-// later (#182): the session starts unbound and binds; the lane is this
-// process's, for whatever name it binds.
-const LANE: string = sessionLane() ?? MAIN_LANE;
-console.error(`[grayboard] local mode, lane "${LANE}"`);
 
 // BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
 // has no adapter. Draining here would consume messages into a void.
@@ -151,6 +145,15 @@ if (NAMED && HUMAN !== isHuman(db, SUGGESTED!)) {
   );
   process.exit(1);
 }
+// This session's lane within the identity's fleet: BUS_LANE, else the
+// worktree's name when the identity was explicit, else the default. Several
+// sessions of one identity run side by side, one per lane. The NAME comes
+// later (#182): the session starts unbound and binds; the lane is this
+// process's, for whatever name it binds. Checked AFTER the human
+// declaration's refusal: the declaration error is the one a BUS_HUMAN
+// session must see, whatever else its env gets wrong.
+const LANE: string = sessionLane() ?? MAIN_LANE;
+console.error(`[grayboard] local mode, lane "${LANE}"`);
 // Claude Code started without a channels flag drops pushes silently; say so.
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
 if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
@@ -200,7 +203,21 @@ else {
     if (r.ok) {
       bound = r.name;
       restored = r.restored;
-    } else unboundNotes.push(restoreNote(rec.name, r.error));
+    } else {
+      // The restore failed. The fleet rule (the startup's mirror): a live
+      // holder on ANOTHER declared lane is a fleet join (dm_claims
+      // arbitrates); the same declared lane is a misconfiguration — fail
+      // loudly (two processes on one lane key would shadow each other's
+      // pushes); anything else is the restore note (#215's unbound start).
+      const held = n.ok ? await fleetLaneOf(db, n.name, LANE) : "none";
+      if (held === "same" && process.env.BUS_LANE !== undefined) {
+        console.error(`[grayboard] "${rec.name}" is already in use on lane "${LANE}"; give this session a different BUS_LANE or BUS_IDENTITY.`);
+        endSession(db, SESSION_ID);
+        process.exit(1);
+      }
+      if (held === "other" && process.env.BUS_LANE !== undefined) bound = rec.name;
+      else unboundNotes.push(restoreNote(rec.name, r.error));
+    }
   } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
     if (r.ok) bound = r.name;
@@ -209,7 +226,27 @@ else {
       console.error(`[grayboard] ${r.error}`);
       endSession(db, SESSION_ID);
       process.exit(1);
-    } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
+    } else {
+      // The name is held. The fleet rule (#114): a fleet join requires the
+      // joiner to DECLARE its lane (BUS_LANE set) — a worktree's implicit
+      // lane or the default main is not a fleet declaration, so those get
+      // #215's contract: the session starts unbound, naming the holder.
+      // With BUS_LANE set: a live holder on ANOTHER lane is the join (this
+      // session binds the same name beside it, dm_claims arbitrating
+      // delivery); a live holder on THIS lane is a misconfiguration — two
+      // processes on one lane key would shadow each other's pushes — and
+      // fails loudly. A holder with no live lane (channels-off, a pre-lanes
+      // socket holder) is not joinable either.
+      const busLaneSet = process.env.BUS_LANE !== undefined;
+      const held = await fleetLaneOf(db, SUGGESTED!, LANE);
+      if (held === "same" && busLaneSet) {
+        console.error(`[grayboard] "${SUGGESTED!}" is already in use on lane "${LANE}"; give this session a different BUS_LANE or BUS_IDENTITY.`);
+        endSession(db, SESSION_ID);
+        process.exit(1);
+      }
+      if (held === "other" && busLaneSet) bound = SUGGESTED!;
+      else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
+    }
   }
   if (!bound) {
     const launcher = launcherName(process.ppid);
@@ -580,6 +617,24 @@ function unboundPeers(): UnboundPeer[] {
     .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
 }
 
+// Which live lane of `name` matters to this session's fleet position (#114):
+//   "same"  — a live lane row with THIS session's lane: a collision (two
+//             processes on one lane key would shadow each other's pushes);
+//   "other" — a live lane on another lane: this session may join the fleet;
+//   "none"  — no live lane rows (a channels-off holder, a pre-lanes socket
+//             holder, a dead fleet): not joinable, the #215 unbound start.
+// Liveness is the lane's wakeup socket answering, not last_seen: an idle
+// lane hasn't drained in a while but is still holding its lane.
+async function fleetLaneOf(db: Database, name: string, myLane: string): Promise<"same" | "other" | "none"> {
+  for (const r of lanesFor(db, name)) {
+    if (r.lane === myLane && (await laneAlive(name, r.lane))) return "same";
+  }
+  for (const r of lanesFor(db, name)) {
+    if (r.lane !== myLane && (await laneAlive(name, r.lane))) return "other";
+  }
+  return "none";
+}
+
 // Drain: emit unread direct messages and pending board items as channel
 // notifications. Loop until empty so concurrent writes that race past a
 // single query still get picked up. Re-entry is guarded; crashed drains
@@ -716,19 +771,21 @@ async function drainLoop(): Promise<void> {
       // do): nothing more for this lane — the siblings' deliveries move the
       // read point, and this lane's next drain syncs past them.
       if (!deliveredDm && boardItems.length === 0) break;
-      // A claim this drain skipped may belong to a claimer that died: nothing
-      // else fires the takeover (the next DM or poke could be hours away), so
-      // arm one retry for the claim's expiry moment — clamped to now by
-      // armClaimRetry when the claim already expired, an immediate retry
-      // (round-8 N1). Null means no undelivered claim exists at all, so
-      // clearing an earlier arm is safe (round-6 item 2).
-      if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
-      const expiry = nextClaimExpiry(name);
-      if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
-      else if (claimRetry !== null) {
-        clearTimeout(claimRetry);
-        claimRetry = null;
-      }
+    }
+    // A claim this drain skipped may belong to a claimer that died: nothing
+    // else fires the takeover (the next DM or poke could be hours away), so
+    // arm one retry for the claim's expiry moment — clamped to now by
+    // armClaimRetry when the claim already expired, an immediate retry
+    // (round-8 N1). Null means no undelivered claim exists at all, so
+    // clearing an earlier arm is safe (round-6 item 2). Arms AFTER the
+    // while: a skip-exit (no delivery, no board items) must still arm —
+    // the armed timer is the ONLY thing that fires the takeover.
+    if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
+    const expiry = nextClaimExpiry(name);
+    if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
+    else if (claimRetry !== null) {
+      clearTimeout(claimRetry);
+      claimRetry = null;
     }
     } while (rerunDrain);
   } finally {
@@ -783,10 +840,25 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     await inflight;
     const previous = bound;
     const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
-    if (!r.ok) return fail(r.error);
-    // The row holds the new name from here: so does this process, whatever
-    // follows fails, or the finally's drain would read a name it no longer holds.
-    bound = n.name;
+    if (!r.ok) {
+      // The name is held. The fleet rule (the startup's mirror): a JOIN
+      // requires the joiner to DECLARE its lane (BUS_LANE set) — a live
+      // holder on another declared lane joins this session into the fleet
+      // (dm_claims arbitrates delivery); the holder's own lane stays the
+      // holder's. Anything else (the same lane, no declared lane, no live
+      // lanes) is master's refusal.
+      const held = await fleetLaneOf(db, n.name, LANE);
+      if (held === "other" && process.env.BUS_LANE !== undefined) {
+        bound = n.name;
+      } else return fail(r.error);
+    } else {
+      // The row holds the new name from here: so does this process, whatever
+      // follows fails, or the finally's drain would read a name it no longer holds.
+      bound = n.name;
+    }
+    // The join path moves no claims: the holder keeps them (it is alive);
+    // a fresh acquire moves this session's claims from its previous name.
+    const movedKeys: string[] = r.ok ? r.moved.map((c: { key: string }) => c.key) : [];
     writeName(bound);
     firstDrain = true;
     testPause("bind:after-acquire");
@@ -807,12 +879,12 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
         writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
       }
     } catch (e) {
-      const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
+      const moved = movedKeys.length ? `; claims moved: ${movedKeys.join(", ")}` : "";
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
       throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
     }
     console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => localBoundInstructions(n.name, general));
+    const ok = bindOk(n.name, previous, movedKeys, (general) => localBoundInstructions(n.name, general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);

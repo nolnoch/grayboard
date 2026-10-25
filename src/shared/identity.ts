@@ -131,11 +131,20 @@ export function pinnedIdentities(cwd = process.cwd()): string[] {
 }
 
 /**
- * The identity this session claims, when BUS_IDENTITY isn't set: the first
- * pin (`.mcp.json`, then `.omp/mcp.json`), or the directory-derived default.
+ * The identity this session claims, when BUS_IDENTITY isn't set: the
+ * `.mcp.json` pin, or the directory-derived default. The omp pin is
+ * echo-detection material only (pinnedIdentities): default naming stays
+ * `.mcp.json` alone — a repo that pins only `.omp/mcp.json` keeps its
+ * directory-derived handles.
  */
 export function pinnedIdentity(cwd = process.cwd()): string | undefined {
-  return pinnedIdentities(cwd)[0];
+  try {
+    const file = join(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
+    const pin = JSON.parse(readFileSync(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    return typeof pin === "string" && pin ? pin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

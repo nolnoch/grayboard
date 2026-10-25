@@ -20,7 +20,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, fleetState, disconnectLane, disconnectIdentity } = createWsHandlers(repo, db, {
+  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, fleetState, disconnectLane } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, ...opts,
   });
 
@@ -84,7 +84,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, { fleetState, disconnectLane, disconnectIdentity });
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, { fleetState, disconnectLane });
     },
 
     websocket: handlers,

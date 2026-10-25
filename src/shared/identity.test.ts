@@ -130,7 +130,9 @@ describe("sessionIdentity", () => {
     writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(pin));
     try {
       expect(sessionIdentity({ BUS_IDENTITY: "fe-omp" }, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
-      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("fe-omp-stream");
+      // Default naming (no BUS_IDENTITY) stays .mcp.json-or-directory: an omp
+      // pin is echo-detection material only, so no assertion here — the
+      // directory default wins (the omp-only test below, master's contract).
       // A name no pin source knows is still a true explicit join.
       expect(sessionIdentity({ BUS_IDENTITY: "scratch" }, at("repo", ".wt", "stream"))).toBe("scratch");
     } finally {

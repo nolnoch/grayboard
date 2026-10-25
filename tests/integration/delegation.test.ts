@@ -286,7 +286,7 @@ test("local: a re-pick retracts the missed pick's message and returns the new on
 
   // be was the pick (first by name) and its socket dies inside the window:
   // the snapshot called it live, the delivery poke misses.
-  rmSync(join(dir, "sock.be"));
+  rmSync(join(dir, "sock.be.main")); // the lane model's wakeup socket: sock.<identity>.<lane>
   const { writeFileSync } = await import("node:fs");
   writeFileSync(goFile, "go");
   const r = await pending;

@@ -186,14 +186,11 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   return json({ name: identity.name, created_at: identity.created_at }, 201);
 }
 
-function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb, disconnectIdentity: (full: string) => void): Response {
+function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   const existing = repo.identities.findByUserAndName(authed.user_id, name);
   if (!existing) return notFound();
-  // Close its live connections first, so their close handlers can't re-insert
-  // the handle after the delete (#73's fix shape).
-  disconnectIdentity(`${authed.user_email}/${name}`);
   repo.identities.remove(authed.user_id, name);
   forgetHandle(db, `${authed.user_email}/${name}`);
   writeAudit(repo, "identity.deleted", authed.user_email, name);
@@ -388,8 +385,6 @@ type FleetHooks = {
   fleetState: () => { identity_full: string; lane: string; live: boolean; push_owner: boolean }[];
   // Close one lane's connections, superseded-style (its user ordered it).
   disconnectLane: (full: string, lane: string) => boolean;
-  // Close every live connection of an identity (identity delete).
-  disconnectIdentity: (full: string) => void;
 };
 
 // `grayboard fleet list [identity]`: the caller's identities' lanes, from the
@@ -494,7 +489,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 export async function handleHttp(
   req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
-  fleet: FleetHooks = { fleetState: () => [], disconnectLane: () => false, disconnectIdentity: () => {} },
+  fleet: FleetHooks = { fleetState: () => [], disconnectLane: () => false },
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -528,7 +523,7 @@ export async function handleHttp(
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
-    return identityDelete(path.slice("/api/identities/".length), authed, repo, db, fleet.disconnectIdentity);
+    return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
   }
 
   if (path === "/api/fleet" && method === "GET") {

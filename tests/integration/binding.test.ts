@@ -174,7 +174,8 @@ test("5, 13: of N concurrent binders exactly one wins; the losers name it and le
   for (const r of results.filter((r) => r.isError)) {
     expect((r.content as { text: string }[])[0]!.text).toContain(`"fe" is held by the live session ${winnerId}`);
   }
-  expect(existsSync(join(dir, "sock.fe"))).toBe(true);
+  // The lane model's wakeup socket carries the lane: the default lane is "main".
+  expect(existsSync(join(dir, "sock.fe.main"))).toBe(true);
   const be = await session("be");
   expect((await be.call("dm_send", { to: "fe", body: "to the winner" })).delivered_now).toBe(true);
   await until(() => contents(winners[0]!).length === 1);
@@ -224,13 +225,13 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   const s = await session("fe");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
   // The wakeup socket can't be renamed onto a non-empty directory.
-  mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
+  mkdirSync(join(dir, "sock.fe2.main", "x"), { recursive: true });
   const err = await refusal(s, "bind", { name: "fe2", create: true });
   expect(err).toContain('bound "fe2" (was "fe"); claims moved: ticket:ENG-142, but setting it up failed');
   expect(rows(`SELECT name FROM bindings WHERE name LIKE 'fe%'`)).toEqual([{ name: "fe2" }]);
   expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
   // fe is free: no listener left on it, and another session takes it.
-  expect(existsSync(join(dir, "sock.fe"))).toBe(false);
+  expect(existsSync(join(dir, "sock.fe.main"))).toBe(false);
   const other = await session();
   expect(await other.call("bind", { name: "fe" })).toContain('Bound to "fe"');
   expect(readdirSync(dir).filter((f) => f.startsWith(".w"))).toEqual([]);
@@ -371,7 +372,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   // A clean exit logs its release, and keeps its name record for a restart under its harness.
   await stop(next.c);
   expect(events("fe").at(-1)!.event).toBe("released");
-  expect(existsSync(join(dir, "sock.fe"))).toBe(false);
+  expect(existsSync(join(dir, "sock.fe.main"))).toBe(false);
   expect(JSON.parse(readFileSync(join(dir, `bind.${next.harnessPid}`), "utf8")).name).toBe("fe");
 }, 30_000);
 

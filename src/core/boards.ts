@@ -198,6 +198,12 @@ export function startSession(
        push_capable = MAX(lanes.push_capable, excluded.push_capable),
        last_seen = excluded.last_seen`,
   ).run(handle, lane, kind, cwd, push, now, now);
+  // A new (non-resume) session on the handle: its legacy columns are the
+  // PREVIOUS holder's state, stale the moment that session ended (#258: an
+  // unverified restore starts a fresh status). The lane's own row carries
+  // this session's state from here; the handle's columns refreeze at the
+  // lane's next endLane snapshot.
+  db.prepare(`UPDATE handles SET cwd = COALESCE(?, cwd), place = NULL, status = NULL, status_at = NULL WHERE name = ?`).run(cwd, handle);
 }
 
 // Refresh a lane's liveness (every drain), without touching its state.

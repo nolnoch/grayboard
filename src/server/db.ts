@@ -144,14 +144,20 @@ export interface Repo {
 export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
-// hasn't reached. The read point is the last delivered-and-handled message id
-// (cursors.last_seen_id); unread = `id > read point` — a message is counted
-// undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
-// plan of the exact statement the code executes, not a hand-copied drift.
+// hasn't reached. The read point is the identity's highest cursor — the bare
+// row (the default lane's, unchanged from pre-lanes rows) or any
+// `recipient#lane` row, since a lane's reads count for the identity. A single
+// range predicate (>= recipient and < recipient$: every identity char sorts
+// above '$') matches the recipient's own row and every lane row and can use
+// the index, unlike a substr prefix compare or an OR of equality and range.
+// Exported so the EXPLAIN pin asserts the plan of the exact statement the
+// code executes, not a hand-copied drift.
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
+                                    WHERE c.stream_type = 'direct'
+                                      AND (c.stream_ref >= m.recipient AND c.stream_ref < m.recipient || '$')), 0)
+              AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {

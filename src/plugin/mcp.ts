@@ -265,6 +265,7 @@ async function helloAs(name: string, opts: { create: boolean; restoredFrom?: str
     try {
       return { c, hello: await helloWithin(c, STARTUP_LIMITED_BY) };
     } catch (e) {
+      console.error(`[DBG-C] helloAs retry: ${(e as Error).message.slice(0, 80)}; restoredFrom=${!!opts.restoredFrom}; left=${deadline - Date.now()}ms`);
       c.close();
       if (!(e instanceof HelloRefused)) throw e;
       if (!(opts.restoredFrom && e.code === "identity_in_use" && Date.now() < deadline)) return { refused: e };

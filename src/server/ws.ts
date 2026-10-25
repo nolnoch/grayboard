@@ -484,13 +484,6 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       }
       return closed;
     },
-    // Every live connection of an identity (identity delete, #73's fix shape).
-    disconnectIdentity: (full: string): void => {
-      for (const ws of fleetConns(hub, full)) {
-        err(ws, undefined, "superseded", "this identity was deleted");
-        ws.close();
-      }
-    },
   };
 }
 
@@ -595,7 +588,16 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       if (ws.readyState !== 1 /* OPEN */) return;
       continue;
     }
-    const holder = hub.laneHolders.get(key);
+    // The lane's push holder — or a hold connection (channels-off: it owns
+    // the name and answers probes but is never in the lane maps), which is
+    // only ever a SAME-LANE holder. A different-lane owner must NOT be
+    // probed here: that path is the fleet join/demotion below, and probing
+    // it would refuse every fleet join.
+    const laneHolder = hub.laneHolders.get(key);
+    const holdHolder = hub.holders.get(full);
+    const holder = laneHolder && laneHolder !== ws ? laneHolder
+      : holdHolder && holdHolder !== ws && holdHolder.data.lane === lane ? holdHolder
+      : undefined;
     if (holder && holder !== ws) {
       const probing = probe(holder, hub.probeMs).finally(() => {
         if (hub.probing.get(key) === probing) hub.probing.delete(key);
@@ -608,7 +610,10 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
         return;
       }
       if (ws.readyState !== 1 /* OPEN */) return;
-      if (hub.laneHolders.get(key) === holder) {
+      // The supersede covers both owner shapes: a lane's push holder and a
+      // hold connection (holders only). Without the holders half, a dead
+      // hold connection would probe-fail forever and never be taken over.
+      if (hub.laneHolders.get(key) === holder || hub.holders.get(full) === holder) {
         err(holder, undefined, "superseded", "a newer session connected with this identity and lane");
         if (holder.data.owner) release(hub, holder, `superseded by session ${sessionId}`);
         holder.close();
@@ -684,13 +689,16 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // no identities yet is bootstrapping (the adapter flow: pin, launch), so
     // the first identity still lazy-creates. Derived identities (pin or
     // directory default) keep the lazy create below, as they always have.
-    if (explicit) {
+    if (explicit && m.create !== true) {
       // The human identity (created by a Slack link) doesn't count: a linked
       // user's first AGENT identity is still a bootstrap, not a typo.
-      const mine = repo.identities.listForUser(authed.user_id).filter((i) => i.name !== HUMAN_NAME);
+      // A hello that says create: true authorizes the create — a startup
+      // explicit BUS_IDENTITY does (#182's client), so the refusal protects
+      // only a join that didn't ask to create (the typo guard).
+      const mine = repo.identities.listForUser(authed.user_id).filter((i: { name: string }) => i.name !== HUMAN_NAME);
       if (mine.length > 0) {
         err(ws, reqId, "not_found",
-          `no identity "${name}" for your account; your identities: ${mine.map((i) => `${authed.user_email}/${i.name}`).join(", ")}` +
+          `no identity "${name}" for your account; your identities: ${mine.map((i: { name: string }) => `${authed.user_email}/${i.name}`).join(", ")}` +
           ` — create it first: grayboard identity create ${name}`);
         ws.close();
         return;
@@ -743,7 +751,12 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       : m.resume ? continuityOf(db, full, { reconnect: sessionId })
       : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
       : null;
-    startSession(db, full, null, lane, { push_capable: push, resume: continued?.verified === true || m.resume === true });
+    // #258: only a VERIFIED continue is the same session mid-task. An
+    // unverified resume (another session's key) is a fresh start: the lane
+    // row and the handle's legacy columns both reset, whatever the m.resume
+    // flag says — the flag alone is exactly what a stale client re-using a
+    // name must NOT inherit.
+    startSession(db, full, null, lane, { push_capable: push, resume: continued?.verified === true });
     setPlace(db, full, m.where ?? null, lane);
     // Only a push-mode owner advertises the capability (a hold, demoted or
     // tools-only connection can't receive a delegation, so it must not be
@@ -794,7 +807,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // reads, leaving the owner uninformed.
   const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
   const notices = [
-    ...(created ? [`New identity "${full}" created for you by this session.`] : []),
+    // A lazy-created identity is silent (master's contract: the first
+    // connect's notices are undefined); the audit row records the create.
     ...(demoted ? [`Push delivery for this identity is owned by lane "${owner!.data.lane}"; this session joined as a tool lane and takes over when that lane ends.`] : []),
     // Only a push owner that opted in pays for the launcher instruction; a
     // hold, demoted or tools-only connection can't receive a delegation.
