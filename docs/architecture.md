@@ -22,7 +22,7 @@ flowchart LR
   caddy["Caddy (TLS)"] -.->|reverse proxy| server
 ```
 
-- One CLI binary is every client entry point. `grayboard mcp` loads `src/plugin/mcp.ts` (server mode) or `src/local/mcp.ts` (local mode); `grayboard-server` is the second binary.
+- The CLI binary is the retained stdio/local/WSS client entry; hosted OpenCode V2 connects directly through native HTTP MCP and an in-process delivery supplement, without a Grayboard executable or subprocess. `grayboard mcp` loads `src/plugin/mcp.ts` (server mode) or `src/local/mcp.ts` (local mode); `grayboard-server` is the second binary.
 - **Mode selection** (`busMode`, `src/cli/api.ts`): server mode if `GRAYBOARD_TOKEN` is set or the credentials file exists, else local. `--mode local|server` overrides, e.g. per repo in `.mcp.json`. An *empty* credentials file means signed out: server mode fails with "signed out" rather than silently becoming local (why logout truncates instead of deleting).
 - **Local mode is a peer, not a fallback.** Same-machine live push needs no managed server process; Unix sockets are the right primitive. It is excluded from the server's migration seam (§7).
 - Identity: `BUS_IDENTITY`, else a pin in the repo's `.mcp.json`, else the git repo's directory name, plus a worktree suffix (`src/shared/identity.ts`). See `boards.md` §3.

@@ -128,7 +128,7 @@ export function opencodeShimGuard(directory: string): { skip: boolean; warning?:
     for (const name of ["opencode.json", "opencode.jsonc"]) {
       const cfg = document(join(directory, name)).value;
       for (const entry of [cfg.mcp?.grayboard, cfg.mcp?.servers?.grayboard]) {
-        if (entry === undefined || localEntry(entry)) continue;
+        if (entry === undefined || localEntry(entry, true)) continue;
         if (!isHostedGrayboard(entry)) return { skip: true, warning: "Remote or unrecognized grayboard MCP configuration found; leaving OpenCode unchanged" };
         hosted = true;
       }
@@ -159,8 +159,9 @@ function pluginDirectory(path: string): string {
   return directory;
 }
 
-function localEntry(entry: unknown): boolean {
-  if (!object(entry) || entry.type !== "local" || Object.keys(entry).some(k => !["type", "command", "environment"].includes(k)) ||
+function localEntry(entry: unknown, registration = false): boolean {
+  if (!object(entry) || entry.type !== "local" || Object.keys(entry).some(k => !["type", "command", "environment", "enabled"].includes(k)) ||
+      (entry.enabled !== undefined && typeof entry.enabled !== "boolean") ||
       !Array.isArray(entry.command) || !entry.command.every((x: unknown) => typeof x === "string")) return false;
   const [cmd, ...args] = entry.command as string[];
   if (!cmd) return false;
@@ -171,6 +172,8 @@ function localEntry(entry: unknown): boolean {
   if (!(isDeepStrictEqual(tail, ["mcp"]) || isDeepStrictEqual(tail, ["mcp", "--mode", "local"]) || isDeepStrictEqual(tail, ["mcp", "--mode", "server"]))) return false;
   const env = entry.environment;
   return env === undefined || (object(env) && Object.keys(env).every(k =>
+    // Ordinary adapter refresh retains its established environment handling; migration stays strict.
+    (registration && typeof env[k] === "string") ||
     (k === "BUS_PUSH" && env[k] === "off") || (k === "BUS_IDENTITY" && identity(env[k]))));
 }
 

@@ -17,9 +17,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 case "${1:-}" in
-  upgrade-matrix | binaries) suite="$1" ;;
+  upgrade-matrix | binaries | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
   *)
-    echo "usage: $0 upgrade-matrix|binaries" >&2
+    echo "usage: $0 upgrade-matrix|binaries|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
     exit 2
     ;;
 esac
@@ -47,6 +47,15 @@ verdict() {
 }
 
 case "$suite" in
+  hosted-*)
+    export GRAYBOARD_E2E_RUN_DIR="$run"
+    # Logs may contain fixture IDs, but never keep auth storage or raw HTTP headers.
+    if bash scripts/hosted-e2e.sh "${suite#hosted-}" 2>&1 | sed -E 's/(Bearer )[A-Za-z0-9._~+\/-]+/\1[REDACTED]/g; s/("(access_token|refresh_token|client_secret)"[[:space:]]*:[[:space:]]*")[^"]*/\1[REDACTED]/g' | tee "$run/hosted.log"; then
+      verdict 'passed'
+    else
+      verdict 'failed (hosted.log in the run dir)'
+    fi
+    ;;
   upgrade-matrix)
     own="v$(jq -r .version package.json)"
     # One line per release: its tag, and whether its own `grayboard update`

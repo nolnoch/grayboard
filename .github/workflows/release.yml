@@ -44,11 +44,14 @@ jobs:
       - name: Test
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
-        run: bun test
+        run: bun run test
+
+  hosted:
+    uses: ./.github/workflows/hosted.yml
 
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: [test, hosted]
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

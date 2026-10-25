@@ -52,13 +52,9 @@ if ! bun run test; then
   exit 1
 fi
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/grayboard-package.XXXXXX")" || exit 1
-trap 'rm -rf -- "$scratch"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 if ! bun run test:opencode ||
-   ! GRAYBOARD_PACKAGE_TEST_DIR="$scratch/host" bun run test:opencode:host ||
-   ! GRAYBOARD_PACKAGE_TEST_DIR="$scratch/config" bun run test:opencode:config; then
+   ! bun run test:opencode:host ||
+   ! bun run test:opencode:config; then
   echo "[pre-push] OpenCode package gate failed; push aborted." >&2
   exit 1
 fi

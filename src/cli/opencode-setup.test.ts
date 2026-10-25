@@ -497,6 +497,23 @@ test("temp cleanup failure does not skip restoring any moved adapter and retains
   expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe(original);
 });
 
+test("ordinary registration recognizes retained custom environment without making hosted migration permissive", () => {
+  const f = fixture();
+  const entry = { ...f.old, enabled: false, environment: { ...f.old.environment, GRAYBOARD_X: "1" } };
+  writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: entry } }));
+  expect(opencodeShimGuard(f.root)).toEqual({ skip: false });
+  expect(() => f.run({ migrate: true })).toThrow("Unrecognized V1");
+  expect(f.read().mcp.grayboard).toEqual(entry);
+});
+
+for (const enabled of [true, false]) test(`explicit migration recognizes retained enabled=${enabled} registration`, () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: { ...f.old, enabled } } }));
+  f.run({ migrate: true });
+  expect(f.read().mcp.grayboard).toBeUndefined();
+  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
+});
+
 test("ordinary local/V1 setup and refresh still install carried shim; refresh respects symlinks", () => {
   const f = fixture();
   fakeOpenCode(f);
