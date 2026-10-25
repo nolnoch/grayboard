@@ -6,6 +6,12 @@ const suites = ["strict", "git", "config", "public", "host", "live", "matrix", "
 const hex = (value: unknown, length: number): value is string => typeof value === "string" && new RegExp(`^[a-f0-9]{${length}}$`).test(value);
 const root = resolve(import.meta.dir, "..");
 
+// Repository-local/discovery settings and inherited command config must not escape a caller's checkout.
+const localGit = new Set(["GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_TEMPLATE_DIR"]);
+export function repositoryGitEnv(inherited: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return Object.fromEntries(Object.entries(inherited).filter(([key, value]) => value !== undefined && !localGit.has(key) && !/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key))) as Record<string, string>;
+}
+
 type Counts = { tests: number; failures: number; skipped: number };
 type Element = { name: string; attributes: Map<string, string>; counts: Counts; outcomes: number };
 
@@ -99,7 +105,7 @@ export function junit(raw: string | undefined, failed: boolean): string {
 
 export function provenance(value: any, checkout = root) {
   if (value?.bun !== "1.4.4" || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
-  const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: checkout });
+  const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: checkout, env: repositoryGitEnv() });
   if (tracked.exitCode) throw new Error("Cannot enumerate public paths");
   const paths = new Set(tracked.stdout.toString().split("\0"));
   const entries = (items: any, compare: boolean) => {

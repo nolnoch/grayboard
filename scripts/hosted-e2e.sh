@@ -7,6 +7,13 @@ package="$root/adapters/opencode-v2"
 [[ "$(bun --version)" == 1.4.4 ]] || { echo "Bun 1.4.4 required" >&2; exit 1; }
 # Retain logs/provenance, never upload the isolated HOME, auth store or databases.
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/grayboard-hosted.XXXXXX")"
+# A verification hook's Git environment must not redirect disposable package fixtures.
+local_git_variables="$(git rev-parse --local-env-vars)"
+while IFS= read -r variable; do [[ -z "$variable" ]] || unset "$variable"; done <<< "$local_git_variables"
+unset GIT_NAMESPACE GIT_QUARANTINE_PATH GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_TEMPLATE_DIR
+for variable in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do [[ -z "$variable" ]] || unset "$variable"; done
+mkdir "$scratch/git-hooks"
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$scratch/git-hooks"
 export GRAYBOARD_PACKAGE_TEST_DIR="$scratch/fixture"
 finish() {
   code=$?

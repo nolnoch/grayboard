@@ -1,12 +1,24 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { junit } from "../../scripts/hosted-evidence.ts";
+import { junit, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 const texts = (path: string): string => readdirSync(path, { withFileTypes: true }).map(e => e.isDirectory() ? texts(join(path, e.name)) : readFileSync(join(path, e.name), "utf8")).join("\n");
+
+function fixtureEnv(root: string, inherited: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const hooks = join(root, "empty-hooks"); mkdirSync(hooks, { recursive: true });
+  return { ...repositoryGitEnv(inherited), GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooks };
+}
+function fixtureGit(root: string, env: Record<string, string>, ...args: string[]) {
+  const result = Bun.spawnSync(["git", ...args], { cwd: root, env });
+  if (result.exitCode !== 0) throw new Error("Owned fixture Git setup failed; subprocess diagnostics withheld");
+  return result.stdout.toString().trim();
+}
+const metadata = (directory: string): string => new Bun.CryptoHasher("sha256").update(readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.name + ":" + (entry.isDirectory() ? metadata(join(directory, entry.name)) : new Bun.CryptoHasher("sha256").update(readFileSync(join(directory, entry.name))).digest("hex"))).join("\n")).digest("hex");
+const identity = ["-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false"];
 
 const document = (body = '<testcase name="fixture"/>', root = 'tests="1" failures="0" skipped="0"', suite = "") => `<testsuites ${root}><testsuite ${suite}>${body}</testsuite></testsuites>`;
 const invalidXML: Record<string, string> = {
@@ -58,7 +70,14 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   const bun = JSON.stringify(process.execPath);
   writeFileSync(join(root, "bin/bun"), `#!/bin/sh
 case "$1" in
-install) exit 0 ;;
+install)
+ child="$GRAYBOARD_E2E_RUN_DIR/child-repository"
+ mkdir "$child" || exit 1
+ git -C "$child" init -q || exit 1
+ printf 'child fixture\\n' > "$child/sentinel"
+ git -C "$child" add sentinel || exit 1
+ git -C "$child" -c user.name=Fixture -c user.email=you@example.com -c commit.gpgsign=false commit -qm child || exit 1
+ exit 0 ;;
 run)
  shift
  if [ "$1" != test ]; then exit 0; fi
@@ -76,10 +95,21 @@ run)
 esac
 `);
   chmodSync(join(root, "bin/bun"), 0o700);
-  const git = (...args: string[]) => { const r = Bun.spawnSync(["git", ...args], { cwd: root }); expect(r.exitCode).toBe(0); };
+  const parent = join(root, "parent"); mkdirSync(parent);
+  const parentEnv = fixtureEnv(parent), parentGit = (...args: string[]) => fixtureGit(parent, parentEnv, ...args);
+  parentGit("init", "-q"); writeFileSync(join(parent, "sentinel"), "parent metadata must not change\n");
+  parentGit("add", "sentinel"); parentGit(...identity, "commit", "-qm", "parent");
+  const before = metadata(join(parent, ".git"));
+  const hooks = join(root, "scripts/hooks"); mkdirSync(hooks);
+  writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch "${join(root, "fixture-hook-ran")}"\nexit 97\n`); chmodSync(join(hooks, "pre-commit"), 0o700);
+  const inherited = { ...process.env, GIT_DIR: join(parent, ".git"), GIT_COMMON_DIR: join(parent, ".git"), GIT_WORK_TREE: parent, GIT_INDEX_FILE: join(parent, ".git/index"), GIT_OBJECT_DIRECTORY: join(parent, ".git/objects"), GIT_ALTERNATE_OBJECT_DIRECTORIES: join(parent, ".git/objects"), GIT_CONFIG_PARAMETERS: "'core.hooksPath'='scripts/hooks'", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooks, GIT_CONFIG_KEY_91: "core.worktree", GIT_CONFIG_VALUE_91: parent };
+  const env = fixtureEnv(root, inherited), git = (...args: string[]) => fixtureGit(root, env, ...args);
   git("init", "-q"); git("add", "scripts", "src", "tests", "adapters");
-  git("-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture");
-  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", "hosted-strict"], { cwd: root, env: { ...process.env, PATH: join(root, "bin") + ":" + process.env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: join(root, "public"), PROBE_ROOT: root, PROBE_MODE: mode } });
+  git(...identity, "commit", "-qm", "fixture");
+  expect(git("rev-parse", "--absolute-git-dir") === realpathSync(join(root, ".git"))).toBe(true);
+  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: join(root, "public"), PROBE_ROOT: root, PROBE_MODE: mode } });
+  expect(metadata(join(parent, ".git"))).toBe(before);
+  expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
   const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(join(root, "public"));
   for (const value of secrets) { expect(terminal.includes(value)).toBe(false); expect(published.includes(value)).toBe(false); }
   expect(result.exitCode).toBe(mode === "success" ? 0 : 1);
@@ -94,6 +124,13 @@ esac
   expect(summary.evidenceProcessed).toBe(mode === "assertion" || mode === "success");
   if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(root, "public/evidence/result"), "utf8")).toBe("failed\n"); }
 }, 30_000);
+
+test("fixture Git filtering covers documented local variables without clearing transport settings", () => {
+  const result = Bun.spawnSync(["git", "rev-parse", "--local-env-vars"], { cwd: checkout, env: repositoryGitEnv() });
+  expect(result.exitCode).toBe(0);
+  const names = [...result.stdout.toString().trim().split("\n"), "GIT_CONFIG_KEY_91", "GIT_CONFIG_VALUE_91", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_TEMPLATE_DIR"];
+  expect(repositoryGitEnv({ ...Object.fromEntries(names.map(name => [name, "fixture-only"])), PATH: "/fixture/bin", GIT_SSH_COMMAND: "ssh" })).toEqual({ PATH: "/fixture/bin", GIT_SSH_COMMAND: "ssh" });
+});
 
 test("JUnit rejects partial metadata and strips all names, diagnostics and attributes", () => {
   expect(() => junit('<testsuites tests="1" failures="0" skipped="0">', false)).toThrow();
