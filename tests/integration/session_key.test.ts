@@ -8,6 +8,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
+import { SqliteBlobs } from "../../src/local/blobs.ts";
+import { openLocalDb } from "../../src/local/open.ts";
+import { runLocalRetention } from "../../src/local/retention.ts";
 import { closeSessions, localSession, stopSession as stop } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 
@@ -90,6 +93,34 @@ test("a clean exit under a live harness detaches; the harness's exit ends the se
   expect(err).toContain(`id_collision: ${id} ended at`);
   expect(audit("id.ended", id)).toHaveLength(1);
   expect(binding(id)).toBeUndefined();
+}, 30_000);
+
+test("a key re-used after retention pruned its ended session registers anew, audited id.reused", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  const s = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key } });
+  await stop(s.c);
+  // The next open finds the harness gone and ends the session.
+  await stop((await localSession(dir, "fe")).c);
+  const endedAt = rows<{ ended_at: number }>(`SELECT ended_at FROM ids WHERE id = ?`, id)[0]!.ended_at;
+  expect(endedAt).toBeNumber();
+
+  // Retention, run as of 91 days on: the ended row goes, leaving a tombstone.
+  const later = Date.now() + 91 * 86_400_000;
+  const { db } = openLocalDb(join(dir, "bus.db"));
+  try {
+    expect(await runLocalRetention(db, new SqliteBlobs(db), 90, later)).toBe(true);
+  } finally {
+    db.close();
+  }
+  expect(rows(`SELECT id FROM ids WHERE id = ?`, id)).toEqual([]);
+  expect(rows(`SELECT ended_at, pruned_at FROM pruned_ids WHERE id = ?`, id)).toEqual([{ ended_at: endedAt, pruned_at: later }]);
+
+  const again = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key } });
+  expect(rows(`SELECT ended_at, keyed FROM ids WHERE id = ?`, id)).toEqual([{ ended_at: null, keyed: 1 }]);
+  expect(audit("id.reused", id)).toEqual([{ ended_at: endedAt, pruned_at: later, pid: binding(id)!.attached_pid }]);
+  expect(rows(`SELECT id FROM pruned_ids`)).toEqual([]);
+  await again.call("peer_list", {});
 }, 30_000);
 
 test("a key already served by a live process under another harness is refused at once", async () => {

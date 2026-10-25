@@ -167,6 +167,8 @@ export type IdFacts = {
   writesAs?: string;
   // A `grayboard tail` (#284 S9): never listed or addressable.
   viewer?: boolean;
+  // The ID came from a session key (#284 S10): retention leaves a tombstone for it.
+  keyed?: boolean;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -181,13 +183,35 @@ export class IdCollision extends CoreError {
   }
 }
 
-/** A new session's ids row. Throws IdCollision if the ID already has one. */
-export function registerId(db: Database, f: IdFacts, now = Date.now()): void {
+/** A keyed ID retention pruned (#284 S10), which a new session has presented again. */
+export type ReusedId = { ended_at: number; pruned_at: number };
+
+/**
+ * A new session's ids row. Throws IdCollision if the ID already has one.
+ * Returns the pruned session's tombstone when the ID is a key re-used after
+ * retention deleted its row, for the caller to audit as id.reused; null
+ * otherwise. Callers are inside a transaction.
+ */
+export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId | null {
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0);
+  return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
+}
+
+/**
+ * Retention for session IDs (#284 S10, decision 4): delete the ids rows of
+ * sessions that ended before `olderThanMs`. Nothing else names an ended ID
+ * but provenance text (binding_events, sender_id, audit rows), which stays.
+ * A keyed row leaves a pruned_ids tombstone. Returns how many it deleted.
+ */
+export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now()): number {
+  return db.transaction(() => {
+    db.prepare(`INSERT OR REPLACE INTO pruned_ids (id, ended_at, pruned_at) SELECT id, ended_at, ? FROM ids WHERE ended_at < ? AND keyed = 1`).run(now, olderThanMs);
+    return db.prepare(`DELETE FROM ids WHERE ended_at < ?`).run(olderThanMs).changes;
+  }).immediate();
 }
 
 /** The principal of session `id`'s row, or undefined when it has none. */

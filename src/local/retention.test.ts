@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { bindAttachments, storeAttachment } from "../core/attachments.ts";
 import { createBoard, post } from "../core/boards.ts";
+import { assertDeliverableId } from "../core/session_end.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { SqliteBlobs } from "./blobs.ts";
 import { openLocalDb } from "./open.ts";
@@ -62,6 +63,23 @@ describe("runLocalRetention", () => {
     expect(count(`SELECT COUNT(*) AS n FROM attachment_blobs`)).toBe(1);
     await expect(blobs.get(a.sha256)).rejects.toThrow();
     await expect(blobs.get(stray.sha256)).rejects.toThrow();
+  });
+
+  test("deletes ended sessions past retention; a keyed one leaves a tombstone, and its ID is not_found", async () => {
+    const id = (n: number) => `id:${String(n).padStart(13, "0")}`;
+    const row = (n: number, endedAt: number | null, keyed: boolean) =>
+      db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen, ended_at, keyed) VALUES (?, NULL, 0, 0, ?, ?)`).run(id(n), endedAt, keyed ? 1 : 0);
+    row(1, NOW - 91 * DAY, true);
+    row(2, NOW - 91 * DAY, false);
+    row(3, NOW - 89 * DAY, true);
+    row(4, null, true);
+
+    expect(await runLocalRetention(db, blobs, 90, NOW)).toBe(true);
+
+    expect((db.prepare(`SELECT id FROM ids ORDER BY id`).all() as { id: string }[]).map((r) => r.id)).toEqual([id(3), id(4)]);
+    expect(db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids`).all()).toEqual([{ id: id(1), ended_at: NOW - 91 * DAY, pruned_at: NOW }]);
+    expect(() => assertDeliverableId(db, id(1))).toThrow(`not_found: no session ${id(1)}`);
+    expect(() => assertDeliverableId(db, id(3))).toThrow(`id_ended: ${id(3)}`);
   });
 
   test("runs at most once a day across the sessions sharing a bus", async () => {

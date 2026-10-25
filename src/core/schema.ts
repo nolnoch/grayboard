@@ -225,6 +225,20 @@ export function initCoreSchema(db: Database): void {
   }
   // viewers() reads the viewer rows on every post.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_viewer ON ids(id) WHERE viewer = 1`);
+  // keyed: the ID came from a session key (#284 S10), so a later session can
+  // present it again. Retention deletes an ended ids row (pruneEndedIds); a
+  // keyed one leaves a pruned_ids row, so a key re-used after the prune is
+  // audited id.reused rather than registering silently. Unkeyed IDs are
+  // random and never come back, so they leave none.
+  if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pruned_ids (
+      id         TEXT PRIMARY KEY,
+      ended_at   INTEGER NOT NULL,
+      pruned_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ids_ended ON ids(ended_at) WHERE ended_at IS NOT NULL;
+  `);
 
   // The 1.x roster's later columns, which each mode's alias seed reads.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));

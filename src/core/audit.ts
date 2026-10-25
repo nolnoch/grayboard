@@ -6,13 +6,15 @@
 // id.ended, a session ended (#284 decision 4), detailing what it held;
 // id.registered, a session's first rows, with how its liveness is kept;
 // id.detached and id.reattached, a keyed session's child exiting and a
-// restart under the same harness taking its place (#284 decision 3); and
+// restart under the same harness taking its place (#284 decision 3);
+// id.reused, a session key re-presented after retention pruned its ended
+// session's row (#284 S10); and
 // alias.created, a name's first bind or declaration (#284).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.ended" | "id.reattached" | "id.registered" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
 
 export function writeCoreAudit(
   db: Database,

@@ -535,7 +535,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // hello and updated by the rest (a reconnect, a rebind), and its hold.
     // The Slack bridge's humans have no ID.
     if (!ws.data.human) {
-      if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true });
+      if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true, keyed: m.session_key !== undefined });
       else {
         setPlace(db, sessionId, m.where ?? null);
         touchId(db, sessionId);

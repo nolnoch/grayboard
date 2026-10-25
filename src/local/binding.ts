@@ -110,14 +110,17 @@ export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: bool
 export function registerSession(db: Database, s: SessionRow, kind: SessionKind = {}): void {
   const { launcher = false, writesAs, viewer } = kind;
   db.transaction(() => {
-    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer }, s.started_at);
+    const keyed = s.harness_rule !== null;
+    const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed }, s.started_at);
+    // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
+    if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });
     db.prepare(
       `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
     writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
       ...(writesAs === undefined ? {} : { tools_only: true, writes_as: writesAs }),
       ...(viewer ? { viewer: true } : {}),
-      keyed: s.harness_rule !== null, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
+      keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     });
   }).immediate();
 }
