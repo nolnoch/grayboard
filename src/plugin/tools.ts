@@ -1,6 +1,7 @@
 // The tools a server-mode `grayboard mcp` serves. Side-effect free, so
 // `grayboard tools` can print them without connecting to the server.
 import { BIND_TOOL } from "../core/bindings.ts";
+import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { boardTools } from "../core/tools.ts";
 import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL } from "../shared/attachments.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM } from "../shared/inbox.ts";
@@ -52,5 +53,6 @@ export const SERVER_TOOLS = [
   DM_ACK_TOOL,
   DM_RETRACT_TOOL,
   ATTACHMENT_GET_TOOL,
+  DELEGATE_TOOL,
   ...boardTools({ teams: true }),
 ];

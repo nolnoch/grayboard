@@ -1,5 +1,5 @@
 import { participant, type MessageRow, type Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type ErrorCode } from "../shared/protocol.ts";
+import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type ErrorCode } from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
@@ -28,6 +28,7 @@ import {
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
@@ -228,6 +229,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
             break;
           case "send":
             handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
+            break;
+          case "delegate":
+            handleDelegate(hub, ws, msg.req_id, msg);
             break;
           case "history":
             handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -447,6 +451,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     if (m.resume || m.restored_from) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
+    setLauncher(db, full, m.launcher === true);
     ws.data.owner = true;
     if (from) {
       // The old connection, which the client closes next, holds nothing now.
@@ -487,6 +492,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     ...(notMoved ? { not_moved: notMoved } : {}),
   };
   const notices = [
+    ...(m.launcher ? launcherInstruction() : []),
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
@@ -597,6 +603,7 @@ function handleSend(
   parentId: number | null,
   pending: boolean,
   attachmentIdsRaw: unknown,
+  extra?: Record<string, unknown>,
 ): void {
   const { repo, db, registry } = hub;
   let ids: number[];
@@ -665,7 +672,7 @@ function handleSend(
   }
 
   if (deliveredNow) {
-    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p });
+    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p, ...extra });
     return;
   }
   const seen = lastSeen(db, parsed.full);
@@ -675,9 +682,30 @@ function handleSend(
     message_id: msg.id,
     delivered_now: false,
     ...p,
+    ...extra,
     ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
     undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
     note: queuedNote(parsed.full, seen),
+  });
+}
+
+// A delegation request (#184): resolve the launcher (or fall back to the
+// requester's human) in core, then deliver it as a pending DM through the
+// ordinary send path — the promise shows in dm_inbox until the launcher
+// reports the result in the thread. The reply carries `to` and, on the
+// degrade path, human_fallback, so the requester knows which it got.
+function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): void {
+  const online = (h: string) => hub.registry.get(h)?.data.ready === true;
+  let d;
+  try {
+    d = resolveDelegation(hub.db, ws.data.identityFull, m, online);
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    throw e;
+  }
+  handleSend(hub, ws, reqId, d.to, d.body, null, true, undefined, {
+    to: d.to,
+    ...(d.humanFallback ? { human_fallback: true as const } : {}),
   });
 }
 

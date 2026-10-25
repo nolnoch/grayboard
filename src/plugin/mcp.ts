@@ -161,7 +161,7 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
     {
       sessionKey: SESSION_KEY, hold: identity !== null && CHANNELS_OFF, from: opts.from, create: opts.create, suggested: SUGGESTED,
-      restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason),
+      restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason), launcher: process.env.BUS_LAUNCHER === "1",
     },
   );
   c.connect();
@@ -408,6 +408,19 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       if (a.pending === true && !rest.pending) {
         rest.note = `${rest.note ? `${rest.note} ` : ""}Sent, but this server doesn't record pending, so dm_inbox won't list the promise; the server needs updating.`;
       }
+      return text(rest);
+    }
+    if (name === "delegate") {
+      // The server resolves the launcher (or falls back to your human) and
+      // sends the payload pending; the reply carries `to` and, on the degrade
+      // path, human_fallback (#184).
+      const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
+        type: "delegate",
+        persona: a.persona,
+        task: a.task,
+        ...(a.context !== undefined ? { context: a.context } : {}),
+        ...(a.to !== undefined ? { to: a.to } : {}),
+      });
       return text(rest);
     }
     if (name === "dm_history") {

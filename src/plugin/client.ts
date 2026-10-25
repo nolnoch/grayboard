@@ -36,6 +36,10 @@ export type ClientOptions = {
   create?: boolean;
   // A read-only hello's suggested name, listed first among its candidates.
   suggested?: string | null;
+  // This session's harness can spawn subagents, so delegate requests may
+  // land here (#184). Sent on every hello; the server records it on the
+  // handle's row and peer_list shows it.
+  launcher?: boolean;
   // The session ID of the process this one restarted from, whose name it
   // takes back (#182 decision 14): sent on the first hello only.
   restoredFrom?: string;
@@ -104,6 +108,7 @@ export class GrayboardClient {
         ...(this.identity === null
           ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
           : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
+        ...(this.opts.launcher ? { launcher: true } : {}),
         ...(sessionKey ? { session_key: sessionKey } : {}),
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
