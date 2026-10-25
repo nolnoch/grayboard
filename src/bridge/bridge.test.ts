@@ -478,6 +478,38 @@ test("slack: an agent's reply that arrives before the owner's post is mapped sti
   store.close();
 });
 
+test("slack: a relay stopped while a reply waits for its thread's mapping posts nothing and keeps the reply queued (#232)", async () => {
+  const said: string[] = [];
+  let waited!: () => void;
+  const threading = new Promise<void>((r) => (waited = r));
+  const store = new Store(join(dir, "b.db"));
+  const f: Fetch = async (url, init) => {
+    if (String(url).endsWith("chat.postMessage")) said.push(JSON.parse(String(init.body)).markdown_text);
+    return Response.json({ ok: true, ts: "9.0" });
+  };
+  let relay!: Relay;
+  const bus: Bus = {
+    call: async (name) => {
+      if (name === "board_read") return { ok: true, value: { posts: [{ id: 7 }] } };
+      if (name !== "board_post") return { ok: true, value: {} };
+      relay.notify({ content: "ack", meta: { board: "ops", post_id: "8", parent_id: "7", from: "be" } });
+      await threading;
+      relay.stop();
+      return { ok: true, value: { post_id: 7, board: "ops" } };
+    },
+    ...noFiles,
+  };
+  relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), {
+    channel: "G1", owner: "U1", onFatal: () => {},
+    debug: (m) => m.includes("before threading") && waited(),
+  });
+  // The drain resumes as the mapping lands, before the event's own Slack calls settle.
+  await relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text: "#ops shutting down", ts: "1.0" } });
+  expect(said.some((t) => t.includes("ack"))).toBe(false);
+  expect(store.pending().map((r) => JSON.parse(r.params).content)).toEqual(["ack"]);
+  store.close();
+});
+
 // ── socket ───────────────────────────────────────────────────────────────────
 
 // A WebSocket server that completes the handshake, says hello, and then goes

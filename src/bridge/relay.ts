@@ -103,8 +103,9 @@ export class Relay {
   // Slack → bus events, one at a time in arrival order: a reply reads its
   // thread's last_id, which the message before it may still be sending.
   private inbound: Promise<void> = Promise.resolve();
-  // Slack events queued or running on `inbound`.
-  private inboundPending = 0;
+  // New threads from Slack whose bus call is out and whose mapping isn't
+  // stored yet (`mapping`).
+  private unmapped = new Set<Promise<void>>();
 
   constructor(
     private readonly store: RelayStore,
@@ -220,9 +221,11 @@ export class Relay {
       let row = this.store.thread(x.kind, x.board, x.root);
       // The owner's message that started this thread may still be mapping it:
       // its bus call hands the agent the root's id before it returns (#232).
-      if (!row && this.inboundPending) {
-        this.debug(`outbox: ${x.kind} ${x.id} waits on ${this.inboundPending} Slack event(s) before threading`);
-        await this.inbound;
+      if (!row && this.unmapped.size) {
+        this.debug(`outbox: ${x.kind} ${x.id} waits on ${this.unmapped.size} new thread(s) before threading`);
+        await Promise.all(this.unmapped);
+        // Thrown, not returned: the item stays in the outbox for the next run.
+        if (this.stopped) throw new Error("relay stopped");
         row = this.store.thread(x.kind, x.board, x.root);
       }
       const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
@@ -390,11 +393,7 @@ export class Relay {
    * Settles when this one has been handled; never rejects.
    */
   onEvent(payload: Record<string, any>): Promise<void> {
-    this.inboundPending++;
-    const run = this.inbound
-      .then(() => this.handle(payload))
-      .catch((e) => this.log(`slack event failed: ${(e as Error).message}`))
-      .finally(() => this.inboundPending--);
+    const run = this.inbound.then(() => this.handle(payload)).catch((e) => this.log(`slack event failed: ${(e as Error).message}`));
     this.inbound = run;
     return run;
   }
@@ -504,13 +503,16 @@ export class Relay {
   // at the Slack message `ts`.
   private async sendDm(to: string, text: string, files: Record<string, any>[], parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
     const r = await this.sendWithFiles(files, text, (body, extra) =>
-      this.bus.call("dm_send", { to, body, ...(parent !== undefined ? { parent_id: parent } : {}), ...extra }),
+      this.mapping(
+        row,
+        () => this.bus.call("dm_send", { to, body, ...(parent !== undefined ? { parent_id: parent } : {}), ...extra }),
+        (v) => this.store.addThread({ thread_ts: ts, kind: "dm", board: null, root_id: v.message_id, peer: to, last_id: v.message_id }),
+      ),
     );
     const where = row?.thread_ts ?? ts;
     if (!r.ok) return this.say(where, `⚠️ not sent: ${r.error}`);
     const v = r.value as { message_id: number; delivered_now: boolean; recipient_last_seen?: string };
     if (row) this.store.advance(row.thread_ts, v.message_id);
-    else this.store.addThread({ thread_ts: ts, kind: "dm", board: null, root_id: v.message_id, peer: to, last_id: v.message_id });
     if (v.delivered_now) await this.react(ts);
     else {
       const seen = v.recipient_last_seen ? ` (last seen ${v.recipient_last_seen})` : "";
@@ -520,15 +522,37 @@ export class Relay {
 
   private async sendPost(board: string, text: string, files: Record<string, any>[], parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
     const r = await this.sendWithFiles(files, text, (body, extra) =>
-      this.bus.call("board_post", { board, body, ...(parent !== undefined ? { parent_id: parent } : {}), ...extra }),
+      this.mapping(
+        row,
+        () => this.bus.call("board_post", { board, body, ...(parent !== undefined ? { parent_id: parent } : {}), ...extra }),
+        (v) => this.store.addThread({ thread_ts: ts, kind: "board", board: v.board, root_id: v.post_id, peer: null, last_id: v.post_id }),
+      ),
     );
     const where = row?.thread_ts ?? ts;
     if (!r.ok) return this.say(where, `⚠️ not posted: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
     const v = r.value as { post_id: number; board: string; unresolved?: string[] };
     if (row) this.store.advance(row.thread_ts, v.post_id);
-    else this.store.addThread({ thread_ts: ts, kind: "board", board: v.board, root_id: v.post_id, peer: null, last_id: v.post_id });
     await this.react(ts);
     if (v.unresolved?.length) await this.say(where, `posted, but no handle matches ${v.unresolved.map((h) => `@${h}`).join(", ")}`);
+  }
+
+  // A bus call that starts a new thread (row null), held in `unmapped` from
+  // the call until `map` stores its Slack mapping: the bus delivers the root,
+  // and an agent can answer it, before the call returns (#232). Only that span
+  // holds the outbox; file downloads before it don't.
+  private async mapping(row: ThreadRow | null, call: () => Promise<ToolResult>, map: (value: any) => void): Promise<ToolResult> {
+    if (row) return call();
+    let done!: () => void;
+    const held = new Promise<void>((r) => (done = r));
+    this.unmapped.add(held);
+    try {
+      const r = await call();
+      if (r.ok) map(r.value);
+      return r;
+    } finally {
+      this.unmapped.delete(held);
+      done();
+    }
   }
 
   // The owner's board starts quiet: replies to their posts and @mentions
