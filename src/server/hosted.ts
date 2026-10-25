@@ -145,9 +145,10 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   function attach(p: OAuthPrincipal, row: HostedSession): HostedSession {
     authorized(p);
-    rootOnly(row);
     const fresh = store.get(row.session_id);
     if (!fresh) throw new ApplicationError("unbound", "unbound; bind again");
+    rootOnly(fresh);
+    fence(p, row, row);
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
     authorized(p);
@@ -216,6 +217,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       return withGate(p, context, true, async row => {
         if (!row) throw new ApplicationError("unbound", `this request carries no session context (${("missing" in context ? context.missing : "missing")}), so it can only read.`);
         rootOnly(row);
+        await testPauseAsync("hosted:owning:before-txn");
         const result = store.atomic(() => fn(attach(p, row)));
         reconcile();
         return committed ? committed(result) : result as unknown as R;
@@ -284,28 +286,35 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (!("id" in mapped) || !Array.isArray(via) || via.length > 16 || via.some(value => typeof value !== "string" || !value.length || value.length > 1024 || /[\x00-\x1f\x7f]/.test(value))) throw new ApplicationError("invalid_registration", "invalid child session source or ancestry");
       const childId = mapped.id;
       if (childId === context.id) throw new ApplicationError("invalid_registration", "a session cannot register itself");
+      const before = store.get(context.id);
       const ids = [context.id, childId].sort();
-      const locked = async (index: number): Promise<unknown> => index < ids.length ? gate(ids[index]!).bind(() => locked(index + 1)) : Promise.resolve(store.atomic(() => {
-        authorized(p);
-        testPause("hosted:register:in-txn");
-        const root = rowFor(p, context)!;
-        if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
-        const existing = store.get(childId);
-        if (existing && (existing.user_id !== p.authed.user_id || existing.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
-        if (existing?.name) throw new ApplicationError("child_bound", `session ${childId} holds "${existing.name}" as its own root (bound ${existing.created_at}, in ${existing.place}); end it with session_end from that session, or leave it as its own root.`);
-        if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
-        const descendants = store.all().filter(r => r.root_session_id === childId);
-        if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
-        if (!existing) admit(p.authed.user_id, root.session_id);
-        else if (!existing.root_session_id && store.all().filter(r => r.root_session_id === root.session_id).length >= limits.children) throw new ApplicationError("bad_request", "hosted child capacity reached");
-        const attached = attach(p, root);
-        if (existing?.root_session_id === root.session_id) return { message: "already registered" };
-        if (existing) store.end(existing.session_id, "closed", now());
-        store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
-          source_session_id: child, name: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
-        audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
-        return { message: "registered", child: childId, root: root.session_id };
-      }));
+      const locked = async (index: number): Promise<unknown> => {
+        if (index < ids.length) return gate(ids[index]!).bind(() => locked(index + 1));
+        await testPauseAsync("hosted:register:before-txn");
+        return store.atomic(() => {
+          authorized(p);
+          testPause("hosted:register:in-txn");
+          const root = rowFor(p, context)!;
+          if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
+          if (before) fence(p, before, before);
+          const existing = store.get(childId);
+          if (existing && (existing.user_id !== p.authed.user_id || existing.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
+          if (existing?.name) throw new ApplicationError("child_bound", `session ${childId} holds "${existing.name}" as its own root (bound ${existing.created_at}, in ${existing.place}); end it with session_end from that session, or leave it as its own root.`);
+          if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
+          const descendants = store.all().filter(r => r.root_session_id === childId);
+          if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
+          if (!existing) admit(p.authed.user_id, root.session_id);
+          else if (!existing.root_session_id && store.all().filter(r => r.root_session_id === root.session_id).length >= limits.children) throw new ApplicationError("bad_request", "hosted child capacity reached");
+          const attached = attach(p, root);
+          touch(attached);
+          if (existing?.root_session_id === root.session_id) return { message: "already registered" };
+          if (existing) store.end(existing.session_id, "closed", now());
+          store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
+            source_session_id: child, name: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
+          audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
+          return { message: "registered", child: childId, root: root.session_id };
+        });
+      };
       const result = await locked(0);
       reconcile();
       return result;

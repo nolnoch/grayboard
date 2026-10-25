@@ -102,6 +102,76 @@ function external(operation: Record<string, unknown>) {
   return JSON.parse(result.stdout.toString().trim().split("\n").at(-1)!);
 }
 
+for (const owning of ["bind", "open", "register"] as const) {
+  for (const change of ["convert", "recreate"] as const) test(`owning ${owning} refuses external ${change} before its transaction`, async () => {
+    const first = issue(), second = issue(), p = second.principal;
+    await hosted.whoami(first.principal, context(first.principal));
+    if (owning === "open") await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
+    const id = (context(p) as { id: string }).id;
+    const old = database.repo.hosted.get(id)!;
+    const operation = () => owning === "bind" ? hosted.bind(p, context(p), { name: "new", create: true })
+      : owning === "open" ? delivery.open(p, context(p)) : hosted.register(p, context(p), "new-child");
+    const point = owning === "register" ? "hosted:register:before-txn" : "hosted:owning:before-txn";
+    await expect(hostedPause(point, operation, async () => {
+      if (change === "convert") {
+        if (owning === "open") expect(external({ operation: "end", principal: first.principal }).ok).toBe(true);
+        expect(external({ operation: "register", rawSession: "parent", child: "root", principal: first.principal }).ok).toBe(true);
+      } else {
+        expect(external({ operation: "end", principal: first.principal }).ok).toBe(true);
+        expect(external({ operation: "bind", name: "be", principal: first.principal }).ok).toBe(true);
+      }
+    })).rejects.toBeDefined();
+    const fresh = database.repo.hosted.get(id)!;
+    expect(fresh.ownership_id).not.toBe(old.ownership_id);
+    expect(fresh.grant_id).toBe(first.grantId);
+    expect(fresh.name).toBe(change === "convert" ? null : "be");
+    expect(database.repo.identities.findByUserAndName(p.authed.user_id, "new")).toBeUndefined();
+    expect(database.repo.hosted.all().some(row => row.source_session_id === "new-child")).toBe(false);
+    expect(delivery.activeLeaseCount).toBe(0);
+  });
+}
+
+test("registration before bind/open preserves the graph and never extends a sticky deadline", async () => {
+  const { principal: p } = issue();
+  await hosted.register(p, context(p), "first");
+  const id = (context(p) as { id: string }).id;
+  const ownership = database.repo.hosted.get(id)!.ownership_id;
+  await hosted.bind(p, context(p), { name: "fe", create: true });
+  const lease = await delivery.open(p, context(p));
+  now += 20_000;
+  await hosted.register(p, context(p), "second");
+  await hosted.register(p, context(p), "first");
+  expect(database.repo.hosted.get(id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
+  expect(database.repo.hosted.all()).toHaveLength(3);
+  now = lease.expiresAt + 1;
+  hosted.sweep();
+  expect(database.repo.hosted.all()).toHaveLength(0);
+});
+
+test("successful new and idempotent registration refresh activity but refusals do not", async () => {
+  const first = issue(), second = issue(), p = first.principal;
+  await hosted.register(p, context(p), "first");
+  const id = (context(p) as { id: string }).id;
+  now += 899_000;
+  await hosted.register(p, context(p), "second");
+  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(now);
+  now += 899_000;
+  await hosted.register(p, context(p), "second");
+  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(now);
+  const active = now;
+  now += 1_001;
+  hosted.sweep();
+  expect(database.repo.hosted.all()).toHaveLength(3);
+  await hosted.bind(p, context(p, "blocked"), { name: "blocked", create: true });
+  await expect(hosted.register(second.principal, context(second.principal), "blocked")).rejects.toMatchObject({ code: "child_bound" });
+  expect(database.repo.hosted.get(id)?.last_seen_at).toBe(active);
+  expect(database.repo.hosted.get(id)?.grant_id).toBe(first.grantId);
+  await hosted.end(p, context(p, "blocked"));
+  now = active + 900_001;
+  hosted.sweep();
+  expect(database.repo.hosted.all()).toHaveLength(0);
+});
+
 for (const operation of ["revoke", "bind"] as const) {
   test(`external ${operation} before receipt lock cannot consume an issued batch`, async () => {
     const issued = issue(), { principal } = issued;
