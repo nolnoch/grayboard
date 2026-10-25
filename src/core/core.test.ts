@@ -638,3 +638,32 @@ test("acknowledge by ref matches markDelivered", () => {
   expect(pendingFor(db, "sim")).toEqual([]);
   expect(getBoard(db, "e2e")!.scope).toBeNull();
 });
+
+test("board_create exposes kind, and a queue board created through the tool routes posts", () => {
+  // The feature is unreachable unless the tool surface carries kind (#192
+  // review): a queue board only a unit test can create lands nothing.
+  const b = callBoardTool(db, "be", "board_create", { name: "lanes", purpose: "work rotation", kind: "queue" })
+    .result as { kind: string };
+  expect(b.kind).toBe("queue");
+  expect(getBoard(db, "lanes")!.kind).toBe("queue");
+  callBoardTool(db, "sim", "board_subscribe", { board: "lanes", mode: "push" });
+  const r = callBoardTool(db, "be", "board_post", { board: "lanes", body: "item" }).result as { notified: string[] };
+  expect(r.notified).toEqual(["sim"]);
+  // An unknown kind is refused, and the default stays broadcast.
+  expect(() => callBoardTool(db, "be", "board_create", { name: "bad", purpose: "x", kind: "fifo" })).toThrow(/kind/);
+  callBoardTool(db, "be", "board_create", { name: "plain", purpose: "default kind" });
+  expect(getBoard(db, "plain")!.kind).toBe("broadcast");
+});
+
+test("peer_status queue param is the explicit rotation opt-out; status text never is", () => {
+  callBoardTool(db, "be", "board_create", { name: "lanes", purpose: "work rotation", kind: "queue" });
+  callBoardTool(db, "sim", "board_subscribe", { board: "lanes", mode: "push" });
+  callBoardTool(db, "fe", "board_subscribe", { board: "lanes", mode: "push" });
+  callBoardTool(db, "fe", "peer_status", { text: "heads-down", queue: "off" });
+  expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBe(true);
+  const r = callBoardTool(db, "be", "board_post", { board: "lanes", body: "item" }).result as { notified: string[] };
+  expect(r.notified).toEqual(["sim"]);
+  callBoardTool(db, "fe", "peer_status", { text: "", queue: "on" });
+  expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBeUndefined();
+  expect(() => callBoardTool(db, "fe", "peer_status", { text: "", queue: "busy" })).toThrow(/queue/);
+});

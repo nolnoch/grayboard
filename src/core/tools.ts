@@ -11,6 +11,7 @@ import {
   normalizeBoard,
   post,
   read,
+  setQueueParticipation,
   setStatus,
   subscribe,
   who,
@@ -44,12 +45,17 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_create",
       description:
-        `board_create(name, purpose${opts.teams ? ", team?" : ""}): create a board (a shared, durable topic); you're subscribed in push mode. Check board_list first so you don't make a near-duplicate.`,
+        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", description: 'Board name, e.g. "e2e" or "#e2e". [a-z0-9_-], max 32.' },
           purpose: { type: "string", description: "One line: what this board is for." },
+          kind: {
+            type: "string",
+            enum: ["broadcast", "queue"],
+            description: 'Optional. "queue": each post wakes exactly one subscriber (work rotation). Default "broadcast" fans out to every push subscriber.',
+          },
           ...(opts.teams
             ? {
                 team: {
@@ -126,10 +132,13 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "peer_status",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        'peer_status(text): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
+        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. queue "off" takes you out of queue-board rotations (an explicit opt-out; status text never affects routing), "on" restores; it persists across restarts.',
       inputSchema: {
         type: "object",
-        properties: { text: { type: "string", description: "At most 200 chars. Empty clears." } },
+        properties: {
+          text: { type: "string", description: "At most 200 chars. Empty clears." },
+          queue: { type: "string", enum: ["on", "off"], description: 'Optional. "off": queue boards skip you in the work rotation; "on": eligible again.' },
+        },
         required: ["text"],
       },
     },
@@ -307,7 +316,9 @@ export function callBoardTool(
 
     case "board_create": {
       const team = optStr(a, "team");
-      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null);
+      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null, {
+        kind: optStr(a, "kind"),
+      });
       return { result: b, wake: [] };
     }
 
@@ -347,9 +358,15 @@ export function callBoardTool(
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
     }
 
-    case "peer_status":
+    case "peer_status": {
+      const queue = optStr(a, "queue");
+      if (queue !== undefined && queue !== "on" && queue !== "off") {
+        throw new CoreError(`queue must be "on" or "off"`);
+      }
       setStatus(db, handle, str(a, "text"));
+      if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");
       return { result: "ok", wake: [] };
+    }
 
     case "board_subscribe": {
       const mode = str(a, "mode") as SubMode | "off";

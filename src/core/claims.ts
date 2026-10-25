@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { canSeeBoard, normalizeBoard, post } from "./boards.ts";
+import { canSeeBoard, normalizeBoard, post, redeliverQueuePost } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -43,7 +43,7 @@ function validKey(key: string): string {
 type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire" | "moved";
 
 // One claim_events row; callers are inside the claim's transaction.
-function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
+export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
   db.prepare(
     `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
@@ -74,6 +74,15 @@ export function claim(
   opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } = {},
 ): ClaimResult {
   const key = validKey(keyInput);
+  // The queue: keyspace is the delivery machinery's: only claimQueuePost
+  // mints these keys, against a post that exists on a board the lane can
+  // see. A public take would let any handle squat a future post's key - the
+  // audit would record a delivery that never happened, and the lane's
+  // reply-ack would fail (#192 review).
+  if (key.startsWith("queue:"))
+    throw new CoreError(
+      `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
+    );
   expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
   const board = opts.board ? normalizeBoard(opts.board) : null;
 
@@ -121,6 +130,14 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
     logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
+    if (key.startsWith("queue:")) {
+      // A declined queue post goes to the next lane with the original post;
+      // the decline post would itself rotate as a new work item, so it isn't
+      // announced either (#192 review).
+      watchersCc(db, key, true);
+      const lane = redeliverQueuePost(db, key, cur.holder, Date.now());
+      return { wake: lane ? [lane] : [] };
+    }
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
@@ -138,6 +155,19 @@ export function moveClaims(db: Database, from: string, to: string, now = Date.no
   const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
   for (const c of moved) logEvent(db, "moved", to, c, now, from);
   return moved;
+}
+
+// A queue post's holder replied in its thread: the work is handled. Releases
+// the claim with an ack note - no redelivery (handled is handled), no board
+// post. A decline, by contrast, is claim_release, which redelivers. Runs
+// inside the caller's transaction; returns whether `handle` held it.
+export function ackQueueClaim(db: Database, handle: string, key: string, now = Date.now()): boolean {
+  const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
+  if (!cur || cur.expires_at <= now || cur.holder !== handle) return false;
+  db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
+  watchersCc(db, key, true);
+  logEvent(db, "release", handle, { ...cur, note: "ack" }, now);
+  return true;
 }
 
 // Be told when someone else's claim is updated or ends, whatever your mode on
@@ -182,6 +212,15 @@ function sweepIn(db: Database, now: number): string[] {
   const wake = new Set<string>();
   for (const c of gone) {
     logEvent(db, "expire", c.holder, c, now);
+    if (c.key.startsWith("queue:")) {
+      // A queue post's claim lapsed: re-offer the original post to the next
+      // lane instead of announcing - an expiry post on a queue board would
+      // itself rotate as a new work item (#192 review).
+      watchersCc(db, c.key, true);
+      const lane = redeliverQueuePost(db, c.key, c.holder, now);
+      if (lane) wake.add(lane);
+      continue;
+    }
     const cc = watchersCc(db, c.key, true);
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
