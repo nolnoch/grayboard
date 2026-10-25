@@ -1,5 +1,7 @@
-import { chmodSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, fchmodSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { SIG, SUMS, verifySums } from "../shared/release_verify.ts";
 
 export const REPO = process.env.GRAYBOARD_REPO || "nolnoch/grayboard";
 // This machine's release target, as the assets name it: grayboard-<target>.
@@ -49,12 +51,14 @@ export function newer(a: string, b: string): boolean {
 }
 
 /**
- * Replace this binary with the latest release, in place. The rename is
- * atomic, so sessions running the old binary keep it until they reconnect.
- * Returns the new release's tag (null if already current) and the origin it
- * came from.
+ * Replace this binary with the latest release, in place. The release's
+ * SHA256SUMS must be signed by a compiled-in key and name the release's tag,
+ * and the binary must match both its SHA256SUMS line and the API digest,
+ * before it's written (#162, #173). The rename is atomic, so sessions running
+ * the old binary keep it until they reconnect. Returns the new release's tag
+ * (null if already current), the origin it came from and the key that signed it.
  */
-export async function selfUpdate(current: string): Promise<{ tag: string | null; origin: string }> {
+export async function selfUpdate(current: string): Promise<{ tag: string | null; origin: string; keyId?: string }> {
   const self = process.execPath;
   if (/^bun(\.exe)?$/.test(basename(self))) {
     throw new Error("running from source; update with git pull instead");
@@ -69,28 +73,51 @@ export async function selfUpdate(current: string): Promise<{ tag: string | null;
   const tag = release.tag_name;
   if (!newer(tag, current)) return { tag: null, origin: downloads };
 
+  const base = `${downloads}/${REPO}/releases/download/${tag}`;
+  let signed;
+  try {
+    // A release without either file is refused like a bad signature.
+    const [sums, sig] = await Promise.all([
+      get(`${base}/${SUMS}`, `the ${tag} ${SUMS}`).then((r) => r.arrayBuffer()),
+      get(`${base}/${SIG}`, `the ${tag} ${SIG}`).then((r) => r.text()),
+    ]);
+    signed = await verifySums(tag, new Uint8Array(sums), sig);
+  } catch (e) {
+    throw new Error(`the ${tag} release failed verification: ${(e as Error).message}; not updating`);
+  }
+
   const asset = `grayboard-${TARGET}`;
+  const listed = signed.digests.get(asset);
+  if (!listed) throw new Error(`the ${tag} ${SUMS} lists no ${asset}; not updating`);
   const digest = release.assets?.find((a) => a.name === asset)?.digest;
-  const bin = await get(`${downloads}/${REPO}/releases/download/${tag}/${asset}`, `the ${tag} binary for ${TARGET}`);
+  const bin = await get(`${base}/${asset}`, `the ${tag} binary for ${TARGET}`);
   const body = new Uint8Array(await bin.arrayBuffer());
 
-  // Verified before it's ever written, let alone run: a wrong or missing
-  // digest refuses the update (#173).
-  const got = `sha256:${new Bun.CryptoHasher("sha256").update(body).digest("hex")}`;
-  if (digest !== got) {
+  // Verified before it's ever written, let alone run.
+  const got = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+  if (got !== listed) {
+    throw new Error(`${asset} failed verification: sha256 ${got}, but ${SUMS} lists ${listed}; not updating`);
+  }
+  if (digest !== `sha256:${got}`) {
     throw new Error(
-      `the ${tag} binary failed verification: ${got}, but the release lists ${digest ?? "no digest"}; not updating`,
+      `${asset} failed verification: sha256 ${got}, but the release API lists ${digest ?? "no digest"}; not updating`,
     );
   }
 
-  // Download next to the binary so the rename stays on one filesystem.
-  const tmp = join(dirname(self), `.grayboard-${tag}-${process.pid}`);
+  // Beside the binary so the rename stays on one filesystem; a fresh random
+  // name opened exclusively, so nothing planted there is written through.
+  const tmp = join(dirname(self), `.grayboard-${tag}-${randomBytes(8).toString("hex")}`);
   try {
-    writeFileSync(tmp, body);
-    chmodSync(tmp, 0o755);
+    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o755);
+    try {
+      writeSync(fd, body);
+      fchmodSync(fd, 0o755); // the umask may have narrowed the mode at creation
+    } finally {
+      closeSync(fd);
+    }
     const check = Bun.spawnSync([tmp, "--version"]);
-    if (check.exitCode !== 0 || !check.stdout.toString().includes(tag.replace(/^v/, ""))) {
-      throw new Error(`the downloaded ${tag} binary didn't run on this machine`);
+    if (check.exitCode !== 0 || check.stdout.toString().trim() !== tag.replace(/^v/, "")) {
+      throw new Error(`the downloaded ${tag} binary reports '${check.stdout.toString().trim()}', not ${tag}; not updating`);
     }
     renameSync(tmp, self);
   } catch (e) {
@@ -100,5 +127,5 @@ export async function selfUpdate(current: string): Promise<{ tag: string | null;
     }
     throw e;
   }
-  return { tag, origin: downloads };
+  return { tag, origin: downloads, keyId: signed.keyId };
 }

@@ -1,54 +1,71 @@
-// install.sh's server upgrade path, run for real under bash with curl, systemctl and
-// sleep stubbed on PATH. The stubs record what they were asked; the release "served"
-// is v9.9.9, and the scenario decides what the unit looks like and what /healthz says.
+// install.sh's verification and server upgrade path, run for real under bash with
+// curl, systemctl and sleep stubbed on PATH. The stubs record what they were asked;
+// the release "served" is v9.9.9 (signed by test key a, #162), and the scenario
+// decides what the unit looks like and what /healthz says. Each run uses a copy of
+// install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
-
-const INSTALL = join(ROOT, "install.sh");
+import { signSums, testInstallSh, testKey, type TestKey } from "../support/release_keys.ts";
 
 let dir: string;
+let INSTALL: string;
 
-// What the curl stub "downloads": the digest install.sh must verify against,
-// or a wrong one (STUB_DIGEST=wrong) that must refuse the install (#173).
+// What the curl stub "downloads": a binary reporting the tag's version.
 const STUB_BIN = "#!/bin/sh\necho 9.9.9\n";
-const STUB_SHA = `sha256:${new Bun.CryptoHasher("sha256").update(STUB_BIN).digest("hex")}`;
-const WRONG_SHA = `sha256:${"0".repeat(64)}`;
+const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
+const STUB_SHA = sha(STUB_BIN);
 const target = `${process.platform}-${process.arch}`;
+const BINS = ["grayboard", "grayboard-server"] as const;
+type Bins = Partial<Record<(typeof BINS)[number], string>>;
+
+/**
+ * Publish the release the curl stub serves: `bins` as the assets; the API's
+ * digests over `api` and a SHA256SUMS for `sumsTag` over `sums` (each
+ * defaulting to `bins`; a bin left out isn't listed), signed by `key`.
+ */
+function publish(bins: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN }, o: { api?: Bins; sums?: Bins; sumsTag?: string; key?: TestKey } = {}) {
+  const rel = join(dir, "release");
+  rmSync(rel, { recursive: true, force: true });
+  mkdirSync(join(rel, "signed"), { recursive: true });
+  for (const [bin, body] of Object.entries(bins)) writeFileSync(join(rel, `${bin}-${target}`), body);
+  writeFileSync(
+    join(dir, "digests.json"),
+    // Pretty-printed, like api.github.com serves (#173: the awk parse must
+    // survive GitHub's real shape, not just compact JSON).
+    JSON.stringify({ tag_name: "v9.9.9", assets: Object.entries(o.api ?? bins).map(([bin, body]) => ({ name: `${bin}-${target}`, digest: `sha256:${sha(body)}` })) }, null, 2),
+  );
+  const files: Record<string, string> = {};
+  for (const [bin, body] of Object.entries(o.sums ?? bins)) {
+    files[`${bin}-${target}`] = join(rel, "signed", bin);
+    writeFileSync(files[`${bin}-${target}`]!, body);
+  }
+  const { sums, sig } = signSums(o.sumsTag ?? "v9.9.9", files, o.key);
+  writeFileSync(join(rel, "SHA256SUMS"), sums);
+  writeFileSync(join(rel, "SHA256SUMS.sig"), sig);
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-install-"));
   mkdirSync(join(dir, "stubs"));
   mkdirSync(join(dir, "bin"));
-  for (const [name, digest] of [["digests", STUB_SHA], ["digests-wrong", WRONG_SHA]] as const) {
-    // Pretty-printed, like api.github.com serves (#173: the awk parse must
-    // survive GitHub's real shape, not just compact JSON).
-    writeFileSync(
-      join(dir, `${name}.json`),
-      JSON.stringify(
-        {
-          tag_name: "v9.9.9",
-          assets: ["grayboard", "grayboard-server"].map((bin) => ({ name: `${bin}-${target}`, digest })),
-        },
-        null,
-        2,
-      ),
-    );
-  }
+  INSTALL = testInstallSh(dir);
+  publish();
   writeStub("sleep", "exit 0");
-  // -w: resolving "latest"; /repos/: the release API (digest lookup); -o: a binary
-  // download; else the /healthz probe.
+  // -w: resolving "latest"; /repos/: the release API (digest lookup); -o: a
+  // download, served from release/ by name (absent: a 404); else the /healthz probe.
   writeStub("curl", `
 args="$*"
-case "$args" in
-  *"-w"*) echo "https://github.com/x/grayboard/releases/tag/v9.9.9"; exit 0 ;;
-  *"/repos/"*) echo "$args" >> "${dir}/api.log"; [ "$STUB_DIGEST" = "wrong" ] && f=digests-wrong.json || f=digests.json; cat "${dir}/$f"; exit 0 ;;
+# " -w " as its own word: the temp dir's random name can hold "-w".
+case " $args " in
+  *" -w "*) echo "https://github.com/x/grayboard/releases/tag/v9.9.9"; exit 0 ;;
+  *"/repos/"*) echo "$args" >> "${dir}/api.log"; cat "${dir}/digests.json"; exit 0 ;;
 esac
-out=""
-while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
-if [ -n "$out" ]; then printf '%s' '${STUB_BIN}' > "$out"; exit 0; fi
+out="" url=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; url="$1"; shift; done
+if [ -n "$out" ]; then echo "$url" >> "${dir}/downloads.log"; [ -f "${dir}/release/\${url##*/}" ] || exit 22; cp "${dir}/release/\${url##*/}" "$out"; exit 0; fi
 echo "$args" >> "${dir}/healthz.log"
 case "$STUB_HEALTH" in
   ok)    echo '{"ok":true,"version":"9.9.9"}' ;;
@@ -78,12 +95,12 @@ function writeStub(name: string, body: string) {
   chmodSync(p, 0o755);
 }
 
-type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; digest?: string };
+type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; script?: string; path?: string };
 
-function install(s: Scenario) {
-  const p = Bun.spawnSync(["bash", INSTALL], {
+function install(s: Scenario = {}) {
+  const p = Bun.spawnSync(["/bin/bash", s.script ?? INSTALL], {
     env: {
-      PATH: `${join(dir, "stubs")}:${process.env.PATH}`,
+      PATH: s.path ?? `${join(dir, "stubs")}:${process.env.PATH}`,
       HOME: dir,
       INSTALL_SERVER: "1",
       INSTALL_DIR: join(dir, "bin"),
@@ -92,7 +109,6 @@ function install(s: Scenario) {
       STUB_STATE: s.state ?? "active",
       STUB_HEALTH: s.health ?? "ok",
       STUB_RESTART_RC: String(s.restartRc ?? 0),
-      ...(s.digest !== undefined ? { STUB_DIGEST: s.digest } : {}),
       ...(s.releasesUrl !== undefined ? { GRAYBOARD_RELEASES_URL: s.releasesUrl } : {}),
     },
   });
@@ -113,28 +129,97 @@ test("an upgrade restarts the unit and waits for /healthz on the env file's port
   expect(readFileSync(join(dir, "api.log"), "utf8")).toContain("/releases/tags/v9.9.9");
 });
 
-test("a binary whose sha256 doesn't match the release's digest is refused; the old binary stays", () => {
-  const r = install({ digest: "wrong" });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain(`sha256 ${STUB_SHA.slice(7)}, but the release lists ${WRONG_SHA}`);
-  // Nothing replaced: the CLI never landed, the server binary is the old one, nothing restarted.
+// Nothing replaced: no CLI landed, the server binary is the old one, nothing restarted.
+function expectUntouched(): void {
   expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
   expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
+  expect(existsSync(join(dir, "bin", "grayboard-server.prev"))).toBe(false);
   expect(restarts()).toBe(0);
+}
+
+function expectRefused(r: ReturnType<typeof install>, why: string): void {
+  expect(r.code, r.out + r.err).toBe(1);
+  expect(r.err).toContain(why);
+  expect(r.err).toContain("not installing");
+  expectUntouched();
+}
+
+test("a release signed by either listed key installs, naming the tag and key it verified", () => {
+  expect(install().out).toContain(`verified v9.9.9 (SHA256SUMS signed by key ${testKey("a").id})`);
+  publish(undefined, { key: testKey("b") });
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`verified v9.9.9 (SHA256SUMS signed by key ${testKey("b").id})`);
+  // The temp dir inside INSTALL_DIR is gone.
+  expect(readFileSync(join(dir, "downloads.log"), "utf8")).toContain("/releases/download/v9.9.9/SHA256SUMS.sig");
+  expect(Bun.spawnSync(["ls", "-A", join(dir, "bin")]).stdout.toString().trim().split("\n").sort()).toEqual(["grayboard", "grayboard-server", "grayboard-server.prev"]);
 });
 
-test("a release that lists no digest for the asset is refused", () => {
+test("a bad signature, or a missing SHA256SUMS or .sig, is refused", () => {
+  writeFileSync(join(dir, "release", "SHA256SUMS"), readFileSync(join(dir, "release", "SHA256SUMS"), "utf8").replace(STUB_SHA, "0".repeat(64)));
+  expectRefused(install(), `the signature doesn't verify against SHA256SUMS with key ${testKey("a").id}`);
+  publish();
+  rmSync(join(dir, "release", "SHA256SUMS.sig"));
+  expectRefused(install(), "couldn't download");
+  publish();
+  rmSync(join(dir, "release", "SHA256SUMS"));
+  expectRefused(install(), "SHA256SUMS");
+  publish();
+  writeFileSync(join(dir, "release", "SHA256SUMS.sig"), "nonsense\n");
+  expectRefused(install(), `SHA256SUMS.sig isn't "<key id> <base64 signature>"`);
+});
+
+test("a key no list holds is refused, as is the test key by the real install.sh", () => {
+  publish(undefined, { key: testKey("c") });
+  expectRefused(install(), `SHA256SUMS.sig: unknown key id ${testKey("c").id}`);
+  publish();
+  expectRefused(install({ script: join(ROOT, "install.sh") }), `SHA256SUMS.sig: unknown key id ${testKey("a").id}`);
+});
+
+test("another release's SHA256SUMS and .sig served under this tag are refused", () => {
+  publish(undefined, { sumsTag: "v9.9.8" });
+  expectRefused(install(), "SHA256SUMS is signed for 'v9.9.8', not v9.9.9");
+});
+
+test("a binary SHA256SUMS doesn't list is refused, and nothing is installed (the first binary included)", () => {
+  publish(undefined, { sums: { grayboard: STUB_BIN } });
+  expectRefused(install(), `grayboard-server-${target}: SHA256SUMS lists no sha256`);
+});
+
+// The forged asset: a replaced binary whose API digest GitHub recomputed.
+test("a binary that doesn't match SHA256SUMS is refused even when the API digest matches it", () => {
+  const forged = "#!/bin/sh\necho 9.9.9 # forged\n";
+  publish({ grayboard: STUB_BIN, "grayboard-server": forged }, { sums: { grayboard: STUB_BIN, "grayboard-server": STUB_BIN } });
+  expectRefused(install(), `grayboard-server-${target}: sha256 ${sha(forged)}, but SHA256SUMS lists ${STUB_SHA}`);
+});
+
+test("a binary whose sha256 doesn't match the release API's digest is refused", () => {
+  const other = "other";
+  publish(undefined, { api: { grayboard: other, "grayboard-server": STUB_BIN } });
+  expectRefused(install(), `grayboard-${target}: sha256 ${STUB_SHA}, but the release API lists sha256:${sha(other)}`);
+  // The install verified each binary against the release API's digest (#173).
+  expect(readFileSync(join(dir, "api.log"), "utf8")).toContain("/releases/tags/v9.9.9");
+});
+
+test("a release that lists no API digest for the asset is refused", () => {
   // Pretty-printed, like the real API: the refusal is about the missing asset,
   // not a parse quirk.
-  writeFileSync(
-    join(dir, "digests.json"),
-    JSON.stringify({ tag_name: "v9.9.9", assets: [] }, null, 2),
-  );
-  const r = install({});
+  writeFileSync(join(dir, "digests.json"), JSON.stringify({ tag_name: "v9.9.9", assets: [] }, null, 2));
+  expectRefused(install(), "the release API lists no sha256 digest");
+});
+
+test("a signed CLI that doesn't report the tag is refused", () => {
+  const stale = "#!/bin/sh\necho 9.9.8\n";
+  publish({ grayboard: stale, "grayboard-server": STUB_BIN });
+  expectRefused(install(), "the downloaded grayboard reports '9.9.8', not v9.9.9");
+});
+
+test("without openssl, install.sh refuses before downloading anything", () => {
+  const r = install({ path: join(dir, "stubs") });
   expect(r.code).toBe(1);
-  expect(r.err).toContain("the release lists no sha256 digest; refusing to install unverified");
-  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
-  expect(restarts()).toBe(0);
+  expect(r.err).toContain("openssl is required");
+  expect(existsSync(join(dir, "downloads.log"))).toBe(false);
+  expectUntouched();
 });
 
 test("a server still reporting the old version fails the install with a rollback", () => {

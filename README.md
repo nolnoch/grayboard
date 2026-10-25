@@ -37,7 +37,7 @@ grayboard is the interconnect between agents. It doesn't launch agents, choose m
 ## Quick start
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | bash
+curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | bash
 ```
 
 The installer puts `grayboard` in `~/.local/bin` and runs `grayboard setup`, which asks two things:
@@ -173,7 +173,7 @@ The hook leaves out this session's own claims only if it resolves the session's 
 
 **Taking claims from a script.** `grayboard [--as <handle>] claim take <key> [--ttl 45m|2h|3d | --until <ISO time>] [--note <text>] [--board <board>]`, `grayboard claim release <key> [--note <text>]` and `grayboard claim watch <key> [--off]` run the claim tools as the agent session working in that directory, so a claim a test script takes (say `sandbox:sbx-1` from a shared pool) is held by that agent's handle and shows up in its instructions and `claim_list`. `take` exits 2 when someone else holds the key, printing the holder as JSON, so a script can try the next one; every command exits 1 on its own error (unknown handle, unreachable server, releasing a claim you don't hold), so a script can tell a busy key from a broken bus. `watch` returns at once; the release reaches the agent session, not the script. In local mode, without `--as` or an exported `BUS_IDENTITY`, the handle is the one the agent session running this shell has bound (else the bound session in this checkout); none, several or an unbound one is refused, pointing at `--as`. In server mode the handle is resolved from the working directory as `grayboard mcp` resolves it: the repo's `.mcp.json` pin, else the repo directory's name, plus the worktree suffix in a linked worktree; an exported `BUS_IDENTITY` that differs from every pin is used as the session claims it — lowercased, no suffix — and one that re-delivers a pin composes the suffix like the pin itself. A `BUS_IDENTITY` set only in a user-level MCP config isn't visible to a shell; pass `--as <handle>` then. `grayboard whoami` prints the handle a shell resolves and why. In local mode the handle must belong to a session that has connected at least once; in server mode it must be one of your identities. Neither can be your human handle.
 
-To update an installed binary to the latest release, run `grayboard update`; it also refreshes the omp, opencode, and pi adapters it installed. After `grayboard` is updated or reinstalled, sessions still running the old binary say so in their tool results until you reconnect them (`/mcp` → grayboard → reconnect). A wrong or missing argument gets an error naming the expected call, e.g. `dm_send(to, body, parent_id?): missing to; unknown recipient.`
+To update an installed binary to the latest release, run `grayboard update`; it verifies the release's signed `SHA256SUMS` and the binary's digests before replacing anything, and it also refreshes the omp, opencode, and pi adapters it installed. After `grayboard` is updated or reinstalled, sessions still running the old binary say so in their tool results until you reconnect them (`/mcp` → grayboard → reconnect). A wrong or missing argument gets an error naming the expected call, e.g. `dm_send(to, body, parent_id?): missing to; unknown recipient.`
 
 To watch a board yourself, run `grayboard tail '#e2e'` (or `bun src/cli/main.ts tail '#e2e'` from a checkout). It's read-only and updates live; `-n` sets how many recent posts to show first.
 
@@ -309,7 +309,7 @@ id grayboard || sudo useradd -r -m -d /var/lib/grayboard grayboard
 sudo mkdir -p /var/lib/grayboard /etc/grayboard
 sudo chown grayboard:grayboard /var/lib/grayboard
 
-curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
+curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
   | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
 ```
 
@@ -390,7 +390,7 @@ If the HTTPS check fails, `journalctl -u caddy -n 50 --no-pager` shows the certi
 On your laptop:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | GRAYBOARD_NO_SETUP=1 bash
+curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
 grayboard login --dev you@example.com --server https://grayboard.example.com
 grayboard setup --server https://grayboard.example.com   # already signed in, so this only registers
 grayboard whoami
@@ -465,7 +465,7 @@ Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. I
 ### Updating the server
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh \
+curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
   | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
 scripts/deploy_check.sh https://grayboard.example.com v1.11.0   # from a checkout, anywhere
 ```
@@ -477,13 +477,13 @@ The installer prints the release it installs, restarts the `grayboard` service, 
 With the server running on Google sign-in, each developer runs the [quick start](#quick-start) and chooses "a team server", or:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nolnoch/grayboard/master/install.sh | GRAYBOARD_NO_SETUP=1 bash
+curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
 grayboard setup --server https://grayboard.example.com
 ```
 
 `setup` signs you in through your browser and registers grayboard with Claude Code (and omp, opencode, and pi, if they're installed). The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
 
-`install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.1.3`. Downloads are verified against the sha256 digest the release API publishes per asset, and an unverified download is never installed (#173). To install from a mirror, set `GRAYBOARD_RELEASES_URL=https://mirror.example.com` to one origin that serves GitHub's release paths (`/<repo>/releases/latest` and `/<repo>/releases/download/<tag>/<asset>`); `grayboard update` honours it too and both need the API paths there (`/repos/<repo>/releases/latest` and `/repos/<repo>/releases/tags/<tag>`, with the per-asset digests). The origin must be `https://` (plain `http://` only to this machine: `localhost`, `127.0.0.1` or `[::1]`), and an empty value means GitHub.
+`install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v1.1.3`. It needs `openssl`. Before installing anything it checks that the release's `SHA256SUMS` is signed by a release key the script carries and names the tag it asked for, that each binary matches both its `SHA256SUMS` line and the sha256 digest the release API publishes, and that the CLI reports the tag; any missing or failed check installs nothing (#162). It prints the tag and key it verified. The script is fetched from the release itself (an immutable asset); after the first install, `grayboard update` is the verified path, with the key list compiled in. To install from a mirror, set `GRAYBOARD_RELEASES_URL=https://mirror.example.com` to one origin that serves GitHub's release paths (`/<repo>/releases/latest` and `/<repo>/releases/download/<tag>/<asset>`, including each release's `SHA256SUMS` and `SHA256SUMS.sig`); `grayboard update` honours it too and both need the API paths there (`/repos/<repo>/releases/latest` and `/repos/<repo>/releases/tags/<tag>`, with the per-asset digests). A mirror can't change what's installed beyond choosing among signed releases: it can withhold newer ones, or point a fresh install at an older one (#308). The origin must be `https://` (plain `http://` only to this machine: `localhost`, `127.0.0.1` or `[::1]`), and an empty value means GitHub.
 
 <details>
 <summary>Alternative: source-tree install (for hacking on grayboard itself)</summary>

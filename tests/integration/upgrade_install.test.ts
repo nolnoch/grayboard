@@ -2,7 +2,9 @@
 // from a local release server (GRAYBOARD_RELEASES_URL), `grayboard setup` with
 // stub claude, omp, opencode and pi on PATH (claude records its argv; setup
 // only looks the others up), and `grayboard update` from an older release to
-// the build under test, which then refreshes the push adapters.
+// the build under test, which then refreshes the push adapters. Releases are
+// signed by test keys (#162): the builds and the install.sh copy list test
+// keys a and b in place of the real list.
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,12 +15,13 @@ import { REPO, TARGET } from "../../src/cli/update.ts";
 import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
-import { ROOT } from "../support/paths.ts";
-import { ReleaseServer } from "../support/release_server.ts";
+import { sign, signSums, testInstallSh, testKey, testKeys } from "../support/release_keys.ts";
+import { ReleaseServer, type SignedOverride } from "../support/release_server.ts";
 import { ownUpdater, previousRelease, releaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
 import { copyFileSync } from "node:fs";
+import { RELEASE_KEYS } from "../../src/shared/release_keys.ts";
 
 const ASSET = `grayboard-${TARGET}`;
 const TAG = `v${pkg.version}`;
@@ -36,7 +39,7 @@ let srv: TestServer | undefined;
 
 beforeAll(async () => {
   buildDir = mkdtempSync(join(tmpdir(), "grayboard-built-"));
-  built = await buildCli(join(buildDir, "grayboard"));
+  built = await buildCli(join(buildDir, "grayboard"), { keys: testKeys() });
 }, 60_000);
 
 afterAll(() => {
@@ -71,7 +74,7 @@ const env = (extra: Record<string, string> = {}): Record<string, string> =>
   cleanEnv({ HOME: home, PATH: `${join(dir, "stubs")}:${bin}:/usr/bin:/bin`, GRAYBOARD_RELEASES_URL: releases!.url, ...extra });
 
 const install = (extra: Record<string, string> = {}): Promise<CliResult> =>
-  runCli([join(ROOT, "install.sh")], { bin: "/bin/bash", env: env({ INSTALL_DIR: bin, GRAYBOARD_NO_SETUP: "1", ...extra }), timeoutMs: 30_000 });
+  runCli([testInstallSh(dir)], { bin: "/bin/bash", env: env({ INSTALL_DIR: bin, GRAYBOARD_NO_SETUP: "1", ...extra }), timeoutMs: 30_000 });
 
 const grayboard = (...args: string[]): Promise<CliResult> => runCli(args, { bin: join(bin, "grayboard"), env: env(), cwd: dir });
 
@@ -156,41 +159,78 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
 }, 60_000);
 
 // `update` from a build of this tree versioned 0.0.0, so this tree's own
-// selfUpdate — the one that verifies the release digest (#173) — is what runs.
-test("update verifies the download against the release's sha256 digest", async () => {
-  label = "update-digest-verify";
-  const v0 = await buildCli(join(dir, "grayboard-v0.0.0"), "0.0.0");
+// selfUpdate — the one that verifies the signed SHA256SUMS (#162) and the
+// release digest (#173) — is what runs. Each refusal keeps the old binary.
+test("update verifies the signed SHA256SUMS and the API digest before replacing anything", async () => {
+  label = "update-verify";
+  const v0 = await buildCli(join(dir, "grayboard-v0.0.0"), { version: "0.0.0", keys: testKeys() });
   mkdirSync(bin, { recursive: true });
   const installed = async (): Promise<string> => (await expectOk(grayboard("--version"))).trim();
   const reinstallV0 = () => {
     copyFileSync(v0, join(bin, "grayboard"));
     chmodSync(join(bin, "grayboard"), 0o755);
   };
+  const serve = (asset: string, opts: { digests?: Record<string, Record<string, string>>; signed?: Record<string, SignedOverride> } = {}) => {
+    releases?.stop();
+    releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: asset } }, opts);
+  };
+  const good = signSums(TAG, { [ASSET]: built });
+  const refusals: [string, () => void, string][] = [
+    ["a bad signature", () => serve(built, { signed: { [TAG]: { sig: sign("other\n") } } }), "the signature doesn't verify against SHA256SUMS"],
+    ["a missing .sig", () => serve(built, { signed: { [TAG]: { sig: null } } }), `couldn't fetch the ${TAG} SHA256SUMS.sig`],
+    ["a missing SHA256SUMS", () => serve(built, { signed: { [TAG]: { sums: null } } }), `couldn't fetch the ${TAG} SHA256SUMS`],
+    ["an unknown key id", () => serve(built, { signed: { [TAG]: signSums(TAG, { [ASSET]: built }, testKey("c")) } }), `unknown key id ${testKey("c").id}`],
+    ["another release's SHA256SUMS", () => serve(built, { signed: { [TAG]: signSums("v0.0.1", { [ASSET]: built }) } }), `SHA256SUMS is signed for v0.0.1, not ${TAG}`],
+    ["a binary SHA256SUMS doesn't list", () => serve(built, { signed: { [TAG]: signSums(TAG, {}) } }), `SHA256SUMS lists no ${ASSET}`],
+    // The forged asset: replaced, with the API digest GitHub recomputed for it.
+    ["a binary that doesn't match SHA256SUMS", () => serve(v0, { signed: { [TAG]: good } }), "but SHA256SUMS lists"],
+    ["an API digest that doesn't match", () => serve(built, { digests: { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } } }), `but the release API lists sha256:${"0".repeat(64)}`],
+    ["a signed binary that doesn't report the tag", () => serve(v0), `reports '0.0.0', not ${TAG}`],
+  ];
+  for (const [what, setup, why] of refusals) {
+    setup();
+    reinstallV0();
+    const r = await grayboard("update");
+    expect(r.code, `${what}: ${r.out}${r.err}`).not.toBe(0);
+    expect(r.err, what).toContain(why);
+    expect(r.err, what).toContain("not updating");
+    expect(await installed(), what).toBe("0.0.0");
+  }
 
-  // A digest that doesn't match the download refuses the update and keeps the binary.
-  reinstallV0();
-  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } }, { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } });
-  const bad = await grayboard("update");
-  expect(bad.code, bad.out + bad.err).not.toBe(0);
-  expect(bad.err).toContain("failed verification");
-  expect(bad.err).toContain(`but the release lists sha256:${"0".repeat(64)}`);
-  expect(await installed()).toBe("0.0.0");
+  // Either listed key lets the update land, and it names the key.
+  for (const key of ["a", "b"]) {
+    serve(built, { signed: { [TAG]: signSums(TAG, { [ASSET]: built }, testKey(key)) } });
+    reinstallV0();
+    const out = await expectOk(grayboard("update"));
+    expect(out).toContain(`Updated grayboard 0.0.0 → ${TAG} from ${releases!.url} (SHA256SUMS signed by key ${testKey(key).id}).`);
+    expect(await installed()).toBe(pkg.version);
+  }
+  expect(releases!.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/SHA256SUMS.sig`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
+}, 120_000);
 
-  // The release's own digest (of the served file) lets the update land.
-  releases.stop();
+// The inverse: a build carrying the real list (as release.yml builds) doesn't
+// trust the test keys, and no test key id is in it.
+test("a CLI built with the real key list refuses a test-signed release", async () => {
+  label = "update-real-keys";
+  const real = await buildCli(join(dir, "grayboard-real"), { version: "0.0.0" });
+  const bytes = readFileSync(real);
+  for (const k of ["a", "b", "c"]) expect(bytes.includes(testKey(k).id)).toBe(false);
+  for (const id of Object.keys(RELEASE_KEYS)) expect(bytes.includes(id)).toBe(true);
+  mkdirSync(bin, { recursive: true });
+  copyFileSync(real, join(bin, "grayboard"));
+  chmodSync(join(bin, "grayboard"), 0o755);
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
-  reinstallV0();
-  const out = await expectOk(grayboard("update"));
-  expect(out).toContain(`Updated grayboard 0.0.0 → ${TAG} from ${releases.url}.`);
-  expect(await installed()).toBe(pkg.version);
-  expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
+  const r = await grayboard("update");
+  expect(r.code).not.toBe(0);
+  expect(r.err).toContain(`SHA256SUMS.sig: unknown key id ${testKey("a").id}`);
+  expect((await expectOk(grayboard("--version"))).trim()).toBe("0.0.0");
 }, 60_000);
 
 test(`update from ${FROM} replaces it with the build under test and refreshes its adapters`, async () => {
   label = `update-from-${FROM}`;
   const old = ownUpdater(FROM)
     ? { tag: FROM, cli: (await releaseBinaries(FROM)).cli }
-    : { tag: "v0.0.0", cli: await buildCli(join(dir, "grayboard-v0.0.0"), "0.0.0") };
+    : { tag: "v0.0.0", cli: await buildCli(join(dir, "grayboard-v0.0.0"), { version: "0.0.0", keys: testKeys() }) };
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built }, [old.tag]: { [ASSET]: old.cli } });
   await expectOk(install({ GRAYBOARD_VERSION: old.tag }));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(old.tag.slice(1));
@@ -208,7 +248,7 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
 
   const out = await expectOk(grayboard("update"));
-  expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}.`);
+  expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}`);
   expect(out).toContain(`Refreshed ${omp}`);
   expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(pkg.version);

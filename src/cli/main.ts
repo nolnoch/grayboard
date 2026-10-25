@@ -628,15 +628,15 @@ program
   .command("update")
   .description("Replace this binary with the latest release")
   .action(async () => {
-    let tag: string | null, origin: string;
+    let tag: string | null, origin: string, keyId: string | undefined;
     try {
-      ({ tag, origin } = await selfUpdate(pkg.version));
+      ({ tag, origin, keyId } = await selfUpdate(pkg.version));
     } catch (e) {
       console.error(`[grayboard] update failed: ${(e as Error).message}`);
       process.exit(1);
     }
     if (!tag) { console.log(`grayboard ${pkg.version} is the latest release (${origin}).`); return; }
-    console.log(`Updated grayboard ${pkg.version} → ${tag} from ${origin}. Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
+    console.log(`Updated grayboard ${pkg.version} → ${tag} from ${origin} (SHA256SUMS signed by key ${keyId}). Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
     // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
     // command; `setup` reinstalls adapters there.
     const r = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });

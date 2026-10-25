@@ -1,14 +1,11 @@
 name: Release
 
+# Tag pushes only: no manual trigger, so no branch run can reach the release
+# environment's signing key (#162).
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to release as (e.g. v0.1.0). Required for manual runs."
-        required: true
 
 # Read-only by default; only the publish job can write (it creates the release).
 permissions:
@@ -27,7 +24,7 @@ jobs:
       # `grayboard update` checks the downloaded binary reports the tag's version.
       - name: Tag matches package.json version
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           version="$(jq -r .version package.json)"
           if [ "$TAG" != "v$version" ]; then
@@ -123,7 +120,7 @@ jobs:
       - name: Binaries suite
         env:
           GRAYBOARD_E2E_BIN_DIR: ${{ github.workspace }}/dist
-          GRAYBOARD_E2E_TAG: ${{ inputs.tag || github.ref_name }}
+          GRAYBOARD_E2E_TAG: ${{ github.ref_name }}
           GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
         run: |
           chmod +x dist/*   # artifacts don't keep the executable bit
@@ -148,13 +145,19 @@ jobs:
     with:
       suite: upgrade-matrix
 
+  # Signs SHA256SUMS with the release key, which only the `release`
+  # environment holds: a v* tag run its required reviewer approves (#162).
   release:
     name: Publish release
     needs: [build, e2e, upgrade-matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: release
     permissions:
-      contents: write   # creates the release
+      contents: write          # creates the release
+      id-token: write          # the attestation's Sigstore certificate
+      attestations: write
+      artifact-metadata: write
 
     steps:
       - uses: actions/checkout@v7.0.1
@@ -169,19 +172,59 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Resolve tag
-        id: tag
+      # The tag line binds the signature to this release; names sort in C order.
+      - name: Write SHA256SUMS
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp install.sh dist/
+          cd dist
+          { echo "# grayboard ${TAG}"; sha256sum grayboard-* install.sh | LC_ALL=C sort -k2; } > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          key="$RUNNER_TEMP/release-signing.key"
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          id="$(openssl pkey -in "$key" -pubout -outform DER | sha256sum | cut -c1-16)"
+          openssl dgst -sha256 -sign "$key" -out "$RUNNER_TEMP/sig.der" dist/SHA256SUMS
+          echo "$id $(openssl base64 -A -in "$RUNNER_TEMP/sig.der")" > dist/SHA256SUMS.sig
+          echo "signed with key $id"
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release-signing.key"
+
+      # A wrong secret fails the release here, not on users' machines: the
+      # signature must verify against the committed key file of its id.
+      - name: Verify the signature against assets/release-keys
+        run: |
+          read -r id b64 < dist/SHA256SUMS.sig
+          pub="assets/release-keys/${id}.pem"
+          [ -f "$pub" ] || { echo "::error::key $id isn't in assets/release-keys"; exit 1; }
+          [ "$(openssl pkey -pubin -in "$pub" -outform DER | sha256sum | cut -c1-16)" = "$id" ] || { echo "::error::$pub isn't key $id"; exit 1; }
+          printf '%s' "$b64" | openssl base64 -d -A > "$RUNNER_TEMP/check.der"
+          openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/check.der" dist/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: |
+            dist/grayboard-*
+            dist/install.sh
+            dist/SHA256SUMS
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3.0.3
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             dist/grayboard-*
-            install.sh
+            dist/install.sh
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
           fail_on_unmatched_files: true
