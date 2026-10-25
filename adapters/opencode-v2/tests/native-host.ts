@@ -113,14 +113,14 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       }
     }
     s.name = args.name; s.ownership ??= ++nextOwnership; s.gen++; s.capability = undefined;
-    return json(b.id, result({ name: s.name!, ownership: s.ownership, instructions: "Bound fixture" }));
+    return json(b.id, result({ name: s.name!, ownership: s.ownership, instructions: ["Bound fixture"] }));
   }
   if (name === "session_register") { await Bun.sleep(80); children.set(args.child, session); return json(b.id, result({ registered: true })); }
   if (name === "session_end") { children.delete(session); s.name = null; s.ownership = null; s.capability = undefined; return json(b.id, result({ ended: true })); }
   if (name === "delivery_open") {
     assert(s.name && s.ownership); opened.push({ session, name: s.name, ownership: s.ownership });
     s.capability = String(s.ownership).padStart(40, "a") + String(s.gen).padStart(3, "0");
-    return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user: { id: 1, email: "you@example.com" }, identity: s.name, identity_full: "you@example.com/" + s.name, issuer, resource } }));
+    return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user_email: "you@example.com", identity_full: "you@example.com/" + s.name } }));
   }
   if (name.startsWith("delivery_")) {
     if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, content: [{ type: "text", text: "no live delivery lease" }] });

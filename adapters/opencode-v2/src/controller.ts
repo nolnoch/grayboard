@@ -281,7 +281,7 @@ export class Controller {
         await this.stop(r);
         if (event.status === "completed") {
           const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
-          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || typeof output.instructions !== "string") throw new Error("Native bind completion lacked validated output");
+          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every(line => typeof line === "string")) throw new Error("Native bind completion lacked validated output");
         }
         await this.prepare(r, false);
       } catch (error) { this.set(r, "approved", `Approval retained; lease unavailable: ${error instanceof Error ? error.message : "unknown refusal"}`); }

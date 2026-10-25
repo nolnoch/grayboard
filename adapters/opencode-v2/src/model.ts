@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 export const METADATA = "grayboard.enrollment";
 export type Configuration = { type: "remote"; url: string; issuer: string; clientID: string; scope: string; configHash: string };
-export type Identity = { user: { id: number; email: string }; identity: string; identity_full: string; issuer: string; resource: string };
+export type Identity = { user: { email: string }; identity: string; identity_full: string; issuer: string; resource: string };
 export type Enrollment = { version: 2; sessionID: string; mcpName: string; configuration: Configuration; integrationID: string; connectionID: string; name?: string };
 export type Item = { id: string; actionable: boolean; event: unknown; ownership: number; bind_gen: number; name: string };
 export type Lease = { capability: string; identity: Identity; ownership: number; bind_gen: number; expiresAt: number };
@@ -21,14 +21,13 @@ export function enrollmentHash(e: Enrollment) {
   return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, e.mcpName, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.integrationID, e.connectionID, e.name])).digest("hex");
 }
 export function stableID(e: Enrollment, id: string, identity: Identity) {
-  return "msg_" + createHash("sha256").update(JSON.stringify([2, identity.user.id, identity.issuer, identity.resource, identity.identity_full, id, e.sessionID])).digest("hex");
+  return "msg_" + createHash("sha256").update(JSON.stringify([3, identity.user.email, identity.issuer, identity.resource, identity.identity_full, id, e.sessionID])).digest("hex");
 }
-export function identityOf(value: unknown): Identity {
-  const i = value as Identity;
-  if (!i || !Number.isSafeInteger(i.user?.id) || i.user.id < 1 || typeof i.user.email !== "string" ||
-    typeof i.identity !== "string" || i.identity_full !== `${i.user.email}/${i.identity}` ||
-    typeof i.issuer !== "string" || typeof i.resource !== "string") throw new Refusal("identity", "Invalid authenticated identity response");
-  return { user: { id: i.user.id, email: i.user.email }, identity: i.identity, identity_full: i.identity_full, issuer: i.issuer, resource: i.resource };
+export function identityOf(value: unknown, e: Enrollment): Identity {
+  const i = value as { user_email?: unknown; identity_full?: unknown };
+  if (!i || typeof i.user_email !== "string" || !i.user_email.length || !e.name ||
+    i.identity_full !== `${i.user_email}/${e.name}`) throw new Refusal("identity", "Invalid authenticated identity response");
+  return { user: { email: i.user_email }, identity: e.name, identity_full: i.identity_full as string, issuer: e.configuration.issuer, resource: e.configuration.url };
 }
 export function bindingOf(value: unknown): BindingState {
   const b = value as BindingState;
@@ -36,7 +35,7 @@ export function bindingOf(value: unknown): BindingState {
   return b;
 }
 export function leaseOf(value: unknown, e: Enrollment): Lease {
-  const l = value as Lease, identity = identityOf(l?.identity);
+  const l = value as Lease, identity = identityOf(l?.identity, e);
   if (!/^[A-Za-z0-9_-]{43}$/.test(l.capability) || !Number.isSafeInteger(l.ownership) || l.ownership < 1 || !Number.isSafeInteger(l.bind_gen) || l.bind_gen < 1 || !Number.isFinite(l.expiresAt) || identity.issuer !== e.configuration.issuer || identity.resource !== e.configuration.url || identity.identity !== e.name) throw new Refusal("identity", "Invalid session delivery lease");
   return { ...l, identity };
 }

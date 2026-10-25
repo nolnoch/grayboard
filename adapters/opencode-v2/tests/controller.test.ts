@@ -29,14 +29,14 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
       if (name === "bind") {
         if (refuseBind) throw new Error('identity_in_use: identity is already in use by the live session holder');
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
-        return { name: row.name, ownership: row.ownership, instructions: "bound" };
+        return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
       }
       if (name === "session_register") { await holdRegister?.(); return { registered: true }; }
       if (name === "session_end" || name === "delivery_release") { rows.delete(this.sessionID); return { ok: true }; }
       if (name === "delivery_open") {
         if (!row?.name) throw new Error("unbound");
         row.capability = (String(row.ownership) + String(row.generation)).padEnd(43, "a");
-        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user: { id: 1, email: "you@example.com" }, identity: row.name, identity_full: `you@example.com/${row.name}`, issuer: f.metadata.issuer, resource: f.config.url } };
+        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
       }
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable("no live delivery lease");
       if (name === "delivery_receipt") {
@@ -60,7 +60,7 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
   } as unknown as Context;
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
-  const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: "bound" } } });
+  const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
   return { controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("approval without name does not bind, lease, admit or receipt; native completion opens once", async () => {
@@ -268,7 +268,7 @@ test("outer CodeMode execute and malformed native output never open a lease", as
   const r = runtime();
   try {
     await r.controller.enroll("R"); r.bind("R", "be");
-    await r.controller.after({ sessionID: "R", tool: "execute", id: "call", status: "completed", result: { output: { name: "be", ownership: 1, instructions: "bound" } } });
+    await r.controller.after({ sessionID: "R", tool: "execute", id: "call", status: "completed", result: { output: { name: "be", ownership: 1, instructions: ["bound"] } } });
     await r.controller.after({ sessionID: "R", tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name: "be" } } });
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(0);
   } finally { await r.controller.close(); }

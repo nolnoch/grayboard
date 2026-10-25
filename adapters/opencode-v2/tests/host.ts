@@ -1,90 +1,84 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { rmSync } from "node:fs";
 import { OpenCode } from "@opencode/sdk";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { startServer } from "../../../src/server/app.ts";
-import { parseOAuthClients } from "../../../src/server/oauth-config.ts";
+import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
+import { sessionContext } from "../../../src/server/hosted.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 
-const installed = process.env.GRAYBOARD_INSTALLED_PACKAGE!;
-assert(installed);
-assert.equal(Bun.which("grayboard"), null, "No Grayboard CLI may be available to the host fixture");
-const { default: installedPlugin, Grayboard } = await import(pathToFileURL(join(installed, "index.js")).href) as typeof import("../src/index.js");
-const issuer = "https://grayboard.example.com:443/hosted", resource = "https://grayboard.example.com/hosted/mcp";
-const scopes = ["grayboard:delivery", "grayboard:tools"];
-for (const name of ["host.sqlite", "grayboard.sqlite"]) for (const suffix of ["", "-wal", "-shm"]) rmSync(join(process.cwd(), name + suffix), { force: true });
-let google = 0, email = "you@example.com", modelCalls = 0, lostReceipt = true, failReceipt = false, failAdmission = false, admissionFailures = 0, receiptAttempts = 0, acceptedReceipts = 0, listens = 0, subscriberReads = 0, subscriberUnauthorized = 0, subscriberOffline = false, missingLeases = 0, opens = 0;
-let now = Date.now(), callbackOrigin: string | undefined;
-const counts = { code: 0, refresh: 0, authorize: 0, blocked: 0, unexpectedNetwork: 0 };
-const app = startServer({ dbPath: join(process.cwd(), "grayboard.sqlite"), blobDir: join(process.cwd(), "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fake-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: parseOAuthClients(JSON.stringify([{ clientId: "opencode-native", name: "Package fixture", redirectUris: ["http://127.0.0.1/callback"], scopes, tokenEndpointAuthMethod: "none", allowRefresh: true }])) }, { hostname: "127.0.0.1", background: false, oauth: { now: () => now, exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; } } });
-const fake = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
-  assert.equal(new URL(req.url).pathname, "/v1/chat/completions"); modelCalls++;
-  const body = await req.json() as { stream?: boolean };
-  if (body.stream) return new Response('data: {"id":"local","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Fixture reply"},"finish_reason":null}]}\n\ndata: {"id":"local","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
-  return Response.json({ id: "local", choices: [{ index: 0, message: { role: "assistant", content: "Fixture reply" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
-} });
-const listener = `http://127.0.0.1:${app.server.port}`, providerURL = `http://127.0.0.1:${fake.port}`, fetch0 = globalThis.fetch;
-const nativeTools = new Set<string>();
+const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
+assert(root); assert.equal(Bun.version, "1.4.4");
+assert.equal((await Bun.file(join(root, "node_modules/@opencode/sdk/package.json")).json()).version, "2.1.4");
+assert.equal(Bun.which("grayboard"), null);
+const installed = readFileSync(join(root, "installed.txt"), "utf8").trim();
+const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
+const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
+let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [] };
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } } });
+let app = start();
+let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
+let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined;
+const admissions: Parameters<Context["session"]["synthetic"]>[0][] = [];
+const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null }[] = [];
+const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
+const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
-  if (![new URL(issuer).origin, listener, providerURL, callbackOrigin].includes(url.origin)) {
-    counts.blocked++;
-    if (url.hostname !== "127.0.0.1" || !["1234", "11434", "8000"].includes(url.port)) counts.unexpectedNetwork++;
-    throw new Error("Nonfixture network denied");
+  if (url.origin === callbackOrigin) return fetch0(req);
+  if (url.origin === "https://model.example.com") {
+    modelCalls++; await req.json();
+    const call = target && !issued; issued = true;
+    const delta = call ? { role: "assistant", tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: "grayboard_" + target!.tool, arguments: JSON.stringify(target!.args) } }] } : { content: "Fixture reply" };
+    return new Response("data: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + "\n\ndata: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + "\n\ndata: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
   }
-  const isMcp = url.pathname === "/hosted/mcp";
-  const body = isMcp && req.method === "POST" ? await req.clone().json() as { method?: string; params?: { name?: string } } : undefined;
-  if (url.pathname === "/hosted/oauth/authorize") counts.authorize++;
-  if (url.pathname === "/hosted/oauth/token") {
-    const grant = new URLSearchParams(await req.clone().text()).get("grant_type");
-    if (grant === "authorization_code") counts.code++; if (grant === "refresh_token") counts.refresh++;
+  assert.equal(url.origin, new URL(issuer).origin, "Only fixture HTTPS endpoints and native OAuth callback allowed");
+  assert(!url.pathname.endsWith("/register"), "CIMD must not use DCR");
+  if (url.pathname.endsWith("/oauth/token")) { const form = new URLSearchParams(await req.clone().text()); if (form.get("grant_type") === "authorization_code") codes++; else refreshes++; assert.equal(form.get("client_id"), OPENCODE_CLIENT); }
+  const b = req.method === "POST" && url.pathname.endsWith("/mcp") ? await req.clone().json() as any : undefined;
+  if (b?.method === "tools/call") {
+    const session = b.params?._meta?.["ai.opencode/sessionID"]; assert.equal(typeof session, "string");
+    calls.push({ name: b.params.name, session, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber", args: b.params.arguments ?? {}, cap: req.headers.get("X-Grayboard-Lease") });
+    assert(!req.headers.has("X-Grayboard-Identity"));
+    console.log("SUBCALL", b.params.name, session);
+    if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
   }
-  if (subscriberOffline && req.headers.get("X-Grayboard-Client") === "subscriber") throw new Error("Fixture subscriber network outage");
-  if (body?.method === "subscriptions/listen") listens++;
-  if (body?.method === "resources/read" && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberReads++;
-  if (body?.params?.name === "delivery_open") opens++;
-  if (body?.params?.name === "delivery_receipt") {
-    receiptAttempts++;
-    if (failReceipt) { failReceipt = false; throw new Error("Fixture refused receipt before server commit"); }
+  const res = await fetch0(new Request(`http://127.0.0.1:${app.server.port}` + url.pathname + url.search, req));
+  if (b?.method === "tools/call" && req.headers.get("X-Grayboard-Client") === "subscriber") { const text = await res.clone().text(); if (text.includes('"isError":true')) console.log("SUBSCRIBER_ERROR", b.params.name, text); }
+  if (b?.params?.name === "delivery_open" && res.ok) {
+    const body = await res.clone().text();
+    const match = body.startsWith("data:") ? JSON.parse(body.slice(5)) : JSON.parse(body);
+    if (!match.result?.isError) { const value = JSON.parse(match.result.content[0].text); opens.push(value); }
   }
-  const target = url.origin === new URL(issuer).origin ? new Request(listener + url.pathname + url.search, req) : req;
-  const res = await fetch0(target);
-  if (res.status === 401 && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberUnauthorized++;
-  if (body?.method === "tools/list" && !req.headers.has("X-Grayboard-Client") && res.ok) {
-    const text = await res.clone().text();
-    for (const name of ["board_create", "dm_send", "delivery_open"]) if (text.includes(`\"name\":\"${name}\"`)) nativeTools.add(name);
-  }
-  if (body?.params?.name === "delivery_renew" && res.ok && (await res.clone().text()).includes("error: delivery lease or item not found")) missingLeases++;
-  if (body?.params?.name === "delivery_receipt" && res.ok) {
-    acceptedReceipts++;
-    if (lostReceipt) { lostReceipt = false; await res.arrayBuffer(); throw new Error("Fixture dropped receipt response"); }
+  if (process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC === "1" && res.status === 401 && url.pathname.endsWith("/mcp")) {
+    const headers = new Headers(res.headers); headers.set("WWW-Authenticate", headers.get("WWW-Authenticate")!.replace('scope="grayboard:tools"', 'scope="grayboard:delivery grayboard:tools"'));
+    return new Response(res.body, { status: res.status, headers });
   }
   return res;
 }) as typeof fetch;
-let ctx: Context | undefined;
-const fixture = Plugin.define({ id: "grayboard.package.fixture", async setup(c) {
+const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   ctx = c;
-  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, headers: { "X-Grayboard-Identity": "be" }, oauth: { client_id: "opencode-native", scope: scopes.join(" ") } }));
-  const providerID = Provider.ID.make("fixture");
-  await c.provider.transform(e => e.add({ info: { ...Provider.Info.empty(providerID), name: "Fixture", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: providerURL + "/v1" } }, models: [{ ...Model.Info.default(providerID, Model.ID.make("fixture")), name: "Fixture" }] }));
-  await c.session.hook("title", e => { e.result = "Fixture session"; });
+  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, codemode: false }));
+  const p = Provider.ID.make("fixture");
+  await c.provider.transform(e => e.add({ info: { ...Provider.Info.empty(p), name: "Fixture", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: "https://model.example.com/v1" } }, models: [{ ...Model.Info.default(p, Model.ID.make("fixture")), name: "Fixture" }] }));
+  await c.session.hook("title", e => { e.result = "Fixture"; });
 } });
-const location = { directory: process.cwd() };
-const configuredPlugin = Plugin.define({ id: installedPlugin.id, setup: c => installedPlugin.setup({ ...c, session: { ...c.session, synthetic: async input => {
-  if (failAdmission) { failAdmission = false; admissionFailures++; throw new Error("Fixture transient admission failure"); }
-  return c.session.synthetic(input);
-} } }) });
-const createHost = () => OpenCode.create({ plugins: [fixture, configuredPlugin], database: { path: join(process.cwd(), "host.sqlite") }, models: { fetch: false }, config: { directory: join(process.cwd(), "home/config"), project: false, claude: false }, fs: { filewatcher: false } });
-let host: Awaited<ReturnType<typeof createHost>> | undefined, nativeClient: Client | undefined;
-async function wait<T>(read: () => Promise<T>, predicate: (value: T) => boolean, timeout = 15_000) {
-  const end = Date.now() + timeout;
-  let value: T;
-  do { try { value = await read(); if (predicate(value)) return value; } catch {} await Bun.sleep(25); } while (Date.now() < end);
-  throw new Error("Fixture wait expired");
+const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({ ...c, session: new Proxy(c.session, { get(s, k) {
+  if (k === "synthetic") return async (input: Parameters<Context["session"]["synthetic"]>[0]) => { admissions.push(structuredClone(input)); if (held) { entered?.(); await new Promise<void>(r => { release = r; }); } return s.synthetic(input); };
+  return Reflect.get(s, k);
+} }) }); } });
+const createHost = () => OpenCode.create({ plugins: [fixture, instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
+let host: Awaited<ReturnType<typeof createHost>> | undefined;
+const location = { directory: join(root, "project") };
+async function wait<T>(read: () => Promise<T> | T, predicate: (v: T) => boolean, label: string, timeout = 20_000) {
+  const deadline = Date.now() + timeout;
+  do { const v = await read(); if (predicate(v)) return v; await Bun.sleep(50); } while (Date.now() < deadline);
+  console.log("STATUS", host ? await host.rpc(Grayboard).status({}, { location }) : "closed");
+  throw new Error("Wait expired: " + label);
 }
 class Browser {
   cookies = new Map<string, string>();
@@ -96,158 +90,145 @@ class Browser {
   }
 }
 async function signIn(integrationID: string) {
-  assert(ctx);
   const previous = await ctx.integration.connection.active(integrationID);
   const method = (await ctx.integration.get({ integrationID })).data?.methods.find(m => m.type === "oauth"); assert(method);
   const attempt = await ctx.integration.oauth.connect({ integrationID, methodID: method.id });
-  const authorization = new URL(attempt.data.url), callback = new URL(authorization.searchParams.get("redirect_uri")!); callbackOrigin = callback.origin;
-  const browser = new Browser(), begin = await browser.request(authorization.href), googleURL = new URL(begin.headers.get("Location")!);
-  const returnedGoogle = await browser.request(issuer + "/oauth/google/callback?" + new URLSearchParams({ code: "fake-code", state: googleURL.searchParams.get("state")!, iss: "https://accounts.google.com" }));
-  const page = await browser.request(returnedGoogle.headers.get("Location")!), html = await page.text();
+  const auth = new URL(attempt.data.url); assert.equal(auth.searchParams.get("client_id"), OPENCODE_CLIENT);
+  callbackOrigin = new URL(auth.searchParams.get("redirect_uri")!).origin;
+  const browser = new Browser(), begin = await browser.request(auth.href), googleURL = new URL(begin.headers.get("Location")!);
+  const googleReturn = await browser.request(issuer + "/oauth/google/callback?" + new URLSearchParams({ code: "fixture-code", state: googleURL.searchParams.get("state")!, iss: "https://accounts.google.com" }));
+  const page = await browser.request(googleReturn.headers.get("Location")!), html = await page.text();
   const request = /name="request" value="([^"]+)"/.exec(html)?.[1], csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1]; assert(request && csrf);
   const consent = await browser.request(issuer + "/oauth/consent", { method: "POST", headers: { Origin: new URL(issuer).origin }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
-  const returned = new URL(consent.headers.get("Location")!); assert.equal(returned.searchParams.get("iss"), issuer); assert.equal(returned.searchParams.get("state"), authorization.searchParams.get("state"));
-  assert.equal((await fetch(returned, { redirect: "manual" })).status, 200);
-  return wait(() => ctx!.integration.connection.active(integrationID), value => Boolean(value && (value.type !== "credential" || previous?.type !== "credential" || value.id !== previous.id)));
+  assert.equal((await fetch(consent.headers.get("Location")!)).status, 200);
+  return wait(() => ctx.integration.connection.active(integrationID), c => !!c && (c.type !== "credential" || previous?.type !== "credential" || c.id !== previous.id), "native OAuth selection");
 }
+async function invoke(sessionID: string, tool: string, args: Record<string, unknown>) {
+  target = { tool, args }; issued = false;
+  await host!.session.switchModel({ sessionID, model: { providerID: "fixture", id: "fixture" } });
+  await host!.session.prompt({ sessionID, text: "Invoke " + tool }); await host!.session.wait({ sessionID }); target = undefined;
+}
+function row(raw: string) { return app.db.prepare("SELECT * FROM hosted_sessions WHERE source_session_id = ?").get(raw) as { session_id: string; root_session_id: string | null; ownership_id: number; bind_gen: number; name: string | null; grant_id: string; lease_deadline: number | null } | null; }
+const makeRoot = (title: string) => host!.session.create({ location, title, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
 try {
-  host = await createHost(); await host.agent.list({ location });
-  await wait(async () => ctx, Boolean); assert(ctx);
+  host = await createHost(); await host.agent.list({ location }); await wait(() => ctx, Boolean, "fixture setup");
+  const native = await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), x => x?.status.status === "needs_auth", "native discovery"); assert(native?.integrationID);
+  const selected = await signIn(native.integrationID); assert(selected?.type === "credential");
+  await host.mcp.connect({ server: "grayboard", location });
+  const projected = await ctx.integration.connection.resolve(selected); if (projected?.type === "oauth") console.log("NATIVE_GRANT_METADATA", JSON.stringify({ issuer: projected.metadata?.issuer, scope: projected.metadata?.scope, serverUrl: projected.metadata?.serverUrl, clientID: (projected.metadata?.client as { client_id?: string })?.client_id }));
+  await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools");
   let rpc = host.rpc(Grayboard);
-  await wait(() => rpc.status({}, { location }), s => s.state === "unenrolled").catch(async error => {
-    const plugins = await ctx!.plugin.list();
-    console.log("PLUGIN_LOAD", JSON.stringify(plugins));
-    throw error;
-  });
-  assert.equal(app.mcp.activeLeases, 0);
-  const native = await wait(async () => (await ctx!.mcp.list()).data.find(e => e.name === "grayboard"), e => e?.status.status === "needs_auth"); assert(native?.integrationID);
-  await signIn(native.integrationID);
-  await host.mcp.connect({ server: "grayboard", location });
-  assert(nativeTools.has("board_create")); assert(nativeTools.has("dm_send")); assert(!nativeTools.has("delivery_open"));
-  const selected = await ctx.integration.connection.active(native.integrationID); assert(selected?.type === "credential");
-  const access = async () => { const c = await ctx!.integration.connection.resolve(selected); assert(c?.type === "oauth"); return c.access; };
-  nativeClient = new Client({ name: "fixture-native-tools", version: "0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
-  await nativeClient.connect(new StreamableHTTPClientTransport(new URL(resource), { authProvider: { token: access, onUnauthorized: async () => { throw new Error("Native fixture requires host authorization"); } }, requestInit: { redirect: "error", headers: { "X-Grayboard-Identity": "be" } } }));
-  assert.notEqual((await nativeClient.callTool({ name: "board_create", arguments: { name: "native-tools", purpose: "Native tools fixture" } })).isError, true);
-  const root = await host.session.create({ location, title: "Root" });
-  await host.session.switchModel({ sessionID: root.id, model: { providerID: "fixture", id: "fixture" } });
-  const child = await host.session.create({ location, parentID: root.id, title: "Child" });
-  assert.equal((await rpc.enroll({ sessionID: child.id }, { location })).state, "paused"); assert.equal(app.mcp.activeLeases, 0);
-  const archived = await host.session.create({ location, title: "Archived root" });
-  await host.session.update({ sessionID: archived.id, archived: true });
-  assert.equal((await rpc.enroll({ sessionID: archived.id }, { location })).state, "paused");
-  const deleted = await host.session.create({ location, title: "Deleted root" });
-  await host.session.remove({ sessionID: deleted.id });
-  assert.equal((await rpc.enroll({ sessionID: deleted.id }, { location })).state, "paused");
-  assert.equal(app.mcp.activeLeases, 0);
-  const board = createBoard(app.db, "you@example.com/be", "fixture", "Fixture board");
-  subscribe(app.db, "you@example.com/be", board.name, "digest");
-  post(app.db, "you@example.com/sim", board.name, "Background digest");
-  assert.notEqual((await rpc.enroll({ sessionID: root.id }, { location })).state, "paused");
-  await wait(() => rpc.status({}, { location }), s => s.state === "active");
-  await wait(async () => acceptedReceipts, n => n >= 1);
-  const enrolled = (await host.session.get({ sessionID: root.id })).metadata?.["grayboard.enrollment"] as { enrollment: { identity: { issuer: string; resource: string }; configuration: { discovery: string } } };
-  assert.equal(enrolled.enrollment.identity.issuer, issuer);
-  assert.equal(enrolled.enrollment.identity.resource, resource);
-  assert.equal(enrolled.enrollment.configuration.discovery, "https://grayboard.example.com/.well-known/oauth-authorization-server/hosted");
-  assert.equal(modelCalls, 0); assert.equal(app.mcp.activeLeases, 1); assert(listens >= 1);
-  const inbox = await host.session.inbox.list({ sessionID: root.id });
-  assert.equal(inbox.length, 1); assert.match(inbox[0]!.id, /^msg_[a-f0-9]{64}$/);
-  await wait(() => rpc.status({}, { location }), s => s.state === "active");
-  failAdmission = true; failReceipt = true;
-  const dm = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/be", "Actionable message", null, false);
-  await wait(async () => app.repo.cursors.directFor("you@example.com/be"), n => n >= dm.id, 20_000);
-  await wait(async () => modelCalls, n => n >= 1);
-  await host.session.wait({ sessionID: root.id });
-  assert.equal(modelCalls, 2, "Deferred digest is evaluated on later wake, not permanently context-only");
-  await wait(async () => acceptedReceipts, count => count === 2);
-  assert.equal(receiptAttempts, acceptedReceipts + 1);
-  assert.equal(admissionFailures, 1);
-  assert.equal((await host.session.context({ sessionID: root.id })).filter(m => m.type === "synthetic").length, 2, "Receipt retry must reuse the admitted ID");
-  assert.notEqual((await nativeClient.callTool({ name: "dm_send", arguments: { to: "be", body: "Native tools fixture" } })).isError, true);
-  await wait(() => host!.session.context({ sessionID: root.id }), context => context.filter(m => m.type === "synthetic").length === 3);
-  await host.session.wait({ sessionID: root.id });
-  assert.equal(modelCalls, 3);
-  const beforeRotation = await access(), beforeOpens = opens, beforeReads = subscriberReads;
-  now += 3_601_000;
-  await host.mcp.connect({ server: "grayboard", location });
-  assert.notEqual(await access(), beforeRotation); assert.equal(counts.refresh, 1);
-  await wait(async () => subscriberReads, value => value > beforeReads, 15_000);
-  assert.equal(opens, beforeOpens, "Native access rotation must retain the delivery lease");
-  await wait(() => rpc.status({}, { location }), s => s.state === "active");
-  console.log("PASS native-only normal refresh, same lease; transient admission and receipt failures replay safely");
-  await nativeClient.close(); nativeClient = undefined;
-  await host.close(); host = undefined; ctx = undefined;
-  await wait(async () => app.mcp.activeLeases, count => count === 0, 35_000).catch(error => { console.log("SHUTDOWN_LEASE_COUNT", app.mcp.activeLeases); throw error; });
-  host = await createHost(); await host.agent.list({ location });
-  const restoredContext: Context | undefined = await wait(async (): Promise<Context | undefined> => ctx, Boolean); assert(restoredContext); ctx = restoredContext;
-  rpc = host.rpc(Grayboard);
-  await wait(() => rpc.status({}, { location }), s => s.state === "active").catch(async error => { console.log("RESTORE_STATUS", JSON.stringify(await rpc.status({}, { location }))); throw error; });
-  assert.equal(app.mcp.activeLeases, 1);
-  console.log("PASS valid explicit enrollment restores ownership after runtime close/reopen");
-  email = "other@example.com";
-  const second = await signIn(native.integrationID); assert(second?.type === "credential" && second.id !== selected.id);
-  await wait(() => rpc.status({}, { location }), s => s.state === "paused");
-  const pending = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/be", "Old account pending", null, false);
-  await Bun.sleep(250);
-  assert(app.repo.cursors.directFor("you@example.com/be") < pending.id);
-  assert.equal((await host.session.context({ sessionID: root.id })).filter(m => m.type === "synthetic").length, 3);
-  console.log("PASS actual second native account selected; old root delivery paused and pending cursor unchanged");
-  const oldRevocation = await fetch(issuer + "/oauth/revoke", { method: "POST", body: new URLSearchParams({ client_id: "opencode-native", token: await access() }) });
-  assert.equal(oldRevocation.status, 200);
-  await wait(async () => app.mcp.activeLeases, count => count === 0, 35_000);
-  assert.notEqual((await rpc.enroll({ sessionID: root.id }, { location })).state, "paused");
-  await wait(() => rpc.status({}, { location }), s => s.state === "active");
-  const enrollment = (await host.session.get({ sessionID: root.id })).metadata?.["grayboard.enrollment"] as { enrollment: { identity: { user: { email: string } } } };
-  assert.equal(enrollment.enrollment.identity.user.email, "other@example.com");
-  const opensBeforeExpiry = opens, refreshBeforeExpiry = counts.refresh;
-  subscriberOffline = true;
-  await wait(async () => app.mcp.activeLeases, count => count === 0, 35_000);
-  subscriberOffline = false;
-  await wait(() => rpc.status({}, { location }), s => s.state === "active", 20_000);
-  assert.equal(opens, opensBeforeExpiry + 1); assert.equal(missingLeases, 1);
-  assert.equal(counts.refresh, refreshBeforeExpiry, "Subscriber lease recovery performs no OAuth refresh");
-  assert.deepEqual((await host.session.get({ sessionID: root.id })).metadata?.["grayboard.enrollment"], enrollment);
-  console.log("PASS actual lease expiry during network outage; same enrolled logical account reacquired without root reenrollment");
-  await Bun.sleep(100);
-  const readsBeforeDrift = subscriberReads;
-  const drift = await ctx.mcp.transform(editor => {
-    const existing = editor.get("grayboard"); assert(existing?.type === "remote");
-    editor.set("grayboard", { ...existing, headers: { ...existing.headers, "X-Grayboard-Identity": "fe" } });
-  });
-  await wait(() => rpc.status({}, { location }), s => s.state === "paused", 15_000);
-  await drift.dispose();
-  await Bun.sleep(250);
-  assert.equal((await rpc.status({}, { location })).state, "paused", "Switch-back must not silently reenroll");
-  assert.equal(subscriberReads, readsBeforeDrift, "Changed binding must be refused before subscriber fetch");
-  await wait(async () => app.mcp.activeLeases, count => count === 0, 35_000);
-  assert.notEqual((await rpc.enroll({ sessionID: root.id }, { location })).state, "paused");
-  await wait(() => rpc.status({}, { location }), s => s.state === "active");
-  const nativeStatus = (await ctx.mcp.list()).data.find(e => e.name === "grayboard")!.status.status;
-  const nextAccess = await ctx.integration.connection.resolve(second); assert(nextAccess?.type === "oauth");
-  assert.equal((await fetch(issuer + "/oauth/revoke", { method: "POST", body: new URLSearchParams({ client_id: "opencode-native", token: nextAccess.access }) })).status, 200);
-  await wait(() => rpc.status({}, { location }), s => s.state === "auth", 15_000);
-  assert.equal(subscriberUnauthorized, 1);
-  await rpc.enroll({ sessionID: root.id }, { location });
-  await Bun.sleep(250);
-  assert.equal(subscriberUnauthorized, 1, "Unchanged rejected access must not be retried");
-  assert.equal((await ctx.mcp.list()).data.find(e => e.name === "grayboard")!.status.status, nativeStatus);
-  await wait(async () => app.mcp.activeLeases, count => count === 0, 35_000);
-  console.log("PASS actual account switch, config drift latch/switch-back, lease expiry, one subscriber 401 and no native status mutation");
-  await rpc.pause({}, { location }); assert.equal(app.mcp.activeLeases, 0);
-  console.log("PASS installed tarball, actual native OAuth, native tools, explicit root, listen ACK, digest idle, actionable wake, durable receipts and cleanup");
-  await host.close(); host = undefined; ctx = undefined;
-  host = await createHost(); await host.agent.list({ location }); await wait(async () => ctx, Boolean);
-  await wait(() => host!.rpc(Grayboard).status({}, { location }), status => status.state === "paused");
-  const persisted = await host.session.context({ sessionID: root.id });
-  assert.equal(persisted.filter(m => m.type === "synthetic").length, 3);
-  assert.equal(app.mcp.activeLeases, 0, "Paused enrollment must not restore ownership");
-  console.log("PASS persisted synthetic admissions, paused reload has no owner");
-  assert.equal(counts.authorize, 2); assert.equal(counts.code, 2); assert(counts.refresh >= 1, "Native host owns normal refresh, including reconnect of revoked access with a still-valid grant"); assert.equal(google, 2);
-  assert.equal(counts.unexpectedNetwork, 0);
-  console.log("COUNTS", JSON.stringify({ ...counts, google, modelCalls, listens, receiptAttempts, acceptedReceipts, admissionFailures, subscriberUnauthorized, opens, missingLeases }));
-} finally {
-  await nativeClient?.close().catch(() => {}); await host?.close(); await app.stop(); fake.stop(true); app.db.close(); globalThis.fetch = fetch0;
-  assert.equal(app.mcp.activeContexts, 0); assert.equal(app.mcp.activeLeases, 0);
-  console.log("PASS all contexts and leases closed");
-}
+  const a = await makeRoot("Root A"), b = await makeRoot("Root B");
+  const approval = await rpc.enroll({ sessionID: a.id }, { location }); console.log("APPROVAL", approval); assert.equal(approval.state, "unbound"); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
+  await invoke(a.id, "bind", { name: "be", create: true });
+  await wait(() => rpc.status({}, { location }), s => s.state === "active", "native bind completion opens real lease");
+  await invoke(b.id, "bind", { name: "fe", create: true }); assert.equal(app.mcp.activeLeases, 1, "Binding before approval is not receiving approval");
+  await rpc.enroll({ sessionID: b.id }, { location });
+  await wait(() => app.mcp.activeLeases, n => n === 2, "two root leases");
+  assert.notEqual(row(a.id)?.ownership_id, row(b.id)?.ownership_id);
+  await invoke(a.id, "dm_send", { to: "fe", body: "Native sender isolation A" });
+  await wait(() => app.repo.cursors.directFor("you@example.com/fe"), n => n > 0, "real receipt cursor B");
+  await invoke(b.id, "dm_send", { to: "be", body: "Native sender isolation B" });
+  await wait(() => app.repo.cursors.directFor("you@example.com/be"), n => n > 0, "real receipt cursor A");
+  const sent = app.db.prepare("SELECT sender, recipient FROM messages WHERE body LIKE 'Native sender isolation%'").all();
+  assert.deepEqual(sent, [{ sender: "you@example.com/be", recipient: "you@example.com/fe" }, { sender: "you@example.com/fe", recipient: "you@example.com/be" }]);
+  console.log("REAL_ROOT_ISOLATION_OK", { opens: opens.length, cimd, codes });
+  const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+  const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+  await invoke(grandchild.id, "dm_send", { to: "fe", body: "Nested child inherits A" });
+  assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); assert.equal(row(child.id), null, "via ancestry is not registration authority");
+  const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
+  await invoke(grandchild.id, "bind", { name: "child-control", create: true }); assert.equal(row(grandchild.id)?.name, null); assert.equal(app.mcp.activeLeases, 2);
+  await host.session.update({ sessionID: grandchild.id, archived: true });
+  await wait(() => row(grandchild.id), r => !r, "raw child self-close"); assert.equal(row(a.id)?.name, "be");
+  console.log("REAL_CHILD_META_AND_SELF_CLOSE_OK");
+  const ownership = row(a.id)!.ownership_id;
+  for (const name of ["r1", "r2", "r3", "r4"]) { const before = opens.length; await invoke(a.id, "bind", { name, create: true }); await wait(() => opens.length, n => n === before + 1, "one rebind lease " + name); assert.equal(row(a.id)!.ownership_id, ownership); assert.equal(app.mcp.activeLeases, 2); }
+  assert.equal(row(a.id)!.bind_gen, 5);
+  console.log("REAL_FOUR_REBINDS_OK", { ownership, opens: opens.length, streams: app.mcp.activeInboxListeners });
+  await rpc.pause({}, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id), null);
+  await rpc.enroll({ sessionID: a.id }, { location });
+  await wait(() => app.mcp.activeLeases, n => n === 1, "pause resume remembered name");
+  assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === "r4" && c.args.create === false));
+  const board = createBoard(app.db, "you@example.com/r4", "fixture", "Fixture board"); subscribe(app.db, "you@example.com/r4", board.name, "digest");
+  const beforeDigest = modelCalls; post(app.db, "you@example.com/sim", board.name, "Idle digest"); app.application.boardsChanged([board.name]);
+  await wait(() => host!.session.inbox.list({ sessionID: a.id }), xs => xs.length >= 1, "digest durable idle admission"); assert.equal(modelCalls, beforeDigest);
+  held = true; const enteredPromise = new Promise<void>(r => { entered = r; });
+  const dm = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Held real durable admission", null, false); app.application.wake(["you@example.com/r4"]);
+  await enteredPromise;
+  assert(app.repo.cursors.directFor("you@example.com/r4") < dm.id, "No real cursor movement before actual host durable admission");
+  assert(admissions.at(-1)?.sessionID === a.id); held = false; release?.();
+  await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === dm.id, "receipt after durable host acceptance");
+  await host.session.wait({ sessionID: a.id });
+  const original = admissions.at(-1)!; assert((await host.session.context({ sessionID: a.id })).some(m => m.id === original.id));
+  console.log("REAL_DURABLE_RECEIPT_NOT_ACK_OK", { cursor: dm.id, receiptAttempts });
+  dropReceipt = true; const receiptsBeforeLoss = receiptAttempts;
+  const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Replay after host reload", null, false); app.application.wake(["you@example.com/r4"]);
+  await wait(() => admissions, xs => xs.some(x => x.text.includes("Replay after host reload")), "lost receipt durable admission");
+  await wait(() => receiptAttempts, n => n > receiptsBeforeLoss, "lost receipt attempted after real durable admission");
+  await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "lost receipt retry boundary before host reload");
+  await host.close(); host = undefined; dropReceipt = false;
+  assert(app.repo.cursors.directFor("you@example.com/r4") < lost.id);
+  host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
+  await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === lost.id, "restored lease replay receipt");
+  await host.session.wait({ sessionID: a.id });
+  const replay = admissions.filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
+  assert.equal((await host.session.context({ sessionID: a.id })).filter(m => m.id === replay[0]!.id).length, 1);
+  console.log("REAL_HOST_RELOAD_STABLE_ID_OK", { replay: replay.length, cursor: lost.id });
+  if (process.env.GRAYBOARD_TEST_SKIP_RESTART === "1") assert.equal(process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC, "1", "Skipping a required gate is diagnostic only");
+  else {
+  const timelyOwnership = row(a.id)!.ownership_id;
+  await host.close(); host = undefined; await app.stop(); app = start();
+  host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
+  await wait(() => app.mcp.activeLeases, n => n === 1, "server restart before sticky deadline"); assert.equal(row(a.id)!.ownership_id, timelyOwnership);
+  await host.close(); host = undefined; await app.stop(); await Bun.sleep(31_000); app = start();
+  host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
+  await wait(() => app.mcp.activeLeases, n => n === 1, "server restart after sticky expiry"); assert.notEqual(row(a.id)!.ownership_id, timelyOwnership);
+  console.log("REAL_SERVER_RESTART_DEADLINES_OK", { before: timelyOwnership, after: row(a.id)!.ownership_id });
+  }
+  await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
+  assert.equal(app.repo.identities.listForUser(app.repo.users.findByEmail("you@example.com")!.id).some(i => i.name === "does-not-exist"), false);
+  await rpc.enroll({ sessionID: a.id, name: "r4" }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit reapproval existing name");
+  const drift = await ctx.mcp.transform(e => { const old = e.get("grayboard"); assert(old?.type === "remote"); e.set("grayboard", { ...old, headers: { "X-Fixture-Drift": "away" } }); }); await ctx.mcp.reload();
+  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "real config drift"); await drift.dispose(); await ctx.mcp.reload(); assert.equal((await rpc.status({}, { location })).state, "paused");
+  console.log("REAL_CONFIG_AWAY_BACK_LATCH_OK");
+  await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "reenroll after observed drift");
+  held = true; const staleEntered = new Promise<void>(r => { entered = r; });
+  const stale = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Old issued batch across native rebind", null, false); app.application.wake(["you@example.com/r4"]);
+  await staleEntered; const oldAdmission = admissions.at(-1)!, staleReceipts = receiptAttempts;
+  const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth");
+  const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
+  await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
+  held = false; release?.();
+  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "out-of-band real service rebind observed after old host admission");
+  assert.equal(receiptAttempts, staleReceipts); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
+  assert((await host.session.context({ sessionID: a.id })).some(m => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some(m => m.id === oldAdmission.id));
+  console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
+  await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");
+  const revokeFixtureGrant = (grantID: string) => {
+    const token = app.db.prepare("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(grantID) as { hash: string }; assert(token);
+    app.repo.oauth.revokeToken(token.hash, OPENCODE_CLIENT, Date.now());
+  };
+  const g1 = row(a.id)!.grant_id, second = await signIn(native.integrationID); assert(second?.type === "credential");
+  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });
+  await invoke(a.id, "peer_list", {}); assert.equal(row(a.id)!.grant_id, g1, "Ordinary G2 tools cannot attach ownership");
+  await invoke(a.id, "bind", { name: "final" }); assert.notEqual(row(a.id)!.grant_id, g1, "Only owning G2 success attaches grant");
+  await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "G2 attached lease");
+  revokeFixtureGrant(g1);
+  assert.equal(row(a.id)?.name, "final", "Revoking old G1 does not release G2 owner");
+  revokeFixtureGrant(row(a.id)!.grant_id);
+  await wait(() => app.mcp.activeLeases, n => n === 0, "G2 revoke ends actual lease"); assert.equal(row(a.id), null);
+  await wait(() => rpc.status({}, { location }), s => s.state === "auth" || s.state === "paused", "revoked token fail closed");
+  console.log("REAL_G1_G2_ATTACH_REVOKE_OK");
+  email = "other@example.com"; await signIn(native.integrationID); await host.mcp.connect({ server: "grayboard", location });
+  assert.equal((await rpc.status({}, { location })).state, "paused", "A new native account never retargets old approval");
+  const oldPending = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/final", "Old account must not retarget", null, false);
+  await rpc.enroll({ sessionID: a.id, name: "final", create: true }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit new account approval");
+  const lastOpen = await host.session.get({ sessionID: a.id }); assert(lastOpen.metadata);
+  const pendingBeforeDisable = admissions.length; app.repo.users.setDisabled(app.repo.users.findByEmail(email)!.id, true);
+  await wait(() => app.mcp.activeLeases, n => n === 0, "actual user disable ends ownership"); assert.equal(row(a.id), null);
+  assert(app.repo.cursors.directFor("you@example.com/final") < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
+  console.log("REAL_ACCOUNT_DRIFT_AND_DISABLE_OK");
+  assert.equal(codes, 3); assert.equal(google, 3); assert(cimd >= 1); assert.equal(refreshes, 0);
+  console.log(process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC === "1" ? "DIAGNOSTIC_ONLY_CHALLENGE_WIDENED" : "REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
+} finally { release?.(); await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
