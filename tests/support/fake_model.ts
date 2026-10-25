@@ -8,7 +8,7 @@
 // tests, after probe P1 measures which routes it calls.
 
 export type ChatMessage = { role: string; content?: unknown; tool_calls?: unknown };
-export type ChatRequest = { messages: ChatMessage[] };
+export type ChatRequest = { messages: ChatMessage[]; tools?: { function: { name: string } }[] };
 export type Recorded<B> = { method: string; path: string; body: B };
 export type Reply = { text: string } | { tool: string; args: Record<string, unknown> };
 export type Rule = (req: ChatRequest) => Reply | undefined;

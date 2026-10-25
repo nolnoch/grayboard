@@ -17,6 +17,7 @@ import {
   type Pending,
   type Post,
   type SubMode,
+  type UnboundPeer,
 } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
@@ -289,7 +290,8 @@ export type ToolOutcome = { result: unknown; wake: string[] };
 // What only the mode knows. online: does this handle have a live session?
 // attachmentLimits: the caps a post's files are bound under; a mode without
 // them can't post files.
-export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits };
+// unbound: the live sessions with no name yet, for peer_list (#182).
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[] };
 
 export function callBoardTool(
   db: Database,
@@ -367,7 +369,7 @@ export function callBoardTool(
     case "peer_list": {
       if (!ctx.online) throw new CoreError("peer_list isn't available in this mode");
       const board = optStr(a, "board");
-      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online);
+      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online, ctx.unbound);
       return { result: r, wake: [] };
     }
 

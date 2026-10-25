@@ -78,7 +78,8 @@ export function initCoreSchema(db: Database): void {
 
     -- Claim history, since release and expiry delete the claims row. Append-
     -- only, written in the claim's own transaction; pruned with posts.
-    -- event: take, renew, refused (held_by has it), release, expire.
+    -- event: take, renew, refused (held_by has it), release, expire, moved
+    -- (a rebind took it to a new name; held_by has the old one).
     CREATE TABLE IF NOT EXISTS claim_events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       key         TEXT    NOT NULL,
@@ -91,6 +92,21 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+
+    -- Which session held which name, and when (#182): the join between a
+    -- session's run metadata and a name. Append-only. event: bound, moved
+    -- (a rebind; detail has the old name), released, refused (detail has
+    -- the holder or the reason).
+    CREATE TABLE IF NOT EXISTS binding_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id  TEXT    NOT NULL,
+      name        TEXT    NOT NULL,
+      event       TEXT    NOT NULL,
+      at          INTEGER NOT NULL,
+      detail      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_binding_events_name ON binding_events(name, at);
+    CREATE INDEX IF NOT EXISTS idx_binding_events_session ON binding_events(session_id);
 
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A

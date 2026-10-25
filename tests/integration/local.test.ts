@@ -10,6 +10,7 @@ import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 import { runCli } from "../support/cli.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { until } from "../support/until.ts";
 
 let dir: string;
 
@@ -70,12 +71,16 @@ test("a worktree session's handle follows the explicit-identity rule", async () 
   expect((await call(sim, "peer_list")).you).toBe("sim");
   expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "sim"]);
 
-  // A BUS_IDENTITY that re-delivers the repo's pin is derived: the suffix
-  // composes, so an existing worktree handle ("be-stream") keeps its name,
-  // mail and claims. The pin lives in the main checkout; the worktree
-  // session resolves it through the repo.
+  // A BUS_IDENTITY that re-delivers the repo's pin is derived, not explicit:
+  // the session starts unbound (#182), with the derived worktree name
+  // ("be-stream", the suffix composes) first among its candidates. The pin
+  // lives in the main checkout; the worktree session resolves it through
+  // the repo.
   writeFileSync(join(dir, "repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
   const stream = await start("be", wt);
+  expect(stream.getInstructions()).toContain('Candidates (free now): be-stream (this checkout\'s default:');
+  expect((await call(stream, "peer_list")).you).toBeUndefined();
+  await call(stream, "bind", { name: "be-stream", create: true });
   expect((await call(stream, "peer_list")).you).toBe("be-stream");
   expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
 }, 20_000);
@@ -93,10 +98,9 @@ test("an explicit identity is lowercased, the server's rule (#181); an invalid o
 test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", async () => {
   // No repo pin: a BUS_IDENTITY from a user-level registration (claude mcp
   // add -e, pi's user mcp.json) is a chosen task name, literal in every
-  // worktree. Both sessions resolve to "task": the second is refused at
-  // startup with the remedy in the message, and the first keeps the name
-  // (one live session per handle; #182 specifies an unbound start instead,
-  // which is not merged yet).
+  // worktree. Both sessions resolve to "task": the second starts unbound,
+  // its instructions name the holder, and the first keeps the name (one
+  // live session per handle; #182).
   const repo = join(dir, "repo2");
   mkdirSync(join(repo, ".git", "worktrees"), { recursive: true });
   for (const wt of ["alpha", "beta"]) {
@@ -107,7 +111,11 @@ test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", as
 
   const first = await start("task", join(repo, ".wt", "alpha"));
   expect((await call(first, "peer_list")).you).toBe("task");
-  await expect(session("task", join(repo, ".wt", "beta"))).rejects.toThrow(/already in use by a live session/);
+  const second = await start("task", join(repo, ".wt", "beta"));
+  expect(second.getInstructions()).toContain('BUS_IDENTITY asked for "task", but');
+  expect((await call(second, "peer_list")).you).toBeUndefined();
+  const refused = await second.callTool({ name: "bind", arguments: { name: "task" } });
+  expect(refused.isError).toBe(true);
   // The first session still owns the name and answers calls.
   expect((await call(first, "peer_list")).you).toBe("task");
 }, 20_000);
@@ -115,8 +123,12 @@ test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", as
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
+  // No BUS_IDENTITY: unbound, the repo's name its first candidate (#182).
   const api = await start(undefined, repo, ["mcp"]);
   const be = await start("be", dir, ["mcp"]);
+  // api has never existed: the candidate says binding it needs create.
+  expect(api.getInstructions()).toContain("Candidates (free now): api (this checkout's default: new: bind with create: true)");
+  await call(api, "bind", { name: "api", create: true });
   expect((await call(api, "peer_list")).you).toBe("api");
   expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
 }, 20_000);
@@ -306,7 +318,11 @@ test("identity create --mcp names a missing directory instead of failing with EN
   const bad = await create("nope/.mcp.json");
   expect(bad.code).toBe(1);
   expect(bad.err).toMatch(/directory \S*\/nope doesn't exist/);
-  expect((await create(".mcp.json")).code).toBe(0);
+  const ok = await create(".mcp.json");
+  expect(ok.code).toBe(0);
+  // The pin is a suggestion; the output says how to bind at start (#182).
+  expect(ok.out).toContain(`"be" is pinned as this checkout's default`);
+  expect(ok.out).toContain("set BUS_IDENTITY in the launch command to bind at start");
 }, 20_000);
 
 test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {
@@ -329,13 +345,23 @@ test("grayboard claims: exits 2 when another session holds a match, 0 otherwise"
 // The CLI as a lane's shell runs it: env and cwd decide the handle.
 const gb = (identity: string | undefined, cwd: string, ...args: string[]) => runCli(args, { cwd, env: busEnv(identity) });
 
-test("grayboard claim take/release acts as the directory's session; held exits 2", async () => {
+test("grayboard claim take/release acts as the shell's bound session; held exits 2", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
   const api = await start(undefined, repo, ["mcp"]);
   const be = await start("be");
 
-  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the directory name)\n" });
+  // Each session runs under its own harness stand-in, none of them an
+  // ancestor of the CLI, so the checkout picks (#182 decision 18); the
+  // ancestor rule is src/cli/claim.test.ts's. An unbound session has no name
+  // to act as: refuse, never guess.
+  const unbound = await gb(undefined, repo, "whoami");
+  expect(unbound.code).toBe(1);
+  expect(unbound.err).toContain("hasn't bound a name yet");
+  await call(api, "bind", { name: "api", create: true });
+  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout)\n" });
+  const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
+  expect((await gb(undefined, elsewhere, "whoami")).err).toContain("no live session runs this shell or this checkout");
   expect(JSON.parse((await gb("be", dir, "--json", "whoami")).out)).toEqual({ handle: "be", source: "BUS_IDENTITY" });
 
   const took = await gb(undefined, repo, "claim", "take", "sandbox:sbx-1", "--ttl", "2h", "--note", "smoke");
@@ -435,7 +461,7 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   const c = await start("be");
   const { tools } = await c.listTools();
   const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
-  expect(upfront).toEqual(["board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
+  expect(upfront).toEqual(["bind", "board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
 test("a Claude Code session started without a channels flag runs tools-only and is warned", async () => {
@@ -460,11 +486,16 @@ Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"]
   expect(on.getInstructions()).not.toContain("Warning:");
   expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
 
-  // The flagless session would drop pushes yet mark them delivered: it takes
-  // none, so peers see it offline and a session with channels gets them later.
+  // The flagless session would drop pushes yet mark them delivered: it holds
+  // its name but takes none, so a DM waits. A session with channels can't
+  // take the name while it's held (#182); once the flagless one exits, it
+  // binds the name and gets what waited.
   expect((await call(on, "dm_send", { to: "be", body: "waits" })).delivered_now).toBe(false);
   const be = await session("be");
-  await Bun.sleep(500);
+  expect(be.c.getInstructions()).toContain('BUS_IDENTITY asked for "be", but');
+  await stop(off);
+  await be.call("bind", { name: "be" });
+  await until(() => contents(be).length > 0);
   expect(contents(be)).toEqual(["waits"]);
 }, 20_000);
 

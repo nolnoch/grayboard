@@ -131,12 +131,17 @@ export function startSession(db: Database, handle: string, cwd: string | null, n
     .run(cwd, handle);
 }
 
-/** Make `handle` the one declared human handle (`grayboard human`). */
-export function declareHuman(db: Database, handle: string): void {
+/**
+ * Make `handle` the one declared human handle (`grayboard human`). `guard`
+ * runs first inside the same write transaction and throws to refuse: local
+ * mode checks there that no live agent session holds the handle (#79).
+ */
+export function declareHuman(db: Database, handle: string, guard?: () => void): void {
   db.transaction(() => {
+    guard?.();
     touchHandle(db, handle);
     db.prepare(`UPDATE handles SET human = (name = ?)`).run(handle);
-  })();
+  }).immediate();
 }
 
 /** Server mode: one handle per linked user is a human; set or clear one. */
@@ -516,11 +521,17 @@ export type Peer = {
   status_age?: string;
   human?: true;
 };
-// Read-only viewers (`grayboard tail`) subscribe under "~" handles, which no
-// identity can have. They aren't agents: keep them out of the roster.
-export const isViewer = (handle: string): boolean => handle.startsWith("~");
+// Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
+// "~" handles, which no identity can have: locally "~<id>", on a server
+// "<email>/~<id>". They aren't agents: keep them out of the roster.
+export const isViewer = (handle: string): boolean => handle.startsWith("~") || handle.includes("/~");
 
-export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
+// A live session with no name yet (#182): shown so the user and other agents
+// see what's running, never messageable, so it has no handle.
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; self?: true };
+
+// `you` is left out for an unbound session: its "~" handle can't be addressed.
+export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The roster: every handle that has connected (the `handles` table), or a
 // board's subscribers. `online` comes from the mode: a live session that will
@@ -530,6 +541,7 @@ export function who(
   handle: string,
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
+  unbound: UnboundPeer[] = [],
 ): WhoResult {
   type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null };
   let rows: Row[];
@@ -564,16 +576,27 @@ export function who(
       ...(r.human ? { human: true as const } : {}),
     };
   });
-  if (opts.include_offline) return { you: handle, peers: all };
+  // Unbound sessions subscribe to nothing, so a board's roster has none.
+  const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
+  const you = isViewer(handle) ? {} : { you: handle };
+  if (opts.include_offline) return { ...you, peers: all, ...sessions };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
-  return { you: handle, peers, ...(hidden ? { offline_hidden: hidden } : {}) };
+  return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
 // When a handle last had a session, or null if it never connected.
 export function lastSeen(db: Database, handle: string): number | null {
   const row = db.prepare(`SELECT last_seen FROM handles WHERE name = ?`).get(handle) as { last_seen: number } | undefined;
   return row?.last_seen ?? null;
+}
+
+/** When and where each of `handles` last had a session; those that never connected are absent. */
+export function sessionsSeen(db: Database, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
+  const rows = db
+    .prepare(`SELECT name, last_seen, cwd, place FROM handles WHERE name IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify(handles)) as { name: string; last_seen: number; cwd: string | null; place: string | null }[];
+  return new Map(rows.map((r) => [r.name, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
 /** Every handle in the roster, for a mode that must check liveness up front. */
@@ -786,6 +809,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
+    db.prepare(`DELETE FROM binding_events WHERE at < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();
 }

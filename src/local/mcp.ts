@@ -7,19 +7,18 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
-  BOARD_INSTRUCTIONS,
   announcementsInstruction,
   claimsInstruction,
   boardNotification,
   dmNotification,
   humanInstruction,
-  boardTools,
   callBoardTool,
   isBoardTool,
 } from "../core/tools.ts";
@@ -42,17 +41,20 @@ import {
   withUploads,
 } from "./db.ts";
 import { localDbPath } from "./open.ts";
-import { assertIdentityFree, listenForWakeup, poke } from "./wakeup.ts";
-import { sessionIdentity } from "../shared/identity.ts";
+import { listenForWakeup, poke } from "./wakeup.ts";
+import { sockDir } from "../shared/sockdir.ts";
+import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
+import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { launcherName } from "../shared/proc.ts";
+import { LOCAL_TOOLS } from "./tools.ts";
+import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
+import { LateCancels } from "../shared/latecancel.ts";
+import { testPause } from "../shared/testpause.ts";
+import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
-import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  DM_ACK_TOOL,
-  DM_INBOX_INSTRUCTION,
-  DM_INBOX_TOOL,
-  DM_RETRACT_TOOL,
-  PENDING_PARAM,
   PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
   ackIds,
@@ -68,13 +70,8 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-const resolved = normalizeIdentityName(sessionIdentity());
-if (!resolved.ok) {
-  console.error(`[grayboard] ${resolved.error}`);
-  process.exit(1);
-}
-const IDENTITY: string = resolved.name;
-console.error(`[grayboard] local mode, identity "${IDENTITY}"`);
+// This process, for run metadata and binding history (#182). Not an address.
+const SESSION_ID = mintSessionId();
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
 // This bus's subdirectory of the default save directory.
@@ -85,9 +82,8 @@ if (RETENTION_DAYS === null) {
   process.exit(1);
 }
 
-// BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
-// separate adapter owns the wakeup socket and delivery. Draining here would
-// consume messages into a void.
+// BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
+// has no adapter. Draining here would consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
@@ -95,11 +91,33 @@ const PUSH = process.env.BUS_PUSH !== "off";
 // human="true". Without it, the human's handle is refused, so an agent can't
 // take it by name.
 const HUMAN = process.env.BUS_HUMAN === "1";
-if (HUMAN !== isHuman(db, IDENTITY)) {
+// A session binds a name at start only when told which (#182): an explicit
+// BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
+// child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
+// the resolved name is only the first suggestion, and the session starts
+// unbound: binding delivers the name's queued DMs and hands it the name's
+// claims, which should follow the agent knowing its task.
+const EXPLICIT = HUMAN || isExplicitIdentity();
+const resolved = (() => {
+  try {
+    return normalizeIdentityName(HUMAN && process.env.BUS_IDENTITY ? process.env.BUS_IDENTITY : sessionIdentity());
+  } catch (e) {
+    return { ok: false as const, error: (e as Error).message };
+  }
+})();
+// A tools-only process (a harness without an adapter) uses the resolved name
+// as it always has, without acquiring it.
+const NAMED = EXPLICIT || !PUSH;
+if (!resolved.ok && NAMED) {
+  console.error(`[grayboard] ${resolved.error}`);
+  process.exit(1);
+}
+const SUGGESTED = resolved.ok ? resolved.name : null;
+if (NAMED && HUMAN !== isHuman(db, SUGGESTED!)) {
   console.error(
     HUMAN
-      ? `[grayboard] BUS_HUMAN=1, but "${IDENTITY}" isn't the declared human handle; declare it with: grayboard human ${IDENTITY}`
-      : `[grayboard] "${IDENTITY}" is your user's handle; an agent session can't use it. Pick another BUS_IDENTITY.`,
+      ? `[grayboard] BUS_HUMAN=1, but "${SUGGESTED}" isn't the declared human handle; declare it with: grayboard human ${SUGGESTED}`
+      : `[grayboard] "${SUGGESTED}" is your user's handle; an agent session can't use it. Pick another BUS_IDENTITY.`,
   );
   process.exit(1);
 }
@@ -110,6 +128,82 @@ if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no cha
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
 
+// The bus name this session holds, or null while unbound. bind() changes it,
+// only between drains.
+let bound: string | null = null;
+// Why this session started unbound, for its instructions.
+const unboundNotes: string[] = [];
+// The name came back from the name record: the same harness session, so its
+// peer status stays.
+let restored = false;
+// The name record (#182 decision 14), written by the session that owns
+// delivery whenever its name changes. The Slack bridge's child keeps none:
+// its name is fixed, and a restart that can't have it must fail loudly.
+const RECORD_DIR = sockDir();
+const RECORDS = PUSH && !HUMAN;
+// A failed write costs only the restore after a restart; the bind itself stands.
+const writeName = (name: string | null) => {
+  if (!RECORDS) return;
+  try {
+    writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+  } catch (e) {
+    console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
+  }
+};
+if (!PUSH) bound = SUGGESTED;
+else {
+  // The session that owns delivery owns the name: it writes the bindings row,
+  // its presence while unbound, and acquires through it. Channels-off
+  // sessions too: they own the session, they just don't listen.
+  registerSession(db, thisSession(SESSION_ID));
+  if (RECORDS) sweepRecords(RECORD_DIR);
+  // A restart under the same harness takes back its predecessor's name, ahead
+  // of BUS_IDENTITY: it's the same session, mid-task.
+  const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
+  if (rec?.name) {
+    const n = normalizeIdentityName(rec.name);
+    // The process it replaces may not have exited yet.
+    if (n.ok) await siblingGone(db, n.name, process.ppid);
+    const r = n.ok
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, detail: `restored: restart of session ${rec.session_id}` })
+      : { ok: false as const, error: n.error };
+    if (r.ok) {
+      bound = r.name;
+      restored = true;
+    } else unboundNotes.push(restoreNote(rec.name, r.error));
+  } else if (EXPLICIT) {
+    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
+    if (r.ok) bound = r.name;
+    else if (HUMAN) {
+      // A bridge has no agent to read a candidate list; refuse loudly.
+      console.error(`[grayboard] ${r.error}`);
+      endSession(db, SESSION_ID);
+      process.exit(1);
+    } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
+  }
+  if (!bound) {
+    const launcher = launcherName(process.ppid);
+    if (launcher) unboundNotes.push(launcherNote(launcher));
+  }
+  writeName(bound);
+}
+console.error(`[grayboard] local mode, session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
+
+// What a session bound to `name` is told (core's boundInstructions), with
+// local mode's human and announcement sentences, and its claims last: the
+// longest, and the one to lose if the client cuts the text.
+function localBoundInstructions(name: string, general: boolean): string[] {
+  return boundInstructions(
+    name,
+    general,
+    () => [...humanInstruction(humanHandles(db).filter((h) => h !== name)), ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db)))],
+    [
+      ...undeliveredInstruction(undeliveredFrom(name, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+      ...claimsInstruction(listClaims(db), name),
+    ],
+  );
+}
+
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
   {
@@ -117,101 +211,19 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
+    // Unbound: one sentence and the candidates. The rest only matters once
+    // a name receives anything, so bind's result carries it.
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      `You are identity "${IDENTITY}" on the grayboard bus, which coordinates between agents.`,
-      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
-      DM_INBOX_INSTRUCTION,
-      ...BOARD_INSTRUCTIONS,
-      ...humanInstruction(humanHandles(db).filter((h) => h !== IDENTITY)),
-      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
-      ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-      `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
-      // Last: the longest, and the one to lose if the client cuts the text.
-      ...claimsInstruction(listClaims(db), IDENTITY),
+      ...(bound ? localBoundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
     ].join(" "),
   },
 );
 
 // Tool discovery
 
-const TOOLS = [
-  {
-    name: "dm_send",
-    // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
-    // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
-    _meta: { "anthropic/alwaysLoad": true },
-    description: `dm_send(to, body, parent_id?, pending?, attachments?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        to: {
-          type: "string",
-          description: "The peer's exact handle, as peer_list shows it.",
-        },
-        body: {
-          type: "string",
-          description: "Message body. Plain text or markdown.",
-        },
-        parent_id: {
-          type: "number",
-          description:
-            "Optional. message_id this is replying to; sets the thread parent.",
-        },
-        pending: PENDING_PARAM,
-        attachments: ATTACHMENTS_PARAM,
-      },
-      required: ["to", "body"],
-    },
-  },
-  {
-    name: "dm_history",
-    description:
-      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        peer: {
-          type: "string",
-          description:
-            "Optional. Only return messages between you and this peer identity.",
-        },
-        limit: {
-          type: "number",
-          description: "Max messages to return (default 20, max 200).",
-        },
-        before_id: {
-          type: "number",
-          description:
-            "Return messages with id strictly less than this; use for pagination.",
-        },
-      },
-    },
-  },
-  {
-    name: "dm_thread",
-    _meta: { "anthropic/alwaysLoad": true },
-    description:
-      "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        thread: {
-          type: "number",
-          description: "Any message_id in the thread.",
-        },
-      },
-      required: ["thread"],
-    },
-  },
-  DM_INBOX_TOOL,
-  DM_ACK_TOOL,
-  DM_RETRACT_TOOL,
-  ATTACHMENT_GET_TOOL,
-  ...boardTools({ teams: false }),
-];
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: LOCAL_TOOLS }));
 
 // Tool dispatch
 
@@ -229,9 +241,19 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
+// A bind that completed after it was cancelled, for the next tool result; it
+// carries the instructions too, as the bind's result would have, for adapters
+// that keep them in the system prompt.
+let missedBindNotice: string | null = null;
+let instructionsStale = false;
+// What a result the client dropped carried, for the next one.
+const requeued: string[] = [];
 const notices = (): string[] => {
-  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  const out = requeued.splice(0);
+  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
+  if (missedBindNotice) out.push(missedBindNotice);
+  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -240,20 +262,39 @@ const notices = (): string[] => {
 // sweep's delete makes each lapse post once.
 const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+const gate = new BindGate();
+const late = new LateCancels();
+mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
-  touchHandle(db, IDENTITY);
-  const r = await call(name, args as Record<string, any>);
+  const run = async () => {
+    // An unbound session writes no handles row: it would join dm_send's roster.
+    if (bound) touchHandle(db, bound);
+    return call(name, args as Record<string, any>, signal);
+  };
+  const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
+    await (name === "bind" ? gate.bind(run) : gate.call(run));
   expiry.arm();
+  // A cancelled call's result is dropped: its notices wait for the next one.
+  if (signal.aborted) return r;
   const extra = notices();
-  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  if (instructionsStale && !out.structuredContent && bound) {
+    instructionsStale = false;
+    out = { ...out, structuredContent: { name: bound, instructions: localBoundInstructions(bound, true) } };
+  }
+  late.answer(requestId, () => {
+    if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    requeued.push(...extra);
+    if (out.structuredContent) instructionsStale = true;
+  });
+  return out;
 });
 
-async function call(name: string, args: Record<string, any>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
-  const bad = checkArgs(TOOLS, name, args);
+async function call(name: string, args: Record<string, any>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+  const bad = checkArgs(LOCAL_TOOLS, name, args);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
-    return await dispatch(name, args);
+    return await dispatch(name, args, signal);
   } catch (err) {
     if (err instanceof CoreError) {
       return { ...text(`error: ${err.message}`), isError: true };
@@ -262,10 +303,15 @@ async function call(name: string, args: Record<string, any>): Promise<{ content:
   }
 }
 
-// Only a message's sender and recipient can see it or thread from it.
-const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
+async function dispatch(name: string, a: Record<string, any>, signal: AbortSignal) {
+  if (name === "bind") return bind(a, signal);
+  if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
+  // Unbound reads go as this session's viewer handle: "~" handles are never
+  // identities and own no subscriptions, so a read advances no cursor.
+  const IDENTITY = bound ?? `~${SESSION_ID}`;
+  // Only a message's sender and recipient can see it or thread from it.
+  const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
 
-async function dispatch(name: string, a: Record<string, any>) {
   if (name === "dm_send") {
     const { to: recipient, body, parent_id, pending } = a as {
       to: string;
@@ -289,7 +335,9 @@ async function dispatch(name: string, a: Record<string, any>) {
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
-    const delivered = await poke(recipient);
+    // A socket that answers for a released name is a bind's swap window: the
+    // DM stays queued for the name's next holder (#182 audit 29).
+    const delivered = (await poke(recipient)) && !lastWasRelease(db, recipient);
     if (delivered) return text(JSON.stringify({ message_id: id, delivered_now: true, ...p, note: "Recipient was online; pushed." }));
     const seen = lastSeen(db, recipient);
     return text(JSON.stringify({
@@ -367,7 +415,8 @@ async function dispatch(name: string, a: Record<string, any>) {
   if (isBoardTool(name)) {
     // Only a human can start an announcement, which reaches the sessions live now.
     const ctx = {
-      ...(name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles() } : {}),
+      ...(name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles(IDENTITY) } : {}),
+      ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
     };
     const { attachments: paths, ...args } = a;
@@ -385,18 +434,27 @@ async function dispatch(name: string, a: Record<string, any>) {
 
 // Which handles have a live session, by probing each wakeup socket. A probe is
 // also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
-async function liveHandles(): Promise<(h: string) => boolean> {
-  const others = rosterHandles(db).filter((h) => h !== IDENTITY);
+async function liveHandles(self: string): Promise<(h: string) => boolean> {
+  const others = rosterHandles(db).filter((h) => h !== self);
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   return (h) => live.has(h);
+}
+
+// Live sessions with no name yet, for peer_list.
+function unboundPeers(): UnboundPeer[] {
+  return liveSessions(db)
+    .filter((r) => r.name === null)
+    .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
 }
 
 // Drain: emit unread direct messages and pending board items as channel
 // notifications. Loop until empty so concurrent writes that race past a
 // single query still get picked up. Re-entry is guarded; crashed drains
 // re-deliver (at-least-once).
-let draining = false;
+let inflight: Promise<void> | null = null;
+// Set while bind swaps names: no drain starts, so none mixes the two names.
+let swapping = false;
 // The first drain also brings deferred thread replies and digests: a new
 // session is the natural time to see them.
 let firstDrain = true;
@@ -407,55 +465,127 @@ let markInitialized!: () => void;
 const initialized = new Promise<void>((r) => { markInitialized = r; });
 mcp.oninitialized = () => markInitialized();
 
-async function drainToClaude(): Promise<void> {
+// A wakeup during a drain joins it: the loop re-queries until empty.
+function drainToClaude(): Promise<void> {
+  if (swapping) return Promise.resolve();
+  inflight ??= drainLoop().finally(() => {
+    inflight = null;
+  });
+  return inflight;
+}
+
+async function drainLoop(): Promise<void> {
   await initialized;
-  if (draining) return;
-  draining = true;
-  try {
-    while (true) {
-      const batch = unreadFor(IDENTITY);
-      // A human's session has no tokens to save; a DM is already waking the agent.
-      const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || batch.length > 0 });
-      firstDrain = false;
-      if (batch.length === 0 && boardItems.length === 0) break;
-      for (const msg of batch) {
-        const params = dmNotification(msg);
-        if (isHuman(db, msg.sender)) params.meta.human = "true";
-        await mcp.notification({ method: "notifications/claude/channel", params });
-        setCursor(IDENTITY, msg.id);
-      }
-      for (const item of boardItems) {
-        const params = boardNotification(item);
-        if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params,
-        });
-        markDelivered(db, IDENTITY, item);
-      }
+  // Read once: a cursor written under one name must never get another's ids.
+  const name = bound;
+  if (!name) return;
+  while (true) {
+    const batch = unreadFor(name);
+    // A human's session has no tokens to save; a DM is already waking the agent.
+    const boardItems = pendingFor(db, name, { all: firstDrain || HUMAN || batch.length > 0 });
+    firstDrain = false;
+    if (batch.length === 0 && boardItems.length === 0) break;
+    for (const msg of batch) {
+      const params = dmNotification(msg);
+      if (isHuman(db, msg.sender)) params.meta.human = "true";
+      await mcp.notification({ method: "notifications/claude/channel", params });
+      setCursor(name, msg.id);
     }
-  } finally {
-    draining = false;
+    for (const item of boardItems) {
+      const params = boardNotification(item);
+      if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params,
+      });
+      markDelivered(db, name, item);
+    }
   }
 }
 
-// Startup: refuse a duplicate identity before the MCP handshake so the client
-// shows the server as failed. Then connect MCP so notifications are accepted,
-// bind the wakeup socket (rechecking), and replay what arrived while offline.
-if (DELIVER) await assertIdentityFree(IDENTITY);
-// A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (DELIVER) startSession(db, IDENTITY, process.cwd());
-else touchHandle(db, IDENTITY);
-await mcp.connect(new StdioServerTransport());
+const onWake = () => {
+  // A wakeup may follow another session's claim_take.
+  expiry.arm();
+  drainToClaude().catch((err) => {
+    console.error("grayboard drain error:", err);
+  });
+};
+let stopListening = () => {};
+
+// bind(name, create?): take a name, or move to another (#182). The new name
+// is acquired first (its row, in one transaction, with this session's claims
+// moved to it); only then does the old name's socket close. Drains stop for
+// the swap, so a DM to the old name is either delivered under it before the
+// swap or stays queued for its next holder; never consumed under the new one.
+// It runs behind the gate, so no tool call overlaps it (#182 audit 11).
+async function bind(a: Record<string, any>, signal: AbortSignal) {
+  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  const n = bindTarget(a, bound, PUSH);
+  if ("result" in n) return n.result;
+  swapping = true;
+  try {
+    await inflight;
+    const previous = bound;
+    const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
+    if (!r.ok) return fail(r.error);
+    // The row holds the new name from here: so does this process, whatever
+    // follows fails, or the finally's drain would read a name it no longer holds.
+    bound = n.name;
+    writeName(bound);
+    firstDrain = true;
+    testPause("bind:after-acquire");
+    try {
+      if (DELIVER) {
+        stopListening();
+        stopListening = () => {};
+        stopListening = listenForWakeup(n.name, onWake);
+      }
+      if (previous) touchHandle(db, previous);
+      startSession(db, n.name, process.cwd());
+    } catch (e) {
+      const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
+      console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
+      throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
+    }
+    console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
+    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => localBoundInstructions(n.name, general));
+    // A cancelled call's result is dropped (pi and opencode cancel on abort).
+    if (signal.aborted) {
+      missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      instructionsStale = true;
+    }
+    return ok;
+  } finally {
+    swapping = false;
+    if (DELIVER && bound) onWake();
+  }
+}
+
+
+// Startup: the name (if any) is already acquired. Connect MCP so
+// notifications are accepted, listen on the name's wakeup socket, and replay
+// what arrived while offline.
+// A tools-only server runs beside the session that owns the identity, and a
+// restored name is the same session restarted: leave their status alone.
+if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
+else if (bound) touchHandle(db, bound);
+const transport = new StdioServerTransport();
+await mcp.connect(transport);
+late.watch(transport);
 // Prunes the bus at most once a day across the sessions that share it.
 startLocalRetention(db, blobs, RETENTION_DAYS);
 
-let cleanup = () => {};
 const shutdown = () => {
   try {
-    touchHandle(db, IDENTITY);
+    if (bound) touchHandle(db, bound);
   } catch {}
-  cleanup();
+  // The socket goes first, while the row still holds the name, so nobody
+  // takes the name with this socket still in place.
+  stopListening();
+  try {
+    if (PUSH) endSession(db, SESSION_ID);
+  } catch {}
+  if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
@@ -465,15 +595,8 @@ process.on("SIGTERM", shutdown);
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
-if (DELIVER) {
-  cleanup = await listenForWakeup(IDENTITY, () => {
-    // A wakeup may follow another session's claim_take.
-    expiry.arm();
-    drainToClaude().catch((err) => {
-      console.error("grayboard drain error:", err);
-    });
-  });
-
+if (DELIVER && bound) {
+  stopListening = listenForWakeup(bound, onWake);
   drainToClaude().catch((err) => {
     console.error("grayboard initial drain error:", err);
   });

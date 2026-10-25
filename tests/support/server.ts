@@ -73,17 +73,18 @@ export class TestServer {
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
-  // A raw WebSocket client; closed by stop().
-  client(token: string, identity: string, opts: WsClientOptions = {}): WsClient {
+  // A raw WebSocket client (identity null: a read-only hello); closed by stop().
+  client(token: string, identity: string | null, opts: WsClientOptions = {}): WsClient {
     const c = new WsClient(this.base, token, identity, opts);
     this.clients.push(c);
     return c;
   }
 
   // A server-mode `grayboard mcp` child signed in with `token`, started in
-  // this server's dir; closeSessions() ends it.
-  session(token: string, identity: string, extra: Record<string, string> = {}): Promise<Session> {
-    return mcpSession({ env: serverEnv(this.dir, this.base, token, identity, extra), cwd: this.dir, args: ["mcp", "--mode", "server"] });
+  // `cwd` (default: this server's dir); identity null starts it unbound.
+  // closeSessions() ends it.
+  session(token: string, identity: string | null, extra: Record<string, string> = {}, cwd = this.dir): Promise<Session> {
+    return mcpSession({ env: serverEnv(this.dir, this.base, token, identity, extra), cwd, args: ["mcp", "--mode", "server"] });
   }
 
   stop(): void {

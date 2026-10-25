@@ -1,27 +1,34 @@
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { sockDir } from "../shared/sockdir.ts";
 
-const SOCK_DIR = process.env.BUS_SOCK_DIR ?? `${homedir()}/.claude-bus`;
+const SOCK_DIR = sockDir();
 
-function sockPath(identity: string): string {
-  return `${SOCK_DIR}/sock.${identity}`;
+function sockPath(identity: string, dir = SOCK_DIR): string {
+  return `${dir}/sock.${identity}`;
 }
 
 export type WakeupHandler = () => void;
 
-export async function listenForWakeup(
-  identity: string,
-  onWake: WakeupHandler,
-): Promise<() => void> {
+/**
+ * Listen on `identity`'s wakeup socket. The caller must own the name (its
+ * bindings row holds it, binding.ts): ownership is decided there, inside a
+ * write transaction, never by probing this socket (#80). So a file already
+ * at the path is a dead holder's and is replaced.
+ *
+ * Bun's stop() unlinks the path it listened on, whatever is there by then, so
+ * listening on the real path would let a stop after a rebind delete the next
+ * holder's socket. Instead it listens on a path of its own and renames that
+ * into place (atomic, and replaces a dead holder's file); the returned stop
+ * removes the real path only while it's still this listener's.
+ */
+export function listenForWakeup(identity: string, onWake: WakeupHandler): () => void {
   if (!existsSync(SOCK_DIR)) mkdirSync(SOCK_DIR, { recursive: true });
   const path = sockPath(identity);
-  await assertIdentityFree(identity);
-  try {
-    if (existsSync(path)) unlinkSync(path);
-  } catch {}
+  // Short: a unix socket path has a ~104-byte limit, and test dirs are deep.
+  const own = `${SOCK_DIR}/.w${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
 
   const server = Bun.listen({
-    unix: path,
+    unix: own,
     socket: {
       open(socket) {
         onWake();
@@ -32,28 +39,28 @@ export async function listenForWakeup(
       error() {},
     },
   });
+  let ino: number;
+  try {
+    ino = statSync(own).ino;
+    renameSync(own, path);
+  } catch (e) {
+    server.stop(true);
+    try {
+      unlinkSync(own);
+    } catch {}
+    throw e;
+  }
 
   return () => {
     try {
       server.stop(true);
-      if (existsSync(path)) unlinkSync(path);
+      if (existsSync(path) && statSync(path).ino === ino) unlinkSync(path);
     } catch {}
   };
 }
 
-// A live listener means another session already owns this identity. Taking
-// the socket over would silently steal its pushes and share its cursor.
-export async function assertIdentityFree(identity: string): Promise<void> {
-  if (await canConnect(sockPath(identity))) {
-    throw new Error(
-      `grayboard: identity "${identity}" is already in use by a live session. ` +
-        `Give this session a different BUS_IDENTITY or don't load grayboard here.`,
-    );
-  }
-}
-
-export async function poke(identity: string): Promise<boolean> {
-  return canConnect(sockPath(identity));
+export async function poke(identity: string, dir = SOCK_DIR): Promise<boolean> {
+  return canConnect(sockPath(identity, dir));
 }
 
 // Connecting is the wakeup: the listener drains on open, so a probe also
@@ -61,7 +68,7 @@ export async function poke(identity: string): Promise<boolean> {
 //
 // A refused connect doesn't prove the owner is gone: a live listener whose
 // process is busy can refuse too. Treating that as "dead" would let a second
-// session take over a live identity, or skip a wakeup. So retry briefly; a
+// session believe a live identity is free, or skip a wakeup. So retry briefly; a
 // stale socket file from a crashed session costs the full ~150ms.
 const RETRY_MS = [25, 50, 75];
 

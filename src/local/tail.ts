@@ -70,7 +70,7 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
     db.prepare(`DELETE FROM outbox WHERE handle = ?`).run(handle);
   };
 
-  const stopListening = await listenForWakeup(handle, drain);
+  const stopListening = listenForWakeup(handle, drain);
   console.error(`-- tailing #${board} (ctrl-c to stop)`);
   drain(); // anything posted between the backlog query and the listener
 

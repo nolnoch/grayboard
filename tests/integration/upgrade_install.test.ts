@@ -86,6 +86,15 @@ const ADAPTERS = {
   opencode: [".config", "opencode", "plugin", "grayboard.ts"],
   pi: [".pi", "agent", "extensions", "grayboard.ts"],
 } as const;
+// The tools-only entries releases before the adapters served the tools wrote.
+function writeOldEntries(exe: string, extraEnv: Record<string, string> = {}): void {
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true });
+  writeFileSync(join(home, ".config", "opencode", "opencode.json"),
+    JSON.stringify({ mcp: { grayboard: { type: "local", command: [exe, "mcp"], environment: { BUS_PUSH: "off", ...extraEnv } } } }));
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(join(home, ".pi", "agent", "mcp.json"),
+    JSON.stringify({ mcpServers: { grayboard: { command: exe, args: ["mcp"], env: { BUS_PUSH: "off", ...extraEnv }, exposure: "direct" } } }));
+}
 const CREDENTIALS = () => join(home, ".grayboard", "credentials");
 
 // Every registration setup writes, each naming the installed binary.
@@ -98,8 +107,9 @@ function expectRegistered(): void {
     { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
   ]);
   expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
-  expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], environment: { BUS_PUSH: "off" } });
-  expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], env: { BUS_PUSH: "off" }, exposure: "direct" });
+  // Disabled: the opencode and pi adapters serve the tools and read their command here.
+  expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
+  expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
   for (const [harness, path] of Object.entries(ADAPTERS)) {
     expect(readFileSync(join(home, ...path), "utf8"), harness).toBe(adapterSource(harness as keyof typeof ADAPTERS));
   }
@@ -112,7 +122,11 @@ test("install.sh installs the latest release; setup --local registers it with ev
   expect(releases.requests).toEqual(expect.arrayContaining([`HEAD /${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(pkg.version);
 
-  expect(await expectOk(grayboard("setup", "-y", "--local"))).toContain("Using local mode.");
+  writeOldEntries(realpathSync(join(bin, "grayboard")), { GRAYBOARD_X: "1" });
+  const out = await expectOk(grayboard("setup", "-y", "--local"));
+  expect(out).toContain("Using local mode.");
+  expect(out).toContain(`Registered in ${join(home, ".config", "opencode", "opencode.json")} (disabled: the plugin serves the tools)`);
+  expect(out).toContain(`Registered in ${join(home, ".pi", "agent", "mcp.json")} (disabled: the extension serves the tools)`);
   expectRegistered();
   expect(existsSync(CREDENTIALS())).toBe(false);
 }, 60_000);
@@ -157,6 +171,9 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   mkdirSync(join(opencode, ".."), { recursive: true });
   writeFileSync(join(dir, "checkout.ts"), "// mine");
   symlinkSync(join(dir, "checkout.ts"), opencode);
+  // Their entries stay as they are: the checkout's adapter, or none, is what reads them.
+  writeOldEntries(realpathSync(join(bin, "grayboard")));
+  const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
 
   const out = await expectOk(grayboard("update"));
   expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}.`);
@@ -167,4 +184,29 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(lstatSync(opencode).isSymbolicLink()).toBe(true);
   expect(readlinkSync(opencode)).toBe(join(dir, "checkout.ts"));
   expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
+  expect([json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")]).toEqual(entries);
+  expect(out).not.toContain("Disabled the grayboard entry");
+}, 60_000);
+
+test("refresh-adapters disables the grayboard entry of each adapter it rewrites, once", async () => {
+  label = "refresh-adapters-entries";
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
+  await expectOk(install({ GRAYBOARD_VERSION: TAG }));
+  const exe = realpathSync(join(bin, "grayboard"));
+  for (const h of ["opencode", "pi"] as const) {
+    mkdirSync(join(home, ...ADAPTERS[h], ".."), { recursive: true });
+    writeFileSync(join(home, ...ADAPTERS[h]), "// stale");
+  }
+  writeOldEntries(exe, { GRAYBOARD_X: "1" });
+  const oc = join(home, ".config", "opencode", "opencode.json");
+  const pi = join(home, ".pi", "agent", "mcp.json");
+
+  const out = await expectOk(grayboard("refresh-adapters"));
+  expect(out).toContain(`Disabled the grayboard entry in ${oc} (the adapter serves the tools)`);
+  expect(out).toContain(`Disabled the grayboard entry in ${pi} (the adapter serves the tools)`);
+  // The entry's own command and environment are kept; pi's exposure goes with the tools.
+  expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off", GRAYBOARD_X: "1" } });
+  expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off", GRAYBOARD_X: "1" } });
+
+  expect(await expectOk(grayboard("refresh-adapters"))).not.toContain("Disabled the grayboard entry");
 }, 60_000);

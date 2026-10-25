@@ -42,6 +42,21 @@ function initLocalSchema(db: Database): void {
       acked_at    INTEGER NOT NULL,
       PRIMARY KEY (reader, message_id)
     );
+    -- One row per live grayboard mcp process (binding.ts, #182). name is the
+    -- bus name it holds, NULL while unbound; UNIQUE makes a name's holder
+    -- one row, taken inside BEGIN IMMEDIATE. pid + proc_start say whether
+    -- the holder still runs; harness_pid is the process that launched it.
+    CREATE TABLE IF NOT EXISTS bindings (
+      session_id   TEXT PRIMARY KEY,
+      name         TEXT UNIQUE,
+      pid          INTEGER NOT NULL,
+      proc_start   TEXT,
+      harness      TEXT,
+      harness_pid  INTEGER,
+      cwd          TEXT,
+      started_at   INTEGER NOT NULL,
+      bound_at     INTEGER
+    );
     -- When a session last ran retention (retention.ts); one row.
     CREATE TABLE IF NOT EXISTS retention_runs (
       id        INTEGER PRIMARY KEY CHECK (id = 1),

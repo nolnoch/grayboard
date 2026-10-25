@@ -15,7 +15,8 @@ export class WsClient {
   constructor(
     private base: string,
     private token: string,
-    private identity: string,
+    // null: a read-only hello (#182), with no identity and push: false.
+    private identity: string | null,
     private opts: WsClientOptions = {},
   ) {}
 
@@ -35,7 +36,11 @@ export class WsClient {
     this.ws.onclose = (e) => this.fail(`socket closed (${e.code}${e.reason ? ` ${e.reason}` : ""})`);
     this.ws.onerror = () => this.fail("socket error");
     this.ws.onopen = () =>
-      this.ws.send(JSON.stringify({ type: "hello", req_id: "h", identity: this.identity, ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello }));
+      this.ws.send(JSON.stringify({
+        type: "hello", req_id: "h",
+        ...(this.identity === null ? { read_only: true, push: false } : { identity: this.identity }),
+        ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello,
+      }));
     return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
   }
 
@@ -47,7 +52,7 @@ export class WsClient {
         const j = this.waiters.indexOf(w);
         if (j >= 0) {
           this.waiters.splice(j, 1);
-          reject(new Error(`${this.identity}: timed out waiting`));
+          reject(new Error(`${this.label}: timed out waiting`));
         }
       }, ms);
       const w = {
@@ -59,8 +64,12 @@ export class WsClient {
     });
   }
 
+  private get label(): string {
+    return this.identity ?? "read-only";
+  }
+
   private fail(why: string): void {
-    for (const w of this.waiters.splice(0)) w.reject(new Error(`${this.identity}: ${why}`));
+    for (const w of this.waiters.splice(0)) w.reject(new Error(`${this.label}: ${why}`));
   }
 
   // Nothing matching arrives within ms.
