@@ -210,8 +210,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     open(_ws: Ws) {
       // wait for hello
     },
-    // The Slack bridge died fatally: hold the notice for the owner's next
-    // hello (any of their identities), drained once per user per stop.
+
     message(ws: Ws, rawData: string | Buffer) {
       const raw = typeof rawData === "string" ? rawData : rawData.toString("utf8");
 
@@ -542,18 +541,17 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     ...(moved ? { moved } : {}),
     ...(notMoved ? { not_moved: notMoved } : {}),
   };
-  const notices = [
-    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-    // Last, as the plugin appends notices: the longest, so the one a cut takes.
-    ...claimsInstruction(listClaims(db, undefined, full), full),
-  ];
   // Bridge-down notices drain on agent-session hellos only: the bridge's own
   // human hello (HumanConn) would steal the notice into a handshake nobody
   // reads, leaving the owner uninformed.
-  if (!ws.data.human) {
-    const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
-    if (bridgeNotice) notices.push(bridgeNotice);
-  }
+  const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
+  const notices = [
+    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    // Before the claims: drained once, so a cut must not take it.
+    ...(bridgeNotice ? [bridgeNotice] : []),
+    // Last, as the plugin appends notices: the longest, so the one a cut takes.
+    ...claimsInstruction(listClaims(db, undefined, full), full),
+  ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;
