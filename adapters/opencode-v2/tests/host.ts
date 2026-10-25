@@ -9,7 +9,9 @@ import { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
+import { realRace, type AdmissionGate } from "./real-races.ts";
 
+const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
 assert(root); assert.equal(Bun.version, "1.4.4");
 assert.equal((await Bun.file(join(root, "node_modules/@opencode/sdk/package.json")).json()).version, "2.1.4");
@@ -22,10 +24,12 @@ const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "bl
 const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
-let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined;
+let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
 const admissions: Parameters<Context["session"]["synthetic"]>[0][] = [];
-const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null }[] = [];
+const raceGate: AdmissionGate = { holding: false, boundary: process.env.GRAYBOARD_TEST_RACE_BOUNDARY === "after" ? "after" : "before", inputs: [], accepted: [], models: [], entered() {}, released: Promise.resolve() };
+const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null; accessHash: string }[] = [];
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
+const nativeCompleted: string[] = [], wrappers: string[] = [];
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
@@ -33,16 +37,17 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.origin === "https://model.example.com") {
     modelCalls++; await req.json();
     const call = target && !issued; issued = true;
-    const delta = call ? { role: "assistant", tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: "grayboard_" + target!.tool, arguments: JSON.stringify(target!.args) } }] } : { content: "Fixture reply" };
+    const delta = call ? { role: "assistant", tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: codeMode ? "execute" : "grayboard_" + target!.tool, arguments: JSON.stringify(codeMode ? { code: `return await tools.grayboard.${target!.tool}(${JSON.stringify(target!.args)})` } : target!.args) } }] } : { content: "Fixture reply" };
     return new Response("data: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + "\n\ndata: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + "\n\ndata: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
   }
   assert.equal(url.origin, new URL(issuer).origin, "Only fixture HTTPS endpoints and native OAuth callback allowed");
   assert(!url.pathname.endsWith("/register"), "CIMD must not use DCR");
   if (url.pathname.endsWith("/oauth/token")) { const form = new URLSearchParams(await req.clone().text()); if (form.get("grant_type") === "authorization_code") codes++; else refreshes++; assert.equal(form.get("client_id"), OPENCODE_CLIENT); }
+  if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") throw new Error("Real backend subscriber network deliberately unavailable");
   const b = req.method === "POST" && url.pathname.endsWith("/mcp") ? await req.clone().json() as any : undefined;
   if (b?.method === "tools/call") {
     const session = b.params?._meta?.["ai.opencode/sessionID"]; assert.equal(typeof session, "string");
-    calls.push({ name: b.params.name, session, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber", args: b.params.arguments ?? {}, cap: req.headers.get("X-Grayboard-Lease") });
+    calls.push({ name: b.params.name, session, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber", args: b.params.arguments ?? {}, cap: req.headers.get("X-Grayboard-Lease"), accessHash: new Bun.CryptoHasher("sha256").update(req.headers.get("Authorization") ?? "").digest("hex") });
     assert(!req.headers.has("X-Grayboard-Identity"));
     console.log("SUBCALL", b.params.name, session);
     if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
@@ -54,21 +59,26 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const match = body.startsWith("data:") ? JSON.parse(body.slice(5)) : JSON.parse(body);
     if (!match.result?.isError) { const value = JSON.parse(match.result.content[0].text); opens.push(value); }
   }
-  if (process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC === "1" && res.status === 401 && url.pathname.endsWith("/mcp")) {
-    const headers = new Headers(res.headers); headers.set("WWW-Authenticate", headers.get("WWW-Authenticate")!.replace('scope="grayboard:tools"', 'scope="grayboard:delivery grayboard:tools"'));
-    return new Response(res.body, { status: res.status, headers });
-  }
   return res;
 }) as typeof fetch;
 const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   ctx = c;
-  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, codemode: false }));
+  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, codemode: codeMode }));
   const p = Provider.ID.make("fixture");
   await c.provider.transform(e => e.add({ info: { ...Provider.Info.empty(p), name: "Fixture", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: "https://model.example.com/v1" } }, models: [{ ...Model.Info.default(p, Model.ID.make("fixture")), name: "Fixture" }] }));
   await c.session.hook("title", e => { e.result = "Fixture"; });
+  await c.session.hook("http.request", e => { if (e.kind === "primary") raceGate.models.push(e.sessionID); });
+  await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
 } });
 const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({ ...c, session: new Proxy(c.session, { get(s, k) {
-  if (k === "synthetic") return async (input: Parameters<Context["session"]["synthetic"]>[0]) => { admissions.push(structuredClone(input)); if (held) { entered?.(); await new Promise<void>(r => { release = r; }); } return s.synthetic(input); };
+  if (k === "synthetic") return async (input: Parameters<Context["session"]["synthetic"]>[0]) => {
+    admissions.push(structuredClone(input)); raceGate.inputs.push(structuredClone(input));
+    if (held) { entered?.(); await new Promise<void>(r => { release = r; }); }
+    if (raceGate.holding && raceGate.boundary === "before") { raceGate.entered(); await raceGate.released; }
+    const value = await s.synthetic(input); raceGate.accepted.push(value);
+    if (raceGate.holding && raceGate.boundary === "after") { raceGate.entered(); await raceGate.released; }
+    return value;
+  };
   return Reflect.get(s, k);
 } }) }); } });
 const createHost = () => OpenCode.create({ plugins: [fixture, instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
@@ -119,6 +129,84 @@ try {
   const projected = await ctx.integration.connection.resolve(selected); if (projected?.type === "oauth") console.log("NATIVE_GRANT_METADATA", JSON.stringify({ issuer: projected.metadata?.issuer, scope: projected.metadata?.scope, serverUrl: projected.metadata?.serverUrl, clientID: (projected.metadata?.client as { client_id?: string })?.client_id }));
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools");
   let rpc = host.rpc(Grayboard);
+  if (process.env.GRAYBOARD_TEST_REAL_RACE === "native-refresh") {
+    const s = await makeRoot("Native host owns refresh");
+    await rpc.enroll({ sessionID: s.id, name: "refresh", create: true }, { location });
+    await wait(() => app.mcp.activeLeases, n => n === 1, "native refresh initial lease");
+    const before = await ctx.integration.connection.resolve(selected); assert(before?.type === "oauth");
+    const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })); assert(!(principal instanceof Response));
+    app.repo.oauth.revokeToken(principal.accessHash, OPENCODE_CLIENT, Date.now());
+    await invoke(s.id, "whoami", {});
+    await wait(() => refreshes, n => n === 1, "native MCP refresh after revoked access");
+    const current = await ctx.integration.connection.resolve(selected); assert(current?.type === "oauth"); assert.notEqual(current.access, before.access);
+    assert(app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })) instanceof Response);
+    const renewed = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + current.access } })); assert(!(renewed instanceof Response)); assert.equal(renewed.grantId, principal.grantId);
+    await rpc.enroll({ sessionID: s.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "same current native grant reopens receiving");
+    const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/refresh", "Fresh native access after native-owned refresh", null, false); app.application.wake(["you@example.com/refresh"]);
+    await wait(() => app.repo.cursors.directFor("you@example.com/refresh"), n => n === message.id, "subscriber uses only fresh projected native access");
+    assert.equal(refreshes, 1); assert.equal(codes, 1);
+    console.log("REAL_NATIVE_OWNED_REFRESH_OK", { codes, refreshes, cursor: message.id, grantUnchanged: true });
+  } else if (process.env.GRAYBOARD_TEST_REAL_RACE === "digest-reload") {
+    const digest = await makeRoot("Separate process idle digest"), action = await makeRoot("Separate process delivered action");
+    await host.session.switchModel({ sessionID: digest.id, model: { providerID: "fixture", id: "fixture" } });
+    await host.session.switchModel({ sessionID: action.id, model: { providerID: "fixture", id: "fixture" } });
+    await rpc.enroll({ sessionID: digest.id, name: "digest", create: true }, { location });
+    await rpc.enroll({ sessionID: action.id, name: "action", create: true }, { location });
+    await wait(() => app.mcp.activeLeases, n => n === 2, "digest and action real leases");
+    const board = createBoard(app.db, "you@example.com/digest", "reload", "Reload digest"); subscribe(app.db, "you@example.com/digest", board.name, "digest");
+    dropReceipt = true; const receipts = receiptAttempts;
+    post(app.db, "you@example.com/sim", board.name, "Process reload immutable digest"); app.application.boardsChanged([board.name]);
+    const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/action", "Process reload immutable action", null, false); app.application.wake(["you@example.com/action"]);
+    await wait(() => receiptAttempts, n => n >= receipts + 2, "both receipts lost after real acceptance");
+    await host.session.wait({ sessionID: action.id });
+    assert(!raceGate.models.includes(digest.id)); assert(raceGate.models.includes(action.id));
+    assert.equal((await host.session.inbox.list({ sessionID: digest.id })).length, 1);
+    assert.equal(app.repo.cursors.directFor("you@example.com/action"), 0);
+    const digestInput = admissions.find(i => i.sessionID === digest.id)!, input = admissions.find(i => i.sessionID === action.id)!;
+    assert(input && digestInput);
+    const boardCursor = () => app.db.prepare("SELECT cursor, notified_id FROM subscriptions WHERE board = ? AND handle = ?").get(board.name, "you@example.com/digest") as { cursor: number; notified_id: number };
+    const oldBoard = boardCursor();
+    await host.close(); host = undefined; dropReceipt = false;
+    await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input, digestInput, location }));
+    const worker = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port) }, stdout: "inherit", stderr: "inherit" });
+    assert.equal(await worker.exited, 0);
+    assert.equal(app.repo.cursors.directFor("you@example.com/action"), lost.id);
+    assert(boardCursor().notified_id > oldBoard.notified_id, "Actual board digest notification cursor advanced only after replayed durable acceptance");
+    console.log("REAL_PROCESS_DIGEST_ACTION_RELOAD_OK", { actionCursor: lost.id, boardBefore: oldBoard, boardAfter: boardCursor() });
+    console.log("REAL_BACKEND_RELOAD_OK");
+  } else if (process.env.GRAYBOARD_TEST_CRASH_BOUNDARY) {
+    const boundary = process.env.GRAYBOARD_TEST_CRASH_BOUNDARY; assert(["before", "after"].includes(boundary));
+    const crashedRoot = await makeRoot("Actual process crash root");
+    await rpc.enroll({ sessionID: crashedRoot.id, name: "crash", create: true }, { location });
+    await wait(() => app.mcp.activeLeases, n => n === 1, "crash root lease");
+    await host.session.switchModel({ sessionID: crashedRoot.id, model: { providerID: "fixture", id: "fixture" } });
+    await host.close(); host = undefined;
+    await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, sessionID: crashedRoot.id, location }));
+    const crashWorker = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "hold-" + boundary }, stdout: "inherit", stderr: "inherit" });
+    try {
+      await wait(() => Bun.file(join(root, "real-worker-ready.json")).exists(), Boolean, "separate process host ready");
+      const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/crash", "Crash at actual " + boundary + " admission", null, false); app.application.wake(["you@example.com/crash"]);
+      await wait(() => Bun.file(join(root, "real-worker-held.json")).exists(), Boolean, "actual admission crash boundary");
+      const saved = await Bun.file(join(root, "real-worker-held.json")).json();
+      assert.equal(app.repo.cursors.directFor("you@example.com/crash"), 0, "Held actual host write has not receipted real item");
+      crashWorker.kill("SIGKILL"); await crashWorker.exited;
+      assert.equal(saved.models.length, boundary === "before" ? 0 : 1, "Historical wake belongs only to already committed actionable root");
+      await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: saved.input, location, uncommitted: boundary === "before" }));
+      const recovery = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "replay" }, stdout: "inherit", stderr: "inherit" });
+      assert.equal(await recovery.exited, 0, "Actual OS-process recovery after kill passes");
+      assert.equal(app.repo.cursors.directFor("you@example.com/crash"), lost.id);
+      const result = await Bun.file(join(root, "real-reload-result.json")).json();
+      console.log("REAL_PROCESS_CRASH_RECOVERY_OK", JSON.stringify({ boundary, original: saved.input, historicalModels: saved.models, recoveryModels: result.models, cursor: lost.id }));
+      console.log("REAL_BACKEND_CRASH_OK");
+    } finally { crashWorker.kill("SIGKILL"); await crashWorker.exited; }
+  } else if (process.env.GRAYBOARD_TEST_REAL_RACE) {
+    await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location,
+      enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
+      pause: () => rpc.pause({}, { location }), status: () => rpc.status({}, { location }),
+      account: async () => { email = "other@example.com"; await signIn(native.integrationID!); },
+      outage: value => { subscriberOutage = value; }, receipts: () => receiptAttempts });
+    console.log("REAL_BACKEND_RACE_OK");
+  } else {
   const a = await makeRoot("Root A"), b = await makeRoot("Root B");
   const approval = await rpc.enroll({ sessionID: a.id }, { location }); console.log("APPROVAL", approval); assert.equal(approval.state, "unbound"); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
   await invoke(a.id, "bind", { name: "be", create: true });
@@ -140,14 +228,39 @@ try {
   assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); assert.equal(row(child.id), null, "via ancestry is not registration authority");
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
   await invoke(grandchild.id, "bind", { name: "child-control", create: true }); assert.equal(row(grandchild.id)?.name, null); assert.equal(app.mcp.activeLeases, 2);
+  const attachmentGrant = await ctx.integration.connection.resolve(selected); assert(attachmentGrant?.type === "oauth");
+  const attachment = (method: string, path: string, raw?: string) => fetch(resource + "/attachments" + path, { method, headers: { Authorization: "Bearer " + attachmentGrant.access, ...(raw ? { "X-Grayboard-Session": encodeURIComponent(raw) } : {}), ...(method === "POST" ? { "Content-Length": String(new TextEncoder().encode("Native child attachment fixture").length) } : {}) }, ...(method === "POST" ? { body: "Native child attachment fixture" } : {}) });
+  assert.equal((await attachment("POST", "?filename=fixture.txt")).status, 403);
+  assert.equal((await attachment("POST", "?filename=fixture.txt", child.id)).status, 403, "via is not attachment mapping authority");
+  assert.equal((await attachment("POST", "?filename=fixture.txt&identity=fe", grandchild.id)).status, 403);
+  const upload = await attachment("POST", "?filename=fixture.txt", grandchild.id); assert.equal(upload.status, 201);
+  const file = await upload.json() as { id: number };
+  assert.equal((app.db.prepare("SELECT uploader FROM attachments WHERE id = ?").get(file.id) as { uploader: string }).uploader, "you@example.com/be");
+  const download = await attachment("GET", "/" + file.id, grandchild.id); assert.equal(download.status, 200); assert.equal(await download.text(), "Native child attachment fixture");
+  assert((await attachment("DELETE", "/" + file.id, grandchild.id)).ok);
+  console.log("REAL_NATIVE_GRANT_CHILD_ATTACHMENTS_OK", { id: file.id, mappedRoot: row(a.id)?.session_id });
   await host.session.update({ sessionID: grandchild.id, archived: true });
   await wait(() => row(grandchild.id), r => !r, "raw child self-close"); assert.equal(row(a.id)?.name, "be");
-  console.log("REAL_CHILD_META_AND_SELF_CLOSE_OK");
+  assert.equal((await attachment("POST", "?filename=ended.txt", grandchild.id)).status, 403, "Ended child cannot reuse attachment mapping");
+  await invoke(child.id, "whoami", {}); assert.equal(row(child.id)?.root_session_id, row(a.id)?.session_id);
+  assert(nativeCompleted.includes(a.id));
+  if (codeMode) { assert(wrappers.includes(a.id)); assert(wrappers.includes(grandchild.id)); }
+  console.log("REAL_CHILD_META_AND_SELF_CLOSE_OK", { codeMode, rootNativeBindCompleted: nativeCompleted.includes(a.id), outerExecute: wrappers.length });
+  await invoke(a.id, "claim_take", { key: "ticket:ENG-142", note: "Native root claim" });
+  const claimHolder = () => (app.db.prepare("SELECT holder FROM claims WHERE key = ?").get("ticket:ENG-142") as { holder: string } | null)?.holder;
+  assert.equal(claimHolder(), "you@example.com/be");
   const ownership = row(a.id)!.ownership_id;
   for (const name of ["r1", "r2", "r3", "r4"]) { const before = opens.length; await invoke(a.id, "bind", { name, create: true }); await wait(() => opens.length, n => n === before + 1, "one rebind lease " + name); assert.equal(row(a.id)!.ownership_id, ownership); assert.equal(app.mcp.activeLeases, 2); }
-  assert.equal(row(a.id)!.bind_gen, 5);
+  assert.equal(row(a.id)!.bind_gen, 5); assert.equal(claimHolder(), "you@example.com/r4");
+  assert.equal(row(child.id)?.root_session_id, row(a.id)?.session_id, "Registered child survives native rebind ownership generations");
+  await invoke(b.id, "bind", { name: "be" });
+  await invoke(b.id, "claim_release", { key: "ticket:ENG-142" }); assert.equal(claimHolder(), "you@example.com/r4", "Successor owner of the old mailbox cannot release moved claim");
+  await invoke(a.id, "claim_release", { key: "ticket:ENG-142" }); assert.equal(claimHolder(), undefined);
+  assert.equal(new Set(calls.map(c => c.accessHash)).size, 1, "Native and subscriber share exactly the current single native access token");
+  assert(calls.some(c => c.subscriber)); assert(calls.some(c => !c.subscriber));
+  console.log("REAL_NATIVE_CLAIM_MOVEMENT_AND_FOREIGN_REFUSAL_OK");
   console.log("REAL_FOUR_REBINDS_OK", { ownership, opens: opens.length, streams: app.mcp.activeInboxListeners });
-  await rpc.pause({}, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id), null);
+  await rpc.pause({}, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id), null); assert.equal(row(child.id), null, "Explicit root pause ends registered descendants");
   await rpc.enroll({ sessionID: a.id }, { location });
   await wait(() => app.mcp.activeLeases, n => n === 1, "pause resume remembered name");
   assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === "r4" && c.args.create === false));
@@ -168,16 +281,21 @@ try {
   await wait(() => admissions, xs => xs.some(x => x.text.includes("Replay after host reload")), "lost receipt durable admission");
   await wait(() => receiptAttempts, n => n > receiptsBeforeLoss, "lost receipt attempted after real durable admission");
   await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "lost receipt retry boundary before host reload");
+  const lostInput = admissions.find(x => x.text.includes("Replay after host reload"))!;
   await host.close(); host = undefined; dropReceipt = false;
   assert(app.repo.cursors.directFor("you@example.com/r4") < lost.id);
+  await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: lostInput, location }));
+  const reloadProcess = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port) }, stdout: "inherit", stderr: "inherit" });
+  assert.equal(await reloadProcess.exited, 0, "Separate installed-host reload process passes");
+  const childReload = await Bun.file(join(root, "real-reload-result.json")).json();
+  assert.notEqual(childReload.pid, process.pid);
+  assert.equal(app.repo.cursors.directFor("you@example.com/r4"), lost.id, "Child process receipt moved actual backend cursor");
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === lost.id, "restored lease replay receipt");
   await host.session.wait({ sessionID: a.id });
-  const replay = admissions.filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
+  const replay = [...admissions, ...childReload.inputs as Parameters<Context["session"]["synthetic"]>[0][]].filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
   assert.equal((await host.session.context({ sessionID: a.id })).filter(m => m.id === replay[0]!.id).length, 1);
   console.log("REAL_HOST_RELOAD_STABLE_ID_OK", { replay: replay.length, cursor: lost.id });
-  if (process.env.GRAYBOARD_TEST_SKIP_RESTART === "1") assert.equal(process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC, "1", "Skipping a required gate is diagnostic only");
-  else {
   const timelyOwnership = row(a.id)!.ownership_id;
   await host.close(); host = undefined; await app.stop(); app = start();
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
@@ -186,7 +304,6 @@ try {
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.mcp.activeLeases, n => n === 1, "server restart after sticky expiry"); assert.notEqual(row(a.id)!.ownership_id, timelyOwnership);
   console.log("REAL_SERVER_RESTART_DEADLINES_OK", { before: timelyOwnership, after: row(a.id)!.ownership_id });
-  }
   await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
   assert.equal(app.repo.identities.listForUser(app.repo.users.findByEmail("you@example.com")!.id).some(i => i.name === "does-not-exist"), false);
   await rpc.enroll({ sessionID: a.id, name: "r4" }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit reapproval existing name");
@@ -230,6 +347,8 @@ try {
   await wait(() => app.mcp.activeLeases, n => n === 0, "actual user disable ends ownership"); assert.equal(row(a.id), null);
   assert(app.repo.cursors.directFor("you@example.com/final") < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
   console.log("REAL_ACCOUNT_DRIFT_AND_DISABLE_OK");
+  assert(!calls.some(c => c.name === "dm_ack"), "Delivery receipts are never dm_ack");
   assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);
-  console.log(process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC === "1" ? "DIAGNOSTIC_ONLY_CHALLENGE_WIDENED" : "REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
-} finally { release?.(); await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
+  console.log("REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
+  }
+} finally { release?.(); raceGate.holding = false; await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
