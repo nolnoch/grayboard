@@ -3,7 +3,7 @@ import type { Repo, Team } from "./db.ts";
 import type { Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
-  mintToken, hashToken, type AuthedUser,
+  mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
@@ -32,10 +32,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-function requireAuth(req: Request, repo: Repo): AuthedUser | null {
+function requireAuth(req: Request, repo: Repo, touches: TouchQueue): AuthedUser | null {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo);
+  return verifySessionToken(raw, repo, touches);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -421,7 +421,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 // ── main router ──────────────────────────────────────────────────────────────
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
+  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
 ): Promise<Response> {
   const url    = new URL(req.url);
@@ -436,7 +436,7 @@ export async function handleHttp(
     return devLogin(req, repo);
   }
 
-  const authed = requireAuth(req, repo);
+  const authed = requireAuth(req, repo, touches);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

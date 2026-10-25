@@ -41,7 +41,11 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
 }
 
-export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void {
+// Returns a stop function that cancels the pending nightly run and the daily
+// sweep, so a server stop() can close the db without them firing afterwards.
+// `firstDelayMs` replaces the next-UTC-midnight delay for the first run — a
+// test hook that lets a test hold the nightly timer pending across a stop().
+export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}): () => void {
   const runNightly = () => void runRetention(repo, db, config);
 
   const runVacuumIfNeeded = () => {
@@ -52,12 +56,16 @@ export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void
     }
   };
 
+  let nightly: ReturnType<typeof setTimeout> | undefined;
+  let daily: ReturnType<typeof setInterval> | undefined;
+
   const scheduleNightly = () => {
-    const delay = msUntilMidnightUTC();
-    setTimeout(() => {
+    const delay = opts.firstDelayMs ?? msUntilMidnightUTC();
+    nightly = setTimeout(() => {
+      nightly = undefined;
       runNightly();
       runVacuumIfNeeded();
-      setInterval(() => {
+      daily = setInterval(() => {
         runNightly();
         runVacuumIfNeeded();
       }, 86_400_000);
@@ -65,4 +73,8 @@ export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config): void
   };
 
   scheduleNightly();
+  return () => {
+    if (nightly) clearTimeout(nightly);
+    if (daily) clearInterval(daily);
+  };
 }
