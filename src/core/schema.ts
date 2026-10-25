@@ -109,6 +109,18 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_binding_events_name ON binding_events(name, at);
     CREATE INDEX IF NOT EXISTS idx_binding_events_session ON binding_events(session_id);
 
+    -- Local mode's audit trail (src/core/audit.ts): the same actions the
+    -- server's audit records, for the actions that need one in both modes
+    -- (delegation.*). Pruned with the bus's retention.
+    CREATE TABLE IF NOT EXISTS audit_log (
+      at      INTEGER NOT NULL,
+      actor   TEXT,
+      action  TEXT    NOT NULL,
+      target  TEXT,
+      detail  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
     -- blob goes when the last attachment naming it does.

@@ -8,7 +8,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { delegateNote, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { delegateOkFields, delegateNote, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
@@ -98,6 +99,11 @@ const HUMAN = process.env.BUS_HUMAN === "1";
 // telling peers what its harness can do, and it's the one that acts on a
 // delegation request when one arrives by DM.
 const LAUNCHER = process.env.BUS_LAUNCHER === "1";
+// A launcher must be able to RECEIVE delegation requests: a tools-only
+// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
+// the name, has no socket, and never touches the launcher flag (a sidecar
+// must not overwrite the owner's opt-in).
+const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
 // child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
@@ -204,7 +210,7 @@ function localBoundInstructions(name: string, general: boolean): string[] {
     name,
     general,
     () => [
-      ...(LAUNCHER ? launcherInstruction() : []),
+      ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
       ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
       ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
     ],
@@ -326,24 +332,55 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (name === "delegate") {
     // Resolve the launcher and build the payload (core), then deliver it as
     // this mode's DM, pending: the promise shows in dm_inbox until the
-    // launcher reports the result in this thread (#184).
-    const online = await liveHandles(IDENTITY);
+    // requester settles the thread (#184). Same result fields as dm_send, via
+    // the shared builder, so the modes can't drift.
+    const live = await liveHandles(IDENTITY);
+    // A launcher inside its bind swap still answers under its old name: filter
+    // it like dm_send does (a released name's socket isn't the session).
+    const online = (h: string) => live(h) && !lastWasRelease(db, h);
     let d;
     try {
       d = resolveDelegation(db, IDENTITY, a, online);
     } catch (e) {
-      if (e instanceof CoreError) return { ...text(`error: ${e.message}`), isError: true };
+      if (e instanceof CoreError) {
+        writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message });
+        return { ...text(`error: ${e.message}`), isError: true };
+      }
       throw e;
     }
+    checkBody(d.body);
     const { id } = await insertMessage(IDENTITY, d.to, d.body, null, true, []);
-    const delivered = (await poke(d.to)) && !lastWasRelease(db, d.to);
-    return text(JSON.stringify({
-      message_id: id,
-      delivered_now: delivered,
-      to: d.to,
-      ...(d.humanFallback ? { human_fallback: true as const } : {}),
-      note: delegateNote(Date.now()),
-    }));
+    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: id });
+    const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
+    let delivered = await deliver(d.to);
+    if (!delivered && !d.humanFallback) {
+      // The pick may have landed in a bind swap: re-resolve once, excluding
+      // the launcher that didn't take it.
+      try {
+        const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
+        if (d2.to !== d.to && !d2.humanFallback) {
+          const { id: id2 } = await insertMessage(IDENTITY, d2.to, d2.body, null, true, []);
+          writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
+          d = d2;
+          delivered = await deliver(d2.to);
+        }
+      } catch {
+        // No second launcher: the request stays queued for the first pick's
+        // name; its next holder drains it.
+      }
+    }
+    const seen = lastSeen(db, d.to);
+    const base = delivered
+      ? { message_id: id, delivered_now: true, pending: true as const, note: "Recipient was online; pushed." }
+      : {
+          message_id: id,
+          delivered_now: false,
+          pending: true as const,
+          note: queuedNote(d.to, seen),
+          ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+          undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === d!.to)?.n ?? 1,
+        };
+    return text(JSON.stringify(delegateOkFields(d, base)));
   }
 
   if (name === "dm_send") {
@@ -579,7 +616,10 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
       }
       if (previous) touchHandle(db, previous);
       startSession(db, n.name, process.cwd());
-      setLauncher(db, n.name, LAUNCHER);
+      if (PUSH) {
+        setLauncher(db, n.name, EFFECTIVE_LAUNCHER);
+        writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
+      }
     } catch (e) {
       const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
@@ -607,7 +647,10 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
 // restored name is the same session restarted: leave their status alone.
 if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
 else if (bound) touchHandle(db, bound);
-if (bound) setLauncher(db, bound, LAUNCHER);
+if (bound && PUSH) {
+  setLauncher(db, bound, EFFECTIVE_LAUNCHER);
+  writeCoreAudit(db, "handle.launcher_set", bound, bound, { on: EFFECTIVE_LAUNCHER });
+}
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
 late.watch(transport);

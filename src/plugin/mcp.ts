@@ -10,7 +10,7 @@ import { GrayboardClient, HelloRefused } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
-import type { Message, SendOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
+import type { Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
@@ -414,13 +414,29 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       // The server resolves the launcher (or falls back to your human) and
       // sends the payload pending; the reply carries `to` and, on the degrade
       // path, human_fallback (#184).
-      const { type: _t, req_id: _r, ...rest } = await client.request<SendOk>({
-        type: "delegate",
-        persona: a.persona,
-        task: a.task,
-        ...(a.context !== undefined ? { context: a.context } : {}),
-        ...(a.to !== undefined ? { to: a.to } : {}),
-      });
+      let rest: Omit<DelegateOk, "type" | "req_id">;
+      try {
+        const r = await client.request<DelegateOk>({
+          type: "delegate",
+          persona: a.persona,
+          task: a.task,
+          ...(a.context !== undefined ? { context: a.context } : {}),
+          ...(a.to !== undefined ? { to: a.to } : {}),
+        });
+        const { type: _frame, req_id: _req, ...body } = r;
+        rest = body;
+      } catch (e) {
+        const msg = (e as Error).message;
+        // A lost answer (a disconnect around the send) is not a failed
+        // delegation: the request may have landed, and a blind retry spawns
+        // the work twice (#184 review 11; the general dedup is #254). A
+        // server refusal (an `error` frame rejects as "code: message") is
+        // surfaced as-is.
+        if (/was lost|no answer from the grayboard server/.test(msg)) {
+          return text(`error: the delegation's answer was lost (${msg}); check dm_inbox's promised list before retrying — the request may have landed and a retry would spawn the work twice.`);
+        }
+        throw e;
+      }
       return text(rest);
     }
     if (name === "dm_history") {

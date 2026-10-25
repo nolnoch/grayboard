@@ -46,6 +46,7 @@ export async function runLocalRetention(db: Database, blobs: BlobStore, days: nu
     if (!claimRun(db, now)) return false;
     pruneMessages(db, now - days * DAY_MS);
     prunePosts(db, now - days * DAY_MS);
+    db.prepare(`DELETE FROM audit_log WHERE at < ?`).run(now - days * DAY_MS);
     pruneUnbound(db, now - UNBOUND_TTL_MS);
   } catch (e) {
     console.error("[grayboard] retention failed:", e);

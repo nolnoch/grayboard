@@ -96,6 +96,9 @@ export type SendOk      = {
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
 };
+// A delegation's send_ok: the ordinary fields plus which launcher took it
+// (or the human fallback).
+export type DelegateOk  = SendOk & { to: string; human_fallback?: true };
 // Messages you sent carry delivered: whether they've reached the recipient's session.
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
@@ -113,7 +116,7 @@ export type BoardPush   = { type: "board_push"; item: Pending };
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string };
 
 export type ServerMessage =
-  | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
+  | HelloOk | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
   | CallOk | BoardPush | InboxOk;
 
 export type ErrorCode =
