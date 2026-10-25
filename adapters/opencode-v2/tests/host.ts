@@ -19,7 +19,7 @@ const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
 const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [] };
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } } });
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined;
@@ -115,6 +115,7 @@ try {
   const native = await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), x => x?.status.status === "needs_auth", "native discovery"); assert(native?.integrationID);
   const selected = await signIn(native.integrationID); assert(selected?.type === "credential");
   await host.mcp.connect({ server: "grayboard", location });
+  console.log("CIMD_TRANSPORT", process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? "production DNS and pinned node:https; no resolver/read seam" : "injected DNS/read fixture; production parser and OAuth");
   const projected = await ctx.integration.connection.resolve(selected); if (projected?.type === "oauth") console.log("NATIVE_GRANT_METADATA", JSON.stringify({ issuer: projected.metadata?.issuer, scope: projected.metadata?.scope, serverUrl: projected.metadata?.serverUrl, clientID: (projected.metadata?.client as { client_id?: string })?.client_id }));
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools");
   let rpc = host.rpc(Grayboard);
@@ -229,6 +230,6 @@ try {
   await wait(() => app.mcp.activeLeases, n => n === 0, "actual user disable ends ownership"); assert.equal(row(a.id), null);
   assert(app.repo.cursors.directFor("you@example.com/final") < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
   console.log("REAL_ACCOUNT_DRIFT_AND_DISABLE_OK");
-  assert.equal(codes, 3); assert.equal(google, 3); assert(cimd >= 1); assert.equal(refreshes, 0);
+  assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);
   console.log(process.env.GRAYBOARD_TEST_CHALLENGE_DIAGNOSTIC === "1" ? "DIAGNOSTIC_ONLY_CHALLENGE_WIDENED" : "REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
 } finally { release?.(); await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
