@@ -132,12 +132,12 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "peer_status",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. queue "off" takes you out of queue-board rotations (an explicit opt-out; status text never affects routing), "on" restores; it persists across restarts.',
+        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
       inputSchema: {
         type: "object",
         properties: {
           text: { type: "string", description: "At most 200 chars. Empty clears." },
-          queue: { type: "string", enum: ["on", "off"], description: 'Optional. "off": queue boards skip you in the work rotation; "on": eligible again.' },
+          queue: { type: "string", enum: ["on", "off"], description: 'Optional. "off" leaves queue-board rotations until "on"; kept across restarts.' },
         },
         required: ["text"],
       },

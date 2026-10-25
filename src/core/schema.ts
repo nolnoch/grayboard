@@ -95,9 +95,10 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
 
     -- Which session held which name, and when (#182): the join between a
-    -- session's run metadata and a name. Append-only. event: bound, moved
-    -- (a rebind; detail has the old name), released, refused (detail has
-    -- the holder or the reason).
+    -- session's run metadata and a name. event: bound, moved (a rebind;
+    -- detail has the old name), released, refused (detail has the holder or
+    -- the reason). Append-only, except that a session's identical refusals
+    -- within REFUSED_COALESCE_MS grow one row's count and last_at (#210).
     CREATE TABLE IF NOT EXISTS binding_events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id  TEXT    NOT NULL,
@@ -169,6 +170,13 @@ export function initCoreSchema(db: Database): void {
   // next push that does (0): a thread reply to a bystander.
   const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
   if (!outboxCols.some((c) => c.name === "wake")) db.exec(`ALTER TABLE outbox ADD COLUMN wake INTEGER NOT NULL DEFAULT 1`);
+
+  // A refused binding event's repeats (#210): NULL count means 1, NULL
+  // last_at means at.
+  const bindingCols = new Set((db.prepare(`PRAGMA table_info(binding_events)`).all() as { name: string }[]).map((c) => c.name));
+  for (const col of ["count", "last_at"]) {
+    if (!bindingCols.has(col)) db.exec(`ALTER TABLE binding_events ADD COLUMN ${col} INTEGER`);
+  }
 
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];

@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { mintSessionKey } from "../../src/core/bindings.ts";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
@@ -110,7 +111,7 @@ test("grayboard claims in server mode reads /api/claims and leaves out boards", 
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};
-  const be = new GrayboardClient(srv.base, () => alice, "be", noop, noop);
+  const be = new GrayboardClient(srv.base, () => alice, "be", mintSessionKey(), noop, noop);
   be.connect();
   await be.ready();
   await be.request({ type: "call", tool: "peer_status", args: { text: "soaking" } });
@@ -128,13 +129,13 @@ test("a refused token says to sign in again: at startup, in a running session's 
   const noop = async () => {};
   const msg = (running: boolean) => (running ? "sign in; reconnecting" : "sign in");
 
-  const stale = new GrayboardClient(srv.base, () => "stale", "be", noop, noop, true, msg);
+  const stale = new GrayboardClient(srv.base, () => "stale", "be", mintSessionKey(), noop, noop, true, msg);
   stale.connect();
   await expect(stale.ready()).rejects.toThrow(/^sign in$/);
 
   // A running session whose token is revoked (as by a database reset)...
   let token = await login("alice@example.com");
-  const be = new GrayboardClient(srv.base, () => token, "be", noop, noop, true, msg);
+  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop, true, msg);
   be.connect();
   await be.ready();
   await fetch(`${srv.base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
@@ -220,7 +221,7 @@ test("grayboard claim in server mode acts as one of your identities; its session
 test("a frame the server can't parse is answered with its req_id, so the call fails instead of hanging (#40)", async () => {
   const noop = async () => {};
   const token = await login("alice@example.com");
-  const be = new GrayboardClient(srv.base, () => token, "be", noop, noop);
+  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop);
   be.connect();
   await be.ready();
   await expect(be.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: "5" })).rejects.toThrow(/bad_request: .*parent_id/);

@@ -109,6 +109,19 @@ test("a reply by the claim holder acks and releases the claim", () => {
   expect(claimEvents(claimKey(r.post.id)).filter((e) => e.event === "take").length).toBe(1);
 });
 
+test("a holder's reply after its claim lapsed, before the sweep, still acks; the sweep redelivers nothing (#234)", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims
+  db.prepare(`UPDATE claims SET expires_at = 1 WHERE key = ?`).run(claimKey(r.post.id));
+  post(db, "fe", "work", "done: landed", r.post.id);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id))).toBe(false);
+  expect(sweepExpired(db).wake).toEqual([]);
+  const events = db.prepare(`SELECT event, note FROM claim_events WHERE key = ? ORDER BY id`).all(claimKey(r.post.id));
+  expect(events).toEqual([
+    { event: "take", note: "queue post" },
+    { event: "release", note: "ack (late)" },
+  ]);
+});
+
 test("a reply by a different lane does not release the holder's claim", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
   post(db, "sim", "work", "chiming in", r.post.id);

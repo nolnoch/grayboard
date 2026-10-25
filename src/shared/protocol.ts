@@ -21,7 +21,7 @@ export type Message = {
 // push: false is a tools-only connection beside the session that owns the
 // identity (a harness that can't show pushes): no pushes, not "online".
 // where: the client's describeLocation (the server can't see its files).
-// resume: a reconnect within one session, so its peer_status stays.
+// resume: a reconnect within one session, so its peer_status stays (#211, below).
 // session_key: the client process's secret (#182 audit 4); the server
 // derives the session ID, the key of its binding_events, from it
 // (sessionIdOf), so no connection can present another session's ID.
@@ -31,7 +31,9 @@ export type Message = {
 // from: the name a rebind leaves; its claims move to the new name if this
 // session holds it by the record. Sent on a bind's first hello only.
 // restored_from: the session ID of the process this one restarted from,
-// taking back its name (#182 decision 14): logged, and its status stays.
+// taking back its name (#182 decision 14). Its status stays, and the bound
+// event says so, only when the name's latest bound or moved event is that
+// session's (#211); likewise a resume's own session. Ignored with from.
 // create: false refuses a name that has never existed (identity_unknown);
 // absent, the name is created lazily, as before #182.
 // read_only: an unbound session's connection (no identity; push must be
@@ -113,7 +115,8 @@ export type CallOk      = { type: "call_ok";    req_id: string; result: unknown 
 export type BoardPush   = { type: "board_push"; item: Pending };
 // known: with identity_unknown, the user's names closest to the one asked for.
 // holder: with identity_in_use, the live session that holds the name.
-export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string };
+// retry_after_ms: on a rate_limited hello, the wait until one is accepted again.
+export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
 
 export type ServerMessage =
   | HelloOk | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage

@@ -6,6 +6,7 @@ import {
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
+import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
 import {
   acknowledge,
   age,
@@ -22,7 +23,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf,
   sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -79,6 +80,8 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
+  // Hellos per user: the burst, and the refill rate (#210).
+  helloLimit?: HelloLimit;
 };
 
 // Per server instance.
@@ -100,6 +103,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  helloLimiter: HelloLimiter;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -136,6 +140,30 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
+// The bridge-down notice is durable, not hub memory: a fatal stop writes a
+// `bridge.stopped` audit row per linked user (src/server/slack.ts), and the
+// drain writes `bridge.notified`. An unsuppressed death newer than the last
+// delivery is still owed — across a restart too, which is why it lives in
+// the audit log — and drains once, at the user's next agent-session hello.
+// Reads and the write run synchronously, so two hellos of one user can't
+// both deliver.
+function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+  const target = `${email}/${HUMAN_NAME}`;
+  const stop = repo.audit.last("bridge.stopped", target);
+  if (!stop) return undefined;
+  let detail: { reason?: string; at?: string; suppressed?: boolean };
+  try {
+    detail = stop.detail ? (JSON.parse(stop.detail) as typeof detail) : {};
+  } catch {
+    return undefined;
+  }
+  if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  const notified = repo.audit.last("bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
+}
+
 // Does the connection answer a ping within ms? The plugin pongs every ping.
 function probe(ws: Ws, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -163,6 +191,17 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    // Logged and audited once per run of refusals, so a loop floods neither.
+    helloLimiter: new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+      start: (_id, email, ctx, retryAfterMs) => {
+        console.error(`[grayboard] rate-limiting hellos from ${email}`);
+        writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+      },
+      end: (_id, email, refused) => {
+        console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+        writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+      },
+    }),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -312,6 +351,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
+      hub.helloLimiter.sweep();
       for (const ws of [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
@@ -337,6 +377,21 @@ function describeHolder(ws: Ws): string {
 async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const { repo, db, registry, holders } = hub;
   const reqId = m.req_id;
+  // First, before anything reads or writes the database. The Slack bridge's
+  // in-process connections are the server's own.
+  if (!ws.data.human) {
+    const t = hub.helloLimiter.take(ws.data.authed.user_id, ws.data.authed.user_email, {
+      session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+      ...(m.read_only ? { read_only: true } : { name: m.identity ?? null }),
+      place: m.where ?? null,
+    });
+    if (!t.ok) {
+      const secs = Math.ceil(t.retryAfterMs / 1000);
+      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${secs}s`, retry_after_ms: t.retryAfterMs });
+      ws.close();
+      return;
+    }
+  }
   const push = m.push !== false;
   // Whether this connection holds its name: a push one, or a hold one, whose
   // harness can't show pushes (#182 audit 2). A tools-only one doesn't.
@@ -446,8 +501,15 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     moved = [];
     holders.set(full, ws);
     if (push) registry.set(full, ws);
-    // A reconnect, or a restart taking its name back, is the same session: its status stays.
-    if (m.resume || m.restored_from) touchHandle(db, full);
+    // A reconnect, or a restart taking its name back, is the same session, so
+    // its status stays, once the name's history shows it (#211). The session
+    // ID comes from the client's secret, so a reconnect proves itself; a
+    // restore names a public ID. A rebind is neither: it logs `moved`.
+    const continued = m.from !== undefined ? null
+      : m.resume ? continuityOf(db, full, { reconnect: sessionId })
+      : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
+      : null;
+    if (continued?.verified) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     // Only a push-mode owner advertises the capability (a hold or tools-only
@@ -471,8 +533,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
       logBinding(db, sessionId, full, "moved", from);
     } else {
-      const how = m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null;
-      logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
+      logBinding(db, sessionId, full, "bound", [continued?.detail ?? null, notMoved].filter((d) => d !== null).join("; ") || null);
     }
   } else {
     hub.toolsOnly.add(ws);
@@ -496,9 +557,15 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     ...(moved ? { moved } : {}),
     ...(notMoved ? { not_moved: notMoved } : {}),
   };
+  // Bridge-down notices drain on agent-session hellos only: the bridge's own
+  // human hello (HumanConn) would steal the notice into a handshake nobody
+  // reads, leaving the owner uninformed.
+  const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
   const notices = [
     ...(m.launcher && push && owns ? launcherInstruction() : []),
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    // Before the claims: drained once, so a cut must not take it.
+    ...(bridgeNotice ? [bridgeNotice] : []),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
   ];

@@ -38,9 +38,31 @@ export function sessionIdOf(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-/** One binding_events row. */
+/** One binding_events row, or one more repeat on a refusal's row. */
 export function logBinding(db: Database, sessionId: string, name: string, event: BindingEvent, detail: string | null = null, at = Date.now()): void {
+  // A retry loop refused for the same reason is one row with a count, not a
+  // row per attempt (#210).
+  if (event === "refused") {
+    const last = db.prepare(
+      `SELECT id, event, detail, COALESCE(last_at, at) AS seen FROM binding_events WHERE session_id = ? AND name = ? ORDER BY id DESC LIMIT 1`,
+    ).get(sessionId, name) as { id: number; event: string; detail: string | null; seen: number } | null;
+    if (last?.event === "refused" && last.detail === detail && at - last.seen <= REFUSED_COALESCE_MS) {
+      db.prepare(`UPDATE binding_events SET count = COALESCE(count, 1) + 1, last_at = ? WHERE id = ?`).run(at, last.id);
+      return;
+    }
+  }
   db.prepare(`INSERT INTO binding_events (session_id, name, event, at, detail) VALUES (?, ?, ?, ?, ?)`).run(sessionId, name, event, at, detail);
+}
+
+/** How long after a refusal an identical one from the same session joins its row. */
+export const REFUSED_COALESCE_MS = 60_000;
+
+/** The session ID of the name's latest bound or moved event, or null when it has none. */
+function latestBinder(db: Database, name: string): string | null {
+  const row = db.prepare(
+    `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
+  ).get(name) as { session_id: string } | null;
+  return row?.session_id ?? null;
 }
 
 /**
@@ -49,10 +71,29 @@ export function logBinding(db: Database, sessionId: string, name: string, event:
  * leaves only then (#182 audit 3).
  */
 export function lastBoundBy(db: Database, name: string, sessionId: string): boolean {
-  const row = db.prepare(
-    `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
-  ).get(name) as { session_id: string } | null;
-  return row?.session_id === sessionId;
+  return latestBinder(db, name) === sessionId;
+}
+
+/** A bind's claim to continue a session on its name, checked against the history. */
+export type Continuity = { verified: boolean; detail: string };
+
+/**
+ * A hello's claim to continue `session` on `name` (#211): a reconnect of the
+ * session itself, or a restart of an earlier one. Honoured only when the
+ * name's latest bound or moved event is that session's, so the binding
+ * history never records a continuation the bus didn't see. A restart names
+ * a public ID, so on the server this shows the history, not descent (#259).
+ * An unverified claim's detail names the latest binder, so the row explains
+ * its refusal. Call it in the transaction that logs the bind.
+ */
+export function continuityOf(db: Database, name: string, claim: { reconnect: string } | { restartOf: string }): Continuity {
+  const session = "reconnect" in claim ? claim.reconnect : claim.restartOf;
+  const latest = latestBinder(db, name);
+  if (latest === session) {
+    return { verified: true, detail: "reconnect" in claim ? "reconnect" : `restored: restart of session ${session}` };
+  }
+  const what = "reconnect" in claim ? "reconnect" : `restored_from ${session}`;
+  return { verified: false, detail: `${what} not verified: latest bound by ${latest ?? "nobody"}` };
 }
 
 /** Whether the name's latest bound, moved or released event is a release. */

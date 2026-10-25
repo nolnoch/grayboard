@@ -146,8 +146,8 @@ const DELIVER = PUSH && !CHANNELS_OFF;
 let bound: string | null = null;
 // Why this session started unbound, for its instructions.
 const unboundNotes: string[] = [];
-// The name came back from the name record: the same harness session, so its
-// peer status stays.
+// The name came back from the name record and the name's history shows the
+// recorded session (#211): the same harness session, so its peer status stays.
 let restored = false;
 // The name record (#182 decision 14), written by the session that owns
 // delivery whenever its name changes. The Slack bridge's child keeps none:
@@ -178,11 +178,11 @@ else {
     // The process it replaces may not have exited yet.
     if (n.ok) await siblingGone(db, n.name, process.ppid);
     const r = n.ok
-      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, detail: `restored: restart of session ${rec.session_id}` })
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
       : { ok: false as const, error: n.error };
     if (r.ok) {
       bound = r.name;
-      restored = true;
+      restored = r.restored;
     } else unboundNotes.push(restoreNote(rec.name, r.error));
   } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });

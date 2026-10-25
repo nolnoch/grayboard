@@ -6,6 +6,7 @@ const KEYS = [
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
+  "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
 ];
 
 describe("loadConfig", () => {
@@ -58,9 +59,34 @@ describe("loadConfig", () => {
     process.env.GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES = "3000";
     expect(loadConfig().attachmentLimits).toEqual({ file: 1000, total: 3000 });
     process.env.GRAYBOARD_ATTACHMENT_MAX_BYTES = "10MB";
-    expect(() => loadConfig()).toThrow(/GRAYBOARD_ATTACHMENT_MAX_BYTES must be a positive number of bytes/);
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_ATTACHMENT_MAX_BYTES must be a positive whole number of bytes/);
     process.env.GRAYBOARD_ATTACHMENT_MAX_BYTES = "4000";
     expect(() => loadConfig()).toThrow(/can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES/);
+  });
+
+  test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_HELLO_BURST = "10";
+    process.env.GRAYBOARD_HELLO_PER_SEC = "0.5";
+    expect(loadConfig().helloLimit).toEqual({ burst: 10, perSec: 0.5 });
+    process.env.GRAYBOARD_HELLO_BURST = "";
+    process.env.GRAYBOARD_HELLO_PER_SEC = "";
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    for (const bad of ["0", "1.5", "-3", "ten"]) {
+      process.env.GRAYBOARD_HELLO_BURST = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HELLO_BURST must be a positive whole number/);
+    }
+    process.env.GRAYBOARD_HELLO_BURST = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HELLO_BURST can be at most 10000/);
+    process.env.GRAYBOARD_HELLO_BURST = "";
+    // Below 0.1/s, one token's wait outlasts a client's startup window.
+    for (const bad of ["0", "0.0", "0.05", "-1", "1e3", "fast"]) {
+      process.env.GRAYBOARD_HELLO_PER_SEC = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HELLO_PER_SEC must be a number of at least 0.1/);
+    }
+    process.env.GRAYBOARD_HELLO_PER_SEC = "0.1";
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 0.1 });
   });
 
   test("retention days and the port parse strictly: garbage refuses to start, unset and empty mean the defaults", () => {
