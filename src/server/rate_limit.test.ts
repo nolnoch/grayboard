@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 
-import { HelloLimiter } from "./hello_limit.ts";
+import { RateLimiter } from "./rate_limit.ts";
 
 function limiter(burst = 2, perSec = 1) {
   const clock = { t: 0 };
   const events: string[] = [];
-  const l = new HelloLimiter({ burst, perSec }, {
+  const l = new RateLimiter<number>({ burst, perSec }, {
     start: (id, email) => events.push(`start ${id} ${email}`),
     end: (id, email, n) => events.push(`end ${id} ${email} ${n}`),
   }, () => clock.t);
@@ -82,11 +82,45 @@ test("a loop just faster than the refill stays one streak, not one per refusal",
 
 test("the streak's start carries the tripping hello's context and wait", () => {
   const seen: unknown[] = [];
-  const l = new HelloLimiter({ burst: 1, perSec: 1 }, {
+  const l = new RateLimiter<number>({ burst: 1, perSec: 1 }, {
     start: (_id, _email, ctx, retryAfterMs) => seen.push({ ...ctx, retryAfterMs }),
     end: () => {},
   }, () => 0);
   l.take(1, "a@x", { session_id: "s1", name: "be" });
   l.take(1, "a@x", { session_id: "s2", read_only: true, place: "host" });
   expect(seen).toEqual([{ session_id: "s2", read_only: true, place: "host", retryAfterMs: 1000 }]);
+});
+
+test("a check never allocates a bucket or spends; a spend never goes below empty", () => {
+  const { l, clock } = limiter(2, 1);
+  expect(l.check(1, "a@x")).toEqual({ ok: true });
+  expect(l.size).toBe(0);
+  l.spend(1, "a@x");
+  l.spend(1, "a@x");
+  l.spend(1, "a@x");
+  l.spend(1, "a@x");
+  // Empty, not -2: the wait is one token's refill.
+  expect(l.check(1, "a@x")).toEqual({ ok: false, retryAfterMs: 1000 });
+  clock.t = 1000;
+  expect(l.check(1, "a@x")).toEqual({ ok: true });
+});
+
+test("at the key cap a new key is neither charged nor refused, with one notice a minute", () => {
+  const clock = { t: 0 };
+  const full: number[] = [];
+  const l = new RateLimiter<string>({ burst: 1, perSec: 1 }, { start: () => {}, end: () => {}, full: (n) => full.push(n) }, () => clock.t, 2);
+  l.spend("a", "a");
+  l.spend("b", "b");
+  l.spend("c", "c");
+  l.spend("c", "c");
+  expect(l.size).toBe(2);
+  expect(l.check("c", "c")).toEqual({ ok: true });
+  expect(l.check("a", "a").ok).toBe(false);
+  expect(full).toEqual([2]);
+  clock.t = 59_999;
+  l.spend("d", "d");
+  expect(full).toEqual([2]);
+  clock.t = 60_000;
+  l.spend("d", "d");
+  expect(full).toEqual([2, 2]);
 });

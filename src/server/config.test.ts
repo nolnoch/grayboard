@@ -7,6 +7,7 @@ const KEYS = [
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
 ];
 
 describe("loadConfig", () => {
@@ -87,6 +88,37 @@ describe("loadConfig", () => {
     }
     process.env.GRAYBOARD_HELLO_PER_SEC = "0.1";
     expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 0.1 });
+  });
+
+  test("the auth-failure limit parses like the hello limit, under its own names", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().authFailLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_AUTH_FAIL_BURST = "20";
+    process.env.GRAYBOARD_AUTH_FAIL_PER_SEC = "0.25";
+    expect(loadConfig().authFailLimit).toEqual({ burst: 20, perSec: 0.25 });
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_AUTH_FAIL_BURST = "0";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_AUTH_FAIL_BURST must be a positive whole number of failures/);
+    process.env.GRAYBOARD_AUTH_FAIL_BURST = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_AUTH_FAIL_BURST can be at most 10000/);
+    process.env.GRAYBOARD_AUTH_FAIL_BURST = "";
+    process.env.GRAYBOARD_AUTH_FAIL_PER_SEC = "0.01";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_AUTH_FAIL_PER_SEC must be a number of at least 0.1/);
+  });
+
+  test("trusted proxies: unset or empty is loopback, \"none\" is nobody, a list replaces the default and must parse", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().trustedProxies).toEqual(["127.0.0.0/8", "::1/128"]);
+    process.env.GRAYBOARD_TRUSTED_PROXIES = " ";
+    expect(loadConfig().trustedProxies).toEqual(["127.0.0.0/8", "::1/128"]);
+    process.env.GRAYBOARD_TRUSTED_PROXIES = "none";
+    expect(loadConfig().trustedProxies).toEqual([]);
+    process.env.GRAYBOARD_TRUSTED_PROXIES = "127.0.0.1, 10.0.0.0/8,fd00::/8";
+    expect(loadConfig().trustedProxies).toEqual(["127.0.0.1/32", "10.0.0.0/8", "fd00::/8"]);
+    for (const bad of ["10.0.0.0/33", "caddy", "127.0.0.1,", "none,10.0.0.1"]) {
+      process.env.GRAYBOARD_TRUSTED_PROXIES = bad;
+      expect(() => loadConfig()).toThrow(/^GRAYBOARD_TRUSTED_PROXIES: ".*" is not an IP address or CIDR/);
+    }
   });
 
   test("retention days and the port parse strictly: garbage refuses to start, unset and empty mean the defaults", () => {

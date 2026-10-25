@@ -146,7 +146,7 @@ const HELLO_OK = { type: "hello_ok", identity_full: `${A}/fe`, user_email: A, te
 test("the client waits the server's retry_after_ms, skips the token check, and reports why while it waits", async () => {
   const s = stub((n) => (n === 1 ? { type: "error", code: "rate_limited", message: "slow down", retry_after_ms: 300 } : HELLO_OK));
   const c = client(s.url);
-  await until(() => c.rateLimited() === "slow down");
+  await until(() => c.rateLimited()?.message === "slow down");
   await c.ready();
   expect(c.rateLimited()).toBeNull();
   expect(s.opens.length).toBe(2);

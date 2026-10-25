@@ -4,7 +4,8 @@ import { expect } from "bun:test";
 import type { ServerMessage } from "../../src/shared/protocol.ts";
 
 export type Any = ServerMessage & Record<string, any>;
-export type WsClientOptions = { pong?: boolean; push?: boolean; hello?: Record<string, unknown> };
+// headers: extra upgrade headers (an X-Forwarded-For, to come from another address).
+export type WsClientOptions = { pong?: boolean; push?: boolean; hello?: Record<string, unknown>; headers?: Record<string, string> };
 
 export class WsClient {
   ws!: WebSocket;
@@ -23,7 +24,7 @@ export class WsClient {
   // Resolves with hello_ok, or the error that refused the hello.
   connect(): Promise<Any> {
     this.ws = new (WebSocket as any)(`${this.base.replace("http", "ws")}/ws`, {
-      headers: { Authorization: `Bearer ${this.token}` },
+      headers: { Authorization: `Bearer ${this.token}`, ...this.opts.headers },
     });
     this.ws.onmessage = (e) => {
       const m = JSON.parse(e.data as string) as Any;

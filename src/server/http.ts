@@ -76,7 +76,14 @@ function authConfig(config: Config): Response {
   });
 }
 
-async function authExchange(req: Request, repo: Repo, config: Config): Promise<Response> {
+// Routes where each call costs the caller's address an auth failure (#240),
+// charged on entry. #204's OAuth routes (authorize, token, registration) join here.
+export function isSignInRoute(method: string, path: string, config: Config): boolean {
+  if (method !== "POST") return false;
+  return path === "/api/auth/exchange" || (path === "/api/auth/dev-login" && config.devAuth);
+}
+
+async function authExchange(req: Request, repo: Repo, config: Config, ip: string | null): Promise<Response> {
   const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
@@ -96,13 +103,13 @@ async function authExchange(req: Request, repo: Repo, config: Config): Promise<R
   const ua   = req.headers.get("user-agent")?.slice(0, 120) ?? null;
   repo.sessions.create(user.id, hashToken(raw), ua);
   writeAudit(repo, "auth.login", email, null, {
-    ip: req.headers.get("x-forwarded-for") ?? undefined,
+    ip: ip ?? undefined,
     ua: ua ?? undefined,
   });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
 
-async function devLogin(req: Request, repo: Repo): Promise<Response> {
+async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
@@ -110,7 +117,7 @@ async function devLogin(req: Request, repo: Repo): Promise<Response> {
   const user  = repo.users.upsertByEmail(email, null);
   const raw   = mintToken();
   repo.sessions.create(user.id, hashToken(raw), "dev");
-  writeAudit(repo, "auth.login", email, null, { dev: true });
+  writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
 
@@ -423,6 +430,8 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 export async function handleHttp(
   req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
   disconnectUser: (userId: number) => void = () => {},
+  // The client's address as the auth gate resolved it (src/server/client_addr.ts).
+  ip: string | null = null,
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -430,10 +439,10 @@ export async function handleHttp(
 
   if (path === "/healthz" && method === "GET") return healthz(repo);
   if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
-  if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, config);
+  if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, config, ip);
   if (path === "/api/auth/dev-login" && method === "POST") {
     if (!config.devAuth) return notFound();
-    return devLogin(req, repo);
+    return devLogin(req, repo, ip);
   }
 
   const authed = requireAuth(req, repo, touches);

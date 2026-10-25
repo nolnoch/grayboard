@@ -1,7 +1,8 @@
 import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_HELLO_LIMIT, type HelloLimit } from "./hello_limit.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
@@ -26,7 +27,11 @@ export type Config = {
   // The bytes of attachments one user may store, sent or not.
   attachmentUserQuota?: number;
   // Hellos per user: the burst, and the refill per second (#210).
-  helloLimit?: HelloLimit;
+  helloLimit?: RateLimit;
+  // Authentication failures per client address (#240), and the proxies
+  // whose X-Forwarded-For is believed (CIDRs; default loopback).
+  authFailLimit?: RateLimit;
+  trustedProxies?: string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -61,7 +66,9 @@ export function loadConfig(): Config {
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
-    helloLimit: parseHelloLimit(process.env),
+    helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
+    authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
+    trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };
 }
@@ -84,18 +91,33 @@ function parseAttachmentLimits(env: Record<string, string | undefined>): { attac
 // The rate's floor keeps the longest wait (one token, 1/perSec) inside a
 // client's startup window (src/plugin/mcp.ts), so a limited session can still
 // start; the burst's ceiling keeps a typo from switching the limit off.
-const MIN_HELLO_PER_SEC = 0.1;
-const MAX_HELLO_BURST = 10_000;
+const MIN_PER_SEC = 0.1;
+const MAX_BURST = 10_000;
 
-function parseHelloLimit(env: Record<string, string | undefined>): HelloLimit {
-  const perSec = env.GRAYBOARD_HELLO_PER_SEC;
-  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) >= MIN_HELLO_PER_SEC)) {
-    throw new Error(`GRAYBOARD_HELLO_PER_SEC must be a number of at least ${MIN_HELLO_PER_SEC}, not "${perSec}"`);
+// `${prefix}_BURST` and `${prefix}_PER_SEC`.
+function parseRateLimit(env: Record<string, string | undefined>, prefix: string, fallback: RateLimit, unit: string): RateLimit {
+  const name = `${prefix}_PER_SEC`;
+  const perSec = env[name];
+  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) >= MIN_PER_SEC)) {
+    throw new Error(`${name} must be a number of at least ${MIN_PER_SEC}, not "${perSec}"`);
   }
   return {
-    burst: positiveInt(env, "GRAYBOARD_HELLO_BURST", DEFAULT_HELLO_LIMIT.burst, MAX_HELLO_BURST, "hellos"),
-    perSec: perSec ? Number(perSec) : DEFAULT_HELLO_LIMIT.perSec,
+    burst: positiveInt(env, `${prefix}_BURST`, fallback.burst, MAX_BURST, unit),
+    perSec: perSec ? Number(perSec) : fallback.perSec,
   };
+}
+
+// Unset or empty: loopback. "none": nobody. Otherwise IPs or CIDRs, comma-separated.
+function parseTrustedProxies(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_TRUSTED_PROXIES;
+  if (raw.trim() === "none") return [];
+  return raw.split(",").map((c) => {
+    try {
+      return parseCidr(c);
+    } catch (e) {
+      throw new Error(`GRAYBOARD_TRUSTED_PROXIES: ${(e as Error).message}; give IPs or CIDRs, comma-separated, or "none"`);
+    }
+  });
 }
 
 // A positive whole-number setting: unset or empty takes the fallback.
