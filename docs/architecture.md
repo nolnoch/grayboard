@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: process model and mode selection; the distributed server (auth and sessions, WS protocol, HTTP access rules, server access policy, build and deploy)
-invariants: one CLI entry picks local or server mode from the credentials file's existence; WS auth lives only on the upgrade (HTTP authenticates per request); Google tokens are never stored; sessions never expire; cursors advance only on ack; one live connection per identity (probe, then refuse); a refused hello after startup never exits the client; hidden teams and boards read as not found; Repo is the Postgres seam and its BlobStore the object-store seam; a backup is the DB snapshot plus the blob directory; attachment bytes cross HTTP, never WS frames, and bind to a message or post only by id
+invariants: one CLI entry picks local or server mode from the credentials file's existence; a server runs with no mandatory outside service beyond the org's identity provider; WS auth lives only on the upgrade (HTTP authenticates per request); Google tokens are never stored; sessions never expire; cursors advance only on ack; one live connection per identity (probe, then refuse); a refused hello after startup never exits the client; hidden teams and boards read as not found; Repo is the Postgres seam and its BlobStore the object-store seam; a backup is the DB snapshot plus the blob directory; attachment bytes cross HTTP, never WS frames, and bind to a message or post only by id
 code-pointers: src/cli/main.ts (mcp, setup), src/cli/api.ts (busMode, credentials), src/server/, src/plugin/, src/shared/protocol.ts, src/shared/identity.ts, src/shared/http.ts, deploy/, install.sh (server restart)
 companions: boards.md (core semantics both modes share), slack-bridge.md (the local bridge, a client of grayboard mcp; the org bridge, in-process in the server), ../AGENTS.md (release runbook), ../README.md (operator steps)
 ```
@@ -38,6 +38,7 @@ flowchart LR
 
 ## 3. Auth and sessions
 
+- **No mandatory SaaS.** An operator self-hosts with only the org's identity provider (Google) as an outside dependency. Auth that needs a hosted tenant (an external authorization server for the hosted MCP path) is refused for that reason, and because a delegated JWT can't be revoked at once the way a server-held grant can (#204 decision; #142). Keeping grants in the server's DB also keeps their audit trail with the operator.
 - **Two layers, kept separate.** Google OIDC proves the human once, at login. Server-issued opaque tokens prove every later call. Google tokens are verified and discarded, never stored.
 - Login (`src/cli/oauth_flow.ts` → `src/server/auth.ts:exchangeGoogleCode`): PKCE over a loopback redirect. The CLI bootstraps client ID and org domain from public `GET /api/auth/config`, so developers need no OAuth config. **The client secret never leaves the server**; the code exchange is server-to-server. The `id_token` must have `hd == GRAYBOARD_ORG_DOMAIN` and `email_verified`. Login (and dev login) refuses an email no direct address can carry (`isValidEmail`, `src/shared/addressing.ts`; e.g. an apostrophe), since that user could sign in but never be addressed (#72).
 - Tokens: `gbrd_v1_<base64url(32 bytes)>`; only the SHA-256 is stored; the raw token is returned once. CLI writes `~/.grayboard/credentials` (0600).
