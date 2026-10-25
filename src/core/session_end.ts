@@ -14,7 +14,7 @@ import { writeCoreAudit } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
 import { logBinding } from "./bindings.ts";
-import { release, sweepIn } from "./claims.ts";
+import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { testPause } from "../shared/testpause.ts";
 
@@ -62,22 +62,37 @@ export function endSession(
 
   const wake = new Set<string>();
   const body = bounceBody(id, now, held);
+  let bounced = 0;
+  let unbounced = 0;
   for (const m of mail.unread(id)) {
     // A bounce to an ID that has itself ended would only bounce back.
-    if (isEndedId(db, m.sender)) continue;
+    if (isEndedId(db, m.sender)) {
+      unbounced++;
+      continue;
+    }
     mail.bounce(id, m.sender, m.id, body, now);
+    bounced++;
     wake.add(m.sender);
   }
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
   for (const h of sweepIn(db, now)) wake.add(h);
   const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(id, now) as { key: string }[];
+  // A release that fails for any reason but a lapse (the sweep below takes
+  // those) still frees the claim, unannounced, and the failure goes in the
+  // id.ended audit: an end must not leave a claim on an ID that can't act.
+  const releaseFailed: { key: string; error: string }[] = [];
   for (const c of claims) {
     try {
       for (const h of release(db, id, c.key, "session ended", { session: id }).wake) wake.add(h);
     } catch (e) {
-      // It lapsed since the select; the sweep below takes it.
       if (!(e instanceof CoreError)) throw e;
+      const cur = db.prepare(`SELECT * FROM claims WHERE key = ? AND holder = ? AND expires_at > ?`).get(c.key, id, Date.now()) as Claim | null;
+      if (!cur) continue;
+      db.prepare(`DELETE FROM claims WHERE key = ?`).run(c.key);
+      db.prepare(`DELETE FROM claim_watches WHERE key = ?`).run(c.key);
+      logEvent(db, "release", id, { ...cur, note: `session ended; announce failed: ${e.message}` }, Date.now());
+      releaseFailed.push({ key: c.key, error: e.message });
     }
   }
   for (const h of sweepIn(db, Date.now())) wake.add(h);
@@ -89,7 +104,13 @@ export function endSession(
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(id);
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
-  writeCoreAudit(db, "id.ended", id, id, { held, why: opts.why ?? null, bounced: wake.size });
+  writeCoreAudit(db, "id.ended", id, id, {
+    held,
+    why: opts.why ?? null,
+    bounced,
+    ...(unbounced ? { unbounced } : {}),
+    ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
+  });
   wake.delete(id);
   return { held, wake: [...wake] };
 }
@@ -116,15 +137,22 @@ export function bounceBody(id: string, endedAt: number, held: string[]): string 
  * session (no_delivery, naming the alias its owner writes as).
  */
 export function assertDeliverableId(db: Database, id: string): void {
+  const why = undeliverableId(db, id);
+  if (why) throw new CoreError(why);
+}
+
+/** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
+export function undeliverableId(db: Database, id: string): string | null {
   const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
     | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
     | null;
-  if (!r || r.viewer) throw new CoreError(`not_found: no session ${id}`);
+  if (!r || r.viewer) return `not_found: no session ${id}`;
   if (r.ended_at != null) {
     const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-    throw new CoreError(`id_ended: ${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
+    return `id_ended: ${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`;
   }
   if (r.delivery === "none") {
-    throw new CoreError(`no_delivery: ${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
+    return `no_delivery: ${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`;
   }
+  return null;
 }

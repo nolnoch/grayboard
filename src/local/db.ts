@@ -5,6 +5,7 @@ import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } f
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
 import { addressParts } from "../core/addresses.ts";
 import { assertDeliverableId } from "../core/session_end.ts";
+import { testPause } from "../shared/testpause.ts";
 
 const opened = openLocalDb();
 export const db = opened.db;
@@ -58,6 +59,7 @@ export function insertMessage(
   pending = false,
   ids: number[] = [],
 ): { id: number; attachments: AttachmentInfo[] } {
+  testPause("send:before-txn");
   return db.transaction(() => {
     if (addressParts(recipient)?.kind === "id") assertDeliverableId(db, recipient);
     const now = Date.now();

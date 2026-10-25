@@ -5,8 +5,9 @@ import { join } from "node:path";
 
 import { storeAttachment } from "./attachments.ts";
 import { holdAlias } from "./bindings.ts";
-import { createBoard, ensureAlias, post, registerId, subscribe } from "./boards.ts";
-import { claim, watch } from "./claims.ts";
+import { createBoard, ensureAlias, openAccess, post, registerId, setAccess, subscribe } from "./boards.ts";
+import { claim, sweepExpired, watch } from "./claims.ts";
+import { CoreError } from "./errors.ts";
 import { assertDeliverableId, endSession } from "./session_end.ts";
 import { SqliteBlobs } from "../local/blobs.ts";
 import { localMail } from "../local/mailbox.ts";
@@ -45,6 +46,7 @@ test("unread mail to an ended ID bounces to its senders; nothing else does", () 
 
   const r = end(db);
   expect(r).toEqual({ held: ["fe"], wake: ["be"] });
+  expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 1, unbounced: 1 });
   expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
     { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `${ID} ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
   ]);
@@ -111,4 +113,43 @@ test("a send to an ID is refused when it ended, has no row, is a viewer or recei
   expect(() => assertDeliverableId(db, OTHER)).toThrow("not_found");
   db.prepare(`UPDATE ids SET viewer = 0, delivery = 'none', writes_as = 'be' WHERE id = ?`).run(OTHER);
   expect(() => assertDeliverableId(db, OTHER)).toThrow(`no_delivery: ${OTHER} is a tools-only session and receives nothing; send to be`);
+});
+
+// Audit S1 (#329): a claim event quotes its key, so a key naming an ID that
+// later ended must not refuse the sweep, every other claim, or the holder's
+// end. An author's own post naming that ID is still refused.
+test("a claim key quoting a since-ended ID leaves sweeps, claims and ends working", () => {
+  const db = bus();
+  createBoard(db, "be", "work", "work items");
+  const key = `review @${OTHER} output`;
+  expect(claim(db, ID, key, { board: "work", addresses: [ID], session: ID }).ok).toBe(true);
+  end(db, OTHER, Date.now());
+  db.prepare(`UPDATE claims SET expires_at = ?`).run(Date.now() - 1);
+
+  expect(() => sweepExpired(db)).not.toThrow();
+  expect(claim(db, "be", "unrelated", {}).ok).toBe(true);
+  expect(claim(db, ID, key, { board: "work", addresses: [ID], session: ID }).ok).toBe(true);
+  end(db, ID, Date.now());
+  expect(db.prepare(`SELECT key FROM claims WHERE holder = ?`).all(ID)).toEqual([]);
+  expect(post(db, "be", "work", `ping @${OTHER}`).unresolved).toEqual([OTHER]);
+  expect(() => post(db, "be", "work", `ping @${OTHER}`, null, { strictIds: true })).toThrow(`id_ended: ${OTHER}`);
+});
+
+// Audit S2 (#329): a release whose announcement fails still frees the claim,
+// and the end's audit names it.
+test("a claim whose release post fails is freed and recorded in id.ended", () => {
+  const db = bus();
+  createBoard(db, "be", "work", "work items");
+  claim(db, ID, "ticket:ENG-4", { board: "work", ttl_minutes: 60 });
+  watch(db, "qa", "ticket:ENG-4");
+  setAccess(db, { ...openAccess(db), resolveMention: () => { throw new CoreError("mention refused"); } });
+
+  end(db, ID, Date.now());
+  expect(db.prepare(`SELECT key FROM claims`).all()).toEqual([]);
+  expect(db.prepare(`SELECT key FROM claim_watches`).all()).toEqual([]);
+  expect(db.prepare(`SELECT event, note FROM claim_events WHERE key = 'ticket:ENG-4' AND event = 'release'`).all()).toEqual([
+    { event: "release", note: "session ended; announce failed: mention refused" },
+  ]);
+  const detail = JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail);
+  expect(detail.release_failed).toEqual([{ key: "ticket:ENG-4", error: "mention refused" }]);
 });

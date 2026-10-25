@@ -377,7 +377,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
+        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits }, strictIds: true },
       );
       const result: BoardPostResult = {
         post_id: p.id,

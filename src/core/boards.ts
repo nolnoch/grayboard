@@ -7,7 +7,7 @@ import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope } from "./addresses.ts";
 import { writeCoreAudit } from "./audit.ts";
 import { SESSION_ID_PATTERN } from "./session_id.ts";
-import { assertDeliverableId } from "./session_end.ts";
+import { undeliverableId } from "./session_end.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -80,7 +80,9 @@ export type Access = {
   // Returns an error message, or null if allowed.
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
-  resolveMention(token: string, author: string, board: Board): string | null;
+  // `strict`: a token that names a session that can't receive refuses the
+  // post instead of going unresolved.
+  resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
   // The board only a human handle can start posts on, or null for none.
@@ -94,12 +96,15 @@ export const openAccess = (db: Database): Access => ({
   announceBoard: ANNOUNCE_BOARD,
   canSee: () => true,
   checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
-  // An @id: is the session itself; one that can't receive refuses the post,
-  // as a direct message to it would (#284 S7, S9).
-  resolveMention: (token) => {
+  // An @id: is the session itself; one that can't receive refuses an
+  // author's post, as a direct message to it would (#284 S7, S9). A system
+  // post (a claim event quoting its key) leaves it unresolved: a key that
+  // names a since-ended ID must not refuse every later sweep and end.
+  resolveMention: (token, _author, _board, strict) => {
     if (addressParts(token)?.kind === "id") {
-      assertDeliverableId(db, token);
-      return token;
+      const why = undeliverableId(db, token);
+      if (why && strict) throw new CoreError(why);
+      return why ? null : token;
     }
     if (!BOARD_NAME_RE.test(token)) return null;
     const row = db.prepare(`SELECT address FROM aliases WHERE address = ?`).get(token) as
@@ -476,12 +481,13 @@ function resolveMentions(
   body: string,
   author: string,
   board: Board,
+  strict: boolean,
 ): { handles: string[]; unresolved: string[] } {
   const a = access(db);
   const handles = new Set<string>();
   const unresolved: string[] = [];
   for (const t of mentionTokens(body)) {
-    const h = a.resolveMention(t, author, board);
+    const h = a.resolveMention(t, author, board, strict);
     if (h && a.canSee(h, board)) handles.add(h);
     else unresolved.push(t);
   }
@@ -521,6 +527,9 @@ export type PostOpts = {
   author_id?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; limits?: AttachmentLimits };
+  // An author's own words: an @id: that can't receive refuses the post.
+  // Unset (system posts), it goes unresolved.
+  strictIds?: boolean;
 };
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
@@ -680,7 +689,7 @@ export function post(
     const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       if (mentioned.length === 0) {
@@ -725,7 +734,7 @@ export function post(
         const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
         for (const m of muted) targets.delete(m.handle);
       }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }

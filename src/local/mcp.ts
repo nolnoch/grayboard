@@ -358,15 +358,28 @@ const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 
 const gate = new BindGate();
 const late = new LateCancels();
+// Set when shutdown starts: no call or drain starts after it, and shutdown
+// waits (bounded) for those in flight before it ends the session, so nothing
+// writes rows for an ended ID. `sessionEnded` guards a write that outlived the wait.
+let shuttingDown = false;
+let sessionEnded = false;
+const calls = new Set<Promise<unknown>>();
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
+  if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
   const run = async () => {
     if (bound) touchAlias(db, bound);
     touchId(db, SESSION_ID);
     return call(name, args, signal);
   };
-  const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
-    await (name === "bind" ? gate.bind(run) : gate.call(run));
+  const pending = name === "bind" ? gate.bind(run) : gate.call(run);
+  calls.add(pending);
+  let r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown };
+  try {
+    r = await pending;
+  } finally {
+    calls.delete(pending);
+  }
   expiry.arm();
   // A cancelled call's result is dropped: its notices wait for the next one.
   if (signal.aborted) return r;
@@ -645,7 +658,7 @@ mcp.oninitialized = () => markInitialized();
 
 // A wakeup during a drain joins it: the loop re-queries until empty.
 function drainToClaude(): Promise<void> {
-  if (swapping) return Promise.resolve();
+  if (swapping || shuttingDown) return Promise.resolve();
   inflight ??= drainLoop().finally(() => {
     inflight = null;
   });
@@ -658,7 +671,7 @@ async function drainLoop(): Promise<void> {
   await initialized;
   // Read once: a cursor written under one name must never get another's ids.
   const readers = bound ? addressesOf(bound) : [SESSION_ID];
-  while (true) {
+  while (!shuttingDown) {
     const first = firstDrain;
     firstDrain = false;
     let any = false;
@@ -669,18 +682,22 @@ async function drainLoop(): Promise<void> {
       if (batch.length === 0 && boardItems.length === 0) continue;
       any = true;
       for (const msg of batch) {
+        if (shuttingDown) return;
         const params = dmNotification(msg);
         if (isHuman(db, msg.sender)) params.meta.human = "true";
         await mcp.notification({ method: "notifications/claude/channel", params });
+        if (sessionEnded) return;
         setCursor(reader, msg.id);
       }
       for (const item of boardItems) {
+        if (shuttingDown) return;
         const params = boardNotification(item);
         if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
         await mcp.notification({
           method: "notifications/claude/channel",
           params,
         });
+        if (sessionEnded) return;
         markDelivered(db, reader, item);
       }
     }
@@ -689,6 +706,7 @@ async function drainLoop(): Promise<void> {
 }
 
 const onWake = () => {
+  if (shuttingDown) return;
   // A wakeup may follow another session's claim_take.
   expiry.arm();
   drainToClaude().catch((err) => {
@@ -766,34 +784,36 @@ await mcp.connect(transport);
 late.watch(transport);
 // Prunes the bus at most once a day across the sessions that share it.
 startLocalRetention(db, blobs, RETENTION_DAYS);
-// What this process's open ended (db.ts): bounces and releases to wake.
-await deliverEnded(openEnded);
 
-// How long exit waits for the end's wakeups: they're conveniences (mail and
-// posts are durable, and each recipient's next wake drains them), so a
-// stuck socket mustn't hold the exit.
+// How long exit waits for in-flight calls and the drain, and then for the
+// end's wakeups: they're conveniences (mail and posts are durable, and each
+// recipient's next wake drains them), so a stuck socket mustn't hold the exit.
 const SHUTDOWN_WAKE_MS = 2000;
-let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
     if (bound) touchAlias(db, bound);
-  } catch {
+  } catch (err) {
     // The bus may already be closed at shutdown; exiting matters more.
+    console.error("grayboard shutdown: touching the alias failed:", err);
   }
   // The sockets go first, while the row still holds the name, so nobody
   // takes the name with this socket still in place.
   stopListening();
   stopIdListening();
+  await Promise.race([Promise.allSettled([...calls, inflight]), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   let ended: Ended = NOTHING_ENDED;
   try {
     // A keyed session outlives this process while its harness runs.
     if (PUSH && HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);
     else ended = endLocalSession(db, SESSION_ID);
-  } catch {
-    // Same: shutdown must not throw.
+  } catch (err) {
+    // Same: shutdown must not throw, but a session left unended is the
+    // next opener's reap, so say why.
+    console.error(`grayboard shutdown: ending ${SESSION_ID} failed:`, err);
   }
+  sessionEnded = true;
   if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   await Promise.race([deliverEnded(ended).catch(() => {}), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   process.exit(0);
@@ -804,6 +824,9 @@ process.on("SIGTERM", () => void shutdown());
 // orphan alive that holds the identity and blocks the next session.
 process.stdin.on("end", () => void shutdown());
 process.stdin.on("close", () => void shutdown());
+// What this process's open ended (db.ts): bounces and releases to wake. After
+// the exit handlers, so a client gone during it still ends this session.
+await deliverEnded(openEnded);
 
 if (DELIVER) {
   stopIdListening = listenForWakeup(SESSION_ID, onWake);

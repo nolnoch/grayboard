@@ -202,15 +202,21 @@ test("race: a send that commits before the end's transaction is bounced to its s
 }, 30_000);
 
 test("race: a send that reaches the write lock after the end is refused with id_ended", async () => {
-  const be = await session("be");
+  const be = await localSession(dir, "be", { extra: pauseEnv("send:before-txn") });
   const s = await session();
   const id = await sessionId(s);
   await sigkill(pidOfId(id));
 
-  // The opener holds the write lock with the ID marked ended.
+  // The send has done everything before its own transaction while the ID
+  // was live; then the opener takes the write lock and marks it ended, and
+  // only then does the send go on. A check made outside the send's
+  // transaction would pass and store mail to an ended ID (audit P4: the send
+  // must provably start before the end commits, or the test proves nothing).
+  const send = refusal(be, "dm_send", { to: id, body: "too late" });
+  await until(() => be.stderr().includes("test pause hit: send:before-txn"));
   const opener = spawnCli(["claims"], pauseEnv("end:in-txn"));
   await until(() => opener.stderr().includes("test pause hit: end:in-txn"));
-  const send = refusal(be, "dm_send", { to: id, body: "too late" });
+  release("send:before-txn");
   release("end:in-txn");
   expect(await send).toContain(`id_ended: ${id} ended at`);
   expect(await opener.p.exited).toBe(0);

@@ -49,7 +49,7 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
   const others = liveAddresses(db).filter((h) => h !== human && !isViewer(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
-  const r = post(db, human, ANNOUNCE_BOARD, body, null, { online: (h) => live.has(h), ttl_ms });
+  const r = post(db, human, ANNOUNCE_BOARD, body, null, { online: (h) => live.has(h), ttl_ms, strictIds: true });
   await Promise.all(r.wake.map((h) => poke(h)));
   const reached = r.wake.filter((h) => !isViewer(h));
   console.log(
