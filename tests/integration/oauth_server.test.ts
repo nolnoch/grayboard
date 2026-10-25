@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
+import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -19,7 +20,7 @@ beforeEach(() => {
   app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [],
-    oauthClients: [{ clientId: "native", name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
+    oauthClients: [{ clientId: OPENCODE_CLIENT, name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
   }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async input => {
     exchanges++;
     expect(input.redirectUri).toBe(issuer + "/oauth/google/callback");
@@ -54,7 +55,7 @@ class Provider implements OAuthClientProvider {
   discovery?: OAuthDiscoveryState;
   stateValue = randomBytes(32).toString("base64url");
   state() { return this.stateValue; }
-  clientInformation() { return { client_id: "native", issuer }; }
+  clientInformation() { return { client_id: OPENCODE_CLIENT, issuer }; }
   tokens() { return this.saved; }
   saveTokens(tokens: StoredOAuthTokens) { this.saved = tokens; }
   redirectToAuthorization(url: URL) { this.authorization = url; }
@@ -87,7 +88,7 @@ test("AS metadata is mounted on the single production listener with canonical re
   for (const path of ["/.well-known/oauth-protected-resource/hosted/mcp", "/hosted/.well-known/oauth-protected-resource/hosted/mcp"]) {
     const res = await fetch(base + path);
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ resource, authorization_servers: [issuer], scopes_supported: ["grayboard:tools"] });
+    expect(await res.json()).toMatchObject({ resource, authorization_servers: [issuer], scopes_supported: ["grayboard:delivery", "grayboard:tools"] });
   }
   const metadata = await fetch(base + "/.well-known/oauth-authorization-server/hosted");
   expect(await metadata.json()).toMatchObject({ issuer, authorization_endpoint: issuer + "/oauth/authorize", token_endpoint: issuer + "/oauth/token" });
@@ -101,7 +102,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(provider.authorization!.searchParams.get("resource")).toBe(resource);
   expect(provider.authorization!.searchParams.get("code_challenge_method")).toBe("S256");
   expect(provider.authorization!.searchParams.get("state")).toBe(provider.stateValue);
-  expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:tools");
+  expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:delivery grayboard:tools");
   const browser = new Browser();
   const begin = await browser.request(provider.authorization!.href);
   expect(begin.status).toBe(303);
@@ -125,7 +126,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(provider.saved!.refresh_token).toBeTruthy();
   const client = new Client({ name: "production-oauth-fixture", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
-  await client.connect(new StreamableHTTPClientTransport(new URL(resource), { authProvider: provider, requestInit: { headers: { "X-Grayboard-Identity": "be" } }, fetch: fetchFn }));
+  await client.connect(new StreamableHTTPClientTransport(new URL(resource), {
+    authProvider: provider,
+    fetch: async (input, init) => fetchFn(await withSessionMeta(new Request(input, init), "oauth-root")),
+  }));
+  await bindFixture(client, "be");
   expect(client.getNegotiatedProtocolVersion()).toBe(version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("board_create");
   expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });

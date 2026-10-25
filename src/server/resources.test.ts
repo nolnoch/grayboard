@@ -7,7 +7,7 @@ import { openDatabase } from "./db.ts";
 import { boardResourceUri, createResources, parseBoardResourceUri } from "./resources.ts";
 import { isSubscribed, subscribe } from "../core/boards.ts";
 import { storeAttachment } from "../core/attachments.ts";
-import type { AuthedUser } from "./auth.ts";
+import { createTouchQueue, type AuthedUser } from "./auth.ts";
 import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
@@ -223,9 +223,10 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     messageRetentionDays: 90, auditRetentionDays: 90, admins: [], orgDomain: "example.com",
   };
   const uploads = new UploadGate(4 * store.repo.attachmentLimits.total, store.repo.attachmentLimits.total);
+  const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, uploads, application.wake, undefined, application.disconnectUser, application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, application.disconnectUser, application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {
@@ -286,7 +287,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
       expect(application.pending(session)).toEqual([]);
       expect(store.repo.cursors.directFor(session.identityFull)).toBe(0);
     }
-  } finally { server.stop(true); }
+  } finally { touches.cancelAll(); server.stop(true); }
 });
 
 test("timer expiry independently hints with no attention subscribers", async () => {

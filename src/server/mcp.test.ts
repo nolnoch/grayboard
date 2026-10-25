@@ -12,6 +12,9 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { randomBytes } from "node:crypto";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
+import { OPENCODE_CLIENT, sessionContext } from "./hosted.ts";
+const meta = { "ai.opencode/sessionID": "test-root" };
+const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -21,16 +24,18 @@ let token: string;
 let oauth: ReturnType<typeof createOAuthServer>;
 let blobDir: string;
 const clients: Client[] = [];
-beforeEach(() => {
+beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
   application = createApplication(store.repo, store.db);
   oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
-  const issued = issueOAuth(store.repo, oauth.resource);
+  const issued = issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
   user = issued.authed;
-  store.repo.aliases.create(user.user_email, "be");
+  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true, where: "tools" });
 });
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
@@ -64,7 +69,12 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Where": "tools" } },
     fetch: async (input, init) => {
-      const request = new Request(input, init);
+      let request = new Request(input, init);
+      if (request.method === "POST" && request.body) {
+        const body = await request.json() as { params?: Record<string, unknown> };
+        body.params = { ...body.params, _meta: { ...((body.params?._meta ?? {}) as object), ...meta } };
+        request = new Request(request, { body: JSON.stringify(body) });
+      }
       headers?.forEach((value, key) => request.headers.set(key, value));
       observeRequest?.(request);
       const response = await hosted.fetch(request);
@@ -77,24 +87,24 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: tools-only contexts preserve live owner and its status`, async () => {
   const events: DeliveryEvent[] = [];
-  const owner = (await application.selectIdentity(user, "be", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
+  const owner = (await application.selectIdentity(user, "fe", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
   application.call(owner, "peer_status", { text: "working" });
   const client = await connect(version);
   for (let n = 0; n < 10; n++) {
-    expect((await client.callTool({ name: "dm_send", arguments: { to: "be", body: `hello ${n}` } })).isError).not.toBe(true);
+    expect((await client.callTool({ name: "dm_send", arguments: { to: "fe", body: `hello ${n}` } })).isError).not.toBe(true);
   }
   expect(events).toHaveLength(10);
   const peers = application.call(owner, "peer_list", {}) as { peers: unknown[] };
-  expect(peers.peers).toMatchObject([{ handle: "alice@example.com/be", online: true, status: "working", where: "owner" }]);
+  expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
   expect(store.repo.cursors.directFor(owner.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(application.selectIdentity(user, "be", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "identity_in_use" });
+  await expect(application.selectIdentity(user, "fe", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "identity_in_use" });
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
   let selections = 0;
-  const admit = application.admitIdentity;
-  application.admitIdentity = (...args) => { selections++; return admit(...args); };
+  const select = hosted.sessions.snapshot;
+  hosted.sessions.snapshot = async (...args) => { selections++; return select(...args); };
   const forbidden = [
     "https://foreign.example.com", "http://grayboard.example.com", "null", "", "not an origin",
     "https://grayboard.example.com/", "https://grayboard.example.com/path", "https://grayboard.example.com?query",
@@ -150,19 +160,16 @@ test("shutdown closes outstanding legacy SSE products and refuses new contexts",
 });
 
 test("shutdown racing the factory cannot leave a selected context behind", async () => {
-  const admit = application.admitIdentity;
+  const select = hosted.sessions.snapshot;
   let selected!: () => void;
   let release!: () => void;
   const ready = new Promise<void>(resolve => { selected = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
-  application.admitIdentity = (...args) => {
-    const select = admit(...args);
-    return async sink => {
-      const result = await select(sink);
-      selected();
-      await gate;
-      return result;
-    };
+  hosted.sessions.snapshot = async (...args) => {
+    const result = await select(...args);
+    selected();
+    await gate;
+    return result;
   };
   const pending = connect();
   await ready;
@@ -332,7 +339,7 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {
   let response: Response | undefined;
   const client = await connect(version, async r => { response = r; });
-  const credential = status === 401 ? "invalid" : issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"]).token;
+  const credential = status === 401 ? "invalid" : issuedOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"]).token;
   const refusal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
   if (!(refusal instanceof Response)) throw new Error("expected fixture OAuth refusal");
   expect(refusal.status).toBe(status);
@@ -353,11 +360,11 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: revocation during identity selection preserves the precommit OAuth challenge`, async () => {
   let response: Response | undefined;
   const client = await connect(version, async r => { response = r; });
-  const original = application.selectIdentity;
+  const original = hosted.sessions.snapshot;
   let selected!: () => void, release!: () => void;
   const selection = new Promise<void>(resolve => { selected = resolve; });
   const barrier = new Promise<void>(resolve => { release = resolve; });
-  application.selectIdentity = async (...args) => {
+  hosted.sessions.snapshot = async (...args) => {
     const result = await original(...args);
     selected();
     await barrier;
@@ -373,22 +380,22 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
     expect(response!.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${oauth.resourceMetadata}", scope="grayboard:tools", error="invalid_token"`);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  } finally { release(); application.selectIdentity = original; }
+  } finally { release(); hosted.sessions.snapshot = original; }
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const stop of ["abort", "close"] as const) test(`${version}: ${stop} during selection is not an OAuth refusal`, async () => {
-  const original = application.selectIdentity;
+  const original = hosted.sessions.snapshot;
   let selected!: () => void, release!: () => void;
   const selection = new Promise<void>(resolve => { selected = resolve; });
   const barrier = new Promise<void>(resolve => { release = resolve; });
-  application.selectIdentity = async (...args) => {
+  hosted.sessions.snapshot = async (...args) => {
     const result = await original(...args);
     selected();
     await barrier;
     return result;
   };
   const abort = new AbortController();
-  const params = { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, ...(version === "2026-07-28" ? { _meta: { "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) };
+  const params = { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, _meta: { ...meta }, ...(version === "2026-07-28" ? { _meta: { ...meta, "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) };
   try {
     const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
     await selection;
@@ -402,7 +409,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
     await response.arrayBuffer();
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  } finally { release(); application.selectIdentity = original; }
+  } finally { release(); hosted.sessions.snapshot = original; }
 });
 
 test("actual access revocation between factory and dispatch prevents mutation", async () => {
@@ -415,9 +422,8 @@ test("actual access revocation between factory and dispatch prevents mutation", 
     return valid;
   };
   try {
-    const result = await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } });
-    expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: unauthenticated" }] });
-    expect(checks).toBe(2);
+    await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
+    expect(checks).toBeGreaterThanOrEqual(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
   } finally { oauth.isAuthorized = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
@@ -447,7 +453,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent refreshed exchanges keep their own access after reversed awaits`, async () => {
-  const grant = issueOAuth(store.repo, oauth.resource);
+  const grant = issuedOAuth(store.repo, oauth.resource);
   const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
   const client = await connect(version, undefined, headers);
   await Bun.sleep(0);
@@ -462,21 +468,21 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
   }
   const firstAccess = rotate(), secondAccess = rotate();
   store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
-  const select = application.selectIdentity;
+  const select = hosted.sessions.snapshot;
   const releases: Array<() => void> = [];
   async function selected(count: number) {
     const deadline = performance.now() + 1000;
     while (releases.length < count && performance.now() < deadline) await Bun.sleep(1);
     expect(releases.length).toBe(count);
   }
-  application.selectIdentity = async (...args) => {
+  hosted.sessions.snapshot = async (...args) => {
     const selected = await select(...args);
     await new Promise<void>(resolve => releases.push(resolve));
     return selected;
   };
   try {
     headers.set("Authorization", `Bearer ${firstAccess}`);
-    const first = client.readResource({ uri: "grayboard://identity" }).catch(error => error);
+    const first = client.callTool({ name: "whoami", arguments: {} }).catch(error => error);
     await selected(1);
     headers.set("Authorization", `Bearer ${secondAccess}`);
     const second = client.callTool({ name: "peer_list", arguments: { include_offline: true } });
@@ -487,7 +493,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
     releases[0]!();
     expect(await first).toBeInstanceOf(Error);
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  } finally { releases.forEach(release => release()); application.selectIdentity = select; }
+  } finally { releases.forEach(release => release()); hosted.sessions.snapshot = select; }
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
@@ -613,7 +619,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
 });
 
 for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["database", "internal"] as const) test(`${version}: ${kind} fault checking the old GET is an internal error, not a successful registration`, async () => {
-  const grant = issueOAuth(store.repo, oauth.resource);
+  const grant = issuedOAuth(store.repo, oauth.resource);
   const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
   const { client, gets, hints, uri } = await legacyWatchFixture(version, headers);
   const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();

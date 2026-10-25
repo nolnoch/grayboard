@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
+import { transactionProcess } from "../../tests/support/transaction-process.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type OAuthCode, type OAuthRequest, type OAuthTokenPair } from "./oauth-types.ts";
 
 const h = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -76,6 +77,29 @@ describe("OAuth domain store", () => {
     expect(first.repo.oauth.findActiveAccess(input.tokens.accessHash, binding.resource, binding.scopes, start)).toBeUndefined();
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(false);
   });
+  test("forced overlapping refresh transactions cannot mint two live successors", async () => {
+    const input = issue();
+    const replacements = [pair(start + 1), pair(start + 1)];
+    const release = join(dir, "release-refresh");
+    const run = (index: number) => transactionProcess("tests/support/oauth-rotate.ts", [join(dir, "db.sqlite"), join(dir, "blobs"), JSON.stringify({ ...binding, refreshHash: input.tokens.refreshHash, tokens: replacements[index] }), String(start + 1)], index === 0 ? "oauth:refresh:in-txn" : "", release);
+    const workers = [run(0), run(1)];
+    try {
+      await Promise.all(workers.map(w => w.wait("READY")));
+      workers[0]!.proc.stdin.end();
+      await workers[0]!.wait("test pause hit: oauth:refresh:in-txn");
+      workers[1]!.proc.stdin.end();
+      await workers[1]!.wait("ROTATING");
+      expect(first.repo.oauth.isGrantActive(input.grantId, start + 1)).toBe(true);
+      await Bun.write(release, "release");
+      await Promise.all(workers.map(async w => { expect(await w.proc.exited).toBe(0); await w.done; }));
+      expect(workers.map(w => JSON.parse(w.output().trim().split("\n").at(-1)!).status).sort()).toEqual(["ok", "replay"]);
+      expect(first.repo.oauth.isGrantActive(input.grantId, start + 1)).toBe(false);
+      for (const replacement of replacements) expect(first.repo.oauth.findActiveAccess(replacement.accessHash, binding.resource, binding.scopes, start + 1)).toBeUndefined();
+    } finally {
+      await Bun.write(release, "release");
+      for (const w of workers) { w.proc.kill(); await w.proc.exited; }
+    }
+  }, 15_000);
   test("code scope lookup is bound, durable, and retains spent replay recognition without exposing PKCE", () => {
     issueCode();
     const get = (time = start) => second.repo.oauth.findCodeScopes(code.codeHash, binding.clientId, binding.resource, binding.redirectUri, time);
@@ -396,7 +420,8 @@ describe("OAuth domain store", () => {
   });
   test("foreign writer contention fails closed in bounded time and retry succeeds after release", async () => {
     const input = issue();
-    expect(first.db.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 250 });
+    expect(first.db.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+    first.db.exec("PRAGMA busy_timeout = 250");
     const modulePath = new URL("./db.ts", import.meta.url).pathname;
     const script = `import { openDatabase } from ${JSON.stringify(modulePath)};
       const {db}=openDatabase(process.argv[1],{blobDir:process.argv[2]});

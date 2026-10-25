@@ -46,7 +46,7 @@ export function matchesRedirect(client: OAuthClient, raw: string): boolean {
   return client.redirectUris.some(registered => {
     if (registered === raw) return true;
     const expected = new URL(registered);
-    if (expected.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(expected.hostname)) return false;
+    if (expected.protocol !== "http:" || !["127.0.0.1", "[::1]", "localhost"].includes(expected.hostname)) return false;
     // RFC 8252's port exception does not permit hostname, path, or query aliases.
     return actual.protocol === expected.protocol && actual.hostname === expected.hostname &&
       actual.pathname === expected.pathname && actual.search === expected.search;

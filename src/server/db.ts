@@ -1,4 +1,6 @@
 import type { Database } from "bun:sqlite";
+import type { HostedStore, HostedSession, HostedEnd } from "./hosted-types.ts";
+import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -54,6 +56,7 @@ export interface Repo {
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
   oauth: OAuthStore;
+  hosted: HostedStore;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
     findByEmail(email: string): User | undefined;
@@ -210,6 +213,20 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
 
 function initSchema(db: Database): void {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS hosted_ownerships (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id),
+      client_id TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, end_reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS hosted_sessions (
+      session_id TEXT PRIMARY KEY, ownership_id INTEGER NOT NULL REFERENCES hosted_ownerships(id),
+      user_id INTEGER NOT NULL REFERENCES users(id), client_id TEXT NOT NULL, grant_id TEXT NOT NULL,
+      source_session_id TEXT NOT NULL, name TEXT, bind_gen INTEGER NOT NULL DEFAULT 0,
+      root_session_id TEXT, place TEXT, lease_deadline INTEGER, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_hosted_grant ON hosted_sessions(grant_id);
+    CREATE INDEX IF NOT EXISTS idx_hosted_ownership ON hosted_sessions(ownership_id);
+    CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;
     CREATE TABLE IF NOT EXISTS oauth_requests (
       hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, data TEXT NOT NULL
     );
@@ -430,12 +447,22 @@ export class PrincipalTaken extends Error {
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  const observers = new Set<() => void>();
+  const changed = () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } };
+  const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
+    const value = fn(...args);
+    changed();
+    return value;
+  };
+  const oauth = makeOAuthStore(db);
+  const hosted = makeHostedStore(db);
   return {
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
 
-    oauth: makeOAuthStore(db),
+    oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
+    hosted: { ...hosted, atomic: change(hosted.atomic), subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
       upsertByEmail(email, displayName) {
         const now = Date.now();
@@ -461,11 +488,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const now = Date.now();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
+            endHostedWhere(db, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
           }
         }).immediate();
+        changed();
       },
     },
 
@@ -492,9 +521,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         db.transaction(() => {
           const now = Date.now();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
+          endHostedWhere(db, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
+        changed();
       },
       touch(sessionId, now) {
         db.run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
@@ -908,7 +939,11 @@ function makeOAuthStore(db: Database): OAuthStore {
         [h, id, kind, expiry, now, kind === "access" ? JSON.stringify(p.scopes) : null]);
     }
   };
-  const revokeGrant = (id: string, now: number) => db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
+  const revokeGrant = (id: string, now: number) => {
+    testPause("hosted:revoke:in-txn");
+    db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
+    endHostedWhere(db, "revoked", now, row => row.grant_id === id);
+  };
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
   const browser = (h: string, now: number) => {
@@ -1025,6 +1060,7 @@ function makeOAuthStore(db: Database): OAuthStore {
     rotateRefresh(input, now) {
       if (!time(now) || !hash(input.refreshHash)) return invalid;
       return db.transaction(() => {
+        testPause("oauth:refresh:in-txn");
         const t = token(input.refreshHash);
         if (!t || t.kind !== "refresh") return missing;
         const g = grant(t.grant_id);
@@ -1090,4 +1126,57 @@ function makeOAuthStore(db: Database): OAuthStore {
       }).immediate();
     },
   };
+}
+
+function makeHostedStore(db: Database): HostedStore {
+  const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
+  const audit = (session: string, action: string, detail: Record<string, unknown>, now: number) => {
+    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, NULL, ?, ?, ?)", [now, action, session, JSON.stringify(detail)]);
+  };
+  const store: HostedStore = {
+    atomic: fn => db.transaction(fn).immediate(),
+    subscribe: () => () => {},
+    get,
+    all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions").all(),
+    start(session, user, client, now) {
+      const r = db.run("INSERT INTO hosted_ownerships(session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?)", [session, user, client, now]);
+      const id = Number(r.lastInsertRowid);
+      audit(session, "hosted.ownership_started", { ownership: id }, now);
+      return id;
+    },
+    insert(row) {
+      db.run("INSERT INTO hosted_sessions(session_id, ownership_id, user_id, client_id, grant_id, source_session_id, name, bind_gen, root_session_id, place, lease_deadline, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [row.session_id, row.ownership_id, row.user_id, row.client_id, row.grant_id, row.source_session_id, row.name, row.bind_gen, row.root_session_id, row.place, row.lease_deadline, row.created_at, row.last_seen_at]);
+    },
+    update(row) {
+      db.run("UPDATE hosted_sessions SET grant_id = ?, name = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",
+        [row.grant_id, row.name, row.bind_gen, row.root_session_id, row.ownership_id, row.place, row.lease_deadline, row.last_seen_at, row.session_id]);
+    },
+    childEnd(session, now) {
+      const row = get(session);
+      if (!row?.root_session_id) return;
+      db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
+      audit(row.root_session_id, "hosted.child_released", { child: session, reason: "closed" }, now);
+    },
+    end(session, reason, now, deadline) {
+      const row = get(session);
+      if (!row || row.root_session_id || (deadline !== undefined && row.lease_deadline !== deadline)) return false;
+      testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
+      const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id);
+      db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
+      if (row.name) {
+        const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(row.user_id)!;
+        db.run("INSERT INTO binding_events(session_id, name, event, at, detail) VALUES (?, ?, 'released', ?, ?)", [session, `${user.email}/${row.name}`, now, reason]);
+      }
+      for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+      if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
+      return true;
+    },
+  };
+  return store;
+}
+
+function endHostedWhere(db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
+  const hosted = makeHostedStore(db);
+  for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) hosted.end(row.session_id, reason, now);
 }

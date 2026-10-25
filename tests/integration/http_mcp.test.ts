@@ -10,6 +10,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { WsClient } from "../support/ws_client.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -33,7 +34,7 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 async function login(email = "alice@example.com", scopes = ["grayboard:tools"]) {
-  return issueOAuth(app.repo, app.oauth.resource, email, scopes).token;
+  return issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT).token;
 }
 async function legacyLogin(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
@@ -44,7 +45,7 @@ async function legacyLogin(email = "alice@example.com") {
   }
   return token;
 }
-async function connect(token: string, identity = "be", version = "2026-07-28", origin?: string) {
+async function connect(token: string, identity = "be", version = "2026-07-28", origin?: string, bind = true) {
   const client = new Client({ name: "http-test", version: "1" }, {
     supportedProtocolVersions: [version],
     versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
@@ -52,7 +53,9 @@ async function connect(token: string, identity = "be", version = "2026-07-28", o
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, ...(origin === undefined ? {} : { Origin: origin }) } },
+    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), identity)),
   }));
+  if (bind) await bindFixture(client, identity);
   return client;
 }
 function value(result: Awaited<ReturnType<Client["callTool"]>>) {
@@ -95,7 +98,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation u
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning WS hello`, async () => {
   const token = await login();
-  const client = await connect(token, "be", version);
+  const legacy = await legacyLogin();
+  const client = await connect(token, "be", version, undefined, false);
   const target = "alice@example.com/human";
   const at = new Date().toISOString();
   writeAudit(app.repo, "bridge.stopped", null, target, { reason: "fixture fatal", at });
@@ -107,10 +111,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP r
   expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
   expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
-  await connect(token, "be", version);
+  await connect(token, "be", version, undefined, false);
   expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
 
-  const owner = new WsClient(base, token, "be");
+  const owner = new WsClient(base, legacy, "be");
   wsClients.push(owner);
   const hello = await owner.connect();
   expect(hello.type).toBe("hello_ok");
@@ -118,7 +122,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP r
   const notified = app.repo.audit.last("bridge.notified", target);
   expect(notified).toBeDefined();
 
-  const next = new WsClient(base, token, "allowed");
+  const next = new WsClient(base, legacy, "allowed");
   wsClients.push(next);
   const again = await next.connect();
   expect(again.type).toBe("hello_ok");
@@ -168,17 +172,24 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
 });
 
-test("all HTTP methods require a valid token and explicit own agent name", async () => {
+test("all HTTP methods authenticate; identity headers never bind an uncontextualized client", async () => {
   const token = await login();
   for (const method of ["POST", "GET", "DELETE", "OPTIONS", "PUT"]) {
     for (const auth of [undefined, "Bearer wrong"]) {
       const res = await fetch(`${base}/mcp`, { method, headers: auth ? { Authorization: auth } : {} });
       expect(res.status).toBe(401);
     }
-    for (const identity of [undefined, "human", "HUMAN", "alice@example.com/be", "bad/name"]) {
-      const res = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, ...(identity ? { "X-Grayboard-Identity": identity } : {}) } });
-      expect(res.status).toBe(400);
-    }
+  }
+  for (const identity of [undefined, "human", "HUMAN", "alice@example.com/be", "bad/name"]) {
+    const client = new Client({ name: "unbound-test", version: "1" });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${token}`, ...(identity ? { "X-Grayboard-Identity": identity } : {}) } },
+    }));
+    expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
+    expect(value(await client.callTool({ name: "whoami", arguments: {} })).name).toBeNull();
+    expect((await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "no context" } })).isError).toBe(true);
+    expect((await client.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).toBe(true);
   }
   expect(app.repo.aliases.find("alice@example.com", "human")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -282,7 +293,7 @@ test("combined shared native grant remains non-owning with read-only resources",
 
 test("live access, family, disable and admin revocation never reuse a cached principal", async () => {
   for (const action of ["access", "family", "disable", "admin"] as const) {
-    const issued = issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`);
+    const issued = issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
     const client = await connect(issued.token);
     switch (action) {
       case "access": app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now()); break;

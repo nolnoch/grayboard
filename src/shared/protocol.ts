@@ -151,7 +151,14 @@ export type ErrorCode =
   // a read-only connection asked for something that needs a name
   | "unbound"
   // hello refused: the session key's ID is another principal's session (#284)
-  | "id_collision";
+  | "id_collision"
+
+  | "child_session"
+  | "invalid_registration"
+  | "root_is_child"
+  | "child_bound"
+  | "child_registered_elsewhere"
+  | "has_children";
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");

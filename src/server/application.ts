@@ -29,7 +29,14 @@ export type ApplicationCode =
   | "identity_unknown"
   | "unbound"
   | "rate_limited"
-  | "id_collision";
+  | "id_collision"
+
+  | "child_session"
+  | "invalid_registration"
+  | "root_is_child"
+  | "child_bound"
+  | "child_registered_elsewhere"
+  | "has_children";
 
 export class ApplicationError extends Error {
   constructor(readonly code: ApplicationCode, message: string, readonly extra: { known?: string[]; holder?: string; retry_after_ms?: number } = {}) {
@@ -477,6 +484,62 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         return select(authed, name, sink, m, false, true);
       };
     },
+    repo,
+    hostedHolder(full: string) { return hub.holders.get(full); },
+    hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
+    hostedSession(authed: AuthedUser, id: string, name: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
+      const session = new ApplicationSession(authed, sink, false, push);
+      session.sessionId = id;
+      session.place = place;
+      session.readOnly = name === null;
+      session.identityName = name ?? `~${id}`;
+      session.identityFull = `${authed.user_email}/${session.identityName}`;
+      session.identityId = name ? repo.identities.findByUserAndName(authed.user_id, name)?.id ?? 0 : 0;
+      hub.sessions.add(session);
+      if (hold && name) hub.holders.set(session.identityFull, session);
+      if (push && name) hub.registry.set(session.identityFull, session);
+      const info: IdentityInfo = {
+        identity_full: session.identityFull, user_email: authed.user_email,
+        teams: repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name)),
+        human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+        attachment_limits: repo.attachmentLimits,
+        ...(name === null ? { candidates: candidates(hub, authed) } : {}),
+      };
+      return { session, info };
+    },
+    hostedBind(authed: AuthedUser, id: string, name: string, previous: string | null, place: string | null, create: boolean) {
+      const full = `${authed.user_email}/${name}`;
+      let identity = repo.identities.findByUserAndName(authed.user_id, name);
+      if (!identity && !create) {
+        const known = closestNames(name, repo.identities.listForUser(authed.user_id).map(i => i.name).filter(n => n !== HUMAN_NAME));
+        const message = unknownNameError(name, known);
+        logBinding(db, id, full, "refused", message);
+        throw new ApplicationError("identity_unknown", message, { known });
+      }
+      if (!identity) {
+        identity = repo.identities.create(authed.user_id, name);
+        writeAudit(repo, "identity.created", authed.user_email, name);
+        onIdentityCreated(db, repo, authed.user_id, full);
+      }
+      let moved: string[] = [];
+      let notMoved: string | undefined;
+      if (previous) {
+        const from = `${authed.user_email}/${previous}`;
+        if (lastBoundBy(db, from, id)) moved = moveClaims(db, from, full).map(c => c.key);
+        else notMoved = `claims not moved: this session doesn't hold "${previous}"`;
+        logBinding(db, id, from, "released", `rebound to ${full}`);
+        logBinding(db, id, full, "moved", [from, notMoved].filter(Boolean).join("; "));
+      } else logBinding(db, id, full, "bound");
+      if (previous === null) startSession(db, full, null);
+      else {
+        touchHandle(db, full);
+        db.prepare("UPDATE handles SET (status, status_at, queue_off) = (SELECT status, status_at, queue_off FROM handles WHERE name = ?) WHERE name = ?")
+          .run(`${authed.user_email}/${previous}`, full);
+      }
+      setPlace(db, full, place);
+      return { moved, notMoved };
+    },
+    hostedRefused(id: string, full: string, detail: string) { logBinding(db, id, full, "refused", detail); },
     selectIdentity: (authed: AuthedUser, name: string | undefined, sink: DeliverySink, options: IdentityOptions = {}) => select(authed, name, sink, options, false),
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman: (authed: AuthedUser, sink: DeliverySink) => select(authed, HUMAN_NAME, sink, {}, true),
@@ -527,11 +590,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
     },
     boardCatalog(session: ApplicationSession, after?: string) {
-      valid(session);
+      valid(session, true);
       return boardCatalog(db, session.identityFull, after);
     },
     boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
-      valid(session);
+      valid(session, true);
       return snapshot(db, session.identityFull, board, options);
     },
     observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {

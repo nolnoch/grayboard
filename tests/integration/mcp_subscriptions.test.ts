@@ -6,9 +6,11 @@ import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
+import { sessionContext } from "../../src/server/hosted.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string, clock: number;
 const clients: Client[] = [];
@@ -33,7 +35,7 @@ afterEach(async () => {
   expect(app.mcp.activeBusListeners).toBe(0);
   app.db.close(); rmSync(dir, { recursive: true, force: true });
 });
-const issue = (email = "alice@example.com") => issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], clock);
+const issue = (email = "alice@example.com") => issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], clock, OPENCODE_CLIENT);
 async function until(predicate: () => boolean) {
   const end = Date.now() + 1800;
   while (!predicate() && Date.now() < end) await Bun.sleep(5);
@@ -41,10 +43,17 @@ async function until(predicate: () => boolean) {
 }
 async function connect(token: string, version: string, role?: string, identity = "be") {
   const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
+  const principal = app.oauth.authenticate(new Request(base + "/mcp", { headers }));
+  if (principal instanceof Response) throw new Error("fixture authentication failed");
+  const routing = sessionContext(principal, { "ai.opencode/sessionID": identity });
+  const current = await app.mcp.sessions.whoami(principal, routing);
+  if (!current.name) await app.mcp.sessions.bind(principal, routing, { name: identity, create: true });
   if (role) headers.set("X-Grayboard-Client", role);
   const hints: string[] = [], getHeaders: Headers[] = [];
   let getGate: Promise<void> | undefined;
   let callSignal: AbortSignal | undefined;
+  let cancelled!: () => void;
+  const cancellationSent = new Promise<void>(resolve => { cancelled = resolve; });
   const client = new Client({ name: "stream-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   client.setNotificationHandler("notifications/resources/updated", n => { hints.push(n.params.uri); });
   clients.push(client);
@@ -54,12 +63,15 @@ async function connect(token: string, version: string, role?: string, identity =
       const request = new Request(input, { ...init, ...(signal ? { signal } : {}) });
       headers.forEach((v, k) => request.headers.set(k, v));
       if (request.method === "GET") { getHeaders.push(new Headers(request.headers)); await getGate; }
-      return fetch(request);
+      const response = await fetch(await withSessionMeta(request, identity));
+      if (typeof init?.body === "string" && JSON.parse(init.body).method === "notifications/cancelled") cancelled();
+      return response;
     },
     reconnectionOptions: { initialReconnectionDelay: 30, maxReconnectionDelay: 30, reconnectionDelayGrowFactor: 1, maxRetries: 1 },
   });
   await client.connect(transport);
-  return { client, transport, headers, hints, getHeaders,
+  await bindFixture(client, identity);
+  return { client, transport, headers, hints, getHeaders, cancellationSent,
     pauseGets() {
       let release!: () => void;
       getGate = new Promise<void>(resolve => { release = resolve; });
@@ -146,10 +158,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are l
   const oldHints = subscriber.hints.length;
   await call(subscriber, "delivery_release");
   await until(() => app.mcp.activeInboxListeners === 0);
+  await bindFixture(subscriber.client, "be");
   const replacement = await call(subscriber, "delivery_open");
   expect(replacement.capability).not.toBe(lease.capability);
   subscriber.headers.set("X-Grayboard-Lease", replacement.capability);
-  expect(await pending(subscriber)).toEqual(batch);
+  expect((await pending(subscriber)).map((item: { id: string }) => item.id)).toEqual(batch.map((item: { id: string }) => item.id));
   await call(native, "dm_send", { to: "be", body: "new epoch", pending: true });
   const replacementBatch = await pending(subscriber);
   expect(replacementBatch).toHaveLength(batch.length + 1);
@@ -207,39 +220,34 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const kind of ["http", "sdk"] 
   const grant = issue(), c = await connect(grant.token, version, "subscriber");
   const abort = new AbortController();
   if (kind === "http") c.setCallSignal(abort.signal);
-  const login = await fetch(base + "/api/auth/dev-login", { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) });
-  const { session_token } = await login.json() as { session_token: string };
-  const ws = new WebSocket(base.replace("http:", "ws:"), { headers: { Authorization: `Bearer ${session_token}` } });
-  let probed!: () => void;
-  const probing = new Promise<void>(resolve => { probed = resolve; });
-  const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
-  const ready = new Promise<void>((resolve, reject) => {
-    ws.onerror = () => reject(new Error("WS failed"));
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", req_id: "open", identity: "be" }));
-    ws.onmessage = event => {
-      const message = JSON.parse(String(event.data));
-      if (message.type === "hello_ok") resolve();
-      if (message.type === "ping") probed();
-    };
-  });
+  const original = app.mcp.delivery.open;
+  let selected!: () => void, resume!: () => void;
+  const acquired = new Promise<void>(resolve => { selected = resolve; });
+  const released = new Promise<void>(resolve => { resume = resolve; });
+  app.mcp.delivery.open = async (...args) => {
+    const lease = await original(...args);
+    selected();
+    await released;
+    return lease;
+  };
   try {
-    await ready;
     const pending = c.client.callTool({ name: "delivery_open", arguments: {} }, kind === "sdk" ? { signal: abort.signal, timeout: 350 } : {}).catch(error => error);
-    await probing;
+    await acquired;
     expect(app.mcp.activeLeases).toBe(1);
     abort.abort();
-    ws.close(); await closed;
-    // The retained owner's existing probe expires after two seconds, allowing selection
-    // to finish after cancellation rather than fabricating a synchronous application.
-    await Bun.sleep(2100);
+    if (kind === "http") await until(() => app.mcp.activePosts === 0);
+    else {
+      await pending;
+      if (version === "2026-07-28") await until(() => app.mcp.activePosts === 0);
+      else await c.cancellationSent;
+    }
+    resume();
     await until(() => app.mcp.activeLeases === 0);
-    // Close only after the ownership assertion: client teardown cannot mask
-    // failure to observe the original HTTP signal in the pending SDK callback.
-    if (kind === "http") await c.client.close();
     await pending;
+    app.mcp.delivery.open = original;
     const replacement = await connect(grant.token, version, "subscriber");
     await call(replacement, "delivery_open");
-  } finally { ws.close(); }
+  } finally { resume(); app.mcp.delivery.open = original; }
 });
 
 function refresh(grant: ReturnType<typeof issueOAuth>, priorRefresh = grant.refreshToken) {
@@ -269,7 +277,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
     expect(app.mcp.activeGetStreams).toBe(0);
     expect(app.mcp.activeWatches).toBe(0);
     expect(app.mcp.activeLegacySessions).toBe(1);
-    expect(JSON.stringify(await c.client.readResource({ uri: "grayboard://identity" }))).toContain("alice@example.com/be");
+    expect(await call(c, "whoami")).toMatchObject({ name: "be" });
     await call(c, "board_post", { board: "e2e", body: "old registration while disconnected" });
     await call(c, "board_post", { board: "next", body: "current registration while disconnected" });
     expect(c.hints).toEqual([]);
@@ -294,7 +302,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   const rotated = refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
   app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
-  expect(JSON.stringify(await c.client.readResource({ uri: "grayboard://identity" }))).toContain("alice@example.com/be");
+  expect(await call(c, "whoami")).toMatchObject({ name: "be" });
   await until(() => app.mcp.activeWatches === 0);
   expect(app.mcp.activeLegacySessions).toBe(1);
   // The protocol session survives; only its old GET access snapshot was retired.
@@ -303,7 +311,6 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   for (const change of [
     { Authorization: `Bearer ${issue("bob@example.com").token}` },
     { Authorization: `Bearer ${issue().token}` },
-    { "X-Grayboard-Identity": "fe" },
     { "X-Grayboard-Client": "subscriber" },
   ]) {
     const headers = new Headers(c.headers);

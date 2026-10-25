@@ -5,12 +5,14 @@ import type { Repo } from "./db.ts";
 import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
+import { createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
 
 export type OAuthPrincipal = {
   authed: AuthedUser; grantId: string; clientId: string; scopes: string[]; accessHash: string; accessExpiry: number;
 };
 export type OAuthOptions = {
   now?: () => number;
+  cimd?: CimdOptions;
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
   exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<{ email: string; displayName: string | null }>;
 };
@@ -92,6 +94,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const resourceMetadata = base.origin + metadataPath;
   const clients = new Map(parseOAuthClients(JSON.stringify(config.oauthClients ?? [])).map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
+  const cimd = createCimdResolver({ ...options.cimd, now });
+  const resolveClient = async (id: string) => clients.get(id) ?? await cimd.resolve(id);
   const secure = base.protocol === "https:";
   const cookiePrefix = secure ? "__Secure-gb_oauth_" : "gb_oauth_";
   const cookiePath = prefix + "/oauth";
@@ -110,7 +114,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     }
     return { binding: found.get(cookiePrefix + "binding"), session: found.get(cookiePrefix + "session") };
   };
-  type Flow = { state: string; csrf: string; expiresAt: number; upstream?: { stateHash: string; verifier: string; nonce: string } };
+  type Flow = { client: OAuthClient; state: string; csrf: string; expiresAt: number; upstream?: { stateHash: string; verifier: string; nonce: string } };
   const flows = new Map<string, Flow>();
   const upstream = new Map<string, string>();
   const attempts = new Map<string, { start: number; n: number }>();
@@ -153,7 +157,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!r) fail();
     return { h, f: f!, r: r!, c };
   };
-  const clientAuth = (req: Request, p: URLSearchParams): OAuthClient => {
+  const clientAuth = async (req: Request, p: URLSearchParams): Promise<OAuthClient> => {
     if (p.has("client_secret")) fail("invalid_client", 401);
     const auth = req.headers.get("authorization");
     if (auth && auth.length > 8192) fail("invalid_client", 401);
@@ -169,7 +173,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         password = decodeURIComponent(decoded.slice(colon + 1).replace(/\+/g, " "));
       } catch { return fail("invalid_client", 401); }
     } else id = p.get("client_id") ?? "";
-    const c = clients.get(id!);
+    const c = await resolveClient(id!);
+    if (closed) fail("temporarily_unavailable", 503);
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
       if (auth !== null) fail("invalid_client", 401);
@@ -192,8 +197,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const bound = repo.oauth.bindRequestSession(r.requestHash, r.browserHash, sessionHash!, now());
     if (bound.status !== "ok") fail();
     const user = repo.users.findById(b!.userId)!;
-    const client = clients.get(r.clientId)!;
     const f = flows.get(r.requestHash)!;
+    const client = f.client;
     return html(`<h1>Authorize ${escapeHTML(client.name)}</h1><p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`);
   };
   const exchange = options.exchangeGoogle ?? (async (input: { code: string; verifier: string; redirectUri: string; nonce: string }) =>
@@ -205,20 +210,22 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const path = prefix && u.pathname.startsWith(prefix + "/") ? u.pathname.slice(prefix.length) : u.pathname;
     const prm = [metadataPath, "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"];
     const as = "/.well-known/oauth-authorization-server" + prefix;
-    if (req.method === "GET" && (prm.includes(u.pathname) || prm.includes(path))) return json({ resource, authorization_servers: [issuer], scopes_supported: ["grayboard:tools"], bearer_methods_supported: ["header"] });
+    if (req.method === "GET" && (prm.includes(u.pathname) || prm.includes(path))) return json({ resource, authorization_servers: [issuer], scopes_supported: OAUTH_SCOPES, bearer_methods_supported: ["header"] });
     if (req.method === "GET" && (u.pathname === as || (prefix && path === as))) return json({ issuer,
       authorization_endpoint: endpoint("/oauth/authorize"), token_endpoint: endpoint("/oauth/token"), revocation_endpoint: endpoint("/oauth/revoke"),
       response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], scopes_supported: OAUTH_SCOPES,
       code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
-      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], authorization_response_iss_parameter_supported: true });
+      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true });
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
     rate(context);
     if (u.search.length > 8192) fail();
     if (["access_token", "client_secret"].some(k => u.searchParams.getAll(k).some(v => v !== ""))) fail();
     if (path === "/oauth/authorize" && req.method === "GET") {
-      const p = recognized(withoutEmpty(parameters(u.search.slice(1))), ["response_type", "client_id", "redirect_uri", "scope", "resource", "state", "code_challenge", "code_challenge_method"]);
-      const client = clients.get(required(p, "client_id"));
+      const raw = parameters(u.search.slice(1));
+      const p = recognized(withoutEmpty(raw), ["response_type", "client_id", "redirect_uri", "scope", "resource", "state", "code_challenge", "code_challenge_method"]);
+      const client = await resolveClient(required(p, "client_id"));
+      if (closed) fail("temporarily_unavailable", 503);
       const redirectUri = required(p, "redirect_uri");
       if (!client || !matchesRedirect(client, redirectUri)) fail();
       const state = required(p, "state");
@@ -226,7 +233,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       let codeChallenge: string, selected: string[];
       try {
         if (required(p, "response_type") !== "code") fail("unsupported_response_type");
-        if (required(p, "resource") !== resource) fail("invalid_target");
+        if (raw.has("resource") && !raw.get("resource")) fail();
+        if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_target");
         if (required(p, "code_challenge_method") !== "S256") fail();
         codeChallenge = required(p, "code_challenge");
         if (!secret(codeChallenge) || Buffer.from(codeChallenge, "base64url").toString("base64url") !== codeChallenge) fail();
@@ -245,7 +253,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         requestHash: hashToken(id), browserHash: hashToken(binding), csrfHash: hashToken(csrf), stateHash: hashToken(state),
         consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t);
       if (request.status !== "ok") fail("temporarily_unavailable", 429);
-      const f: Flow = { state, csrf, expiresAt: t + OAUTH_TTL.request };
+      const f: Flow = { client, state, csrf, expiresAt: t + OAUTH_TTL.request };
       flows.set(hashToken(id), f);
       let response: Response;
       if (c.session && repo.oauth.findBrowserSession(hashToken(c.session), t)) {
@@ -318,9 +326,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const body = await form(req);
       const securityFields = ["grant_type", "client_id", "client_secret", "access_token", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token", "token", "token_type_hint"];
       if ([...query].some(([k, v]) => v !== "" && securityFields.includes(k)) || [...query.keys()].some(k => body.has(k))) fail();
+      if (body.has("resource") && !body.get("resource")) fail("invalid_grant");
       const submitted = withoutEmpty(body);
       if (submitted.has("access_token")) fail();
-      const client = clientAuth(req, submitted);
+      const client = await clientAuth(req, submitted);
       if (path === "/oauth/revoke") {
         const p = recognized(submitted, ["token", "token_type_hint"]);
         repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
@@ -331,7 +340,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (!["authorization_code", "refresh_token"].includes(grantType)) fail("unsupported_grant_type");
       const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"] : ["grant_type", "client_id", "refresh_token", "resource", "scope"];
       if ([...p].some(([k, v]) => v !== "" && !allowed.includes(k))) fail();
-      if (required(p, "resource") !== resource) fail("invalid_grant");
+      if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
       const t = now();
       const access = random(), refresh = random();
       let selected: string[];
@@ -400,6 +409,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const a = repo.oauth.findActiveAccess(principal.accessHash, resource, principal.scopes, now());
       return !!a && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
     },
-    close() { closed = true; clearInterval(timer); flows.clear(); upstream.clear(); attempts.clear(); },
+    close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); attempts.clear(); },
   };
 }

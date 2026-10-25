@@ -10,9 +10,9 @@ const checked = <T>(result: OAuthResult<T>): T => {
 };
 
 // Trusted test-only issuance through the same atomic consent/code lifecycle as the AS.
-export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now()) {
+export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now(), clientId = "test-native") {
   const user = repo.users.upsertByEmail(email, null);
-  const binding = { clientId: "test-native", resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
+  const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
   const sessionHash = hashToken(random());
   checked(repo.oauth.createBrowserSession({ sessionHash, userId: user.id, createdAt: now, expiresAt: now + OAUTH_TTL.browser }, now));

@@ -265,6 +265,16 @@ A central server on one host, a per-session MCP shim on each developer's machine
 
 The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no Google), so the server and transport are proven before OAuth is involved.
 
+### Hosted HTTP MCP
+
+The same server also serves native HTTP MCP at `https://grayboard.example.com/mcp`. This is separate from the CLI/WSS setup below: your MCP host performs OAuth sign-in, stores credentials and refreshes them. Do not paste a CLI session token into its OAuth configuration or add a second login for a delivery supplement.
+
+For hosted OAuth, create a Google **Web application** client with the exact callback `https://grayboard.example.com/oauth/google/callback`. Set `GRAYBOARD_MCP_GOOGLE_CLIENT_ID` and `GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET` on the server to use it while retaining the Desktop client for `grayboard login`. Restart the server after changing its configuration. Development login does not authorize hosted OAuth clients.
+
+Supported native clients register automatically through their HTTPS client metadata document; no client secret or registration copy/paste is needed. Review the account, client, redirect and tools/delivery permissions on the consent page before approving. If a refresh fails ambiguously, sign in again rather than retrying an old refresh token.
+
+Sign-in does not choose a mailbox. A mapped host session starts unbound: ask `whoami`, then `bind` an existing name, or explicitly permit creation with `create: true`. A client without a supported session-context mapping can use unbound read tools but cannot bind or write. Static identity headers are not a substitute. Native agent tools and a hosted delivery supplement use the same grant; the supplement must not register duplicate agent tools. Server-side session, child and delivery rules are in [`docs/architecture.md`](docs/architecture.md#hosted-mcp).
+
 ### Before you start
 
 - **A Google Workspace domain.** Sign-in accepts only Google accounts whose Workspace domain (the ID token's `hd` claim) equals `GRAYBOARD_ORG_DOMAIN`. Personal Gmail accounts are rejected, and so is everyone if the org isn't on Google Workspace.

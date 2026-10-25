@@ -7,6 +7,7 @@ import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { reprDigest, sha256Hex } from "../../src/shared/attachments.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -24,11 +25,15 @@ afterEach(async () => {
   await app.stop(); app.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
-function issue(email = "alice@example.com", scopes = ["grayboard:tools"]) { return issueOAuth(app.repo, app.oauth.resource, email, scopes); }
+function issue(email = "alice@example.com", scopes = ["grayboard:tools"]) { return issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT); }
 async function connect(token: string, version: string) {
   const client = new Client({ name: "attachment-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
-  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } } }));
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
+    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), "attachment-root")),
+  }));
+  await bindFixture(client, "be");
   return client;
 }
 function value(result: Awaited<ReturnType<Client["callTool"]>>) {
@@ -44,16 +49,15 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
   const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
   app.repo.identities.create(outsider.authed.user_id, "be");
-  const identity = await a.readResource({ uri: "grayboard://identity" });
-  const info = JSON.parse((identity.contents[0] as { text: string }).text);
-  expect(info.resource).toBe(app.oauth.resource);
+  const info = value(await a.callTool({ name: "whoami", arguments: {} }));
+  expect(info.name).toBe("be");
   const upload = await attachment(alice.token);
   expect(upload.status).toBe(201);
   expect(upload.headers.get("Cache-Control")).toBe("private, no-store");
   const descriptor = await upload.json() as { id: number; sha256: string };
   expect(descriptor).toMatchObject({ filename: "report.txt", type: "text/plain", size: bytes.length, sha256: sha256Hex(bytes) });
-  const downloadUrl = new URL(`${info.resource}/attachments/${descriptor.id}`);
-  downloadUrl.searchParams.set("identity", info.identity);
+  const downloadUrl = new URL(`${app.oauth.resource}/attachments/${descriptor.id}`);
+  downloadUrl.searchParams.set("identity", info.name);
   expect(downloadUrl.href).not.toContain(alice.token);
   expect((await attachment(bob.token, "GET", descriptor.id)).status).toBe(404);
   const sent = await a.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "file", attachment_ids: [descriptor.id] } });

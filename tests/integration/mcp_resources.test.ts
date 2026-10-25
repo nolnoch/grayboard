@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
@@ -30,7 +31,7 @@ afterEach(async () => {
   app.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
-const issue = (email = "alice@example.com", scopes = ["grayboard:tools", "grayboard:delivery"]) => issueOAuth(app.repo, app.oauth.resource, email, scopes, clock);
+const issue = (email = "alice@example.com", scopes = ["grayboard:tools", "grayboard:delivery"]) => issueOAuth(app.repo, app.oauth.resource, email, scopes, clock, OPENCODE_CLIENT);
 async function connect(token: string, version = "2026-07-28", role?: string, identity = "be") {
   const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
   if (role !== undefined) headers.set("X-Grayboard-Client", role);
@@ -39,12 +40,13 @@ async function connect(token: string, version = "2026-07-28", role?: string, ide
   });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(base + "/mcp"), {
-    fetch: (input, init) => {
-      const request = new Request(input, init);
+    fetch: async (input, init) => {
+      const request = await withSessionMeta(new Request(input, init), identity);
       headers.forEach((value, key) => request.headers.set(key, value));
       return fetch(request);
     },
   }));
+  await bindFixture(client, identity);
   return { client, headers };
 }
 function value(result: Awaited<ReturnType<Client["callTool"]>>) {
@@ -77,13 +79,14 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   expect((await native.client.listTools()).tools.some(t => t.name.startsWith("delivery_"))).toBe(false);
   await expect(call(native.client, "delivery_open")).rejects.toThrow("not found");
   expect((await native.client.listResourceTemplates()).resourceTemplates).toEqual([]);
-  const identity = await read(native.client, "grayboard://identity");
-  expect(identity).toEqual({ user: { id: grant.authed.user_id, email: "alice@example.com" }, identity_full: "alice@example.com/be", identity: "be", issuer: publicUrl, resource: "https://grayboard.example.com/hosted/mcp" });
-  expect(JSON.stringify(identity)).not.toMatch(/access|refresh|capability|lease|grant/);
+  const who = value(await call(native.client, "whoami"));
+  expect(who).toMatchObject({ name: "be" });
+  const identity = { identity_full: "alice@example.com/be" };
+  await expect(read(native.client, "grayboard://identity")).rejects.toThrow();
   value(await call(native.client, "board_create", { name: "e2e", purpose: "fixtures" }));
   for (let i = 0; i < 23; i++) value(await call(native.client, "board_post", { board: "e2e", body: `post ${i}` }));
   const listed = await native.client.listResources();
-  expect(listed.resources.map(r => r.uri)).toEqual(["grayboard://identity", "grayboard://boards/e2e"]);
+  expect(listed.resources.map(r => r.uri)).toEqual(["grayboard://boards/e2e"]);
   if (version === "2026-07-28") expect(listed).toMatchObject({ ttlMs: 0, cacheScope: "private" });
   const snapshot = await read(native.client, "grayboard://boards/e2e");
   expect(snapshot.posts).toHaveLength(20);
@@ -95,9 +98,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   await expect(read(native.client, "grayboard://inbox")).rejects.toThrow();
   expect(app.mcp.activeLeases).toBe(0);
   const sub = await connect(grant.token, version, "subscriber");
-  expect((await sub.client.listResources()).resources.map(r => r.uri)).toEqual(["grayboard://identity", "grayboard://inbox"]);
-  expect(await read(sub.client, "grayboard://identity")).toEqual(identity);
-  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
+  expect((await sub.client.listResources()).resources.map(r => r.uri)).toEqual(["grayboard://inbox"]);
+  expect(value(await call(sub.client, "whoami"))).toEqual(who);
+  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["whoami", "bind", "session_register", "session_end", "delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
   await expect(call(sub.client, "dm_send", { to: "be", body: "not exposed" })).rejects.toThrow("not found");
   await expect(read(sub.client, "grayboard://boards/e2e")).rejects.toThrow();
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
@@ -198,7 +201,7 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   const other = await connect(bob.token);
   for (let i = 0; i < 102; i++) value(await call(native.client, "board_create", { name: `page${String(i).padStart(3, "0")}`, purpose: "pagination" }));
   const first = await other.client.request({ method: "resources/list", params: {} });
-  expect(first.resources).toHaveLength(101);
+  expect(first.resources).toHaveLength(100);
   expect(first.nextCursor).toBe("page099");
   expect(first.resources.some(r => r.uri.includes("private"))).toBe(false);
   const second = await other.client.listResources({ cursor: first.nextCursor });
@@ -276,7 +279,7 @@ test("fresh access of the same grant continues a lease; revoked access and repla
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
   sub.headers.set("Authorization", `Bearer ${token}`);
   expect(value(await call(sub.client, "delivery_renew")).capability).toBe(lease.capability);
-  expect(await read(sub.client, "grayboard://identity")).toMatchObject({ identity_full: "alice@example.com/be" });
+  expect(value(await call(sub.client, "whoami"))).toMatchObject({ name: "be" });
   sub.headers.set("Authorization", `Bearer ${issue().token}`);
   expect((await call(sub.client, "delivery_release")).isError).toBe(true);
   sub.headers.set("Authorization", `Bearer ${token}`);
@@ -293,7 +296,7 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   if (action === "disable") app.repo.users.setDisabled(grant.authed.user_id, true);
   if (action === "admin") app.repo.sessions.revokeAllForUser(grant.authed.user_id);
   await expect(sub.client.listResources()).rejects.toThrow();
-  await expect(read(sub.client, "grayboard://identity")).rejects.toThrow();
+  await expect(call(sub.client, "whoami")).rejects.toThrow();
   await expect(call(sub.client, "delivery_renew")).rejects.toThrow();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
@@ -317,13 +320,14 @@ test("explicit open conflicts with an existing live WS-style owner; native and s
   await ready;
   const native = await connect(grant.token);
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
-  await read(native.client, "grayboard://identity");
-  await read(sub.client, "grayboard://identity");
+  expect(value(await call(native.client, "whoami"))).toHaveProperty("unbound", true);
+  expect(value(await call(sub.client, "whoami"))).toHaveProperty("unbound", true);
   expect(app.mcp.activeLeases).toBe(0);
   expect((await call(sub.client, "delivery_open")).isError).toBe(true);
   expect(app.mcp.activeLeases).toBe(0);
   ws.close();
   await closed;
+  expect((await call(sub.client, "bind", { name: "be" })).isError).not.toBe(true);
   await open(sub.client, sub.headers);
   expect(app.mcp.activeLeases).toBe(1);
 });

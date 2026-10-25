@@ -25,8 +25,8 @@ const registrations: OAuthClient[] = [
   { clientId: "subscriber", name: "Subscriber", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:delivery", "grayboard:tools"], tokenEndpointAuthMethod: "none", allowRefresh: true },
   { clientId: "confidential:client", name: "Web", redirectUris: ["https://client.example/callback"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "client_secret_basic", clientSecretHash: hashToken("secret:with+spaces "), allowRefresh: true },
 ];
-function makeService() {
-  return createOAuthServer(storage.repo, config, { now: () => clock,
+function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
+  return createOAuthServer(storage.repo, config, { now: () => clock, cimd,
     // Explicit fake upstream identity only; all downstream browser/code/token work is real HTTP + SQLite.
     exchangeGoogle: async input => {
       exchanges++;
@@ -68,6 +68,37 @@ afterEach(async () => {
   await Promise.all(liveClients.splice(0).map(c => c.close()));
   await mcp.close(); service.close(); await server.stop(true); storage.db.close(); rmSync(dir, { recursive: true, force: true });
 });
+test("CIMD automatic registration uses one native grant and omitted resource stays bound through exchange/refresh/revocation", async () => {
+  service.close(); config = { ...config, oauthClients: [] };
+  const clientId = "https://opencode.ai/oauth/opencode/client.json";
+  let reads = 0;
+  service = makeService({ resolve: async () => [{ address: "93.184.216.34", family: 4 }], read: async () => { reads++; return JSON.stringify({ client_id: clientId, client_name: "OpenCode", redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"] }); } });
+  const metadata = await (await fetch(base + "/.well-known/oauth-authorization-server")).json();
+  expect(metadata.client_id_metadata_document_supported).toBe(true);
+  expect(metadata.registration_endpoint).toBeUndefined();
+  const a = authorization(clientId, undefined, undefined, "grayboard:delivery grayboard:tools");
+  const url = new URL(a.url); url.searchParams.delete("resource");
+  const browser = new Browser();
+  const consent = await loginConsent(browser, url.href);
+  const approved = await decide(browser, consent);
+  const callback = new URL(approved.headers.get("location")!);
+  const params = { grant_type: "authorization_code", client_id: clientId, code: callback.searchParams.get("code")!, code_verifier: a.verifier, redirect_uri: a.redirectUri };
+  expect((await post("/oauth/token", { ...params, resource: base + "/wrong" })).status).toBe(400);
+  const exchanged = await post("/oauth/token", params); expect(exchanged.status).toBe(200);
+  const tokens = await exchanged.json() as Tokens;
+  expect(tokens.scope).toBe("grayboard:delivery grayboard:tools");
+  const original = principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
+  expect(original.clientId).toBe(clientId);
+  const refresh = { grant_type: "refresh_token", client_id: clientId, refresh_token: tokens.refresh_token };
+  expect((await post("/oauth/token", { ...refresh, resource: base + "/wrong" })).status).toBe(400);
+  const renewed = await post("/oauth/token", refresh); expect(renewed.status).toBe(200);
+  const next = await renewed.json() as Tokens;
+  expect(principal(next).grantId).toBe(original.grantId);
+  expect(reads).toBe(1);
+  expect((await post("/oauth/revoke", { client_id: clientId, token: next.refresh_token })).status).toBe(200);
+  expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${next.access_token}` } }))).toBeInstanceOf(Response);
+});
+
 test("internal grant liveness survives individual access revocation but never authorizes that access", () => {
   const grant = issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery", "grayboard:tools"], clock);
   const request = new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } });
@@ -230,7 +261,7 @@ test("real HTTP metadata uses configured canonical issuer including prefix/defau
   service.close();
   service = createOAuthServer(storage.repo, { ...config, publicUrl: "https://grayboard.example.com:443/hosted", devAuth: false });
   const prm = await fetch(base + "/.well-known/oauth-protected-resource/hosted/mcp", { headers: { Host: "attacker.example", Forwarded: "host=attacker.example" } });
-  expect(await prm.json()).toMatchObject({ resource: "https://grayboard.example.com/hosted/mcp", authorization_servers: ["https://grayboard.example.com:443/hosted"], scopes_supported: ["grayboard:tools"] });
+  expect(await prm.json()).toMatchObject({ resource: "https://grayboard.example.com/hosted/mcp", authorization_servers: ["https://grayboard.example.com:443/hosted"], scopes_supported: ["grayboard:delivery", "grayboard:tools"] });
   const metadata = await (await fetch(base + "/.well-known/oauth-authorization-server/hosted")).json() as Record<string, unknown>;
   expect(metadata).toMatchObject({ issuer: "https://grayboard.example.com:443/hosted", authorization_endpoint: "https://grayboard.example.com:443/hosted/oauth/authorize", authorization_response_iss_parameter_supported: true, token_endpoint_auth_methods_supported: ["none", "client_secret_basic"] });
   expect(metadata.registration_endpoint).toBeUndefined(); expect(metadata.jwks_uri).toBeUndefined();
@@ -344,7 +375,7 @@ test("trusted authorization errors redirect with state/issuer; untrusted or ambi
     expect(callback.searchParams.get("state")).toBe(a.state); expect(callback.searchParams.get("iss")).toBe(base);
     expect([...callback.searchParams.keys()].sort()).toEqual(["error", "iss", "state"]);
   }
-  for (const key of ["response_type", "resource", "code_challenge_method", "code_challenge", "scope"]) {
+  for (const key of ["response_type", "code_challenge_method", "code_challenge", "scope"]) {
     const u = new URL(a.url); u.searchParams.delete(key);
     const response = await fetch(u, { redirect: "manual" }); expect(response.status).toBe(303);
     const callback = new URL(response.headers.get("Location")!);
@@ -538,7 +569,7 @@ class Provider implements OAuthClientProvider {
   saved?: StoredOAuthTokens; verifier = ""; authorization?: URL; discovery?: OAuthDiscoveryState;
   stateValue = random();
   state() { return this.stateValue; }
-  clientInformation() { return { client_id: "native", issuer: base }; }
+  clientInformation() { return { client_id: "subscriber", issuer: base }; }
   tokens() { return this.saved; }
   saveTokens(t: StoredOAuthTokens) { this.saved = t; }
   redirectToAuthorization(url: URL) { this.authorization = url; }
@@ -558,7 +589,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const fetchFn = (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init); return fetch(new Request(mapURL(req.url), req));
   };
-  class PrefixProvider extends Provider { override clientInformation() { return { client_id: "native", issuer: publicUrl }; } }
+  class PrefixProvider extends Provider { override clientInformation() { return { client_id: "subscriber", issuer: publicUrl }; } }
   const provider = new PrefixProvider();
   expect(await auth(provider, { serverUrl: service.resource, fetchFn })).toBe("REDIRECT");
   expect(provider.authorization!.searchParams.get("resource")).toBe(service.resource);
@@ -575,18 +606,18 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const approved = await browser.request(base + "/hosted/oauth/consent", { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ ...data, decision: "approve" }) });
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("iss")).toBe(publicUrl); expect(returned.searchParams.get("state")).toBe(provider.stateValue);
-  const wrongResource = await post("/oauth/token", { grant_type: "authorization_code", client_id: "native", code: returned.searchParams.get("code")!, code_verifier: provider.verifier, redirect_uri: provider.redirectUrl, resource: publicUrl + "/mcp" });
+  const wrongResource = await post("/oauth/token", { grant_type: "authorization_code", client_id: "subscriber", code: returned.searchParams.get("code")!, code_verifier: provider.verifier, redirect_uri: provider.redirectUrl, resource: publicUrl + "/mcp" });
   expect(wrongResource.status).toBe(400);
   await expect(auth(provider, { serverUrl: service.resource, fetchFn, authorizationCode: returned.searchParams.get("code")!, iss: new URL(publicUrl).href })).rejects.toThrow();
   expect(await auth(provider, { serverUrl: service.resource, fetchFn, authorizationCode: returned.searchParams.get("code")!, iss: publicUrl })).toBe("AUTHORIZED");
-  expect(provider.saved!.issuer).toBe(publicUrl); expect(principal(provider.saved as Tokens).clientId).toBe("native");
+  expect(provider.saved!.issuer).toBe(publicUrl); expect(principal(provider.saved as Tokens).clientId).toBe("subscriber");
 });
 
 for (const version of ["2026-07-28", "2025-11-25"]) test(`${version} official SDK preregistered PRM/discovery/S256/iss/code/refresh and real MCP fixture`, async () => {
   const provider = new Provider();
   expect(await auth(provider, { serverUrl: service.resource })).toBe("REDIRECT");
   expect(provider.authorization!.searchParams.get("resource")).toBe(service.resource);
-  expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:tools");
+  expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:delivery grayboard:tools");
   const browser = new Browser(); const data = await loginConsent(browser, provider.authorization!.href);
   const response = await decide(browser, data); const callback = new URL(response.headers.get("location")!);
   expect(callback.searchParams.get("state")).toBe(provider.stateValue);

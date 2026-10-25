@@ -9,6 +9,8 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
+import { createHostedSessions, sessionContext, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { unboundInstruction } from "../core/bindings.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -20,9 +22,9 @@ const id = z.number().int().positive();
 const ids = z.array(id);
 const attachmentIds = ids.describe("IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.");
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
-type Context = { request: Request; principal: OAuthPrincipal; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
-type Legacy = { server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
+type Legacy = { meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number }) {
@@ -69,11 +71,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     closing.add(settled);
   };
   const resources = createResources(application, { isAuthorized: session => {
-    const principal = principals.get(session);
-    return !closed && !!principal && oauth.isAuthorized(principal);
+    const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
+    return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal);
   } });
-  const delivery = createDelivery(application, { isAuthorized: principal => oauth.isGrantActive(principal.grantId) });
-  const exchanges = new AsyncLocalStorage<{ request: Request; refusal?: Response; context?: Context; legacy?: Legacy }>();
+  const hosted = createHostedSessions(application, { now, isAuthorized: principal => oauth.isAuthorized(principal) });
+  const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
+  const exchanges = new AsyncLocalStorage<{ request: Request; meta?: unknown; refusal?: Response; context?: Context; legacy?: Legacy }>();
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
     if (exchange) exchange.refusal = response;
@@ -88,16 +91,24 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   function authorize(context: Context, signal?: AbortSignal) {
     if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
-    application.revalidateSession(context.session);
+    application.revalidateSession(context.session, true);
+    hosted.sweep();
   }
   async function select(request: Request): Promise<Context> {
     const role = hostedRole(request);
     const principal = oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) return refuse(principal);
-    const selected = await application.selectIdentity(principal.authed, request.headers.get("X-Grayboard-Identity")!,
-      { deliver() {}, probe: async () => false, closed() {} },
-      { push: false, where: request.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !request.signal.aborted });
-    const context: Context = { request, principal, role, ...selected, finish() {
+    const routing = sessionContext(principal, exchanges.getStore()?.meta);
+    let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
+    try { selected = await hosted.snapshot(principal, routing); }
+    catch (error) {
+      if (!closed && !request.signal.aborted && error instanceof ApplicationError && error.code === "unauthenticated") {
+        const refusal = oauth.authenticate(request, roleScopes(role));
+        if (refusal instanceof Response) refuse(refusal);
+      }
+      throw error;
+    }
+    const context: Context = { request, principal, sessionContext: routing, role, ...selected, finish() {
       if (!contexts.delete(context)) return;
       principals.delete(context.session);
       application.close(context.session);
@@ -117,13 +128,27 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   function binding(context: Context): Binding {
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
-  function matches(a: Binding, b: Binding) { return a.user === b.user && a.email === b.email && a.grant === b.grant && a.role === b.role && a.identity === b.identity; }
+  function matches(a: Binding, b: Binding) { return a.user === b.user && a.email === b.email && a.grant === b.grant && a.role === b.role; }
+  function bindingLive(context: Context) {
+    if (!("id" in context.sessionContext)) return false;
+    const row = hosted.row(context.sessionContext.id);
+    if (!row) return false;
+    const root = hosted.rootOf(row);
+    return !!root.name && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
+  }
+  const unlistenHosted = hosted.listen(() => {
+    for (const live of [...lives]) {
+      try { if (!bindingLive(live.context)) live.stop(); }
+      catch { live.stop(); }
+    }
+  });
   function watchable(context: Context, uri: string): string | null {
     authorize(context);
+    if (!bindingLive(context)) throw new ApplicationError("unbound", "ownership changed; subscribe again with current session context");
     if (context.role === "subscriber") {
       const cap = context.request.headers.get("X-Grayboard-Lease");
       if (uri !== "grayboard://inbox" || !cap || !/^[A-Za-z0-9_-]{43}$/.test(cap) ||
-          delivery.describe(context.principal, cap).identity.identity_full !== context.session.identityFull) {
+          delivery.describe(context.principal, context.sessionContext, cap).identity.identity_full !== context.session.identityFull) {
         throw new ApplicationError("not_found", "resource not found");
       }
       return cap;
@@ -198,7 +223,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : [
+      instructions: role === "subscriber" ? undefined : context.session.readOnly ? unboundInstruction(info.candidates ?? []) : [
         `You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`,
         ...BOARD_INSTRUCTIONS.slice(1),
         ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
@@ -207,7 +232,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     });
     server.server.registerCapabilities({ resources: { subscribe: true } });
     registerHostedResources(server, {
-      role, current, issuer: oauth.issuer, resource: oauth.resource, resources, delivery, leaseHooks,
+      role, current, issuer: oauth.issuer, resource: oauth.resource, resources, delivery, hosted, leaseHooks,
       authorize() { authorize(current()); },
     });
     if (legacy) {
@@ -218,6 +243,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           if (subscribe) {
             if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
             const cap = watchable(context, uri);
+            const previous = sessionContext(context.principal, legacy.meta);
+            if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
+              throw new ApplicationError("bad_request", "legacy subscriptions require one session context per protocol session");
+            }
             const stream = legacy.stream;
             if (stream) {
               let compatible: boolean;
@@ -236,6 +265,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 stream.stop();
               }
             }
+            legacy.meta = exchanges.getStore()?.meta;
             legacy.subscriptions.set(uri, cap);
           } else {
             watchable(context, uri);
@@ -254,7 +284,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => control(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => control(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context.session; });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; });
     return server;
   }
   const modernFactory = async () => {
@@ -300,6 +330,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return wrapped.response;
   }
   return {
+    sessions: hosted,
+    delivery,
     get activeContexts() { return contexts.size; },
     get activeLeases() { return delivery.activeLeaseCount; },
     get activeResourceContexts() { return principals.size; },
@@ -331,14 +363,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       try {
         const principal = oauth.authenticate(original, roleScopes(role));
         if (principal instanceof Response) { releasePost(); return principal; }
-        const name = original.headers.get("X-Grayboard-Identity");
-        if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
-          releasePost(); return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
-        }
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
-        return await exchanges.run({ request: req }, async () => {
+        const parsed = body.parsedBody as { params?: { _meta?: unknown } } | undefined;
+        return await exchanges.run({ request: req, meta: parsed?.params?._meta }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
@@ -367,14 +396,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               const sid = req.headers.get("Mcp-Session-Id");
               let legacy = sid ? legacySessions.get(sid) : undefined;
               if (sid && !legacy) { releasePost(); return new Response("unknown MCP session", { status: 404 }); }
-              const requestedBinding: Binding = { user: principal.authed.user_id, email: principal.authed.user_email, grant: principal.grantId, role, identity: `${principal.authed.user_email}/${name.toLowerCase()}` };
-              if (legacy && !matches(legacy.binding, requestedBinding)) { releasePost(); return new Response("MCP session binding mismatch", { status: 403 }); }
+              if (req.method === "GET" && legacy) exchange.meta = legacy.meta;
               const context = exchange.context = await select(req);
               if (legacy && !matches(legacy.binding, binding(context))) { context.finish(); releasePost(); return new Response("MCP session binding mismatch", { status: 403 }); }
               if (!legacy) {
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
                 if (legacyAll.size >= 256) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
-                legacy = { binding: binding(context), subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
+                legacy = { meta: exchange.meta, binding: binding(context), subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
                 const created = legacy;
                 legacy.transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID(), keepAliveMs: 5000,
                   onsessioninitialized(id) { legacySessions.set(id, created); }, onsessionclosed() { retire(created); } });
@@ -433,7 +461,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       for (const live of [...lives]) live.stop();
       for (const legacy of [...legacyAll]) retire(legacy);
       await Promise.all([...forwarding].map(stream => stream.stop()));
-      resources.close(); delivery.close();
+      unlistenHosted(); resources.close(); delivery.close(); hosted.close();
       await modern.close();
       await Promise.allSettled([...bodyReads]);
       while (closing.size) await Promise.all([...closing]);
@@ -442,14 +470,25 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
 }
 
-function registerNativeTools(server: McpServer, application: Application, current: (ctx: ServerContext) => ApplicationSession) {
-  const run = (ctx: ServerContext, call: (session: ApplicationSession) => unknown): CallToolResult => {
-    try { return text(call(current(ctx)) ?? "ok"); }
+function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context) {
+  const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
+    try {
+      const context = current(ctx);
+      return text(await hosted.run(context.principal, context.sessionContext, tool, call) ?? "ok");
+    }
     catch (e) {
       const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
       return { ...text(`error: ${message}`), isError: true };
     }
   };
+  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: z.strictObject({}) }, async (_, ctx) => {
+    const context = current(ctx);
+    return text(await hosted.whoami(context.principal, context.sessionContext));
+  });
+  server.registerTool("bind", { description: "Take or change this session's name; unknown names require create:true.", inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
+    try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args); }
+    catch (e) { return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
+  });
   for (const tool of boardTools({ teams: true })) {
     const properties = { ...tool.inputSchema.properties };
     if (tool.name === "board_post") { delete properties.attachments; properties.attachment_ids = z.toJSONSchema(attachmentIds); }
@@ -457,25 +496,25 @@ function registerNativeTools(server: McpServer, application: Application, curren
       description: tool.name === "board_post" ? tool.description.replace("attachments?", "attachment_ids?") : tool.description,
       ...(tool._meta ? { _meta: tool._meta } : {}),
       inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, properties, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-    }, (args, ctx) => run(ctx, session => application.call(session, tool.name, args)));
+    }, (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
   }
   server.registerTool("dm_send", {
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
     inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional() }),
-  }, (a, ctx) => run(ctx, session => application.send(session, a.to, a.body, a)));
+  }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
   server.registerTool("dm_history", {
     description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
     inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
-  }, (a, ctx) => run(ctx, session => application.history(session, a)));
+  }, (a, ctx) => run(ctx, "dm_history", session => application.history(session, a)));
   server.registerTool("dm_thread", { description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },
-    (a, ctx) => run(ctx, session => application.thread(session, a.thread)));
+    (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread)));
   server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }) },
-    (a, ctx) => run(ctx, session => application.inbox(session, a.days)));
+    (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
   server.registerTool(DM_ACK_TOOL.name, {
     description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: z.strictObject({ message_id: z.union([id, ids.min(1)]) }),
-  }, (a, ctx) => {
+  }, async (a, ctx) => {
     const acked: number[] = [], missing: number[] = [];
-    const result = run(ctx, session => {
+    const result = await run(ctx, "dm_ack", session => {
       for (const n of new Set(Array.isArray(a.message_id) ? a.message_id : [a.message_id])) {
         try { application.acknowledgeDm(session, n); acked.push(n); } catch (e) {
           if (!(e instanceof ApplicationError) || e.code !== "not_found") throw e;
@@ -487,5 +526,5 @@ function registerNativeTools(server: McpServer, application: Application, curren
     return { ...result, ...(missing.length && !acked.length ? { isError: true } : {}) };
   });
   server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: z.strictObject({ message_id: id }) },
-    (a, ctx) => run(ctx, session => application.retract(session, a.message_id)));
+    (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
 }
