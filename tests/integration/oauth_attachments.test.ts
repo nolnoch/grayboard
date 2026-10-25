@@ -42,13 +42,15 @@ function value(result: Awaited<ReturnType<Client["callTool"]>>) {
 }
 async function attachment(token: string, method = "POST", id?: number, alias = false) {
   const path = `${alias ? "/mcp" : "/hosted/mcp"}/attachments${id === undefined ? "" : `/${id}`}?identity=be${method === "POST" ? "&filename=report.txt" : ""}`;
-  return fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${token}`, ...(method === "POST" ? { "Content-Length": String(bytes.length) } : {}) }, ...(method === "POST" ? { body: bytes } : {}) });
+  return fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent("attachment-root"), ...(method === "POST" ? { "Content-Length": String(bytes.length) } : {}) }, ...(method === "POST" ? { body: bytes } : {}) });
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
   const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
   app.repo.identities.create(outsider.authed.user_id, "be");
+  expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
+  await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
   expect(info.name).toBe("be");
   const upload = await attachment(alice.token);
@@ -125,5 +127,6 @@ test("old API remains session-only and OAuth cannot become admin or WS credentia
   const ws = await fetch(`${base}/`, { headers: { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13", Authorization: `Bearer ${alice.token}` } });
   expect(ws.status).toBe(401);
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
+  await connect(alice.token, "2026-07-28");
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);
 });

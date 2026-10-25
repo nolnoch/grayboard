@@ -30,6 +30,75 @@ beforeEach(() => {
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
+test("unbound row quota survives service restart, idle cleanup frees rows and gates", async () => {
+  for (let i = 0; i < hosted.limits.user; i++) await hosted.whoami(principal, context(`unbound-${i}`));
+  expect(database.repo.hosted.all()).toHaveLength(hosted.limits.user);
+  expect(hosted.gateCount).toBe(0);
+  const before = database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM hosted_ownerships").get()?.count;
+  await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM hosted_ownerships").get()?.count).toBe(before);
+  hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.all()).toEqual([]);
+  await hosted.whoami(principal, context("overflow"));
+  expect(hosted.gateCount).toBe(0);
+  await hosted.end(principal, context("overflow"));
+  expect(database.repo.hosted.all()).toEqual([]);
+});
+
+test("child quota refusal leaves grant, lease and graph unchanged; ending a child frees capacity", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
+  const lease = await delivery.open(principal, context("root"));
+  const otherGrant = { ...principal, grantId: "G2" };
+  await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
+  expect(database.repo.hosted.all().every(row => row.grant_id === "G1")).toBe(true);
+  expect(delivery.describe(principal, context("root"), lease.capability).capability).toBe(lease.capability);
+  await hosted.end(principal, context("child-0"));
+  await hosted.register(principal, context("root"), "overflow");
+  expect(database.repo.hosted.all()).toHaveLength(1 + hosted.limits.children);
+  expect(hosted.gateCount).toBe(0);
+});
+
+test("global quota applies across users transactionally without creating an overflow ownership", async () => {
+  await hosted.whoami(principal, context("template"));
+  const template = database.repo.hosted.all()[0]!;
+  await hosted.end(principal, context("template"));
+  database.repo.hosted.atomic(() => {
+    for (let userIndex = 0; userIndex < hosted.limits.global / hosted.limits.user; userIndex++) {
+      const user = database.repo.users.upsertByEmail(`user${userIndex}@example.com`, null);
+      for (let i = 0; i < hosted.limits.user; i++) {
+        const id = `seed-${userIndex}-${i}`;
+        const ownership = database.repo.hosted.start(id, user.id, OPENCODE_CLIENT, now);
+        database.repo.hosted.insert({ ...template, session_id: id, ownership_id: ownership, user_id: user.id });
+      }
+    }
+  });
+  await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
+  expect(database.repo.hosted.all()).toHaveLength(hosted.limits.global);
+  expect(hosted.gateCount).toBe(0);
+});
+
+test("queued readers and writers retain one gate through retirement and root conversion", async () => {
+  const lock = hosted.gate("ordered");
+  let release!: () => void, entered = false;
+  const held = lock.call(async () => { entered = true; await new Promise<void>(resolve => { release = resolve; }); });
+  expect(entered).toBe(true);
+  const order: string[] = [];
+  const writer = hosted.gate("ordered").bind(async () => { order.push("writer"); });
+  const reader = hosted.gate("ordered").call(async () => { order.push("reader"); });
+  expect(hosted.gateCount).toBe(1);
+  release(); await Promise.all([held, writer, reader]);
+  expect(order).toEqual(["writer", "reader"]);
+  expect(hosted.gateCount).toBe(0);
+  await hosted.whoami(principal, context("child"));
+  await hosted.register(principal, context("root"), "child");
+  await hosted.whoami(principal, context("child"));
+  expect(hosted.gateCount).toBe(0);
+});
+
 test("native metadata is mapped only for the registered client", () => {
   expect(context("one")).not.toEqual(context("two"));
   expect(sessionContext({ ...principal, clientId: "other" }, { [OPENCODE_SESSION_META]: "one" })).toHaveProperty("missing");

@@ -28,7 +28,7 @@ export async function storeUpload(
   guard?: () => void,
 ): Promise<AttachmentRow> {
   const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
-  const row = await storeAttachment(db, repo.blobs, handle, file, { quota });
+  const row = await storeAttachment(db, repo.blobs, handle, file, { quota, guard });
   try {
     guard?.();
     writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
@@ -51,8 +51,9 @@ export async function releaseStored(
   handle: string,
   id: number,
   detail: Record<string, unknown> = {},
+  guard?: () => void,
 ): Promise<AttachmentRow | null> {
-  const row = await releaseUpload(db, repo.blobs, id, handle);
+  const row = await releaseUpload(db, repo.blobs, id, handle, guard);
   if (row) {
     writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,

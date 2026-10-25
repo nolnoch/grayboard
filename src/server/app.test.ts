@@ -5,7 +5,43 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "./app.ts";
 
+import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+
 const hostname = "127.0.0.1";
+
+for (const expired of [false, true]) test(`actual server restart restores or expires live graph, expired=${expired}`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-restart-"));
+  const config = { dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] };
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(config, { hostname, background: false });
+    const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+    const principal = app.oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
+    if (principal instanceof Response) throw new Error("fixture unauthorized");
+    const context = sessionContext(principal, { [OPENCODE_SESSION_META]: "root" });
+    await app.mcp.sessions.bind(principal, context, { name: "be", create: true });
+    await app.mcp.sessions.register(principal, context, "child");
+    const lease = await app.mcp.delivery.open(principal, context);
+    if (expired) app.db.exec("UPDATE hosted_sessions SET lease_deadline=1");
+    await app.stop(); app = undefined;
+    app = startServer(config, { hostname, background: false });
+    const rows = app.repo.hosted.all();
+    if (expired) {
+      expect(rows).toEqual([]);
+      expect(app.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='released' AND detail='expired'").get()?.count).toBe(1);
+      app.mcp.sessions.sweep();
+      expect(app.repo.hosted.all()).toEqual([]);
+    } else {
+      expect(rows).toHaveLength(2);
+      expect(rows.every(row => row.ownership_id === lease.ownership)).toBe(true);
+      expect(rows.find(row => !row.root_session_id)?.lease_deadline).toBe(lease.expiresAt);
+      expect(app.application.hostedHolder("you@example.com/be")).toBeDefined();
+      expect(app.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
+      expect((await app.mcp.delivery.open(principal, context)).ownership).toBe(lease.ownership);
+    }
+  } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("an exact-address listener refuses an occupied same-address port", async () => {
   const occupied = Bun.serve({ hostname, port: 0, fetch: () => new Response("other listener") });

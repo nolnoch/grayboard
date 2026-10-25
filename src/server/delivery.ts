@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { refOf, type PendingRef } from "../core/boards.ts";
-import { testPauseAsync } from "../shared/testpause.ts";
+import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ApplicationError, type ApplicationSession, type DeliveryEvent, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
@@ -14,7 +14,7 @@ export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): bool
 type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
-  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>;
+  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
 const notify = (fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(() => {}); } catch {} };
 function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
@@ -28,6 +28,14 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   const ttl = options.ttlMs ?? 30_000, now = options.now ?? hosted.now;
   if (!Number.isFinite(ttl) || ttl < 1) throw new Error("invalid delivery TTL");
   const leases = new Map<string, Lease>();
+  const attempts = new WeakMap<DeliveryLease, { lease: Lease; version: number; created: boolean; hooks: DeliveryHooks }>();
+  function opened(lease: Lease, created: boolean, hooks: DeliveryHooks) {
+    const result = describe(lease);
+    const version = ++lease.openVersion;
+    lease.pendingOpens.add(version);
+    attempts.set(result, { lease, version, created, hooks });
+    return result;
+  }
   let stopped = false;
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
@@ -69,7 +77,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });
         return { row, expiresAt };
       }, result => {
-        if ("capability" in result) { result.hooks = hooks; return describe(result); }
+        if ("capability" in result) return opened(result, false, hooks);
         if (previous) finish(previous);
         const { row, expiresAt } = result;
         let lease!: Lease;
@@ -79,15 +87,31 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           closed() { if (lease) finish(lease); },
         }, false, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
-          ownership: row.ownership_id, generation: row.bind_gen, name: row.name!, session: selected.session, identity: selected.info, hooks, issued: new Map() };
+          ownership: row.ownership_id, generation: row.bind_gen, name: row.name!, session: selected.session, identity: selected.info, hooks, issued: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
         leases.set(lease.capability, lease);
-        return describe(lease);
+        return opened(lease, true, hooks);
       });
+    },
+    accept(result: DeliveryLease) {
+      const attempt = attempts.get(result);
+      if (attempt) {
+        attempt.lease.pendingOpens.delete(attempt.version);
+        if (leases.get(result.capability) === attempt.lease && attempt.version > attempt.lease.acceptedVersion) {
+          attempt.lease.acceptedVersion = attempt.version;
+          attempt.lease.hooks = attempt.hooks;
+        }
+      }
+      attempts.delete(result);
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, true, row => {
-        const lease = get(p, context, capability, row), deadline = now() + ttl;
-        store.atomic(() => store.update({ ...row, lease_deadline: deadline, last_seen_at: now() }));
+        const { lease, deadline } = store.atomic(() => {
+          const fresh = store.get(row.session_id);
+          const lease = get(p, context, capability, fresh), deadline = now() + ttl;
+          if (!fresh || fresh.root_session_id) stale(p, context, capability);
+          store.update({ ...fresh, lease_deadline: deadline, last_seen_at: now() });
+          return { lease, deadline };
+        });
         lease.expiresAt = deadline;
         if (hooks) lease.hooks = hooks;
         return describe(lease);
@@ -106,39 +130,55 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       });
     },
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
-      return hosted.control(p, context, false, row => {
-        const lease = get(p, context, capability, row);
-        if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
-        const records = ids.map(id => lease.issued.get(id) ?? stale(p, context, capability));
-        for (const r of records) {
-          if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || r.item.name !== row.name) stale(p, context, capability);
-          if (r.item.event.kind === "board" && !application.canReceiveBoard(lease.session, r.item.event.item.kind === "push" ? r.item.event.item.post.board : r.item.event.item.board)) stale(p, context, capability);
-        }
-        const direct = records.filter(r => !r.acked && r.item.event.kind === "direct");
-        if (direct.length) {
-          const unread = application.pending(lease.session, 100).filter(e => e.kind === "direct");
-          const requested = new Set(direct.map(r => r.item.id));
-          if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
-        }
-        store.atomic(() => {
+      return hosted.control(p, context, false, async () => {
+        await testPauseAsync("hosted:receipt:before-txn");
+        const records = store.atomic(() => {
+          testPause("hosted:receipt:in-txn");
+          const row = "id" in context ? store.get(context.id) : undefined;
+          const lease = get(p, context, capability, row);
+          if (!row || row.root_session_id) stale(p, context, capability);
+          if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
+          const records = ids.map(id => lease.issued.get(id) ?? stale(p, context, capability));
+          for (const r of records) {
+            if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || r.item.name !== row.name) stale(p, context, capability);
+            if (r.item.event.kind === "board" && !application.canReceiveBoard(lease.session, r.item.event.item.kind === "push" ? r.item.event.item.post.board : r.item.event.item.board)) stale(p, context, capability);
+          }
+          const direct = records.filter(r => !r.acked && r.item.event.kind === "direct");
+          if (direct.length) {
+            const unread = application.pending(lease.session, 100).filter(e => e.kind === "direct");
+            const requested = new Set(direct.map(r => r.item.id));
+            if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
+          }
           application.receiptDirect(lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
           application.receiptBoards(lease.session, records.filter(r => !r.acked && r.ref).map(r => r.ref!));
+          return records;
         });
         for (const r of records) r.acked = true;
       });
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, row => {
-        get(p, context, capability, row);
-        hosted.release(row.session_id, "closed");
+        store.atomic(() => {
+          get(p, context, capability, store.get(row.session_id));
+          store.end(row.session_id, "closed", now());
+        });
+        hosted.reconcile();
       });
     },
-    async cancel(capability: string) {
-      const lease = leases.get(capability);
-      if (!lease) return;
+    async cancel(result: DeliveryLease) {
+      const attempt = attempts.get(result);
+      attempts.delete(result);
+      if (!attempt) return;
+      const { lease, version } = attempt;
+      lease.pendingOpens.delete(version);
+      if (attempt.created) lease.cancelledCreator = true;
+      const capability = result.capability;
       await hosted.gate(lease.sessionId).bind(async () => {
-        if (leases.get(capability) !== lease) return;
-        if (matches(lease, store.get(lease.sessionId))) hosted.release(lease.sessionId, "closed");
+        if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
+        store.atomic(() => {
+          if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
+        });
+        hosted.sweep();
         finish(lease);
       });
     },

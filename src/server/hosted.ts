@@ -35,11 +35,25 @@ export function createHostedSessions(application: Application, options: { now?: 
   const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? "900");
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive integer");
   const idle = rawIdle * 1000;
-  const gates = new Map<string, BindGate>();
+  const gates = new Map<string, { gate: BindGate; users: number }>();
+  const limits = { user: 256, global: 4096, children: 128 };
+  function admit(user: number, root?: string) {
+    const rows = store.all();
+    if (rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user || (root && rows.filter(r => r.root_session_id === root).length >= limits.children)) throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
+  }
   const holders = new Map<string, { row: HostedSession; session: ApplicationSession }>();
   const listeners = new Set<(row: HostedSession | undefined, id: string) => void>();
   let stopped = false;
-  const gate = (id: string) => { let g = gates.get(id); if (!g) gates.set(id, g = new BindGate()); return g; };
+  const gate = (id: string) => {
+    const enter = async <T>(writer: boolean, fn: () => Promise<T>): Promise<T> => {
+      let entry = gates.get(id);
+      if (!entry) gates.set(id, entry = { gate: new BindGate(), users: 0 });
+      entry.users++;
+      try { return await entry.gate[writer ? "bind" : "call"](fn); }
+      finally { if (--entry.users === 0 && gates.get(id) === entry) gates.delete(id); }
+    };
+    return { call: <T>(fn: () => Promise<T>) => enter(false, fn), bind: <T>(fn: () => Promise<T>) => enter(true, fn) };
+  };
   const audit = (id: string, action: `hosted.${string}`, detail: Record<string, unknown>) => writeAudit(repo, action, null, id, detail);
   function authorized(p: OAuthPrincipal) {
     if (stopped || !options.isAuthorized(p)) throw new ApplicationError("unauthenticated", "unauthenticated");
@@ -49,6 +63,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     let row = store.get(context.id);
     if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
     if (!row && create) {
+      admit(p.authed.user_id);
       const t = now();
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, name: null, bind_gen: 0,
@@ -106,6 +121,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       for (const row of store.all()) if (!row.root_session_id) {
         if (repo.users.findById(row.user_id)?.disabled_at != null) store.end(row.session_id, "disabled", now());
         else if (row.lease_deadline !== null && row.lease_deadline <= now()) store.end(row.session_id, "expired", now(), row.lease_deadline);
+        else if (!row.name && row.lease_deadline === null && row.last_seen_at < now() - idle) store.end(row.session_id, "idle", now());
       }
     });
     reconcile();
@@ -144,8 +160,17 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = row ? rootOf(row) : undefined;
     return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root?.name ?? null, root?.place ?? null, quietSink), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
+  function fence(p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
+    authorized(p);
+    if (!row || !root) return;
+    const fresh = store.get(row.session_id);
+    const current = fresh ? rootOf(fresh) : undefined;
+    if (!fresh || fresh.ownership_id !== row.ownership_id || fresh.root_session_id !== row.root_session_id || !current || current.session_id !== root.session_id || current.ownership_id !== root.ownership_id || current.bind_gen !== root.bind_gen || current.name !== root.name || (current.lease_deadline !== null && current.lease_deadline <= now())) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
+  }
   const service = {
     application,
+    limits,
+    get gateCount() { return gates.size; },
     now,
     gate,
     row(id: string) { return store.get(id); },
@@ -156,18 +181,33 @@ export function createHostedSessions(application: Application, options: { now?: 
     sweep,
     listen(fn: (row: HostedSession | undefined, id: string) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row)); },
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T | Promise<T>): Promise<T> {
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(row) : undefined;
         if (!root?.name && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first; child sessions need the grayboard plugin to register them");
         const selected = snapshot(p, row);
         try {
           await testPauseAsync("hosted:tool:in-gate");
-          authorized(p);
-          const fresh = row ? store.get(row.session_id) : undefined;
-          if (row && (!fresh || fresh.ownership_id !== row.ownership_id)) throw new ApplicationError("unbound", "ownership ended; bind or register again");
-          const value = await fn(selected.session);
-          if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, name: root!.name });
+          return store.atomic(() => {
+            fence(p, row, root);
+            const value = fn(selected.session);
+            if (value instanceof Promise) throw new Error("hosted native effects must be synchronous");
+            if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, name: root!.name });
+            return value;
+          });
+        } finally { application.close(selected.session); }
+      });
+    },
+    async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: () => void) => Promise<T>): Promise<T> {
+      return withGate(p, context, false, async row => {
+        const root = row ? rootOf(row) : undefined;
+        if (!root?.name) throw new ApplicationError("unbound", "attachments require a bound source session");
+        const selected = snapshot(p, row);
+        const guard = () => { store.atomic(() => fence(p, row, root)); };
+        try {
+          guard();
+          const value = await fn(selected.session, guard);
+          guard();
           return value;
         } finally { application.close(selected.session); }
       });
@@ -256,6 +296,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
         const descendants = store.all().filter(r => r.root_session_id === childId);
         if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
+        if (!existing) admit(p.authed.user_id, root.session_id);
+        else if (!existing.root_session_id && store.all().filter(r => r.root_session_id === root.session_id).length >= limits.children) throw new ApplicationError("bad_request", "hosted child capacity reached");
         const attached = attach(p, root);
         if (existing?.root_session_id === root.session_id) return { message: "already registered" };
         if (existing) store.end(existing.session_id, "closed", now());
@@ -274,9 +316,13 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (!row) return { ended: false };
         const target = session ?? row.session_id;
         if (row.root_session_id && target !== row.session_id) rootOnly(row);
-        const candidate = store.get(target);
-        if (!candidate || candidate.user_id !== p.authed.user_id || candidate.client_id !== p.clientId || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
-        store.atomic(() => candidate.root_session_id ? store.childEnd(target, now()) : store.end(target, "closed", now()));
+        const root = rootOf(row);
+        store.atomic(() => {
+          fence(p, row, root);
+          const candidate = store.get(target);
+          if (!candidate || candidate.user_id !== p.authed.user_id || candidate.client_id !== p.clientId || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
+          candidate.root_session_id ? store.childEnd(target, now()) : store.end(target, "closed", now());
+        });
         reconcile();
         return { ended: true };
       });

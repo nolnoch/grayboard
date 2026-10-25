@@ -41,18 +41,18 @@ export function createResources(application: Application, options: ResourceOptio
   function finishQuietly(watch: Watch) {
     try { finish(watch); } catch {}
   }
-  function authorized(session: ApplicationSession): boolean {
+  function authorized(session: ApplicationSession, allowUnbound = false): boolean {
     try {
       if (stopped || !options.isAuthorized(session)) return false;
-      application.revalidateSession(session);
+      application.revalidateSession(session, allowUnbound);
       return true;
     } catch (error) {
       if (error instanceof ApplicationError && error.code === "unauthenticated") return false;
       throw error;
     }
   }
-  function requireSession(session: ApplicationSession) {
-    if (authorized(session)) return;
+  function requireSession(session: ApplicationSession, allowUnbound = false) {
+    if (authorized(session, allowUnbound)) return;
     for (const watch of [...watches.values()]) if (watch.session === session) finishQuietly(watch);
     throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
   }
@@ -68,12 +68,12 @@ export function createResources(application: Application, options: ResourceOptio
   const service = {
     get activeWatchCount() { return watches.size; },
     list(session: ApplicationSession, after?: string) {
-      requireSession(session);
+      requireSession(session, true);
       const page = application.boardCatalog(session, after);
       return { resources: page.boards.map(board => ({ uri: boardResourceUri(board.name), board })), next_after: page.next_after };
     },
     read(session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
-      requireSession(session);
+      requireSession(session, true);
       const board = parseBoardResourceUri(uri);
       return { uri: boardResourceUri(board), ...application.boardSnapshot(session, board, options) };
     },

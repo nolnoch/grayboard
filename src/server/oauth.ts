@@ -378,7 +378,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     return json({ error: "invalid_request" }, 405);
   }
   const bearerError = (status: 401 | 403, error: string | undefined, requiredScopes: string[]) => json({ error: error ?? "unauthorized" }, status, {
-    "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${requiredScopes.join(" ")}"${error ? `, error="${error}"` : ""}`,
+    "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
   return {
     issuer, resource, resourceMetadata,

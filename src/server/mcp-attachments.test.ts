@@ -6,6 +6,11 @@ import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
 import { UploadGate } from "./uploads.ts";
+import { createApplication } from "./application.ts";
+import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+
+let application: ReturnType<typeof createApplication>;
+let hosted: ReturnType<typeof createHostedSessions>;
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { getAttachment, bindAttachments } from "../core/attachments.ts";
 
@@ -24,24 +29,29 @@ function deferred() {
   const promise = new Promise<void>(r => { resolve = r; });
   return { promise, resolve };
 }
-beforeEach(() => {
+beforeEach(async () => {
   now = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-attachments-"));
-  store = openDatabase(":memory:", { blobDir: dir });
+  store = openDatabase(join(dir, "bus.db"), { blobDir: dir });
   oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${origin}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] }, { now: () => now });
-  issued = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
+  issued = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
   store.repo.identities.create(issued.authed.user_id, "be");
   gate = new UploadGate(1024, 1024);
-  router = createMcpAttachments(store.repo, store.db, oauth, gate, { trustedOrigin: origin });
+  application = createApplication(store.repo, store.db);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: p => oauth.isAuthorized(p) });
+  const principal = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
+  if (principal instanceof Response) throw new Error("fixture auth failed");
+  await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });
+  router = createMcpAttachments(store.repo, store.db, oauth, gate, { trustedOrigin: origin, sessions: hosted });
 });
 afterEach(async () => {
   await router.close();
-  oauth.close();
+  hosted.close(); application.stopExpiry(); oauth.close();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
 function request(method = "POST", path = "/hosted/mcp/attachments?identity=be&filename=report.txt", body: BodyInit | null = bytes, token = issued.token, extra: RequestInit = {}) {
-  return new Request(`${origin}${path}`, { method, headers: { Authorization: `Bearer ${token}`, ...(method === "POST" ? { "Content-Length": String(bytes.length) } : {}) }, ...(method === "POST" ? { body } : {}), ...extra });
+  return new Request(`${origin}${path}`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent("attachment-root"), ...(method === "POST" ? { "Content-Length": String(bytes.length) } : {}) }, ...(method === "POST" ? { body } : {}), ...extra });
 }
 async function send(req = request()) { return (await router.fetch(req))!; }
 async function uploaded() {
@@ -61,12 +71,82 @@ test("precise routing, canonical challenge, strict query and existing identity o
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
   }
   for (const query of ["", "identity=be", "identity=be&filename=report.txt&identity=be", "identity=human&filename=report.txt", "identity=alice%40example.com%2Fbe&filename=report.txt", "identity=be&filename=../secret", "identity=be&filename=x&access_token=bad", "identity=be&filename=x&unknown=1", "identity=be&filename=%FF", "identity=be&filename=%xx", "identity=be&filename=x%00", "identity=be&filename=x&filename=x"]) {
-    expect((await send(request("POST", `/mcp/attachments?${query}`))).status).toBe(query.includes("access_token") ? 401 : 400);
+    expect((await send(request("POST", `/mcp/attachments?${query}`))).status).toBe(query.includes("access_token") ? 401 : query.startsWith("identity=human&") || query.startsWith("identity=alice%40") ? 403 : 400);
   }
-  expect((await send(request("POST", "/mcp/attachments?identity=missing&filename=x.txt"))).status).toBe(404);
+  expect((await send(request("POST", "/mcp/attachments?identity=missing&filename=x.txt"))).status).toBe(403);
   expect(store.repo.identities.findByUserAndName(issued.authed.user_id, "missing")).toBeUndefined();
   for (const id of ["0", "-1", "1e2", "01", "9007199254740992", "%31"]) expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(400);
   expect(count()).toBe(0);
+});
+
+function principal() {
+  const p = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
+  if (p instanceof Response) throw new Error("fixture unauthorized");
+  return p;
+}
+
+function external(operation: "bind" | "end", rawSession: string) {
+  const p = principal();
+  const result = Bun.spawnSync([process.execPath, "tests/support/hosted-operation.ts", join(dir, "bus.db"), dir, JSON.stringify({ now, operation, principal: p, rawSession, name: "fe" })], { stdin: Buffer.from(""), env: { ...process.env, BUS_TEST_PAUSE: "", BUS_TEST_PAUSE_FILE: "" } });
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout.toString().trim().split("\n").at(-1)!).ok).toBe(true);
+}
+
+test("all private attachment methods require mapped bound context, not a name override", async () => {
+  const id = await uploaded();
+  const unmapped = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
+  for (const method of ["POST", "GET", "DELETE"]) {
+    const path = method === "POST" ? "/mcp/attachments?identity=be&filename=report.txt" : `/mcp/attachments/${id}?identity=be`;
+    for (const raw of [undefined, "never-bound", "%61ttachment-root", "%FF"]) {
+      const req = request(method, path);
+      if (raw === undefined) req.headers.delete("X-Grayboard-Session"); else req.headers.set("X-Grayboard-Session", raw);
+      expect((await send(req)).status).toBe(raw?.startsWith("%") ? 400 : 403);
+    }
+    expect((await send(request(method, path, bytes, unmapped.token))).status).toBe(403);
+  }
+  expect(count()).toBe(1);
+});
+
+test("registered child attachments resolve the root; query name is only an assertion", async () => {
+  const p = principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.register(p, root, "attachment-child");
+  const upload = request("POST", "/mcp/attachments?filename=child.txt"); upload.headers.set("X-Grayboard-Session", "attachment-child");
+  const response = await send(upload); expect(response.status).toBe(201);
+  const id = (await response.json() as { id: number }).id;
+  expect(getAttachment(store.db, id)?.uploader).toBe("alice@example.com/be");
+  const download = request("GET", `/mcp/attachments/${id}`); download.headers.set("X-Grayboard-Session", "attachment-child");
+  expect((await send(download)).status).toBe(200);
+  const mismatch = request("POST", "/mcp/attachments?identity=fe&filename=child.txt"); mismatch.headers.set("X-Grayboard-Session", "attachment-child");
+  expect((await send(mismatch)).status).toBe(403);
+});
+
+for (const boundary of ["body", "store", "download"] as const) for (const operation of ["bind", "end"] as const) test(`external ${operation} during attachment ${boundary} fences root and child snapshots`, async () => {
+  const p = principal();
+  await hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" }), "attachment-child");
+  const entered = deferred(), resume = deferred();
+  let id: number | undefined, req: Request;
+  if (boundary === "download") {
+    id = await uploaded();
+    const get = store.repo.blobs.get.bind(store.repo.blobs);
+    store.repo.blobs.get = async hash => { const data = await get(hash); entered.resolve(); await resume.promise; return data; };
+    req = request("GET", `/mcp/attachments/${id}`);
+  } else if (boundary === "body") {
+    req = request("POST", undefined, new ReadableStream({ async start(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }));
+  } else {
+    const put = store.repo.blobs.put.bind(store.repo.blobs);
+    store.repo.blobs.put = async (hash, data) => { entered.resolve(); await resume.promise; return put(hash, data); };
+    req = request();
+  }
+  req.headers.set("X-Grayboard-Session", "attachment-child");
+  const pending = send(req);
+  await entered.promise;
+  external(operation, operation === "bind" ? "attachment-root" : "attachment-child");
+  resume.resolve();
+  const response = await pending;
+  expect(response.status).toBe(403);
+  expect(await response.text()).not.toContain("attachment bytes");
+  expect(count()).toBe(boundary === "download" ? 1 : 0);
+  const free = await gate.reserve(issued.authed.user_email, 1024, new AbortController().signal); free();
 });
 
 test("Origin precedes authentication; scope and audience never fall back", async () => {

@@ -267,7 +267,7 @@ test("real HTTP metadata uses configured canonical issuer including prefix/defau
   expect(metadata.registration_endpoint).toBeUndefined(); expect(metadata.jwks_uri).toBeUndefined();
   expect((await fetch(base + "/.well-known/openid-configuration")).status).toBe(404);
   const auth = service.authenticate(new Request(base + "/mcp"), ["grayboard:delivery"]) as Response;
-  expect(auth.status).toBe(401); expect(auth.headers.get("WWW-Authenticate")).toContain('scope="grayboard:delivery"');
+  expect(auth.status).toBe(401); expect(auth.headers.get("WWW-Authenticate")).toContain('scope="grayboard:delivery grayboard:tools"');
   expect(auth.headers.get("WWW-Authenticate")).not.toContain("offline_access");
   const dev = createOAuthServer(storage.repo, { ...config, publicUrl: "http://127.0.0.1:80/hosted" });
   expect(dev.issuer).toBe("http://127.0.0.1:80/hosted"); expect(dev.resource).toBe("http://127.0.0.1/hosted/mcp"); dev.close();
@@ -578,6 +578,19 @@ class Provider implements OAuthClientProvider {
   saveDiscoveryState(d: OAuthDiscoveryState) { this.discovery = d; }
   discoveryState() { return this.discovery; }
 }
+test("URL-only SDK enrollment honors native challenge and obtains one tools+delivery grant", async () => {
+  const provider = new Provider();
+  const client = new Client({ name: "url-only", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  liveClients.push(client);
+  await expect(client.connect(new StreamableHTTPClientTransport(new URL(service.resource), { authProvider: provider }))).rejects.toThrow();
+  expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:delivery grayboard:tools");
+  const browser = new Browser(), consent = await loginConsent(browser, provider.authorization!.href);
+  const approved = await decide(browser, consent), callback = new URL(approved.headers.get("location")!);
+  expect(await auth(provider, { serverUrl: service.resource, authorizationCode: callback.searchParams.get("code")!, iss: callback.searchParams.get("iss")! })).toBe("AUTHORIZED");
+  expect(principal(provider.saved as Tokens, ["grayboard:tools", "grayboard:delivery"]).scopes).toEqual(["grayboard:delivery", "grayboard:tools"]);
+  expect(storage.db.query<{ count: number }, []>("SELECT count(*) AS count FROM oauth_grants").get()?.count).toBe(1);
+});
+
 test("official SDK binds one canonical default-port resource while preserving exact configured issuer and iss", async () => {
   const publicUrl = "https://grayboard.example.com:443/hosted";
   service.close();

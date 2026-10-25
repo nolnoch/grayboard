@@ -85,6 +85,24 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   return client;
 }
 
+for (const mapped of [true, false]) test(`unbound native resource catalog and snapshots match nonconsuming tools, mapped=${mapped}`, async () => {
+  const owner = await connect();
+  expect((await owner.callTool({ name: "board_create", arguments: { name: "general", purpose: "visible catalog" } })).isError).not.toBe(true);
+  const access = mapped ? token : issueOAuth(store.repo, oauth.resource, "reader@example.com").token;
+  const client = new Client({ name: "unbound-reader", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
+    requestInit: { headers: { Authorization: `Bearer ${access}` } },
+    fetch: (input, init) => hosted.fetch(new Request(input, init)),
+  }));
+  const resources = await client.listResources();
+  expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
+  expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
+  expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+  expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
+  expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);
+});
+
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: tools-only contexts preserve live owner and its status`, async () => {
   const events: DeliveryEvent[] = [];
   const owner = (await application.selectIdentity(user, "fe", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
@@ -349,7 +367,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
   try {
     await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } }).catch(() => undefined);
     expect(response).toBe(refusal);
-    expect(response!.headers.get("WWW-Authenticate")).toContain(`scope="grayboard:tools", error="${status === 401 ? "invalid_token" : "insufficient_scope"}"`);
+    expect(response!.headers.get("WWW-Authenticate")).toContain(`scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${status === 401 ? "invalid_token" : "insufficient_scope"}"`);
     expect(response!.headers.get("WWW-Authenticate")).toContain(oauth.resourceMetadata);
     expect(checks).toBe(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
@@ -377,7 +395,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
     release();
     await pending;
     expect(response!.status).toBe(401);
-    expect(response!.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${oauth.resourceMetadata}", scope="grayboard:tools", error="invalid_token"`);
+    expect(response!.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${oauth.resourceMetadata}", scope="grayboard:delivery grayboard:tools", error="invalid_token"`);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { release(); hosted.sessions.snapshot = original; }

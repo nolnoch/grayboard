@@ -38,6 +38,55 @@ beforeEach(async () => {
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = (body = "hello", pending = false) => application.send(sender, "bob@example.com/fe", body, { pending }).message_id;
 
+test("canceling duplicate open preserves accepted lease, children, receipts and notification owner", async () => {
+  let originalHints = 0, duplicateHints = 0;
+  await hosted.register(bob, context(bob), "child");
+  const first = await delivery.open(bob, context(bob), { changed: () => { originalHints++; } });
+  delivery.accept(first);
+  send();
+  const items = await delivery.pending(bob, context(bob), first.capability);
+  const duplicate = await delivery.open(bob, context(bob), { changed: () => { duplicateHints++; } });
+  await delivery.cancel(duplicate);
+  expect(delivery.activeLeaseCount).toBe(1);
+  expect(store.repo.hosted.all()).toHaveLength(2);
+  expect(originalHints).toBe(1);
+  send();
+  expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);
+  await delivery.receipt(bob, context(bob), first.capability, [items[0]!.id]);
+  await delivery.renew(bob, context(bob), first.capability);
+});
+
+test("successful reuse fences older creator cancellation; canceled reuse does not leak a canceled creator", async () => {
+  const creator = await delivery.open(bob, context(bob));
+  const reuse = await delivery.open(bob, context(bob));
+  delivery.accept(reuse);
+  await delivery.cancel(creator);
+  expect(delivery.activeLeaseCount).toBe(1);
+  expect(delivery.describe(bob, context(bob), reuse.capability).capability).toBe(creator.capability);
+  await delivery.release(bob, context(bob), reuse.capability);
+  await hosted.bind(bob, context(bob), { name: "fe" });
+  const next = await delivery.open(bob, context(bob));
+  const canceledReuse = await delivery.open(bob, context(bob));
+  await delivery.cancel(next);
+  expect(delivery.activeLeaseCount).toBe(1);
+  await delivery.cancel(canceledReuse);
+  expect(delivery.activeLeaseCount).toBe(0);
+  expect(store.repo.hosted.all()).toEqual([]);
+});
+
+test("old attempt cancellation cannot end a replacement generation or ownership", async () => {
+  const old = await delivery.open(bob, context(bob));
+  await hosted.bind(bob, context(bob), { name: "new", create: true });
+  const current = await delivery.open(bob, context(bob)); delivery.accept(current);
+  await delivery.cancel(old);
+  expect(delivery.describe(bob, context(bob), current.capability).bind_gen).toBeGreaterThan(old.bind_gen);
+  await delivery.release(bob, context(bob), current.capability);
+  await hosted.bind(bob, context(bob), { name: "new" });
+  const replacement = await delivery.open(bob, context(bob)); delivery.accept(replacement);
+  await delivery.cancel(current);
+  expect(delivery.describe(bob, context(bob), replacement.capability).ownership).not.toBe(current.ownership);
+});
+
 test("reads repeat without admission; receipt and dm_ack remain distinct", async () => {
   let hints = 0;
   const lease = await delivery.open(bob, context(bob), { changed: () => { hints++; throw new Error("lost hint"); } });

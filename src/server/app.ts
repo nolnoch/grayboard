@@ -25,6 +25,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
+  let slack: SlackBridge | undefined;
   const application = createApplication(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,
   });
@@ -45,7 +46,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
-  const slack = config.slack ? new SlackBridge({
+  slack = config.slack ? new SlackBridge({
     repo, db, application, ...config.slack,
     ...(process.env.GRAYBOARD_SLACK_DEBUG ? { debug: (msg: string) => console.error(`[grayboard slack] debug: ${msg}`) } : {}),
   }) : undefined;
@@ -59,7 +60,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
-  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin });
+  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
 
   const server = Bun.serve<WsData>({
     hostname: opts.hostname,

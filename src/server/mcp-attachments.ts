@@ -1,5 +1,6 @@
 import type { CoreDb } from "../core/boards.ts";
-import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
+import { ApplicationError } from "./application.ts";
+import { OPENCODE_SESSION_META, sessionContext, type HostedSessions } from "./hosted.ts";
 import type { Repo } from "./db.ts";
 import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.ts";
 import type { createOAuthServer } from "./oauth.ts";
@@ -15,7 +16,7 @@ const privateResponse = (response: Response) => {
   return response;
 };
 
-export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string }) {
+export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
   const origin = new URL(opts.trustedOrigin).origin;
   const paths = new Set(["/mcp/attachments", `${new URL(oauth.resource).pathname}/attachments`]);
   const pending = new Set<Promise<Response>>();
@@ -45,30 +46,45 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
         if (!allowed.includes(key) || seen.has(key) || /[\x00-\x1f\x7f\ufffd]/u.test(value)) return error("bad_request", "invalid query", 400);
         seen.add(key);
       }
-      const name = url.searchParams.get("identity")?.toLowerCase();
-      if (!name || !isValidIdentityName(name) || name === HUMAN_NAME) return error("bad_request", "invalid identity", 400);
-      const identity = repo.identities.findByUserAndName(principal.authed.user_id, name);
-      if (!identity) return error("not_found", "identity not found", 404);
+      const source = req.headers.get("X-Grayboard-Session");
+      let raw: string | undefined;
+      try {
+        if (source && source.length <= 12288) {
+          raw = decodeURIComponent(source);
+          if (encodeURIComponent(raw) !== source) return error("bad_request", "noncanonical source context", 400);
+        }
+      } catch { return error("bad_request", "invalid source context", 400); }
+      const context = sessionContext(principal, { [OPENCODE_SESSION_META]: raw });
       if (id !== undefined && (!/^[1-9]\d{0,14}$/.test(id) || !Number.isSafeInteger(Number(id)))) return error("bad_request", "invalid attachment id", 400);
       if (req.method === "POST") {
         const filename = url.searchParams.get("filename");
         if (!filename || filename.length > 255 || /[/\\]/.test(filename) || filename === "." || filename === "..") return error("bad_request", "invalid filename", 400);
       }
       const signal = AbortSignal.any([req.signal, shutdown.signal]);
-      const guard = () => {
-        if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
-        // Do not infer authentication failures from exceptions: persistence faults propagate.
-        const current = oauth.authenticate(req, ["grayboard:tools"]);
-        if (current instanceof Response) throw new Refusal(current);
-        const owned = repo.identities.findByUserAndName(current.authed.user_id, name);
-        if (!owned || owned.id !== identity.id) throw new Refusal(error("not_found", "identity not found", 404));
-      };
-      guard();
-      if (req.method === "POST") return await attachmentUpload(req, url, principal.authed, repo, db, uploads, guard, signal);
-      if (req.method === "GET") return await attachmentDownload(id!, url, principal.authed, repo, db, guard);
-      return await attachmentRelease(id!, url, principal.authed, repo, db, guard);
+      return await opts.sessions.transfer(principal, context, async (session, bindingGuard) => {
+        const asserted = url.searchParams.get("identity");
+        if (asserted !== null && asserted !== session.identityName) return error("forbidden", "identity differs from current source binding", 403);
+        const selected = new URL(url);
+        selected.searchParams.set("identity", session.identityName);
+        const guard = () => {
+          if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
+          const current = oauth.authenticate(req, ["grayboard:tools"]);
+          if (current instanceof Response) throw new Refusal(current);
+          bindingGuard();
+          const identity = repo.identities.findByUserAndName(principal.authed.user_id, session.identityName);
+          if (!identity || identity.id !== session.identityId) throw new Refusal(error("not_found", "identity not found", 404));
+        };
+        guard();
+        const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)
+          : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, db, guard)
+          : await attachmentRelease(id!, selected, principal.authed, repo, db, guard);
+        if (req.method === "POST" && req.body && !req.body.locked) await req.body.cancel();
+        guard();
+        return response;
+      });
     } catch (cause) {
       if (cause instanceof Refusal) return cause.response;
+      if (cause instanceof ApplicationError) return error(cause.code, cause.message, cause.code === "unauthenticated" ? 401 : 403);
       if (req.signal.aborted && cause === req.signal.reason) return error("cancelled", "request cancelled", 499);
       // Cancellation is not evidence that a simultaneous storage fault was auth failure.
       return error("internal", "internal error", 500);
@@ -87,7 +103,7 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
         const response = await handle(req, url, id);
         try {
           // Refusals before quota/body reading still own the original source.
-          if (req.method === "POST" && req.body) await req.body.cancel();
+          if (response.status >= 400 && req.method === "POST" && req.body) await req.body.cancel();
           return privateResponse(response);
         } catch {
           return privateResponse(error("internal", "internal error", 500));

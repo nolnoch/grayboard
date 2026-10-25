@@ -303,6 +303,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
     if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
     throw e;
   }
+  return db.transaction(() => {
   guard?.();
   if (guard) {
     const current = readableAttachment(repo, db, handle, row.id);
@@ -318,6 +319,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
       "Cache-Control": "private, no-store",
     },
   });
+  }).immediate();
 }
 
 // DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
@@ -326,7 +328,7 @@ export async function attachmentRelease(idStr: string, url: URL, authed: AuthedU
   const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   guard?.();
-  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
+  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr), {}, guard) : null;
   guard?.();
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });

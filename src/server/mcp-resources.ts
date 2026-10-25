@@ -135,9 +135,9 @@ export function registerHostedResources(server: McpServer, context: {
     const hooks = context.leaseHooks?.();
     const lease = await delivery.open(principal, sessionContext, hooks);
     hooks?.bind(lease.capability);
-    try { authorize(ctx.mcpReq.signal); return lease; }
+    try { authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
     catch (error) {
-      try { await delivery.cancel(lease.capability); } catch {}
+      try { await delivery.cancel(lease); } catch {}
       throw error;
     }
   }));

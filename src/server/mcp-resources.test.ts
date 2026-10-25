@@ -58,6 +58,37 @@ async function connect(version: string, role = "subscriber", signal?: AbortSigna
   return client;
 }
 
+for (const version of MCP_PROTOCOL_VERSIONS) for (const creatorHeld of [false, true]) test(`${version}: canceled open cannot release a successful shared lease, creatorHeld=${creatorHeld}`, async () => {
+  const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (p instanceof Response) throw new Error("fixture unauthorized");
+  const context = sessionContext(p, meta);
+  await hosted.sessions.register(p, context, "child");
+  const successful = await connect(version);
+  if (!creatorHeld) expect((await successful.callTool({ name: "delivery_open", arguments: {} })).isError).not.toBe(true);
+  const abort = new AbortController(), canceled = await connect(version, "subscriber", abort.signal);
+  const original = hosted.delivery.open;
+  let entered!: () => void, resume!: () => void;
+  const reached = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { resume = resolve; });
+  let first = true;
+  hosted.delivery.open = async (...args) => {
+    const result = await original(...args);
+    if (first) { first = false; entered(); await held; }
+    return result;
+  };
+  try {
+    const pending = canceled.callTool({ name: "delivery_open", arguments: {} }, { signal: abort.signal }).catch(error => error);
+    await reached;
+    if (creatorHeld) expect((await successful.callTool({ name: "delivery_open", arguments: {} })).isError).not.toBe(true);
+    const rows = store.repo.hosted.all(), ownership = rows[0]!.ownership_id;
+    abort.abort(); resume(); await pending; await Bun.sleep(0);
+    expect(hosted.activeLeases).toBe(1);
+    expect(store.repo.hosted.all()).toHaveLength(2);
+    expect(store.repo.hosted.all().every(row => row.ownership_id === ownership)).toBe(true);
+    expect((await successful.callTool({ name: "whoami", arguments: {} })).isError).not.toBe(true);
+    expect((await successful.callTool({ name: "delivery_open", arguments: {} })).isError).not.toBe(true);
+  } finally { resume(); hosted.delivery.open = original; }
+});
+
 for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abort", "close"] as const) test(`${version}: ${stop} after async lease selection releases new ownership`, async () => {
   const abort = new AbortController();
   const client = await connect(version, "subscriber", abort.signal);

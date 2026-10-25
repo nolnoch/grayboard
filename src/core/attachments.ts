@@ -68,7 +68,7 @@ export async function storeAttachment(
   blobs: BlobStore,
   uploader: string,
   file: AttachmentFile,
-  opts: { now?: number; quota?: UploadQuota } = {},
+  opts: { now?: number; quota?: UploadQuota; guard?: () => void } = {},
 ): Promise<AttachmentRow> {
   const now = opts.now ?? Date.now();
   const sha256 = sha256Hex(file.data);
@@ -76,6 +76,7 @@ export async function storeAttachment(
   try {
     return await withBlob(sha256, async () => {
       const row = db.transaction(() => {
+        opts.guard?.();
         unnamed = pruneUnbound(db, now - UNBOUND_TTL_MS) > 0;
         const q = opts.quota;
         // Bytes the principal already has under this blob add nothing.
@@ -251,10 +252,11 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
 
 // Drops one of `uploader`'s unsent uploads, for a send that failed after
 // uploading. Null if it isn't theirs or a message or post already carries it.
-export async function releaseUpload(db: Database, blobs: BlobStore, id: number, uploader: string): Promise<AttachmentRow | null> {
-  const row = db
-    .prepare(`DELETE FROM attachments WHERE id = ? AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`)
-    .get(id, uploader) as AttachmentRow | null;
+export async function releaseUpload(db: Database, blobs: BlobStore, id: number, uploader: string, guard?: () => void): Promise<AttachmentRow | null> {
+  const row = db.transaction(() => {
+    guard?.();
+    return db.prepare(`DELETE FROM attachments WHERE id = ? AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`).get(id, uploader) as AttachmentRow | null;
+  }).immediate();
   if (row) await sweepBlobs(db, blobs);
   return row;
 }

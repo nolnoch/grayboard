@@ -9,6 +9,7 @@ import { openDatabase } from "./db.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
 
 let dir: string, now: number;
@@ -94,6 +95,50 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   expect(rows[0]?.name).toBe("fe");
   expect(releases()).toEqual([{ detail: "expired" }]);
 }, 15_000);
+
+function external(operation: Record<string, unknown>) {
+  const result = Bun.spawnSync([process.execPath, "tests/support/hosted-operation.ts", join(dir, "bus.db"), join(dir, "blobs"), JSON.stringify({ now, ...operation })], { stdin: Buffer.from(""), env: { ...process.env, BUS_TEST_PAUSE: "", BUS_TEST_PAUSE_FILE: "" } });
+  expect(result.exitCode).toBe(0);
+  return JSON.parse(result.stdout.toString().trim().split("\n").at(-1)!);
+}
+
+for (const operation of ["revoke", "bind"] as const) {
+  test(`external ${operation} before receipt lock cannot consume an issued batch`, async () => {
+    const issued = issue(), { principal } = issued;
+    await hosted.bind(principal, context(principal), { name: "fe", create: true });
+    const lease = await delivery.open(principal, context(principal));
+    database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false);
+    const batch = await delivery.pending(principal, context(principal), lease.capability);
+    const receipt = hostedPause("hosted:receipt:before-txn", () => delivery.receipt(principal, context(principal), lease.capability, batch.map(item => item.id)), async () => {
+      expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
+    });
+    await expect(receipt).rejects.toHaveProperty("code", "not_found");
+    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(0);
+  });
+
+  test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
+    const issued = issue(), { principal } = issued;
+    await hosted.bind(principal, context(principal), { name: "fe", create: true });
+    const message = database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false);
+    const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
+    expect(results.every(result => result.ok)).toBe(true);
+    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(message.id);
+  }, 15_000);
+}
+
+for (const child of [false, true]) test(`external rebind during native dispatch await fences old snapshot, child=${child}`, async () => {
+  const { principal } = issue();
+  await hosted.bind(principal, context(principal), { name: "fe", create: true });
+  if (child) await hosted.register(principal, context(principal), "child");
+  let dispatched = false;
+  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", session => {
+    dispatched = true;
+    return application.call(session, "peer_status", { text: "stale write" });
+  }), async () => { expect(external({ operation: "bind", principal, name: "be" }).ok).toBe(true); });
+  await expect(call).rejects.toHaveProperty("code", "unbound");
+  expect(dispatched).toBe(false);
+  expect(database.db.query<{ status: string | null }, []>("SELECT status FROM handles WHERE name='you@example.com/fe'").get()?.status).not.toBe("stale write");
+});
 
 test("two restarts retain ownership and deadline; expiry rebuild releases exactly once", async () => {
   const { principal } = issue();
