@@ -17,11 +17,19 @@ export class Binding {
     return { type: "remote" as const, url: url.href, configHash };
   }
   async watch(expected: Expected) {
-    return this.ctx.mcp.transform(editor => {
-      try {
-        if (!same(this.endpoint(editor.get(this.name)), { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.drift();
-      } catch { this.drift(); }
+    let active = true;
+    const registration = await this.ctx.mcp.transform(editor => {
+      const check = () => {
+        if (!active) return;
+        try {
+          if (!same(this.endpoint(editor.get(this.name)), { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.drift();
+        } catch { this.drift(); }
+      };
+      check();
+      // Later synchronous transforms can still mutate this editor.
+      queueMicrotask(check);
     });
+    return { async dispose() { active = false; await registration.dispose(); } };
   }
   async configuration() {
     let result: ReturnType<Binding["endpoint"]>;

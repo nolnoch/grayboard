@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { OpenCode } from "@opencode/sdk";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import { durableCases, DurableFixture } from "./durable-cases.ts";
 
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
 assert(root); assert.equal(Bun.version, "1.4.4");
@@ -21,6 +22,21 @@ let modelIssued = false;
 const parallelDispatch = new Set<string>(), streams = new Map<string, Set<symbol>>();
 const opened: { session: string; name: string; ownership: number }[] = [];
 const receipted = new Set<string>();
+const durable = mode === "durable" ? new DurableFixture(root) : undefined;
+if (durable?.phase === "reload") {
+  const saved = await Bun.file(join(root, "service.json")).json();
+  for (const [id, value] of saved.sessions) sessions.set(id, value);
+  nextOwnership = saved.nextOwnership;
+  const replay = await Bun.file(join(root, "durable.json")).json();
+  for (const [id, items] of replay.batches) durable.batches.set(id, items.map((item: import("./durable-cases.ts").Batch) => ({ ...item, event: { text: "ALTERED REPLAY MUST NOT REPLACE ORIGINAL" } })));
+  durable.holding = false;
+}
+const instrumented = durable ? Plugin.define({ ...installed, setup(c) {
+  return installed.setup({ ...c, session: new Proxy(c.session, { get(session, key) {
+    if (key === "synthetic") return (input: Parameters<Context["session"]["synthetic"]>[0]) => durable.synthetic(input, value => session.synthetic(value));
+    return Reflect.get(session, key);
+  } }) });
+} }) : installed;
 const state = (id: string) => { if (!sessions.has(id)) sessions.set(id, { name: null, ownership: null, gen: 0 }); return sessions.get(id)!; };
 const fetch0 = globalThis.fetch;
 const json = (id: unknown, result: unknown) => Response.json({ jsonrpc: "2.0", id, result });
@@ -37,7 +53,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const args = mode === "code" ? { code: ordinary ? "return await tools.grayboard.whoami({})" : target === "parallel" ? 'return await Promise.all([tools.grayboard.bind({name:"parallel-first"}),tools.grayboard.bind({name:"parallel-final"})])' : `return await tools.grayboard.bind({name:${JSON.stringify(value)}})` } : ordinary ? {} : { name: value };
       return { index, id: "call_fixture_" + index, type: "function", function: { name, arguments: JSON.stringify(args) } };
     });
-    const delta = done ? { content: "done" } : { role: "assistant", tool_calls };
+    const delta = done || durable ? { content: "done" } : { role: "assistant", tool_calls };
     return new Response("data: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + "\n\ndata: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: done ? "stop" : "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + "\n\ndata: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
   }
   if (url.origin !== issuer) throw new Error("Nonfixture network denied: " + url.origin);
@@ -50,7 +66,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     codes++; return Response.json({ access_token: "fixture-access", token_type: "Bearer", expires_in: 3600, refresh_token: "fixture-refresh", scope });
   }
   assert.equal(url.pathname, "/mcp");
-  if (req.headers.get("Authorization") !== "Bearer fixture-access") return new Response(null, { status: 401, headers: { "WWW-Authenticate": `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource", scope="${scope}"` } });
+  if ((durable?.revoked && req.headers.get("X-Grayboard-Client") === "subscriber") || !["Bearer fixture-access", "Bearer fixture-other-access"].includes(req.headers.get("Authorization") ?? "")) return new Response(null, { status: 401, headers: { "WWW-Authenticate": `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource", scope="${scope}"` } });
   if (req.method === "GET") return new Response(null, { status: 405 });
   if (req.method === "DELETE") return new Response(null, { status: 200 });
   const b = await req.json() as any;
@@ -75,7 +91,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
   }
   if (b.method === "resources/read") {
-    const items = s.name === "parallel-final" && !receipted.has(session) ? [{ id: "fixture:parallel", actionable: false, event: { text: "Final parallel digest" }, ownership: s.ownership, bind_gen: s.gen, name: s.name }] : [];
+    if (durable && !durable.batches.has(session)) await wait(async () => durable.batches.has(session), Boolean, "durable batch ready");
+    const items = durable ? (durable.batches.get(session) ?? []).filter(i => !durable.cursor.has(i.id)) : s.name === "parallel-final" && !receipted.has(session) ? [{ id: "fixture:parallel", actionable: false, event: { text: "Final parallel digest" }, ownership: s.ownership, bind_gen: s.gen, name: s.name }] : [];
     return json(b.id, { resultType: "complete", ttlMs: 0, cacheScope: "private", contents: [{ uri: b.params.uri, mimeType: "application/json", text: JSON.stringify({ items }) }] });
   }
   if (b.method !== "tools/call") return json(b.id, {});
@@ -106,7 +123,12 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user: { id: 1, email: "you@example.com" }, identity: s.name, identity_full: "you@example.com/" + s.name, issuer, resource } }));
   }
   if (name.startsWith("delivery_")) {
+    if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, content: [{ type: "text", text: "no live delivery lease" }] });
     assert.equal(req.headers.get("X-Grayboard-Lease"), s.capability);
+    if (durable && name === "delivery_receipt") {
+      try { durable.receipt(session, args.ids); } catch { throw new Error("fixture receipt connection disconnected"); }
+      return json(b.id, result({ ok: true }));
+    }
     if (name === "delivery_receipt") {
       assert.deepEqual(args.ids, ["fixture:parallel"]);
       receipted.add(session);
@@ -117,10 +139,11 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch;
 const fixture = Plugin.define({ id: "grayboard.native.fixture", async setup(c) {
   ctx = c;
-  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, codemode: mode === "code" }));
+  await c.mcp.transform(e => e.set("grayboard", { type: "remote", url: resource, codemode: mode === "code", ...(durable?.configAway ? { headers: { "X-Fixture-Drift": "away" } } : {}) }));
   const p = Provider.ID.make("fixture");
   await c.provider.transform(e => e.add({ info: { ...Provider.Info.empty(p), name: "Fixture", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: "https://model.example.com/v1" } }, models: [{ ...Model.Info.default(p, Model.ID.make("fixture")), name: "Fixture" }] }));
   await c.session.hook("title", e => { e.result = "Fixture"; });
+  if (durable) await c.session.hook("http.request", e => { if (e.kind === "primary") durable.models.push(e.sessionID); });
 } });
 async function wait<T>(read: () => Promise<T>, predicate: (v: T) => boolean, label: string) {
   for (let i = 0; i < 240; i++) { const v = await read(); if (predicate(v)) return v; await Bun.sleep(50); }
@@ -128,23 +151,31 @@ async function wait<T>(read: () => Promise<T>, predicate: (v: T) => boolean, lab
 }
 let host: Awaited<ReturnType<typeof OpenCode.create>> | undefined;
 try {
-  host = await OpenCode.create({ plugins: mode === "disabled" ? [fixture] : [fixture, installed], database: { path: join(root, "native-host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "native-config"), project: false, claude: false }, fs: { filewatcher: false } });
+  host = await OpenCode.create({ plugins: mode === "disabled" ? [fixture] : [fixture, instrumented], database: { path: join(root, "native-host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "native-config"), project: false, claude: false }, fs: { filewatcher: false } });
   const location = { directory: join(root, "project") };
   await host.agent.list({ location });
   const rpc = host.rpc(Grayboard);
   await wait(async () => ctx, Boolean, "fixture setup");
-  const native = await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), x => x?.status.status === "needs_auth", "native discovery");
+  const native = await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), x => durable?.phase === "reload" ? !!x?.integrationID : x?.status.status === "needs_auth", "native discovery");
   assert(native?.integrationID);
   const integrationID = native.integrationID;
+  if (durable?.phase !== "reload") {
   const method = (await ctx.integration.get({ integrationID })).data?.methods.find(m => m.type === "oauth"); assert(method);
   const attempt = await ctx.integration.oauth.connect({ integrationID, methodID: method.id });
   const auth = new URL(attempt.data.url), returned = new URL(auth.searchParams.get("redirect_uri")!); callbackOrigin = returned.origin;
   assert.equal(auth.searchParams.get("client_id"), "fixture-native-client");
   returned.searchParams.set("code", "fixture-code"); returned.searchParams.set("state", auth.searchParams.get("state")!); returned.searchParams.set("iss", issuer);
   assert.equal((await fetch(returned)).status, 200);
+  }
   await wait(() => ctx.integration.connection.active(integrationID), Boolean, "native credential");
   await host.mcp.connect({ server: "grayboard", location });
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tool");
+  if (durable) {
+    await durableCases(durable, host, ctx, rpc, location, state);
+    assert.equal(codes, durable.phase === "reload" ? 0 : 1); assert.equal(refreshes, 0);
+    console.log("DURABLE_NATIVE_AUTH_OK", JSON.stringify({ scenario: durable.scenario, boundary: durable.boundary, phase: durable.phase, codes, refreshes }));
+    await Bun.write(join(root, "service.json"), JSON.stringify({ sessions: [...sessions], nextOwnership }));
+  } else {
   const a = await host.session.create({ location, title: "Root A", permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   if (mode === "disabled") {
     await host.session.switchModel({ sessionID: a.id, model: { providerID: "fixture", id: "fixture" } });
@@ -200,5 +231,6 @@ try {
   await rpc.pause({}, { location }); assert.equal(state(b.id).name, null);
   assert.equal(codes, 1); assert.equal(refreshes, 0);
   console.log("NATIVE_HOST_OK", JSON.stringify({ mode, codes, refreshes, roots: [a.id, b.id], child: child.id, grandchild: grandchild.id, opens: calls.filter(c => c.name === "delivery_open").length }));
+  }
   }
 } finally { await host?.close(); globalThis.fetch = fetch0; }

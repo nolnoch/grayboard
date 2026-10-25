@@ -28,6 +28,13 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
   })();
   restoring = (async () => {
     await new Promise(resolve => setTimeout(resolve, 0));
+    for (let attempt = 0; attempt < 50 && !events.signal.aborted; attempt++) {
+      try { await controller.binding.configuration(); break; }
+      catch (error) {
+        if (!(error instanceof Refusal) || error.code !== "binding" || attempt === 49) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
     await controller.restore().catch(error => events.signal.aborted ? undefined : controller.pause(error instanceof Refusal ? error.message : "Saved enrollment unavailable; explicitly enroll again")).catch(() => {});
   })();
   return async () => {

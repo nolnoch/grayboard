@@ -67,6 +67,22 @@ test("static authority headers and disabled OAuth never become subscriber author
   const f = fixture(); f.config.oauth = false;
   await expect(f.binding.capture()).rejects.toThrow(); expect(f.resolutions).toBe(0);
 });
+test("watch rechecks later synchronous editor changes and fences disposed observers", async () => {
+  const f = fixture(), e = await f.binding.capture();
+  const watch = await f.binding.watch(e);
+  f.reload();
+  f.config.headers["X-Later-Transform"] = "away";
+  await Promise.resolve();
+  expect(f.drifts).toBeGreaterThan(0);
+  const g = fixture(), saved = await g.binding.capture();
+  const disposed = await g.binding.watch(saved);
+  g.reload();
+  const disposing = disposed.dispose();
+  g.config.url = "https://other.example.com/mcp";
+  await disposing; await Promise.resolve();
+  expect(g.drifts).toBe(0);
+  await watch.dispose();
+});
 test("incomplete public OAuth metadata fails closed rather than inventing client or scopes", async () => {
   for (const key of ["issuer", "scope", "client", "serverUrl"] as const) {
     const f = fixture(); delete (f.metadata as Partial<typeof f.metadata>)[key];
