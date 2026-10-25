@@ -13,7 +13,7 @@ import { localEnv } from "./env.ts";
 import { onChannelDm, messageText, startFakeModel, type ChatRequest, type Reply, type Rule } from "./fake_model.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
-import { grayboardChildren } from "./procs.ts";
+import { adapterChildren, grayboardChildren } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
@@ -168,6 +168,7 @@ async function scenario(dir: string, bin?: string): Promise<void> {
     await pi.command({ type: "get_state" });
     await until(async () => (await p.call("peer_list")).peers.some((x: any) => x.handle === "pi"), 15_000, "pi online");
     expect(grayboardChildren(pi.pid, bin)).toHaveLength(1);
+    expect(adapterChildren(pi.pid, bin)).toHaveLength(1);
 
     // Digest: no model call. It reaches the session with the next wake, or with
     // the first drain if the adapter's MCP handshake finishes after this post.
@@ -300,6 +301,14 @@ export function piReenabledScenario(dir: string, bin?: string): Promise<void> {
       const notice = await until(() => pi.notices().find((n) => n.includes("is enabled")), 15_000, "refusal notice");
       expect(notice).toContain(join(dir, "pi-agent", "mcp.json"));
       expect(notice).toContain('"enabled": false');
+      // The extension would have spawned in session_start, before pi answered
+      // get_state; pi's own child for the entry is in its own process group.
+      expect(adapterChildren(pi.pid, bin)).toEqual([]);
+      // pi's default codemode exposure doesn't declare the entry's tools, so any
+      // mcp__grayboard__ tool in the request is one the extension registered.
+      await pi.command({ type: "prompt", message: "start" });
+      await until(() => model.requests.length > 0, 15_000, "model call");
+      expect(requestTools(model.requests[0]!).filter((n) => n.startsWith("mcp__grayboard__"))).toEqual([]);
       await pi.quit();
     } finally {
       await stopAll(procs);
