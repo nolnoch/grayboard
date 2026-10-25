@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse } from "jsonc-parser";
@@ -204,16 +204,48 @@ test("migration dry-run validates all inputs without creating backups or moving 
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
 });
 
-test("injected replacement failure restores config/adapter and removes created backups/temp", () => {
+test("injected replacement failure restores adapter and retains config backup for manual recovery", () => {
   const f = fixture();
   writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
   const before = readFileSync(f.config, "utf8");
   f.seedAdapter();
-  expect(() => setupOpenCode({ ...f.opts, migrate: true }, source, () => { throw new Error("injected failure"); })).toThrow("injected failure");
+  const injected = new Error("injected failure");
+  let failure: unknown;
+  try { setupOpenCode({ ...f.opts, migrate: true }, source, () => { throw injected; }); } catch (e) { failure = e; }
+  expect((failure as Error).cause).toBe(injected);
+  expect((failure as Error).message).toContain("manual recovery");
   expect(readFileSync(f.config, "utf8")).toBe(before);
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
-  expect(existsSync(f.config + ".grayboard-backup")).toBe(false);
+  expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe(before);
   expect(existsSync(f.adapter + ".grayboard-backup")).toBe(false);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+});
+
+for (const replacement of ["file", "edit", "symlink", "directory"]) test(`rollback retains concurrent ${replacement} config backup and concurrent selected config`, () => {
+  const f = fixture();
+  const original = JSON.stringify({ mcp: { grayboard: f.old } });
+  writeFileSync(f.config, original); f.seedAdapter();
+  const backup = f.config + ".grayboard-backup", saved = backup + ".saved", target = join(f.root, "user-target");
+  const concurrent = '{"concurrent":"selected replacement"}';
+  writeFileSync(target, "user backup data");
+  let failure: unknown;
+  try {
+    setupOpenCode({ ...f.opts, migrate: true }, source, () => {
+      if (replacement !== "edit") renameSync(backup, saved);
+      if (replacement === "symlink") symlinkSync(target, backup);
+      else if (replacement === "directory") { mkdirSync(backup); writeFileSync(join(backup, "retained"), "user backup data"); }
+      else writeFileSync(backup, "user backup data");
+      writeFileSync(f.config, concurrent);
+    });
+  } catch (e) { failure = e; }
+  expect((failure as Error).message).toContain("manual recovery");
+  expect(((failure as Error).cause as Error)?.message).toContain("Config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(concurrent);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readFileSync(target, "utf8")).toBe("user backup data");
+  if (replacement === "symlink") expect(readlinkSync(backup)).toBe(target);
+  else expect(readFileSync(replacement === "directory" ? join(backup, "retained") : backup, "utf8")).toBe("user backup data");
+  if (replacement !== "edit") expect(readFileSync(saved, "utf8")).toBe(original);
   expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
 });
 

@@ -35,11 +35,11 @@ jobs:
           SUITE: ${{ matrix.suite }}
         run: bash scripts/e2e.sh "hosted-$SUITE"
 
-      - name: Upload redacted evidence only
+      - name: Upload allowlisted evidence only
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
           name: hosted-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hosted-run
+          path: ${{ runner.temp }}/hosted-run/evidence
           retention-days: 7
           if-no-files-found: warn

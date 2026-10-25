@@ -3,6 +3,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 package="$root/adapters/opencode-v2"
 : "${GRAYBOARD_E2E_RUN_DIR:?Run through scripts/e2e.sh}"
+: "${GRAYBOARD_EVIDENCE_PRIVATE:?Internal runner; use scripts/e2e.sh}"
 [[ "$(bun --version)" == 1.4.4 ]] || { echo "Bun 1.4.4 required" >&2; exit 1; }
 # Retain logs/provenance, never upload the isolated HOME, auth store or databases.
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/grayboard-hosted.XXXXXX")"

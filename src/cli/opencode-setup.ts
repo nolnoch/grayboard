@@ -310,8 +310,12 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
       else linkSync(move.backup, move.path);
       unlinkSync(move.backup);
     });
-    if (backedUp && !incomplete) recover(() => unlinkSync(configBackup));
-    if (incomplete) throw new Error("OpenCode setup failed; manual recovery required. Concurrent entries were preserved and useful backups retained; recovery may be incomplete", { cause: e });
+    // A backup pathname may have been replaced or edited; never delete it on rollback.
+    if (backedUp) incomplete = true;
+    if (incomplete) {
+      const changed = e instanceof Error && e.message.startsWith("Config changed during setup") ? "Config changed during setup. " : "";
+      throw new Error(changed + "OpenCode setup failed; manual recovery required. Concurrent entries were preserved and config backups retained; recovery may be incomplete", { cause: e });
+    }
     throw e;
   }
   return { changed, migrated: migration, dryRun: false };

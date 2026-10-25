@@ -49,11 +49,11 @@ verdict() {
 case "$suite" in
   hosted-*)
     export GRAYBOARD_E2E_RUN_DIR="$run"
-    # Logs may contain fixture IDs, but never keep auth storage or raw HTTP headers.
-    if bash scripts/hosted-e2e.sh "${suite#hosted-}" 2>&1 | sed -E 's/(Bearer )[A-Za-z0-9._~+\/-]+/\1[REDACTED]/g; s/("(access_token|refresh_token|client_secret)"[[:space:]]*:[[:space:]]*")[^"]*/\1[REDACTED]/g' | tee "$run/hosted.log"; then
+    # The child stream and raw JUnit stay private; only constructed metadata is public.
+    if bun scripts/hosted-evidence.ts "${suite#hosted-}" "$run"; then
       verdict 'passed'
     else
-      verdict 'failed (hosted.log in the run dir)'
+      verdict 'failed (safe evidence summary in the run dir; raw diagnostics private)'
     fi
     ;;
   upgrade-matrix)

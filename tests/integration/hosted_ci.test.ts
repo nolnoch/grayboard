@@ -16,6 +16,9 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   expect(hosted).toContain("contents: read");
   expect(hosted).toContain("if: always()");
   expect(hosted).toContain("retention-days: 7");
+  expect(hosted).toContain("path: ${{ runner.temp }}/hosted-run/evidence");
+  expect(read("scripts/e2e.sh")).toContain("bun scripts/hosted-evidence.ts");
+  expect(read("scripts/e2e.sh")).not.toContain("tee \"$run/hosted.log\"");
   expect(hosted).not.toContain("continue-on-error");
   expect(hosted).not.toContain("secrets: inherit");
   for (const workflow of ["test", "release"]) expect(read(`.github/workflows/${workflow}.yml`)).toContain("uses: ./.github/workflows/hosted.yml");
