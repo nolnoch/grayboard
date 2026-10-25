@@ -6,7 +6,7 @@
 // grayboard (binaries.e2e.ts) instead of this checkout, with the adapter that
 // binary carries.
 import { expect } from "bun:test";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { localEnv } from "./env.ts";
@@ -39,7 +39,9 @@ class Pi {
         buf = buf.slice(nl + 1);
         try {
           this.events.push(JSON.parse(line));
-        } catch {}
+        } catch {
+          // pi prints non-JSON lines (banners, notices) alongside the RPC stream.
+        }
       }
     });
     proc.stderr!.setEncoding("utf8").on("data", (chunk: string) => {
@@ -75,9 +77,14 @@ type PiOpts = {
   identity?: string | null;
   // Merged over the grayboard entry setup writes.
   entry?: Record<string, unknown>;
+  // Extra env for the pi process (and its grayboard child): e.g. BUS_LAUNCHER.
+  env?: Record<string, string>;
+  // Local package paths declared in the agent dir's settings.json (a local
+  // package loads from the path; nothing is installed or fetched).
+  packages?: string[];
 };
 
-function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {} }: PiOpts = {}): Pi {
+function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, env = {}, packages }: PiOpts = {}): Pi {
   const agentDir = join(dir, "pi-agent");
   const extension = join(agentDir, "extensions", "grayboard.ts");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
@@ -100,9 +107,10 @@ function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, i
       fake: { baseUrl: `http://localhost:${modelPort}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-1" }] },
     },
   }));
+  if (packages?.length) writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages }));
   const proc = spawn("node", [PI_CLI, "--mode", "rpc", "--no-session", "--offline", "--provider", "fake", "--model", "fake-1"], {
     cwd: dir,
-    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }),
+    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...env }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
@@ -355,4 +363,122 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
       model.stop();
     }
   });
+}
+
+// The delegation round trip (#243): a real pi launcher session receives a
+// `delegate` request, its adapter translates the payload into the native
+// `subagent` call (persona → agent file), a real pi-subagents child runs the
+// task, and the result returns in the requester's thread. This is the
+// real-spawn evidence #246's review asked for (issue 14): no script fakes the
+// spawn — the child is a real pi-subagents run, whose model calls hit the
+// same fake model.
+export function piDelegationScenario(dir: string): Promise<void> {
+  return named(() => delegationScenario(dir));
+}
+
+async function delegationScenario(dir: string): Promise<void> {
+  const procs: ChildProcess[] = [];
+  let model: ReturnType<typeof startFakeModel> | undefined;
+  const TASK = "Reply with exactly DELEGATION-E2E-OK and nothing else.";
+  const RESULT = "DELEGATION-E2E-OK";
+  try {
+    // The launcher's agent dir: the researcher agent file (its frontmatter
+    // pins the fake model, so the child's calls land on the scripted
+    // server), and pi-subagents as a local package (the `subagent` tool).
+    const agentDir = join(dir, "pi-agent");
+    const subagents = join(ROOT, "node_modules", "pi-subagents");
+    if (!existsSync(subagents)) throw new Error("pi-subagents is not installed; bun install first");
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "agents", "researcher.md"),
+      "---\ndescription: Research with sources.\nmodel: fake/fake-1\n---\nYou are a researcher. Follow the task exactly.\n",
+    );
+
+    // The launcher's script: on the delegation DM, spawn the native way;
+    // when the subagent's result is in, report it in the thread. The child
+    // answers its own model call — the task, no channel tags (it has no
+    // grayboard: ambient extensions don't load in children; parent-relay is
+    // the floor, and the launcher does the reporting).
+    const dmRe = /<channel source="grayboard" message_id="(\d+)" from="sim"/;
+    model = startFakeModel([
+      (req) => {
+        const text = req.messages.map(messageText).join("\n");
+        if (text.includes("DELEGATION-E2E-OK") && !text.includes("<channel")) return { text: RESULT };
+        return undefined;
+      },
+      (req) => {
+        const at = req.messages.findLastIndex((m) => dmRe.test(messageText(m)));
+        if (at < 0) return undefined;
+        const done = req.messages.slice(at + 1).filter((m) => m.role === "assistant").length;
+        const id = Number(dmRe.exec(messageText(req.messages[at]!))![1]);
+        if (done === 0) return { tool: "subagent", args: { agent: "researcher", task: TASK } };
+        if (done === 1) return { tool: "mcp__grayboard__dm_send", args: { to: "sim", body: `Result: ${RESULT}`, parent_id: id } };
+        return { text: "reported" };
+      },
+    ]);
+
+    const sim = await localSession(dir, "sim");
+    const pi = startPi(dir, model.port, procs, { identity: "pi", env: { BUS_LAUNCHER: "1" }, packages: [subagents] });
+    await pi.command({ type: "get_state" });
+    await until(
+      async () => (await sim.call("peer_list")).peers.some((x: any) => x.handle === "pi" && x.launcher),
+      20_000,
+      "pi online as a launcher",
+    );
+
+    // The delegation: routed to the pi launcher, delivered by push.
+    const r = await sim.call("delegate", { persona: "a researcher", task: TASK });
+    expect(r.to).toBe("pi");
+    expect(r.delivered_now).toBe(true);
+
+    // The launcher's first turn carries the payload AND the adapter's
+    // translation: the native spawn call, the persona resolved to the agent
+    // file, no model name anywhere.
+    await until(() => model.requests.length > 0, 30_000, "the launcher's first turn");
+    const firstText = model.requests[0]!.body.messages.map(messageText).join("\n");
+    expect(firstText).toContain(`<channel source="grayboard" message_id="${r.message_id}" from="sim"`);
+    expect(firstText).toContain('"persona": "a researcher"');
+    expect(firstText).toContain("native spawn call");
+    expect(firstText).toContain('"agent": "researcher"');
+    expect(firstText).not.toMatch(/glm|sonnet|opus|gpt-/i);
+
+    // The child really ran: its own model call reached the fake model, and
+    // the subagent tool result carries its reply.
+    await until(() => pi.events.some((e) => e.type === "agent_settled"), 180_000, "the launcher's turn");
+    const childCalls = model.requests.filter((q) => {
+      const t = q.body.messages.map(messageText).join("\n");
+      return t.includes("DELEGATION-E2E-OK") && !t.includes("<channel");
+    });
+    expect(childCalls.length).toBeGreaterThanOrEqual(1);
+    const sub = (await pi.messages()).filter((m) => m.toolName === "subagent");
+    expect(sub).toHaveLength(1);
+    expect(sub[0]!.isError).toBeFalsy();
+    expect(JSON.stringify(sub[0]!.content)).toContain(RESULT);
+
+    // The result returned in the requester's thread, and the promise
+    // settled by the requester's dm_ack.
+    const thread = await until(
+      async () => {
+        const t = (await sim.call("dm_thread", { thread: r.message_id })) as { sender: string; body: string; parent_id: number | null }[];
+        return t.length >= 2 ? t : undefined;
+      },
+      30_000,
+      "the result in the thread",
+    );
+    expect(thread[1]!.sender).toBe("pi");
+    expect(thread[1]!.parent_id).toBe(r.message_id);
+    expect(thread[1]!.body).toContain(RESULT);
+    await sim.call("dm_ack", { message_id: [r.message_id] });
+    await until(
+      async () => !((await sim.call("dm_inbox")).promised ?? []).some((p: any) => p.to === "pi"),
+      10_000,
+      "the promise settled",
+    );
+
+    expect(model.unhandled).toEqual([]);
+    await pi.quit();
+  } finally {
+    await stopAll(procs);
+    model?.stop();
+  }
 }

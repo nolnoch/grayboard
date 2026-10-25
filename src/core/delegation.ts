@@ -199,6 +199,37 @@ export function launcherInstruction(): string[] {
   ];
 }
 
+// The delegation payload, parsed back out of a body the builders above made.
+// This is the harness-neutral seam of #243: an adapter detects a delegation DM
+// and gets the structured fields to translate into its harness's native spawn
+// call, without scraping prose. Builder and parser live side by side so a
+// shape change fails the drift test (adapters/pi/delegation.test.ts); only a
+// well-formed payload parses — anything else is null, and the adapter treats
+// it as an ordinary DM.
+export type DelegationPayload = { requester: string; persona: string; task: string; context?: string };
+
+export function parseDelegationBody(body: string): DelegationPayload | null {
+  if (!body.startsWith("[delegation request from ")) return null;
+  const at = body.indexOf(`\n${FENCE}json\n`);
+  if (at < 0) return null;
+  const start = at + 1 + FENCE.length + "json\n".length;
+  const end = body.indexOf(`\n${FENCE}`, start);
+  if (end < 0) return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(body.slice(start, end));
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.requester !== "string" || !d.requester) return null;
+  if (typeof d.persona !== "string" || !d.persona) return null;
+  if (typeof d.task !== "string" || !d.task) return null;
+  if (d.context !== undefined && typeof d.context !== "string") return null;
+  return { requester: d.requester, persona: d.persona, task: d.task, ...(d.context !== undefined ? { context: d.context } : {}) };
+}
+
 // The delegate result's delegation-specific note, the same in every mode. The
 // promise settles when the REQUESTER settles the thread (a later message of
 // theirs or a dm_ack) — the launcher's reply alone leaves it listed.

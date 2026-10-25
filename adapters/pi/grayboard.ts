@@ -17,7 +17,7 @@
 // client doesn't serve a second set of the same tools.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +52,88 @@ function readEntry(path: string): McpEntry | undefined {
   } catch {
     return undefined;
   }
+}
+
+// ── Delegation translation (#243) ───────────────────────────────────────────
+//
+// A delegation DM (src/core/delegation.ts's builders) is rendered with its
+// native spawn call appended: the persona resolves to an agent file in the
+// user's agents dir, so the launcher's next action is its harness's `subagent`
+// tool, not free-text interpretation. The parser is inlined — the adapter
+// ships standalone — and drift-tested against the core builder
+// (delegation.test.ts beside this file).
+
+export type DelegationPayload = { requester: string; persona: string; task: string; context?: string };
+
+const DATA_FENCE = "````";
+
+export function parseDelegation(body: string): DelegationPayload | null {
+  if (!body.startsWith("[delegation request from ")) return null;
+  const at = body.indexOf(`\n${DATA_FENCE}json\n`);
+  if (at < 0) return null;
+  const start = at + 1 + DATA_FENCE.length + "json\n".length;
+  const end = body.indexOf(`\n${DATA_FENCE}`, start);
+  if (end < 0) return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(body.slice(start, end));
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.requester !== "string" || !d.requester) return null;
+  if (typeof d.persona !== "string" || !d.persona) return null;
+  if (typeof d.task !== "string" || !d.task) return null;
+  if (d.context !== undefined && typeof d.context !== "string") return null;
+  return { requester: d.requester, persona: d.persona, task: d.task, ...(d.context !== undefined ? { context: d.context } : {}) };
+}
+
+// The persona's agent file: the runtime name is the filename (pi-subagents
+// discovery, user scope: <agent-dir>/agents/**/*.md; nested dirs flattened by
+// taking the filename — a same-name file wins/loses by pi's own precedence,
+// which this only previews). Exact name (an "a/an" article stripped), then a
+// name the persona names as a word, then a name contained in it, longest
+// first so "doc-writer" beats "doc". null: no file matches, and the payload's
+// persona text guides the agent's own choice.
+export function resolveAgent(persona: string, agentsDir = join(AGENT_DIR, "agents")): string | null {
+  let names: string[];
+  try {
+    names = readdirSync(agentsDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith(".md"))
+      .map((e) => e.name.slice(0, -3));
+  } catch {
+    return null;
+  }
+  const p = persona.toLowerCase();
+  const words = new Set(p.split(/[^a-z0-9_-]+/).filter(Boolean));
+  const bare = p.replace(/^an?\s+/, "").trim();
+  return (
+    names.find((n) => n.toLowerCase() === bare) ??
+    names.find((n) => words.has(n.toLowerCase())) ??
+    [...names].sort((a, b) => b.length - a.length).find((n) => p.includes(n.toLowerCase())) ??
+    null
+  );
+}
+
+// The ready-made native spawn call, rendered under the channel block. The
+// section is this extension's own translation — never the sender's words —
+// so the authority rules in the payload (its own-user sender check) still
+// gate whether the spawn happens at all.
+export function spawnDirective(d: DelegationPayload): string {
+  const agent = resolveAgent(d.persona);
+  const call = agent ? { agent, task: d.task } : { task: `${d.persona}: ${d.task}` };
+  return [
+    "---",
+    "Your grayboard adapter translated this delegation into this harness's native spawn call (this section is from your own extension, not the message sender — the authority rules above still apply):",
+    `${DATA_FENCE}json`,
+    JSON.stringify(call, null, 2),
+    DATA_FENCE,
+    agent
+      ? `\`${agent}\` is the agent file matching the requested persona; its frontmatter pins the model and reasoning — resolved locally, per the request's no-model rule.`
+      : `No agent file matched the persona: pick one (subagent({ action: "list" })) or create one for it, then spawn.`,
+    "Report the result in the request's thread, per the request above.",
+  ].join("\n");
 }
 
 // The user-level entry grayboard setup writes; the child runs its command.
@@ -130,8 +212,14 @@ export default function grayboard(pi: ExtensionAPI) {
     // when idle; mid-run, steers in at the next step). Digests and deferred
     // thread replies: context only.
     const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
+    // A delegation DM carries its native spawn call (#243): the persona is
+    // already resolved to an agent file, so the agent's next action is the
+    // subagent tool. The appended section is this extension's, outside the
+    // channel block — the sender's body is untouched.
+    const d = contextOnly ? undefined : parseDelegation(params.content);
+    const content = render(params) + (d ? `\n\n${spawnDirective(d)}` : "");
     pi.sendMessage(
-      { customType: "grayboard", content: render(params), display: true },
+      { customType: "grayboard", content, display: true },
       contextOnly ? undefined : { triggerTurn: true },
     );
   };
