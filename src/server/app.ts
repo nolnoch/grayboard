@@ -1,7 +1,8 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
-import { handleHttp } from "./http.ts";
+import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
+import { AuthGate } from "./auth_gate.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { verifySessionToken, extractBearer, createTouchQueue } from "./auth.ts";
@@ -19,9 +20,19 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
-    humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, ...opts,
+  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, sweepHellos } = createWsHandlers(repo, db, {
+    humanReach, slackRunning: () => slack?.running ?? false, ...opts, helloLimit: config.helloLimit,
   });
+  const authGate = new AuthGate(repo, {
+    trustedProxies: config.trustedProxies,
+    limit: config.authFailLimit,
+    ...(opts.now ? { now: opts.now } : {}),
+  });
+  // Both limiters drop refilled buckets, ending their runs of refusals.
+  const sweepLimits = () => {
+    sweepHellos();
+    authGate.sweep();
+  };
 
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
@@ -51,13 +62,19 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     fetch(req, server) {
+      // First, before anything reads the database (#240).
+      const caller = authGate.caller(req, server.requestIP(req)?.address);
+      const path = new URL(req.url).pathname;
+      const limited = authGate.refuse(caller, path);
+      if (limited) return limited;
+
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
-        if (!raw) {
-          return Response.json({ code: "unauthenticated", message: "missing token" }, { status: 401 });
-        }
+        // No token costs nothing: a page can open a WebSocket cross-origin (auth_gate.ts).
+        if (!raw) return Response.json({ code: "unauthenticated", message: "missing token" }, { status: 401 });
         const authed = verifySessionToken(raw, repo, touches);
         if (!authed) {
+          authGate.charge(caller, req, path, "invalid token");
           return Response.json({ code: "unauthenticated", message: "invalid token" }, { status: 401 });
         }
         const upgraded = server.upgrade(req, {
@@ -73,7 +90,14 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser);
+      // A sign-in costs a token up front: the exchange awaits Google. Only a
+      // JSON body is accepted, uncharged otherwise: a cross-origin page can
+      // post a form without a preflight, but not application/json.
+      if (signInRoute(req.method, path, config)?.charged) {
+        if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
+        authGate.charge(caller, req, path, "sign-in");
+      }
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: handlers,
@@ -91,7 +115,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopRetention: (() => void) | undefined;
   let stopped = false;
   if (opts.background !== false) {
-    timers.push(startPing());
+    timers.push(startPing(), setInterval(sweepLimits, 30_000));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined);
   }
 
@@ -102,8 +126,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     handlers,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
-    // The heartbeat's auth re-check, for tests that run without it.
+    // The heartbeat's auth re-check and limiter sweep, for tests that run without it.
     revalidate,
+    sweepLimits,
+    authGate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
     // The session-touch queue, for tests that schedule touches directly.

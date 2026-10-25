@@ -8,6 +8,8 @@ import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { cleanEnv, serverEnv } from "./env.ts";
 import { mcpSession, type Session } from "./mcp.ts";
 import { WsClient, type WsClientOptions } from "./ws_client.ts";
@@ -25,13 +27,16 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
     auditRetentionDays: 90,
     devAuth: true,
     admins: [],
+    helloLimit: DEFAULT_HELLO_LIMIT,
+    authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
+    trustedProxies: DEFAULT_TRUSTED_PROXIES,
     ...overrides,
   };
 }
 
 // A dev-auth session token for `email` on the server at `base`.
 export async function devLogin(base: string, email: string): Promise<string> {
-  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
   return ((await r.json()) as { session_token: string }).session_token;
 }

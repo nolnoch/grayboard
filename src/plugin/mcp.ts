@@ -208,9 +208,10 @@ const helloWithin = (c: GrayboardClient, limitedBy: number): Promise<HelloOk> =>
     const check = () => {
       const limited = c.rateLimited();
       const left = limitedBy - Date.now();
-      if (limited && left > 0) return void (timer = setTimeout(check, Math.min(1000, left)));
+      // Waited out only when the next try fits the window.
+      if (limited && left > 0 && limited.retryAt <= limitedBy) return void (timer = setTimeout(check, Math.min(1000, left)));
       reject(new HelloTimeout(limited
-        ? `the grayboard server at ${serverUrl} is rate-limiting this user's connections (${limited}); gave up after ${Math.round((Date.now() - start) / 1000)}s`
+        ? `the grayboard server at ${serverUrl} is rate-limiting ${limited.what} (${limited.message}); gave up after ${Math.round((Date.now() - start) / 1000)}s`
         : `no answer from grayboard server at ${serverUrl} within ${Math.round((Date.now() - start) / 1000)}s`));
     };
     timer = setTimeout(check, Math.max(0, Math.min(HELLO_MS, limitedBy - start)));

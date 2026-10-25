@@ -7,7 +7,7 @@ import {
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
-import { writeAudit } from "./audit.ts";
+import { userAgent, writeAudit } from "./audit.ts";
 import { canAdmin, type SendPrincipal } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
@@ -76,7 +76,14 @@ function authConfig(config: Config): Response {
   });
 }
 
-async function authExchange(req: Request, repo: Repo, config: Config): Promise<Response> {
+
+// A sign-in body must be JSON (#240): a cross-origin page can't send that
+// without a CORS preflight, so it can't spend an office's sign-in budget.
+export function isJsonRequest(req: Request): boolean {
+  return req.headers.get("content-type")?.split(";")[0]!.trim().toLowerCase() === "application/json";
+}
+
+async function authExchange(req: Request, repo: Repo, config: Config, ip: string | null): Promise<Response> {
   const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
@@ -93,16 +100,16 @@ async function authExchange(req: Request, repo: Repo, config: Config): Promise<R
   if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
   const user = repo.users.upsertByEmail(email, displayName ?? null);
   const raw  = mintToken();
-  const ua   = req.headers.get("user-agent")?.slice(0, 120) ?? null;
+  const ua   = userAgent(req);
   repo.sessions.create(user.id, hashToken(raw), ua);
   writeAudit(repo, "auth.login", email, null, {
-    ip: req.headers.get("x-forwarded-for") ?? undefined,
+    ip: ip ?? undefined,
     ua: ua ?? undefined,
   });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
 
-async function devLogin(req: Request, repo: Repo): Promise<Response> {
+async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
@@ -110,8 +117,27 @@ async function devLogin(req: Request, repo: Repo): Promise<Response> {
   const user  = repo.users.upsertByEmail(email, null);
   const raw   = mintToken();
   repo.sessions.create(user.id, hashToken(raw), "dev");
-  writeAudit(repo, "auth.login", email, null, { dev: true });
+  writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
   return json({ session_token: raw, user_email: email, expires_at: null });
+}
+
+// Sign-in routes: each call costs the caller's address an auth failure
+// (#240), charged on entry while the route is enabled. The router dispatches
+// them from this table, so a route can't be served without being charged.
+// #204's OAuth routes (authorize, token, registration) join here.
+type SignInHandler = (req: Request, repo: Repo, config: Config, ip: string | null) => Promise<Response>;
+const SIGN_IN_ROUTES = new Map<string, { enabled: (config: Config) => boolean; handle: SignInHandler }>([
+  ["/api/auth/exchange", { enabled: () => true, handle: authExchange }],
+  ["/api/auth/dev-login", { enabled: (config) => config.devAuth, handle: (req, repo, _config, ip) => devLogin(req, repo, ip) }],
+]);
+
+/** The sign-in route `method` and `path` name, if any: whether it's on (and
+ *  so charged), and its handler, which a route that's off doesn't reach. */
+export function signInRoute(method: string, path: string, config: Config): { charged: boolean; handle: SignInHandler } | null {
+  const r = method === "POST" ? SIGN_IN_ROUTES.get(path) : undefined;
+  if (!r) return null;
+  const on = r.enabled(config);
+  return { charged: on, handle: on ? r.handle : async () => notFound() };
 }
 
 function authLogout(authed: AuthedUser, repo: Repo): Response {
@@ -421,8 +447,10 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 // ── main router ──────────────────────────────────────────────────────────────
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void = () => {}, slack?: SlackLinker,
-  disconnectUser: (userId: number) => void = () => {},
+  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  disconnectUser: (userId: number) => void,
+  // The client's address as the auth gate resolved it (src/server/client_addr.ts).
+  ip: string | null,
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -430,11 +458,8 @@ export async function handleHttp(
 
   if (path === "/healthz" && method === "GET") return healthz(repo);
   if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
-  if (path === "/api/auth/exchange"  && method === "POST") return authExchange(req, repo, config);
-  if (path === "/api/auth/dev-login" && method === "POST") {
-    if (!config.devAuth) return notFound();
-    return devLogin(req, repo);
-  }
+  const signIn = signInRoute(method, path, config);
+  if (signIn) return signIn.handle(req, repo, config, ip);
 
   const authed = requireAuth(req, repo, touches);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
