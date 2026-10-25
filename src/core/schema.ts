@@ -223,6 +223,8 @@ export function initCoreSchema(db: Database): void {
     // handles' rows go once, on the open that adds the column.
     db.exec(`DELETE FROM subscriptions WHERE handle LIKE '~tail-%'; DELETE FROM outbox WHERE handle LIKE '~tail-%';`);
   }
+  // viewers() reads the viewer rows on every post.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_viewer ON ids(id) WHERE viewer = 1`);
 
   // The 1.x roster's later columns, which each mode's alias seed reads.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));

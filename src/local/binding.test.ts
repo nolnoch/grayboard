@@ -14,7 +14,7 @@ import { openLocalDb } from "./open.ts";
 test("a dead row reaped twice logs one release", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abc";
-  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null }, false);
+  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null });
   holdAlias(db, "fe", id);
   const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
   db.transaction(() => reap(db, rows, 2)).immediate();
@@ -29,10 +29,10 @@ test("a dead row reaped twice logs one release", () => {
 test("registering an ID that has a row, live or ended, throws IdCollision", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const s = { ...thisSession("id:0123456789abe"), pid: 999999, proc_start: null };
-  registerSession(db, s, false);
-  expect(() => registerSession(db, s, false)).toThrow(new IdCollision(s.session_id, null));
+  registerSession(db, s);
+  expect(() => registerSession(db, s)).toThrow(new IdCollision(s.session_id, null));
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(s.session_id);
-  expect(() => registerSession(db, s, false)).toThrow(new IdCollision(s.session_id, 5));
+  expect(() => registerSession(db, s)).toThrow(new IdCollision(s.session_id, 5));
   expect(db.prepare(`SELECT COUNT(*) AS n FROM bindings`).get()).toEqual({ n: 1 });
 });
 
@@ -45,7 +45,7 @@ test("a live 1.x holder blocks a HEAD acquire; a HEAD hold mirrors into bindings
   db.prepare(`INSERT INTO bindings (session_id, name, pid, proc_start, harness_pid, started_at, bound_at) VALUES ('0123456789abcdef', ?, ?, ?, NULL, 1, 1)`)
     .run(name, process.pid, procStart(process.pid) ?? null);
   const me = "id:0123456789abd";
-  registerSession(db, { ...thisSession(me), pid: 999999, proc_start: null }, false);
+  registerSession(db, { ...thisSession(me), pid: 999999, proc_start: null });
   const r = await acquireName(db, me, name, { create: true, previous: null });
   expect(r).toMatchObject({ ok: false, error: expect.stringContaining("0123456789abcdef") });
   // The 1.x process exits uncleanly: its row is dead, reaped, its release logged.
@@ -63,7 +63,7 @@ test("a live 1.x holder blocks a HEAD acquire; a HEAD hold mirrors into bindings
 test("a hold whose bindings row a 1.x reap deleted is swept and its session ended", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abe";
-  registerSession(db, { ...thisSession(id), pid: 999999, proc_start: null }, false);
+  registerSession(db, { ...thisSession(id), pid: 999999, proc_start: null });
   holdAlias(db, "fe", id);
   db.prepare(`DELETE FROM bindings WHERE session_id = ?`).run(id);
   expect(liveSessions(db)).toMatchObject({ alive: [], ended: [id] });

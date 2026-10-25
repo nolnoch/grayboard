@@ -154,6 +154,8 @@ export type IdFacts = {
   launcher: boolean;
   // A tools-only process (#284 S7): receives nothing, writes as this alias.
   writesAs?: string;
+  // A `grayboard tail` (#284 S9): never listed or addressable.
+  viewer?: boolean;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -173,8 +175,8 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): void {
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0);
 }
 
 /** The principal of session `id`'s row, or undefined when it has none. */
@@ -499,6 +501,7 @@ export function queueLanes(
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
+  const isViewer = viewers(db);
   const rows = (
     db
       .prepare(
@@ -608,6 +611,7 @@ export function post(
   }
   const files = opts.attachments ?? { ids: [] };
   if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
+  const isViewer = viewers(db);
 
   return db.transaction((): PostResult => {
     const now = Date.now();
@@ -756,10 +760,16 @@ export type Peer = {
   queue_off?: true;
   launcher?: true;
 };
-// Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
-// "~" handles, which no identity can have: locally "~<id>", on a server
-// "<email>/~<id>". They aren't agents: keep them out of the roster.
-export const isViewer = (handle: string): boolean => handle.startsWith("~") || handle.includes("/~");
+/**
+ * Which handles are read-only viewers, kept out of the roster, rotations and
+ * notified lists: a `grayboard tail` session (ids.viewer, #284 S9), and the
+ * "~" handles no identity can have: a 1.x local tail's "~tail-<pid>", and a
+ * server's "<email>/~<id>" (until PR 3). Read once per call.
+ */
+export function viewers(db: Database): (handle: string) => boolean {
+  const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
+  return (h) => h.startsWith("~") || h.includes("/~") || ids.has(h);
+}
 
 // A live session with no name yet (#182): shown so the user and other agents
 // see what's running, never messageable, so it has no handle.
@@ -790,6 +800,7 @@ export function who(
   online: (h: string) => boolean,
   unbound: UnboundPeer[] = [],
 ): WhoResult {
+  const isViewer = viewers(db);
   type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
   const held = `EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address AND h.id = i.id)`;
   const cols = `a.last_seen, i.cwd, i.place, CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;

@@ -198,7 +198,7 @@ if (!PUSH) {
   // Its liveness is its own process, keyed or not: it ends on exit, and a
   // key shared with a live session collides rather than attaching.
   try {
-    registerSession(db, thisSession(SESSION_ID), false, bound!);
+    registerSession(db, thisSession(SESSION_ID), { writesAs: bound! });
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
     writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid, tools_only: true });
@@ -214,7 +214,7 @@ if (!PUSH) {
   // it first if the harness had died, so attaching is refused then.
   let attached = false;
   try {
-    registerSession(db, self, EFFECTIVE_LAUNCHER);
+    registerSession(db, self, { launcher: EFFECTIVE_LAUNCHER });
     // The flag is the session's (ids.launcher), so it's audited once, here.
     writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   } catch (e) {

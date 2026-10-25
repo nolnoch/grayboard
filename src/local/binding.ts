@@ -10,7 +10,7 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, isViewer, registerId } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, viewers } from "../core/boards.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
@@ -96,21 +96,27 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
   return { pid, proc_start: start, rule: "ancestor" };
 }
 
+/** What kind of session a registration is, beyond its row: see IdFacts. */
+export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean };
+
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
  * are its presence until it binds. A tools-only process (#284 S7) passes the
- * alias it writes as, `writesAs`: it never binds, and receives nothing.
- * Throws IdCollision when the ID already has a row: an ID is never reused,
- * and a keyed session's restart attaches (attachSession) instead.
+ * alias it writes as, `writesAs`: it never binds, and receives nothing. A
+ * `grayboard tail` passes `viewer`. Throws IdCollision when the ID already
+ * has a row: an ID is never reused, and a keyed session's restart attaches
+ * (attachSession) instead.
  */
-export function registerSession(db: Database, s: SessionRow, launcher: boolean, writesAs?: string): void {
+export function registerSession(db: Database, s: SessionRow, kind: SessionKind = {}): void {
+  const { launcher = false, writesAs, viewer } = kind;
   db.transaction(() => {
-    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs }, s.started_at);
+    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer }, s.started_at);
     db.prepare(
       `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
     writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
       ...(writesAs === undefined ? {} : { tools_only: true, writes_as: writesAs }),
+      ...(viewer ? { viewer: true } : {}),
       keyed: s.harness_rule !== null, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     });
   }).immediate();
@@ -247,15 +253,15 @@ const ORPHAN_SQL = `SELECT id FROM ids WHERE ended_at IS NULL AND id NOT IN (SEL
 /**
  * Every live session row that receives, ending the dead ones: those whose
  * process is gone, and orphans (ORPHAN_SQL). Tools-only processes (#284 S7)
- * are ended like any session but never returned: they own no shell, take no
- * name and can't be reached. The probe runs before the write lock; each
+ * and viewers (S9) are ended like any session but never returned: they own
+ * no shell, take no name and can't be reached. The probe runs before the write lock; each
  * candidate is re-checked inside it.
  */
 export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const rows = db.prepare(SESSION_SQL).all() as SessionRow[];
   const { alive: live, dead } = aliveRows(rows);
-  const toolsOnly = new Set((db.prepare(`SELECT id FROM ids WHERE delivery = 'none' AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
-  const alive = live.filter((r) => !toolsOnly.has(r.session_id));
+  const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
+  const alive = live.filter((r) => !silent.has(r.session_id));
   const orphans = db.prepare(ORPHAN_SQL).all() as { id: string }[];
   if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
   testPause("end:before-txn");
@@ -282,6 +288,7 @@ export type AcquireResult = (
 // Whether a roster name is an agent's: not a viewer's, nor a human's.
 function agentName(db: Database): (name: string) => boolean {
   const humans = new Set(humanHandles(db));
+  const isViewer = viewers(db);
   return (n) => !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
 }
 
