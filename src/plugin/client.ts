@@ -73,6 +73,9 @@ export class GrayboardClient {
   private dead      = false; // set on superseded, refusal or close; do not reconnect
 
   private helloData: HelloOk | null = null;
+  // The last accepted hello's write_dedup, kept across a disconnect: a lost
+  // answer is reported after the connection that carried it is gone.
+  private dedup = false;
   private refused: string | null = null; // set while the server refuses our token
   // Set while the server rate-limits this client, its user's hellos (#210)
   // or its address after auth failures (#240), until a hello is accepted:
@@ -222,6 +225,7 @@ export class GrayboardClient {
     switch (msg.type) {
       case "hello_ok":
         this.helloData = msg;
+        this.dedup = msg.write_dedup === true;
         this.wasReady = true;
         this.refused = null;
         this.limited = null;
@@ -395,6 +399,11 @@ export class GrayboardClient {
   /** Throws unless requests can go out now: before hello_ok the server
    *  rejects them and closes the socket, so a caller fails fast instead.
    *  Returns this connection's hello_ok, which a reconnect replaces. */
+  /** Whether the server deduplicates this session's append writes (#254). */
+  get dedupsWrites(): boolean {
+    return this.dedup;
+  }
+
   assertConnected(): HelloOk {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
       const limited = this.rateLimited();

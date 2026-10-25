@@ -3,7 +3,7 @@ import type { Config } from "./config.ts";
 import { prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
-import { WRITE_DEDUP_WINDOW_MS } from "./write_dedup.ts";
+import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 
 export function pruneMessages(repo: Repo, cutoffMs: number): void {
   repo.messages.prune(cutoffMs);

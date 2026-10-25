@@ -13,11 +13,8 @@ import { createHash } from "node:crypto";
 
 import { writeAudit } from "./audit.ts";
 import type { Repo, Sync } from "./db.ts";
+import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { Replayed, WriteRef } from "../shared/protocol.ts";
-
-// It must outlast a harness's answer timeout plus the model's next turn; a
-// wider window swallows more deliberate repeats.
-export const WRITE_DEDUP_WINDOW_MS = 10 * 60_000;
 
 export type DedupTool = "dm_send" | "board_post" | "delegate";
 

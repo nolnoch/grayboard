@@ -26,6 +26,7 @@ import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
 import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 
 export type ToolDef = {
   name: string;
@@ -39,7 +40,7 @@ const BOARD = { type: "string", description: 'Board name, with or without the "#
 // On the append writes (dm_send, board_post, delegate): a server answers an
 // identical call within its dedup window with the first one's result (#254,
 // src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
-export const RESEND_PARAM = { type: "boolean", description: "true sends again even if an identical call landed in the last 10 minutes." };
+export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
 
 export function boardTools(opts: { teams: boolean }): ToolDef[] {
   return [
@@ -318,7 +319,9 @@ export type BoardPostResult = {
 // attachmentLimits: the caps a post's files are bound under; a mode without
 // them can't post files.
 // unbound: the live sessions with no name yet, for peer_list (#182).
-export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[] };
+// `human`: the caller is the Slack bridge's human, exempt from #254's
+// answers from state.
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[]; human?: boolean };
 
 export function callBoardTool(
   db: Database,
@@ -333,17 +336,22 @@ export function callBoardTool(
       return { result: listBoards(db, handle), wake: [] };
 
     case "board_create": {
+      const team = optStr(a, "team");
+      const scope = team ? `team:${team.toLowerCase()}` : null;
+      const kind = optStr(a, "kind");
       // A repeat whose first answer was lost (#254) is answered from state:
-      // the board exists and the caller made it.
+      // the caller made this board with these arguments. Other arguments get
+      // "already exists", and so does the Slack bridge's human, whose relay
+      // treats success as a fresh create.
       const name = normalizeBoard(str(a, "name"));
-      const mine = getBoard(db, name);
-      if (mine && mine.created_by === handle && canSeeBoard(db, handle, name)) {
+      const mine = ctx.human ? undefined : getBoard(db, name);
+      if (
+        mine && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
+        mine.purpose === str(a, "purpose").trim() && canSeeBoard(db, handle, name)
+      ) {
         return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
       }
-      const team = optStr(a, "team");
-      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null, {
-        kind: optStr(a, "kind"),
-      });
+      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [] };
     }
 

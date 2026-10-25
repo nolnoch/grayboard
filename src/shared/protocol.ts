@@ -90,6 +90,10 @@ export type HelloOk     = {
   moved?: string[];
   // A rebind whose claims stayed behind: why.
   not_moved?: string;
+  // This server deduplicates this session's append writes (#254): a hello
+  // with a session_key, so a reconnect keeps the session. A server from before
+  // #254, or a keyless hello, sends none, and a retry may write twice.
+  write_dedup?: boolean;
 };
 // The row an append write made (#254): a direct message or a board post.
 export type WriteRef = { kind: "message" | "post"; id: number };

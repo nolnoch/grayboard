@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { runRetention } from "./retention.ts";
-import { WRITE_DEDUP_WINDOW_MS, canonicalJson, dedupWrite, fingerprint, type DedupCall } from "./write_dedup.ts";
+import { canonicalJson, dedupWrite, fingerprint, type DedupCall } from "./write_dedup.ts";
+import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { CoreDb } from "../core/boards.ts";
 
 describe("canonicalJson", () => {

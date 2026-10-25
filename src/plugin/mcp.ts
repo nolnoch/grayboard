@@ -11,6 +11,7 @@ import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } 
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
+import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
@@ -497,7 +498,9 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
     if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
-    if (APPEND_WRITES.has(name) && isLostAnswer(e as Error)) return { ...text(`error: ${lostAnswer((e as Error).message)}`), isError: true };
+    if (APPEND_WRITES.has(name) && isLostAnswer(e as Error)) {
+      return { ...text(`error: ${lostAnswer((e as Error).message, client?.dedupsWrites === true, a.resend === true)}`), isError: true };
+    }
     // The HTTP API (attachments) refused the token, as a WS hello would have.
     if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
     // Server errors arrive as "code: message"; show them to the agent.
@@ -510,9 +513,15 @@ const APPEND_WRITES = new Set(["dm_send", "board_post", "delegate"]);
 // A disconnect around the call, or no answer in time: not a refusal (an
 // `error` frame rejects as "code: message"), so the write may have landed.
 const isLostAnswer = (e: Error) => /was lost|no answer from the grayboard server/.test(e.message);
-// One sentence for every append write: the server makes the retry safe.
-const lostAnswer = (why: string) =>
-  `the server's answer was lost (${why}); the write may have landed. Calling again with the same arguments within 10 minutes is safe: the server returns the first result instead of sending twice.`;
+// One answer for every append write. The retry is safe only when the server
+// deduplicates (its hello_ok said so) and the call didn't force a resend.
+const lostAnswer = (why: string, dedup: boolean, resend: boolean) =>
+  `the server's answer was lost (${why}); the write may have landed. ` +
+  (!dedup
+    ? "This server doesn't deduplicate writes, so calling again may send twice: check dm_history, board_read or dm_inbox's promised list first."
+    : resend
+      ? `It was a resend, so calling again with resend sends again; calling again without resend within ${WRITE_DEDUP_WINDOW_TEXT} returns its result instead.`
+      : `Calling again with the same arguments within ${WRITE_DEDUP_WINDOW_TEXT} is safe: the server returns the first result instead of sending twice.`);
 
 // The server's HTTP API as this session's user, with the current token.
 const api = () => new ApiClient(serverUrl, currentToken());
@@ -574,7 +583,7 @@ async function releaseUploads(me: string, ids: number[]): Promise<number> {
 // A send whose answer was lost, though the server bound its attachments.
 class SendLanded extends Error {
   constructor(readonly attachments: number[], cause: Error) {
-    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. Don't send it again; dm_history or board_read shows it.`);
+    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`);
   }
 }
 

@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import type { Conn, WsData } from "../../src/server/ws.ts";
-import { WRITE_DEDUP_WINDOW_MS } from "../../src/server/write_dedup.ts";
+import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -290,6 +290,13 @@ describe("dedup and state answers (in process)", () => {
     expect(b!.replayed).toBeUndefined();
     expect(b!.message_id).not.toBe(a!.message_id);
     expect(n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
+    // Its relay treats a successful board_create as a fresh create, so a
+    // repeat keeps answering "already exists".
+    frame({ type: "call", req_id: "c1", tool: "board_create", args: { name: "slack-made", purpose: "fixtures" } });
+    frame({ type: "call", req_id: "c2", tool: "board_create", args: { name: "slack-made", purpose: "fixtures" } });
+    await until(() => out.find((m) => m.req_id === "c2"));
+    expect(out.find((m) => m.req_id === "c1")!.type).toBe("call_ok");
+    expect(out.find((m) => m.req_id === "c2")).toMatchObject({ type: "error", message: expect.stringContaining("already exists") });
   });
 });
 

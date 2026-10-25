@@ -684,8 +684,13 @@ test("claim_release and board_create repeats answer from state; another's histor
   db.prepare(`UPDATE claims SET expires_at = 1`).run();
   expect(() => release(db, "fe", "dev:env")).toThrow(/no active claim/);
 
-  const made = callBoardTool(db, "be", "board_create", { name: "e2e", purpose: "fixtures" }).result as { created_at: number };
-  const again = callBoardTool(db, "be", "board_create", { name: "#E2E", purpose: "fixtures" }).result;
-  expect(again).toEqual({ ...made, note: `you created #e2e at ${new Date(made.created_at).toISOString()}` });
-  expect(() => callBoardTool(db, "sim", "board_create", { name: "e2e", purpose: "fixtures" })).toThrow(/already exists/);
+  const made = callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }).result as { created_at: number };
+  const again = callBoardTool(db, "be", "board_create", { name: "#RUNS", purpose: "fixtures" }).result;
+  expect(again).toEqual({ ...made, note: `you created #runs at ${new Date(made.created_at).toISOString()}` });
+  expect(() => callBoardTool(db, "sim", "board_create", { name: "runs", purpose: "fixtures" })).toThrow(/already exists/);
+  // Only the same arguments are a repeat: another kind, scope or purpose is a different board.
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", kind: "queue" })).toThrow(/already exists/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "other" })).toThrow(/already exists/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", team: "core" })).toThrow(/team boards need distributed mode/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }, { human: true })).toThrow(/already exists/);
 });

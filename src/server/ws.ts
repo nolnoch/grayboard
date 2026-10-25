@@ -564,6 +564,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
     attachment_limits: repo.attachmentLimits,
+    ...(m.session_key ? { write_dedup: true } : {}),
     ...(moved ? { moved } : {}),
     ...(notMoved ? { not_moved: notMoved } : {}),
   };
@@ -912,6 +913,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   const ctx: ToolContext = {
     online: (h: string) => hub.registry.get(h)?.data.ready === true,
     attachmentLimits: hub.repo.attachmentLimits,
+    human: ws.data.human,
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
   };
   if (tool === "board_post") return handleBoardPost(hub, ws, reqId, args, ctx);
