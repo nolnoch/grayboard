@@ -24,6 +24,8 @@ import {
   refOf,
   setAccess,
   ensureAlias,
+  lastSeen,
+  liveAddresses,
   registerId,
   subscribe,
   touchAlias,
@@ -728,6 +730,22 @@ test("peer_list shows the session's facts through its alias; on a rebind they mo
   expect(peer("fe")?.queue_off).toBe(true);
   // A name no session holds has no session to set a status on.
   expect(() => callBoardTool(db, "sim", "peer_status", { text: "x" })).toThrow(/no live session holds "sim"/);
+});
+
+// #284 S6: an unbound live push session is addressable by its ID; a bound,
+// ended, tools-only or viewer one isn't. lastSeen reads an ID's own row.
+test("liveAddresses lists the roster and the unbound live push IDs; lastSeen reads either", () => {
+  const ids = { unbound: "id:0000000000001", bound: "id:0000000000002", ended: "id:0000000000003", tools: "id:0000000000004", viewer: "id:0000000000005" };
+  for (const id of Object.values(ids)) registerId(db, { id, principal: null, launcher: false }, 42);
+  holdAlias(db, "fe", ids.bound);
+  db.prepare(`UPDATE ids SET ended_at = 50 WHERE id = ?`).run(ids.ended);
+  db.prepare(`UPDATE ids SET delivery = 'none' WHERE id = ?`).run(ids.tools);
+  db.prepare(`UPDATE ids SET viewer = 1 WHERE id = ?`).run(ids.viewer);
+  expect(liveAddresses(db).sort()).toEqual(["be", "fe", "sim", ids.unbound].sort());
+  expect(lastSeen(db, ids.unbound)).toBe(42);
+  expect(lastSeen(db, "id:000000000000z")).toBeNull();
+  expect(lastSeen(db, "be")).toEqual(expect.any(Number));
+  expect(lastSeen(db, "never")).toBeNull();
 });
 
 // #254: a repeat whose first answer was lost is answered from state.

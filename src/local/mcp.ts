@@ -71,7 +71,7 @@ import {
   queuedNote,
   retractRefusal,
   alreadyRetracted,
-  showPending,
+  showMessage,
   unanswered,
   undeliveredInstruction,
 } from "../shared/inbox.ts";
@@ -504,14 +504,14 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   }
 
   if (name === "dm_history") {
-    return text(getHistory(ADDRS, a.peer as string | undefined, historyLimit(a.limit), a.before_id as number | undefined).map(showPending));
+    return text(getHistory(ADDRS, a.peer as string | undefined, historyLimit(a.limit), a.before_id as number | undefined).map(showMessage));
   }
 
   if (name === "dm_thread") {
     if (!mine(getMessage(a.thread as number))) {
       return { ...text(`error: message ${a.thread} not found`), isError: true };
     }
-    return text(getThread(a.thread as number).filter(mine).map(showPending));
+    return text(getThread(a.thread as number).filter(mine).map(showMessage));
   }
 
   if (name === "dm_inbox") {

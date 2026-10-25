@@ -15,6 +15,8 @@ export type Message = {
   pending?: true;
   // Only when it carries files.
   attachments?: AttachmentInfo[];
+  // Only when set: "bounce", returned by a session that ended before reading it (#284 S12).
+  kind?: "bounce";
 };
 
 // Client -> Server

@@ -33,14 +33,16 @@ export type Message = {
   parent_id: number | null;
   created_at: number;
   pending: number;
+  // 'bounce' for a message returned by an ended ID (#284 S12); else null.
+  kind: "bounce" | null;
   // Present on reads when the message carries files.
   attachments?: AttachmentInfo[];
 };
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads.
-const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending`;
+const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending, kind`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
 
 // Stores the message from session `senderId` (null from a tools-only
 // process, which has no session row) and binds the sender's uploads

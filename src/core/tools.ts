@@ -470,9 +470,10 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 }
 
 // The channel notification for a direct message. Same shape in every mode.
-export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+  if (msg.kind) meta.kind = msg.kind;
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
