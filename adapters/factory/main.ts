@@ -10,7 +10,17 @@
 // types (scripts/check_factory_isolation.ts enforces it).
 import { readFileSync } from "node:fs";
 import { ClientBus, type FactoryBus } from "./bus.ts";
-import { isDelegationBody, parseDelegation, receiptBody } from "./delegate.ts";
+import { isDelegationBody, parseDelegation, receiptBody, type DelegationPayload } from "./delegate.ts";
+import { translateDelegation as claudeTranslate } from "./claude/translate.ts";
+
+// Spawn translators by harness (docs/future/factory.md §6): the launcher's
+// harness names which one handles its requests (FACTORY_HARNESS). No entry
+// (or no FACTORY_HARNESS) keeps the skeleton's plain receipt. Each returns
+// the in-thread reply: a spawn directive when the persona resolves, a
+// decline when it doesn't — so the requester can re-delegate or fall back.
+const translators: Record<string, (p: DelegationPayload) => string> = {
+  claude: claudeTranslate,
+};
 
 export type FactoryOptions = {
   serverUrl: string;
@@ -51,9 +61,10 @@ export async function run(opts?: Partial<FactoryOptions>): Promise<FactoryBus> {
 }
 
 // The module's run loop: consume the event stream, answer delegations. One
-// receipt per request, keyed by the request's message id — a redelivered
-// DM (at-least-once) must not produce a second receipt.
+// reply per request, keyed by the request's message id — a redelivered
+// DM (at-least-once) must not produce a second reply.
 async function runLoop(bus: FactoryBus): Promise<void> {
+  const translate = translators[process.env.FACTORY_HARNESS ?? ""];
   for await (const e of bus.events()) {
     if (e.subject !== "dm") continue;
     const msg = e.payload;
@@ -62,7 +73,7 @@ async function runLoop(bus: FactoryBus): Promise<void> {
     if (!d) continue;
     await bus.send({
       to: d.requester,
-      body: receiptBody(d),
+      body: translate ? translate(d) : receiptBody(d),
       threadId: msg.id,
       idempotencyKey: `receipt:${msg.id}`,
     });
