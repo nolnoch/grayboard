@@ -1,6 +1,7 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
+import type { CommsMechanism } from "./harness.ts";
 import { SESSION_ID, SESSION_KEY, type Candidate } from "../core/bindings.ts";
 
 export type Message = {
@@ -45,6 +46,12 @@ export type HelloRequest = {
   // This session's harness can spawn subagents, so delegate requests may land
   // here (#184). Recorded on the handle's row; peer_list shows it.
   launcher?: boolean;
+  // Which coding agent this session runs under, and how its subagents reach
+  // the bus (#245): the client self-reports (env detection or BUS_HARNESS /
+  // BUS_COMMS); the server validates comms and records both on the handle's
+  // row. peer_list shows them; delegation's auto-pick prefers a comms
+  // mechanism closer to native.
+  harness?: string; comms?: CommsMechanism;
 };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };

@@ -1,4 +1,6 @@
 import type { Database } from "bun:sqlite";
+
+import type { CommsMechanism } from "../shared/harness.ts";
 import { describeLocation } from "../shared/identity.ts";
 import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
@@ -129,8 +131,19 @@ export function touchHandle(db: Database, handle: string, now = Date.now()): voi
 // status.
 export function startSession(db: Database, handle: string, cwd: string | null, now?: number): void {
   touchHandle(db, handle, now);
-  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL WHERE name = ?`)
+  db.prepare(`UPDATE handles SET cwd = ?, place = NULL, status = NULL, status_at = NULL, harness = NULL, comms = NULL WHERE name = ?`)
     .run(cwd, handle);
+}
+
+// The session's harness capability (#245): which coding agent it runs under
+// and how its subagents reach the bus. Self-reported at hello/bind (env
+// detection or BUS_HARNESS/BUS_COMMS, src/shared/harness.ts); describes the
+// live session, so a session start clears it. Only a session that owns the
+// name records it — a tools-only sidecar shares the handle's row and must
+// not overwrite the owner's facts. `comms` is validated by the caller.
+export function setCapability(db: Database, handle: string, harness: string | null, comms: CommsMechanism | null): void {
+  touchHandle(db, handle);
+  db.prepare(`UPDATE handles SET harness = ?, comms = ? WHERE name = ?`).run(harness, comms, handle);
 }
 
 /**
@@ -670,6 +683,10 @@ export type Peer = {
   human?: true;
   queue_off?: true;
   launcher?: true;
+  // Which coding agent this session runs under, and how its subagents reach
+  // the bus (#245): self-reported at hello/bind (src/shared/harness.ts).
+  harness?: string;
+  comms?: CommsMechanism;
 };
 // Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
 // "~" handles, which no identity can have: locally "~<id>", on a server
@@ -693,7 +710,7 @@ export function who(
   online: (h: string) => boolean,
   unbound: UnboundPeer[] = [],
 ): WhoResult {
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null; harness: string | null; comms: string | null };
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
@@ -701,7 +718,7 @@ export function who(
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human, h.queue_off, h.launcher FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human, h.queue_off, h.launcher, h.harness, h.comms FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -709,7 +726,7 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human, queue_off, launcher FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human, queue_off, launcher, harness, comms FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
   const now = Date.now();
@@ -726,6 +743,8 @@ export function who(
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
       ...(r.launcher ? { launcher: true as const } : {}),
+      ...(r.harness ? { harness: r.harness } : {}),
+      ...(r.comms ? { comms: r.comms as CommsMechanism } : {}),
     };
   });
   // Unbound sessions subscribe to nothing, so a board's roster has none.

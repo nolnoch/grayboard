@@ -1,4 +1,5 @@
 import type { ServerMessage, ClientMessage, ErrorMessage, HelloOk, Message } from "../shared/protocol.ts";
+import type { CommsMechanism } from "../shared/harness.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { describeLocation } from "../shared/identity.ts";
 
@@ -37,6 +38,12 @@ export type ClientOptions = {
   // land here (#184). Sent on every hello; the server records it on the
   // handle's row and peer_list shows it.
   launcher?: boolean;
+  // Which coding agent this session runs under, and how its subagents reach
+  // the bus (#245): self-reported (the adapter or env detection knows;
+  // grayboard doesn't). Sent on every hello; peer_list shows both, and
+  // delegation's auto-pick prefers a comms mechanism closer to native.
+  harness?: string;
+  comms?: CommsMechanism;
   // The session ID of the process this one restarted from, whose name it
   // takes back (#182 decision 14): sent on the first hello only.
   restoredFrom?: string;
@@ -112,6 +119,8 @@ export class GrayboardClient {
           ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
           : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
         ...(this.opts.launcher ? { launcher: true } : {}),
+        ...(this.opts.harness ? { harness: this.opts.harness } : {}),
+        ...(this.opts.comms ? { comms: this.opts.comms } : {}),
         session_key: this.sessionKey,
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
