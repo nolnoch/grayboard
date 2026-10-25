@@ -5,6 +5,7 @@ const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
+  "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
 ];
 
 describe("loadConfig", () => {
@@ -60,6 +61,38 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/GRAYBOARD_ATTACHMENT_MAX_BYTES must be a positive number of bytes/);
     process.env.GRAYBOARD_ATTACHMENT_MAX_BYTES = "4000";
     expect(() => loadConfig()).toThrow(/can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES/);
+  });
+
+  test("retention days and the port parse strictly: garbage refuses to start, unset and empty mean the defaults", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    // Unset: the server's defaults.
+    expect(loadConfig()).toMatchObject({ messageRetentionDays: 90, auditRetentionDays: 90, httpPort: 8080 });
+    // Set and valid, including port 0 (an ephemeral port).
+    process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS = "30";
+    process.env.GRAYBOARD_AUDIT_RETENTION_DAYS = "365";
+    process.env.GRAYBOARD_HTTP_PORT = "0";
+    expect(loadConfig()).toMatchObject({ messageRetentionDays: 30, auditRetentionDays: 365, httpPort: 0 });
+    // Empty string is unset, like local mode's BUS_RETENTION_DAYS.
+    process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS = "";
+    process.env.GRAYBOARD_AUDIT_RETENTION_DAYS = "";
+    process.env.GRAYBOARD_HTTP_PORT = "";
+    expect(loadConfig()).toMatchObject({ messageRetentionDays: 90, auditRetentionDays: 90, httpPort: 8080 });
+    // NaN would make every `created_at < cutoff` false and silently prune nothing.
+    process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS = "abc";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_MESSAGE_RETENTION_DAYS must be a whole number of days, not "abc"/);
+    process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS = "30";
+    process.env.GRAYBOARD_AUDIT_RETENTION_DAYS = "0";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_AUDIT_RETENTION_DAYS must be a whole number of days, not "0"/);
+    process.env.GRAYBOARD_AUDIT_RETENTION_DAYS = "365";
+    process.env.GRAYBOARD_HTTP_PORT = "notaport";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "notaport"/);
+    process.env.GRAYBOARD_HTTP_PORT = "70000";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "70000"/);
+    // Number() would accept these; the digit gate refuses them like local's day rule.
+    for (const weird of ["1e3", "0x1F90", " 8080 ", "8080.0", "+8080", "-1"]) {
+      process.env.GRAYBOARD_HTTP_PORT = weird;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HTTP_PORT must be a port between 0 and 65535/);
+    }
   });
 
   test("attachment caps have ceilings, and the per-user quota holds at least one message", () => {

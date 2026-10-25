@@ -798,6 +798,16 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
 // How long messages and posts keep, unless the operator (or a local user) says otherwise.
 export const DEFAULT_RETENTION_DAYS = 90;
 
+// The one retention-days rule, shared by the server (GRAYBOARD_*_RETENTION_DAYS) and
+// local (BUS_RETENTION_DAYS): unset/empty returns the fallback; otherwise a positive
+// whole number of days, or null to refuse. NaN here would make every `created_at <
+// cutoff` comparison false and silently prune nothing, so both modes parse through
+// this and never re-type the rule (#151).
+export function parseRetentionDays(raw: string | undefined, fallback: number): number | null {
+  if (raw === undefined || raw === "") return fallback;
+  return /^[1-9]\d*$/.test(raw) ? Number(raw) : null;
+}
+
 // Operator retention, not an agent operation. Replies outlive their pruned
 // parents as thread roots.
 export function prunePosts(db: Database, olderThanMs: number): void {

@@ -2,7 +2,7 @@ import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
-import { DEFAULT_RETENTION_DAYS } from "../core/boards.ts";
+import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
 export type Config = {
   dbPath: string;
@@ -47,13 +47,13 @@ export function loadConfig(): Config {
   return {
     dbPath,
     blobDir: process.env.GRAYBOARD_BLOB_DIR || join(dirname(dbPath), "blobs"),
-    httpPort: parseInt(process.env.GRAYBOARD_HTTP_PORT ?? "8080", 10),
+    httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
-    messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS), 10),
-    auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
+    messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
+    auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
@@ -108,4 +108,24 @@ function requireEnv(name: string): string {
   const val = process.env[name];
   if (!val) throw new Error(`Required env var ${name} is not set`);
   return val;
+}
+
+// Retention days parse through the shared rule (src/core/boards.ts's parseRetentionDays,
+// the same one local mode's BUS_RETENTION_DAYS uses): a positive whole number of days, or
+// unset for the default — refusing to start otherwise. NaN here would make every
+// `created_at < cutoff` false and silently prune nothing.
+function retentionDays(name: string, raw: string | undefined, fallback: number): number {
+  const days = parseRetentionDays(raw, fallback);
+  if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
+  return days;
+}
+
+// Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so
+// "1e3", "0x1F90" and " 8080 " don't slip through Number().
+function parsePort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 8080;
+  if (!/^\d+$/.test(raw) || Number(raw) > 65535) {
+    throw new Error(`GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "${raw}"`);
+  }
+  return Number(raw);
 }

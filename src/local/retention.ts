@@ -3,7 +3,7 @@
 // run, so the sessions sharing a bus prune it at most once a day between them.
 import type { Database } from "bun:sqlite";
 
-import { DEFAULT_RETENTION_DAYS, prunePosts } from "../core/boards.ts";
+import { DEFAULT_RETENTION_DAYS, parseRetentionDays, prunePosts } from "../core/boards.ts";
 import { dropAttachments, pruneUnbound, sweepBlobs, type BlobStore } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 
@@ -12,20 +12,18 @@ const DAY_MS = 86_400_000;
 const CHECK_MS = 3_600_000;
 
 // BUS_RETENTION_DAYS: how long messages and posts keep (default: the server's).
-// Null if it isn't a positive whole number.
+// Null if it isn't a positive whole number — the shared rule is src/core/boards.ts's
+// parseRetentionDays; this wrapper keeps local's env shape and null-on-invalid contract.
 export function retentionDays(env: Record<string, string | undefined> = process.env): number | null {
-  const raw = env.BUS_RETENTION_DAYS;
-  if (raw === undefined || raw === "") return DEFAULT_RETENTION_DAYS;
-  return /^[1-9]\d*$/.test(raw) ? Number(raw) : null;
+  return parseRetentionDays(env.BUS_RETENTION_DAYS, DEFAULT_RETENTION_DAYS);
 }
 
 // Replies outlive pruned parents as roots; parent_id is a foreign key.
 function pruneMessages(db: Database, olderThanMs: number): void {
   db.transaction(() => {
-    const old = `SELECT id FROM messages WHERE created_at < ?`;
-    db.prepare(`DELETE FROM dm_acks WHERE message_id IN (${old})`).run(olderThanMs);
-    db.prepare(`UPDATE messages SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
-    dropAttachments(db, "message", old, olderThanMs);
+    db.prepare(`DELETE FROM dm_acks WHERE message_id IN (SELECT id FROM messages WHERE created_at < ?)`).run(olderThanMs);
+    db.prepare(`UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)`).run(olderThanMs);
+    dropAttachments(db, "message", "SELECT id FROM messages WHERE created_at < ?", olderThanMs);
     db.prepare(`DELETE FROM messages WHERE created_at < ?`).run(olderThanMs);
   }).immediate();
 }
