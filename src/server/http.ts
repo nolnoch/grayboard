@@ -83,6 +83,12 @@ export function isSignInRoute(method: string, path: string, config: Config): boo
   return path === "/api/auth/exchange" || (path === "/api/auth/dev-login" && config.devAuth);
 }
 
+// A sign-in body must be JSON (#240): a cross-origin page can't send that
+// without a CORS preflight, so it can't spend an office's sign-in budget.
+export function isJsonRequest(req: Request): boolean {
+  return req.headers.get("content-type")?.split(";")[0]!.trim().toLowerCase() === "application/json";
+}
+
 async function authExchange(req: Request, repo: Repo, config: Config, ip: string | null): Promise<Response> {
   const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {

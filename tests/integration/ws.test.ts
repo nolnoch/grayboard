@@ -463,7 +463,7 @@ test("a handler that throws answers the call with an internal error and keeps th
 });
 
 test("login refuses an email no direct address can carry", async () => {
-  const r = await fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "o'brien@example.com" }) });
+  const r = await fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "o'brien@example.com" }) });
   expect(r.status).toBe(400);
 });
 

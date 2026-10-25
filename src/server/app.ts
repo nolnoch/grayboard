@@ -1,7 +1,7 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
-import { handleHttp, isSignInRoute } from "./http.ts";
+import { handleHttp, isJsonRequest, isSignInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { UploadGate } from "./uploads.ts";
@@ -71,10 +71,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
-        if (!raw) {
-          authGate.charge(caller);
-          return Response.json({ code: "unauthenticated", message: "missing token" }, { status: 401 });
-        }
+        // No token costs nothing: a page can open a WebSocket cross-origin (auth_gate.ts).
+        if (!raw) return Response.json({ code: "unauthenticated", message: "missing token" }, { status: 401 });
         const authed = verifySessionToken(raw, repo, touches);
         if (!authed) {
           authGate.charge(caller);
@@ -93,9 +91,14 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      // A sign-in costs a token up front: the exchange awaits Google.
-      if (isSignInRoute(req.method, path, config)) authGate.charge(caller);
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip).then((res) => authGate.chargeIf401(caller, res));
+      // A sign-in costs a token up front: the exchange awaits Google. Only a
+      // JSON body is accepted, uncharged otherwise: a cross-origin page can
+      // post a form without a preflight, but not application/json.
+      if (isSignInRoute(req.method, path, config)) {
+        if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
+        authGate.charge(caller);
+      }
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip).then((res) => authGate.chargeRefusedToken(caller, req, res));
     },
 
     websocket: handlers,

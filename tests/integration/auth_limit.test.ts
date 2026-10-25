@@ -56,9 +56,9 @@ test("burst bad upgrades are refused 401; the next gets 429 with a wait, before 
   expect(r.headers.get("retry-after")).toBe("10");
   expect(await r.json()).toEqual({ code: "rate_limited", message: "too many authentication failures from this address; retry in 10s", retry_after_ms: 10_000 });
   expect(lookups()).toBe(3);
-  // A missing token costs the same as a bad one.
-  expect((await upgrade(srv, null, Y)).status).toBe(401);
-  expect(srv.app.authGate.size).toBe(2);
+  // A missing token costs nothing: a page can open a WebSocket cross-origin.
+  for (let i = 0; i < 5; i++) expect((await upgrade(srv, null, Y)).status).toBe(401);
+  expect(srv.app.authGate.size).toBe(1);
 });
 
 test("a limited address is refused everything, a valid token and /healthz too; another address isn't", async () => {
@@ -72,7 +72,7 @@ test("a limited address is refused everything, a valid token and /healthz too; a
   expect((await srv.client(alice, null, { headers: { "X-Forwarded-For": Y } }).connect()).type).toBe("hello_ok");
 });
 
-test("valid traffic, 403s and 404s never spend; a 401 on any path does", async () => {
+test("valid traffic, 403s, 404s and requests with no token never spend; a refused token on any path does", async () => {
   const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
   const alice = await srv.login(A);
   for (let i = 0; i < 5; i++) {
@@ -81,16 +81,25 @@ test("valid traffic, 403s and 404s never spend; a 401 on any path does", async (
     // Not an admin, and no such route.
     expect((await fetch(`${srv.base}/api/admin/users`, { method: "POST", headers: { Authorization: `Bearer ${alice}`, "X-Forwarded-For": X }, body: "{}" })).status).toBe(403);
     expect((await get(srv, "/api/nothing-here", alice, X)).status).toBe(404);
+    // No token: an <img> on any page can make a browser send this.
+    expect((await get(srv, "/api/whoami", null, X)).status).toBe(401);
   }
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
-  // An unknown path isn't a public route, so requireAuth answers it: a bad token is a 401, charged by chargeIf401.
+  // An unknown path isn't a public route, so requireAuth answers it: a bad token is a 401, charged by chargeRefusedToken.
   expect((await get(srv, "/api/nothing-here", "bad", X)).status).toBe(401);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
 });
 
-test("sign-in calls are charged on entry; dev-login with dev auth off is a 404 and isn't", async () => {
+test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev-login with dev auth off is a 404 and isn't", async () => {
   const { srv } = serve();
-  const devLogin = (from: string) => fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: JSON.stringify({ email: A }) });
+  const devLogin = (from: string) => fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from, "Content-Type": "application/json; charset=utf-8" }, body: JSON.stringify({ email: A }) });
+  // A cross-origin form post: text/plain needs no preflight.
+  for (let i = 0; i < 5; i++) {
+    const r = await fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": X }, body: JSON.stringify({ email: A }) });
+    expect(r.status).toBe(415);
+    expect(await r.json()).toEqual({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" });
+  }
+  expect(srv.app.authGate.size).toBe(0);
   for (let i = 0; i < 3; i++) expect((await devLogin(X)).status).toBe(200);
   expect((await devLogin(X)).status).toBe(429);
   // The audit's address is the resolved one, not the raw header.

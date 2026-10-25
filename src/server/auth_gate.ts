@@ -1,10 +1,14 @@
-// The per-address limit on authentication failures (#240). Every 401 the
-// server answers, and every call to a sign-in route, costs the client's
+// The per-address limit on authentication failures (#240). A presented token
+// the server refuses, and every call to a sign-in route, costs the client's
 // address a token; while its bucket is empty, every request from it gets 429
 // before anything reads the database. Valid authenticated traffic costs
 // nothing, so a stale-token client behind a shared address only blocks its
-// neighbours after it has failed the whole burst.
+// neighbours after it has failed the whole burst. A request with no token
+// costs nothing either: a web page can make a browser send those cross-origin
+// (an <img>, a WebSocket), but not an Authorization header without a CORS
+// preflight, so charging them would let any page lock out an office.
 import type { Repo } from "./db.ts";
+import { extractBearer } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import { clientAddress, rateKey, TrustedProxies } from "./client_addr.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
@@ -67,9 +71,9 @@ export class AuthGate {
     if (c.key) this.limiter.spend(c.key, c.key);
   }
 
-  /** Charge the caller if `res` is a 401; passes `res` through. */
-  chargeIf401(c: Caller, res: Response): Response {
-    if (res.status === 401) this.charge(c);
+  /** Charge the caller if `res` refused a token `req` presented; passes `res` through. */
+  chargeRefusedToken(c: Caller, req: Request, res: Response): Response {
+    if (res.status === 401 && extractBearer(req)) this.charge(c);
     return res;
   }
 

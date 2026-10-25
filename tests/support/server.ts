@@ -31,7 +31,7 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
 
 // A dev-auth session token for `email` on the server at `base`.
 export async function devLogin(base: string, email: string): Promise<string> {
-  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  const r = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   if (!r.ok) throw new Error(`dev-login ${email}: ${r.status} ${await r.text()}`);
   return ((await r.json()) as { session_token: string }).session_token;
 }
