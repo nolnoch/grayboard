@@ -17,7 +17,9 @@
 #     restarts it and waits for /healthz to report the installed release
 #
 # Overrides:
-#   GRAYBOARD_VERSION=v1.0.0   pin a release (default: latest)
+#   GRAYBOARD_VERSION=v2.0.0   pin a release (default: latest); a release
+#                              published before signing has no SHA256SUMS and
+#                              needs its own install.sh
 #   INSTALL_DIR=/some/path     install dir   (default: ~/.local/bin)
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   GRAYBOARD_RELEASES_URL=https://mirror.example.com
@@ -26,6 +28,10 @@
 #   GRAYBOARD_NO_SETUP=1       skip `grayboard setup`
 
 set -euo pipefail
+
+# A stalled origin fails the install instead of hanging it: 30 s to connect,
+# and under 1 KB/s for 60 s aborts a transfer.
+CURL_LIMITS=(--connect-timeout 30 --speed-limit 1024 --speed-time 60)
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "grayboard: openssl is required to verify the release's signature; install it (apt install openssl, dnf install openssl) and rerun" >&2
@@ -38,6 +44,7 @@ REPO="${GRAYBOARD_REPO:-nolnoch/grayboard}"
 RELEASES_URL="${GRAYBOARD_RELEASES_URL:-https://github.com}"
 while [ "${RELEASES_URL%/}" != "$RELEASES_URL" ]; do RELEASES_URL="${RELEASES_URL%/}"; done
 case "$RELEASES_URL" in
+  *@*) echo "grayboard: GRAYBOARD_RELEASES_URL must not carry user info: ${GRAYBOARD_RELEASES_URL}" >&2; exit 1 ;;
   https://* | http://localhost | http://localhost:* | http://localhost/* | http://127.0.0.1 | http://127.0.0.1:* | http://127.0.0.1/* | "http://[::1]" | "http://[::1]:"* | "http://[::1]/"*) ;;
   *) echo "grayboard: GRAYBOARD_RELEASES_URL must be https (or http to localhost): ${GRAYBOARD_RELEASES_URL}" >&2; exit 1 ;;
 esac
@@ -70,10 +77,12 @@ echo "grayboard: detected ${target}"
 # Resolve "latest" to its tag once, so every binary comes from one release and a
 # server install knows which version /healthz must report.
 if [ "$VERSION" = "latest" ]; then
-  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/${REPO}/releases/latest")" || {
+  latest_url="$(curl "${CURL_LIMITS[@]}" -fsSLI -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/${REPO}/releases/latest")" || {
     echo "grayboard: couldn't resolve the latest release of ${REPO} from ${RELEASES_URL}" >&2; exit 1; }
   VERSION="${latest_url##*/}"
 fi
+[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
+  echo "grayboard: '${VERSION}' isn't a release tag (vX.Y.Z)" >&2; exit 1; }
 echo "grayboard: installing ${VERSION}"
 base_url="${RELEASES_URL}/${REPO}/releases/download/${VERSION}"
 
@@ -101,11 +110,13 @@ binary_sum() {
 # ("name": "x"), mirrors may serve compact ("name":"x"): the patterns allow
 # either. Validated against the live API before use (#173).
 asset_digest() {
-  curl -fsSL -H "Accept: application/vnd.github+json" "$1" \
+  # awk reads to EOF: an early exit would SIGPIPE curl or tr on a large
+  # response, and pipefail would turn that into a missing digest.
+  curl "${CURL_LIMITS[@]}" -fsSL -H "Accept: application/vnd.github+json" "$1" \
     | tr ',{}' '\n' \
     | awk -v name="$2" '
         /"name":/ { seen = ($0 ~ "\"name\": ?\"" name "\"") }
-        seen && /"digest":/ { sub(/.*"digest": ?"/, ""); sub(/".*/, ""); print; exit }
+        seen && !found && /"digest":/ { sub(/.*"digest": ?"/, ""); sub(/".*/, ""); print; found = 1 }
       '
 }
 
@@ -143,26 +154,42 @@ refuse() { echo "grayboard: $*; not installing." >&2; exit 1; }
 # fetch <asset> <file in tmp>
 fetch() {
   echo "grayboard: downloading ${base_url}/$1"
-  curl -fsSL -o "${tmp}/$2" "${base_url}/$1" || refuse "couldn't download ${base_url}/$1"
+  curl "${CURL_LIMITS[@]}" -fsSL -o "${tmp}/$2" "${base_url}/$1" || refuse "couldn't download ${base_url}/$1"
 }
 
 # SHA256SUMS.sig is one line: the signing key's id and the base64 DER signature.
 fetch SHA256SUMS SHA256SUMS
 fetch SHA256SUMS.sig SHA256SUMS.sig
-keyid="" b64="" rest=""
-read -r keyid b64 rest < "${tmp}/SHA256SUMS.sig" || true
-[[ "$keyid" =~ ^[0-9a-f]{16}$ ]] && [[ "$b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ -z "$rest" ] \
+# Parsed as strictly as src/shared/release_verify.ts: exactly that line, at
+# most one trailing newline.
+sigline="$(cat "${tmp}/SHA256SUMS.sig")"
+[ "$(wc -c < "${tmp}/SHA256SUMS.sig")" -le "$(( ${#sigline} + 1 ))" ] \
+  && [[ "$sigline" =~ ^([0-9a-f]{16})\ ([A-Za-z0-9+/]+={0,2})$ ]] \
   || refuse "SHA256SUMS.sig isn't \"<key id> <base64 signature>\""
+keyid="${BASH_REMATCH[1]}" b64="${BASH_REMATCH[2]}"
 release_key "$keyid" > "${tmp}/key.pem" || refuse "SHA256SUMS.sig: unknown key id ${keyid}"
-printf '%s' "$b64" | openssl base64 -d -A > "${tmp}/sig.der" || refuse "SHA256SUMS.sig: the signature isn't base64"
+# openssl base64 -d exits 0 on garbage; a P-256 DER signature is 8–72 bytes.
+printf '%s' "$b64" | openssl base64 -d -A > "${tmp}/sig.der" || true
+siglen="$(wc -c < "${tmp}/sig.der")"
+[ "$siglen" -ge 8 ] && [ "$siglen" -le 72 ] || refuse "SHA256SUMS.sig: malformed signature (${siglen// /} bytes decoded)"
 openssl dgst -sha256 -verify "${tmp}/key.pem" -signature "${tmp}/sig.der" "${tmp}/SHA256SUMS" >/dev/null 2>&1 \
   || refuse "SHA256SUMS.sig: the signature doesn't verify against SHA256SUMS with key ${keyid}"
+# The same shape src/shared/release_verify.ts parseSums accepts: the tag line,
+# then "<64 hex>  <name>" per line, no name twice; anything else refuses.
+sums_bad="$(awk '
+  /\r/ { print "has a malformed line"; exit }
+  NR == 1 { if ($0 !~ /^# grayboard [^ \t]+$/) { print "has no \"# grayboard <tag>\" first line"; exit } next }
+  # No {64} interval: mawk (the Debian default awk) may lack them.
+  NF != 2 || $0 != $1 "  " $2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ { print "has a malformed line"; exit }
+  seen[$2]++ { print "lists " $2 " twice"; exit }
+' "${tmp}/SHA256SUMS")"
+[ -z "$sums_bad" ] || refuse "SHA256SUMS ${sums_bad}"
 tagline="$(head -n 1 "${tmp}/SHA256SUMS")"
-[ "$tagline" = "# grayboard ${VERSION}" ] || refuse "SHA256SUMS is signed for '${tagline#\# grayboard }', not ${VERSION}"
+[ "$tagline" = "# grayboard ${VERSION}" ] || refuse "SHA256SUMS is signed for ${tagline#\# grayboard }, not ${VERSION}"
 
 for bin in "${bins[@]}"; do
   asset="${bin}-${target}"
-  want_sum="$(awk -v n="$asset" 'NR > 1 && NF == 2 && $2 == n { print $1; exit }' "${tmp}/SHA256SUMS")"
+  want_sum="$(awk -v n="$asset" 'NR > 1 && $2 == n { print $1 }' "${tmp}/SHA256SUMS")"
   [[ "$want_sum" =~ ^[0-9a-f]{64}$ ]] || refuse "${asset}: SHA256SUMS lists no sha256"
   want_api="$(asset_digest "$release_api" "$asset")" || want_api=""
   case "$want_api" in
@@ -180,12 +207,14 @@ reported="$("${tmp}/grayboard" --version 2>/dev/null)" || reported=""
 [ "$reported" = "${VERSION#v}" ] || refuse "the downloaded grayboard reports '${reported}', not ${VERSION}"
 echo "grayboard: verified ${VERSION} (SHA256SUMS signed by key ${keyid})"
 
-# Every binary passed; only now is any replaced.
+# Every binary passed; only now is any replaced. Keep the server binary being
+# replaced, so a release that won't start can be rolled back; that copy is
+# taken before any rename, so a failed copy leaves both binaries old.
+if [ "$INSTALL_SERVER" = "1" ] && [ -f "${INSTALL_DIR}/grayboard-server" ]; then
+  cp -p "${INSTALL_DIR}/grayboard-server" "${INSTALL_DIR}/grayboard-server.prev" \
+    || refuse "couldn't back up ${INSTALL_DIR}/grayboard-server to grayboard-server.prev"
+fi
 for bin in "${bins[@]}"; do
-  # Keep the server binary being replaced, so a release that won't start can be rolled back.
-  if [ "$bin" = "grayboard-server" ] && [ -f "${INSTALL_DIR}/${bin}" ]; then
-    cp -p "${INSTALL_DIR}/${bin}" "${INSTALL_DIR}/${bin}.prev"
-  fi
   mv "${tmp}/${bin}" "${INSTALL_DIR}/${bin}"
 done
 

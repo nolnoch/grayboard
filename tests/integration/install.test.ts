@@ -8,7 +8,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
-import { signSums, testInstallSh, testKey, type TestKey } from "../support/release_keys.ts";
+import { sign, signSums, testInstallSh, testKey, type TestKey } from "../support/release_keys.ts";
 
 let dir: string;
 let INSTALL: string;
@@ -60,7 +60,7 @@ beforeEach(() => {
 args="$*"
 # " -w " as its own word: the temp dir's random name can hold "-w".
 case " $args " in
-  *" -w "*) echo "https://github.com/x/grayboard/releases/tag/v9.9.9"; exit 0 ;;
+  *" -w "*) echo "\${STUB_LATEST:-https://github.com/x/grayboard/releases/tag/v9.9.9}"; exit 0 ;;
   *"/repos/"*) echo "$args" >> "${dir}/api.log"; cat "${dir}/digests.json"; exit 0 ;;
 esac
 out="" url=""
@@ -95,7 +95,7 @@ function writeStub(name: string, body: string) {
   chmodSync(p, 0o755);
 }
 
-type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; script?: string; path?: string };
+type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; script?: string; path?: string; latest?: string };
 
 function install(s: Scenario = {}) {
   const p = Bun.spawnSync(["/bin/bash", s.script ?? INSTALL], {
@@ -109,6 +109,7 @@ function install(s: Scenario = {}) {
       STUB_STATE: s.state ?? "active",
       STUB_HEALTH: s.health ?? "ok",
       STUB_RESTART_RC: String(s.restartRc ?? 0),
+      ...(s.latest !== undefined ? { STUB_LATEST: s.latest } : {}),
       ...(s.releasesUrl !== undefined ? { GRAYBOARD_RELEASES_URL: s.releasesUrl } : {}),
     },
   });
@@ -160,13 +161,66 @@ test("a bad signature, or a missing SHA256SUMS or .sig, is refused", () => {
   expectRefused(install(), `the signature doesn't verify against SHA256SUMS with key ${testKey("a").id}`);
   publish();
   rmSync(join(dir, "release", "SHA256SUMS.sig"));
-  expectRefused(install(), "couldn't download");
+  expectRefused(install(), "couldn't download https://github.com/nolnoch/grayboard/releases/download/v9.9.9/SHA256SUMS.sig;");
   publish();
   rmSync(join(dir, "release", "SHA256SUMS"));
-  expectRefused(install(), "SHA256SUMS");
+  expectRefused(install(), "couldn't download https://github.com/nolnoch/grayboard/releases/download/v9.9.9/SHA256SUMS;");
   publish();
   writeFileSync(join(dir, "release", "SHA256SUMS.sig"), "nonsense\n");
   expectRefused(install(), `SHA256SUMS.sig isn't "<key id> <base64 signature>"`);
+});
+
+// The same shapes src/shared/release_verify.ts refuses (release_verify.test.ts):
+// the two verifiers accept one format.
+test("a .sig or SHA256SUMS in any shape but the exact one is refused, even when signed", () => {
+  const sig = () => readFileSync(join(dir, "release", "SHA256SUMS.sig"), "utf8");
+  const id = testKey("a").id;
+  for (const bad of [sig().replace(" ", "  "), `${sig()}\n`, sig().replace("\n", "\r\n"), ` ${sig()}`]) {
+    publish();
+    writeFileSync(join(dir, "release", "SHA256SUMS.sig"), bad);
+    expectRefused(install(), `SHA256SUMS.sig isn't "<key id> <base64 signature>"`);
+  }
+  publish();
+  writeFileSync(join(dir, "release", "SHA256SUMS.sig"), `${id} AAAA\n`);
+  expectRefused(install(), "SHA256SUMS.sig: malformed signature (3 bytes decoded)");
+  const line = `${STUB_SHA}  grayboard-${target}`;
+  for (const [sums, why] of [
+    [`# grayboard v9.9.9\n${line}\n${line}\n`, `SHA256SUMS lists grayboard-${target} twice`],
+    [`# grayboard v9.9.9\n${line.replace("  ", " ")}\n`, "SHA256SUMS has a malformed line"],
+    [`# grayboard v9.9.9\n${line}\r\n`, "SHA256SUMS has a malformed line"],
+    [`${line}\n`, `SHA256SUMS has no "# grayboard <tag>" first line`],
+  ] as const) {
+    writeFileSync(join(dir, "release", "SHA256SUMS"), sums);
+    writeFileSync(join(dir, "release", "SHA256SUMS.sig"), sign(sums));
+    expectRefused(install(), why);
+  }
+});
+
+test("a latest release whose tag isn't vX.Y.Z is refused before anything is fetched", () => {
+  const r = install({ latest: "https://github.com/x/grayboard/releases/tag/v9.9.9-..%2F" });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("isn't a release tag (vX.Y.Z)");
+  expect(existsSync(join(dir, "downloads.log"))).toBe(false);
+  expectUntouched();
+});
+
+// awk stopping early SIGPIPEs the writer; under pipefail that read as a missing digest.
+test("a release API response far larger than a pipe buffer still yields the digest", () => {
+  const api = JSON.parse(readFileSync(join(dir, "digests.json"), "utf8"));
+  writeFileSync(join(dir, "digests.json"), JSON.stringify({ ...api, body: "x, ".repeat(200_000) }, null, 2));
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+});
+
+test("a server binary that can't be backed up refuses before anything is replaced", () => {
+  writeFileSync(join(dir, "bin", "grayboard-server.prev"), "older");
+  chmodSync(join(dir, "bin", "grayboard-server.prev"), 0o444);
+  const r = install();
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("couldn't back up");
+  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
+  expect(restarts()).toBe(0);
 });
 
 test("a key no list holds is refused, as is the test key by the real install.sh", () => {
@@ -178,7 +232,7 @@ test("a key no list holds is refused, as is the test key by the real install.sh"
 
 test("another release's SHA256SUMS and .sig served under this tag are refused", () => {
   publish(undefined, { sumsTag: "v9.9.8" });
-  expectRefused(install(), "SHA256SUMS is signed for 'v9.9.8', not v9.9.9");
+  expectRefused(install(), "SHA256SUMS is signed for v9.9.8, not v9.9.9");
 });
 
 test("a binary SHA256SUMS doesn't list is refused, and nothing is installed (the first binary included)", () => {
@@ -273,6 +327,10 @@ test("GRAYBOARD_RELEASES_URL: http only to this machine, trailing slashes droppe
   expect(refused.code).toBe(1);
   expect(refused.err).toContain("GRAYBOARD_RELEASES_URL must be https (or http to localhost): http://mirror.example.com");
   expect(existsSync(join(dir, "healthz.log"))).toBe(false);
+  // curl would read "localhost:" as user info and connect to mirror.example.com.
+  const userinfo = install({ releasesUrl: "http://localhost:@mirror.example.com" });
+  expect(userinfo.code).toBe(1);
+  expect(userinfo.err).toContain("must not carry user info");
 
   const local = install({ releasesUrl: "http://127.0.0.1:8080//" });
   expect(local.code).toBe(0);
