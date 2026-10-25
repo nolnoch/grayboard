@@ -16,7 +16,8 @@ const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 // GRAYBOARD_RELEASES_URL: one origin serving GitHub's paths for both its API
 // and its downloads (a mirror, or the upgrade tests' release server), without
 // trailing slashes; unset or empty means GitHub. It serves the binary update
-// runs, so it must be https, or http to this machine.
+// runs, so it must be https, or http to this machine, with no user info
+// (`http://localhost:@evil.example.com` is evil's host, as install.sh refuses).
 export function releasesOrigin(raw = process.env.GRAYBOARD_RELEASES_URL): string | undefined {
   if (!raw) return undefined;
   const origin = raw.replace(/\/+$/, "");
@@ -26,6 +27,7 @@ export function releasesOrigin(raw = process.env.GRAYBOARD_RELEASES_URL): string
   } catch {
     throw new Error(`GRAYBOARD_RELEASES_URL isn't a URL: ${raw}`);
   }
+  if (origin.includes("@")) throw new Error(`GRAYBOARD_RELEASES_URL must not carry user info: ${raw}`);
   if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) {
     throw new Error(`GRAYBOARD_RELEASES_URL must be https (or http to localhost): ${raw}`);
   }
