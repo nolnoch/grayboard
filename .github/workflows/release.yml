@@ -78,8 +78,8 @@ jobs:
       - name: Compile binaries for ${{ matrix.target }}
         run: |
           mkdir -p dist
-          bun build --compile --target=${{ matrix.bun_target }} src/cli/main.ts    --outfile dist/grayboard-${{ matrix.target }}
-          bun build --compile --target=${{ matrix.bun_target }} src/server/main.ts --outfile dist/grayboard-server-${{ matrix.target }}
+          bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/cli/main.ts"    --outfile "$GITHUB_WORKSPACE/dist/grayboard-${{ matrix.target }}"
+          bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/server/main.ts" --outfile "$GITHUB_WORKSPACE/dist/grayboard-server-${{ matrix.target }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.2
