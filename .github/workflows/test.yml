@@ -26,6 +26,9 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Factory module isolation
+        run: bun scripts/check_factory_isolation.ts
+
       - name: Test
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
