@@ -54,7 +54,11 @@ export interface FactoryBus {
   settle(messageId: number): Promise<void>;
   // Acknowledge delivered pushes so they aren't resent on reconnect.
   acknowledge(messageIds: number[]): Promise<void>;
-  post(op: PostOp): Promise<{ postId: number; board: string }>;
+  post(op: PostOp): Promise<{ postId: number; board: string; notified: string[] }>;
+  // Idempotent for a same-creator repeat: the board_create tool answers it
+  // from state (#254's lost-answer semantics), so the roster's ensure step
+  // can call it every cycle.
+  boardCreate(op: { name: string; purpose: string; kind?: "broadcast" | "queue"; idempotencyKey: string }): Promise<{ name: string }>;
   readBoard(board: string): Promise<{ board: string; posts: BusPost[]; unread_remaining: number }>;
   claimTake(op: ClaimOp): Promise<Record<string, unknown>>;
   claimRelease(key: string, note?: string): Promise<void>;
@@ -143,6 +147,15 @@ export class ClientBus implements FactoryBus {
     return p;
   }
 
+  // Every op waits for hello_ok: a caller that fires an op as the module
+  // starts queues instead of racing the connect (the once() ops got this
+  // from whenReady; the plain ops route through here for the same reason —
+  // a roster cycle at startup must not throw "not connected").
+  private async gated<T extends ServerMessage>(msg: Parameters<GrayboardClient["request"]>[0]): Promise<T> {
+    await this.whenReady;
+    return this.client.request<T>(msg);
+  }
+
   async send(op: SendOp): Promise<SendResult> {
     return this.once(`send:${op.idempotencyKey}`, async () => {
       const ok = await this.client.request<SendOk>({
@@ -154,34 +167,45 @@ export class ClientBus implements FactoryBus {
   }
 
   async thread(messageId: number): Promise<Message[]> {
-    const ok = await this.client.request<ThreadOk>({ type: "thread", req_id: this.reqId(), message_id: messageId });
+    const ok = await this.gated<ThreadOk>({ type: "thread", req_id: this.reqId(), message_id: messageId });
     return ok.messages;
   }
 
   async inbox() {
-    const { type: _t, req_id: _r, ...rest } = await this.client.request<InboxOk>({ type: "inbox", req_id: this.reqId() });
+    const { type: _t, req_id: _r, ...rest } = await this.gated<InboxOk>({ type: "inbox", req_id: this.reqId() });
     return rest;
   }
 
   async settle(messageId: number): Promise<void> {
-    await this.client.request<AckOk>({ type: "dm_ack", req_id: this.reqId(), message_id: messageId });
+    await this.gated<AckOk>({ type: "dm_ack", req_id: this.reqId(), message_id: messageId });
   }
 
   async acknowledge(messageIds: number[]): Promise<void> {
     if (!messageIds.length) return;
-    await this.client.request({ type: "ack", req_id: this.reqId(), message_ids: messageIds });
+    await this.gated({ type: "ack", req_id: this.reqId(), message_ids: messageIds });
   }
 
-  async post(op: PostOp): Promise<{ postId: number; board: string }> {
+  async post(op: PostOp): Promise<{ postId: number; board: string; notified: string[] }> {
     return this.once(`post:${op.idempotencyKey}`, async () => {
       const ok = await this.client.request<CallOk>({ type: "call", req_id: this.reqId(), tool: "board_post", args: { board: op.board, body: op.body } });
-      const r = ok.result as { post_id: number; board: string };
-      return { postId: r.post_id, board: r.board };
+      const r = ok.result as { post_id: number; board: string; notified?: string[] };
+      return { postId: r.post_id, board: r.board, notified: r.notified ?? [] };
+    });
+  }
+
+  async boardCreate(op: { name: string; purpose: string; kind?: "broadcast" | "queue"; idempotencyKey: string }): Promise<{ name: string }> {
+    return this.once(`boardCreate:${op.idempotencyKey}`, async () => {
+      const ok = await this.client.request<CallOk>({
+        type: "call", req_id: this.reqId(), tool: "board_create",
+        args: { name: op.name, purpose: op.purpose, ...(op.kind ? { kind: op.kind } : {}) },
+      });
+      const r = ok.result as { name: string };
+      return { name: r.name };
     });
   }
 
   async readBoard(board: string) {
-    const ok = await this.client.request<CallOk>({ type: "call", req_id: this.reqId(), tool: "board_read", args: { board } });
+    const ok = await this.gated<CallOk>({ type: "call", req_id: this.reqId(), tool: "board_read", args: { board } });
     return ok.result as { board: string; posts: BusPost[]; unread_remaining: number };
   }
 
@@ -196,16 +220,16 @@ export class ClientBus implements FactoryBus {
   }
 
   async claimRelease(key: string, note?: string): Promise<void> {
-    await this.client.request<CallOk>({ type: "call", req_id: this.reqId(), tool: "claim_release", args: { key, ...(note ? { note } : {}) } });
+    await this.gated<CallOk>({ type: "call", req_id: this.reqId(), tool: "claim_release", args: { key, ...(note ? { note } : {}) } });
   }
 
   async claimList() {
-    const ok = await this.client.request<CallOk>({ type: "call", req_id: this.reqId(), tool: "claim_list", args: {} });
+    const ok = await this.gated<CallOk>({ type: "call", req_id: this.reqId(), tool: "claim_list", args: {} });
     return ok.result as { key: string; [k: string]: unknown }[];
   }
 
   async peers(board?: string): Promise<Peer[]> {
-    const ok = await this.client.request<CallOk>({ type: "call", req_id: this.reqId(), tool: "peer_list", args: board ? { board } : {} });
+    const ok = await this.gated<CallOk>({ type: "call", req_id: this.reqId(), tool: "peer_list", args: board ? { board } : {} });
     return (ok.result as { peers: Peer[] }).peers ?? [];
   }
 

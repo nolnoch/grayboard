@@ -11,12 +11,16 @@
 import { readFileSync } from "node:fs";
 import { ClientBus, type FactoryBus } from "./bus.ts";
 import { isDelegationBody, parseDelegation, receiptBody } from "./delegate.ts";
+import { startRoster } from "./roster/roster.ts";
 
 export type FactoryOptions = {
   serverUrl: string;
   token: string;
   identity: string;
   capabilities?: Record<string, string | number | boolean>;
+  // The fleets config for the roster (#124's rescoped shape): when set, the
+  // module also runs the fleet-roster cycle loop against this config file.
+  fleetsPath?: string;
 };
 
 // Credentials for a server-mode bus: the env the tests and ops use, or the
@@ -47,6 +51,14 @@ export async function run(opts?: Partial<FactoryOptions>): Promise<FactoryBus> {
     onDead: (reason) => console.error(`[factory] stopped: ${reason}`),
   });
   void runLoop(bus);
+  // The fleet roster (#124's rescoped shape) runs beside the delegation
+  // loop when a fleets config is set: FACTORY_FLEETS or the option. Its
+  // cycle timer lives for the process; the controller's stop() is for tests
+  // (which call startRoster directly).
+  const fleetsPath = opts?.fleetsPath ?? process.env.FACTORY_FLEETS;
+  if (fleetsPath) {
+    void startRoster(bus, fleetsPath).catch((e) => console.error(`[factory] roster stopped: ${e instanceof Error ? e.message : String(e)}`));
+  }
   return bus;
 }
 
