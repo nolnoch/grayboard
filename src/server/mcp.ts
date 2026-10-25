@@ -4,6 +4,7 @@ import { z } from "zod";
 import { boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
 import { closestNames, unknownNameError } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
+import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
@@ -88,6 +89,10 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
       inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional() }),
     }, a => run(() => application.send(session, a.to, a.body, a)));
+    server.registerTool(DELEGATE_TOOL.name, {
+      description: DELEGATE_TOOL.description,
+      inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+    }, a => run(() => application.delegate(session, a)));
     server.registerTool("dm_history", {
       description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
       inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),

@@ -1,5 +1,7 @@
-import type { HelloRequest } from "../shared/protocol.ts";
-import { MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, sessionIdOf, unboundPeer, unknownNameError, type Candidate } from "../core/bindings.ts";
+import type { HelloRequest, DelegateRequest } from "../shared/protocol.ts";
+import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf, sessionIdOf, unboundPeer, unknownNameError, type Candidate } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address } from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
@@ -23,10 +25,11 @@ export type ApplicationCode =
   | "superseded"
   | "identity_in_use"
   | "identity_unknown"
-  | "unbound";
+  | "unbound"
+  | "rate_limited";
 
 export class ApplicationError extends Error {
-  constructor(readonly code: ApplicationCode, message: string, readonly extra: { known?: string[]; holder?: string } = {}) {
+  constructor(readonly code: ApplicationCode, message: string, readonly extra: { known?: string[]; holder?: string; retry_after_ms?: number } = {}) {
     super(message);
   }
 }
@@ -70,6 +73,7 @@ export type ApplicationOptions = {
   probeMs?: number;
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
+  helloLimit?: HelloLimit;
 };
 export type IdentityOptions = Omit<HelloRequest, "type" | "req_id" | "identity"> & {
   alive?: () => boolean;
@@ -159,6 +163,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
   };
+  const helloLimiter = new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+    start: (_id, email, ctx, retryAfterMs) => {
+      console.error(`[grayboard] rate-limiting hellos from ${email}`);
+      writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+    },
+    end: (_id, email, refused) => {
+      console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+      writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+    },
+  });
   const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
   const revoked = new Map<number, number>();
   function release(session: ApplicationSession, why: string) {
@@ -190,6 +204,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   }
   async function select(authed: AuthedUser, nameInput: string | undefined, sink: DeliverySink, m: IdentityOptions, human: boolean) {
     const { holders, registry } = hub;
+    // Before database work; trusted bridge attachments are the server's own.
+    if (!human) {
+      const t = helloLimiter.take(authed.user_id, authed.user_email, {
+        session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+        ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
+        place: m.where ?? null,
+      });
+      if (!t.ok) {
+        const secs = Math.ceil(t.retryAfterMs / 1000);
+        throw new ApplicationError("rate_limited", `too many connections for this user; retry in ${secs}s`, { retry_after_ms: t.retryAfterMs });
+      }
+    }
     const push = m.push !== false;
     const owns = push || m.hold === true;
     const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
@@ -307,10 +333,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       moved = [];
       holders.set(full, session);
       if (push) registry.set(full, session);
-      // A reconnect, or a restart taking its name back, is the same session: its status stays.
-      if (m.resume || m.restored_from) touchHandle(db, full);
+      // Preserve status only when the name's binding history verifies continuity.
+      const continued = m.from !== undefined ? null
+        : m.resume ? continuityOf(db, full, { reconnect: sessionId })
+        : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
+        : null;
+      if (continued?.verified) touchHandle(db, full);
       else startSession(db, full, null);
       setPlace(db, full, m.where ?? null);
+      if (push) {
+        setLauncher(db, full, m.launcher === true);
+        writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+      }
       session.owner = true;
       if (from) {
         // The old connection, which the client closes next, holds nothing now.
@@ -325,20 +359,22 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
         logBinding(db, sessionId, full, "moved", from);
       } else {
-        const how = m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null;
-        logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
+        logBinding(db, sessionId, full, "bound", [continued?.detail ?? null, notMoved].filter((d) => d !== null).join("; ") || null);
       }
     } else {
       touchHandle(db, full);
     }
 
     const info: IdentityInfo = { ...infoFor(full), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
-    const notices = [...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)), ...claimsInstruction(listClaims(db, undefined, full), full)];
     // Tools-only requests and the bridge's human attachment cannot consume the owner's notice.
-    if (owns && !human) {
-      const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
-      if (bridgeNotice) notices.push(bridgeNotice);
-    }
+    const bridgeNotice = owns && !human ? owedBridgeNotice(repo, authed.user_email) : undefined;
+    const notices = [
+      ...(m.launcher && push && owns ? launcherInstruction() : []),
+      ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)),
+      ...(bridgeNotice ? [bridgeNotice] : []),
+      // Last: claims are the longest notice, so a client cut must lose them first.
+      ...claimsInstruction(listClaims(db, undefined, full), full),
+    ];
     if (notices.length) info.notices = notices;
     return { session, info };
   }
@@ -364,6 +400,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     ) {
       valid(session);
       return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids);
+    },
+    delegate(session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
+      valid(session);
+      return handleDelegate(hub, session, request);
     },
     history(session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
       valid(session);
@@ -422,6 +462,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     heartbeat() {
       application.revalidate();
+      helloLimiter.sweep();
       for (const s of hub.sessions) s.sink.keepAlive?.();
     },
     stopExpiry: expiry.stop,
@@ -567,6 +608,34 @@ function handleSend(
     undelivered_from_you: repo.messages.undeliveredFrom(session.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
     note: queuedNote(parsed.full, seen),
   };
+}
+
+function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">) {
+  const { repo, db } = hub;
+  const { authed } = session;
+  let to: string | undefined;
+  let resolvedTo = m.to;
+  try {
+    if (m.to !== undefined) to = resolvePeer(repo, session, m.to).full;
+    const d = resolveDelegation(db, session.identityFull, { ...m, to },
+      h => hub.registry.get(h)?.active === true,
+      () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id));
+    resolvedTo = d.to;
+    const sent = handleSend(hub, session, d.to, d.body, null, true, undefined);
+    const result = delegateOkFields(d, sent);
+    writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+      requester: session.identityFull,
+      via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
+      message_id: result.message_id,
+    });
+    return result;
+  } catch (e) {
+    if (e instanceof CoreError || e instanceof ApplicationError) {
+      writeAudit(repo, "delegation.refused", authed.user_email, session.identityFull, { reason: e.message, to: resolvedTo });
+      if (e instanceof CoreError) fail("bad_request", e.message);
+    }
+    throw e;
+  }
 }
 
 // The cursor moves only when the recipient acks, so a live recipient may hold

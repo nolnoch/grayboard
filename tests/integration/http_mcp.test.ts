@@ -70,6 +70,21 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(app.mcp.activeContexts).toBe(0);
 });
 
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
+  const token = await login();
+  const launcher = new WsClient(base, token, "allowed", { hello: { launcher: true } });
+  wsClients.push(launcher);
+  expect((await launcher.connect()).type).toBe("hello_ok");
+  const client = await connect(token, "be", version);
+  expect((await client.listTools()).tools.map(t => t.name)).toContain("delegate");
+  const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));
+  expect(result).toMatchObject({ to: "alice@example.com/allowed", delivered_now: true, pending: true });
+  expect(result.note).toContain("settle the thread");
+  expect(app.repo.messages.getById(result.message_id)).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
+  expect(JSON.parse(app.repo.audit.last("delegation.requested", "alice@example.com/allowed")!.detail!)).toMatchObject({ via: "explicit", message_id: result.message_id });
+  expect((value(await client.callTool({ name: "peer_list", arguments: {} })).peers as { handle: string; launcher?: boolean }[]).find(p => p.handle === "alice@example.com/be")?.launcher).toBeUndefined();
+});
+
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning WS hello`, async () => {
   const token = await login();
   const client = await connect(token, "be", version);

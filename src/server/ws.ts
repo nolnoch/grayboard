@@ -116,6 +116,9 @@ export function createWsHandlers(application: Application) {
           case "send":
             send(ws, { type: "send_ok", req_id: msg.req_id, ...application.send(session, msg.recipient, msg.body, msg) });
             break;
+          case "delegate":
+            send(ws, { type: "send_ok", req_id: msg.req_id, ...application.delegate(session, msg) });
+            break;
           case "history":
             send(ws, { type: "history_ok", req_id: msg.req_id, messages: application.history(session, msg) });
             break;

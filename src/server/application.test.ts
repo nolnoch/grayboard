@@ -109,6 +109,18 @@ test("only an owning agent selection consumes a bridge death notice, including h
   expect(store.repo.audit.last("bridge.notified", target)).toEqual(notified);
 });
 
+test("application selection shares the per-user hello budget across tools-only and unbound callers", async () => {
+  application.stopExpiry();
+  application = createApplication(store.repo, store.db, { helloLimit: { burst: 1, perSec: 0.01 } });
+  await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true });
+  await expect(application.selectIdentity(alice, "refused", delivery(sink()), { push: false })).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
+  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  expect(store.db.query("SELECT * FROM binding_events").all()).toEqual([]);
+  expect(store.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+  expect((await application.attachHuman(alice, delivery(sink()))).session.human).toBe(true);
+  expect((await application.selectIdentity(bob, "be", delivery(sink()))).session.owner).toBe(true);
+});
+
 test("concurrent owner acquisitions recheck after a dead-owner probe", async () => {
   let resolve!: (alive: boolean) => void;
   const dead = sink(() => new Promise<boolean>(r => {
@@ -183,6 +195,7 @@ test("unbound application sessions cannot use named operations or persist synthe
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
   const operations = [
     () => application.send(session, "be", "no"),
+    () => application.delegate(session, { persona: "a researcher", task: "no" }),
     () => application.history(session),
     () => application.thread(session, 1),
     () => application.inbox(session),
