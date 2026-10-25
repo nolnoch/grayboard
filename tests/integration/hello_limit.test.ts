@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from "bun:test";
 
 import { FakeSlack } from "./fake_slack.ts";
+import { mintSessionKey } from "../../src/core/bindings.ts";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
@@ -134,7 +135,7 @@ function stub(reply: (n: number) => Record<string, unknown>) {
 }
 
 function client(url: string): GrayboardClient {
-  const c = new GrayboardClient(url, () => "t", "fe", async () => {}, async () => {});
+  const c = new GrayboardClient(url, () => "t", "fe", mintSessionKey(), async () => {}, async () => {});
   cleanup.push(() => c.close());
   c.connect();
   return c;

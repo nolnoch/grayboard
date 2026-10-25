@@ -8,7 +8,7 @@ import type { Database } from "bun:sqlite";
 
 import { declareHuman, humanHandles, isHuman, isViewer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { continuityOf, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -90,7 +90,7 @@ export function liveSessions(db: Database): SessionRow[] {
 }
 
 export type AcquireResult =
-  | { ok: true; name: string; moved: Claim[] }
+  | { ok: true; name: string; moved: Claim[]; restored: boolean }
   | { ok: false; error: string; holder?: string; known?: string[] };
 
 // Whether a roster name is an agent's: not a viewer's, nor a human's.
@@ -110,7 +110,9 @@ function knownNames(db: Database): string[] {
  * Bind session `sessionId` to `name`, moving it off `previous` (a rebind)
  * with its claims. `create` allows a name that has never existed (startup
  * passes it for an explicit BUS_IDENTITY, as startup always created one).
- * `detail` goes on the bound event (a restart's restore). Refusals are logged.
+ * `restartOf` is the session a restart takes the name back from: verified
+ * against the name's history in the transaction that logs the bind (#211),
+ * and `restored` says whether it held. Refusals are logged.
  *
  * The socket probe for a pre-upgrade holder (no live row, live socket) runs
  * before the lock and is re-checked against the rows inside it, so the write
@@ -121,7 +123,7 @@ export async function acquireName(
   db: Database,
   sessionId: string,
   name: string,
-  opts: { create: boolean; previous: string | null; allowHuman?: boolean; detail?: string },
+  opts: { create: boolean; previous: string | null; allowHuman?: boolean; restartOf?: string },
 ): Promise<AcquireResult> {
   const rowHolder = () => db.prepare(`SELECT * FROM bindings WHERE name = ? AND session_id != ?`).get(name, sessionId) as SessionRow | null;
   const before = rowHolder();
@@ -155,10 +157,11 @@ export async function acquireName(
 
     const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
+    const restart = opts.restartOf === undefined ? null : continuityOf(db, name, { restartOf: opts.restartOf });
     const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
     if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
-    logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? opts.detail ?? null, now);
-    return { ok: true, name, moved };
+    logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? restart?.detail ?? null, now);
+    return { ok: true, name, moved, restored: restart?.verified ?? false };
   }).immediate();
 }
 

@@ -375,6 +375,45 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect(JSON.parse(readFileSync(join(dir, `bind.${next.harnessPid}`), "utf8")).name).toBe("fe");
 }, 30_000);
 
+test("#211: a name record whose session the name's history doesn't show restores the name unverified, with a fresh status", async () => {
+  let s = await session(null);
+  await s.call("bind", { name: "api", create: true });
+  await s.call("peer_status", { text: "mid-task" });
+  const path = join(dir, `bind.${s.harnessPid}`);
+  const stranger = "0123456789abcdef";
+  const prior = events("api").at(-1)!.session_id;
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), session_id: stranger }));
+  s = await s.restart("crash");
+  expect((await s.call("peer_list", {})).you).toBe("api");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
+  expect(rows<{ status: string | null }>(`SELECT status FROM handles WHERE name = 'api'`)[0]!.status).toBeNull();
+}, 30_000);
+
+test("#211: a restore is verified in the transaction that binds: a bind that lands while it waits makes it unverified", async () => {
+  const s = await session(null, { extra: pauseEnv("bind:before-txn") });
+  const bind = s.call("bind", { name: "api", create: true });
+  await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
+  release("bind:before-txn");
+  await bind;
+  const prior = events("api").at(-1)!.session_id;
+  rmSync(join(dir, "go-bind:before-txn"));
+  // The restart parks just before its transaction; another session binds the
+  // name, sets a status and exits meanwhile.
+  const hits = () => s.stderr().split("test pause hit: bind:before-txn").length - 1;
+  const restarting = s.restart("crash");
+  await until(() => hits() === 2);
+  const other = await session("api");
+  await other.call("peer_status", { text: "theirs" });
+  await stop(other.c);
+  const theirs = events("api").filter((e) => e.event === "bound").at(-1)!.session_id;
+  expect(theirs).not.toBe(prior);
+  release("bind:before-txn");
+  const next = await restarting;
+  expect((await next.call("peer_list", {})).you).toBe("api");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${prior} not verified: latest bound by ${theirs}` });
+  expect(rows<{ status: string | null }>(`SELECT status FROM handles WHERE name = 'api'`)[0]!.status).toBeNull();
+}, 30_000);
+
 test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
   // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
   let s = await session("be");

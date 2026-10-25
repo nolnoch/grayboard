@@ -23,9 +23,6 @@ export class HelloRefused extends Error {
 }
 
 export type ClientOptions = {
-  // This process's session key (#182 audit 4): the server derives the
-  // session ID it keys binding events on from it.
-  sessionKey?: string;
   // With push false: hold the name all the same (probed, claims move), for a
   // harness that can't show pushes (#182 audit 2).
   hold?: boolean;
@@ -66,6 +63,10 @@ export class GrayboardClient {
     private readonly token: () => string,
     // null: an unbound session's read-only connection, with no name.
     private readonly identity: string | null,
+    // This process's session key (#182 audit 4): the server derives the
+    // session ID it keys binding events on from it, and a reconnect keeps its
+    // status only under the ID that last bound the name (#211).
+    private readonly sessionKey: string,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
     // false: a tools-only connection that never receives pushes.
@@ -100,13 +101,13 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
-      const { sessionKey, hold, from, create, suggested, restoredFrom } = this.opts;
+      const { hold, from, create, suggested, restoredFrom } = this.opts;
       this.send({
         type: "hello", req_id: this.helloId,
         ...(this.identity === null
           ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
           : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
-        ...(sessionKey ? { session_key: sessionKey } : {}),
+        session_key: this.sessionKey,
         ...(where ? { where } : {}),
         ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
       });
