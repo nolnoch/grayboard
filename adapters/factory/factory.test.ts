@@ -105,7 +105,10 @@ describe("factory bus", () => {
     token = await srv.login("you@example.com");
     const sim = await srv.session(token, "sim");
     const proc = Bun.spawn([process.execPath, join("adapters", "factory", "main.ts")], {
-      env: { ...process.env, ...factoryEnv(), GRAYBOARD_CREDENTIALS: "" },
+      // An empty agents fixture: the receipt path is deterministic (no
+      // translator matches), whichever agents the running machine's real
+      // pi install carries (#243's translators resolve against this env).
+      env: { ...process.env, ...factoryEnv(), GRAYBOARD_CREDENTIALS: "", PI_CODING_AGENT_DIR: join(dir, "no-agents") },
       cwd: join(import.meta.dir, "..", ".."),
       stdout: "pipe",
       stderr: "pipe",
