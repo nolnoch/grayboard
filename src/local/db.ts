@@ -3,6 +3,8 @@ import { SqliteBlobs } from "./blobs.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments } from "../core/attachments.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
+import { addressParts } from "../core/addresses.ts";
+import { assertDeliverableId } from "../core/session_end.ts";
 
 const opened = openLocalDb();
 export const db = opened.db;
@@ -42,7 +44,9 @@ const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_
 
 // Stores the message from session `senderId` (null from a tools-only
 // process, which has no session row) and binds the sender's uploads
-// `ids` to it, in one transaction.
+// `ids` to it, in one transaction. A session ID recipient is checked in that
+// transaction, so the send can't race the session's end (#284 S8): it's
+// refused once the end has the lock, and bounced by it if it landed first.
 export function insertMessage(
   sender: string,
   senderId: string | null,
@@ -53,6 +57,7 @@ export function insertMessage(
   ids: number[] = [],
 ): { id: number; attachments: AttachmentInfo[] } {
   return db.transaction(() => {
+    if (addressParts(recipient)?.kind === "id") assertDeliverableId(db, recipient);
     const now = Date.now();
     const { lastInsertRowid } = db
       .prepare(

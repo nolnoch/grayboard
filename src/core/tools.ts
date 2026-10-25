@@ -439,6 +439,7 @@ export function callBoardTool(
         note: optStr(a, "note"),
         board: optStr(a, "board"),
         addresses: ctx.addresses,
+        session: ctx.session,
       });
       const { wake, ...rest } = r;
       return { result: rest, wake };
@@ -446,7 +447,7 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"), ctx.addresses);
+      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
       return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake };
     }
 

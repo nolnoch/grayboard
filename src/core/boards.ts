@@ -4,7 +4,7 @@ import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts"
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
-import { aliasScope } from "./addresses.ts";
+import { addressParts, aliasScope } from "./addresses.ts";
 import { writeCoreAudit } from "./audit.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
@@ -487,7 +487,8 @@ export type PostOpts = {
 // Eligible lanes for a queue board's rotation, least-recently-woken first
 // (never-woken first, then by handle). A lane is a push subscriber who isn't
 // the poster, hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer. With `online`, live lanes come first; offline lanes are
+// read-only viewer: an alias, or a session ID that holds none (#284 S8; a
+// bound session's lane is its alias, and an ID can't opt out). With `online`, live lanes come first; offline lanes are
 // the fallback in the same order, so an empty live set still delivers.
 export function queueLanes(
   db: Database,
@@ -499,8 +500,11 @@ export function queueLanes(
   const rows = (
     db
       .prepare(
-        `SELECT s.handle FROM subscriptions s JOIN aliases h ON h.address = s.handle
-         WHERE s.board = ? AND s.mode = 'push' AND s.handle != ? AND h.queue_off IS NULL
+        `SELECT s.handle FROM subscriptions s LEFT JOIN aliases h ON h.address = s.handle
+         LEFT JOIN ids i ON i.id = s.handle
+         WHERE s.board = ? AND s.mode = 'push' AND s.handle != ?
+           AND (h.address IS NOT NULL AND h.queue_off IS NULL
+                OR i.id IS NOT NULL AND i.ended_at IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id))
          ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
                     WHERE o2.handle = s.handle AND p2.board = s.board) ASC NULLS FIRST, s.handle ASC`,
       )
@@ -661,7 +665,7 @@ export function post(
       for (const s of subs)
         if (s.mode === "push" && !queueBoard) targets.set(s.handle, { reason: "subscription", wake: true });
       if (announcement) {
-        for (const h of rosterHandles(db)) {
+        for (const h of liveAddresses(db)) {
           if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
         }
       } else if (parentId !== null) {
@@ -835,9 +839,11 @@ export function who(
   return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
-// When a handle last had a session, or null if it never connected.
+// When a handle last had a session, or null if it never connected. An ID's
+// is its own session's (#284 S8).
 export function lastSeen(db: Database, handle: string): number | null {
-  const row = db.prepare(`SELECT last_seen FROM aliases WHERE address = ?`).get(handle) as { last_seen: number | null } | undefined;
+  const sql = addressParts(handle)?.kind === "id" ? `SELECT last_seen FROM ids WHERE id = ?` : `SELECT last_seen FROM aliases WHERE address = ?`;
+  const row = db.prepare(sql).get(handle) as { last_seen: number | null } | undefined;
   return row?.last_seen ?? null;
 }
 
@@ -852,9 +858,25 @@ export function sessionsSeen(db: Database, handles: string[]): Map<string, { las
   return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
-/** Every handle in the roster, for a mode that must check liveness up front. */
+/** Every handle in the roster: the aliases that have had a session. */
 export function rosterHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE last_seen IS NOT NULL`).all() as { address: string }[]).map((r) => r.address);
+}
+
+/**
+ * Every address that may have a live session, for a mode that must check
+ * liveness up front (#284 S8): the roster, and the session IDs that haven't
+ * ended, deliver, aren't viewers and hold no alias (a bound session is
+ * reached through its alias).
+ */
+export function liveAddresses(db: Database): string[] {
+  const ids = db
+    .prepare(
+      `SELECT id FROM ids i WHERE ended_at IS NULL AND delivery = 'push' AND viewer = 0
+         AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id) ORDER BY id`,
+    )
+    .all() as { id: string }[];
+  return [...rosterHandles(db), ...ids.map((r) => r.id)];
 }
 
 // A human's announcements still inside their TTL, oldest first.

@@ -49,9 +49,13 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
-function announce(db: Database, handle: string, board: string | null, text: string): string[] {
+// The calling session (#284): `addresses` is its address set, the primary
+// first; `session` its ID, recorded on the posts it makes (S8).
+export type ClaimCtx = { addresses?: string[]; session?: string };
+
+function announce(db: Database, handle: string, board: string | null, text: string, session?: string): string[] {
   if (!board) return [];
-  return post(db, handle, board, text).wake;
+  return post(db, handle, board, text, null, { author_id: session }).wake;
 }
 
 // The claim's watchers as @mentions for a post about it. An end post takes
@@ -74,7 +78,7 @@ export function claim(
   db: Database,
   handle: string,
   keyInput: string,
-  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string; addresses?: string[] } = {},
+  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } & ClaimCtx = {},
 ): ClaimResult {
   const key = validKey(keyInput);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
@@ -119,9 +123,9 @@ export function claim(
       .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
     logEvent(db, renewed ? "renew" : "take", as, row, now);
     const wake = !renewed
-      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
+      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts.session)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
-        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`)
+        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts.session)
         : [];
     return { ok: true, claim: row, renewed, wake: [...new Set([...lapsed, ...wake])] };
   }).immediate();
@@ -148,9 +152,10 @@ export function release(
   handle: string,
   keyInput: string,
   note?: string,
-  addresses: string[] = [handle],
+  ctx: ClaimCtx = {},
 ): { wake: string[]; releasedAt?: number } {
   const key = validKey(keyInput);
+  const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     const active = !!cur && cur.expires_at > Date.now();
@@ -175,7 +180,7 @@ export function release(
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
     const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
-    return { wake: announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`) };
+    return { wake: announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session) };
   }).immediate();
 }
 

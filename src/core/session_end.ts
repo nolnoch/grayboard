@@ -74,7 +74,7 @@ export function endSession(
   const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(id, now) as { key: string }[];
   for (const c of claims) {
     try {
-      for (const h of release(db, id, c.key, "session ended").wake) wake.add(h);
+      for (const h of release(db, id, c.key, "session ended", { session: id }).wake) wake.add(h);
     } catch (e) {
       // It lapsed since the select; the sweep below takes it.
       if (!(e instanceof CoreError)) throw e;

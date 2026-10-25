@@ -7,13 +7,14 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { SESSION_KEY, UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, mintSessionKey, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
+import { addressParts } from "../core/addresses.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
@@ -401,7 +402,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // this mode's DM, pending: the promise shows in dm_inbox until the
     // requester settles the thread (#184). Same result fields as dm_send, via
     // the shared builder, so the modes can't drift.
-    const live = await liveHandles(IDENTITY);
+    const live = await liveHandles(ADDRS);
     // A launcher inside its bind swap still answers under its old name: filter
     // it like dm_send does (a released name's socket isn't the session).
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
@@ -462,14 +463,17 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   }
 
   if (name === "dm_send") {
-    const { to: recipient, body, parent_id, pending } = a as {
+    const { to, body, parent_id, pending } = a as {
       to: string;
       body: string;
       parent_id?: number;
       pending?: boolean;
     };
     checkBody(body);
-    if (!rosterHandles(db).includes(recipient)) {
+    // A session ID is checked where the message is written (insertMessage).
+    const parsed = addressParts(to);
+    const recipient = parsed?.kind === "id" ? parsed.address : to;
+    if (parsed?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
         isError: true,
@@ -573,7 +577,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // too; other posts don't pay for it.
     const queuePost = name === "board_post" && isQueueBoard(db, typeof a.board === "string" ? a.board : "");
     const ctx = {
-      ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
+      ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(ADDRS) } : {}),
       ...(name === "peer_list" ? { unbound: await unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
       human: HUMAN,
@@ -593,10 +597,10 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   throw new Error(`unknown tool: ${name}`);
 }
 
-// Which handles have a live session, by probing each wakeup socket. A probe is
-// also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
-async function liveHandles(self: string): Promise<(h: string) => boolean> {
-  const others = rosterHandles(db).filter((h) => h !== self);
+// Which addresses have a live session, by probing each wakeup socket. A probe
+// is also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
+async function liveHandles(self: string[]): Promise<(h: string) => boolean> {
+  const others = liveAddresses(db).filter((h) => !self.includes(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   return (h) => live.has(h);

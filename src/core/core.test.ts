@@ -367,9 +367,9 @@ test("a claim held by any of the caller's addresses renews, releases and refuses
   expect(claim(db, "sim", "lane:a")).toMatchObject({ ok: false, held_by: ID });
   expect(() => watch(db, "be", "lane:a", false, set)).toThrow(/you hold/);
   expect(() => release(db, "be", "lane:a")).toThrow(`held by ${ID}`);
-  release(db, "be", "lane:a", "done", set);
+  release(db, "be", "lane:a", "done", { addresses: set, session: ID });
   // A repeat whose first answer was lost (#254) is answered from the event.
-  expect(release(db, "be", "lane:a", "done", set).releasedAt).toEqual(expect.any(Number));
+  expect(release(db, "be", "lane:a", "done", { addresses: set }).releasedAt).toEqual(expect.any(Number));
   const events = db.prepare(`SELECT handle, event FROM claim_events WHERE key = 'lane:a' ORDER BY id`).all();
   expect(events).toEqual([{ handle: ID, event: "take" }, { handle: ID, event: "renew" }, { handle: "sim", event: "refused" }, { handle: ID, event: "release" }]);
   expect(read(db, "sim", "e2e", { before_id: 999 }).posts.map((p) => [p.author, p.body])).toEqual([
@@ -377,6 +377,8 @@ test("a claim held by any of the caller's addresses renews, releases and refuses
     [ID, "[update] lane:a — step 2"],
     [ID, "[release] lane:a — done"],
   ]);
+  // S8: the release post records the session that made it.
+  expect(db.prepare(`SELECT author_id FROM posts WHERE body LIKE '[release]%'`).get()).toEqual({ author_id: ID });
   expect(claimsInstruction(listClaims(db), set)[0]).toContain("Yours: lane:b");
 });
 

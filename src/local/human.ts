@@ -4,7 +4,7 @@
 import { db, openEnded } from "./db.ts";
 import { deliverEnded, poke } from "./wakeup.ts";
 import { declareLocalHuman } from "./binding.ts";
-import { ANNOUNCE_BOARD, createBoard, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { ANNOUNCE_BOARD, createBoard, humanHandles, isViewer, liveAddresses, post, subscribe } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import { parseTtl as parseDuration } from "../shared/ttl.ts";
@@ -45,7 +45,7 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
   const human = declaredHuman();
   const ttl_ms = ttl === undefined ? undefined : parseTtl(ttl);
   // Probing a socket also wakes its session; it drains nothing until the post lands.
-  const others = rosterHandles(db).filter((h) => h !== human && !isViewer(h));
+  const others = liveAddresses(db).filter((h) => h !== human && !isViewer(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   const r = post(db, human, ANNOUNCE_BOARD, body, null, { online: (h) => live.has(h), ttl_ms });
