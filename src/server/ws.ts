@@ -24,7 +24,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, restoreOf,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf,
   sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -498,9 +498,15 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     moved = [];
     holders.set(full, ws);
     if (push) registry.set(full, ws);
-    // A reconnect, or a verified restart taking its name back, is the same session: its status stays.
-    const restore = m.restored_from === undefined || m.resume ? null : restoreOf(db, full, m.restored_from);
-    if (m.resume || restore?.verified) touchHandle(db, full);
+    // A reconnect, or a restart taking its name back, is the same session, so
+    // its status stays, once the name's history shows it (#211). The session
+    // ID comes from the client's secret, so a reconnect proves itself; a
+    // restore names a public ID. A rebind is neither: it logs `moved`.
+    const continued = m.from !== undefined ? null
+      : m.resume ? continuityOf(db, full, { reconnect: sessionId })
+      : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
+      : null;
+    if (continued?.verified) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     ws.data.owner = true;
@@ -517,8 +523,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
       logBinding(db, sessionId, full, "moved", from);
     } else {
-      const how = m.resume ? "reconnect" : (restore?.detail ?? null);
-      logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
+      logBinding(db, sessionId, full, "bound", [continued?.detail ?? null, notMoved].filter((d) => d !== null).join("; ") || null);
     }
   } else {
     hub.toolsOnly.add(ws);

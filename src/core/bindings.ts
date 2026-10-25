@@ -57,28 +57,43 @@ export function logBinding(db: Database, sessionId: string, name: string, event:
 /** How long after a refusal an identical one from the same session joins its row. */
 export const REFUSED_COALESCE_MS = 60_000;
 
+/** The session ID of the name's latest bound or moved event, or null when it has none. */
+function latestBinder(db: Database, name: string): string | null {
+  const row = db.prepare(
+    `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
+  ).get(name) as { session_id: string } | null;
+  return row?.session_id ?? null;
+}
+
 /**
  * Whether `sessionId` holds `name` by the record: the latest bound or moved
  * event for the name is its own. A rebind moves claims from the name it
  * leaves only then (#182 audit 3).
  */
 export function lastBoundBy(db: Database, name: string, sessionId: string): boolean {
-  const row = db.prepare(
-    `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
-  ).get(name) as { session_id: string } | null;
-  return row?.session_id === sessionId;
+  return latestBinder(db, name) === sessionId;
 }
 
+/** A bind's claim to continue a session on its name, checked against the history. */
+export type Continuity = { verified: boolean; detail: string };
+
 /**
- * A hello's claim to restart `previous` (#211): honoured only when the name's
- * latest bound or moved event is that session's, so the binding history never
- * records a restart the bus didn't see, and a stranger's claim can't keep the
- * name's status.
+ * A hello's claim to continue `session` on `name` (#211): a reconnect of the
+ * session itself, or a restart of an earlier one. Honoured only when the
+ * name's latest bound or moved event is that session's, so the binding
+ * history never records a continuation the bus didn't see. A restart names
+ * a public ID, so on the server this shows the history, not descent (#259).
+ * An unverified claim's detail names the latest binder, so the row explains
+ * its refusal. Call it in the transaction that logs the bind.
  */
-export function restoreOf(db: Database, name: string, previous: string): { verified: boolean; detail: string } {
-  return lastBoundBy(db, name, previous)
-    ? { verified: true, detail: `restored: restart of session ${previous}` }
-    : { verified: false, detail: `restored_from ${previous} not verified` };
+export function continuityOf(db: Database, name: string, claim: { reconnect: string } | { restartOf: string }): Continuity {
+  const session = "reconnect" in claim ? claim.reconnect : claim.restartOf;
+  const latest = latestBinder(db, name);
+  if (latest === session) {
+    return { verified: true, detail: "reconnect" in claim ? "reconnect" : `restored: restart of session ${session}` };
+  }
+  const what = "reconnect" in claim ? "reconnect" : `restored_from ${session}`;
+  return { verified: false, detail: `${what} not verified: latest bound by ${latest ?? "nobody"}` };
 }
 
 /** Whether the name's latest bound, moved or released event is a release. */

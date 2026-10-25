@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, restoreOf, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -134,8 +134,8 @@ const DELIVER = PUSH && !CHANNELS_OFF;
 let bound: string | null = null;
 // Why this session started unbound, for its instructions.
 const unboundNotes: string[] = [];
-// The name came back from the name record: the same harness session, so its
-// peer status stays.
+// The name came back from the name record and the name's history shows the
+// recorded session (#211): the same harness session, so its peer status stays.
 let restored = false;
 // The name record (#182 decision 14), written by the session that owns
 // delivery whenever its name changes. The Slack bridge's child keeps none:
@@ -165,13 +165,12 @@ else {
     const n = normalizeIdentityName(rec.name);
     // The process it replaces may not have exited yet.
     if (n.ok) await siblingGone(db, n.name, process.ppid);
-    const restore = n.ok ? restoreOf(db, n.name, rec.session_id) : null;
     const r = n.ok
-      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, detail: restore!.detail })
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
       : { ok: false as const, error: n.error };
     if (r.ok) {
       bound = r.name;
-      restored = restore!.verified;
+      restored = r.restored;
     } else unboundNotes.push(restoreNote(rec.name, r.error));
   } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });

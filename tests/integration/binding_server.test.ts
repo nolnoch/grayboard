@@ -527,13 +527,50 @@ test("11: a restart under the same harness takes its name back; a fresh harness 
 test("#211: a restored_from the name's history doesn't show is logged unverified and starts a fresh status", async () => {
   const s = await session("api");
   await s.call("peer_status", { text: "mid-task" });
+  const prior = events("api").at(-1)!.session_id;
   await stop(s.c);
   const { WsClient } = await import("../support/ws_client.ts");
   const stranger = "0123456789abcdef";
   const ws = new WsClient(srv.base, alice, "api", { hello: { restored_from: stranger } });
   expect((await ws.connect()).type).toBe("hello_ok");
-  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified` });
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(rows<{ status: string | null }>("SELECT status FROM handles WHERE name = ?", `${A}/api`)[0]!.status).toBeNull();
+  ws.close();
+});
+
+test("#211: a resume keeps its status only when its own session last bound the name; a rebind ignores restored_from", async () => {
+  const { WsClient } = await import("../support/ws_client.ts");
+  const status = () => rows<{ status: string | null }>("SELECT status FROM handles WHERE name = ?", `${A}/api`)[0]!.status;
+  const [mine, theirs] = ["a1".repeat(32), "b1".repeat(32)];
+  const connect = async (key: string, hello: Record<string, unknown>) => {
+    const ws = new WsClient(srv.base, alice, "api", { hello: { session_key: key, ...hello } });
+    expect((await ws.connect()).type).toBe("hello_ok");
+    return ws;
+  };
+  let ws = await connect(mine, {});
+  expect((await ws.call("peer_status", { text: "mid-task" })).type).toBe("call_ok");
+  ws.close();
+  await until(() => events("api").at(-1)!.event === "released");
+  // A reconnect of the session that last bound it: verified, status kept.
+  ws = await connect(mine, { resume: true });
+  expect(events("api").at(-1)).toMatchObject({ session_id: sessionIdOf(mine), event: "bound", detail: "reconnect" });
+  expect(status()).toBe("mid-task");
+  ws.close();
+  await until(() => events("api").at(-1)!.event === "released");
+  // Another session's resume: unverified, fresh status.
+  ws = await connect(theirs, { resume: true });
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `reconnect not verified: latest bound by ${sessionIdOf(mine)}` });
+  expect(status()).toBeNull();
+  await ws.call("peer_status", { text: "theirs" });
+  ws.close();
+  await until(() => events("api").at(-1)!.event === "released");
+  // A rebind naming a restored_from that would verify still starts fresh, and logs only the move.
+  const other = await connect(mine, { identity: "fe" });
+  other.close();
+  await until(() => events("fe").at(-1)!.event === "released");
+  ws = await connect(mine, { from: "fe", restored_from: sessionIdOf(theirs) });
+  expect(events("api").at(-1)).toMatchObject({ event: "moved", detail: `${A}/fe` });
+  expect(status()).toBeNull();
   ws.close();
 });
 

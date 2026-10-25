@@ -50,3 +50,20 @@ test("a session's identical refusals within the window share a row; anything els
   prunePosts(db, 2000 + REFUSED_COALESCE_MS);
   expect(db.prepare(`SELECT at FROM binding_events WHERE count = 3`).all()).toEqual([{ at: 1000 }]);
 });
+
+// #211: retention keeps each name's latest bound or moved event, which says
+// who holds the name by the record; everything else past the window goes.
+test("retention keeps each name's latest bound or moved event", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const [s1, s2] = ["0123456789abcdef", "fedcba9876543210"];
+  logBinding(db, s1, "fe", "bound", null, 1000);
+  logBinding(db, s2, "fe", "bound", null, 2000);
+  logBinding(db, s2, "fe", "released", null, 3000);
+  logBinding(db, s1, "be", "moved", "fe", 4000);
+  logBinding(db, s1, "be", "refused", "held", 5000);
+  prunePosts(db, 10_000);
+  expect(db.prepare(`SELECT session_id, name, event FROM binding_events ORDER BY id`).all()).toEqual([
+    { session_id: s2, name: "fe", event: "bound" },
+    { session_id: s1, name: "be", event: "moved" },
+  ]);
+});
