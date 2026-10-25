@@ -2,6 +2,12 @@ import { expect, test } from "bun:test";
 import { createCimdResolver, parseCimd, publicAddress } from "./oauth-cimd.ts";
 import { matchesRedirect } from "./oauth-config.ts";
 
+test("production HTTPS lookup preserves both callback shapes, pinning and TLS/response guards", async () => {
+  const proc = Bun.spawn([process.execPath, new URL("../../tests/support/cimd-transport.ts", import.meta.url).pathname], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  expect({ exit, stderr, stdout }).toEqual({ exit: 0, stderr: "", stdout: "PASS ok4\nPASS ok6\nPASS redirect\nPASS oversize\nPASS utf8\nPASS untrusted\nPASS wrong-name\nPASS slow\n" });
+}, 15000);
+
 const id = "https://opencode.ai/oauth/opencode/client.json";
 const document = (clientId = id) => JSON.stringify({ client_id: clientId, client_name: "OpenCode", redirect_uris: ["http://127.0.0.1/callback", "http://localhost/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] });
 test("CIMD accepts only public unicast DNS answers, including no mapped/tunnel aliases", () => {

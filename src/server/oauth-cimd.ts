@@ -27,7 +27,7 @@ export type CimdOptions = {
 };
 function readPinned(url: URL, address: Address, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    const req = request(url, { agent: false, signal, lookup: (_host, _options, callback) => callback(null, address.address, address.family), headers: { Accept: "application/json" } }, response => {
+    const req = request(url, { agent: false, signal, lookup: (_host, options, callback) => options.all ? callback(null, [address]) : callback(null, address.address, address.family), headers: { Accept: "application/json" } }, response => {
       if (response.statusCode !== 200 || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:;|$)/i.test(response.headers["content-type"] ?? "")) { response.destroy(); reject(new Error("invalid CIMD response")); return; }
       const chunks: Buffer[] = [];
       let bytes = 0;
