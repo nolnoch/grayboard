@@ -7,18 +7,22 @@
 //   bun scripts/check_factory_isolation.ts [root]   (default: this repo)
 //
 // Imports come from TypeScript's own scanner, which sees every static form
-// (type-only, multi-line, re-export, side-effect, `import =`, `import()` types)
-// plus dynamic import and require with a literal path, and nothing in comments
-// or strings. A computed `import(expr)` can't be resolved and isn't covered.
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+// (type-only, multi-line, re-export, side-effect, `import =`, `import()` types,
+// `/// <reference path>`) plus dynamic import and require with a literal path,
+// and nothing in comments or strings. Specs resolve as Bun resolves them
+// (extensionless, `.js` for `.ts`, `file://` URLs), then to the real, canonically
+// cased path. Not covered: a computed `import(expr)`, and code loaded other
+// than by import or require (`new Worker(url)`, `Bun.spawn`, `import.meta.resolve`).
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const FACTORY = "adapters/factory";
 // The published surface: the only src/ files the module may import.
 const PUBLISHED = new Set(["src/plugin/client.ts", "src/shared/protocol.ts"]);
-const SOURCE = /\.(ts|tsx|mts|cts|js|mjs|cjs)$/;
-const TEST = /\.test\.(ts|tsx|mts|cts|js|mjs|cjs)$/;
+const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+const TEST = /\.test\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 /** Repo-relative posix path, or null outside `root`. */
 function repoPath(root: string, abs: string): string | null {
@@ -27,6 +31,17 @@ function repoPath(root: string, abs: string): string | null {
 }
 
 const under = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
+
+/**
+ * `abs` with symlinks followed and case canonical (a case-insensitive disk
+ * opens `Adapters/Factory`), so it compares with the real `root`. A path that
+ * doesn't exist yet keeps its missing tail under its nearest real ancestor.
+ */
+function canonical(abs: string): string {
+  if (existsSync(abs)) return realpathSync.native(abs);
+  const parent = dirname(abs);
+  return parent === abs ? abs : join(canonical(parent), basename(abs));
+}
 
 /** Every file and symlink under `dir`, without following symlinks. */
 function* walk(dir: string): Generator<{ path: string; link: boolean }> {
@@ -39,29 +54,38 @@ function* walk(dir: string): Generator<{ path: string; link: boolean }> {
   }
 }
 
+/** Where `spec` in `file` loads from, as Bun resolves it; a missing target resolves as a plain path. */
+function resolveSpec(file: string, spec: string): string {
+  const path = spec.startsWith("file:") ? fileURLToPath(spec) : spec;
+  try {
+    return canonical(Bun.resolveSync(path, dirname(file)));
+  } catch {
+    return canonical(resolve(dirname(file), path));
+  }
+}
+
 /** The repo paths `file` imports; packages (bare specifiers) are skipped. */
 function importsOf(root: string, file: string): { spec: string; target: string | null }[] {
-  return ts
-    .preProcessFile(readFileSync(file, "utf8"), true, true)
-    .importedFiles.map((f) => f.fileName)
-    .filter((spec) => spec.startsWith(".") || isAbsolute(spec))
-    .map((spec) => {
-      // Real paths on both sides, so `root` and a target reached through a
-      // symlinked prefix (macOS's /var → /private/var) compare.
-      const abs = resolve(dirname(file), spec);
-      return { spec, target: repoPath(root, existsSync(abs) ? realpathSync(abs) : abs) };
-    });
+  const info = ts.preProcessFile(readFileSync(file, "utf8"), true, true);
+  const local = (spec: string) => spec.startsWith(".") || spec.startsWith("file:") || isAbsolute(spec);
+  // A reference path is relative to its file even without a leading `./`.
+  const specs = [
+    ...info.importedFiles.map((f) => f.fileName).filter(local),
+    ...info.referencedFiles.map((f) => (local(f.fileName) ? f.fileName : `./${f.fileName}`)),
+  ];
+  return specs.map((spec) => ({ spec, target: repoPath(root, resolveSpec(file, spec)) }));
 }
 
 /** Each way `root`'s tree breaks the boundary, one line per import or link. */
 export function isolationViolations(root: string): string[] {
-  root = realpathSync(root);
+  root = realpathSync.native(root);
   const out: string[] = [];
   const where = (abs: string) => repoPath(root, abs)!;
 
   for (const { path, link } of walk(join(root, "src"))) {
     if (link) {
-      const real = existsSync(path) ? repoPath(root, realpathSync(path)) : null;
+      // Checked by where it points, so a link committed before its target lands is caught too.
+      const real = repoPath(root, canonical(resolve(dirname(path), readlinkSync(path))));
       if (real && under(real, FACTORY)) out.push(`${where(path)}: a symlink into ${FACTORY}/`);
       continue;
     }
