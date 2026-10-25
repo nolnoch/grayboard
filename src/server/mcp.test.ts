@@ -3,7 +3,7 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication, type DeliveryEvent } from "./application.ts";
+import { ApplicationError, createApplication, type DeliveryEvent } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import { hashToken, mintToken, createTouchQueue, type AuthedUser } from "./auth.ts";
@@ -154,6 +154,46 @@ test("shutdown racing the factory cannot leave a selected context behind", async
   await hosted.close();
   release();
   await expect(pending).rejects.toThrow();
+  expect(hosted.activeContexts).toBe(0);
+});
+
+for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: only typed admission refusals bypass factory error redaction`, async () => {
+  let last!: { status: number; retryAfter: string | null; body: string };
+  const client = await connect(version, async response => {
+    last = { status: response.status, retryAfter: response.headers.get("Retry-After"), body: await response.clone().text() };
+  });
+  const select = application.selectIdentity;
+  const secret = "SELECT token FROM /private/database.sqlite alice@example.com";
+  for (const error of [new Error(secret), new ApplicationError("internal", secret), { code: "rate_limited", message: secret, extra: { retry_after_ms: 1250 } }]) {
+    application.selectIdentity = async () => { throw error; };
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(500);
+    expect(last.retryAfter).toBeNull();
+    expect(last.body).not.toContain(secret);
+    expect(last.body).not.toContain("retry_after_ms");
+  }
+  application.selectIdentity = async () => { throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 }); };
+  await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+  expect(last.status).toBe(429);
+  expect(last.retryAfter).toBe("2");
+  expect(JSON.parse(last.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32000, data: { code: "rate_limited", retry_after_ms: 1250 } } });
+  expect(last.body).not.toContain(secret);
+  application.selectIdentity = select;
+  expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+  expect(last.status).toBe(200);
+  expect(last.retryAfter).toBeNull();
+  let selections = 0;
+  application.selectIdentity = async (...args) => {
+    const n = ++selections;
+    await Promise.resolve();
+    if (n === 1) throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 });
+    return select(...args);
+  };
+  const results = await Promise.allSettled([client.callTool({ name: "board_list", arguments: {} }), client.callTool({ name: "board_list", arguments: {} })]);
+  expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
+  expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+  expect(selections).toBe(2);
+  application.selectIdentity = select;
   expect(hosted.activeContexts).toBe(0);
 });
 

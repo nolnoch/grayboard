@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer, createMcpHandler, fromJsonSchema } from "@modelcontextprotocol/server";
 import type { CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
@@ -35,6 +36,8 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   };
   let closed = false;
   const sessions = new Map<ApplicationSession, McpServer>();
+  // SDK legacy routing clones Requests; scope refusals to the serving exchange.
+  const admission = new AsyncLocalStorage<{ retryAfterMs?: number }>();
   const handler = createMcpHandler(async ({ requestInfo }) => {
     if (!requestInfo || closed) throw new Error("MCP endpoint is closed");
     const raw = extractBearer(requestInfo);
@@ -44,7 +47,14 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       authed, requestInfo.headers.get("X-Grayboard-Identity")!,
       { deliver() {}, probe: async () => false, closed() {} },
       { push: false, create: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
-    );
+    ).catch((e: unknown) => {
+      // The SDK redacts factory errors; retain only this expected admission refusal.
+      const exchange = admission.getStore();
+      if (exchange && e instanceof ApplicationError && e.code === "rate_limited" && typeof e.extra.retry_after_ms === "number" && Number.isFinite(e.extra.retry_after_ms) && e.extra.retry_after_ms > 0) {
+        exchange.retryAfterMs = e.extra.retry_after_ms;
+      }
+      throw e;
+    });
     if (closed || requestInfo.signal.aborted) {
       application.close(session);
       throw new Error("MCP request is closed");
@@ -141,9 +151,22 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
         const known = closestNames(name.toLowerCase(), repo.identities.listForUser(authed.user_id).map(i => i.name).filter(n => n !== HUMAN_NAME));
         return Response.json({ code: "identity_unknown", message: unknownNameError(name.toLowerCase(), known), known }, { status: 400 });
       }
-      try { return await handler.fetch(req); } catch {
-        return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
-      }
+      return admission.run({}, async () => {
+        try {
+          const response = await handler.fetch(req);
+          const retryAfterMs = admission.getStore()!.retryAfterMs;
+          if (retryAfterMs !== undefined) {
+            const { id = null } = await response.json() as { id?: string | number | null };
+            return Response.json({
+              jsonrpc: "2.0", id,
+              error: { code: -32000, message: "too many connections; retry after the indicated delay", data: { code: "rate_limited", retry_after_ms: retryAfterMs } },
+            }, { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } });
+          }
+          return response;
+        } catch {
+          return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
+        }
+      });
     },
     async close() {
       closed = true;
