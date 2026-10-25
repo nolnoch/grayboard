@@ -69,7 +69,7 @@ export function endSession(
     wake.add(m.sender);
   }
 
-  // Lapsed claims first: release() refuses one, which would roll the end back.
+  // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
   for (const h of sweepIn(db, now)) wake.add(h);
   const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(id, now) as { key: string }[];
   for (const c of claims) {

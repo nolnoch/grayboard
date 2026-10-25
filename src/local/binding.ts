@@ -97,7 +97,7 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
 }
 
 /** What kind of session a registration is, beyond its row: see IdFacts. */
-export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean };
+export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean };
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
@@ -108,9 +108,9 @@ export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: bool
  * (attachSession) instead.
  */
 export function registerSession(db: Database, s: SessionRow, kind: SessionKind = {}): void {
-  const { launcher = false, writesAs, viewer } = kind;
+  // A keyed tools-only process has no harness row: its key is passed explicitly.
+  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null } = kind;
   db.transaction(() => {
-    const keyed = s.harness_rule !== null;
     const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed }, s.started_at);
     // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
     if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });

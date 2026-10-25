@@ -149,6 +149,15 @@ test("a tools-only process sharing a live session's key is refused: it never att
   expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "push", ended_at: null }]);
 }, 30_000);
 
+test("a keyed tools-only process alone registers its key's ID as keyed, so retention leaves it a tombstone", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  const s = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } });
+  expect(rows(`SELECT delivery, keyed FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "none", keyed: 1 }]);
+  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ tools_only: true, keyed: true })]);
+  await stop(s.c);
+}, 30_000);
+
 test("a session keyed like a live tools-only process is refused: the key is the tools-only process's ID", async () => {
   const key = mintSessionKey();
   const id = idAddress(key);
