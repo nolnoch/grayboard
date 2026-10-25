@@ -119,7 +119,12 @@ export class GrayboardClient {
     this.ws.onclose = () => {
       for (const p of this.pending.values()) p.reject(new Error("connection to the grayboard server was lost"));
       this.pending.clear();
-      if (this.dead) return;
+      if (this.dead) {
+        // A deliberate stop (a bind's swap, supersede, exit): said once, so a
+        // reconnect that shouldn't happen shows as the line below instead.
+        if (this.wasReady) console.error(`[grayboard] connection as ${this.who()} closed; not reconnecting`);
+        return;
+      }
       const neverOpened = !this.helloData;
       this.ws = null;
       this.helloData = null;
@@ -235,7 +240,12 @@ export class GrayboardClient {
   private scheduleReconnect(): void {
     const delay = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+    console.error(`[grayboard] connection as ${this.who()} lost; reconnecting in ${delay}ms`);
     setTimeout(() => this.connect(), delay);
+  }
+
+  private who(): string {
+    return this.identity === null ? "an unbound session" : `"${this.identity}"`;
   }
 
   private send(msg: ClientMessage): void {

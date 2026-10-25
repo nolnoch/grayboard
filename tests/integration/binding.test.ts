@@ -113,8 +113,12 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
 
   // 3: a new name gets none of api's mail, and api's mail stays unread.
   await s.call("bind", { name: "api2", create: true });
-  await Bun.sleep(300);
-  expect(contents(s)).toEqual([]);
+  // Barrier: the bind's drain under api2 runs before this DM's, so api's mail,
+  // if wrongly delivered, would arrive first.
+  await be.call("dm_send", { to: "api2", body: "probe" });
+  await until(() => contents(s).length > 0);
+  expect(contents(s)).toEqual(["probe"]);
+  s.pushes.splice(0);
   expect(rows(`SELECT 1 FROM cursors WHERE reader = 'api'`)).toEqual([]);
 
   // 1: binding the name delivers what waited, and a new DM wakes it.
@@ -274,9 +278,15 @@ test("9: a DM sent mid-swap is never consumed under the new name", async () => {
   await stop(third.c);
   release("bind:after-acquire");
   expect((await binding).isError).toBeFalsy();
-  await Bun.sleep(300);
+  // Barrier: fe2's first drain runs after every drain under fe, so mid-swap,
+  // if it was ever going to reach this session, is in before the probe.
+  await be.call("dm_send", { to: "fe2", body: "probe" });
+  await until(() => contents(s).includes("probe"));
   // Delivered as fe before the swap, or left for fe; never read as fe2.
   const asFe = contents(s).includes("mid-swap");
+  const [{ id }] = rows<{ id: number }>(`SELECT id FROM messages WHERE body = 'mid-swap'`);
+  const feCursor = rows<{ last_seen_id: number }>(`SELECT last_seen_id FROM cursors WHERE reader = 'fe'`)[0]?.last_seen_id ?? 0;
+  expect(feCursor >= id).toBe(asFe);
   if (!asFe) {
     const next = await session();
     await next.call("bind", { name: "fe" });

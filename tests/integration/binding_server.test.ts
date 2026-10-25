@@ -96,8 +96,12 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
 
   // 3: a new name gets none of api's mail.
   await s.call("bind", { name: "api2", create: true });
-  await Bun.sleep(300);
-  expect(contents(s)).toEqual([]);
+  // Barrier: api2's backlog is sent on its connection before this DM, so api's
+  // mail, if wrongly delivered, would arrive first.
+  await be.call("dm_send", { to: "api2", body: "probe" });
+  await until(() => contents(s).length > 0);
+  expect(contents(s)).toEqual(["probe"]);
+  s.pushes.splice(0);
 
   // 1: binding the name delivers what waited, and a new DM wakes it.
   await s.call("bind", { name: "api" });
@@ -197,8 +201,9 @@ test("9: a DM sent mid-swap is never consumed under the new name, and the old co
   await be.call("dm_send", { to: "fe", body: "mid-swap" });
   release("bind:after-acquire");
   expect((await binding).isError).toBeFalsy();
-  await Bun.sleep(300);
-  // The old connection didn't reconnect and take fe back.
+  // The old connection closed for good: a reconnect would log "lost; reconnecting" instead.
+  await until(() => s.stderr().includes(`connection as "fe" closed; not reconnecting`));
+  expect(s.stderr()).not.toContain(`connection as "fe" lost`);
   const fe = (await be.call("peer_list", { include_offline: true })).peers.find((p: any) => p.handle === `${A}/fe`);
   expect(fe.online).toBe(false);
   // Delivered as fe before the swap, or left for fe; never read as fe2.
@@ -292,8 +297,10 @@ test("audit 5: a bind whose hello_ok comes after its timeout completes, and the 
   expect(texts.slice(1).join(" ")).toContain(`Your claims moved from "old" to "fe": ticket:ENG-142.`);
   // For adapters, which keep the instructions in the system prompt.
   expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
-  // The old connection is closed, and fe stays this session's.
-  await Bun.sleep(300);
+  // The old connection is closed for good, and fe stays this session's.
+  await until(() => s.stderr().includes(`connection as "old" closed; not reconnecting`));
+  expect(s.stderr()).not.toContain(`connection as "old" lost`);
+  expect(s.stderr()).not.toContain(`connection as "fe" closed`);
   expect(events("fe").at(-1)!.event).toBe("moved");
   expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
 }, 30_000);
