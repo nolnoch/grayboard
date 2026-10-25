@@ -87,17 +87,23 @@ for (const mode of ["local", "server"] as const) {
   });
 }
 
-test("opencode: unbound reads work, writes are refused; bind and rebind move the one grayboard process and the system prompt follows in full", async () => {
+test("opencode: an unbound session acts as its ID; bind and rebind move the one grayboard process and the system prompt follows in full", async () => {
   const peer = await localSession(dir, "peer");
   const oc = driver(undefined, entry("local"));
   await oc.send("init");
   await oc.send("config", { cfg: { mcp: { grayboard: entry("local") } } });
   // The first turn can start before the child's initialize: it waits for it.
-  expect((await oc.send("system", { sessionID: "s1" })).join("\n")).toContain("This session has no bus name yet");
+  expect((await oc.send("system", { sessionID: "s1" })).join("\n")).toContain("This session has no bus name yet, so it acts as its ID");
   expect(grayboardChildren(oc.pid)).toHaveLength(1);
 
+  // #284 S13: unbound, it writes and receives as its ID.
   expect(await oc.send("call", { tool: "grayboard_board_list", args: {} })).toBeString();
-  await expect(oc.send("call", { tool: "grayboard_dm_send", args: { to: "peer", body: "too early" } })).rejects.toThrow("no bus name yet");
+  const id = JSON.parse(await oc.send("call", { tool: "grayboard_peer_list", args: {} })).you as string;
+  expect(id).toMatch(/^id:/);
+  expect(await oc.send("call", { tool: "grayboard_dm_send", args: { to: "peer", body: "as my id" } })).toContain("message_id");
+  await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s1" } } } });
+  const toId = await peer.call("dm_send", { to: id, body: "to your id" });
+  await until(async () => (await oc.send("state")).prompts.some((p: any) => p.text.includes(`message_id="${toId.message_id}"`)), 15_000, "DM to the ID delivered");
   expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-tmp", create: true } })).toContain('Bound to "oc-tmp"');
   // A rebind replaces the prompt section with the full set, not just the name's part.
   expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-task", create: true } })).toContain('Bound to "oc-task" (was "oc-tmp")');

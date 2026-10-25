@@ -80,7 +80,7 @@ test("a worktree session's handle follows the explicit-identity rule", async () 
   writeFileSync(join(dir, "repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
   const stream = await start("be", wt);
   expect(stream.getInstructions()).toContain('Candidates (free now): be-stream (this checkout\'s default:');
-  expect((await call(stream, "peer_list")).you).toBeUndefined();
+  expect((await call(stream, "peer_list")).you).toMatch(/^id:/);
   await call(stream, "bind", { name: "be-stream", create: true });
   expect((await call(stream, "peer_list")).you).toBe("be-stream");
   expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
@@ -114,7 +114,7 @@ test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", as
   expect((await call(first, "peer_list")).you).toBe("task");
   const second = await start("task", join(repo, ".wt", "beta"));
   expect(second.getInstructions()).toContain('BUS_IDENTITY asked for "task", but');
-  expect((await call(second, "peer_list")).you).toBeUndefined();
+  expect((await call(second, "peer_list")).you).toMatch(/^id:/);
   const refused = await second.callTool({ name: "bind", arguments: { name: "task" } });
   expect(refused.isError).toBe(true);
   // The first session still owns the name and answers calls.

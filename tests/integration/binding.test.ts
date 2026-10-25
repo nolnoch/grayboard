@@ -84,7 +84,7 @@ function spawnCli(args: string[], extra: Record<string, string>) {
 const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
 const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
 
-test("1, 3, 14, 18: an unbound session reads without a trace, offers its default with its mail, and binds", async () => {
+test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
   // "api" existed once and has 3 DMs queued, with no live holder.
@@ -95,18 +95,18 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   await be.call("board_post", { board: "e2e", body: "hello" });
 
   const s = await session(undefined, { cwd: repo });
-  expect(s.c.getInstructions()).toStartWith("This session has no bus name yet.");
-  expect(s.c.getInstructions()).toContain("Candidates (free now): api (this checkout's default: 3 queued DMs, 0 claims");
   const id = await sessionId(s);
   expect(id).toMatch(/^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/);
+  // #284 S13: it acts as its ID, told so in one line beside the usual text.
+  expect(s.c.getInstructions()).toStartWith(`You are identity "${id}" on the grayboard bus`);
+  expect(s.c.getInstructions()).toContain(`This session has no bus name yet, so it acts as its ID: peers reach it at ${id}`);
+  expect(s.c.getInstructions()).toContain("Candidates (free now): api (this checkout's default: 3 queued DMs, 0 claims");
 
-  // Reads work; nothing else does, and nothing records the session.
+  // Reads work as before, and nothing is recorded under a "~" handle.
   expect((await s.call("board_read", { board: "e2e" })).posts.map((p: any) => p.body)).toEqual(["hello"]);
   expect((await s.call("board_list", {})).map((b: any) => b.name)).toContain("e2e");
   expect(await s.call("claim_list", {})).toEqual([]);
-  for (const [tool, args] of [["board_post", { board: "e2e", body: "x" }], ["dm_send", { to: "be", body: "x" }], ["claim_take", { key: "k" }], ["dm_inbox", {}]] as const) {
-    expect(await refusal(s, tool, args)).toContain("no bus name yet. Call bind(name)");
-  }
+  expect(await s.call("dm_inbox", {})).toEqual({ unanswered: [] });
   expect(cellsEqual(`~${id}`)).toEqual([]);
 
   // 14: peers see it by session ID, unbound.
@@ -463,7 +463,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   // A new harness process is a new session: unbound, with "api" free to bind.
   await stop(s.c);
   const fresh = await session();
-  expect(fresh.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(fresh.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 
   // A launcher between harness and grayboard is a new parent on each restart,
@@ -474,7 +474,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(l.c.getInstructions()).toContain(launcherNote);
   await l.call("bind", { name: "web", create: true });
   l = await l.restart("reconnect");
-  expect(l.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(l.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(l.c.getInstructions()).toContain(launcherNote);
 }, 60_000);
 
@@ -492,7 +492,12 @@ test("13 (decision 13): `grayboard tools` prints what the session serves; bind's
   expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
   const { instructions } = r.structuredContent as { instructions: string[] };
   expect(instructions[0]).toStartWith(`You are identity "api"`);
-  expect((r.content as { text: string }[])[0]!.text).toEndWith(instructions.join(" "));
+  // The unbound session already had the general text (#284 S13): the result
+  // repeats only what's about the name.
+  const text = (r.content as { text: string }[])[0]!.text;
+  expect(text).toEndWith(instructions[0]!);
+  expect(s.c.getInstructions()).toContain(instructions[1]!);
+  expect(text).not.toContain(instructions[1]!);
 }, 20_000);
 
 // #284 audit B1/W1: a write carries the writing session's ID; a tools-only

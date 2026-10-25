@@ -22,6 +22,7 @@ import {
   type SubMode,
   type UnboundPeer,
 } from "./boards.ts";
+import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
@@ -404,6 +405,10 @@ export function callBoardTool(
       const queue = optStr(a, "queue");
       if (queue !== undefined && queue !== "on" && queue !== "off") {
         throw new CoreError(`queue must be "on" or "off"`);
+      }
+      // The opt-out is a name's flag; an ID is always in its queues' rotation.
+      if (queue !== undefined && addressParts(handle)?.kind === "id") {
+        throw new CoreError(`queue opt-out is a name's; bind(name) first, or leave queue unset`);
       }
       setStatus(db, handle, str(a, "text"));
       if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");

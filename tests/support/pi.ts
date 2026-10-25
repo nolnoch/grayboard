@@ -232,10 +232,11 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
   let model: ReturnType<typeof startFakeModel> | undefined;
   try {
     const p = await localSession(dir, "peer", { bin });
-    // After the prompt, one step per tool result: a read, a refused write, bind, rebind.
+    // After the prompt, one step per tool result: a read, a write as the
+    // session's ID (#284 S13), bind, rebind.
     const steps: Reply[] = [
       { tool: "mcp__grayboard__board_list", args: {} },
-      { tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "too early" } },
+      { tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "as my id" } },
       { tool: "mcp__grayboard__bind", args: { name: "pi-tmp", create: true } },
       { tool: "mcp__grayboard__bind", args: { name: "pi-task", create: true } },
     ];
@@ -258,14 +259,15 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
     const results = (await pi.messages()).filter((m) => m.role === "toolResult");
     expect(results.map((m) => [m.toolName, !!m.isError])).toEqual([
       ["mcp__grayboard__board_list", false],
-      ["mcp__grayboard__dm_send", true],
+      ["mcp__grayboard__dm_send", false],
       ["mcp__grayboard__bind", false],
       ["mcp__grayboard__bind", false],
     ]);
-    expect(JSON.stringify(results[1]!.content)).toContain("no bus name yet");
+    const asId = await until(() => p.pushes.find((x) => x.content === "as my id"), 10_000, "the ID's DM at peer");
+    expect(asId.meta.from).toMatch(/^id:/);
     expect(JSON.stringify(results[2]!.content)).toContain('Bound to \\"pi-tmp\\"');
     expect(JSON.stringify(results[3]!.content)).toContain('Bound to \\"pi-task\\" (was \\"pi-tmp\\")');
-    expect(systemText(requests[0]!.body)).toContain("This session has no bus name yet");
+    expect(systemText(requests[0]!.body)).toContain(`This session has no bus name yet, so it acts as its ID: peers reach it at ${asId.meta.from}`);
     expect(grayboardChildren(pi.pid, bin)).toHaveLength(1);
 
     // The bound name receives: a DM triggers a turn whose system prompt is the

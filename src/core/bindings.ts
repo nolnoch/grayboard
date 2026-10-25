@@ -213,6 +213,17 @@ export function unboundInstruction(candidates: Candidate[], notes: string[] = []
   return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
 }
 
+/**
+ * A local session with no name (#284 S13): it acts as its ID. One sentence
+ * beside its bound instructions, with `notes` on why it has no name and the
+ * candidates.
+ */
+export function localUnboundInstruction(id: string, candidates: Candidate[], notes: string[] = []): string {
+  const why = notes.map((n) => ` ${n}`).join("");
+  const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
+  return `This session has no bus name yet, so it acts as its ID: peers reach it at ${id}, and it posts, sends and claims as ${id}.${why} Bind a name with bind(name) once you know your task; what the ID has stays with this session.${list}`;
+}
+
 /** An explicit name a live session already held at start. */
 export function heldNote(name: string, holder: string): string {
   return `BUS_IDENTITY asked for "${name}", but ${holder} holds it, so this session started without a name.`;
@@ -280,15 +291,16 @@ export function unboundPeer(sessionId: string, where: string | null, self: boole
  * a rebind, which the model already has. `structuredContent` carries the full
  * set, name and general alike, for adapters that replace their system-prompt
  * section with it (pi, opencode), so they never parse the text.
+ * `generalKnown`: an unbound session already had the general part (local).
  */
-export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
+export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = [], generalKnown = false) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
     ...notes,
-    ...instructions(previous === null),
+    ...instructions(previous === null && !generalKnown),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }

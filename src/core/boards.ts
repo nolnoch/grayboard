@@ -242,9 +242,9 @@ export function setStatus(db: Database, handle: string, text: string, now = Date
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
   touchAlias(db, handle, now);
-  const r = db
-    .prepare(`UPDATE ids SET status = ?, status_at = ? WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`)
-    .run(t || null, t ? now : null, handle);
+  // An ID-only session (#284 S13) sets its own row; a name, its holder's.
+  const session = addressParts(handle)?.kind === "id" ? `?3 AND ended_at IS NULL` : `(SELECT id FROM alias_holds WHERE address = ?3)`;
+  const r = db.prepare(`UPDATE ids SET status = ?1, status_at = ?2 WHERE id = ${session}`).run(t || null, t ? now : null, handle);
   if (r.changes === 0) throw new CoreError(`no live session holds "${handle}", so it has no status to set`);
 }
 

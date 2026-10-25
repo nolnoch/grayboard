@@ -71,6 +71,58 @@ async function sigkill(pid: number): Promise<void> {
   });
 }
 
+// #284 AC 1, S13: with no name the session is a full participant as its ID,
+// and what it did as the ID stays its own after it binds.
+test("an unbound session sends, uploads, posts, claims and takes queue work as its ID; after a bind it keeps all of it", async () => {
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  const be = await session("be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await be.call("board_create", { name: "work", purpose: "queue", kind: "queue" });
+  await (await session("gone")).c.close();
+  const s = await session();
+  const id = await sessionId(s);
+
+  // Writes go as the ID.
+  const sent = await s.call("dm_send", { to: "be", body: "from my id", attachments: ["notes.md"] });
+  expect(sent.attachments).toEqual([expect.objectContaining({ filename: "notes.md" })]);
+  await until(() => be.pushes.some((p) => p.content === "from my id"));
+  expect(be.pushes.find((p) => p.content === "from my id")!.meta).toMatchObject({ from: id, attachments: expect.stringContaining("notes.md") });
+  const posted = await s.call("board_post", { board: "e2e", body: "as my id" });
+  expect((await be.call("board_read", { board: "e2e" })).posts).toContainEqual(expect.objectContaining({ id: posted.post_id, author: id }));
+  const queued = await s.call("dm_send", { to: "gone", body: "take this back" });
+  expect(queued.delivered_now).toBe(false);
+  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 30 });
+
+  // Replies and queue work reach the ID.
+  const reply = await be.call("dm_send", { to: id, body: "reply to your id", parent_id: sent.message_id });
+  expect(reply.delivered_now).toBe(true);
+  await until(() => s.pushes.some((p) => p.content === "reply to your id"));
+  await s.call("board_subscribe", { board: "work", mode: "push" });
+  const item = await be.call("board_post", { board: "work", body: "work item" });
+  await until(() => s.pushes.some((p) => p.meta.post_id === String(item.post_id)));
+  const queueKey = `queue:work:${item.post_id}`;
+  expect(rows(`SELECT key, holder FROM claims ORDER BY key`)).toEqual([{ key: queueKey, holder: id }, { key: "ticket:ENG-142", holder: id }]);
+
+  // After a bind, the ID's mail, claims and queue work are still this session's.
+  await s.call("bind", { name: "fe", create: true });
+  expect((await s.call("dm_thread", { thread: reply.message_id })).map((m: any) => m.body)).toEqual(["from my id", "reply to your id"]);
+  expect(((await s.call("dm_inbox", {})).unanswered ?? []).map((m: any) => m.id)).toContain(reply.message_id);
+  await s.call("dm_ack", { message_id: reply.message_id });
+  expect(((await s.call("dm_inbox", {})).unanswered ?? []).map((m: any) => m.id)).not.toContain(reply.message_id);
+  await s.call("dm_retract", { message_id: queued.message_id });
+  expect(rows(`SELECT 1 FROM messages WHERE id = ?`, queued.message_id)).toEqual([]);
+
+  const before = rows<{ expires_at: number }>(`SELECT expires_at FROM claims WHERE key = 'ticket:ENG-142'`)[0]!.expires_at;
+  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 120 });
+  expect(rows<{ holder: string; expires_at: number }>(`SELECT holder, expires_at FROM claims WHERE key = 'ticket:ENG-142'`)[0]).toEqual({ holder: id, expires_at: expect.any(Number) });
+  expect(rows<{ expires_at: number }>(`SELECT expires_at FROM claims WHERE key = 'ticket:ENG-142'`)[0]!.expires_at).toBeGreaterThan(before);
+  await s.call("claim_release", { key: "ticket:ENG-142" });
+  // A reply on the queue post acks and releases its claim; nothing is redelivered.
+  await s.call("board_post", { board: "work", body: "done", parent_id: item.post_id });
+  expect(rows(`SELECT key FROM claims`)).toEqual([]);
+  expect(rows(`SELECT handle FROM outbox WHERE post_id = ?`, item.post_id)).toEqual([{ handle: id }]);
+}, 30_000);
+
 test("a DM to an unbound session's ID is pushed now, and follows it into the name it binds", async () => {
   const be = await session("be");
   const s = await session();

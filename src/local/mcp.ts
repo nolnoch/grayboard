@@ -10,7 +10,7 @@ import {
 import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { SESSION_KEY, UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, mintSessionKey, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { SESSION_KEY, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, localUnboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -267,10 +267,11 @@ function addressesOf(primary: string): string[] {
   return PUSH ? [...new Set([primary, SESSION_ID])] : [primary];
 }
 
-// What a session bound to `name` is told (core's boundInstructions), with
+// What a session acting as `name` is told (core's boundInstructions), with
 // local mode's human and announcement sentences, and its claims last: the
-// longest, and the one to lose if the client cuts the text.
-function localBoundInstructions(name: string, general: boolean): string[] {
+// longest, and the one to lose if the client cuts the text. `lead` opens the
+// variable part: an unbound session's line about binding a name.
+function localBoundInstructions(name: string, general: boolean, lead: string[] = []): string[] {
   return boundInstructions(
     name,
     general,
@@ -280,6 +281,7 @@ function localBoundInstructions(name: string, general: boolean): string[] {
       ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
     ],
     [
+      ...lead,
       ...undeliveredInstruction(undeliveredFrom(addressesOf(name), Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       ...claimsInstruction(listClaims(db), addressesOf(name)),
     ],
@@ -293,11 +295,12 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    // Unbound: one sentence and the candidates. The rest only matters once
-    // a name receives anything, so bind's result carries it.
+    // Unbound: the session acts as its ID, with a line on binding a name.
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      ...(bound ? localBoundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
+      ...(bound
+        ? localBoundInstructions(bound, true)
+        : localBoundInstructions(SESSION_ID, true, [localUnboundInstruction(SESSION_ID, await candidateNames(db, SUGGESTED), unboundNotes)])),
     ].join(" "),
   },
 );
@@ -387,10 +390,8 @@ async function call(name: string, args: Record<string, unknown>, signal: AbortSi
 
 async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   if (name === "bind") return bind(a, signal);
-  if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
-  // Unbound reads go as this session's viewer handle: "~" handles are never
-  // identities and own no subscriptions, so a read advances no cursor.
-  const IDENTITY = bound ?? `~${SESSION_ID}`;
+  // With no name, the session acts as its ID (#284 S13).
+  const IDENTITY = bound ?? SESSION_ID;
   // What this session reads mail, claims and uploads as; IDENTITY is the
   // primary it writes as.
   const ADDRS = addressesOf(IDENTITY);
@@ -730,7 +731,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     // ones this session no longer holds.
     const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
     const notes = left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
-    const ok = bindOk(n.name, previous, [], (general) => localBoundInstructions(n.name, general), notes);
+    const ok = bindOk(n.name, previous, [], (general) => localBoundInstructions(n.name, general), notes, true);
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
