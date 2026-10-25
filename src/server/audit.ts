@@ -26,7 +26,10 @@ export type AuditAction =
   | "slack.unlinked"
   | "team.created"
   | "team.member_added"
-  | "team.member_removed";
+  | "team.member_removed"
+  | "delegation.requested"
+  | "delegation.refused"
+  | "handle.launcher_set";
 
 export function writeAudit(
   repo: Repo,

@@ -669,6 +669,7 @@ export type Peer = {
   status_age?: string;
   human?: true;
   queue_off?: true;
+  launcher?: true;
 };
 // Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
 // "~" handles, which no identity can have: locally "~<id>", on a server
@@ -692,7 +693,7 @@ export function who(
   online: (h: string) => boolean,
   unbound: UnboundPeer[] = [],
 ): WhoResult {
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null };
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
@@ -700,7 +701,7 @@ export function who(
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human, h.queue_off FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human, h.queue_off, h.launcher FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -708,7 +709,7 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human, queue_off FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human, queue_off, launcher FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
   const now = Date.now();
@@ -724,6 +725,7 @@ export function who(
       ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
+      ...(r.launcher ? { launcher: true as const } : {}),
     };
   });
   // Unbound sessions subscribe to nothing, so a board's roster has none.

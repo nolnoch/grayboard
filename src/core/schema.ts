@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 
 // Board + claim tables, shared by local and distributed modes. Kept separate
 // from each mode's direct-message tables so neither needs a migration.
+// (handles.launcher: the session's harness can spawn subagents, #184.)
 export function initCoreSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS handles (
@@ -109,6 +110,18 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_binding_events_name ON binding_events(name, at);
     CREATE INDEX IF NOT EXISTS idx_binding_events_session ON binding_events(session_id);
 
+    -- Local mode's audit trail (src/core/audit.ts): the same actions the
+    -- server's audit records, for the actions that need one in both modes
+    -- (delegation.*). Pruned with the bus's retention.
+    CREATE TABLE IF NOT EXISTS audit_log (
+      at      INTEGER NOT NULL,
+      actor   TEXT,
+      action  TEXT    NOT NULL,
+      target  TEXT,
+      detail  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
     -- blob goes when the last attachment naming it does.
@@ -145,7 +158,7 @@ export function initCoreSchema(db: Database): void {
   // free-text status it set, both reset when a session starts; and whether the
   // handle is a declared human's (`grayboard human`), which persists.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"]]) {
+  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"], ["launcher", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
   }
 

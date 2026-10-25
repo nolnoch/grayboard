@@ -8,6 +8,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
@@ -92,6 +94,16 @@ const PUSH = process.env.BUS_PUSH !== "off";
 // human="true". Without it, the human's handle is refused, so an agent can't
 // take it by name.
 const HUMAN = process.env.BUS_HUMAN === "1";
+// BUS_LAUNCHER=1: this session's harness can spawn subagents, so delegate
+// requests may land here (#184). It grants nothing by itself: the session is
+// telling peers what its harness can do, and it's the one that acts on a
+// delegation request when one arrives by DM.
+const LAUNCHER = process.env.BUS_LAUNCHER === "1";
+// A launcher must be able to RECEIVE delegation requests: a tools-only
+// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
+// the name, has no socket, and never touches the launcher flag (a sidecar
+// must not overwrite the owner's opt-in).
+const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
 // child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
@@ -197,7 +209,11 @@ function localBoundInstructions(name: string, general: boolean): string[] {
   return boundInstructions(
     name,
     general,
-    () => [...humanInstruction(humanHandles(db).filter((h) => h !== name)), ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db)))],
+    () => [
+      ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
+      ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
+      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
+    ],
     [
       ...undeliveredInstruction(undeliveredFrom(name, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
       ...claimsInstruction(listClaims(db), name),
@@ -270,7 +286,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   const run = async () => {
     // An unbound session writes no handles row: it would join dm_send's roster.
     if (bound) touchHandle(db, bound);
-    return call(name, args as Record<string, any>, signal);
+    return call(name, args, signal);
   };
   const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
     await (name === "bind" ? gate.bind(run) : gate.call(run));
@@ -291,7 +307,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   return out;
 });
 
-async function call(name: string, args: Record<string, any>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+async function call(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
   const bad = checkArgs(LOCAL_TOOLS, name, args);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
@@ -304,7 +320,7 @@ async function call(name: string, args: Record<string, any>, signal: AbortSignal
   }
 }
 
-async function dispatch(name: string, a: Record<string, any>, signal: AbortSignal) {
+async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   if (name === "bind") return bind(a, signal);
   if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
   // Unbound reads go as this session's viewer handle: "~" handles are never
@@ -312,6 +328,71 @@ async function dispatch(name: string, a: Record<string, any>, signal: AbortSigna
   const IDENTITY = bound ?? `~${SESSION_ID}`;
   // Only a message's sender and recipient can see it or thread from it.
   const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
+
+  if (name === "delegate") {
+    // Resolve the launcher and build the payload (core), then deliver it as
+    // this mode's DM, pending: the promise shows in dm_inbox until the
+    // requester settles the thread (#184). Same result fields as dm_send, via
+    // the shared builder, so the modes can't drift.
+    const live = await liveHandles(IDENTITY);
+    // A launcher inside its bind swap still answers under its old name: filter
+    // it like dm_send does (a released name's socket isn't the session).
+    const online = (h: string) => live(h) && !lastWasRelease(db, h);
+    let d;
+    try {
+      d = resolveDelegation(db, IDENTITY, a, online);
+    } catch (e) {
+      if (e instanceof CoreError) {
+        writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message });
+        return { ...text(`error: ${e.message}`), isError: true };
+      }
+      throw e;
+    }
+    // The window a re-pick races: the liveness snapshot above is taken once,
+    // the delivery pokes again below. Tests force the overlap here (a socket
+    // that dies between the two) — #246 review 12/16.
+    testPause("delegate:after-resolve");
+    checkBody(d.body);
+    // The message id tracks the pick that owns the work: a re-pick replaces
+    // both (review 16).
+    let msgId = (await insertMessage(IDENTITY, d.to, d.body, null, true, [])).id;
+    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
+    const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
+    let delivered = await deliver(d.to);
+    if (!delivered && !d.humanFallback) {
+      // The pick may have landed in a bind swap: re-resolve once, excluding
+      // the launcher that didn't take it. The first message is retracted
+      // first — left queued, that name's next holder would drain it and
+      // spawn the same work again (#246 review 16) — and the re-pick only
+      // proceeds when the retraction wins; otherwise the request stays
+      // queued for the first pick, which the catch below treats as fine.
+      try {
+        const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
+        if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
+          const id2 = (await insertMessage(IDENTITY, d2.to, d2.body, null, true, [])).id;
+          writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
+          d = d2;
+          msgId = id2;
+          delivered = await deliver(d2.to);
+        }
+      } catch {
+        // No second launcher: the request stays queued for the first pick's
+        // name; its next holder drains it.
+      }
+    }
+    const seen = lastSeen(db, d.to);
+    const base = delivered
+      ? { message_id: msgId, delivered_now: true, pending: true as const }
+      : {
+          message_id: msgId,
+          delivered_now: false,
+          pending: true as const,
+          note: queuedNote(d.to, seen),
+          ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+          undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === d!.to)?.n ?? 1,
+        };
+    return text(JSON.stringify(delegateOkFields(d, base)));
+  }
 
   if (name === "dm_send") {
     const { to: recipient, body, parent_id, pending } = a as {
@@ -352,14 +433,14 @@ async function dispatch(name: string, a: Record<string, any>, signal: AbortSigna
   }
 
   if (name === "dm_history") {
-    return text(getHistory(IDENTITY, a.peer, historyLimit(a.limit), a.before_id).map(showPending));
+    return text(getHistory(IDENTITY, a.peer as string | undefined, historyLimit(a.limit), a.before_id as number | undefined).map(showPending));
   }
 
   if (name === "dm_thread") {
-    if (!mine(getMessage(a.thread))) {
+    if (!mine(getMessage(a.thread as number))) {
       return { ...text(`error: message ${a.thread} not found`), isError: true };
     }
-    return text(getThread(a.thread).filter(mine).map(showPending));
+    return text(getThread(a.thread as number).filter(mine).map(showPending));
   }
 
   if (name === "dm_inbox") {
@@ -390,9 +471,9 @@ async function dispatch(name: string, a: Record<string, any>, signal: AbortSigna
   }
 
   if (name === "dm_retract") {
-    const m = getMessage(a.message_id);
+    const m = getMessage(a.message_id as number);
     const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-    if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(a.message_id));
+    if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(a.message_id as number));
     // A probe is a wakeup: a live recipient drains the message now.
     if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
     if (!retractMessage(IDENTITY, m.id)) {
@@ -522,7 +603,7 @@ let stopListening = () => {};
 // the swap, so a DM to the old name is either delivered under it before the
 // swap or stays queued for its next holder; never consumed under the new one.
 // It runs behind the gate, so no tool call overlaps it (#182 audit 11).
-async function bind(a: Record<string, any>, signal: AbortSignal) {
+async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   const n = bindTarget(a, bound, PUSH);
   if ("result" in n) return n.result;
@@ -546,6 +627,10 @@ async function bind(a: Record<string, any>, signal: AbortSignal) {
       }
       if (previous) touchHandle(db, previous);
       startSession(db, n.name, process.cwd());
+      if (PUSH) {
+        setLauncher(db, n.name, EFFECTIVE_LAUNCHER);
+        writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
+      }
     } catch (e) {
       const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
@@ -573,6 +658,10 @@ async function bind(a: Record<string, any>, signal: AbortSignal) {
 // restored name is the same session restarted: leave their status alone.
 if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
 else if (bound) touchHandle(db, bound);
+if (bound && PUSH) {
+  setLauncher(db, bound, EFFECTIVE_LAUNCHER);
+  writeCoreAudit(db, "handle.launcher_set", bound, bound, { on: EFFECTIVE_LAUNCHER });
+}
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
 late.watch(transport);

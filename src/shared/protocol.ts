@@ -42,9 +42,17 @@ export type Message = {
 export type HelloRequest = {
   type: "hello"; req_id: string; identity?: string; push?: boolean; where?: string; resume?: boolean;
   session_key?: string; hold?: boolean; from?: string; create?: boolean; read_only?: boolean; suggested?: string; restored_from?: string;
+  // This session's harness can spawn subagents, so delegate requests may land
+  // here (#184). Recorded on the handle's row; peer_list shows it.
+  launcher?: boolean;
 };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
+// Hand work to a launcher session (#184): the server resolves the launcher
+// (explicit `to`, or any live one; none live → the requester's human) and
+// sends the payload pending. The reply is send_ok with `to` (and
+// human_fallback on the degrade path) added.
+export type DelegateRequest = { type: "delegate"; req_id: string; persona: string; task: string; context?: string; to?: string };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
@@ -57,7 +65,7 @@ export type CallRequest    = { type: "call";      req_id: string; tool: string; 
 export type BoardAckRequest = { type: "board_ack"; req_id: string; refs: PendingRef[] };
 
 export type ClientMessage =
-  | HelloRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
+  | HelloRequest | DelegateRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
   | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest | DmRetractRequest;
 
 // Server -> Client
@@ -90,6 +98,9 @@ export type SendOk      = {
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
 };
+// A delegation's send_ok: the ordinary fields plus which launcher took it
+// (or the human fallback).
+export type DelegateOk  = SendOk & { to: string; human_fallback?: true };
 // Messages you sent carry delivered: whether they've reached the recipient's session.
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
@@ -108,7 +119,7 @@ export type BoardPush   = { type: "board_push"; item: Pending };
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
 
 export type ServerMessage =
-  | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
+  | HelloOk | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
   | CallOk | BoardPush | InboxOk;
 
 export type ErrorCode =
@@ -145,6 +156,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");
+      if (m.launcher !== undefined && typeof m.launcher !== "boolean") throw new Error("launcher must be boolean");
       return m as unknown as HelloRequest;
     case "send":
       assertStr(m, "req_id"); assertStr(m, "recipient"); assertStr(m, "body");
@@ -183,6 +195,13 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       assertStr(m, "req_id");
       if (typeof m.message_id !== "number") throw new Error("message_id must be number");
       return m as unknown as DmRetractRequest;
+    case "delegate":
+      assertStr(m, "req_id"); assertStr(m, "persona"); assertStr(m, "task");
+      if (m.context !== undefined && typeof m.context !== "string") throw new Error("context must be string");
+      if (m.to !== undefined && typeof m.to !== "string") throw new Error("to must be string");
+      // SAFETY: every field of DelegateRequest was validated just above; the
+      // cast only re-labels the parsed object.
+      return m as unknown as DelegateRequest;
     case "call":
       assertStr(m, "req_id"); assertStr(m, "tool");
       if (m.args !== undefined && (typeof m.args !== "object" || m.args === null || Array.isArray(m.args)))

@@ -1,5 +1,5 @@
 import { participant, type MessageRow, type Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type ErrorCode } from "../shared/protocol.ts";
+import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type SendOk, type ErrorCode } from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
@@ -13,7 +13,6 @@ import {
   checkBody,
   lastSeen,
   pendingFor,
-  post,
   refOf,
   sessionsSeen,
   setPlace,
@@ -29,6 +28,7 @@ import {
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
@@ -68,7 +68,7 @@ export type WsData = {
 export type Conn = {
   data: WsData;
   readonly readyState: number;
-  send(data: string): unknown;
+  send(data: string): void;
   close(): void;
 };
 
@@ -267,6 +267,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
             break;
           case "send":
             handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
+            break;
+          case "delegate":
+            handleDelegate(hub, ws, msg.req_id, msg);
             break;
           case "history":
             handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -509,6 +512,13 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     if (continued?.verified) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
+    // Only a push-mode owner advertises the capability (a hold or tools-only
+    // connection can't receive a delegation, so it must not be one), and its
+    // flag flip is audited (#184 review 4/6).
+    if (push) {
+      setLauncher(db, full, m.launcher === true);
+      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+    }
     ws.data.owner = true;
     if (from) {
       // The old connection, which the client closes next, holds nothing now.
@@ -552,6 +562,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // reads, leaving the owner uninformed.
   const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
   const notices = [
+    ...(m.launcher && push && owns ? launcherInstruction() : []),
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
     // Before the claims: drained once, so a cut must not take it.
     ...(bridgeNotice ? [bridgeNotice] : []),
@@ -625,34 +636,42 @@ function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
 }
 
 // A bare name means your own identity of that name, else the one identity
-// anyone has with it (as @name does in a post). Null once it has answered
-// the request with why not.
-function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
-  const { authed } = ws.data;
+// anyone has with it (as @name does in a post). The pure core of resolvePeer,
+// shared with delegate's `to` resolution (#184 review 7): both take bare and
+// mixed-case names through the same path.
+function resolvePeerInput(repo: Repo, email: string, userId: number, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
   if (isValidIdentityName(input)) {
     const name = input.toLowerCase();
-    if (repo.identities.findByUserAndName(authed.user_id, name)) {
-      input = formatDirectAddress(authed.user_email, name);
+    if (repo.identities.findByUserAndName(userId, name)) {
+      input = formatDirectAddress(email, name);
     } else if (name === HUMAN_NAME) {
       // Every linked user has one; listing them would only leak who linked.
-      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
-      return null;
+      return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
     } else {
       const all = repo.identities.findAllByName(name);
       if (all.length !== 1) {
         const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
-        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
-        return null;
+        return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
       }
       input = formatDirectAddress(all[0]!.email, name);
     }
   }
   try {
-    return parseAddress(input);
+    return { address: parseAddress(input) };
   } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
+    return { error: String(e), code: "bad_request" };
+  }
+}
+
+// Null once it has answered the request with why not.
+function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
+  const { authed } = ws.data;
+  const r = resolvePeerInput(repo, authed.user_email, authed.user_id, input);
+  if ("error" in r) {
+    err(ws, reqId, r.code, r.error);
     return null;
   }
+  return r.address;
 }
 
 function handleSend(
@@ -664,19 +683,28 @@ function handleSend(
   parentId: number | null,
   pending: boolean,
   attachmentIdsRaw: unknown,
-): void {
+  extra: Record<string, unknown> & { note?: string } = {},
+  // A caller that needs the reply shaped (delegate's result builder) applies
+  // it here — the same object is sent and returned, so the two can't drift.
+  shapeOk?: (ok: SendOk) => SendOk,
+): { ok?: SendOk; refused?: string } {
   const { repo, db, registry } = hub;
   let ids: number[];
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
   } catch (e) {
-    return err(ws, reqId, "bad_request", (e as Error).message);
+    err(ws, reqId, "bad_request", (e as Error).message);
+    return { refused: (e as Error).message };
   }
 
   const { authed } = ws.data;
-  const parsed = resolvePeer(repo, ws, reqId, recipientStr);
-  if (!parsed) return;
+  const parsedR = resolvePeerInput(repo, authed.user_email, authed.user_id, recipientStr);
+  if ("error" in parsedR) {
+    err(ws, reqId, parsedR.code, parsedR.error);
+    return { refused: parsedR.error };
+  }
+  const parsed = parsedR.address;
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
@@ -687,36 +715,43 @@ function handleSend(
   };
 
   if (parsed.kind === "team") {
-    err(ws, reqId, "bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
-    return;
+    const why = `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`;
+    err(ws, reqId, "bad_request", why);
+    return { refused: why };
   }
 
   const recipientUser = repo.users.findByEmail(parsed.email);
   if (!recipientUser) {
-    err(ws, reqId, "not_found", `user "${parsed.email}" not found`);
-    return;
+    const why = `user "${parsed.email}" not found`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
   const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
   if (!recipientIdentity) {
-    err(ws, reqId, "not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
-    return;
+    const why = `identity "${parsed.full}" not found; peer_list shows exact handles`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) {
     err(ws, reqId, decision.code, decision.reason);
-    return;
+    return { refused: decision.reason };
   }
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.identityFull)) {
-    err(ws, reqId, "not_found", `parent_id ${parentId} is not a message you sent or received`);
-    return;
+    const why = `parent_id ${parentId} is not a message you sent or received`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
 
   let msg: MessageRow;
   try {
     msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending, ids);
   } catch (e) {
-    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    if (e instanceof CoreError) {
+      err(ws, reqId, "bad_request", e.message);
+      return { refused: e.message };
+    }
     throw e;
   }
   for (const a of msg.attachments ?? []) {
@@ -724,6 +759,7 @@ function handleSend(
   }
   const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
+  const { note: extraNote, ...restExtra } = extra ?? {};
   let deliveredNow = false;
   const recipientWs = registry.get(parsed.full);
   if (recipientWs?.data.ready) {
@@ -731,21 +767,75 @@ function handleSend(
     deliveredNow = true;
   }
 
-  if (deliveredNow) {
-    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p });
-    return;
-  }
   const seen = lastSeen(db, parsed.full);
-  send(ws, {
-    type: "send_ok",
-    req_id: reqId,
-    message_id: msg.id,
-    delivered_now: false,
-    ...p,
-    ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
-    undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
-    note: queuedNote(parsed.full, seen),
-  });
+  const ok: SendOk = deliveredNow
+    ? { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p, ...restExtra, ...(extraNote ? { note: extraNote } : {}) }
+    : {
+        type: "send_ok",
+        req_id: reqId,
+        message_id: msg.id,
+        delivered_now: false,
+        ...p,
+        ...restExtra,
+        ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+        undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
+        note: [queuedNote(parsed.full, seen), extraNote].filter(Boolean).join(" "),
+      };
+  const shaped = shapeOk ? shapeOk(ok) : ok;
+  send(ws, shaped);
+  return { ok: shaped };
+}
+
+// A delegation request (#184): resolve the launcher (or fall back to the
+// requester's human) in core, then deliver it as a pending DM through the
+// ordinary send path. `to` resolves like dm_send's recipient (bare and
+// mixed-case names included, #184 review 7); the human fallback checks real
+// Slack reachability, not a last_seen row (review 10). Every outcome is
+// audited: which launcher resolution picked and why, or the refusal (#184
+// review 4). The reply is a DelegateOk — the send_ok fields plus `to` and,
+// on the degrade path, human_fallback.
+function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): void {
+  const { repo } = hub;
+  const { authed } = ws.data;
+  let to: string | undefined;
+  if (m.to !== undefined) {
+    const r = resolvePeerInput(repo, authed.user_email, authed.user_id, m.to);
+    if ("error" in r) {
+      // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
+      writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: r.error, to: m.to });
+      return err(ws, reqId, r.code, r.error);
+    }
+    to = r.address.full;
+  }
+  const online = (h: string) => hub.registry.get(h)?.data.ready === true;
+  // The human fallback's reachability is the server's own knowledge: the
+  // bridge is running and this user is linked. A last_seen row is not
+  // reachability (#191: an unlinked or stopped bridge queues into the void).
+  const humanReachable = () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id);
+  let d;
+  try {
+    d = resolveDelegation(hub.db, ws.data.identityFull, { ...m, to }, online, humanReachable);
+  } catch (e) {
+    if (e instanceof CoreError) {
+      writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: e.message, to: m.to });
+      return err(ws, reqId, "bad_request", e.message);
+    }
+    throw e;
+  }
+  // The result is built by the same builder local uses (review 13): the
+  // extra carries nothing delegation-specific, so the modes can't drift.
+  const sent = handleSend(hub, ws, reqId, d.to, d.body, null, true, undefined, {}, (ok) => ({ ...ok, ...delegateOkFields(d, ok) }));
+  if (sent.ok) {
+    writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+      requester: ws.data.identityFull,
+      via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
+      message_id: sent.ok.message_id,
+    });
+  } else {
+    // A refused send (canSend, a missing identity, a bad body) is a refusal,
+    // not a request (#184 review 4).
+    writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: sent.refused ?? "send refused", to: d.to });
+  }
 }
 
 // The cursor moves only when the recipient acks, so a live recipient may hold
