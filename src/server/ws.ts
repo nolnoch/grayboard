@@ -18,17 +18,19 @@ import {
   normalizeBoard,
   pendingFor,
   refOf,
+  idPrincipal,
+  inheritStatus,
+  registerId,
   sessionsSeen,
   setPlace,
-  startSession,
-  touchHandle,
+  touchAlias,
   type CoreDb,
   type PendingRef,
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf,
-  sessionIdOf, unboundPeer, unknownNameError, type Candidate,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, clearHolds, closestNames, dropHold, holdAlias, idAddress, lastBoundBy, lastWasRelease, logBinding, mintSessionKey,
+  orderCandidates, continuityOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
@@ -37,14 +39,13 @@ import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests } from "../
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
-import { onIdentityCreated } from "./teams.ts";
+import { onAliasCreated } from "./teams.ts";
 import {
   PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
   authed: AuthedUser;
-  identityId: number;
   identityName: string;
   identityFull: string;
   ready: boolean;
@@ -56,8 +57,10 @@ export type WsData = {
   // The server's Slack bridge holding a user's human identity: the only
   // connection allowed the reserved name, and drained like a human's session.
   human?: true;
-  // The client process's session ID (#182): derived from its session key, or
-  // minted here for a client from before session IDs. Keys binding_events.
+  // The client process's session ID (#182, #284): derived from its session
+  // key, or minted here for a client from before session IDs and for the
+  // Slack bridge's humans. Keys binding_events, and the ids and alias_holds
+  // rows of a session that holds its name (never a human's).
   sessionId?: string;
   // Where the client runs, from its hello.
   place?: string | null;
@@ -215,6 +218,8 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
+  // No connection outlives the server, so no hold a previous run left is live.
+  clearHolds(db);
 
   const handlers = {
     open(_ws: Ws) {
@@ -332,7 +337,8 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
       if (full && hub.registry.get(full) === ws) hub.registry.delete(full);
       if (full && hub.holders.get(full) === ws) {
         hub.holders.delete(full);
-        touchHandle(hub.db, full);
+        if (!ws.data.human) dropHold(hub.db, full, ws.data.sessionId!);
+        touchAlias(hub.db, full);
       }
       if (ws.data.owner) release(hub, ws, "connection closed");
       ws.data.onPong = undefined;
@@ -391,7 +397,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // in-process connections are the server's own.
   if (!ws.data.human) {
     const t = hub.helloLimiter.take(ws.data.authed.user_email, {
-      session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+      session_id: m.session_key ? idAddress(m.session_key) : null,
       ...(m.read_only ? { read_only: true } : { name: m.identity ?? null }),
       place: m.where ?? null,
     });
@@ -408,7 +414,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // Derived from the client's secret, so no connection can present another
   // session's ID (#182 audit 4). A client from before session IDs gets one
   // here, so its events have a key.
-  const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
+  const sessionId = idAddress(m.session_key ?? mintSessionKey());
   ws.data.sessionId = sessionId;
   ws.data.place = m.where ?? null;
   if (m.read_only) return helloReadOnly(hub, ws, reqId, sessionId, m.suggested);
@@ -433,8 +439,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
 
   // A typo would otherwise create a fresh name, and the DMs queued for the
   // intended one would never arrive.
-  if (m.create === false && !repo.identities.findByUserAndName(authed.user_id, name)) {
-    const known = closestNames(name, repo.identities.listForUser(authed.user_id).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+  if (m.create === false && !repo.aliases.find(authed.user_email, name)) {
+    const known = closestNames(name, repo.aliases.listFor(authed.user_email).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
     const message = unknownNameError(name, known);
     refuse("identity_unknown", message, message, { known });
     return;
@@ -476,6 +482,15 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     }
   }
 
+  // A session's ID is one principal's (#284): a key whose ID is another
+  // user's session is refused, never attached to that session's row. From
+  // here to registry.set nothing awaits, so the row read here stands.
+  const prior = owns && !ws.data.human ? idPrincipal(db, sessionId) : undefined;
+  if (prior !== undefined && prior !== authed.user_email) {
+    writeAudit(repo, "id.collision", authed.user_email, sessionId, { name: full });
+    return refuse("id_collision", `id_collision: ${sessionId} is another principal's session; start with a new session key`, "id_collision");
+  }
+
   // A rebind names the name it leaves (#182 audit 3). Its claims move only
   // if this session holds that name by the record and no other connection
   // holds it live; that holds whether or not the old connection is open. A
@@ -498,11 +513,10 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     }
   }
 
-  let identity = repo.identities.findByUserAndName(authed.user_id, name);
-  if (!identity) {
-    identity = repo.identities.create(authed.user_id, name);
-    writeAudit(repo, "identity.created", authed.user_email, name, { lazy: true });
-    onIdentityCreated(db, repo, authed.user_id, full);
+  if (!repo.aliases.find(authed.user_email, name)) {
+    repo.aliases.create(authed.user_email, name);
+    writeAudit(repo, "alias.created", authed.user_email, full, { lazy: true });
+    onAliasCreated(db, repo, authed.user_id, full);
   }
 
   let moved: string[] | undefined;
@@ -510,6 +524,14 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     moved = [];
     holders.set(full, ws);
     if (push) registry.set(full, ws);
+    // The session's rows (#284): its ids row, written by its first owner
+    // hello and updated by the rest (a reconnect, a rebind), and its hold.
+    // The Slack bridge's humans have no ID.
+    if (!ws.data.human) {
+      if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true });
+      else setPlace(db, sessionId, m.where ?? null);
+      holdAlias(db, full, sessionId);
+    }
     // A reconnect, or a restart taking its name back, is the same session, so
     // its status stays, once the name's history shows it (#211). The session
     // ID comes from the client's secret, so a reconnect proves itself; a
@@ -518,14 +540,14 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       : m.resume ? continuityOf(db, full, { reconnect: sessionId })
       : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
       : null;
-    if (continued?.verified) touchHandle(db, full);
-    else startSession(db, full, null);
-    setPlace(db, full, m.where ?? null);
+    // A verified restore is the same harness session: its status carries over.
+    if (continued?.verified && m.restored_from !== undefined && !ws.data.human) inheritStatus(db, sessionId, m.restored_from);
+    touchAlias(db, full);
     // Only a push-mode owner advertises the capability (a hold or tools-only
     // connection can't receive a delegation, so it must not be one). Every
     // owner hello rewrites the flag and audits it, changed or not (#184 review 4/6).
     if (push) {
-      setLauncher(db, full, m.launcher === true);
+      if (!ws.data.human) setLauncher(db, sessionId, m.launcher === true);
       writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
     }
     ws.data.owner = true;
@@ -535,7 +557,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       if (prev) {
         holders.delete(from);
         if (registry.get(from) === prev) registry.delete(from);
-        touchHandle(db, from);
+        dropHold(db, from, sessionId);
+        touchAlias(db, from);
       }
       moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
       if (prev?.data.owner) release(hub, prev, `rebound to ${full}`);
@@ -546,9 +569,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     }
   } else {
     hub.toolsOnly.add(ws);
-    touchHandle(db, full);
+    touchAlias(db, full);
   }
-  ws.data.identityId   = identity.id;
   ws.data.identityName = name;
   ws.data.identityFull = full;
   ws.data.ready        = true;
@@ -584,7 +606,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   if (!push) return;
 
   // Direct messages since the cursor (unacked ones are resent), then boards.
-  const since = repo.cursors.get(identity.id, "direct", full);
+  const since = repo.cursors.get(full, "direct", full);
   for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
     send(ws, { type: "push", message: showPending(message) });
   }
@@ -599,7 +621,6 @@ function helloReadOnly(hub: Hub, ws: Ws, reqId: string, sessionId: string, sugge
   const { authed } = ws.data;
   readOnly.add(ws);
   ws.data.readOnly     = true;
-  ws.data.identityId   = 0;
   ws.data.identityName = `~${sessionId}`;
   ws.data.identityFull = `${authed.user_email}/~${sessionId}`;
   ws.data.ready        = true;
@@ -622,7 +643,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
   const { repo, db, holders } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
   const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
-  const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
+  const names = repo.aliases.listFor(authed.user_email).map((i) => i.name).filter(free);
   const queued = repo.messages.queuedTo(names.map(full));
   const seen = sessionsSeen(db, names.map(full));
   const claims = new Map<string, number>();
@@ -649,16 +670,16 @@ function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
 // anyone has with it (as @name does in a post). The pure core of resolvePeer,
 // shared with delegate's `to` resolution (#184 review 7): both take bare and
 // mixed-case names through the same path.
-function resolvePeerInput(repo: Repo, email: string, userId: number, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
+function resolvePeerInput(repo: Repo, email: string, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
   if (isValidIdentityName(input)) {
     const name = input.toLowerCase();
-    if (repo.identities.findByUserAndName(userId, name)) {
+    if (repo.aliases.find(email, name)) {
       input = formatDirectAddress(email, name);
     } else if (name === HUMAN_NAME) {
       // Every linked user has one; listing them would only leak who linked.
       return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
     } else {
-      const all = repo.identities.findAllByName(name);
+      const all = repo.aliases.findAllByName(name);
       if (all.length !== 1) {
         const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
         return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
@@ -676,7 +697,7 @@ function resolvePeerInput(repo: Repo, email: string, userId: number, input: stri
 // Null once it has answered the request with why not.
 function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
   const { authed } = ws.data;
-  const r = resolvePeerInput(repo, authed.user_email, authed.user_id, input);
+  const r = resolvePeerInput(repo, authed.user_email, input);
   if ("error" in r) {
     err(ws, reqId, r.code, r.error);
     return null;
@@ -712,14 +733,13 @@ function prepareSend(
     throw e;
   }
 
-  const parsedR = resolvePeerInput(repo, authed.user_email, authed.user_id, recipientStr);
+  const parsedR = resolvePeerInput(repo, authed.user_email, recipientStr);
   if ("error" in parsedR) throw new SendRefused(parsedR.code, parsedR.error);
   const parsed = parsedR.address;
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
     user_email:    authed.user_email,
-    identity_id:   ws.data.identityId,
     identity_name: ws.data.identityName,
     identity_full: ws.data.identityFull,
   };
@@ -728,8 +748,7 @@ function prepareSend(
 
   const recipientUser = repo.users.findByEmail(parsed.email);
   if (!recipientUser) throw new SendRefused("not_found", `user "${parsed.email}" not found`);
-  const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
-  if (!recipientIdentity) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
+  if (!repo.aliases.find(recipientUser.email, parsed.name)) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
@@ -746,7 +765,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
   const { repo, db, registry } = hub;
   let msg: MessageRow;
   try {
-    msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids);
+    msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.human ? null : ws.data.sessionId);
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
@@ -835,7 +854,7 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
   const { authed } = ws.data;
   let to: string | undefined;
   if (m.to !== undefined) {
-    const r = resolvePeerInput(repo, authed.user_email, authed.user_id, m.to);
+    const r = resolvePeerInput(repo, authed.user_email, m.to);
     if ("error" in r) {
       // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
       writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: r.error, to: m.to });
@@ -925,6 +944,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     online: (h: string) => hub.registry.get(h)?.data.ready === true,
     attachmentLimits: hub.repo.attachmentLimits,
     human: ws.data.human,
+    ...(ws.data.human ? {} : { session: ws.data.sessionId }),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
   };
   if (tool === "board_post") return handleBoardPost(hub, ws, reqId, args, ctx);
@@ -1051,7 +1071,7 @@ function handleAck(ws: Ws, reqId: string, messageIds: number[], repo: Repo): voi
     const msg = repo.messages.getById(msgId);
     // Only your own direct messages move your cursor.
     if (!msg || msg.recipient_type !== "user" || msg.recipient !== ws.data.identityFull) continue;
-    repo.cursors.advance(ws.data.identityId, "direct", ws.data.identityFull, msgId);
+    repo.cursors.advance(ws.data.identityFull, "direct", ws.data.identityFull, msgId);
   }
   send(ws, { type: "ack_ok", req_id: reqId });
 }

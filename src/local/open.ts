@@ -42,10 +42,11 @@ function initLocalSchema(db: Database): void {
       acked_at    INTEGER NOT NULL,
       PRIMARY KEY (reader, message_id)
     );
-    -- One row per live grayboard mcp process (binding.ts, #182). name is the
-    -- bus name it holds, NULL while unbound; UNIQUE makes a name's holder
-    -- one row, taken inside BEGIN IMMEDIATE. pid + proc_start say whether
-    -- the holder still runs; harness_pid is the process that launched it.
+    -- One row per live grayboard mcp process (binding.ts, #182): local
+    -- liveness. pid + proc_start say whether the session still runs;
+    -- harness_pid is the process that launched it. Since #284 the session's
+    -- facts are its ids row and the name it holds is alias_holds; name,
+    -- harness, cwd and bound_at are written only by 1.x processes.
     CREATE TABLE IF NOT EXISTS bindings (
       session_id   TEXT PRIMARY KEY,
       name         TEXT UNIQUE,
@@ -63,27 +64,19 @@ function initLocalSchema(db: Database): void {
       last_run  INTEGER NOT NULL
     );
   `);
-  // dm_send pending: the sender owes a follow-up in the thread.
+  // dm_send pending: the sender owes a follow-up in the thread. sender_id:
+  // the sending session's ID (#284), beside the address it sent as; null for
+  // messages from before it, and for writers with no session.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
+  if (!msgCols.some((c) => c.name === "sender_id")) db.exec(`ALTER TABLE messages ADD COLUMN sender_id TEXT`);
   initCoreSchema(db);
-  // The handles roster arrived after the bus did. Backfill identities that have
-  // run a session (sent, read, posted, or subscribed) so peer_list shows them
-  // and dm_send accepts them. Recipients alone don't count: that would
-  // legitimize old typos.
+  // Every 1.x handle is an alias (#284), with its durable facts. Seeded on
+  // every open, not once: a 1.x grayboard sharing this file may still add
+  // handles, and local mode never deletes an alias, so none comes back.
   db.exec(`
-    INSERT OR IGNORE INTO handles (name, first_seen, last_seen)
-    SELECT h, MIN(t), MAX(t) FROM (
-      SELECT sender AS h, created_at AS t FROM messages
-      UNION ALL
-      SELECT c.reader, COALESCE(m.created_at, 0) FROM cursors c LEFT JOIN messages m ON m.id = c.last_seen_id
-      UNION ALL
-      SELECT author, created_at FROM posts
-      UNION ALL
-      SELECT handle, 0 FROM subscriptions
-    ) WHERE h NOT LIKE '~%' GROUP BY h;
-    -- Earlier builds backfilled tail viewers (~tail-<pid>) as peers.
-    DELETE FROM handles WHERE name LIKE '~%';
+    INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
+    SELECT name, 'person', NULL, name, human, queue_off, first_seen, last_seen FROM handles WHERE name NOT LIKE '~%';
   `);
   ensureBoard(db, ANNOUNCE_BOARD, "Your user's announcements to every live session. Only a human starts posts here; reply in the thread to acknowledge.", null, "grayboard");
 }

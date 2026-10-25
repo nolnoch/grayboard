@@ -24,7 +24,7 @@ export type Message = {
 // resume: a reconnect within one session, so its peer_status stays (#211, below).
 // session_key: the client process's secret (#182 audit 4); the server
 // derives the session ID, the key of its binding_events, from it
-// (sessionIdOf), so no connection can present another session's ID.
+// (idAddress), so no connection can present another session's ID.
 // hold: with push: false, the connection holds its name as push does (the
 // probe, binding events, claim moves) but gets no pushes and isn't online:
 // a session whose harness can't show pushes (Claude Code without channels).
@@ -146,7 +146,9 @@ export type ErrorCode =
   // hello refused: create: false and the name has never existed
   | "identity_unknown"
   // a read-only connection asked for something that needs a name
-  | "unbound";
+  | "unbound"
+  // hello refused: the session key's ID is another principal's session (#284)
+  | "id_collision";
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
@@ -168,7 +170,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.hold === true && (m.push !== false || m.read_only === true)) throw new Error("hold needs push: false and a name");
       if (m.from !== undefined && (typeof m.from !== "string" || m.read_only === true)) throw new Error("from must be a string, on a hello with a name");
       if (m.restored_from !== undefined && (typeof m.restored_from !== "string" || !SESSION_ID.test(m.restored_from)))
-        throw new Error("restored_from must be 16 lowercase hex characters");
+        throw new Error("restored_from must be a session ID (id: and 13 characters)");
       if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");

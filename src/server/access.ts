@@ -50,7 +50,7 @@ export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Acces
       const slash = token.lastIndexOf("/");
       const name = slash >= 0 ? token.slice(slash + 1) : token;
       const prefix = slash >= 0 ? token.slice(0, slash) : null;
-      const candidates = repo.identities
+      const candidates = repo.aliases
         .findAllByName(name)
         .map((i) => `${i.email}/${i.name}`)
         .filter((h) => {

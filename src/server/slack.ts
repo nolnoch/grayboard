@@ -21,7 +21,7 @@ import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
-import { onIdentityCreated } from "./teams.ts";
+import { onAliasCreated } from "./teams.ts";
 import type { Conn, WsData } from "./ws.ts";
 
 const CODE_TTL_MS = 10 * 60_000;
@@ -81,7 +81,7 @@ class HumanConn implements Conn {
     authed: AuthedUser,
     private readonly onItem: (m: PushMessage | BoardPush) => void,
   ) {
-    this.data = { authed, identityId: 0, identityName: "", identityFull: "", ready: false, human: true };
+    this.data = { authed, identityName: "", identityFull: "", ready: false, human: true };
   }
 
   send(raw: string): void {
@@ -213,7 +213,7 @@ export class SlackBridge implements SlackLinker {
     repo.slack.unlink(userId);
     // Unread DMs to an identity nobody reads would only pile up; a later link
     // starts from the newest message (see linkUser).
-    repo.identities.remove(userId, HUMAN_NAME);
+    repo.aliases.remove(link.email, HUMAN_NAME);
     forgetHandle(db, `${link.email}/${HUMAN_NAME}`);
     writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
     return true;
@@ -249,14 +249,14 @@ export class SlackBridge implements SlackLinker {
     this.detach(user.id);
     repo.slack.link(user.id, slackUser, channel);
     const handle = `${user.email}/${HUMAN_NAME}`;
-    if (!repo.identities.findByUserAndName(user.id, HUMAN_NAME)) {
-      // Start from now: drop what queued for an earlier link's identity.
+    if (!repo.aliases.find(user.email, HUMAN_NAME)) {
+      // Start from now: drop what queued for an earlier link's alias.
       forgetHandle(db, handle);
-      const identity = repo.identities.create(user.id, HUMAN_NAME);
-      writeAudit(repo, "identity.created", user.email, HUMAN_NAME, { slack: true });
-      onIdentityCreated(db, repo, user.id, handle);
+      repo.aliases.create(user.email, HUMAN_NAME);
+      writeAudit(repo, "alias.created", user.email, handle, { slack: true });
+      onAliasCreated(db, repo, user.id, handle);
       const newest = repo.messages.history(handle, undefined, 1)[0];
-      if (newest) repo.cursors.advance(identity.id, "direct", handle, newest.id);
+      if (newest) repo.cursors.advance(handle, "direct", handle, newest.id);
     }
     markHuman(db, handle, true);
     writeAudit(repo, "slack.linked", user.email, slackUser);

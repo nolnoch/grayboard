@@ -3,20 +3,25 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { REFUSED_COALESCE_MS, logBinding } from "../core/bindings.ts";
+import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
 import { prunePosts } from "../core/boards.ts";
-import { reap, type SessionRow } from "./binding.ts";
+import { reap, registerSession, type SessionRow } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 
 // #182 audit 29: two processes that read the same dead row both reap it;
 // only the one whose delete removed it logs the release.
 test("a dead row reaped twice logs one release", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
-  db.prepare(`INSERT INTO bindings (session_id, name, pid, started_at) VALUES ('0123456789abcdef', 'fe', 999999, 1)`).run();
+  const id = "id:0123456789abc";
+  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1 }, false);
+  holdAlias(db, "fe", id);
   const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
   db.transaction(() => reap(db, rows, 2)).immediate();
   db.transaction(() => reap(db, rows, 3)).immediate();
   expect(db.prepare(`SELECT name, event, detail FROM binding_events`).all()).toEqual([{ name: "fe", event: "released", detail: "reaped: pid 999999 is gone" }]);
+  // The reap ends the session (#284): its hold goes and its ID is never taken again.
+  expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
 });
 
 // #210: a retry loop refused for the same reason is one row with a count.

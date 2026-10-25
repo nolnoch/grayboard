@@ -367,10 +367,10 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     expect(JSON.parse(requested[0]!.detail).via).toBe("human_fallback");
     expect(requested[0]!.target).toBe("alice@example.com/human");
 
-    // A refusal never masquerades as a request: with the human's identity
+    // A refusal never masquerades as a request: with the human's alias
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
-    srv.app.db.exec(`DELETE FROM identities WHERE name = 'human'`);
+    srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`);
     await expect(call(sim.c, "delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
     const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);

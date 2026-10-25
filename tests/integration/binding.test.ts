@@ -12,6 +12,7 @@ import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
+import { crockford13, idAddress } from "../../src/core/bindings.ts";
 
 let dir: string;
 
@@ -41,7 +42,10 @@ const events = (name: string) => rows<{ session_id: string; event: string; detai
 const contents = (s: Session) => s.pushes.map((p) => p.content);
 // An unbound session's own row in peer_list's unbound_sessions.
 const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
-const pidOf = (name: string) => rows<{ pid: number }>(`SELECT pid FROM bindings WHERE name = ?`, name)[0]!.pid;
+const pidOf = (name: string) => rows<{ pid: number }>(`SELECT b.pid FROM bindings b JOIN alias_holds h ON h.id = b.session_id WHERE h.address = ?`, name)[0]!.pid;
+// The session holding `name`, and its status (#284: status is the session's).
+const holderOf = (name: string) => rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, name)[0]?.id;
+const statusOf = (name: string) => rows<{ status: string | null }>(`SELECT i.status FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`, name)[0]!.status;
 
 // A tool call's error text; a call that succeeds fails the test.
 async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
@@ -94,7 +98,7 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   expect(s.c.getInstructions()).toStartWith("This session has no bus name yet.");
   expect(s.c.getInstructions()).toContain("Candidates (free now): api (this checkout's default: 3 queued DMs, 0 claims");
   const id = await sessionId(s);
-  expect(id).toMatch(/^[0-9a-f]{16}$/);
+  expect(id).toMatch(/^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/);
 
   // Reads work; nothing else does, and nothing records the session.
   expect((await s.call("board_read", { board: "e2e" })).posts.map((p: any) => p.body)).toEqual(["hello"]);
@@ -133,6 +137,32 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   expect((await be.call("peer_list", {})).unbound_sessions).toBeUndefined();
 }, 30_000);
 
+// #284 decision 2: an orchestrator that mints the key knows the ID first;
+// a reused key is refused, live or ended, and so is a malformed one.
+test("#284: BUS_SESSION_KEY sets the session's ID; a reused or malformed key is refused at start", async () => {
+  const key = "5e".repeat(32);
+  const s = await session(undefined, { extra: { BUS_SESSION_KEY: key } });
+  expect(await sessionId(s)).toBe(idAddress(key));
+  const mcp = (extra: Record<string, string>) =>
+    runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, extra), holdStdin: true, timeoutMs: 5000 });
+  // Live: its ID is taken.
+  let r = await mcp({ BUS_SESSION_KEY: key });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain(`id_collision: ${idAddress(key)} is a live session's`);
+  // Ended: its ID is never taken again.
+  await stop(s.c);
+  r = await mcp({ BUS_SESSION_KEY: key });
+  expect(r.code).toBe(1);
+  expect(r.err).toMatch(new RegExp(`id_collision: ${idAddress(key)} ended at \\d{4}-`));
+  expect(rows<{ actor: string; action: string }>(`SELECT actor, action FROM audit_log WHERE action = 'id.collision'`)).toEqual([
+    { actor: idAddress(key), action: "id.collision" },
+    { actor: idAddress(key), action: "id.collision" },
+  ]);
+  r = await mcp({ BUS_SESSION_KEY: "not-a-key" });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("BUS_SESSION_KEY must be 64 lowercase hex characters");
+}, 30_000);
+
 test("2: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {
   const first = await session("fe");
   const second = await session("fe");
@@ -155,7 +185,7 @@ test("2: a Slack-bridge child on a held human name still exits", async () => {
 test("4: a never-seen name needs create; the refusal lists the closest names, not viewers", async () => {
   await stop((await session("fe")).c);
   const db = new Database(join(dir, "bus.db"));
-  db.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('~fe', 1, 1)`).run();
+  db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~fe', 'person', '~fe', 1, 1)`).run();
   db.close();
   const s = await session();
   const err = await refusal(s, "bind", { name: "fee" });
@@ -170,7 +200,7 @@ test("5, 13: of N concurrent binders exactly one wins; the losers name it and le
   const results = await Promise.all(all.map((s) => s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } })));
   const winners = all.filter((_, i) => !results[i]!.isError);
   expect(winners).toHaveLength(1);
-  const winnerId = rows<{ session_id: string }>(`SELECT session_id FROM bindings WHERE name = 'fe'`)[0]!.session_id;
+  const winnerId = holderOf("fe")!;
   for (const r of results.filter((r) => r.isError)) {
     expect((r.content as { text: string }[])[0]!.text).toContain(`"fe" is held by the live session ${winnerId}`);
   }
@@ -204,7 +234,7 @@ beforeAll(async () => {
 test("7: a pre-upgrade session holding a name by socket alone keeps it", async () => {
   await localSession(dir, "fe", { bin: rel.cli });
   const s = await session();
-  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toEqual([]);
+  expect(holderOf("fe")).toBeUndefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
   expect(s.c.getInstructions()).not.toContain("fe (");
 }, 30_000);
@@ -215,9 +245,9 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   await session("fe");
   process.kill(pidOf("fe"), "SIGKILL");
   await localSession(dir, "fe", { bin: rel.cli });
-  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toHaveLength(1);
+  expect(holderOf("fe")).toBeDefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
-  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toEqual([]);
+  expect(holderOf("fe")).toBeUndefined();
 }, 30_000);
 
 test("8: a bind whose setup fails after the acquire leaves the session on the new name, and says so", async () => {
@@ -227,7 +257,7 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
   const err = await refusal(s, "bind", { name: "fe2", create: true });
   expect(err).toContain('bound "fe2" (was "fe"); claims moved: ticket:ENG-142, but setting it up failed');
-  expect(rows(`SELECT name FROM bindings WHERE name LIKE 'fe%'`)).toEqual([{ name: "fe2" }]);
+  expect(rows(`SELECT address FROM alias_holds WHERE address LIKE 'fe%'`)).toEqual([{ address: "fe2" }]);
   expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
   // fe is free: no listener left on it, and another session takes it.
   expect(existsSync(join(dir, "sock.fe"))).toBe(false);
@@ -361,7 +391,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
       return true;
     }
   });
-  expect(rows(`SELECT 1 FROM bindings WHERE name = 'fe'`)).toHaveLength(1);
+  expect(holderOf("fe")).toBeDefined();
   const next = await session();
   await next.call("bind", { name: "fe" });
   expect((await next.call("peer_list", {})).you).toBe("fe");
@@ -380,13 +410,30 @@ test("#211: a name record whose session the name's history doesn't show restores
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   const path = join(dir, `bind.${s.harnessPid}`);
-  const stranger = "0123456789abcdef";
+  const stranger = "id:0123456789abc";
   const prior = events("api").at(-1)!.session_id;
   writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), session_id: stranger }));
   s = await s.restart("crash");
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
-  expect(rows<{ status: string | null }>(`SELECT status FROM handles WHERE name = 'api'`)[0]!.status).toBeNull();
+  expect(statusOf("api")).toBeNull();
+}, 30_000);
+
+// #284: a 1.x name record and binding history carry a 16-hex session ID, the
+// same 64 bits; a restart across the upgrade still matches its history.
+test("#284: a restart from a 1.x name record is verified against 1.x binding history", async () => {
+  let s = await session(null);
+  await s.call("bind", { name: "api", create: true });
+  await s.call("peer_status", { text: "mid-task" });
+  const legacy = "0123456789abcdef";
+  const db = new Database(join(dir, "bus.db"));
+  db.prepare(`INSERT INTO binding_events (session_id, name, event, at) VALUES (?, 'api', 'bound', ?)`).run(legacy, Date.now());
+  db.close();
+  const path = join(dir, `bind.${s.harnessPid}`);
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), session_id: legacy }));
+  s = await s.restart("crash");
+  expect((await s.call("peer_list", {})).you).toBe("api");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored: restart of session id:${crockford13(legacy)}` });
 }, 30_000);
 
 test("#211: a restore is verified in the transaction that binds: a bind that lands while it waits makes it unverified", async () => {
@@ -411,7 +458,7 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   const next = await restarting;
   expect((await next.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${prior} not verified: latest bound by ${theirs}` });
-  expect(rows<{ status: string | null }>(`SELECT status FROM handles WHERE name = 'api'`)[0]!.status).toBeNull();
+  expect(statusOf("api")).toBeNull();
 }, 30_000);
 
 test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
@@ -421,13 +468,13 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   await s.call("peer_status", { text: "mid-task" });
   const peer = await session("fe");
   for (const how of ["reconnect", "crash"] as const) {
-    const before = rows<{ session_id: string }>(`SELECT session_id FROM bindings WHERE name = 'api'`)[0]!.session_id;
+    const before = holderOf("api")!;
     const harness = s.harnessPid;
     s = await s.restart(how);
     expect(s.harnessPid).toBe(harness);
     expect(s.c.getInstructions()).toStartWith(`You are identity "api"`);
     expect((await s.call("peer_list", {})).you).toBe("api");
-    const now = rows<{ session_id: string }>(`SELECT session_id FROM bindings WHERE name = 'api'`)[0]!.session_id;
+    const now = holderOf("api")!;
     expect(now).not.toBe(before);
     expect(events("api").at(-1)).toEqual({ session_id: now, event: "bound", detail: `restored: restart of session ${before}` });
     // The same session to its peers: its status stays, and its mail arrives.

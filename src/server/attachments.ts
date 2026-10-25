@@ -14,9 +14,10 @@ export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: n
   return row && canReadAttachment(db, handle, row, dmVisible) ? row : undefined;
 }
 
-// Stores a checked file as an unsent upload of `handle`'s, within its user's
-// quotas (unsent bytes, and stored bytes in all), and audits it. The HTTP
-// upload route and the Slack app's in-process sends both store this way.
+// Stores a checked file as an unsent upload of `handle`'s, within the quotas
+// of its principal, the user `email` (unsent bytes, and stored bytes in all),
+// and audits it. The HTTP upload route and the Slack app's in-process sends
+// both store this way.
 export async function storeUpload(
   repo: Repo,
   db: CoreDb,
@@ -25,7 +26,7 @@ export async function storeUpload(
   file: AttachmentFile,
   detail: Record<string, unknown> = {},
 ): Promise<AttachmentRow> {
-  const quota = { prefix: `${email}/`, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
+  const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
   const row = await storeAttachment(db, repo.blobs, handle, file, { quota });
   writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
     identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,

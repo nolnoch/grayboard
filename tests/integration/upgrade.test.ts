@@ -215,6 +215,45 @@ async function readAll(be: Session, fe: Session, w: Written, beHandle: string, f
   }
 }
 
+// Read points (#284 AC 5): the DMs each agent was pushed before the upgrade
+// stay read, and one sent while it was offline arrives after. `readPoint` and
+// `newest` read the release's database beside its live writers (WAL): the
+// release records a read point only after the client handled the push.
+type Mailbox = { readPoint: (address: string) => number; newest: (address: string) => number };
+
+function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox {
+  const one = (sql: string, address: string) => {
+    const db = new Database(path, { readonly: true });
+    try {
+      return (db.query(sql).get(address) as { n: number | null }).n ?? 0;
+    } finally {
+      db.close();
+    }
+  };
+  return { readPoint: (a) => one(readPointSql, a), newest: (a) => one(newestSql, a) };
+}
+
+// Waits until each agent's read point covers what it was pushed, takes both
+// offline, and has a third agent DM each of them.
+async function sendWhileOffline(m: Mailbox, be: Session, fe: Session, sim: () => Promise<Session>, beHandle: string, feHandle: string): Promise<void> {
+  for (const a of [beHandle, feHandle]) await until(() => m.readPoint(a) >= m.newest(a), 10_000);
+  await stopSession(be.c);
+  await stopSession(fe.c);
+  const s = await sim();
+  await s.call("dm_send", { to: beHandle, body: "while be was out" });
+  await s.call("dm_send", { to: feHandle, body: "while fe was out" });
+  await stopSession(s.c);
+}
+
+// After the upgrade: the offline DM arrives, and nothing it follows comes again.
+async function expectReadPointsKept(be: Session, fe: Session): Promise<void> {
+  for (const [s, offline] of [[be, "while be was out"], [fe, "while fe was out"]] as const) {
+    await until(() => s.pushes.find((p) => p.content === offline), 10_000);
+    const dms = s.pushes.filter((p) => p.meta.message_id !== undefined).map((p) => p.content);
+    expect(dms).toEqual([offline]);
+  }
+}
+
 test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   label = "server";
   const dbPath = join(dir, "old", "grayboard.db");
@@ -237,15 +276,22 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
       expect(r.code, r.err).toBe(0);
     }
   }
-  await stopSession(be.c);
-  await stopSession(fe.c);
+  const m = mailbox(
+    dbPath,
+    `SELECT MAX(last_seen_id) AS n FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?`,
+    `SELECT MAX(id) AS n FROM messages WHERE recipient_type = 'user' AND recipient = ?`,
+  );
+  await sendWhileOffline(m, be, fe, () => session(old!.base, alice, "sim", rel.cli), "alice@example.com/be", "bob@example.com/fe");
   await stopOld();
   keep(`${label}-as-written`, join(dir, "old"));
   const before = schema(dbPath);
 
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
   // The old sign-ins still hold.
-  await readAll(await srv.session(alice, "be"), await srv.session(bob, "fe"), w, "alice@example.com/be", "bob@example.com/fe");
+  const be2 = await srv.session(alice, "be");
+  const fe2 = await srv.session(bob, "fe");
+  await expectReadPointsKept(be2, fe2);
+  await readAll(be2, fe2, w, "alice@example.com/be", "bob@example.com/fe");
   writeFileSync(creds, JSON.stringify({ session_token: alice, server: srv.base, user_email: "alice@example.com" }));
   if (teams) {
     const members = await runCli(["--json", "team", "members", "core"], { cwd: dir, env: serverEnv(dir, srv.base, alice, "be", { GRAYBOARD_CREDENTIALS: creds }) });
@@ -269,12 +315,15 @@ test(`local: a bus ${FROM} wrote opens and reads back`, async () => {
     const r = await runCli(["human", "alex"], { bin: rel.cli, cwd: bus, env: localEnv(bus) });
     expect(r.code, r.err).toBe(0);
   }
-  await stopSession(be.c);
-  await stopSession(fe.c);
+  const m = mailbox(join(bus, "bus.db"), `SELECT last_seen_id AS n FROM cursors WHERE reader = ?`, `SELECT MAX(id) AS n FROM messages WHERE recipient = ?`);
+  await sendWhileOffline(m, be, fe, () => localSession(bus, "sim", { bin: rel.cli }), "be", "fe");
   keep(`${label}-as-written`, bus);
   const before = schema(join(bus, "bus.db"));
 
-  await readAll(await localSession(bus, "be"), await localSession(bus, "fe"), w, "be", "fe");
+  const be2 = await localSession(bus, "be");
+  const fe2 = await localSession(bus, "fe");
+  await expectReadPointsKept(be2, fe2);
+  await readAll(be2, fe2, w, "be", "fe");
   if (human) expect((await runCli(["human"], { cwd: bus, env: localEnv(bus) })).out).toContain("alex");
   await closeSessions();
 

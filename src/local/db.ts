@@ -32,9 +32,16 @@ export type Message = {
   attachments?: AttachmentInfo[];
 };
 
-// Stores the message and binds the sender's uploads `ids` to it, in one transaction.
+// A message's columns as readers see them. sender_id (#284) is the sending
+// session's provenance, kept in the database and left out of reads.
+const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending`;
+
+// Stores the message from session `senderId` and binds the sender's uploads
+// `ids` to it, in one transaction.
 export function insertMessage(
   sender: string,
+  senderId: string,
   recipient: string,
   body: string,
   parent_id: number | null,
@@ -45,10 +52,10 @@ export function insertMessage(
     const now = Date.now();
     const { lastInsertRowid } = db
       .prepare(
-        `INSERT INTO messages (sender, recipient, body, parent_id, created_at, pending)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(sender, recipient, body, parent_id, now, pending ? 1 : 0);
+      .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
     return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
@@ -61,7 +68,7 @@ export function unreadFor(reader: string): Message[] {
     "message",
     db
       .prepare(
-        `SELECT * FROM messages
+        `SELECT ${MSG_COLS} FROM messages
          WHERE recipient = ? AND id > ?
          ORDER BY id ASC`,
       )
@@ -86,7 +93,7 @@ export function setCursor(reader: string, last_seen_id: number): void {
 }
 
 export function getMessage(id: number): Message | undefined {
-  return db.prepare(`SELECT * FROM messages WHERE id = ?`).get(id) as
+  return db.prepare(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) as
     | Message
     | undefined;
 }
@@ -105,9 +112,9 @@ function threadRows(id: number): Message[] {
          SELECT m.id, m.parent_id FROM messages m JOIN up ON m.id = up.parent_id
        ),
        thread AS (
-         SELECT * FROM messages WHERE id = (SELECT id FROM up WHERE parent_id IS NULL)
+         SELECT ${MSG_COLS} FROM messages WHERE id = (SELECT id FROM up WHERE parent_id IS NULL)
          UNION ALL
-         SELECT m.* FROM messages m
+         SELECT ${M_MSG_COLS} FROM messages m
          JOIN thread t ON m.parent_id = t.id
        )
        SELECT * FROM thread ORDER BY id ASC`,
@@ -164,7 +171,7 @@ export function getHistory(
   }
 
   const sql = `
-    SELECT * FROM messages
+    SELECT ${MSG_COLS} FROM messages
     WHERE ${clauses.join(" AND ")}
     ORDER BY id DESC
     LIMIT ?
@@ -184,7 +191,7 @@ export function ackMessage(reader: string, id: number): void {
 export function receivedUnacked(reader: string, since: number): Message[] {
   return withAttachments(db, "message", db
     .prepare(
-      `SELECT * FROM messages m
+      `SELECT ${M_MSG_COLS} FROM messages m
         WHERE m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
           AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
         ORDER BY m.id ASC`,
@@ -196,7 +203,7 @@ export function receivedUnacked(reader: string, since: number): Message[] {
 export function sentPending(sender: string, since: number): Message[] {
   return withAttachments(db, "message", db
     .prepare(
-      `SELECT * FROM messages m
+      `SELECT ${M_MSG_COLS} FROM messages m
         WHERE m.sender = ? AND m.pending = 1 AND m.created_at >= ?
           AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
         ORDER BY m.id ASC`,

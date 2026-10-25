@@ -456,8 +456,8 @@ test("a handler that throws answers the call with an internal error and keeps th
   await Promise.all([be.connect(), fe.connect()]);
   await be.request({ type: "send", recipient: "fe", body: "hi" });
   const id = (await fe.next((m) => m.type === "push")).message.id;
-  // Deleting the identity under its live connection makes the ack's cursor write fail.
-  expect((await api(alice, "DELETE", "/api/identities/fe")).status).toBe(200);
+  // A read-point table gone from under the live server makes the ack's cursor write fail.
+  srv.app.db.exec(`ALTER TABLE mailbox_cursors RENAME TO mailbox_cursors_gone`);
   expect(await fe.request({ type: "ack", message_ids: [id] })).toMatchObject({ type: "error", code: "internal" });
   expect((await fe.call("board_list")).type).toBe("call_ok");
 });
@@ -538,7 +538,7 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   await a.connect();
   const fresh = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "fresh" });
   expect(fresh.note).toMatch(/^Recipient offline/);
-  srv.app.db.prepare("UPDATE handles SET last_seen = ? WHERE name = ?").run(Date.now() - 22 * 3_600_000, "bob@example.com/fe");
+  srv.app.db.prepare("UPDATE aliases SET last_seen = ? WHERE address = ?").run(Date.now() - 22 * 3_600_000, "bob@example.com/fe");
   const wrong = await a.request({ type: "send", recipient: "bob@example.com/fe", body: "wrong" });
   expect(wrong.note).toMatch(/^Queued: bob@example.com\/fe last seen 22h ago\. .*dm_retract/);
 

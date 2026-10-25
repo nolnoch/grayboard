@@ -80,7 +80,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         const upgraded = server.upgrade(req, {
           data: {
             authed,
-            identityId: 0,
             identityName: "",
             identityFull: "",
             ready: false,

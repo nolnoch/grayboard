@@ -356,24 +356,36 @@ describe("storage", () => {
   const store = (uploader: string, f: AttachmentFile, opts: Parameters<typeof storeAttachment>[4] = {}) => storeAttachment(db, blobs, uploader, f, opts);
   const files = (ids: number[]) => ({ attachments: { ids, limits: LIMITS } });
 
-  test("a quota caps the unbound bytes a user's handles hold, counted inside the store", async () => {
-    const quota = { prefix: "you@example.com/", unsent: 10, stored: 1000 };
+  test("a quota caps the unbound bytes a principal's uploads hold, counted inside the store", async () => {
+    const quota = { principal: "you@example.com", unsent: 10, stored: 1000 };
     await store("you@example.com/be", file("123456"), { quota });
-    await store("other@example.com/be", file("123456"), { quota: { ...quota, prefix: "other@example.com/" } });
-    // A handle that only shares the prefix's text isn't under it.
-    await store("you@example.com.evil/be", file("123456"), { quota: { ...quota, prefix: "you@example.com.evil/" } });
+    await store("other@example.com/be", file("123456"), { quota: { ...quota, principal: "other@example.com" } });
+    // A principal whose name only starts with this one's isn't it.
+    await store("you@example.com.evil/be", file("123456"), { quota: { ...quota, principal: "you@example.com.evil" } });
     await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow("your unsent uploads would exceed 10B");
     expect((await store("you@example.com/fe", file("1234"), { quota })).size).toBe(4);
   });
 
-  test("a quota caps the bytes a user's handles store in all, sent or not", async () => {
-    const quota = { prefix: "you@example.com/", unsent: 1000, stored: 10 };
+  test("a quota caps the bytes a principal's uploads store in all, sent or not", async () => {
+    const quota = { principal: "you@example.com", unsent: 1000, stored: 10 };
     const sent = await store("you@example.com/be", file("123456"), { quota });
     bindAttachments(db, [sent.id], "you@example.com/be", { message_id: msg("you@example.com/be") }, LIMITS);
     await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow(/your stored attachments would exceed 10B/);
     expect((await store("you@example.com/fe", file("1234"), { quota })).size).toBe(4);
-    expect(uploadedBytes(db, "you@example.com/", false)).toBe(10);
-    expect(uploadedBytes(db, "you@example.com/", true)).toBe(4);
+    expect(uploadedBytes(db, "you@example.com", false)).toBe(10);
+    expect(uploadedBytes(db, "you@example.com", true)).toBe(4);
+  });
+
+  // #284 decision 13: the quota follows the principal, not the uploader's
+  // address, so a session uploading under its ID can't go unmetered.
+  test("an id: uploader's bytes count against its principal, each distinct blob once", async () => {
+    const quota = { principal: "you@example.com", unsent: 10, stored: 1000 };
+    const row = await store("id:0123456789abc", file("123456"), { quota });
+    expect(db.prepare(`SELECT uploader, uploader_principal FROM attachments WHERE id = ?`).get(row.id)).toEqual({ uploader: "id:0123456789abc", uploader_principal: "you@example.com" });
+    // The same bytes again, from the alias: one blob, counted once.
+    await store("you@example.com/be", file("123456"), { quota });
+    expect(uploadedBytes(db, "you@example.com", true)).toBe(6);
+    await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow("your unsent uploads would exceed 10B");
   });
 
   test("bind checks the message's total against the limits it's given", async () => {

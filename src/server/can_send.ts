@@ -15,7 +15,6 @@ export type SendContext = {
 export type SendPrincipal = {
   user_id: number;
   user_email: string;
-  identity_id: number;
   identity_name: string;
   identity_full: string;
 };

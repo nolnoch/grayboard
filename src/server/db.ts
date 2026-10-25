@@ -14,7 +14,9 @@ import { DiskBlobs } from "./blobs.ts";
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
-export type Identity = { id: number; user_id: number; name: string; created_at: number };
+// A person-scope alias (#284): one of a user's names, `email/name`.
+export type Alias = { id: number; address: string; name: string; created_at: number };
+
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; attachments?: AttachmentInfo[] };
@@ -38,6 +40,11 @@ export type WriteReceipt = {
   ref_kind: "message" | "post"; ref_id: number; result_json: string; at: number;
 };
 
+// A message's columns as readers see them. sender_id (#284) is the sending
+// session's provenance, kept in the database and left out of reads and pushes.
+const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, pending`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.pending`;
+
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
@@ -58,14 +65,18 @@ export interface Repo {
     revokeAllForUser(userId: number): void;
     touch(sessionId: number, now: number): void;
   };
-  identities: {
-    create(userId: number, name: string): Identity;
-    listForUser(userId: number): Identity[];
-    findByUserAndName(userId: number, name: string): Identity | undefined;
+  // A user's names, keyed by the user's email (the person scope).
+  aliases: {
+    create(email: string, name: string): Alias;
+    listFor(email: string): Alias[];
+    find(email: string, name: string): Alias | undefined;
     findAllByName(name: string): { email: string; name: string }[];
-    remove(userId: number, name: string): void;
+    // Also deletes the alias's read points.
+    remove(email: string, name: string): void;
   };
   teams: {
+    // Inserts the team's principal in the same transaction; throws
+    // PrincipalTaken if another principal has the name.
     create(name: string, createdBy: number): Team;
     findByName(name: string): Team | undefined;
     listForUser(userId: number): Team[];
@@ -78,7 +89,8 @@ export interface Repo {
   messages: {
     // attachmentIds: the sender's unbound uploads, bound in the insert's
     // transaction (a refused id throws CoreError and nothing is written).
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[]): MessageRow;
+    // senderId: the sending session's ID (#284); null for a writer with no session.
+    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[], senderId?: string | null): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
@@ -99,11 +111,13 @@ export interface Repo {
     retract(sender: string, id: number): boolean;
     prune(olderThanMs: number): void;
   };
+  // Read points (#284), keyed by the reading address: how far it has
+  // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
-    get(identityId: number, streamType: "direct" | "team", streamRef: string): number;
-    // How far an identity (by full address) has received its direct messages.
-    directFor(identityFull: string): number;
-    advance(identityId: number, streamType: "direct" | "team", streamRef: string, messageId: number): void;
+    get(address: string, streamType: "direct" | "team", streamRef: string): number;
+    // How far an address has received its direct messages.
+    directFor(address: string): number;
+    advance(address: string, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
     write(row: AccessLogRow): void;
@@ -154,11 +168,11 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
-// (cursors.last_seen_id); unread = `id > read point` — a message is counted
+// (mailbox_cursors.last_seen_id); unread = `id > read point` — a message is counted
 // undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
 // plan of the exact statement the code executes, not a hand-copied drift.
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
+             LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
@@ -168,8 +182,11 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   // auto_vacuum first: it takes effect only before the file's first page is
   // written, and the WAL switch writes it.
   const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", (d) => {
+    // The first open under #284 creates aliases; that open seeds it.
+    const first = !d.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aliases'`).get();
     initSchema(d);
     initCoreSchema(d);
+    seedSchema(d, first);
   });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
   setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
@@ -241,6 +258,29 @@ function initSchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_cursors_stream ON cursors(stream_type, stream_ref);
 
+    -- Read points by address (#284), replacing cursors, which an
+    -- alias-less session can't key: identity_id is NOT NULL there.
+    CREATE TABLE IF NOT EXISTS mailbox_cursors (
+      address       TEXT    NOT NULL,
+      stream_type   TEXT    NOT NULL CHECK (stream_type IN ('direct','team')),
+      stream_ref    TEXT    NOT NULL,
+      last_seen_id  INTEGER NOT NULL,
+      PRIMARY KEY (address, stream_type, stream_ref)
+    );
+
+    -- Scope owners (#284 decision 5): every user (name = email) and team,
+    -- and service principals (#270). name is one namespace: a team and a
+    -- service principal can't share one, and neither can contain "@".
+    CREATE TABLE IF NOT EXISTS principals (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind        TEXT    NOT NULL CHECK (kind IN ('user','team','service')),
+      name        TEXT    NOT NULL UNIQUE,
+      user_id     INTEGER REFERENCES users(id),
+      team_id     INTEGER REFERENCES teams(id),
+      parent_id   INTEGER REFERENCES principals(id),
+      created_at  INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS access_log (
       id     INTEGER PRIMARY KEY AUTOINCREMENT,
       at     INTEGER NOT NULL,
@@ -306,9 +346,40 @@ function initSchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_write_receipts_at ON write_receipts(at);
   `);
-  // dm_send pending: the sender owes a follow-up in the thread.
+  // dm_send pending: the sender owes a follow-up in the thread. sender_id:
+  // the sending session's ID (#284), beside the address it sent as; null for
+  // messages from before it, and for writers with no session.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
+  if (!msgCols.some((c) => c.name === "sender_id")) db.exec(`ALTER TABLE messages ADD COLUMN sender_id TEXT`);
+}
+
+// #284's seeds, inside the schema transaction. Principals follow users and
+// teams on every open (their writers insert them too). Aliases and read
+// points come from the 1.x identities, handles and cursors once, on the open
+// that creates aliases (`first`): after it, nothing reads or writes those
+// tables, and a later seed would bring back an alias deleted since.
+function seedSchema(db: Database, first: boolean): void {
+  db.exec(`
+    INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) SELECT 'user', email, id, created_at FROM users;
+    INSERT OR IGNORE INTO principals (kind, name, team_id, created_at) SELECT 'team', name, id, created_at FROM teams;
+  `);
+  if (!first) return;
+  db.exec(`
+    INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_by_principal, created_at, last_seen)
+    SELECT u.email || '/' || i.name, 'person', u.email, i.name, h.human, h.queue_off, u.email, i.created_at, h.last_seen
+      FROM identities i JOIN users u ON u.id = i.user_id LEFT JOIN handles h ON h.name = u.email || '/' || i.name;
+    INSERT OR IGNORE INTO mailbox_cursors (address, stream_type, stream_ref, last_seen_id)
+    SELECT u.email || '/' || i.name, c.stream_type, c.stream_ref, c.last_seen_id
+      FROM cursors c JOIN identities i ON i.id = c.identity_id JOIN users u ON u.id = i.user_id;
+  `);
+}
+
+/** A team's name another principal already has (#284 decision 5). */
+export class PrincipalTaken extends Error {
+  constructor(readonly name: string) {
+    super(`the name "${name}" belongs to another team or service principal`);
+  }
 }
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
@@ -321,12 +392,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     users: {
       upsertByEmail(email, displayName) {
         const now = Date.now();
-        db.run(
-          `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
-           ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name`,
-          [email, displayName, now],
-        );
-        return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email)!;
+        return db.transaction(() => {
+          db.run(
+            `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
+             ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name`,
+            [email, displayName, now],
+          );
+          const user = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email)!;
+          db.run(`INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) VALUES ('user', ?, ?, ?)`, [email, user.id, now]);
+          return user;
+        })();
       },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
@@ -369,38 +444,48 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    identities: {
-      create(userId, name) {
-        const now = Date.now();
-        db.run("INSERT INTO identities (user_id, name, created_at) VALUES (?, ?, ?)", [userId, name, now]);
-        return db.query<Identity, [number, string]>(
-          "SELECT * FROM identities WHERE user_id = ? AND name = ?",
-        ).get(userId, name)!;
+    aliases: {
+      create(email, name) {
+        return db.query<Alias, [string, string, string, string, number]>(
+          `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
+           VALUES (?, 'person', ?, ?, ?, ?) RETURNING id, address, name, created_at`,
+        ).get(`${email}/${name}`, email, name, email, Date.now())!;
       },
-      listForUser(userId) {
-        return db.query<Identity, [number]>("SELECT * FROM identities WHERE user_id = ?").all(userId);
+      listFor(email) {
+        return db.query<Alias, [string]>(
+          "SELECT id, address, name, created_at FROM aliases WHERE scope_ref = ? AND scope_kind = 'person' ORDER BY name",
+        ).all(email);
       },
-      findByUserAndName(userId, name) {
-        return (
-          db.query<Identity, [number, string]>(
-            "SELECT * FROM identities WHERE user_id = ? AND name = ?",
-          ).get(userId, name) ?? undefined
-        );
+      find(email, name) {
+        return db.query<Alias, [string, string]>(
+          "SELECT id, address, name, created_at FROM aliases WHERE scope_ref = ? AND scope_kind = 'person' AND name = ?",
+        ).get(email, name) ?? undefined;
       },
       findAllByName(name) {
         return db.query<{ email: string; name: string }, [string]>(
-          "SELECT u.email, i.name FROM identities i JOIN users u ON u.id = i.user_id WHERE i.name = ?",
+          "SELECT scope_ref AS email, name FROM aliases WHERE name = ? AND scope_kind = 'person'",
         ).all(name);
       },
-      remove(userId, name) {
-        db.run("DELETE FROM identities WHERE user_id = ? AND name = ?", [userId, name]);
+      remove(email, name) {
+        db.transaction(() => {
+          const address = `${email}/${name}`;
+          db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);
+          db.run("DELETE FROM aliases WHERE address = ?", [address]);
+        })();
       },
     },
 
     teams: {
       create(name, createdBy) {
-        db.run("INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?)", [name, createdBy, Date.now()]);
-        return db.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name)!;
+        return db.transaction(() => {
+          const now = Date.now();
+          if (db.query<{ x: number }, [string]>("SELECT 1 AS x FROM principals WHERE name = ?").get(name)) throw new PrincipalTaken(name);
+          const team = db.query<Team, [string, number, number]>(
+            "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?) RETURNING *",
+          ).get(name, createdBy, now)!;
+          db.run(`INSERT INTO principals (kind, name, team_id, created_at) VALUES ('team', ?, ?, ?)`, [name, team.id, now]);
+          return team;
+        })();
       },
       findByName(name) {
         return db.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
@@ -438,32 +523,32 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = []) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null) {
         return db.transaction(() => {
-          const row = db.query<MessageRow, [string, string, string, string, number | null, number, number]>(
-            `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-          ).get(sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
           const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
       getById(id) {
-        return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id) ?? undefined;
+        return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
       history(identityFull, peer, limit = 20, beforeId) {
         const cap = Math.min(limit, 200);
         if (peer) {
           if (beforeId !== undefined) {
             return att(db.query<MessageRow, [string, string, string, string, number, number]>(
-              `SELECT * FROM messages
+              `SELECT ${MSG_COLS} FROM messages
                WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                  AND recipient_type = 'user' AND id < ?
                ORDER BY id DESC LIMIT ?`,
             ).all(identityFull, peer, peer, identityFull, beforeId, cap));
           }
           return att(db.query<MessageRow, [string, string, string, string, number]>(
-            `SELECT * FROM messages
+            `SELECT ${MSG_COLS} FROM messages
              WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                AND recipient_type = 'user'
              ORDER BY id DESC LIMIT ?`,
@@ -471,13 +556,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }
         if (beforeId !== undefined) {
           return att(db.query<MessageRow, [string, string, number, number]>(
-            `SELECT * FROM messages
+            `SELECT ${MSG_COLS} FROM messages
              WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user')) AND id < ?
              ORDER BY id DESC LIMIT ?`,
           ).all(identityFull, identityFull, beforeId, cap));
         }
         return att(db.query<MessageRow, [string, string, number]>(
-          `SELECT * FROM messages
+          `SELECT ${MSG_COLS} FROM messages
            WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user'))
            ORDER BY id DESC LIMIT ?`,
         ).all(identityFull, identityFull, cap));
@@ -495,7 +580,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             UNION ALL
             SELECT m.id FROM messages m JOIN tree t ON m.parent_id = t.id
           )
-          SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
+          SELECT ${M_MSG_COLS} FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
         `).all(id));
       },
       unreadSince(streams) {
@@ -504,7 +589,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         for (const s of streams) {
           const colType = s.type === "direct" ? "user" : "team";
           const rows = db.query<MessageRow, [string, string, number]>(
-            `SELECT * FROM messages WHERE recipient_type = ? AND recipient = ? AND id > ? ORDER BY id ASC`,
+            `SELECT ${MSG_COLS} FROM messages WHERE recipient_type = ? AND recipient = ? AND id > ? ORDER BY id ASC`,
           ).all(colType, s.ref, s.since);
           all.push(...rows);
         }
@@ -515,7 +600,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const rows = db.query<{ recipient: string; n: number }, [string]>(
           `SELECT m.recipient, COUNT(*) AS n FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
-              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c WHERE c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
+              AND m.id > COALESCE((SELECT c.last_seen_id FROM mailbox_cursors c WHERE c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
             GROUP BY m.recipient`,
         ).all(JSON.stringify(recipients));
         return new Map(rows.map((r) => [r.recipient, r.n]));
@@ -527,7 +612,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       receivedUnacked(reader, since) {
         return att(db.query<MessageRow, [string, number]>(
-          `SELECT * FROM messages m
+          `SELECT ${M_MSG_COLS} FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
@@ -535,7 +620,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       sentPending(sender, since) {
         return att(db.query<MessageRow, [string, number]>(
-          `SELECT * FROM messages m
+          `SELECT ${M_MSG_COLS} FROM messages m
             WHERE m.recipient_type = 'user' AND m.sender = ? AND m.pending = 1 AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
@@ -548,8 +633,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.transaction(() => {
           const retractable = db.query<{ x: number }, [number, string]>(
             `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
-               AND id > COALESCE((SELECT MAX(last_seen_id) FROM cursors
-                                   WHERE stream_type = 'direct' AND stream_ref = messages.recipient), 0)
+               AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0)
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
           ).get(id, sender);
           if (!retractable) return false;
@@ -577,24 +662,24 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     cursors: {
-      get(identityId, streamType, streamRef) {
-        const row = db.query<{ last_seen_id: number }, [number, string, string]>(
-          "SELECT last_seen_id FROM cursors WHERE identity_id = ? AND stream_type = ? AND stream_ref = ?",
-        ).get(identityId, streamType, streamRef);
+      get(address, streamType, streamRef) {
+        const row = db.query<{ last_seen_id: number }, [string, string, string]>(
+          "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = ? AND stream_ref = ?",
+        ).get(address, streamType, streamRef);
         return row?.last_seen_id ?? 0;
       },
-      directFor(identityFull) {
-        const row = db.query<{ id: number | null }, [string]>(
-          "SELECT MAX(last_seen_id) AS id FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?",
-        ).get(identityFull);
-        return row?.id ?? 0;
+      directFor(address) {
+        const row = db.query<{ last_seen_id: number }, [string, string]>(
+          "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = 'direct' AND stream_ref = ?",
+        ).get(address, address);
+        return row?.last_seen_id ?? 0;
       },
-      advance(identityId, streamType, streamRef, messageId) {
+      advance(address, streamType, streamRef, messageId) {
         db.run(
-          `INSERT INTO cursors (identity_id, stream_type, stream_ref, last_seen_id) VALUES (?, ?, ?, ?)
-           ON CONFLICT(identity_id, stream_type, stream_ref)
-           DO UPDATE SET last_seen_id = MAX(excluded.last_seen_id, cursors.last_seen_id)`,
-          [identityId, streamType, streamRef, messageId],
+          `INSERT INTO mailbox_cursors (address, stream_type, stream_ref, last_seen_id) VALUES (?, ?, ?, ?)
+           ON CONFLICT(address, stream_type, stream_ref)
+           DO UPDATE SET last_seen_id = MAX(excluded.last_seen_id, mailbox_cursors.last_seen_id)`,
+          [address, streamType, streamRef, messageId],
         );
       },
     },
