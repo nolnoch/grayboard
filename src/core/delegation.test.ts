@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { declareHuman, startSession, touchHandle } from "./boards.ts";
-import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, setLauncher, DELEGATE_TOOL } from "./delegation.ts";
-import { CoreError } from "./errors.ts";
+import { ackDelegationClaim, claimDelegation, delegateNote, delegateOkFields, delegationBody, DELEGATION_TTL_MS, humanDegrade, humanFallbackBody, isLauncher, launchers, nextLauncher, resolveDelegation, setLauncher, touchDelegated, DELEGATE_TOOL } from "./delegation.ts";
+import { claim, claimExpiryTimer, listClaims, sweepDelegationClaims, sweepExpired } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -257,4 +257,168 @@ describe("result note and fields (#246 review 8/13)", () => {
 
 test("the tool def requires persona and task only", () => {
   expect(DELEGATE_TOOL.inputSchema.required).toEqual(["persona", "task"]);
+});
+
+// Takeover rotation (#242): an auto-picked delegation spreads across the
+// user's launchers instead of feeding the first by name until it saturates,
+// and a launcher that goes silent loses the request to the next one.
+describe("takeover rotation (#242)", () => {
+  test("launchers() orders by last delegation, never-delegated first, then name", () => {
+    session("b", true);
+    session("a", true);
+    touchDelegated(db, "a");
+    // b was never delegated to: it precedes a despite the name order.
+    expect(launchers(db)).toEqual(["b", "a"]);
+  });
+
+  test("touchDelegated stamps the handle's rotation clock", () => {
+    session("a", true);
+    touchDelegated(db, "a", 1234);
+    expect(db.prepare(`SELECT last_delegated_at FROM handles WHERE name = 'a'`).get()).toEqual({ last_delegated_at: 1234 });
+  });
+
+  test("auto-pick rotates: the least-recently-delegated live launcher takes the next request", () => {
+    session("a", true);
+    session("b", true);
+    expect(resolveDelegation(db, "me", args, live).to).toBe("a");
+    touchDelegated(db, "a");
+    // Reverting the rotation order (back to name order) picks a again —
+    // this assertion is what fails.
+    expect(resolveDelegation(db, "me", args, live).to).toBe("b");
+  });
+
+  test("the takeover claim: holder, requester in the note, no board, the TTL", () => {
+    session("a", true);
+    const now = Date.now();
+    expect(claimDelegation(db, 101, "a", "me", now)).toBe(true);
+    const row = db.prepare(`SELECT * FROM claims WHERE key = 'delegation:101'`).get() as any;
+    expect(row.holder).toBe("a");
+    expect(row.note).toBe("me");
+    expect(row.board).toBeNull();
+    expect(row.expires_at - row.acquired_at).toBe(DELEGATION_TTL_MS);
+    // Idempotent: the claim is the delivery's token, a duplicate write (a
+    // re-push) is not a second take.
+    expect(claimDelegation(db, 101, "a", "me", now)).toBe(false);
+  });
+
+  test("the takeover claim: a custom ttl wins (test lever)", () => {
+    const now = Date.now();
+    claimDelegation(db, 101, "a", "me", now, 500);
+    const row = db.prepare(`SELECT expires_at, acquired_at FROM claims WHERE key = 'delegation:101'`).get() as any;
+    expect(row.expires_at - row.acquired_at).toBe(500);
+  });
+
+  test("ackDelegationClaim: the launcher's reply acks the takeover", () => {
+    claimDelegation(db, 101, "a", "me");
+    expect(ackDelegationClaim(db, "a", 101)).toBe("ack");
+    expect(db.prepare(`SELECT count(*) AS n FROM claims WHERE key = 'delegation:101'`).get()).toEqual({ n: 0 });
+  });
+
+  test("ackDelegationClaim: the requester settling ends the takeover", () => {
+    claimDelegation(db, 101, "a", "me");
+    expect(ackDelegationClaim(db, "me", 101)).toBe("settled");
+    expect(db.prepare(`SELECT count(*) AS n FROM claims WHERE key = 'delegation:101'`).get()).toEqual({ n: 0 });
+  });
+
+  test("ackDelegationClaim: an uninvolved handle releases nothing", () => {
+    claimDelegation(db, 101, "a", "me");
+    expect(ackDelegationClaim(db, "stranger", 101)).toBeNull();
+    expect(db.prepare(`SELECT count(*) AS n FROM claims WHERE key = 'delegation:101'`).get()).toEqual({ n: 1 });
+  });
+
+  test("nextLauncher: rotation minus the silent holder, the requester excluded", () => {
+    session("a", true);
+    session("b", true);
+    session("c", true);
+    touchDelegated(db, "a");
+    touchDelegated(db, "b", Date.now() + 1);
+    // c was never delegated to; a is older than b.
+    expect(nextLauncher(db, "me", "z")).toBe("c");
+    expect(nextLauncher(db, "me", "c")).toBe("a");
+    // The requester never delegates to itself.
+    session("me", true);
+    expect(nextLauncher(db, "me", "z")).toBe("c");
+  });
+
+  test("nextLauncher: same-user only on a server (#246 review's scope ruling)", () => {
+    session("u@x/be", true);
+    session("u@x/ad", true);
+    session("v@y/be", true);
+    expect(nextLauncher(db, "u@x/me", "u@x/be")).toBe("u@x/ad");
+    expect(nextLauncher(db, "v@y/me", "v@y/be")).toBeNull();
+  });
+
+  test("nextLauncher: live lanes preferred, offline the fallback", () => {
+    session("u@x/be", true);
+    session("u@x/ad", true);
+    // be is live, ad isn't: be wins despite the name order.
+    expect(nextLauncher(db, "u@x/me", "u@x/zz", (h) => h === "u@x/be")).toBe("u@x/be");
+    // Nobody's live: the first rotation lane still takes it (its outbox
+    // holds the re-offer until it wakes).
+    expect(nextLauncher(db, "u@x/me", "u@x/zz", () => false)).toBe("u@x/ad");
+  });
+
+  test("humanDegrade: the reachable human, else null", () => {
+    declareHuman(db, "human");
+    startSession(db, "human", null);
+    expect(humanDegrade(db, "me", (h) => h === "human")?.to).toBe("human");
+    expect(humanDegrade(db, "me", () => false)).toBeNull();
+  });
+});
+
+// The claims surface meets the takeover claims (#242): the keyspace is
+// machinery-only, the listing is same-user scoped, the generic sweep leaves
+// them, and the expiry timer arms for them.
+describe("delegation takeover claims on the claims surface (#242)", () => {
+  test("claim() refuses the delegation: keyspace", () => {
+    expect(() => claim(db, "a", "delegation:101")).toThrow(/reserved for delivery machinery/);
+  });
+
+  test("listClaims: a delegation claim is same-user only", () => {
+    session("u@x/be", true);
+    claimDelegation(db, 101, "u@x/be", "u@x/me");
+    expect(listClaims(db, undefined, "u@x/me").map((c) => c.key)).toContain("delegation:101");
+    expect(listClaims(db, undefined, "v@y/watcher").map((c) => c.key)).not.toContain("delegation:101");
+  });
+
+  test("the generic sweep leaves delegation claims for the dedicated one", () => {
+    claimDelegation(db, 101, "a", "me", Date.now() - 2_000, 1_000);
+    sweepExpired(db);
+    // Reverting the sweep's exclusion (deleting every lapsed claim) makes
+    // this fail: the takeover would be dropped without a redelivery.
+    expect(db.prepare(`SELECT count(*) AS n FROM claims WHERE key = 'delegation:101'`).get()).toEqual({ n: 1 });
+  });
+
+  test("sweepDelegationClaims: consumes lapsed claims only, deliver per claim", () => {
+    claimDelegation(db, 101, "a", "me", Date.now() - 2_000, 1_000);
+    claimDelegation(db, 102, "b", "me", Date.now(), 60_000);
+    const delivered: string[] = [];
+    const wake = sweepDelegationClaims(db, Date.now(), (c) => {
+      delivered.push(c.key);
+      return c.holder === "a" ? "b" : null;
+    });
+    expect(delivered).toEqual(["delegation:101"]);
+    expect(wake).toEqual(["b"]);
+    expect(db.prepare(`SELECT count(*) AS n FROM claims WHERE key = 'delegation:102'`).get()).toEqual({ n: 1 });
+  });
+
+  test("the expiry timer arms for delegation claims (#242)", async () => {
+    claimDelegation(db, 101, "a", "me", Date.now(), 60);
+    // The real deliverer consumes the claim; here deleting it stands in (and
+    // stops the arm/expire loop a leftover row would cause).
+    let resolveFired!: (v: string[]) => void;
+    const fired = new Promise<string[]>((r) => (resolveFired = r));
+    const t = claimExpiryTimer(db, () => {}, () => {
+      resolveFired(["a"]);
+      db.prepare(`DELETE FROM claims WHERE key = 'delegation:101'`).run();
+      return ["a"];
+    });
+    try {
+      const winner = await Promise.race([fired, new Promise<null>((r) => setTimeout(() => r(null), 2_000))]);
+      // Reverting arm()'s delegation clause leaves the timer unarmed: null.
+      expect(winner).toEqual(["a"]);
+    } finally {
+      t.stop();
+    }
+  });
 });

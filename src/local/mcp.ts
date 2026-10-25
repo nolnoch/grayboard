@@ -8,11 +8,22 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import {
+  ackDelegationClaim,
+  claimDelegation,
+  DELEGATION_KEY_PREFIX,
+  delegateOkFields,
+  humanDegrade,
+  launcherInstruction,
+  nextLauncher,
+  resolveDelegation,
+  setLauncher,
+  touchDelegated,
+} from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
-import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims, sweepDelegationClaims, type Claim } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
 import { retentionDays, startLocalRetention } from "./retention.ts";
 import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
@@ -276,8 +287,40 @@ const notices = (): string[] => {
 };
 
 // Announces claims that lapse on their boards. Every session runs one; the
-// sweep's delete makes each lapse post once.
-const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
+// sweep's delete makes each lapse post once. The third hook runs the
+// delegation takeover sweep when a takeover claim lapses (#242): the local
+// delivery re-offers the request to the requester's next launcher, or
+// degrades to their human.
+const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles), () =>
+  sweepDelegationClaims(db, Date.now(), (c) => redeliverTakeover(c)),
+);
+
+// The local takeover delivery: the original request body verbatim (plus the
+// redelivery marker carrying the request id — the dedup token the launcher
+// instruction's "already handled" rule keys on) to the next launcher in
+// rotation; no launcher left, the requester's human. Presence-blind like the
+// queue sweep: an offline lane holds the re-offer until it wakes.
+function redeliverTakeover(c: Claim): string | null {
+  const requester = c.note ?? "";
+  const requestId = Number(c.key.slice(DELEGATION_KEY_PREFIX.length));
+  const orig = Number.isInteger(requestId) && requestId > 0 ? getMessage(requestId) : undefined;
+  if (!requester || !orig || orig.sender !== requester) return null;
+  const body = `${orig.body}\n\n[redelivered] This request was first delivered to another launcher that didn't report back (request ${requestId}); if you already handled it, don't act again.`;
+  const lane = nextLauncher(db, requester, c.holder);
+  if (lane) {
+    const { id } = insertMessage(requester, lane, body, null, true, []);
+    writeCoreAudit(db, "delegation.requested", requester, lane, { via: "auto", message_id: id, redelivered_from: c.holder });
+    touchDelegated(db, lane, Date.now());
+    claimDelegation(db, id, lane, requester);
+    expiry.arm();
+    return lane;
+  }
+  const d = humanDegrade(db, requester, (h) => lastSeen(db, h) !== null);
+  if (!d) return null;
+  insertMessage(requester, d.to, d.body, null, true, []);
+  writeCoreAudit(db, "delegation.requested", requester, d.to, { via: "human_fallback", redelivered_from: c.holder });
+  return null;
+}
 
 const gate = new BindGate();
 const late = new LateCancels();
@@ -357,6 +400,14 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // both (review 16).
     let msgId = (await insertMessage(IDENTITY, d.to, d.body, null, true, [])).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
+    // The takeover claim: a delivered request that its launcher goes silent
+    // on is re-offered to the next launcher after the TTL (#242). The human
+    // fallback takes none — a person isn't taken over.
+    if (!d.humanFallback) {
+      touchDelegated(db, d.to, Date.now());
+      claimDelegation(db, msgId, d.to, IDENTITY);
+      expiry.arm();
+    }
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
     if (!delivered && !d.humanFallback) {
@@ -373,6 +424,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
           d = d2;
           msgId = id2;
+          touchDelegated(db, d2.to, Date.now());
+          claimDelegation(db, id2, d2.to, IDENTITY);
+          expiry.arm();
           delivered = await deliver(d2.to);
         }
       } catch {
@@ -416,6 +470,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
+    // A reply in a delegation request's thread settles its takeover claim:
+    // the launcher's reply acks the work, the requester's settles it (#242).
+    if (parent_id !== undefined) ackDelegationClaim(db, IDENTITY, parent_id);
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
@@ -465,6 +522,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     for (const id of ids) {
       const m = getMessage(id);
       if (m && (m.recipient === IDENTITY || (m.sender === IDENTITY && m.pending))) { ackMessage(IDENTITY, id); acked.push(id); } else missing.push(id);
+      // Settling a delegation's promise ends its takeover: nobody should
+      // re-offer work the requester gave up on (#242).
+      ackDelegationClaim(db, IDENTITY, id);
     }
     const r = ackResult(acked, missing);
     return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };

@@ -16,21 +16,56 @@
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
+import { logEvent } from "./claims.ts";
 import { humanHandles, lastSeen, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import type { ToolDef } from "./tools.ts";
 
+// How long a launcher holds a taken delegation before the takeover sweep
+// offers it to the next launcher (#242). Matches the claims default
+// (claims.ts DEFAULT_TTL_MIN). GRAYBOARD_DELEGATION_TTL_MS overrides it —
+// a test lever, so integration tests can watch a takeover happen.
+export const DELEGATION_TTL_MS = 30 * 60_000;
+
+export function delegationTtlMs(): number {
+  const v = Number(process.env.GRAYBOARD_DELEGATION_TTL_MS);
+  return Number.isInteger(v) && v > 0 ? v : DELEGATION_TTL_MS;
+}
+
+// The takeover claim's key for a delivered delegation request: the claim is
+// the idempotency token (as `queue:` claims are for queue posts, #192), and
+// the keyspace is reserved from public claim_take (claims.ts) — a squatted
+// takeover would suppress the real launcher's settle and misroute the
+// redelivery.
+export function delegationClaimKey(messageId: number): string {
+  return `${DELEGATION_KEY_PREFIX}${messageId}`;
+}
+
+// The takeover keyspace: delegationClaimKey's prefix, and how the modes
+// slice the message id back out of a claim key.
+export const DELEGATION_KEY_PREFIX = "delegation:";
+
 // The launchers on the roster: handles whose live session opted in
 // (BUS_LAUNCHER=1, or the hello's launcher flag). Humans can't spawn — a
-// bridge holds their identity — and viewers have no handles row.
+// bridge holds their identity — and viewers have no handles row. Rotation
+// order (least-recently-delegated first, never-delegated first, then by
+// name): the auto-pick spreads load instead of feeding one launcher until
+// it saturates (#242).
 export function launchers(db: Database): string[] {
-  return (db.prepare(`SELECT name FROM handles WHERE launcher = 1 AND (human IS NULL OR human = 0) ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+  return (db.prepare(`SELECT name FROM handles WHERE launcher = 1 AND (human IS NULL OR human = 0) ORDER BY last_delegated_at ASC NULLS FIRST, name ASC`).all() as { name: string }[]).map((r) => r.name);
 }
 
 // One session row notes the capability; the next session on the handle
 // rewrites it (the row describes the live session, as cwd and status do).
 export function setLauncher(db: Database, handle: string, on: boolean): void {
   db.prepare(`UPDATE handles SET launcher = ? WHERE name = ?`).run(on ? 1 : 0, handle);
+}
+
+// A delivered delegation loads its launcher: the rotation sends the next
+// request to a different one when it can (#242). Written per delivery, not
+// per claim event, so it survives the claim's settle.
+export function touchDelegated(db: Database, handle: string, now = Date.now()): void {
+  db.prepare(`UPDATE handles SET last_delegated_at = ? WHERE name = ?`).run(now, handle);
 }
 
 export function isLauncher(db: Database, handle: string): boolean {
@@ -127,6 +162,66 @@ export function resolveDelegation(
   const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
+}
+
+// The takeover claim: the delivered request expires if its launcher goes
+// quiet, and the mode's sweep re-offers it to the next launcher (#242). The
+// claim row is the idempotency token and the lapse record; its `note`
+// carries the requester (the redelivery re-scopes from it). Written for
+// auto-picked and explicit deliveries alike — an explicit `to` that goes
+// silent strands the request just as an auto-pick does. The human fallback
+// takes no claim: a person isn't taken over.
+export function claimDelegation(db: Database, messageId: number, holder: string, requester: string, now = Date.now(), ttlMs = delegationTtlMs()): boolean {
+  const res = db
+    .prepare(
+      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
+       VALUES (?, ?, ?, NULL, ?, ?)`,
+    )
+    .run(delegationClaimKey(messageId), holder, requester, now, now + ttlMs);
+  const claim = { key: delegationClaimKey(messageId), holder, note: requester, board: null, acquired_at: now, expires_at: now + ttlMs };
+  if (Number(res.changes) > 0) logEvent(db, "take", holder, claim, now);
+  return Number(res.changes) > 0;
+}
+
+// The takeover claim ends when the launcher replies in the request's thread
+// (it took the work) or the requester settles it (dm_ack on the request, or
+// any later act of theirs — the promise machinery's own settle). Returns
+// which, or null when the claim is gone or the handle is uninvolved.
+export function ackDelegationClaim(db: Database, handle: string, messageId: number, now = Date.now()): "ack" | "settled" | null {
+  const key = delegationClaimKey(messageId);
+  const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as { holder: string; note: string | null } | undefined;
+  if (!cur) return null;
+  const kind = cur.holder === handle ? "ack" : cur.note === handle ? "settled" : null;
+  if (!kind) return null;
+  db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
+  logEvent(db, "release", handle, { key, note: kind, holder: cur.holder }, now);
+  return kind;
+}
+
+// The next launcher for a lapsed request: the requester's own-user launchers
+// except the one that went silent, rotation order (so the least-loaded
+// launcher takes over). Presence-blind like redeliverQueuePost: an offline
+// lane holds the re-offer until it wakes. null when there is no other
+// launcher — the mode's sweep falls back to the human.
+export function nextLauncher(db: Database, requester: string, prevHolder: string, online?: (handle: string) => boolean): string | null {
+  const lanes = launchers(db).filter((h) => sameUser(requester, h) && h !== prevHolder && h !== requester);
+  if (!lanes.length) return null;
+  if (!online) return lanes[0]!;
+  return lanes.find((h) => online(h)) ?? lanes[0]!;
+}
+
+// The late degrade: every launcher went silent, so the request surfaces to
+// the requester's human after all — the same fallback the first resolve
+// would have taken, checked at takeover time. null when nobody is
+// reachable.
+export function humanDegrade(
+  db: Database,
+  requester: string,
+  reachable: (humanHandle: string) => boolean,
+): { to: string; body: string } | null {
+  const to = humanFallbackHandle(db, requester, reachable);
+  if (!to) return null;
+  return { to, body: humanFallbackBody({ requester, persona: "", task: "" }) };
 }
 
 // What the launcher session receives. The harness owns the spawn surface: the
