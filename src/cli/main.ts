@@ -63,6 +63,9 @@ const ADAPTERS: { path: string; source: string; config?: HarnessConfig }[] = [
   { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
   { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode"), config: OC_CONFIG },
   { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi"), config: PI_CONFIG },
+  // pi subagent children (subagentOnlyExtensions): the child's own grayboard,
+  // its own name and push channel (#244). No config: it owns no mcp.json entry.
+  { path: join(PI_DIR, "extensions", "grayboard-child.ts"), source: adapterSource("pi-child") },
 ];
 
 function writeAdapter(path: string, source: string): void {
@@ -548,7 +551,7 @@ program
       const where = creds?.server ? ` from ${creds.server}` : "";
       if (!(await confirm(`Local mode signs you out${where}. Continue?`, true))) process.exit(1);
       if (creds?.session_token) {
-        try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch {}
+        try { await new ApiClient(creds.server, creds.session_token).post("/api/auth/logout"); } catch { /* the server is optional on the way out */ }
       }
       rmSync(credentialsPath(), { force: true });
       console.log("Using local mode.");
@@ -604,13 +607,16 @@ program
 
     // 5. pi: its MCP client drops notifications and, for direct tools, the
     // server's instructions, so like opencode the extension serves the tools,
-    // runs the push side and supplies the instructions.
+    // runs the push side and supplies the instructions. The child adapter goes
+    // beside it: an agent definition's subagentOnlyExtensions points a
+    // subagent child at its own grayboard (#244).
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
       try { putEntry(PI_CONFIG, { command, args }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      const ext = ADAPTERS[2]!;
-      writeAdapter(ext.path, ext.source);
-      console.log(`Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools); installed ${ext.path}`);
+      for (const ext of [ADAPTERS[2]!, ADAPTERS[3]!]) {
+        writeAdapter(ext.path, ext.source);
+        console.log(`Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools); installed ${ext.path}`);
+      }
     }
 
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");

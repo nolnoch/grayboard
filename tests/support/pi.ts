@@ -17,6 +17,7 @@ import { adapterChildren, grayboardChildren } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
+const CHILD_ADAPTER = join(ROOT, "adapters/pi/grayboard-child.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
 const PI = JSON.parse(readFileSync(PI_PKG, "utf8")) as { version: string; bin: { pi: string } };
 const PI_CLI = join(dirname(PI_PKG), PI.bin.pi);
@@ -39,7 +40,8 @@ class Pi {
         buf = buf.slice(nl + 1);
         try {
           this.events.push(JSON.parse(line));
-        } catch {}
+        } catch { // not JSON (a stray write on the RPC stream): skip the line
+        }
       }
     });
     proc.stderr!.setEncoding("utf8").on("data", (chunk: string) => {
@@ -75,20 +77,30 @@ type PiOpts = {
   identity?: string | null;
   // Merged over the grayboard entry setup writes.
   entry?: Record<string, unknown>;
+  // Extra env for the pi process (a child runner's leaked vars, bindings).
+  env?: Record<string, string>;
+  // Extra extension files, as pi-subagents' runner loads a child's
+  // `subagentOnlyExtensions` (--no-extensions --extension <file>).
+  extensions?: string[];
 };
 
-function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {} }: PiOpts = {}): Pi {
+function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, env: extraEnv = {}, extensions = [] }: PiOpts = {}): Pi {
   const agentDir = join(dir, "pi-agent");
   const extension = join(agentDir, "extensions", "grayboard.ts");
+  // A child run (--extension, the pi-subagents runner's shape) loads no
+  // ambient extensions: the parent adapter isn't installed there.
+  const child = extensions.length > 0;
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
-  if (bin) {
-    // The adapter the binary carries: refresh-adapters rewrites an installed one.
-    writeFileSync(extension, "");
-    const r = Bun.spawnSync([bin, "refresh-adapters"], { env: localEnv(dir, undefined, { PI_CODING_AGENT_DIR: agentDir }), timeout: 10_000, killSignal: "SIGKILL" });
-    if (r.exitedDueToTimeout) throw new Error(`${bin} refresh-adapters: no exit in 10 s`);
-    if (r.exitCode !== 0 || !readFileSync(extension, "utf8")) throw new Error(`${bin} refresh-adapters: ${r.stderr}`);
-  } else {
-    copyFileSync(ADAPTER, extension);
+  if (!child) {
+    if (bin) {
+      // The adapter the binary carries: refresh-adapters rewrites an installed one.
+      writeFileSync(extension, "");
+      const r = Bun.spawnSync([bin, "refresh-adapters"], { env: localEnv(dir, undefined, { PI_CODING_AGENT_DIR: agentDir }), timeout: 10_000, killSignal: "SIGKILL" });
+      if (r.exitedDueToTimeout) throw new Error(`${bin} refresh-adapters: no exit in 10 s`);
+      if (r.exitCode !== 0 || !readFileSync(extension, "utf8")) throw new Error(`${bin} refresh-adapters: ${r.stderr}`);
+    } else {
+      copyFileSync(ADAPTER, extension);
+    }
   }
   // The entry grayboard setup writes, with this checkout or the binary as the command.
   const command = bin ? { command: bin, args: ["mcp", "--mode", "local"] } : { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] };
@@ -100,9 +112,10 @@ function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, i
       fake: { baseUrl: `http://localhost:${modelPort}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-1" }] },
     },
   }));
-  const proc = spawn("node", [PI_CLI, "--mode", "rpc", "--no-session", "--offline", "--provider", "fake", "--model", "fake-1"], {
+  const adapterArgs = child ? ["--no-extensions", ...extensions.flatMap((e) => ["--extension", e])] : [];
+  const proc = spawn("node", [PI_CLI, ...adapterArgs, "--mode", "rpc", "--no-session", "--offline", "--provider", "fake", "--model", "fake-1"], {
     cwd: dir,
-    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }),
+    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...extraEnv }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
@@ -353,6 +366,114 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
     } finally {
       await stopAll(procs);
       model.stop();
+    }
+  });
+}
+// ── pi subagent children (#244) ──────────────────────────────────────────────
+
+// A pi-subagents background child: a pi process loading ONLY the child
+// adapter (--no-extensions --extension, the runner's shape), with the parent's
+// BUS_IDENTITY leaked into its env (the runner inherits it) and, when the
+// launcher passed one, its bindings. `bindings` null simulates a launcher that
+// passed no grayboard namespace: the child runs unbound (read-only floor).
+function startChildPi(dir: string, modelPort: number, procs: ChildProcess[], bindings: Record<string, string> | null): Pi {
+  return startPi(dir, modelPort, procs, {
+    identity: null,
+    extensions: [CHILD_ADAPTER],
+    env: {
+      // The runner inherits the parent's env: the leak the child adapter must ignore.
+      BUS_IDENTITY: "pi",
+      ...(bindings ? { PI_SUBAGENT_EXTENSION_BINDINGS: JSON.stringify({ "grayboard/1": bindings }) } : {}),
+    },
+  });
+}
+
+// A launcher names the child in its bindings (grayboard/1: identity + parent):
+// the child holds its own name, receives pushes on it, and answers a DM in
+// its own thread — bus-native, no parent in the loop. A child that reused the
+// leaked parent identity would be refused (identity_in_use: the holder of
+// "pi" is live) and never come online, so this pins the bindings path against
+// the ambient-env fallback.
+export function piChildScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const holder = await localSession(dir, "pi");
+    const peer = await localSession(dir, "peer");
+    const model = startFakeModel([onChannelDm("peer", (id) => ({ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "pong", parent_id: id } }))]);
+    try {
+      const child = startChildPi(dir, model.port, procs, { identity: "pi-task-1", parent: "pi" });
+      await child.command({ type: "get_state" });
+      await until(async () => (await peer.call("peer_list")).peers.some((x: any) => x.handle === "pi-task-1"), 15_000, "child online as its own name");
+      // The leaked parent identity stayed the holder's: both live at once.
+      const peers = await peer.call("peer_list");
+      expect(peers.peers.find((x: any) => x.handle === "pi")?.online).toBe(true);
+
+      // The child receives a DM on its own name and replies in-thread: send
+      // AND receive, no parent in the loop.
+      const sent = await peer.call("dm_send", { to: "pi-task-1", body: "ping" });
+      const reply = await until(() => peer.pushes.find((x) => x.content.includes("pong")), 30_000, "pong from the child");
+      expect(reply).toBeDefined();
+      const thread = await peer.call("dm_thread", { thread: sent.message_id });
+      expect(thread.map((m: any) => [m.sender, m.body, m.parent_id])).toEqual([
+        ["peer", "ping", null],
+        ["pi-task-1", "pong", sent.message_id],
+      ]);
+
+      // The child's own grayboard, not a second process of the holder's.
+      expect(grayboardChildren(child.pid)).toHaveLength(1);
+
+      // Quitting frees the child's name.
+      await child.quit();
+      await until(
+        async () => (await peer.call("peer_list", { include_offline: true })).peers.find((x: any) => x.handle === "pi-task-1")?.online === false,
+        15_000,
+        "child offline",
+      );
+    } finally {
+      await stopAll(procs);
+      model.stop();
+      await stopSession(holder.c);
+      await stopSession(peer.c);
+    }
+  });
+}
+
+// A launcher that passed no grayboard bindings: the child runs unbound (the
+// read-only floor) even though the leaked parent identity sits in its env —
+// and it must NOT take that name: with nobody holding "pi", a child that
+// consulted the ambient env would bind the parent's name out from under it
+// (the parent reconnects and is refused). Reads work, a send is refused with
+// the bind pointer, no name is taken.
+export function piChildUnboundScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const peer = await localSession(dir, "peer");
+    const steps: Reply[] = [{ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "too early" } }];
+    const scripted: Rule = (req) => {
+      const at = req.messages.findLastIndex((m) => m.role === "user" && messageText(m) === "start");
+      if (at < 0) return undefined;
+      const done = req.messages.slice(at + 1).filter((m) => m.role === "assistant").length;
+      return steps[done] ?? { text: "done" };
+    };
+    const model = startFakeModel([scripted]);
+    try {
+      const child = startChildPi(dir, model.port, procs, null);
+      await child.command({ type: "get_state" });
+      await child.command({ type: "prompt", message: "start" });
+      await until(() => child.events.some((e) => e.type === "agent_settled"), 30_000, "scripted turn");
+
+      const results = (await child.messages()).filter((m) => m.role === "toolResult");
+      expect(results.map((m) => [m.toolName, !!m.isError])).toEqual([["mcp__grayboard__dm_send", true]]);
+      expect(JSON.stringify(results[0]!.content)).toContain("no bus name yet");
+      // The leaked identity was not taken: nobody holds "pi".
+      const peers = await peer.call("peer_list");
+      expect(peers.peers.find((x: any) => x.handle === "pi")?.online).toBeFalsy();
+      expect(grayboardChildren(child.pid)).toHaveLength(1);
+      await child.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+      await stopSession(peer.c);
     }
   });
 }
