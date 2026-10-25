@@ -11,6 +11,7 @@ import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { crockford13 } from "../../src/core/bindings.ts";
 
@@ -217,7 +218,7 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   // s starts first: its startup reaps dead rows, and the row must still be there at its bind.
   const s = await session();
   await session("fe");
-  process.kill(pidOf("fe"), "SIGKILL");
+  await sigkill(pidOf("fe"));
   await localSession(dir, "fe", { bin: rel.cli });
   expect(holderOf("fe")).toBeDefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
@@ -357,7 +358,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect(existsSync(record)).toBe(false);
 
   await session("fe");
-  process.kill(pidOf("fe"), "SIGKILL");
+  await sigkill(pidOf("fe"));
   await until(() => {
     try {
       process.kill(pidOf("fe"), 0);
@@ -391,6 +392,24 @@ test("#211: a name record whose session the name's history doesn't show restores
   s = await s.restart("crash");
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
+  expect(statusOf("api")).toBeNull();
+}, 30_000);
+
+// #259, local half: a session ID is public, but locally the proof of descent
+// is the name record under the same harness, which a stray never has.
+test("#259: a stray refused while the holder lived binds the name after its death as a fresh session: no restore, no status", async () => {
+  const holder = await session("api");
+  await holder.call("peer_status", { text: "mid-task" });
+  const prior = holderOf("api")!;
+  const stray = await session("api");
+  expect((await stray.call("peer_list", {})).you).toMatch(/^id:/);
+  await sigkill(pidOf("api"));
+  await stray.call("bind", { name: "api" });
+  expect((await stray.call("peer_list", {})).you).toBe("api");
+  expect(holderOf("api")).not.toBe(prior);
+  const bound = events("api").filter((e) => e.event === "bound").at(-1)!;
+  expect(bound.session_id).toBe(holderOf("api")!);
+  expect(bound.detail ?? "").not.toContain("restored");
   expect(statusOf("api")).toBeNull();
 }, 30_000);
 

@@ -118,6 +118,16 @@ test("a tools-only process sharing a live session's key is refused: it never att
   expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "push", ended_at: null }]);
 }, 30_000);
 
+test("a session keyed like a live tools-only process is refused: the key is the tools-only process's ID", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  const tools = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } });
+  const err = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key } }).then(() => "started", (e: Error) => e.message);
+  expect(err).toContain(`id_collision: ${id} is a tools-only session's (pid ${binding(id)!.pid}); start with a new session key`);
+  expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "none", ended_at: null }]);
+  await tools.call("peer_list", {});
+}, 30_000);
+
 test("the harness is the first ancestor past a launcher, or BUS_HARNESS_PID; a bad key or a harness pid without a key refuses to start", async () => {
   const viaSh = mintSessionKey();
   const sh = await localSession(dir, undefined, { via: SH, extra: { BUS_SESSION_KEY: viaSh } });

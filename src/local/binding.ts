@@ -149,7 +149,7 @@ export async function attachSession(db: Database, s: SessionRow, ms = ATTACH_WAI
   }
   testPause("attach:before-txn");
   return db.transaction((): AttachResult => {
-    const id = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(s.session_id) as { ended_at: number | null } | null;
+    const id = db.prepare(`SELECT ended_at, delivery FROM ids WHERE id = ?`).get(s.session_id) as { ended_at: number | null; delivery: string } | null;
     const b = db.prepare(`SELECT pid, proc_start, harness_rule, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
       Pick<SessionRow, "pid" | "proc_start" | "harness_rule" | "attached_pid" | "attached_start"> | null;
     const refuse = (why: string, detail: Record<string, unknown> = {}): AttachResult => {
@@ -159,6 +159,7 @@ export async function attachSession(db: Database, s: SessionRow, ms = ATTACH_WAI
     if (!id) return refuse("has no session row");
     if (id.ended_at !== null) return refuse(`ended at ${new Date(id.ended_at).toISOString()}`, { ended_at: id.ended_at });
     if (!b) return refuse("has no process row (an older grayboard removed it)");
+    if (id.delivery === "none") return refuse(`is a tools-only session's (pid ${b.pid})`);
     if (b.harness_rule === null) return refuse(`is an unkeyed session's (pid ${b.pid})`);
     if (b.pid !== s.pid || b.proc_start !== s.proc_start) return refuse(`belongs to a session under harness pid ${b.pid}`, { harness_pid: b.pid });
     if (b.attached_pid !== null && isAlive(b.attached_pid, b.attached_start)) {

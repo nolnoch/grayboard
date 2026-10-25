@@ -10,6 +10,7 @@ import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { closeSessions, localSession, type Session } from "../support/mcp.ts";
+import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 
 let dir: string;
@@ -58,18 +59,6 @@ function spawnCli(args: string[], extra: Record<string, string>) {
 
 const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
 const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
-
-async function sigkill(pid: number): Promise<void> {
-  process.kill(pid, "SIGKILL");
-  await until(() => {
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      return true;
-    }
-  });
-}
 
 // #284 AC 1, S13: with no name the session is a full participant as its ID,
 // and what it did as the ID stays its own after it binds.
