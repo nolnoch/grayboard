@@ -41,7 +41,7 @@ function overview() {
         (SELECT COUNT(*) FROM boards)   AS boards,
         (SELECT COUNT(*) FROM posts)    AS posts,
         (SELECT COUNT(*) FROM messages WHERE ${DM}) AS dms,
-        (SELECT COUNT(*) FROM handles)  AS handles,
+        (SELECT COUNT(*) FROM aliases)  AS handles,
         (SELECT COUNT(*) FROM claims)   AS claims`).get(),
     boards: all(`SELECT b.name, b.purpose, b.scope, b.created_by, b.created_at,
         COUNT(p.id) AS posts, MAX(p.created_at) AS last_post,
@@ -49,11 +49,13 @@ function overview() {
         (SELECT COUNT(*) FROM subscriptions s WHERE s.board = b.name) AS subscribers
       FROM boards b LEFT JOIN posts p ON p.board = b.name
       GROUP BY b.name ORDER BY last_post DESC`),
-    handles: all(`SELECT h.name, h.first_seen, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human,
-        (SELECT COUNT(*) FROM posts WHERE author = h.name)       AS posts,
-        (SELECT COUNT(*) FROM messages WHERE ${DM} AND sender = h.name)    AS dms_sent,
-        (SELECT COUNT(*) FROM messages WHERE ${DM} AND recipient = h.name) AS dms_recv
-      FROM handles h ORDER BY h.last_seen DESC`),
+    // Aliases (#284), with the facts of the session holding each now.
+    handles: all(`SELECT a.address AS name, a.created_at AS first_seen, a.last_seen, i.cwd, i.place, i.status, i.status_at, a.human, ah.id AS session_id,
+        (SELECT COUNT(*) FROM posts WHERE author = a.address)       AS posts,
+        (SELECT COUNT(*) FROM messages WHERE ${DM} AND sender = a.address)    AS dms_sent,
+        (SELECT COUNT(*) FROM messages WHERE ${DM} AND recipient = a.address) AS dms_recv
+      FROM aliases a LEFT JOIN alias_holds ah ON ah.address = a.address LEFT JOIN ids i ON i.id = ah.id
+      ORDER BY a.last_seen DESC`),
     // Per-day activity for the last 30 days, local time.
     daily: all(`SELECT day, SUM(kind = 'post') AS posts, SUM(kind = 'dm') AS dms FROM (
         SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day, 'post' AS kind FROM posts WHERE created_at >= ?1
@@ -109,10 +111,10 @@ const OWNS = (col: string) => `substr(${col}, 1, length(u.email) + 1) = u.email 
 function users() {
   return {
     users: all(`SELECT u.email, u.display_name, u.created_at, u.disabled_at,
-        (SELECT COUNT(*) FROM identities WHERE user_id = u.id) AS identities,
+        (SELECT COUNT(*) FROM aliases WHERE scope_ref = u.email) AS identities,
         (SELECT COUNT(*) FROM sessions WHERE user_id = u.id AND revoked_at IS NULL) AS sessions,
         (SELECT MAX(last_used_at) FROM sessions WHERE user_id = u.id) AS last_used,
-        (SELECT MAX(last_seen) FROM handles WHERE ${OWNS("name")}) AS last_seen,
+        (SELECT MAX(last_seen) FROM aliases WHERE scope_ref = u.email) AS last_seen,
         (SELECT COUNT(*) FROM posts WHERE ${OWNS("author")}) AS posts,
         (SELECT COUNT(*) FROM messages WHERE ${DM} AND ${OWNS("sender")}) AS dms_sent,
         (SELECT GROUP_CONCAT(t.name, ' ') FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = u.id) AS teams

@@ -7,7 +7,7 @@
 //   bare     = name                  ; local mode's aliases, in its one implicit person scope
 //
 // The name rule itself (`[a-z0-9_-]{1,32}`) lives in src/shared/addressing.ts.
-import { isValidIdentityName } from "../shared/addressing.ts";
+import { isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { SESSION_ID } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
 
@@ -19,10 +19,11 @@ export type ParsedAddress =
 
 /**
  * An address's parts, or null if it isn't one. An alias splits at its first
- * `/` (a scope is one segment, #104 nests by parent, not by path); an `@` in
- * the scope makes it a person, anything else a principal.
+ * `/` (a scope is one segment, #104 nests by parent, not by path); a scope
+ * that is an email makes it a person, one with no `@` a principal. The
+ * server's wire addresses (user and team) parse in src/shared/addressing.ts.
  */
-export function parseAddress(input: string): ParsedAddress | null {
+export function addressParts(input: string): ParsedAddress | null {
   const s = input.toLowerCase();
   if (SESSION_ID.test(s)) return { kind: "id", address: s };
   if (s.startsWith("team:")) {
@@ -34,7 +35,8 @@ export function parseAddress(input: string): ParsedAddress | null {
   const scope = s.slice(0, slash);
   const name = s.slice(slash + 1);
   if (!scope || !isValidIdentityName(name)) return null;
-  return { kind: "alias", address: s, scope, scopeKind: scope.includes("@") ? "person" : "principal", name };
+  if (isValidEmail(scope)) return { kind: "alias", address: s, scope, scopeKind: "person", name };
+  return scope.includes("@") ? null : { kind: "alias", address: s, scope, scopeKind: "principal", name };
 }
 
 /** An aliases row's scope columns: a person scope (an email), or null for local mode's implicit one. */
@@ -46,7 +48,7 @@ export type AliasScope = { scope_kind: "person"; scope_ref: string | null; name:
  * broadcast or a principal scope can't name one here.
  */
 export function aliasScope(address: string): AliasScope {
-  const p = parseAddress(address);
+  const p = addressParts(address);
   if (p?.kind === "bare") return { scope_kind: "person", scope_ref: null, name: p.name };
   if (p?.kind === "alias" && p.scopeKind === "person") return { scope_kind: "person", scope_ref: p.scope, name: p.name };
   throw new CoreError(`"${address}" isn't a person's alias`);

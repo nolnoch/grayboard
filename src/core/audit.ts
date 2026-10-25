@@ -2,12 +2,13 @@
 // Repo facade). The delegation slice writes the same actions both modes
 // write: delegation.requested, delegation.refused, handle.launcher_set;
 // message.retracted, which a repeated dm_retract is answered from (#254); and
-// id.collision, a session refused because its ID already has a row (#284).
+// id.collision, a session refused because its ID already has a row, and
+// alias.created, a name's first bind or declaration (#284).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "message.retracted";
 
 export function writeCoreAudit(
   db: Database,

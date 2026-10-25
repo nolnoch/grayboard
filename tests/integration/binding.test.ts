@@ -12,7 +12,7 @@ import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
-import { crockford13, idAddress } from "../../src/core/bindings.ts";
+import { crockford13 } from "../../src/core/bindings.ts";
 
 let dir: string;
 
@@ -135,32 +135,6 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   // 14: once it exits, it's gone from the list.
   await stop(s.c);
   expect((await be.call("peer_list", {})).unbound_sessions).toBeUndefined();
-}, 30_000);
-
-// #284 decision 2: an orchestrator that mints the key knows the ID first;
-// a reused key is refused, live or ended, and so is a malformed one.
-test("#284: BUS_SESSION_KEY sets the session's ID; a reused or malformed key is refused at start", async () => {
-  const key = "5e".repeat(32);
-  const s = await session(undefined, { extra: { BUS_SESSION_KEY: key } });
-  expect(await sessionId(s)).toBe(idAddress(key));
-  const mcp = (extra: Record<string, string>) =>
-    runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, extra), holdStdin: true, timeoutMs: 5000 });
-  // Live: its ID is taken.
-  let r = await mcp({ BUS_SESSION_KEY: key });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain(`id_collision: ${idAddress(key)} is a live session's`);
-  // Ended: its ID is never taken again.
-  await stop(s.c);
-  r = await mcp({ BUS_SESSION_KEY: key });
-  expect(r.code).toBe(1);
-  expect(r.err).toMatch(new RegExp(`id_collision: ${idAddress(key)} ended at \\d{4}-`));
-  expect(rows<{ actor: string; action: string }>(`SELECT actor, action FROM audit_log WHERE action = 'id.collision'`)).toEqual([
-    { actor: idAddress(key), action: "id.collision" },
-    { actor: idAddress(key), action: "id.collision" },
-  ]);
-  r = await mcp({ BUS_SESSION_KEY: "not-a-key" });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("BUS_SESSION_KEY must be 64 lowercase hex characters");
 }, 30_000);
 
 test("2: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {
@@ -518,4 +492,20 @@ test("13 (decision 13): `grayboard tools` prints what the session serves; bind's
   const { instructions } = r.structuredContent as { instructions: string[] };
   expect(instructions[0]).toStartWith(`You are identity "api"`);
   expect((r.content as { text: string }[])[0]!.text).toEndWith(instructions.join(" "));
+}, 20_000);
+
+// #284 audit B1/W1: a write carries the writing session's ID; a tools-only
+// process registers no session, so its writes carry none.
+test("#284: messages and posts carry the owner session's ID; a tools-only process's carry null", async () => {
+  const owner = await session("be");
+  await owner.call("board_create", { name: "e2e", purpose: "test" });
+  const tools = await session("be", { extra: { BUS_PUSH: "off" } });
+  for (const [s, tag] of [[owner, "owner"], [tools, "tools"]] as const) {
+    await s.call("dm_send", { to: "be", body: `dm ${tag}` });
+    await s.call("board_post", { board: "e2e", body: `post ${tag}` });
+  }
+  const id = holderOf("be")!;
+  expect(id).toMatch(/^id:[0-9a-z]{13}$/);
+  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: null }]);
+  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: null }]);
 }, 20_000);

@@ -18,12 +18,14 @@ import {
   normalizeBoard,
   pendingFor,
   refOf,
+  idCollisionText,
   idPrincipal,
   inheritStatus,
   registerId,
   sessionsSeen,
   setPlace,
   touchAlias,
+  touchId,
   type CoreDb,
   type PendingRef,
   type UnboundPeer,
@@ -69,6 +71,10 @@ export type WsData = {
   readOnly?: true;
   // This connection holds its name: its close logs the release.
   owner?: true;
+  // The session ID this connection's writes carry (#284): set once its ids
+  // row exists. A tools-only connection and the Slack bridge's humans have
+  // none, so their messages and posts carry no session.
+  writerId?: string;
 };
 
 // What the hub needs of a connection: a client's WebSocket, or an in-process
@@ -340,6 +346,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
         if (!ws.data.human) dropHold(hub.db, full, ws.data.sessionId!);
         touchAlias(hub.db, full);
       }
+      if (ws.data.writerId) touchId(hub.db, ws.data.writerId);
       if (ws.data.owner) release(hub, ws, "connection closed");
       ws.data.onPong = undefined;
     },
@@ -488,7 +495,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const prior = owns && !ws.data.human ? idPrincipal(db, sessionId) : undefined;
   if (prior !== undefined && prior !== authed.user_email) {
     writeAudit(repo, "id.collision", authed.user_email, sessionId, { name: full });
-    return refuse("id_collision", `id_collision: ${sessionId} is another principal's session; start with a new session key`, "id_collision");
+    return refuse("id_collision", idCollisionText(sessionId, "is another principal's session"), "id_collision");
   }
 
   // A rebind names the name it leaves (#182 audit 3). Its claims move only
@@ -515,7 +522,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
 
   if (!repo.aliases.find(authed.user_email, name)) {
     repo.aliases.create(authed.user_email, name);
-    writeAudit(repo, "alias.created", authed.user_email, full, { lazy: true });
+    writeAudit(repo, "alias.created", authed.user_email, full, { lazy: true, ...(ws.data.human ? {} : { session: sessionId }) });
     onAliasCreated(db, repo, authed.user_id, full);
   }
 
@@ -529,8 +536,12 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // The Slack bridge's humans have no ID.
     if (!ws.data.human) {
       if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true });
-      else setPlace(db, sessionId, m.where ?? null);
+      else {
+        setPlace(db, sessionId, m.where ?? null);
+        touchId(db, sessionId);
+      }
       holdAlias(db, full, sessionId);
+      ws.data.writerId = sessionId;
     }
     // A reconnect, or a restart taking its name back, is the same session, so
     // its status stays, once the name's history shows it (#211). The session
@@ -547,8 +558,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // connection can't receive a delegation, so it must not be one). Every
     // owner hello rewrites the flag and audits it, changed or not (#184 review 4/6).
     if (push) {
-      if (!ws.data.human) setLauncher(db, sessionId, m.launcher === true);
-      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+      // registerId wrote the flag for a new row; a later hello rewrites it.
+      if (!ws.data.human && prior !== undefined) setLauncher(db, sessionId, m.launcher === true);
+      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true, ...(ws.data.human ? {} : { session: sessionId }) });
     }
     ws.data.owner = true;
     if (from) {
@@ -765,7 +777,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
   const { repo, db, registry } = hub;
   let msg: MessageRow;
   try {
-    msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.human ? null : ws.data.sessionId);
+    msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.writerId ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
@@ -944,7 +956,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     online: (h: string) => hub.registry.get(h)?.data.ready === true,
     attachmentLimits: hub.repo.attachmentLimits,
     human: ws.data.human,
-    ...(ws.data.human ? {} : { session: ws.data.sessionId }),
+    ...(ws.data.writerId ? { session: ws.data.writerId } : {}),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
   };
   if (tool === "board_post") return handleBoardPost(hub, ws, reqId, args, ctx);

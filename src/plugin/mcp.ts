@@ -15,7 +15,7 @@ import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
-  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, launcherNote, oldServerBindNote, restoreNote, sessionKeyFromEnv, unboundInstruction,
+  UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, launcherNote, mintSessionKey, oldServerBindNote, restoreNote, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
@@ -69,16 +69,8 @@ function loadCredentials(): Credentials {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-// The secret the server derives this session's ID from (#182 audit 4):
-// BUS_SESSION_KEY when an orchestrator minted it, so it knows the ID first (#284).
-const SESSION_KEY = (() => {
-  try {
-    return sessionKeyFromEnv();
-  } catch (e) {
-    console.error(`[grayboard] ${(e as Error).message}`);
-    process.exit(1);
-  }
-})();
+// The secret the server derives this session's ID from (#182 audit 4).
+const SESSION_KEY = mintSessionKey();
 const SESSION_ID = idAddress(SESSION_KEY);
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY, not a harness re-delivering the repo's pin. Otherwise the

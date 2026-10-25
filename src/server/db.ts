@@ -177,6 +177,20 @@ export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id
               AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
+// queuedTo: per recipient, the DMs its read point hasn't reached. Exported
+// for the same EXPLAIN pin.
+export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
+              AND m.id > COALESCE((SELECT c.last_seen_id FROM mailbox_cursors c WHERE c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
+            GROUP BY m.recipient`;
+
+// retract: the sender's message, still unread and unanswered. Exported for
+// the same EXPLAIN pin.
+export const RETRACTABLE_SQL = `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+               AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0)
+               AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
+
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   // auto_vacuum first: it takes effect only before the file's first page is
@@ -598,10 +612,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       queuedTo(recipients) {
         const rows = db.query<{ recipient: string; n: number }, [string]>(
-          `SELECT m.recipient, COUNT(*) AS n FROM messages m
-            WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
-              AND m.id > COALESCE((SELECT c.last_seen_id FROM mailbox_cursors c WHERE c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
-            GROUP BY m.recipient`,
+          QUEUED_TO_SQL,
         ).all(JSON.stringify(recipients));
         return new Map(rows.map((r) => [r.recipient, r.n]));
       },
@@ -632,10 +643,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       retract(sender, id) {
         return db.transaction(() => {
           const retractable = db.query<{ x: number }, [number, string]>(
-            `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
-               AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0)
-               AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
+            RETRACTABLE_SQL,
           ).get(id, sender);
           if (!retractable) return false;
           dropAttachments(db, "message", "?", id);

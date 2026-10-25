@@ -42,6 +42,17 @@ async function closeAndSettle(c: WsClient) {
   await Bun.sleep(50);
 }
 
+// #284 decision 5 (audit W8): a team can't take another principal's name.
+test("team create on another principal's name is a 409, and no team or board is made", async () => {
+  const alice = await login("alice@example.com");
+  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  const r = await api(alice, "POST", "/api/teams", { name: "ingest" });
+  expect(r.status).toBe(409);
+  expect(JSON.stringify(r.body)).toContain("ingest");
+  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM teams WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
+  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM boards WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
+});
+
 test("team board: members see it and get pushes; non-members can't see or be mentioned", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

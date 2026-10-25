@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { openDatabase, PrincipalTaken, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -162,4 +162,23 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
   expect(detail).not.toContain("SCAN c");
+});
+
+// #284 audit: queuedTo and retract read the read point by its key too.
+test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  repo.users.upsertByEmail("a@example.com", null);
+  repo.aliases.create("a@example.com", "fe");
+  repo.users.upsertByEmail("b@example.com", null);
+  repo.aliases.create("b@example.com", "be");
+  repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+  repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
+  const detail = (sql: string, ...args: (string | number)[]) =>
+    (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
+  const queued = detail(QUEUED_TO_SQL, JSON.stringify(["b@example.com/be"]));
+  expect(queued).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
+  expect(queued).not.toContain("SCAN c");
+  const retract = detail(RETRACTABLE_SQL, 1, "a@example.com/fe");
+  expect(retract).toContain("SEARCH mailbox_cursors USING INDEX sqlite_autoindex_mailbox_cursors_1");
+  expect(retract).not.toContain("SCAN mailbox_cursors");
 });

@@ -37,11 +37,12 @@ export type Message = {
 const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending`;
 const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending`;
 
-// Stores the message from session `senderId` and binds the sender's uploads
+// Stores the message from session `senderId` (null from a tools-only
+// process, which has no session row) and binds the sender's uploads
 // `ids` to it, in one transaction.
 export function insertMessage(
   sender: string,
-  senderId: string,
+  senderId: string | null,
   recipient: string,
   body: string,
   parent_id: number | null,

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 
-import { aliasScope, parseAddress } from "./addresses.ts";
-import { SESSION_ID, asSessionId, crockford13, idAddress, mintSessionKey, sessionKeyFromEnv } from "./bindings.ts";
+import { aliasScope, addressParts } from "./addresses.ts";
+import { SESSION_ID, asSessionId, crockford13, idAddress, mintSessionKey } from "./bindings.ts";
 
 // #284 decision 2: the session ID is the same 64 bits, as 13 Crockford characters.
 test("crockford13 encodes 64 bits as 13 lowercase Crockford characters, big-endian", () => {
@@ -29,26 +29,17 @@ test("a 1.x session ID is re-encoded; an id: one is left as it is", () => {
   expect(asSessionId(id)).toBe(id);
 });
 
-test("BUS_SESSION_KEY is the session's key when set; a malformed one throws", () => {
-  const key = "c".repeat(64);
-  expect(sessionKeyFromEnv({ BUS_SESSION_KEY: key })).toBe(key);
-  expect(sessionKeyFromEnv({})).toMatch(/^[0-9a-f]{64}$/);
-  for (const bad of ["", "C".repeat(64), "c".repeat(63), "g".repeat(64)]) {
-    expect(() => sessionKeyFromEnv({ BUS_SESSION_KEY: bad })).toThrow("BUS_SESSION_KEY must be 64 lowercase hex characters");
-  }
-});
-
 // #284 decision 16.
-test("parseAddress: IDs, team broadcasts, person and principal aliases, bare names", () => {
+test("addressParts: IDs, team broadcasts, person and principal aliases, bare names", () => {
   const id = idAddress("d".repeat(64));
-  expect(parseAddress(id)).toEqual({ kind: "id", address: id });
-  expect(parseAddress("team:eng")).toEqual({ kind: "team", address: "team:eng", name: "eng" });
-  expect(parseAddress("You@Example.com/be")).toEqual({ kind: "alias", address: "you@example.com/be", scope: "you@example.com", scopeKind: "person", name: "be" });
-  expect(parseAddress("eng/deploy-bot")).toEqual({ kind: "alias", address: "eng/deploy-bot", scope: "eng", scopeKind: "principal", name: "deploy-bot" });
-  expect(parseAddress("be")).toEqual({ kind: "bare", address: "be", name: "be" });
+  expect(addressParts(id)).toEqual({ kind: "id", address: id });
+  expect(addressParts("team:eng")).toEqual({ kind: "team", address: "team:eng", name: "eng" });
+  expect(addressParts("You@Example.com/be")).toEqual({ kind: "alias", address: "you@example.com/be", scope: "you@example.com", scopeKind: "person", name: "be" });
+  expect(addressParts("eng/deploy-bot")).toEqual({ kind: "alias", address: "eng/deploy-bot", scope: "eng", scopeKind: "principal", name: "deploy-bot" });
+  expect(addressParts("be")).toEqual({ kind: "bare", address: "be", name: "be" });
   // A scope is one segment: the split is at the first "/", so the name can't hold another.
-  expect(parseAddress("eng/x/y")).toBeNull();
-  for (const bad of ["", "/be", "you@example.com/", "team:", "id:short", "~tail-1"]) expect(parseAddress(bad)).toBeNull();
+  expect(addressParts("eng/x/y")).toBeNull();
+  for (const bad of ["", "/be", "you@example.com/", "team:", "id:short", "~tail-1", "not@an-email/be"]) expect(addressParts(bad)).toBeNull();
 });
 
 test("aliasScope: a person's alias, or local mode's bare name; nothing else names one", () => {

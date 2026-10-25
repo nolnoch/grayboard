@@ -23,19 +23,6 @@ export function mintSessionKey(): string {
 /** A session key's shape: 64 lowercase hex characters. */
 export const SESSION_KEY = /^[0-9a-f]{64}$/;
 
-/**
- * This process's session key: BUS_SESSION_KEY when set, so an orchestrator
- * that mints the key knows the session's ID before the process starts
- * (#284), else a fresh one. A malformed BUS_SESSION_KEY throws: startup
- * refuses rather than run under an ID nobody expects.
- */
-export function sessionKeyFromEnv(env: Record<string, string | undefined> = process.env): string {
-  const key = env.BUS_SESSION_KEY;
-  if (key === undefined) return mintSessionKey();
-  if (!SESSION_KEY.test(key)) throw new Error("BUS_SESSION_KEY must be 64 lowercase hex characters");
-  return key;
-}
-
 // Crockford's base32, lowercased: no i, l, o or u, so an ID reads back
 // unambiguously. IDs are only ever compared, never decoded.
 const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -85,11 +72,6 @@ export function holdAlias(db: Database, address: string, id: string, now = Date.
 /** Session `id` no longer holds `address`; a hold another session took since stays. */
 export function dropHold(db: Database, address: string, id: string): void {
   db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);
-}
-
-/** The session holding `address`, or null. */
-export function holderOf(db: Database, address: string): string | null {
-  return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
 }
 
 /** At server start: no connection outlives the server, so no hold is live. */

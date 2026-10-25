@@ -1,7 +1,7 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
-import { SESSION_ID, SESSION_KEY, type Candidate } from "../core/bindings.ts";
+import { SESSION_ID, SESSION_KEY, asSessionId, type Candidate } from "../core/bindings.ts";
 
 export type Message = {
   id: number;
@@ -169,8 +169,11 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.hold !== undefined && typeof m.hold !== "boolean") throw new Error("hold must be boolean");
       if (m.hold === true && (m.push !== false || m.read_only === true)) throw new Error("hold needs push: false and a name");
       if (m.from !== undefined && (typeof m.from !== "string" || m.read_only === true)) throw new Error("from must be a string, on a hello with a name");
+      // A 1.x client records its session ID as 16 hex characters: the same
+      // 64 bits, re-encoded here so its restore still matches the history.
+      if (typeof m.restored_from === "string") m.restored_from = asSessionId(m.restored_from);
       if (m.restored_from !== undefined && (typeof m.restored_from !== "string" || !SESSION_ID.test(m.restored_from)))
-        throw new Error("restored_from must be a session ID (id: and 13 characters)");
+        throw new Error("restored_from must be a session ID (id: and 13 characters, or a 1.x client's 16 hex)");
       if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
       if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
       if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");

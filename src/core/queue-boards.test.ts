@@ -24,7 +24,7 @@ beforeEach(() => {
   db = new Database(":memory:");
   initCoreSchema(db);
   for (const h of ["be", "sim", "fe"]) {
-    ensureAlias(db, h, null);
+    ensureAlias(db, h, "test");
     touchAlias(db, h);
   }
   createBoard(db, "be", "work", "the work queue", null, { kind: "queue" });

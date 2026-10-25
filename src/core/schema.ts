@@ -221,15 +221,12 @@ export function initCoreSchema(db: Database): void {
   if (!postCols.some((c) => c.name === "author_id")) db.exec(`ALTER TABLE posts ADD COLUMN author_id TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
-  // user's email, null in local mode. Backfilled once from the uploader's
-  // "email/" prefix, which is what the quota ranged over before.
+  // user's email, null in local mode. Backfilled from the uploader's "email/"
+  // prefix, which is what the quota ranged over before, on every open: rows
+  // a 1.x server wrote after a downgrade count too.
   const attachmentCols = db.prepare(`PRAGMA table_info(attachments)`).all() as { name: string }[];
-  if (!attachmentCols.some((c) => c.name === "uploader_principal")) {
-    db.exec(`
-      ALTER TABLE attachments ADD COLUMN uploader_principal TEXT;
-      UPDATE attachments SET uploader_principal = substr(uploader, 1, instr(uploader, '/') - 1) WHERE instr(uploader, '/') > 0;
-    `);
-  }
+  if (!attachmentCols.some((c) => c.name === "uploader_principal")) db.exec(`ALTER TABLE attachments ADD COLUMN uploader_principal TEXT`);
+  db.exec(`UPDATE attachments SET uploader_principal = substr(uploader, 1, instr(uploader, '/') - 1) WHERE uploader_principal IS NULL AND instr(uploader, '/') > 0`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_attachments_principal ON attachments(uploader_principal, sha256) WHERE uploader_principal IS NOT NULL`);
 
   // Whether a push wakes its recipient (1), or waits to ride along with the

@@ -5,6 +5,7 @@ import { bindAttachments, dropAttachments, withAttachments } from "./attachments
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { aliasScope } from "./addresses.ts";
+import { writeCoreAudit } from "./audit.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -127,16 +128,15 @@ export function normalizeBoard(input: string): string {
 
 /**
  * Make `address` an alias if it isn't one: local mode's first bind of a
- * name, or its declared human. `createdBy` is the creating principal (null
- * in local mode's implicit scope). The server creates its aliases through
- * its Repo.
+ * name, or its declared human. A new one is audited as `actor`'s
+ * alias.created. The server creates its aliases through its Repo.
  */
-export function ensureAlias(db: Database, address: string, createdBy: string | null, now = Date.now()): void {
+export function ensureAlias(db: Database, address: string, actor: string, now = Date.now()): void {
   const s = aliasScope(address);
-  db.prepare(
-    `INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(address, s.scope_kind, s.scope_ref, s.name, createdBy, now);
+  const r = db.prepare(
+    `INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, created_at) VALUES (?, ?, ?, ?, ?)`,
+  ).run(address, s.scope_kind, s.scope_ref, s.name, now);
+  if (r.changes) writeCoreAudit(db, "alias.created", actor, address);
 }
 
 /** A session used `address`: its last_seen moves. An address that isn't an alias is left alone. */
@@ -155,9 +155,14 @@ export type IdFacts = {
 };
 
 /** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
+/** The id_collision refusal's text, both modes: `id` and why it's taken. */
+export function idCollisionText(id: string, why: string): string {
+  return `id_collision: ${id} ${why}; start with a new session key`;
+}
+
 export class IdCollision extends CoreError {
   constructor(readonly id: string, readonly endedAt: number | null) {
-    super(`id_collision: ${id} ${endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`}; start with a new session key`);
+    super(idCollisionText(id, endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`));
   }
 }
 
@@ -204,7 +209,7 @@ export function inheritStatus(db: Database, id: string, from: string): void {
 export function declareHuman(db: Database, handle: string, guard?: () => void): void {
   db.transaction(() => {
     guard?.();
-    ensureAlias(db, handle, null);
+    ensureAlias(db, handle, handle);
     touchAlias(db, handle);
     db.prepare(`UPDATE aliases SET human = (address = ?)`).run(handle);
   }).immediate();
@@ -760,14 +765,18 @@ export type UnboundPeer = { session_id: string; unbound: true; online: true; whe
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The session an alias's metadata comes from (#284): its holder, or once
-// it's offline, the session that last bound it, from the binding history.
-// `a` is the aliases row in the query that uses it.
+// it's offline, the session that last bound it, from the binding history,
+// unless that session has since bound another name (its facts are that
+// name's now). `a` is the aliases row in the query that uses it.
 export const ALIAS_SESSION_SQL = `COALESCE(
     (SELECT id FROM alias_holds WHERE address = a.address),
-    (SELECT session_id FROM binding_events WHERE name = a.address AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1))`;
+    (SELECT l.session_id FROM (SELECT id, session_id FROM binding_events WHERE name = a.address AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1) l
+      WHERE NOT EXISTS (SELECT 1 FROM binding_events e WHERE e.session_id = l.session_id AND e.event IN ('bound', 'moved') AND e.id > l.id)))`;
 
 // The roster: every alias a session has used (aliases with a last_seen),
 // or a board's subscribers, each with its session's facts (ALIAS_SESSION_SQL).
+// A status is shown only while a session holds the alias: it's the
+// session's, and clears when the session ends (#284 decision 11).
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 export function who(
@@ -778,7 +787,8 @@ export function who(
   unbound: UnboundPeer[] = [],
 ): WhoResult {
   type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
-  const cols = `a.last_seen, i.cwd, i.place, i.status, i.status_at, a.human, a.queue_off, i.launcher`;
+  const held = `EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address AND h.id = i.id)`;
+  const cols = `a.last_seen, i.cwd, i.place, CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);

@@ -540,6 +540,23 @@ test("#211: a restored_from the name's history doesn't show is logged unverified
   ws.close();
 });
 
+test("#284: a 1.x client's 16-hex restored_from is the same session ID: its restore verifies", async () => {
+  const { WsClient } = await import("../support/ws_client.ts");
+  const key = "d5".repeat(32);
+  let ws = new WsClient(srv.base, alice, "api", { hello: { session_key: key } });
+  expect((await ws.connect()).type).toBe("hello_ok");
+  await ws.call("peer_status", { text: "mid-task" });
+  ws.close();
+  await until(() => events("api").at(-1)!.event === "released");
+  // What a 1.x client's name record holds: the key's SHA-256, first 16 hex.
+  const hex = new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 16);
+  ws = new WsClient(srv.base, alice, "api", { hello: { session_key: "e6".repeat(32), restored_from: hex } });
+  expect((await ws.connect()).type).toBe("hello_ok");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored: restart of session ${idAddress(key)}` });
+  expect(status(`${A}/api`)).toBe("mid-task");
+  ws.close();
+});
+
 test("#211: a resume keeps its status only when its own session last bound the name; a rebind ignores restored_from", async () => {
   const { WsClient } = await import("../support/ws_client.ts");
   const apiStatus = () => status(`${A}/api`);
@@ -628,3 +645,31 @@ test("audit 19: a hello refused for an invalid or reserved name is logged as ref
   expect(events(long.slice(0, 32))).toEqual([{ session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: "invalid name" }]);
   expect(events("human")).toEqual([{ session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: expect.stringContaining("human") }]);
 });
+
+// #284 audit B1/W1: a write carries the writing session's ID; a tools-only
+// connection holds no session row, so its writes carry none.
+test("#284: messages and posts carry the owner session's ID; a tools-only connection's carry null", async () => {
+  const owner = await session("be");
+  await owner.call("board_create", { name: "e2e", purpose: "test" });
+  const tools = await session("be", { extra: { BUS_PUSH: "off" } });
+  for (const [s, tag] of [[owner, "owner"], [tools, "tools"]] as const) {
+    await s.call("dm_send", { to: `${A}/be`, body: `dm ${tag}` });
+    await s.call("board_post", { board: "e2e", body: `post ${tag}` });
+  }
+  const id = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/be`)[0]!.id;
+  expect(id).toMatch(/^id:[0-9a-z]{13}$/);
+  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: null }]);
+  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: null }]);
+}, 20_000);
+
+// #284 audit B12/W5: the lazy alias.created and handle.launcher_set rows name
+// the session; the first hello's launcher flag is written once, by registerId.
+test("#284: alias.created and handle.launcher_set name the session; the flag is on its ids row", async () => {
+  await session("be", { extra: { BUS_LAUNCHER: "1" } });
+  const id = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/be`)[0]!.id;
+  expect(rows(`SELECT action, actor, target, detail FROM access_log WHERE action IN ('alias.created', 'handle.launcher_set') AND target = ? ORDER BY id`, `${A}/be`)).toEqual([
+    { action: "alias.created", actor: A, target: `${A}/be`, detail: JSON.stringify({ lazy: true, session: id }) },
+    { action: "handle.launcher_set", actor: A, target: `${A}/be`, detail: JSON.stringify({ on: true, session: id }) },
+  ]);
+  expect(rows(`SELECT launcher FROM ids WHERE id = ?`, id)).toEqual([{ launcher: 1 }]);
+}, 20_000);

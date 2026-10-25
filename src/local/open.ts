@@ -45,8 +45,9 @@ function initLocalSchema(db: Database): void {
     -- One row per live grayboard mcp process (binding.ts, #182): local
     -- liveness. pid + proc_start say whether the session still runs;
     -- harness_pid is the process that launched it. Since #284 the session's
-    -- facts are its ids row and the name it holds is alias_holds; name,
-    -- harness, cwd and bound_at are written only by 1.x processes.
+    -- facts are its ids row and the name it holds is alias_holds. name and
+    -- bound_at mirror the hold, for 1.x processes sharing the file (their
+    -- holder check reads them); harness and cwd are written only by 1.x.
     CREATE TABLE IF NOT EXISTS bindings (
       session_id   TEXT PRIMARY KEY,
       name         TEXT UNIQUE,

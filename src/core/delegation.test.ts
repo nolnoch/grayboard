@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { declareHuman, ensureAlias, registerId, touchAlias } from "./boards.ts";
-import { holdAlias } from "./bindings.ts";
+import { declareHuman, ensureAlias, registerId, setStatus, touchAlias, who } from "./boards.ts";
+import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, DELEGATE_TOOL } from "./delegation.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
@@ -16,7 +16,7 @@ beforeEach(() => {
 
 // A name that has connected: an alias on the roster.
 function connected(name: string): void {
-  ensureAlias(db, name, null);
+  ensureAlias(db, name, "test");
   touchAlias(db, name);
 }
 
@@ -48,6 +48,36 @@ describe("launchers", () => {
     expect(isLauncher(db, "a")).toBe(true);
     expect(isLauncher(db, "b")).toBe(false);
     expect(isLauncher(db, "nobody")).toBe(false);
+  });
+
+  // #284 audit B4: an offline alias's facts come from the session that last
+  // bound it, unless that session has moved to another name since.
+  test("an alias whose last binder moved on has none of its facts", () => {
+    session("fe", true);
+    const id = `id:${String(sessions).padStart(13, "0")}`;
+    logBinding(db, id, "fe", "bound", null);
+    dropHold(db, "fe", id);
+    connected("fe2");
+    holdAlias(db, "fe2", id);
+    logBinding(db, id, "fe2", "moved", "fe");
+    setStatus(db, "fe2", "on fe2");
+    expect(isLauncher(db, "fe")).toBe(false);
+    expect(isLauncher(db, "fe2")).toBe(true);
+    const peers = who(db, "me", { include_offline: true }, () => false).peers;
+    expect(peers.find((p) => p.handle === "fe")).toEqual({ handle: "fe", online: false, last_seen: expect.any(Number) });
+    expect(peers.find((p) => p.handle === "fe2")).toMatchObject({ status: "on fe2", launcher: true });
+  });
+
+  test("an offline alias keeps its last binder's launcher flag but shows no status", () => {
+    session("fe", true);
+    const id = `id:${String(sessions).padStart(13, "0")}`;
+    logBinding(db, id, "fe", "bound", null);
+    setStatus(db, "fe", "busy");
+    dropHold(db, "fe", id);
+    expect(isLauncher(db, "fe")).toBe(true);
+    const fe = who(db, "me", { include_offline: true }, () => false).peers.find((p) => p.handle === "fe");
+    expect(fe).toMatchObject({ launcher: true });
+    expect(fe!.status).toBeUndefined();
   });
 });
 

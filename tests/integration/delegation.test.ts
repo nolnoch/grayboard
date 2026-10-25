@@ -3,6 +3,7 @@
 // TestServer. The launcher opt-in (BUS_LAUNCHER=1), the delegate tool's
 // resolution rules, the payload's harness-neutrality, the human fallback,
 // and result-return through the pending/promise machinery.
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -251,6 +252,19 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   // The positive control proves both observables: a push launcher's
   // instructions do carry the sentence (review 6: the gate, both modes).
   expect(be.c.getInstructions()).toContain("You're a launcher session");
+
+  // The flag is the session's: audited once per session that owns delivery,
+  // under its ID, and never by a tools-only process (#284 audit W5).
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try {
+    const idOf = (name: string) => (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(name) as { id: string }).id;
+    expect(db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'handle.launcher_set' ORDER BY rowid`).all()).toEqual([
+      { actor: idOf("be"), target: idOf("be"), detail: JSON.stringify({ on: true }) },
+      { actor: idOf("sim"), target: idOf("sim"), detail: JSON.stringify({ on: false }) },
+    ]);
+  } finally {
+    db.close();
+  }
 }, 30_000);
 
 test("server: the human fallback checks Slack reachability (review 10)", async () => {

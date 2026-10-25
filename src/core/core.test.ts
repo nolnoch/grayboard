@@ -39,7 +39,7 @@ let db: Database;
 
 // A name a session has used: an alias with a last_seen, so it's on the roster.
 const seen = (h: string) => {
-  ensureAlias(db, h, null);
+  ensureAlias(db, h, "test");
   touchAlias(db, h);
 };
 
