@@ -27,11 +27,11 @@ export type Config = {
   // The bytes of attachments one user may store, sent or not.
   attachmentUserQuota?: number;
   // Hellos per user: the burst, and the refill per second (#210).
-  helloLimit?: RateLimit;
+  helloLimit: RateLimit;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
-  authFailLimit?: RateLimit;
-  trustedProxies?: string[];
+  authFailLimit: RateLimit;
+  trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -88,9 +88,10 @@ function parseAttachmentLimits(env: Record<string, string | undefined>): { attac
   return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
 }
 
-// The rate's floor keeps the longest wait (one token, 1/perSec) inside a
-// client's startup window (src/plugin/mcp.ts), so a limited session can still
-// start; the burst's ceiling keeps a typo from switching the limit off.
+// The rate's floor caps one token's refill at 10s; with the client's jitter
+// (up to 1.5x) that still fits the 25s a rate-limited session waits at
+// startup (HELLO_LIMITED_MS, src/plugin/mcp.ts), so it can still start. The
+// burst's ceiling keeps a typo from switching the limit off.
 const MIN_PER_SEC = 0.1;
 const MAX_BURST = 10_000;
 
@@ -109,7 +110,7 @@ function parseRateLimit(env: Record<string, string | undefined>, prefix: string,
 
 // Unset or empty: loopback. "none": nobody. Otherwise IPs or CIDRs, comma-separated.
 function parseTrustedProxies(raw: string | undefined): string[] {
-  if (raw === undefined || raw.trim() === "") return DEFAULT_TRUSTED_PROXIES;
+  if (raw === undefined || raw.trim() === "") return [...DEFAULT_TRUSTED_PROXIES];
   if (raw.trim() === "none") return [];
   return raw.split(",").map((c) => {
     try {

@@ -14,6 +14,7 @@ export type AuditAction =
   | "auth.login"
   | "auth.logout"
   | "auth.rate_limit_ended"
+  | "auth.rate_limit_full"
   | "auth.rate_limited"
   | "auth.session_revoked"
   | "auth.user_disabled"
@@ -32,6 +33,11 @@ export type AuditAction =
   | "delegation.requested"
   | "delegation.refused"
   | "handle.launcher_set";
+
+/** A request's user agent as audit rows and sessions carry it: at most 120 characters. */
+export function userAgent(req: Request): string | null {
+  return req.headers.get("user-agent")?.slice(0, 120) ?? null;
+}
 
 export function writeAudit(
   repo: Repo,

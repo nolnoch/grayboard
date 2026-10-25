@@ -136,7 +136,11 @@ test("a run of refusals writes one row and one log line at its start and one at 
   expect(started.length).toBe(1);
   expect(started[0]!.actor).toBeNull();
   expect(started[0]!.target).toBe(X);
-  expect(JSON.parse(started[0]!.detail)).toEqual({ path: "/api/claims", retry_after_ms: 10_000 });
+  // What tripped the limit, and the failure that drained the bucket (#240 audit item 8).
+  expect(JSON.parse(started[0]!.detail)).toEqual({
+    addr: X, path: "/api/claims", retry_after_ms: 10_000,
+    last_failure: { addr: X, path: "/api/whoami", reason: "refused token", ua: expect.any(String) },
+  });
   expect(audit(srv, "auth.rate_limit_ended")).toEqual([]);
   // Refilled (30s at 0.1/s), seen by the heartbeat's sweep.
   clock.t += 30_000;

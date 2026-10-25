@@ -6,7 +6,7 @@ import {
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { DEFAULT_HELLO_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
+import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import {
   acknowledge,
   age,
@@ -80,8 +80,6 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
-  // Hellos per user: the burst, and the refill rate (#210).
-  helloLimit?: RateLimit;
   // The rate limiters' clock; tests move it instead of sleeping.
   now?: () => number;
 };
@@ -105,7 +103,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
-  helloLimiter: RateLimiter<number>;
+  helloLimiter: RateLimiter;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -188,18 +186,20 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
   });
 }
 
-export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
+// helloLimit: hellos per user, the burst and the refill rate (#210).
+export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { helloLimit: RateLimit }) {
   const hub: Hub = {
     registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
     // Logged and audited once per run of refusals, so a loop floods neither.
-    helloLimiter: new RateLimiter<number>(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
-      start: (_id, email, ctx, retryAfterMs) => {
+    // Keyed by email, which is unique per user.
+    helloLimiter: new RateLimiter(opts.helloLimit, {
+      start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
         writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
       },
-      end: (_id, email, refused) => {
+      end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
         writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
       },
@@ -382,14 +382,13 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // First, before anything reads or writes the database. The Slack bridge's
   // in-process connections are the server's own.
   if (!ws.data.human) {
-    const t = hub.helloLimiter.take(ws.data.authed.user_id, ws.data.authed.user_email, {
+    const t = hub.helloLimiter.take(ws.data.authed.user_email, {
       session_id: m.session_key ? sessionIdOf(m.session_key) : null,
       ...(m.read_only ? { read_only: true } : { name: m.identity ?? null }),
       place: m.where ?? null,
     });
     if (!t.ok) {
-      const secs = Math.ceil(t.retryAfterMs / 1000);
-      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${secs}s`, retry_after_ms: t.retryAfterMs });
+      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, retry_after_ms: t.retryAfterMs });
       ws.close();
       return;
     }

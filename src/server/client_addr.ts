@@ -4,7 +4,7 @@
 import { BlockList, isIP } from "node:net";
 
 // Unset GRAYBOARD_TRUSTED_PROXIES: a proxy on the same host (Caddy).
-export const DEFAULT_TRUSTED_PROXIES = ["127.0.0.0/8", "::1/128"];
+export const DEFAULT_TRUSTED_PROXIES: readonly string[] = ["127.0.0.0/8", "::1/128"];
 
 /** A validated, normalised `a.b.c.d/n` or `x::y/n`, or throws naming `raw`. */
 export function parseCidr(raw: string): string {
@@ -19,8 +19,9 @@ export function parseCidr(raw: string): string {
 
 export class TrustedProxies {
   private readonly list = new BlockList();
+  private warnedUnparsable = false;
 
-  constructor(cidrs: string[]) {
+  constructor(cidrs: readonly string[]) {
     for (const c of cidrs) {
       const [ip, prefix] = parseCidr(c).split("/") as [string, string];
       this.list.addSubnet(ip, Number(prefix), isIP(ip) === 4 ? "ipv4" : "ipv6");
@@ -30,18 +31,41 @@ export class TrustedProxies {
   has(ip: string): boolean {
     return this.list.check(ip, isIP(ip) === 4 ? "ipv4" : "ipv6");
   }
+
+  // A trusted proxy that writes an entry this can't read keys its clients
+  // to itself, so they share one bucket; say so once per run, not per request.
+  noteUnparsable(peer: string, entry: string): void {
+    if (this.warnedUnparsable) return;
+    this.warnedUnparsable = true;
+    console.error(`[grayboard] trusted proxy ${peer} sent an X-Forwarded-For entry that isn't an address (${JSON.stringify(entry.slice(0, 64))}); its clients share its rate-limit bucket`);
+  }
 }
 
 /** An address as the limiter and the audit trail key it: IPv4-mapped IPv6
- *  (how Bun reports an IPv4 peer) as IPv4, lowercase, no zone. Null when
- *  it isn't an address. */
+ *  (how Bun reports an IPv4 peer), dotted or hex, as IPv4; lowercase, no
+ *  zone. Null when it isn't an address. */
 export function normalizeIp(raw: string): string | null {
   let ip = raw.trim().toLowerCase();
   const zone = ip.indexOf("%");
   if (zone >= 0) ip = ip.slice(0, zone);
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
   if (mapped) ip = mapped[1]!;
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(ip);
+  if (hex) {
+    const [hi, lo] = [parseInt(hex[1]!, 16), parseInt(hex[2]!, 16)];
+    ip = `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+  }
   return isIP(ip) ? ip : null;
+}
+
+// One X-Forwarded-For entry's address. Some proxies append the client's
+// port (`1.2.3.4:5678`) or bracket IPv6 (`[2001:db8::1]`, `[2001:db8::1]:443`).
+function hopAddress(entry: string): string | null {
+  const s = entry.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(s);
+  if (bracketed) return normalizeIp(bracketed[1]!);
+  const v4port = /^(\d+\.\d+\.\d+\.\d+):\d+$/.exec(s);
+  return normalizeIp(v4port ? v4port[1]! : s);
 }
 
 /** The client's address: the peer unless it's a trusted proxy, then the
@@ -53,8 +77,11 @@ export function clientAddress(peer: string | null | undefined, xff: string | nul
   if (!addr || !trusted.has(addr)) return addr;
   const hops = xff ? xff.split(",") : [];
   for (let i = hops.length - 1; i >= 0; i--) {
-    const hop = normalizeIp(hops[i]!);
-    if (!hop) return addr;
+    const hop = hopAddress(hops[i]!);
+    if (!hop) {
+      trusted.noteUnparsable(addr, hops[i]!);
+      return addr;
+    }
     addr = hop;
     if (!trusted.has(hop)) return hop;
   }
