@@ -334,8 +334,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
     const info: IdentityInfo = { ...infoFor(full), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
     const notices = [...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)), ...claimsInstruction(listClaims(db, undefined, full), full)];
-    // The bridge's human attachment must not consume the owner's notice.
-    if (!human) {
+    // Tools-only requests and the bridge's human attachment cannot consume the owner's notice.
+    if (owns && !human) {
       const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
       if (bridgeNotice) notices.push(bridgeNotice);
     }

@@ -5,11 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
+import { writeAudit } from "../../src/server/audit.ts";
+import { WsClient } from "../support/ws_client.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
 let blobDir: string;
 const clients: Client[] = [];
+const wsClients: WsClient[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
@@ -18,6 +21,7 @@ beforeEach(() => {
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
+  for (const client of wsClients.splice(0)) client.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
   app.db.close();
@@ -64,6 +68,39 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toMatchObject([{ name: "e2e" }]);
   expect(value(await client.callTool({ name: "dm_inbox", arguments: {} }))).toEqual({ unanswered: [] });
   expect(app.mcp.activeContexts).toBe(0);
+});
+
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning WS hello`, async () => {
+  const token = await login();
+  const client = await connect(token, "be", version);
+  const target = "alice@example.com/human";
+  const at = new Date().toISOString();
+  writeAudit(app.repo, "bridge.stopped", null, target, { reason: "fixture fatal", at });
+  const notice = `your Slack bridge stopped at ${at} (fixture fatal); linked humans are offline until it reconnects or the server restarts`;
+
+  const tools = await client.listTools();
+  expect(tools.tools.length).toBeGreaterThan(0);
+  expect(JSON.stringify(tools)).not.toContain(notice);
+  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
+  expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
+  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
+  await connect(token, "be", version);
+  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
+
+  const owner = new WsClient(base, token, "be");
+  wsClients.push(owner);
+  const hello = await owner.connect();
+  expect(hello.type).toBe("hello_ok");
+  expect(hello.notices).toEqual([notice]);
+  const notified = app.repo.audit.last("bridge.notified", target);
+  expect(notified).toBeDefined();
+
+  const next = new WsClient(base, token, "allowed");
+  wsClients.push(next);
+  const again = await next.connect();
+  expect(again.type).toBe("hello_ok");
+  expect(again.notices ?? []).toEqual([]);
+  expect(app.repo.audit.last("bridge.notified", target)).toEqual(notified);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createApplication, type DeliveryEvent, type DeliverySink } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
+import { writeAudit } from "./audit.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -87,6 +88,25 @@ test("tools-only calls neither own nor drain deliveries nor reset the owner's st
   expect(peers.peers.find(p => p.handle === a.identityFull)).toMatchObject({ online: true, status: "working" });
   application.close(tools);
   await expect(application.selectIdentity(alice, "be", delivery(sink()))).rejects.toMatchObject({ code: "identity_in_use" });
+});
+
+test("only an owning agent selection consumes a bridge death notice, including hold-only owners", async () => {
+  const target = `${alice.user_email}/human`;
+  writeAudit(store.repo, "bridge.stopped", null, target, { reason: "fixture fatal", at: new Date().toISOString() });
+  const tools = await application.selectIdentity(alice, "be", delivery(sink()), { push: false });
+  const unbound = await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true });
+  const human = await application.attachHuman(alice, delivery(sink()));
+  for (const { info } of [tools, unbound, human]) expect(info.notices ?? []).toEqual([]);
+  expect(store.repo.audit.last("bridge.notified", target)).toBeUndefined();
+
+  const held = await application.selectIdentity(alice, "be", delivery(sink()), { push: false, hold: true });
+  expect(held.info.notices).toHaveLength(1);
+  expect(held.info.notices![0]).toContain("fixture fatal");
+  const notified = store.repo.audit.last("bridge.notified", target);
+  expect(notified).toBeDefined();
+  const next = await application.selectIdentity(alice, "fe", delivery(sink()));
+  expect(next.info.notices ?? []).toEqual([]);
+  expect(store.repo.audit.last("bridge.notified", target)).toEqual(notified);
 });
 
 test("concurrent owner acquisitions recheck after a dead-owner probe", async () => {
