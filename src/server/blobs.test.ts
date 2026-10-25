@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { releaseUpload, storeAttachment, sweepBlobs, type BlobStore } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import { sha256Hex } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 import { DiskBlobs } from "./blobs.ts";
 
 let dir: string;

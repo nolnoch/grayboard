@@ -6,28 +6,34 @@
 //       a new P-256 key: the private key to the given path (mode 600, outside
 //       the repo), the public key to assets/release-keys/, then sync
 //   bun scripts/release_keys.ts sync     regenerate both embeddings
-//   bun scripts/release_keys.ts check    exit 1 if either is stale
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { keyId } from "../src/shared/release_verify.ts";
+//
+// A test fails when either embedding is stale.
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { keyId } from "../src/shared/spki.ts";
 
-const ROOT = join(import.meta.dir, "..");
-export const KEY_DIR = join(ROOT, "assets", "release-keys");
+const ROOT = realpathSync(join(import.meta.dir, ".."));
+const KEY_DIR = join(ROOT, "assets", "release-keys");
 const TS = join(ROOT, "src", "shared", "release_keys.ts");
 const SH = join(ROOT, "install.sh");
 const BEGIN = "# BEGIN RELEASE KEYS";
 const END = "# END RELEASE KEYS";
 
-/** The canonical keys, id → PEM; each file must be named for its own key id. */
-export function canonicalKeys(dir = KEY_DIR): Record<string, string> {
+/**
+ * The canonical keys, id → PEM; each file must be named for its own key id.
+ * No keys is an error: embedding an empty list would make every release
+ * unverifiable.
+ */
+export function canonicalKeys(): Record<string, string> {
   const keys: Record<string, string> = {};
-  if (!existsSync(dir)) return keys;
-  for (const f of readdirSync(dir).filter((f) => f.endsWith(".pem")).sort()) {
-    const pem = readFileSync(join(dir, f), "utf8");
+  if (!existsSync(KEY_DIR)) throw new Error(`${KEY_DIR} doesn't exist`);
+  for (const f of readdirSync(KEY_DIR).filter((f) => f.endsWith(".pem")).sort()) {
+    const pem = readFileSync(join(KEY_DIR, f), "utf8");
     const id = keyId(pem);
     if (f !== `${id}.pem`) throw new Error(`${f} holds key ${id}; name it ${id}.pem`);
     keys[id] = pem.trimEnd() + "\n";
   }
+  if (!Object.keys(keys).length) throw new Error(`${KEY_DIR} holds no .pem keys`);
   return keys;
 }
 
@@ -57,20 +63,16 @@ export function spliceSh(script: string, keys: Record<string, string>): string {
   return script.slice(0, a) + renderShBlock(keys) + script.slice(b + END.length);
 }
 
-function sync(write: boolean): boolean {
+function sync(): void {
   const keys = canonicalKeys();
-  let fresh = true;
   for (const [path, want] of [[TS, renderTs(keys)], [SH, spliceSh(readFileSync(SH, "utf8"), keys)]] as const) {
-    if (readFileSync(path, "utf8") === want) continue;
-    fresh = false;
-    if (write) writeFileSync(path, want);
-    else console.error(`${path} is stale; run: bun scripts/release_keys.ts sync`);
+    if (readFileSync(path, "utf8") !== want) writeFileSync(path, want);
   }
-  return fresh;
 }
 
 function keygen(out: string): void {
-  const priv = resolve(out);
+  // Resolved through symlinks, so a link into the repo doesn't pass for outside it.
+  const priv = join(realpathSync(dirname(resolve(out))), basename(out));
   if (priv.startsWith(ROOT + "/")) throw new Error("write the private key outside the repo");
   if (existsSync(priv)) throw new Error(`${priv} exists; not overwriting`);
   const run = (cmd: string[]) => {
@@ -84,19 +86,18 @@ function keygen(out: string): void {
   const id = keyId(pem);
   mkdirSync(KEY_DIR, { recursive: true });
   writeFileSync(join(KEY_DIR, `${id}.pem`), pem);
-  sync(true);
+  sync();
   console.log(`key ${id}: private key at ${priv}, public key at ${join(KEY_DIR, `${id}.pem`)}`);
   console.log(`next: gh secret set RELEASE_SIGNING_KEY --env release < ${priv}`);
-  console.log("then store the private key in the password manager and delete the file");
+  console.log("then keep one offline backup of the private key and delete the file");
 }
 
 if (import.meta.main) {
   const [cmd, arg] = process.argv.slice(2);
-  if (cmd === "sync") sync(true);
-  else if (cmd === "check") process.exit(sync(false) ? 0 : 1);
+  if (cmd === "sync") sync();
   else if (cmd === "keygen" && arg) keygen(arg);
   else {
-    console.error("usage: bun scripts/release_keys.ts keygen <private key path> | sync | check");
+    console.error("usage: bun scripts/release_keys.ts keygen <private key path> | sync");
     process.exit(2);
   }
 }

@@ -12,9 +12,10 @@
 // message, and files the owner shares in Slack ride on the dm_send/board_post.
 // A file Slack won't take goes back to its sender as a reply.
 import {
-  DEFAULT_ATTACHMENT_LIMITS, SizeTally, checkFile, parseAttachmentsMeta, sanitizeFilename, sha256Hex,
+  DEFAULT_ATTACHMENT_LIMITS, SizeTally, checkFile, parseAttachmentsMeta, sanitizeFilename,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 

@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { sha256Hex } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import { Relay, format, fromSlack, type Bus, type RelayOptions } from "./relay.ts";
 import { SocketMode } from "./socket.ts";

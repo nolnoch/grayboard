@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spliceSh } from "../../scripts/release_keys.ts";
-import { keyId } from "../../src/shared/release_verify.ts";
+import { keyId } from "../../src/shared/spki.ts";
 import { ROOT } from "./paths.ts";
 
 export type TestKey = { id: string; pem: string; priv: string };

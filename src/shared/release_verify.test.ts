@@ -5,7 +5,8 @@ import { canonicalKeys, renderTs, spliceSh } from "../../scripts/release_keys.ts
 import { ROOT } from "../../tests/support/paths.ts";
 import { sign, testKey, testKeys } from "../../tests/support/release_keys.ts";
 import { RELEASE_KEYS } from "./release_keys.ts";
-import { derToP1363, keyId, parseSums, verifySums } from "./release_verify.ts";
+import { derToP1363, parseSums, verifySums } from "./release_verify.ts";
+import { keyId } from "./spki.ts";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const HEX = "a".repeat(64);
@@ -16,7 +17,6 @@ describe("verifySums", () => {
   test("accepts openssl's signature and returns the tag, key and digests", async () => {
     const r = await verifySums("v1.2.3", enc(SUMS_TEXT), sign(SUMS_TEXT), testKeys());
     expect(r.keyId).toBe(testKey().id);
-    expect(r.tag).toBe("v1.2.3");
     expect(r.digests.get("grayboard-linux-x64")).toBe(HEX);
     expect(r.digests.size).toBe(2);
   });
@@ -46,6 +46,8 @@ describe("verifySums", () => {
     await expect(refuse("v1.2.4", SUMS_TEXT, good)).rejects.toThrow("SHA256SUMS is signed for v1.2.3, not v1.2.4");
     await expect(refuse("v1.2.3", SUMS_TEXT, "")).rejects.toThrow('isn\'t "<key id> <base64 signature>"');
     await expect(refuse("v1.2.3", SUMS_TEXT, `${good.trim()} extra`)).rejects.toThrow('isn\'t "<key id> <base64 signature>"');
+    // Well-formed line, but the base64 isn't a DER signature.
+    await expect(refuse("v1.2.3", SUMS_TEXT, `${testKey().id} AAAAAAAA\n`)).rejects.toThrow("SHA256SUMS.sig: malformed signature (");
     // The key id must be its own: a signature by key a claiming key b's id fails, not passes.
     await expect(refuse("v1.2.3", SUMS_TEXT, `${testKey("b").id} ${good.split(" ")[1]}`)).rejects.toThrow("doesn't verify");
   });
@@ -87,9 +89,16 @@ describe("derToP1363", () => {
 describe("parseSums", () => {
   test("refuses a missing tag line, malformed lines and duplicates", () => {
     expect(() => parseSums(`${HEX}  x\n`)).toThrow("# grayboard <tag>");
-    expect(() => parseSums(`# grayboard v1\n${HEX} x\n`)).toThrow("malformed line");
-    expect(() => parseSums(`# grayboard v1\n${HEX}  x y\n`)).toThrow("malformed line");
-    expect(() => parseSums(`# grayboard v1\n${HEX}  x\n${HEX}  x\n`)).toThrow("lists x twice");
+    expect(() => parseSums(`# grayboard v1.0.0\n${HEX} x\n`)).toThrow("malformed line");
+    expect(() => parseSums(`# grayboard v1.0.0\n${HEX}  x y\n`)).toThrow("malformed line");
+    expect(() => parseSums(`# grayboard v1.0.0\n${HEX}  x\n${HEX}  x\n`)).toThrow("lists x twice");
+  });
+
+  test("the tag must be a release tag's shape: it goes into URLs and file names", () => {
+    expect(parseSums(`# grayboard v1.3.0-rc.1\n${HEX}  x\n`).tag).toBe("v1.3.0-rc.1");
+    for (const tag of ["v1", "1.0.0", "v1.0.0/../../tmp/x", "v1.0.0-", "v1.0.0-a/b"]) {
+      expect(() => parseSums(`# grayboard ${tag}\n${HEX}  x\n`), tag).toThrow('has no "# grayboard <tag>" first line');
+    }
   });
 });
 

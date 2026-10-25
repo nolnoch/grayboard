@@ -4,24 +4,14 @@
 // -sha256 -sign`. install.sh checks the same files with the openssl CLI; this
 // is `grayboard update`'s side, on WebCrypto, against the compiled-in keys.
 import { RELEASE_KEYS } from "./release_keys.ts";
+import { pemToDer } from "./spki.ts";
 
 export const SUMS = "SHA256SUMS";
 export const SIG = "SHA256SUMS.sig";
 
-/** A verified SHA256SUMS: the tag it's for, the key that signed it, and asset name → hex sha256. */
-export type SignedSums = { tag: string; keyId: string; digests: Map<string, string> };
-
-/** An SPKI PEM's DER bytes. */
-export function pemToDer(pem: string): Uint8Array<ArrayBuffer> {
-  const m = /^-----BEGIN PUBLIC KEY-----\n([A-Za-z0-9+/=\n]+)-----END PUBLIC KEY-----\n?$/.exec(pem);
-  if (!m) throw new Error("not a PEM public key");
-  return Uint8Array.from(Buffer.from(m[1]!.replace(/\n/g, ""), "base64"));
-}
-
-/** A key's id: the first 16 hex characters of sha256 over its SPKI DER. */
-export function keyId(pem: string): string {
-  return new Bun.CryptoHasher("sha256").update(pemToDer(pem)).digest("hex").slice(0, 16);
-}
+// A release tag. It's spliced into URLs and file names, so a signed SHA256SUMS
+// naming `v1.0.0/../x` must not get that far.
+export const RELEASE_TAG = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/;
 
 /** One DER INTEGER at `at` as a 32-byte big-endian value; returns it and the offset after it. */
 function derInt(der: Uint8Array, at: number): [Uint8Array, number] {
@@ -62,7 +52,7 @@ export function parseSums(text: string): { tag: string; digests: Map<string, str
   const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
   const head = /^# grayboard (\S+)$/.exec(lines[0] ?? "");
-  if (!head) throw new Error(`${SUMS} doesn't start with a "# grayboard <tag>" line`);
+  if (!head || !RELEASE_TAG.test(head[1]!)) throw new Error(`${SUMS} has no "# grayboard <tag>" first line`);
   const digests = new Map<string, string>();
   for (const line of lines.slice(1)) {
     const m = /^([0-9a-f]{64}) {2}(\S+)$/.exec(line);
@@ -83,7 +73,7 @@ export async function verifySums(
   sums: Uint8Array<ArrayBuffer>,
   sig: string,
   keys: Record<string, string> = RELEASE_KEYS,
-): Promise<SignedSums> {
+): Promise<{ keyId: string; digests: Map<string, string> }> {
   const m = /^([0-9a-f]{16}) ([A-Za-z0-9+/]+={0,2})\n?$/.exec(sig);
   if (!m) throw new Error(`${SIG} isn't "<key id> <base64 signature>"`);
   const [, id, b64] = m;
@@ -101,5 +91,5 @@ export async function verifySums(
   }
   const parsed = parseSums(new TextDecoder("utf-8", { fatal: true }).decode(sums));
   if (parsed.tag !== tag) throw new Error(`${SUMS} is signed for ${parsed.tag}, not ${tag}`);
-  return { tag, keyId: id!, digests: parsed.digests };
+  return { keyId: id!, digests: parsed.digests };
 }

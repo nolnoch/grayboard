@@ -27,9 +27,10 @@ import { BindGate } from "../shared/bindgate.ts";
 import { boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  attachRoots, checkAttachmentId, digestSha256, dispositionFilename, sha256Hex, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
+  attachRoots, checkAttachmentId, digestSha256, dispositionFilename, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
   type AttachmentLimits,
 } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // Team boards are members-only on the server; this keeps their content from
