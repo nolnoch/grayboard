@@ -21,6 +21,7 @@ import {
   type CoreDb,
   type PendingRef,
   type UnboundPeer,
+  setCapability,
 } from "../core/boards.ts";
 import {
   MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf,
@@ -29,6 +30,7 @@ import {
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { isCommsMechanism } from "../shared/harness.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
@@ -518,6 +520,18 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     if (push) {
       setLauncher(db, full, m.launcher === true);
       writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+    }
+    // The harness facts (#245) any owning connection carries — push or hold:
+    // they describe the session's software, not its delivery. A tools-only
+    // sidecar shares the handle's row and must not overwrite them.
+    if (owns) {
+      if (m.harness !== undefined && (typeof m.harness !== "string" || m.harness.length > 40)) {
+        return refuse("bad_request", "invalid harness", "harness must be a short string");
+      }
+      if (m.comms !== undefined && !isCommsMechanism(m.comms)) {
+        return refuse("bad_request", "invalid comms", "comms must be one of native, fabric, relay");
+      }
+      setCapability(db, full, m.harness ?? null, m.comms ?? null);
     }
     ws.data.owner = true;
     if (from) {

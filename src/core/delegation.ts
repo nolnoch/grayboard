@@ -18,13 +18,14 @@ import type { Database } from "bun:sqlite";
 import { CoreError } from "./errors.ts";
 import { humanHandles, lastSeen, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
+import { commsRank, type CommsMechanism } from "../shared/harness.ts";
 import type { ToolDef } from "./tools.ts";
 
-// The launchers on the roster: handles whose live session opted in
-// (BUS_LAUNCHER=1, or the hello's launcher flag). Humans can't spawn — a
-// bridge holds their identity — and viewers have no handles row.
-export function launchers(db: Database): string[] {
-  return (db.prepare(`SELECT name FROM handles WHERE launcher = 1 AND (human IS NULL OR human = 0) ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+// The launchers with their subagent-comms mechanism (#245): auto-pick sorts
+// by it, preferring a launcher whose subagents reach the bus on their own
+// over one that can only relay.
+export function launchersWithComms(db: Database): { name: string; comms: string | null }[] {
+  return db.prepare(`SELECT name, comms FROM handles WHERE launcher = 1 AND (human IS NULL OR human = 0) ORDER BY name`).all() as { name: string; comms: string | null }[];
 }
 
 // One session row notes the capability; the next session on the handle
@@ -121,8 +122,10 @@ export function resolveDelegation(
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(requester, h) && h !== requester && online(h));
-  if (live.length) return { to: live[0]!, body: delegationBody(brief) };
+  const live = launchersWithComms(db)
+    .filter((l) => sameUser(requester, l.name) && l.name !== requester && online(l.name))
+    .sort((a, b) => commsRank(b.comms) - commsRank(a.comms));
+  if (live.length) return { to: live[0]!.name, body: delegationBody(brief) };
 
   const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };

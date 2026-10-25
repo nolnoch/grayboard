@@ -7,8 +7,9 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, setCapability, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { defaultComms, detectHarness } from "../shared/harness.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -104,6 +105,13 @@ const LAUNCHER = process.env.BUS_LAUNCHER === "1";
 // the name, has no socket, and never touches the launcher flag (a sidecar
 // must not overwrite the owner's opt-in).
 const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
+// Harness capability (#245): which coding agent this session runs under and
+// how its subagents reach the bus. Self-reported from the environment
+// (BUS_HARNESS / BUS_COMMS override the detection), recorded on the name's
+// row at start and bind; peer_list shows it and delegation's auto-pick
+// prefers a comms mechanism closer to native.
+const HARNESS = detectHarness(process.env);
+const COMMS = defaultComms(HARNESS, process.env);
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
 // child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
@@ -627,6 +635,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
       }
       if (previous) touchHandle(db, previous);
       startSession(db, n.name, process.cwd());
+      if (PUSH) setCapability(db, n.name, HARNESS, COMMS);
       if (PUSH) {
         setLauncher(db, n.name, EFFECTIVE_LAUNCHER);
         writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
@@ -656,7 +665,10 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
 // what arrived while offline.
 // A tools-only server runs beside the session that owns the identity, and a
 // restored name is the same session restarted: leave their status alone.
-if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
+if (bound && PUSH && !restored) {
+  startSession(db, bound, process.cwd());
+  setCapability(db, bound, HARNESS, COMMS);
+}
 else if (bound) touchHandle(db, bound);
 if (bound && PUSH) {
   setLauncher(db, bound, EFFECTIVE_LAUNCHER);

@@ -18,6 +18,7 @@ import {
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
+import { defaultComms, detectHarness } from "../shared/harness.ts";
 import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -69,6 +70,11 @@ function loadCredentials(): Credentials {
 
 // The secret the server derives this session's ID from (#182 audit 4).
 const SESSION_KEY = mintSessionKey();
+// Harness capability (#245): which coding agent this process runs under, and
+// how its subagents reach the bus. Detection is env-based (the harness spawns
+// this process and its env shows it); BUS_HARNESS/BUS_COMMS override.
+const HARNESS = detectHarness(process.env);
+const COMMS = defaultComms(HARNESS, process.env);
 const SESSION_ID = sessionIdOf(SESSION_KEY);
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY, not a harness re-delivering the repo's pin. Otherwise the
@@ -163,6 +169,9 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     {
       hold: identity !== null && CHANNELS_OFF, from: opts.from, create: opts.create, suggested: SUGGESTED,
       restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason), launcher: process.env.BUS_LAUNCHER === "1",
+      // Harness capability (#245): self-reported from the environment the
+      // harness gave this process (BUS_HARNESS/BUS_COMMS override detection).
+      ...(HARNESS ? { harness: HARNESS } : {}), comms: COMMS,
     },
   );
   c.connect();

@@ -53,8 +53,8 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
   await call(sim, "board_subscribe", { board: "e2e", mode: "quiet" });
   expect((await call(sim, "peer_list", { board: "#e2e" })).peers).toEqual([
-    { handle: "be", online: true, last_seen: expect.any(Number), mode: "push", where: expect.any(String) },
-    { handle: "sim", online: true, last_seen: expect.any(Number), self: true, mode: "quiet", where: expect.any(String) },
+    { handle: "be", online: true, last_seen: expect.any(Number), mode: "push", where: expect.any(String), comms: "relay" },
+    { handle: "sim", online: true, last_seen: expect.any(Number), self: true, mode: "quiet", where: expect.any(String), comms: "relay" },
   ]);
 }, 20_000);
 

@@ -28,6 +28,7 @@ import {
   touchHandle,
   who,
   type Access,
+  setCapability,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
@@ -532,6 +533,21 @@ describe("who", () => {
     const all = who(db, "be", { include_offline: true }, online);
     expect(all.peers.map((p) => [p.handle, p.online])).toEqual([["be", true], ["fe", false], ["sim", true]]);
     expect(all.offline_hidden).toBeUndefined();
+  });
+
+  test("a session's harness capability is surfaced and cleared on restart (#245)", () => {
+    setCapability(db, "sim", "pi", "native");
+    const withCap = who(db, "be", {}, online).peers.find((p) => p.handle === "sim");
+    expect(withCap).toMatchObject({ harness: "pi", comms: "native" });
+    // A peer with no reported capability shows none (the field is absent).
+    const be = who(db, "sim", { include_offline: true }, online).peers.find((p) => p.handle === "be");
+    expect("harness" in be!).toBe(false);
+    expect("comms" in be!).toBe(false);
+    // The facts describe the live session: a session start clears them.
+    startSession(db, "sim", null);
+    const after = who(db, "be", {}, online).peers.find((p) => p.handle === "sim");
+    expect("harness" in after!).toBe(false);
+    expect("comms" in after!).toBe(false);
   });
 
   test("board scope: subscribers with their mode", () => {

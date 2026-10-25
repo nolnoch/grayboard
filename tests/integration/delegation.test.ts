@@ -386,3 +386,54 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     slack.stop();
   }
 }, 40_000);
+
+test("server: a launcher's harness capability is recorded, surfaced, and steers auto-pick (#245)", async () => {
+  const srv = new TestServer();
+  try {
+    const token = await srv.login("you@example.com");
+    // aaa sorts first by name but can only relay; zzz spawns natively.
+    const relay = await srv.session(token, "aaa", { BUS_LAUNCHER: "1", BUS_HARNESS: "cursor" });
+    const native = await srv.session(token, "zzz", { BUS_LAUNCHER: "1", BUS_HARNESS: "pi" });
+    await srv.session(token, "plain"); // live, not a launcher
+
+    // peer_list shows both facts for a reporting session, nothing for one
+    // that doesn't report.
+    const peers = (await call(relay.c, "peer_list")).peers as { handle: string; harness?: string; comms?: string }[];
+    const zzz = peers.find((p) => p.handle === "you@example.com/zzz")!;
+    expect(zzz.harness).toBe("pi");
+    expect(zzz.comms).toBe("native");
+    const aaa = peers.find((p) => p.handle === "you@example.com/aaa")!;
+    expect(aaa.harness).toBe("cursor");
+    expect(aaa.comms).toBe("relay");
+    expect(peers.find((p) => p.handle === "you@example.com/plain")?.harness).toBeUndefined();
+
+    // The auto-pick prefers native over relay whatever the name order
+    // (#245's routing value).
+    const r = await call(relay.c, "delegate", { persona: "a researcher", task: "survey the field" });
+    expect(r.to).toBe("you@example.com/zzz");
+
+    // A garbage comms value is refused at hello (the server validates).
+    const refused = await srv.client(token, "bogus", { hello: { harness: "x", comms: "telepathy" } }).connect();
+    expect(refused).toMatchObject({ type: "error", code: "bad_request" });
+  } finally {
+    srv.stop();
+  }
+}, 30_000);
+
+test("local: the harness capability is detected, recorded, and a push-off sidecar leaves it alone (#245)", async () => {
+  // The launcher reports its harness via env; the detection runs in the
+  // session process (BUS_HARNESS overrides the markers).
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1", BUS_HARNESS: "pi" } });
+  const peers = (await call(be.c, "peer_list")).peers as { handle: string; harness?: string; comms?: string }[];
+  const me = peers.find((p) => p.handle === "be")!;
+  expect(me.harness).toBe("pi");
+  expect(me.comms).toBe("native");
+
+  // A tools-only sidecar under the same name shares the handle's row: it
+  // must not overwrite the owner's recorded capability (#246 review 5's
+  // shape, for the #245 facts).
+  const sidecar = await localSession(dir, "be", { extra: { BUS_PUSH: "off", BUS_HARNESS: "cursor" } });
+  const after = (await call(be.c, "peer_list")).peers as { handle: string; harness?: string }[];
+  expect(after.find((p) => p.handle === "be")?.harness).toBe("pi");
+  await sidecar.c.close();
+}, 30_000);

@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { declareHuman, startSession, touchHandle } from "./boards.ts";
-import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, setLauncher, DELEGATE_TOOL } from "./delegation.ts";
+import { declareHuman, setCapability, startSession, touchHandle } from "./boards.ts";
+import type { CommsMechanism } from "../shared/harness.ts";
+import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchersWithComms, resolveDelegation, setLauncher, DELEGATE_TOOL } from "./delegation.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -15,24 +16,25 @@ beforeEach(() => {
 
 // A session on the roster, its launcher flag per the test's need. The row
 // describes the live session, so startSession then setLauncher is the order
-// both modes use.
-function session(name: string, launcher = false, seen = true): void {
+// both modes use. `harness`/`comms` record the capability facts (#245).
+function session(name: string, launcher = false, seen = true, harness: string | null = null, comms: string | null = null): void {
   if (seen) startSession(db, name, null);
   else touchHandle(db, name);
   setLauncher(db, name, launcher);
+  setCapability(db, name, harness, comms as CommsMechanism | null);
 }
 
 const live = (h: string) => h !== "dead";
 const online = (h: string) => h !== "dead" && h !== "sleepy";
 
-describe("launchers", () => {
+describe("launchersWithComms", () => {
   test("lists only opted-in, non-human handles", () => {
     session("a", true);
     session("b", false);
     startSession(db, "human", null);
     db.prepare(`UPDATE handles SET human = 1 WHERE name = 'human'`).run();
     setLauncher(db, "human", true);
-    expect(launchers(db)).toEqual(["a"]);
+    expect(launchersWithComms(db)).toEqual([{ name: "a", comms: null }]);
   });
 
   test("isLauncher: only the flag", () => {
@@ -257,4 +259,48 @@ describe("result note and fields (#246 review 8/13)", () => {
 
 test("the tool def requires persona and task only", () => {
   expect(DELEGATE_TOOL.inputSchema.required).toEqual(["persona", "task"]);
+});
+
+// Auto-pick prefers a launcher whose subagents reach the bus natively over
+// one that can only relay (#245), whatever the name order — that preference
+// is the slice's routing value.
+test("auto-pick prefers native comms over relay, whatever the name order", () => {
+  // "aaa" sorts first by name but can only relay; "zzz" spawns natively.
+  session("aaa", true, true, "cursor", "relay");
+  session("zzz", true, true, "pi", "native");
+  const d = resolveDelegation(db, "me", args, online);
+  expect(d.to).toBe("zzz");
+});
+
+test("auto-pick falls back to name order when the comms mechanisms tie", () => {
+  session("aaa", true, true, "cursor", "relay");
+  session("zzz", true, true, "cursor", "relay");
+  expect(resolveDelegation(db, "me", args, online).to).toBe("aaa");
+});
+
+test("auto-pick prefers fabric over relay", () => {
+  session("aaa", true, true, null, "relay");
+  session("zzz", true, true, null, "fabric");
+  expect(resolveDelegation(db, "me", args, online).to).toBe("zzz");
+});
+
+// A launcher with no reported capability is the floor: it loses to any
+// reported-native peer and still wins when it's the only candidate.
+test("a launcher with unreported capability ranks as relay", () => {
+  session("aaa", true, true, null, null);
+  session("zzz", true, true, "pi", "native");
+  expect(resolveDelegation(db, "me", args, online).to).toBe("zzz");
+  // Alone, it still takes the work.
+  const db2 = db; // same db, but drop zzz's liveness
+  void db2;
+  const d = resolveDelegation(db, "me", args, (h) => h === "aaa");
+  expect(d.to).toBe("aaa");
+});
+
+// The capability facts describe the live session: a session start clears
+// them (the next session re-reports), like status.
+test("a session start clears the recorded harness capability", () => {
+  session("a", true, true, "pi", "native");
+  startSession(db, "a", null);
+  expect(launchersWithComms(db)).toEqual([{ name: "a", comms: null }]);
 });
