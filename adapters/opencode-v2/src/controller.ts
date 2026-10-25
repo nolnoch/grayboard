@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Binding } from "./binding.js";
 import { LeaseUnavailable, Wire } from "./wire.js";
-import { METADATA, Refusal, admitPrefix, enrollmentHash, identityOf, itemsOf, render, same, stableID, type Enrollment } from "./model.js";
+import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
+import { SessionRoutes, resolveRoot } from "./sessions.js";
 
-export type Options = { mcpName: string; issuer: string; rootSessionID?: string };
+export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
 export type Status = { state: string; message: string; sessionID?: string };
-function fingerprint(access: string) { return createHash("sha256").update(access).digest("hex"); }
+type Root = { e: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
+type Invocation = { tool: string; sessionID: string; id: string };
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -17,282 +19,294 @@ function sleep(ms: number, signal: AbortSignal) {
 }
 export class Controller {
   readonly binding: Binding;
-  private enrollment?: Enrollment;
-  private abort?: AbortController;
-  private task?: Promise<void>;
-  private controls: Promise<unknown> = Promise.resolve();
-  private pendingControls = 0;
-  private latched = false;
+  readonly routes = new SessionRoutes();
+  private roots = new Map<string, Root>();
+  private watches = new Map<string, { dispose(): Promise<void> }>();
   private stopped = false;
-  private rejected?: string;
-  private lastAccess?: string;
-  private persistence: Promise<void> = Promise.resolve();
-  private state: Status = { state: "unenrolled", message: "Explicitly enroll an active root session" };
-  constructor(readonly ctx: Context, readonly options: Options) {
+  private drifted = false;
+  private controls: Promise<unknown> = Promise.resolve();
+  private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name" };
+  constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire) {
     this.binding = new Binding(ctx, options.mcpName, () => this.latch("Native binding changed; explicitly enroll again"));
   }
   status(): Status { return { ...this.state }; }
+  private set(r: Root, state: string, message: string) { this.state = r.status = { state, message, sessionID: r.e.sessionID }; }
   private serial<T>(call: () => Promise<T>): Promise<T> {
-    if (this.pendingControls >= 8) return Promise.reject(new Refusal("paused", "Too many pending controls; retry after the current operation"));
-    this.pendingControls++;
-    const result = this.controls.then(call, call).finally(() => { this.pendingControls--; });
+    const result = this.controls.then(call, call);
     this.controls = result.catch(() => {});
     return result;
   }
   private latch(message: string) {
-    this.persistence = this.persistence.then(() => this.ctx.storage.set("paused", true)).catch(() => {});
-    this.latched = true;
-    this.state = { state: "paused", message, sessionID: this.enrollment?.sessionID };
-    this.abort?.abort();
-  }
-  observe(type: string, data: unknown) {
-    if (!this.enrollment || this.stopped) return;
-    if (type === "credential.switched" && (data as { integrationID?: string })?.integrationID === this.enrollment.integrationID) this.latch("Selected native account changed; explicitly enroll again");
-  }
-  private async root(sessionID: string) {
-    const session = await this.ctx.session.get({ sessionID });
-    if (session.parentID || session.time.archived) throw new Refusal("root", "An active root session is required");
-    return session;
-  }
-  private async guard(e: Enrollment, signal?: AbortSignal) {
-    if (this.latched || signal?.aborted) throw new Refusal("paused", "Subscriber paused");
-    try {
-      await this.binding.check(e);
-      const session = await this.root(e.sessionID);
-      const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
-      if (!saved?.enabled || !same(saved.enrollment, e)) throw new Refusal("root", "Root enrollment changed; explicitly enroll again");
-    } catch (error) {
-      if (!signal?.aborted && !this.stopped && error instanceof Refusal) this.latch(error.message);
-      throw error;
+    this.drifted = true;
+    for (const r of this.roots.values()) {
+      r.paused = true; r.epoch++; r.abort?.abort(); this.set(r, "paused", message);
+      void this.ctx.storage.set(`paused:${r.e.sessionID}`, true).catch(() => {});
     }
-    if (signal?.aborted || this.latched) throw new Refusal("paused", "Subscriber paused");
   }
-  private async access(e: Enrollment, signal: AbortSignal) {
-    await this.guard(e, signal);
-    const access = await this.binding.access(e);
-    const hash = fingerprint(access);
-    if (hash === this.rejected) throw new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
-    this.lastAccess = hash;
-    return access;
+  private async path(sessionID: string) {
+    const path = await resolveRoot(sessionID, id => this.ctx.session.get({ sessionID: id }));
+    this.routes.remember(path);
+    return path;
   }
-  private wire(e: Enrollment, signal: AbortSignal) {
-    return new Wire(e.configuration, { token: () => this.access(e, signal), onUnauthorized: async () => {
-      const rejected = this.rejected = this.lastAccess;
-      if (rejected) this.persistence = this.persistence.then(() => this.ctx.storage.set("rejectedAccessHash", rejected)).catch(() => {});
-      this.state = { state: "auth", message: "Subscriber authorization refused; reconnect or sign in using native MCP, then resume", sessionID: e.sessionID };
-      throw new Refusal("auth", this.state.message);
-    } }, signal);
+  private async activeRoot(sessionID: string) {
+    const path = await this.path(sessionID);
+    if (path.root !== sessionID) throw new Refusal("root", "An active top-level root is required");
+    return this.ctx.session.get({ sessionID });
   }
-  async enroll(sessionID: string) { return this.serial(async () => {
-    if (this.stopped) throw new Refusal("paused", "Plugin is stopping");
-    await this.stopLoop();
-    if (this.enrollment && this.enrollment.sessionID !== sessionID) {
-      const old = await this.ctx.session.get({ sessionID: this.enrollment.sessionID }).catch(() => undefined);
-      if (old) await this.ctx.session.update({ sessionID: old.id, metadata: { ...old.metadata, [METADATA]: { enabled: false, enrollment: this.enrollment } } });
-    }
-    await this.root(sessionID);
-    const captured = await this.binding.capture();
-    const discovery = await fetch(captured.configuration.discovery, { redirect: "error", signal: AbortSignal.timeout(10_000) });
-    const discoveredIssuer = discovery.ok ? (await discovery.json() as { issuer?: string }).issuer : undefined;
-    const issuer = this.options.issuer || discoveredIssuer;
-    if (!issuer || discoveredIssuer !== issuer) throw new Refusal("identity", "Trusted discovery issuer mismatch");
-    const parsedIssuer = new URL(issuer);
-    if (parsedIssuer.protocol !== "https:" || parsedIssuer.username || parsedIssuer.password || parsedIssuer.search || parsedIssuer.hash) throw new Refusal("identity", "Trusted discovery must declare an HTTPS issuer");
-    this.latched = false;
-    const provisional: Enrollment = { version: 1, sessionID, mcpName: this.options.mcpName, ...captured, identity: { user: { id: 1, email: "" }, identity: "", identity_full: "/", issuer: "", resource: "" } };
-    const ac = new AbortController();
-    // Enrollment reads identity before owning delivery; no session metadata exists yet.
-    const wire = new Wire(captured.configuration, { token: async () => {
-      if (this.latched) throw new Refusal("binding", "Binding changed during enrollment");
-      const access = await this.binding.access(captured);
-      if (fingerprint(access) === this.rejected) throw new Refusal("auth", "Restore native authentication before enrollment");
-      return access;
-    }, onUnauthorized: async () => { throw new Refusal("auth", "Use native MCP sign-in"); } }, ac.signal);
-    try {
-      await wire.connect();
-      const identity = identityOf(await wire.read("grayboard://identity"));
-      if (identity.issuer !== issuer || identity.resource !== captured.configuration.url || identity.identity !== captured.configuration.identity) throw new Refusal("identity", "Authenticated identity does not match trusted enrollment");
-      await this.binding.check(captured);
-      if (this.latched) throw new Refusal("binding", "Binding changed during enrollment");
-      const session = await this.root(sessionID);
-      const e: Enrollment = { ...provisional, identity };
-      await this.ctx.session.update({ sessionID, metadata: { ...session.metadata, [METADATA]: { enabled: true, enrollment: e } } });
-      this.enrollment = e;
-      await this.ctx.storage.set("rootSessionID", sessionID);
-      await this.ctx.storage.set("enrollmentHash", enrollmentHash(e));
-      await this.persistence;
-      await this.ctx.storage.set("paused", false);
-    } finally { await wire.close().catch(() => {}); ac.abort(); }
-    this.start();
-    return this.status();
-  }); }
-  async pause(message = "Explicitly enroll to resume") { return this.serial(async () => {
-    await this.stopLoop();
-    this.latch(message);
-    await this.persistence;
-    if (this.enrollment) {
-      const session = await this.ctx.session.get({ sessionID: this.enrollment.sessionID }).catch(() => undefined);
-      if (session) await this.ctx.session.update({ sessionID: this.enrollment.sessionID, metadata: { ...session.metadata, [METADATA]: { enabled: false, enrollment: this.enrollment } } });
-    }
-    this.state = { state: "paused", message, sessionID: this.enrollment?.sessionID };
-    return this.status();
-  }); }
-  async restore() {
-    if (this.stopped) return;
-    const rejected = await this.ctx.storage.get("rejectedAccessHash");
-    if (typeof rejected === "string") this.rejected = rejected;
-    if (await this.ctx.storage.get("paused") === true) {
-      this.latched = true;
-      this.state = { state: "paused", message: "Saved subscriber pause; explicitly enroll to resume" };
-      return;
-    }
-    const stored = await this.ctx.storage.get("rootSessionID");
-    const sessionID = this.options.rootSessionID ?? (typeof stored === "string" ? stored : undefined);
-    if (!sessionID) return;
-    const session = await this.root(sessionID);
+  private async save(r: Root, enabled = !r.paused) {
+    const session = await this.activeRoot(r.e.sessionID);
+    await this.ctx.session.update({ sessionID: session.id, metadata: { ...session.metadata, [METADATA]: { enabled, enrollment: r.e } } });
+    await this.ctx.storage.set(`enrollmentHash:${session.id}`, enrollmentHash(r.e));
+    await this.ctx.storage.set(`paused:${session.id}`, !enabled);
+    await this.ctx.storage.set("rootSessionIDs", [...this.roots.keys()]);
+  }
+  private async guard(r: Root, epoch: number, signal: AbortSignal) {
+    const e = r.e, hash = enrollmentHash(e);
+    const check = () => { if (this.stopped || this.drifted || r.paused || signal.aborted || r.epoch !== epoch || this.roots.get(e.sessionID) !== r || enrollmentHash(r.e) !== hash) throw new Refusal("paused", "Admission target changed"); };
+    check();
+    await this.binding.check(e);
+    const session = await this.activeRoot(e.sessionID);
     const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
-    if (!saved?.enabled || !saved.enrollment) {
-      if (this.options.rootSessionID && !saved) return this.enroll(sessionID);
-      return;
-    }
-    {
-      const e = saved.enrollment;
-      if (e.sessionID !== sessionID) throw new Refusal("root", "Saved enrollment target changed");
-      identityOf(e.identity);
-      if (await this.ctx.storage.get("enrollmentHash") !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
-      if (e.version !== 1 || e.mcpName !== this.options.mcpName || (this.options.issuer && e.identity.issuer !== this.options.issuer) || e.identity.resource !== e.configuration.url) throw new Refusal("identity", "Saved enrollment does not match trusted options");
-      this.enrollment = e;
-      for (let attempt = 0; ; attempt++) {
-        if (this.stopped) return;
-        try { await this.binding.check(e); break; }
-        catch (error) {
-          if (this.latched || !(error instanceof Refusal) || attempt >= 49) throw error;
-          await sleep(100, new AbortController().signal);
-        }
-      }
-      await this.guard(e);
-      this.start();
-    }
+    if (!saved?.enabled || !same(saved.enrollment, e)) { r.paused = true; throw new Refusal("root", "Root approval changed; explicitly enroll again"); }
+    check();
   }
-  private start() {
-    if (!this.enrollment || this.stopped) return;
-    this.latched = false;
-    this.state = { state: "connecting", message: "Connecting subscriber", sessionID: this.enrollment.sessionID };
-    const ac = this.abort = new AbortController();
-    this.task = this.run(this.enrollment, ac.signal).catch(() => {
-      if (!ac.signal.aborted) this.state = { state: "paused", message: "Delivery stopped; inspect native MCP status and explicitly enroll again", sessionID: this.enrollment?.sessionID };
+  private async wire(e: Enrollment, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000)) {
+    const key = `rejectedAccess:${e.integrationID}:${e.connectionID}`;
+    let accessHash: string | undefined;
+    const wire = new this.Transport(e.configuration, { token: async () => {
+      const token = await this.binding.access(e);
+      accessHash = createHash("sha256").update(token).digest("hex");
+      if (await this.ctx.storage.get(key) === accessHash) throw new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
+      return token;
+    }, onUnauthorized: async () => {
+      if (accessHash) await this.ctx.storage.set(key, accessHash);
+      throw new Refusal("auth", "Restore authentication through native MCP; the plugin never refreshes credentials");
+    } }, signal, sessionID);
+    await wire.connect();
+    return wire;
+  }
+  private async temporary<T>(e: Enrollment, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID) {
+    const wire = await this.wire(e, sessionID);
+    try { return await call(wire); } finally { await wire.close().catch(() => {}); }
+  }
+  private async capture(sessionID: string): Promise<Enrollment> {
+    const captured = await this.binding.capture();
+    if (this.options.issuer && captured.configuration.issuer !== this.options.issuer) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
+    return { version: 2, sessionID, mcpName: this.options.mcpName, ...captured };
+  }
+  async enroll(sessionID: string, name?: string, create = false) { return this.serial(async () => {
+    if (this.stopped) throw new Refusal("paused", "Plugin is stopping");
+    await this.activeRoot(sessionID);
+    if (this.drifted) {
+      for (const watch of this.watches.values()) await watch.dispose();
+      this.watches.clear();
+    }
+    await this.watches.get(sessionID)?.dispose(); this.watches.delete(sessionID);
+    const previous = this.roots.get(sessionID);
+    if (previous) await this.stop(previous);
+    const captured = await this.capture(sessionID);
+    const e = { ...captured, ...(previous?.e.name ? { name: previous.e.name } : {}) };
+    const r: Root = { e, epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state };
+    this.roots.set(sessionID, r); this.drifted = false;
+    await this.save(r);
+    this.watches.set(sessionID, await this.binding.watch(e));
+    this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+    try {
+      if (name) await this.temporary(e, w => w.call("bind", { name, create, where: this.ctx.location.directory }));
+      await this.prepare(r, !!previous?.paused && !name);
+    } catch (error) { this.set(r, "approved", `Root approval saved; binding refused: ${error instanceof Error ? error.message : "unknown refusal"}`); }
+    return this.status();
+  }); }
+  private async prepare(r: Root, resume = false) {
+    const epoch = r.epoch;
+    await this.temporary(r.e, async wire => {
+      let current = bindingOf(await wire.call("whoami"));
+      if (!current.name && r.e.name && resume) {
+        await wire.call("bind", { name: r.e.name, create: false, where: this.ctx.location.directory });
+        current = bindingOf(await wire.call("whoami"));
+      }
+      if (r.epoch !== epoch || r.paused || this.stopped) return;
+      if (!current.name) { this.set(r, "unbound", `Root approved, unbound; bind(name) to take one. Candidates: ${JSON.stringify(current.candidates ?? [])}`); return; }
+      r.e = { ...r.e, name: current.name };
+      await this.save(r);
+      if (r.epoch === epoch && !r.paused && !this.stopped) this.start(r);
     });
   }
-  private async run(e: Enrollment, signal: AbortSignal) {
-    let wire: Wire | undefined;
-    let capability: string | undefined;
-    let attempts = 0, recoveries = 0;
-    try {
-      while (!signal.aborted && attempts < 8) {
+  private start(r: Root) {
+    if (r.task || r.paused || this.stopped) return;
+    const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController();
+    r.task = this.run(r, e, epoch, abort.signal).catch(error => {
+      if (!abort.signal.aborted) { r.paused = true; this.set(r, "paused", error instanceof Error ? error.message : "Subscriber stopped"); void this.ctx.storage.set(`paused:${e.sessionID}`, true); }
+    });
+  }
+  private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal) {
+    let failures = 0, recoveries = 0;
+    while (!signal.aborted && failures < 8) {
+      let wire: Wire | undefined;
+      try {
+        await this.guard(r, epoch, signal);
+        wire = await this.wire(e, e.sessionID, signal);
+        const current = bindingOf(await wire.call("whoami"));
+        if (!current.name) {
+          r.lease = undefined;
+          await wire.call("bind", { name: e.name, create: false, where: this.ctx.location.directory });
+        } else if (current.name !== e.name) throw new Refusal("identity", "Root binding changed without a native completion; explicitly enroll again");
+        const lease = leaseOf(await wire.call("delivery_open"), e);
+        await this.guard(r, epoch, signal);
+        r.lease = lease; wire.capability = lease.capability;
+        failures = 0; recoveries = 0;
+        this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
+        let dirty = true, wake: (() => void) | undefined, closed = false;
+        wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
+        const subscription = await wire.listen();
+        void subscription.closed.then(() => { closed = true; wake?.(); }, () => { closed = true; wake?.(); });
+        let renewal = Date.now() + 10_000;
         try {
-          await this.guard(e, signal);
-          this.state = { state: "connecting", message: "Connecting subscriber", sessionID: e.sessionID };
-          wire = this.wire(e, signal);
-          await wire.connect();
-          if (!same(identityOf(await wire.read("grayboard://identity")), e.identity)) throw new Refusal("identity", "Authenticated account changed; explicitly enroll again");
-          this.rejected = undefined;
-          await this.persistence;
-          await this.ctx.storage.remove("rejectedAccessHash");
-          if (!capability) {
-            const lease = await wire.call("delivery_open") as { capability?: string; identity?: { identity_full?: string } };
-            if (!lease.capability || !/^[A-Za-z0-9_-]{43}$/.test(lease.capability) || lease.identity?.identity_full !== e.identity.identity_full) throw new Refusal("identity", "Invalid delivery lease");
-            capability = lease.capability;
-          }
-          wire.capability = capability;
-          await wire.call("delivery_renew");
-          let subscription = await wire.listen();
-          let dirty = true;
-          let wake: (() => void) | undefined;
-          wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
-          this.state = { state: "active", message: "Subscribed; receipts follow durable root admission", sessionID: e.sessionID };
-          let renewal = Date.now() + 10_000;
-          let subscriptionClosed = false;
-          const watch = (current: typeof subscription) => {
-            const closed = () => { if (current === subscription) { subscriptionClosed = true; wake?.(); } };
-            void current.closed.then(closed, closed);
-          };
-          watch(subscription);
           while (!signal.aborted) {
             if (dirty) {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
               await admitPrefix(items, async item => {
-                await this.guard(e, signal);
-                await this.ctx.session.synthetic({ sessionID: e.sessionID, id: stableID(e, item.id), text: render(item), delivery: "queue", resume: item.actionable, metadata: { source: "grayboard" } });
-                await this.guard(e, signal);
+                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity) throw new Refusal("identity", "Issued batch does not match the immutable lease");
+                await this.guard(r, epoch, signal);
+                await wire!.call("delivery_renew");
+                await this.guard(r, epoch, signal);
+                await this.ctx.session.synthetic({ sessionID: e.sessionID, id: stableID(e, item.id, lease.identity), text: render(item), delivery: "queue", resume: item.actionable, metadata: { source: "grayboard" } });
+                await this.guard(r, epoch, signal);
               }, async ids => {
-                await this.guard(e, signal);
+                await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
               });
               if (items.length === 100) dirty = true;
             }
-            if (signal.aborted) break;
-            if (subscriptionClosed) throw new Error("Subscription closed");
+            if (closed) throw new Error("Subscription closed");
             if (Date.now() >= renewal) {
-              await this.guard(e, signal);
-              await wire.call("delivery_renew");
-              await subscription.close();
-              subscription = await wire.listen();
-              subscriptionClosed = false;
-              watch(subscription);
-              renewal = Date.now() + 10_000;
-              dirty = true;
+              await this.guard(r, epoch, signal); await wire.call("delivery_renew");
+              renewal = Date.now() + 10_000; dirty = true;
             }
             if (dirty) continue;
             const timer = new AbortController();
-            await Promise.race([sleep(Math.min(1000, Math.max(1, renewal - Date.now())), AbortSignal.any([signal, timer.signal])), new Promise<void>(resolve => { wake = resolve; })]);
-            wake = undefined;
-            timer.abort();
+            await Promise.race([sleep(1000, AbortSignal.any([signal, timer.signal])), new Promise<void>(resolve => { wake = resolve; })]);
+            wake = undefined; timer.abort();
           }
-          await subscription.close().catch(() => {});
-          break;
-        } catch (error) {
-          if (signal.aborted) break;
-          if (error instanceof LeaseUnavailable) {
-            capability = undefined;
-            await wire?.close().catch(() => {});
-            wire = undefined;
-            if (++recoveries > 3) { this.latch("Lease recovery limit reached; explicitly enroll again"); break; }
-            attempts = 0;
-            this.state = { state: "retrying", message: "Lease expired; revalidating the enrolled account before reacquiring", sessionID: e.sessionID };
-            await sleep(500, signal);
-            continue;
-          }
-          if (error instanceof Refusal) {
-            if (error.code !== "auth") this.latch(error.message);
-            else this.state = { state: "auth", message: error.message, sessionID: e.sessionID };
-            break;
-          }
-          attempts++;
-          this.state = { state: "retrying", message: "Delivery interrupted; pending items remain durable", sessionID: e.sessionID };
-          await wire?.close().catch(() => {});
-          wire = undefined;
-          await sleep(Math.min(8000, 250 * 2 ** attempts), signal);
+        } finally { await subscription.close().catch(() => {}); }
+      } catch (error) {
+        if (signal.aborted) break;
+        if (error instanceof Refusal) throw error;
+        if (error instanceof LeaseUnavailable) {
+          r.lease = undefined;
+          if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
+        } else if (error instanceof Error && /identity_in_use|already in use|identity_unknown/.test(error.message)) throw error;
+        else failures++;
+        this.set(r, "retrying", "Revalidating the approved root before reopening delivery");
+        await sleep(Math.min(8000, 250 * 2 ** failures), signal);
+      } finally { await wire?.close().catch(() => {}); }
+    }
+    if (failures >= 8) throw new Error("Retry limit reached; explicitly enroll again");
+  }
+  private async stop(r: Root) { r.epoch++; r.abort?.abort(); await r.task; r.task = undefined; r.abort = undefined; }
+  private async release(r: Root) {
+    const lease = r.lease; r.lease = undefined;
+    await this.temporary(r.e, async wire => {
+      if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(() => {}); }
+      await wire.call("session_end");
+    });
+  }
+  async pause(message = "Ownership ended; explicitly enroll to resume") { return this.serial(async () => {
+    for (const r of this.roots.values()) {
+      r.paused = true; await this.stop(r);
+      await this.release(r).catch(() => {});
+      await this.save(r, false).catch(() => {});
+      this.set(r, "paused", message);
+    }
+    return this.status();
+  }); }
+  async restore() {
+    const ids = await this.ctx.storage.get("rootSessionIDs");
+    if (!Array.isArray(ids)) return;
+    for (const id of ids) {
+      if (typeof id !== "string" || this.stopped) continue;
+      const session = await this.activeRoot(id);
+      const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
+      const e = saved?.enrollment;
+      if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
+      const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true;
+      const r: Root = { e, epoch: 0, paused, status: this.state };
+      this.roots.set(id, r);
+      if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
+      await this.binding.check(e);
+      this.watches.set(id, await this.binding.watch(e));
+      await this.prepare(r, true);
+    }
+  }
+  private async native(tool: string) {
+    const namespace = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return (await this.ctx.tool.list()).some(t => t.id === tool && t.options?.namespace === namespace);
+  }
+  async before(event: Invocation) {
+    if (!await this.native(event.tool)) return;
+    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
+    if (path.root !== event.sessionID) {
+      const e = r?.e ?? await this.capture(path.root);
+      await this.temporary(e, wire => wire.call("session_register", { child: event.sessionID, via: path.via }));
+      this.routes.remember(path);
+    }
+    const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
+    if (r && event.tool === bindID && path.root === event.sessionID) await this.stop(r);
+  }
+  async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
+    if (!await this.native(event.tool)) return;
+    const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
+    const r = this.roots.get(event.sessionID);
+    if (event.tool !== bindID || !r || r.paused || this.drifted) return;
+    try {
+      if (event.status === "completed") {
+        const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
+        if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || typeof output.instructions !== "string") throw new Error("Native bind completion lacked validated output");
+      }
+      await this.prepare(r, false);
+    } catch (error) { this.set(r, "approved", `Approval retained; lease unavailable: ${error instanceof Error ? error.message : "unknown refusal"}`); }
+  }
+  async observe(type: string, data: unknown) {
+    if (this.stopped) return;
+    if (type === "session.created" && this.options.name) {
+      const id = (data as { sessionID?: string })?.sessionID;
+      if (id) {
+        const path = await this.path(id);
+        if (path.root === id) {
+          try {
+            const e = await this.capture(id);
+            await this.temporary(e, w => w.call("bind", { name: this.options.name, create: this.options.create === true, where: this.ctx.location.directory }));
+            this.state = { state: "unenrolled", sessionID: id, message: `Bound ${this.options.name}; receiving still requires human approval` };
+          } catch (error) { this.state = { state: "unbound", sessionID: id, message: error instanceof Error ? error.message : "Configured binding refused" }; }
         }
       }
-      if (attempts >= 8) this.latch("Retry limit reached; explicitly enroll again");
-    } finally {
-      await wire?.close().catch(() => {});
-      // Never use a cached access token or a changed account for old-lease cleanup.
-      if (capability && !this.rejected) {
-        const cleanup = new AbortController();
-        const timeout = setTimeout(() => cleanup.abort(), 3000);
-        let release: Wire | undefined;
-        try {
-          await this.binding.check(e);
-          release = new Wire(e.configuration, { token: () => this.binding.access(e), onUnauthorized: async () => { throw new Error("Cleanup refused"); } }, cleanup.signal);
-          release.capability = capability;
-          await release.connect();
-          await release.call("delivery_release");
-        } catch {} finally { await release?.close().catch(() => {}); clearTimeout(timeout); cleanup.abort(); }
+    }
+    if (type === "credential.switched") {
+      const id = (data as { integrationID?: string })?.integrationID;
+      if ([...this.roots.values()].some(r => r.e.integrationID === id)) this.latch("Selected native account changed; explicitly enroll again");
+    }
+    if (type === "session.deleted" || type === "session.archived") {
+      const id = (data as { sessionID?: string })?.sessionID;
+      if (!id) return;
+      const path = this.routes.end(id);
+      if (!path) return;
+      const r = this.roots.get(path.root);
+      if (id === path.root && r) {
+        r.paused = true; await this.stop(r); await this.release(r).catch(() => {});
+        await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released");
+      } else {
+        const e = r?.e ?? await this.capture(path.root);
+        await this.temporary(e, w => w.call("session_end"), id).catch(() => {});
       }
     }
   }
-  private async stopLoop() { this.abort?.abort(); await this.task; this.task = undefined; this.abort = undefined; }
-  async close() { this.stopped = true; this.abort?.abort(); await this.controls; await this.stopLoop(); await this.persistence; }
+  async close() {
+    this.stopped = true;
+    for (const r of this.roots.values()) r.abort?.abort();
+    await this.controls;
+    for (const r of this.roots.values()) await this.stop(r);
+    for (const watch of this.watches.values()) await watch.dispose().catch(() => {});
+    this.watches.clear();
+  }
 }

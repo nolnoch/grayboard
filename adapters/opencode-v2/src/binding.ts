@@ -1,32 +1,38 @@
+import { createHash } from "node:crypto";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import type { MCPEditor } from "@opencode/plugin/promise/mcp";
 import { Refusal, same, type Configuration, type Enrollment } from "./model.js";
 
+type Expected = Pick<Enrollment, "configuration" | "integrationID" | "connectionID">;
 export class Binding {
   constructor(readonly ctx: Context, readonly name: string, readonly drift: () => void) {}
-  async configuration(): Promise<Configuration> {
-    let result: Configuration | undefined;
-    const observer = await this.ctx.mcp.transform(editor => {
-      const c = editor.get(this.name);
-      if (!c || c.type !== "remote" || !c.oauth || c.disabled) return;
-      const headers = new Headers(c.headers);
-      const identity = headers.get("X-Grayboard-Identity");
-      const scopes = [...new Set(c.oauth.scope?.split(/\s+/).filter(Boolean))].sort();
-      if (!identity || !c.oauth.client_id || !scopes.includes("grayboard:tools") || !scopes.includes("grayboard:delivery") || headers.has("Authorization") || headers.has("X-Grayboard-Lease") || headers.has("X-Grayboard-Client")) return;
-      const url = new URL(c.url);
-      if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) return;
-      let metadata = c.oauth.auth_server_metadata_url;
-      if (metadata === undefined) {
-        const rawPath = /^https:\/\/[^/?#]+(\/[^?#]*)?$/.exec(c.url)?.[1];
-        if (rawPath !== url.pathname || !url.pathname.endsWith("/mcp") || url.pathname.includes("//") || /%(?:2e|2f|5c)/i.test(url.pathname)) return;
-        metadata = url.origin + "/.well-known/oauth-authorization-server" + url.pathname.slice(0, -4);
-      }
-      const discovery = new URL(metadata);
-      if (discovery.protocol !== "https:" || discovery.username || discovery.password || discovery.hash) return;
-      result = { type: "remote", url: url.href, identity, clientID: c.oauth.client_id, scope: scopes.join(" "), discovery: discovery.href };
+  private endpoint(c: ReturnType<MCPEditor["get"]>) {
+    if (!c || c.type !== "remote" || c.oauth === false || c.disabled) return;
+    const headers = new Headers(c.headers);
+    if (["Authorization", "X-Grayboard-Identity", "X-Grayboard-Lease", "X-Grayboard-Client"].some(key => headers.has(key))) return;
+    const url = new URL(c.url);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) return;
+    const oauth = c.oauth || undefined;
+    const configHash = createHash("sha256").update(JSON.stringify([url.href, [...headers.entries()].sort(), oauth?.client_id, oauth?.scope, oauth?.auth_server_metadata_url])).digest("hex");
+    return { type: "remote" as const, url: url.href, configHash };
+  }
+  async watch(expected: Expected) {
+    return this.ctx.mcp.transform(editor => {
+      try {
+        if (!same(this.endpoint(editor.get(this.name)), { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.drift();
+      } catch { this.drift(); }
     });
+  }
+  async configuration() {
+    let result: ReturnType<Binding["endpoint"]>;
+    const observer = await this.ctx.mcp.transform(editor => { result = this.endpoint(editor.get(this.name)); });
     await observer.dispose();
-    if (!result) throw new Refusal("binding", "Configure an enabled native OAuth HTTP MCP entry with identity, client ID, both Grayboard scopes and a canonical /mcp endpoint or explicit HTTPS discovery URL");
+    if (!result) throw new Refusal("binding", "Configure an enabled native OAuth HTTPS MCP entry without static authority headers");
     return result;
+  }
+  private mismatch(): never {
+    this.drift();
+    throw new Refusal("binding", "Native endpoint, grant or account changed; explicitly enroll again");
   }
   async selection(expected?: Pick<Enrollment, "integrationID" | "connectionID">) {
     const entry = (await this.ctx.mcp.list()).data.find(e => e.name === this.name);
@@ -39,29 +45,37 @@ export class Binding {
     if (!projected || projected.status) throw new Refusal("auth", "Native MCP connection requires authentication");
     return { integrationID: entry.integrationID, connectionID: connection.id, connection };
   }
-  async capture(expected?: Pick<Enrollment, "configuration" | "integrationID" | "connectionID">) {
-    const configuration = await this.configuration();
-    if (expected && !same(configuration, expected.configuration)) this.mismatch();
-    const selected = await this.selection(expected);
-    return { configuration, integrationID: selected.integrationID, connectionID: selected.connectionID };
-  }
-  private mismatch(): never {
-    this.drift();
-    throw new Refusal("binding", "Native endpoint, identity or account changed; explicitly enroll again");
-  }
-  async check(expected: Pick<Enrollment, "configuration" | "integrationID" | "connectionID">) {
-    const current = await this.capture(expected);
-    if (!same(current, { configuration: expected.configuration, integrationID: expected.integrationID, connectionID: expected.connectionID })) this.mismatch();
-  }
-  async access(expected: Pick<Enrollment, "configuration" | "integrationID" | "connectionID">) {
-    await this.check(expected);
-    const selected = await this.selection(expected);
-    if (selected.integrationID !== expected.integrationID || selected.connectionID !== expected.connectionID) this.mismatch();
-    if (!same(await this.configuration(), expected.configuration)) this.mismatch();
+  private async project(selected: Awaited<ReturnType<Binding["selection"]>>, endpoint: Awaited<ReturnType<Binding["configuration"]>>) {
     const credential = await this.ctx.integration.connection.resolve(selected.connection);
     if (credential?.type !== "oauth" || credential.expires <= Date.now() || !credential.access) throw new Refusal("auth", "Native access expired; reconnect or sign in using OpenCode");
-    const access = credential.access;
+    const m = credential.metadata as { serverUrl?: unknown; issuer?: unknown; scope?: unknown; client?: { client_id?: unknown } } | undefined;
+    if (!m || m.serverUrl !== endpoint.url || typeof m.issuer !== "string" || typeof m.scope !== "string" || typeof m.client?.client_id !== "string") throw new Refusal("auth", "Native OAuth projection lacks server, issuer, client or scopes; reconnect using native MCP");
+    const issuer = new URL(m.issuer);
+    if (issuer.protocol !== "https:" || issuer.username || issuer.password || issuer.search || issuer.hash) throw new Refusal("identity", "Native issuer must be HTTPS");
+    const scope = [...new Set(m.scope.split(/\s+/).filter(Boolean))].sort();
+    if (!scope.includes("grayboard:tools") || !scope.includes("grayboard:delivery")) throw new Refusal("auth", "Native grant needs both Grayboard scopes");
+    const configuration: Configuration = { ...endpoint, issuer: m.issuer, clientID: m.client.client_id, scope: scope.join(" ") };
+    return { configuration, access: credential.access };
+  }
+  async capture(expected?: Expected) {
+    const endpoint = await this.configuration();
+    if (expected && !same(endpoint, { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.mismatch();
+    const selected = await this.selection(expected);
+    const projected = await this.project(selected, endpoint);
+    if (expected && !same(projected.configuration, expected.configuration)) this.mismatch();
+    const again = await this.selection(expected ?? selected);
+    if (again.connectionID !== selected.connectionID || !same(await this.configuration(), endpoint)) this.mismatch();
+    return { configuration: projected.configuration, integrationID: selected.integrationID, connectionID: selected.connectionID };
+  }
+  async check(expected: Expected) { await this.capture(expected); }
+  async access(expected: Expected) {
     await this.check(expected);
-    return access;
+    const endpoint = await this.configuration();
+    if (!same(endpoint, { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.mismatch();
+    const selected = await this.selection(expected);
+    const projected = await this.project(selected, endpoint);
+    if (!same(projected.configuration, expected.configuration)) this.mismatch();
+    await this.check(expected);
+    return projected.access;
   }
 }

@@ -1,106 +1,68 @@
 # grayboard-opencode
 
-Standalone OpenCode **v2** integration for hosted Grayboard. Version 1.10.0 targets the published OpenCode 2.1.4 plugin API and the official MCP client 2.4.0. It does not replace the existing local/V1 adapter and never starts Grayboard, a stdio proxy, or a custom WebSocket receiver. Remote OpenCode needs no Grayboard CLI.
-
-The native HTTP MCP connection supplies agent tools, server instructions, sign-in, credential storage and refresh. This package supplements it with an in-process `2026-07-28` resource subscriber and durable root-session admission. It registers no agent tools and creates no OAuth grant or refresh handler.
+Standalone hosted Grayboard integration targeting the published OpenCode **2.1.4** API and official MCP client **2.4.0**. Native HTTP MCP remains the only agent-tool, OAuth, credential-storage and refresh owner. This package adds session ancestry registration and human-approved durable delivery; it registers no agent tools, runs no CLI/proxy and never reads a refresh token or private credential file.
 
 ## Install from Git
 
-Use OpenCode 2.1.4 and a reviewed, publicly available **full 40-character commit hash** containing this package:
+Use a reviewed, publicly available **full 40-character commit hash** containing this package:
 
 ```sh
 opencode plugin add 'github:nolnoch/grayboard#<FULL_40_CHARACTER_SHA>::path:adapters/opencode-v2'
 ```
 
-Replace the placeholder with the complete hash; do not use a mutable branch, tag or abbreviated hash. The same quoted target can be used as the `plugins` package value below. Confirm that the revision is on GitHub before recommending it to others. Git installation loads packaged TypeScript source directly, with no build command or lifecycle hook required. A tarball installation is a separate option, not verification of the Git target.
+Replace the placeholder with the complete hash, not a branch, tag or abbreviated hash. Confirm that revision is on GitHub before recommending it. Package exports and directory wrappers load packaged TypeScript `src/` directly: no build command, generated `dist/`, install script or lifecycle hook is required. A local source-only Git fixture verifies installation mechanics, not public availability of a future revision. Tarball installation is separate and does not satisfy the Git verification gate.
 
-## Build and install locally
+## Configuration
 
-This directory is an independent package; root typechecking does not cover it.
+```json
+{
+  "plugins": [{ "package": "/path/to/installed/grayboard-opencode", "options": { "mcpName": "grayboard" } }],
+  "mcp": { "servers": { "grayboard": { "type": "remote", "url": "https://grayboard.example.com/hosted/mcp" } } }
+}
+```
+
+Use native `/mcps` to sign in. No explicit OAuth client/scopes block or identity header is required. The selected native grant must authorize both `grayboard:tools` and `grayboard:delivery`. Current access and exact issuer/client/scope come from public connection projection; incomplete metadata or expired access fails closed. `Authorization`, `X-Grayboard-Identity`, subscriber-role and lease headers in the native entry are refused. Optional plugin `issuer` pins the exact native issuer string; it is not an endpoint-derived guess.
+
+OpenCode loads the companion `./tui` entry alongside the package. A separate CLI talking to a remote OpenCode server needs the companion installed in its local CLI plugins too. The companion talks to public host RPC; no Grayboard executable is required.
+
+## Approval and binding
+
+`/grayboard-enroll` asks the human to approve the active top-level root for receiving. Approval alone creates no name, lease, cursor movement or receipt. It reports `whoami` and candidates when unbound. A native agent `bind` does not approve receiving. Delivery begins only once the root is both approved and bound, in either order.
+
+`/grayboard-enroll <name>` saves approval first, then binds with `create:false`; a refusal leaves approval standing and shows the server's holder/known-name message. Add `--create` for explicit creation. Optional plugin `name` binds new root sessions without enrolling them; optional `create:true` explicitly permits creation. A configured name is not automatic approval. Separate roots sharing one native config retain separate approvals and delivery targets.
+
+`/grayboard-pause` ends approved roots' ownerships. Their last bound names remain in protected enrollment records; explicit enrollment resumes with `create:false`, never silently creates a replacement, and stops on a held-name refusal. `/grayboard-status` reports the latest root/control outcome. Public RPC exposes `status({})`, `enroll({sessionID,name?,create?})`, and `pause({})`; the companion provides human confirmation, while RPC itself is an authenticated control surface rather than proof of human intent.
+
+## Session attribution and lifecycle
+
+The plugin observes exact native configured tool IDs, including the inner native calls in CodeMode, not its outer `execute` wrapper. Before any descendant Grayboard call it walks `parentID` to the top-level root (at most 16 lookups), rejects missing/repeated/archived ancestry, and awaits `session_register(child,via)` directly under that root. It does not keep a registration cache across ownerships. Native bind completion is accepted only for completed results with validated `result.output`; lease failures are reported after execution, not misrepresented as pre-dispatch rejection.
+
+Subscriber calls carry `_meta["ai.opencode/sessionID"]` from the approved root, using the same current native access. The server's client mapping selects the context source. Roots and children never share delivery targets. Retained routes permit idempotent archive/delete cleanup after host records disappear; child-self `session_end` closes only that child, and root release/end closes the ownership. Host shutdown closes transport without proactively ending ownership, allowing a restart within the server deadline; explicit pause ends ownership immediately when authorized cleanup succeeds.
+
+Native account/configuration drift latches delivery rather than retargeting it. Restoring a saved approval requires both root metadata and the protected plugin-storage fingerprint. No `rootSessionID` startup option manufactures approval. Cleanup requires fresh current access and unchanged binding; when that is unavailable, server expiry remains the backstop.
+
+## Delivery safety
+
+Each lease is validated against the approved endpoint, exact issuer, bound name, ownership and bind generation. Every pending item must match that immutable stamp. Native rebind fences old admission, keeps approval, and opens delivery under the new binding without releasing the ownership. Successful opens reset the recovery counter, including after more than three rebinds. Restart/expiry recovery checks `whoami`, rebinds a remembered name only with `create:false` when unbound, and reopens for the rightful root.
+
+Admission uses public `session.synthetic`, `delivery:queue`, untrusted channel text, and `resume` equal to the actionable flag. Idle digests do not wake execution, but may be evaluated on a later actionable wake. Stable IDs bind authenticated principal, issuer, resource, name, item and root and survive lease/access rotation. A receipt is sent only after durable host acceptance and another public-state guard; it is distinct from `dm_ack`. Failure/uncertain admission sends no receipt. Receipt failure replays the same durable ID before later items.
+
+Public guard and host admission are **not atomic** in OpenCode 2.1.4. A same-root host write already committed during a concurrent pause/rebind/account change cannot be recalled; the post-await guard suppresses its receipt. There is no fallback root or cross-account retry. These checks are not an atomic security snapshot or an exactly-once processing guarantee.
+
+## Build and verification
+
+This independent package is outside root typechecking:
 
 ```sh
 bun install --frozen-lockfile
 bun run typecheck
-bun test
+bun run test
 bun run build:package
 npm pack --ignore-scripts
 ```
 
-The package is not published by these commands. Install the resulting tarball into a dedicated directory, or use this package directory with dependencies installed. OpenCode loads a package/directory, not a tarball URL. Both package exports and directory-discovery wrappers load `src/`; optional generated `dist/` is included when explicitly built before packing, but is never required for installation. The compiler command is deliberately named `build:package`: a script named `build` triggers unnecessary Pacote Git preparation, whose nested npm launcher is absent in the published OpenCode 2.1.4 SDK installer. No install/prepare/prepack hooks are used. The command-only TUI imports the public `tui/plugin` definition subpath without pulling optional Solid rendering peers into source loading.
+The explicit compiler command is named `build:package`: Pacote's Git preparation treats a script literally named `build` specially even with outer scripts disabled, and the published OpenCode 2.1.4 SDK's nested npm launcher is absent. No install/prepare/prepack hooks are used. Optional `dist/` remains packable when explicitly built, but source installation never depends on it. The TUI imports the public `tui/plugin` definition subpath, avoiding optional Solid rendering peers.
 
-Example `opencode.json` (replace the registered example server/client and directory):
+`GRAYBOARD_PACKAGE_TEST_DIR=/path/to/fresh/approved/scratch bun run test:git` creates a disposable source-only Git repo, pins its full hash and subdirectory, and uses the actual installed public OpenCode 2.1.4 host installer with scripts disabled. It asserts active server/TUI/RPC discovery, actual installed-source imports and directory wrappers, inert unenrolled status, and no `dist/`. It does not test interactive TUI rendering or public GitHub availability.
 
-```json
-{
-  "plugins": [
-    {
-      "package": "/path/to/installed/grayboard-opencode",
-      "options": {
-        "mcpName": "grayboard",
-        "issuer": "https://grayboard.example.com/hosted"
-      }
-    }
-  ],
-  "mcp": {
-    "servers": {
-      "grayboard": {
-        "type": "remote",
-        "url": "https://grayboard.example.com/hosted/mcp",
-        "headers": { "X-Grayboard-Identity": "be" },
-        "oauth": {
-          "client_id": "opencode-native",
-          "scope": "grayboard:tools grayboard:delivery"
-        }
-      }
-    }
-  }
-}
-```
-
-The native entry must already exist, be enabled, use OAuth and have both scopes. Static Authorization, subscriber-role and lease headers are refused. The package does not mutate or overwrite that entry. With no options it uses native entry `grayboard`. If native `oauth.auth_server_metadata_url` is absent, the package derives only Grayboard's embedded-AS discovery route from the fixed canonical HTTPS resource: `/mcp` maps to `/.well-known/oauth-authorization-server`, and `/hosted/mcp` maps to `/.well-known/oauth-authorization-server/hosted`. The final literal `/mcp` is required; ambiguous/unsupported paths, queries and userinfo are refused rather than guessing an external issuer. An explicit HTTPS `oauth.auth_server_metadata_url` overrides that derivation and remains a guarded configuration field.
-
-During explicit enrollment, the package reads the selected HTTPS metadata without access/lease/secret headers, with redirects rejected and a timeout. Its response supplies the trusted **exact** issuer; optional plugin `issuer` additionally pins that string, including any significant explicit port/path. Deriving the metadata URL does **not** derive or normalize the issuer identifier: metadata may declare `https://grayboard.example.com:443/hosted` while the canonical resource is `https://grayboard.example.com/hosted/mcp`. The authenticated identity must match both independently. Neither a Host header nor an unstamped native credential establishes the issuer. This read-only metadata lookup is not a second OAuth flow; native MCP still owns sign-in, discovery, the grant and refresh.
-
-Use OpenCode's native `/mcps` sign-in interface. Missing/expired credentials are reported; the subscriber cannot force native refresh. OpenCode remains the sole grant and refresh owner, including its known 2.1.4 native refresh-concurrency limitation.
-
-OpenCode automatically loads `./tui` alongside the package. For a separately installed CLI talking to a remote OpenCode server, install the companion locally too and enable its package directory under the CLI's `plugins` array. The TUI uses the connected server's public RPC API; no local Grayboard executable is needed.
-
-## Explicit enrollment and controls
-
-Open an active **root** session, then run `/grayboard-enroll` or the **Grayboard: enroll current root** palette action and confirm. `/grayboard-pause` stops delivery; `/grayboard-status` reports status. The root is taken from the current session route, not the last user message. Child, archived and deleted targets are refused. No enrollment means no lease, subscriber owner or inbox consumption.
-
-The exported `Grayboard` RPC schema provides `status({})`, `enroll({sessionID})`, and `pause({})` through `client.rpc(Grayboard)` at the selected location. RPC is an authenticated host control surface, not cryptographic proof of human intent; the companion asks for confirmation. An operator may alternatively set `rootSessionID` in plugin options for explicit initial enrollment. Do not set it to an automatically chosen session.
-
-Enrollment reads the authenticated `grayboard://identity` before opening delivery. User ID/email, simple/full identity, exact issuer, canonical resource, native configuration, integration ID, selected connection ID and target root are persisted in `session.metadata["grayboard.enrollment"]`. Plugin storage retains only the explicit root pointer, an enrollment fingerprint, pause state and a rejected-access fingerprint; it stores no credential, bearer or lease capability. Restore requires that pointer/options and a still-matching enabled root tuple whose fingerprint matches protected plugin storage; editing metadata cannot authorize a replacement tuple. Startup restoration is deferred so other plugins can finish configuring native MCP, with a bounded five-second public-read readiness window. A pause or observed binding drift is latched across reload; switching configuration/accounts back does not resume it. Explicit enrollment is required again.
-
-## Binding and authorization
-
-Every request projects **only current access** from public APIs: a fresh temporary tail `mcp.transform` reads selected effective configuration fields; `mcp.list` supplies integration ID; `integration.connection.active` supplies selected credential ID; `integration.get` supplies projected connection status; `connection.resolve` supplies OAuth type/expiry/access. Every explicitly observed integration/selected-credential ID is compared with enrollment before resolution; an observed mismatch latches refusal even if selection subsequently switches back. Configuration is checked again immediately before resolution, and configuration/selection are checked again afterward. No refresh property, private credential file, native rotating grant, copied credential object or cached bearer is used.
-
-The endpoint, identity, OAuth client, normalized scopes, discovery pointer and selected connection are fixed by enrollment. Drift pauses/cancels old work. The HTTP destination is fixed and redirects are rejected. Events are advisory; selection events can latch a pause but do not establish token freshness. A subscriber 401 stops that subscriber and remembers a one-way access fingerprint, without modifying native MCP status or retrying unchanged rejected access. Recovery requires restored native access, explicit enrollment and an actual authorized request, not an event.
-
-OpenCode 2.1.4 provides no public configuration revision/CAS or atomic guard-plus-admission transaction. These are repeated best-effort public-state checks, not an atomic security snapshot. Operators must not treat a configuration event as proof of freshness or an arbitrary metadata edit as enrollment.
-
-## Delivery and receipts
-
-After explicit enrollment, the subscriber opens one delivery lease. The capability exists only in memory and is sent in `X-Grayboard-Lease`, never in a URI. It waits for a `subscriptions/listen` acknowledgment honoring `grayboard://inbox` **before** reading durable pending items. Renewals occur about every ten seconds for a thirty-second server lease; renewal also relistens and reconciles missed hints. Transport loss uses bounded, cancelable exponential backoff (eight interruptions, capped at eight seconds per delay); the SDK is not assumed to replay or relisten. On an expired/not-found lease the old capability is retired. Reacquisition requires another actual authenticated identity read matching the enrolled user ID/email, exact issuer/resource and simple/full identity, plus unchanged native configuration/selected credential and a valid root enrollment. Recovery is bounded to three lease retirements per run. A same-logical-user native reauthorization can therefore recover without a new root enrollment; an observed account/configuration/selected-credential change always latches a pause. Opaque grant-only changes are not observable from the identity resource and are not claimed to be detected. Authorization is always revalidated by the server; no stale-access fallback is used.
-
-Admissions and receipts are serialized. Each item is rendered as untrusted channel/user data and sent using `session.synthetic`, delivery `queue`, metadata source `grayboard`, and `resume` equal to the item's actionable flag. Stable IDs are `msg_` plus SHA-256 of a versioned authenticated-user/issuer/resource/full-identity/item/target-root tuple, independent of access rotation. After awaiting durable host acceptance, the package rechecks root/binding and receipts that one item. First admission/receipt failure stops the prefix; later direct messages are never receipted past it. Retry reuses the stable ID, relying on durable first-wins host deduplication. A receipt is not processing completion, a DM acknowledgment, or an exactly-once execution guarantee.
-
-`resume:false` suppresses an idle wake only. A deferred digest can receive its own model evaluation when a later actionable item wakes execution; it is not permanently context-only. Payloads and batches are bounded; malformed/oversized items remain pending rather than being silently acknowledged. Server receipt-capacity exhaustion stops delivery for explicit operator recovery rather than dropping dedupe records.
-
-Pause/reload/shutdown cancels the loop and closes streams. Cleanup releases an old lease only with fresh access and a still-matching public binding. It never retargets cleanup or uses a cached credential after an account/configuration change; otherwise the server's thirty-second expiry removes ownership. In particular, embedded-host shutdown can make public MCP/integration services unavailable before plugin cleanup, so shutdown may rely on that bounded expiry rather than an immediate release; an explicit pause while the host is running releases promptly. Deleted/archived roots are rechecked before admission and receipt. In-flight public guard/admission races cannot be made atomic by this package.
-
-## Verification
-
-`GRAYBOARD_PACKAGE_TEST_DIR=/path/to/fresh/approved/scratch bun run test:git` creates a disposable source-only Git repository outside the real checkout, pins its full hash and subdirectory, and lets the actual installed OpenCode 2.1.4 SDK host install/load it from configuration with scripts disabled. It asserts active server/TUI/RPC discovery, imports the installed source entries through the published host loader, checks inert unenrolled RPC status and directory wrappers, and rejects any dependence on `dist/`. This verifies local Git transport, not availability of a future GitHub revision or interactive TUI rendering.
-
-`bun test` covers deterministic IDs, payload bounds and contiguous-prefix failure/retry semantics. `bun run test:host` builds and packs the package, installs the local tarball into a directory, checks exports, strictly typechecks the fixture, then loads the installed main entry in the actual embedded OpenCode 2.1.4 runtime. Set an approved isolated scratch directory first:
-
-```sh
-GRAYBOARD_PACKAGE_TEST_DIR=/path/to/approved/scratch bun run test:host
-```
-
-The fixture snapshots the current Grayboard source into that scratch directory; no absolute checkout imports are committed. It uses the actual Grayboard AS/MCP, real native OAuth code/PKCE/consent/callback handling, a trusted fake Google exchange and a loopback fake model. All fixture listeners bind IPv4 explicitly; the child receives only PATH and scratch HOME/XDG/TMPDIR. External traffic is denied before I/O. The installed package's setup runs with real host context; no plugin options are supplied, and only a one-shot admission fault is fixture-injected. No global OpenCode service/config/credentials or real Google/model is used.
-
-The host fixture exercises explicit/invalid roots, native tools, listen acknowledgment, missed hints, digest idle/actionable wake, admission failure, lost/failed receipts, native access rotation, an actual second native account authorization, binding drift/switch-back, lease expiry, revoked access, cleanup and SQLite reopen. TUI controls are strictly typechecked against published APIs and the `./tui` export is resolved in the install test; an interactive TUI was not run. Real browser/TLS/deployment behavior, multi-process ownership, crash/power-loss recovery and atomic account-switch admission are not claimed.
+Unit tests cover ancestry bounds, native public grant projection, approval/binding order, root isolation, awaited registration, retained lifecycle routes, four rebinds, pause/resume, immutable batch stamps and admission/receipt failure fences. The pre-session-contract `test:host` fixture is being migrated to the revised backend contract; its earlier passing run is not evidence for the revised runtime. Final real-backend and exact public Git SHA validation remain integration gates, not claims made by the local fixture.
