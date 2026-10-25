@@ -6,6 +6,8 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { storeAttachment } from "../../src/core/attachments.ts";
+import { SqliteBlobs } from "../../src/local/blobs.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
@@ -112,6 +114,35 @@ test("an unbound session sends, uploads, posts, claims and takes queue work as i
   expect(rows(`SELECT handle FROM outbox WHERE post_id = ?`, item.post_id)).toEqual([{ handle: id }]);
 }, 30_000);
 
+// #284 audit F10: a status set as the ID shows on that session's unbound row.
+test("an unbound session's peer_status shows on its row in peer_list", async () => {
+  const be = await session("be");
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("peer_status", { text: "scoping auth" });
+  const row = ((await be.call("peer_list", {})).unbound_sessions as { session_id: string; status?: string; status_age?: string }[]).find((u) => u.session_id === id);
+  expect(row).toMatchObject({ status: "scoping auth", status_age: "0m" });
+}, 30_000);
+
+// #284 audit P6: a board's roster lists a subscription taken as the ID with
+// that session's facts, and under its name once it binds.
+test("a board's peer_list shows an ID subscriber with its facts, then under the name it binds", async () => {
+  const be = await session("be");
+  const s = await session();
+  const id = await sessionId(s);
+  await be.call("board_create", { name: "e2e", purpose: "x" });
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("peer_status", { text: "on e2e" });
+  const before = (await be.call("peer_list", { board: "e2e" })).peers as { handle: string }[];
+  expect(before.find((p) => p.handle === id)).toMatchObject({ online: true, mode: "push", status: "on e2e" });
+  expect(before.find((p) => p.handle === id)).toHaveProperty("where");
+
+  await s.call("bind", { name: "fe", create: true });
+  const after = (await be.call("peer_list", { board: "e2e" })).peers as { handle: string }[];
+  expect(after.map((p) => p.handle)).toEqual(["be", "fe"]);
+  expect(after.find((p) => p.handle === "fe")).toMatchObject({ online: true, mode: "push", status: "on e2e" });
+}, 30_000);
+
 test("a DM to an unbound session's ID is pushed now, and follows it into the name it binds", async () => {
   const be = await session("be");
   const s = await session();
@@ -177,6 +208,53 @@ test("an @id: mention reaches that session whatever it's bound to; an unknown, e
   await session();
   expect(await refusal(be, "board_post", { board: "e2e", body: `@${id} hi` })).toContain(`error: id_ended: ${id} ended at`);
   expect((await be.call("board_read", { board: "e2e" })).posts.length).toBe(before);
+}, 30_000);
+
+// #284 PR 2 step 2: an upload a session dropped mid-send goes with its end,
+// bytes included, as soon as the end commits.
+test("an ended session's unsent upload is deleted, and its bytes swept, by the opener that ends it", async () => {
+  const s = await session();
+  const id = await sessionId(s);
+  await sigkill(pidOfId(id));
+  // What a send leaves when its process dies between the upload and the send's commit.
+  const db = new Database(join(dir, "bus.db"));
+  try {
+    await storeAttachment(db, new SqliteBlobs(db), id, { filename: "half.txt", type: "text/plain", data: new TextEncoder().encode("never sent") });
+  } finally {
+    db.close();
+  }
+  expect(rows(`SELECT 1 FROM attachment_bytes`).length).toBe(1);
+  const r = await runCli(["claims"], { cwd: dir, env: localEnv(dir) });
+  expect(r.code).toBe(0);
+  expect(endedAt(id)).not.toBeNull();
+  expect(rows(`SELECT 1 FROM attachments WHERE uploader = ?`, id)).toEqual([]);
+  expect(rows(`SELECT 1 FROM attachment_bytes`)).toEqual([]);
+  expect(rows(`SELECT 1 FROM attachment_blobs`)).toEqual([]);
+}, 30_000);
+
+// #284 audit P5(a): the end releases a queue claim the ID held, and the
+// release hands the post to the next lane.
+test("a queue post claimed by an ID that ends is redelivered to the next lane", async () => {
+  const be = await session("be");
+  await be.call("board_create", { name: "work", purpose: "queue", kind: "queue" });
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("board_subscribe", { board: "work", mode: "push" });
+  const item = await be.call("board_post", { board: "work", body: "work item" });
+  const key = `queue:work:${item.post_id}`;
+  await until(() => s.pushes.some((p) => p.meta.post_id === String(item.post_id)));
+  expect(rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([{ holder: id }]);
+
+  const fe = await session("fe");
+  await fe.call("board_subscribe", { board: "work", mode: "push" });
+  await sigkill(pidOfId(id));
+  // The next opener ends it; `claims` exits 2 because the redelivered claim is active.
+  const r = await runCli(["claims"], { cwd: dir, env: localEnv(dir) });
+  expect(r.code).toBe(2);
+  expect(r.err).toContain(`queue:work:${item.post_id} held by fe`);
+  expect(endedAt(id)).not.toBeNull();
+  await until(() => fe.pushes.some((p) => p.meta.post_id === String(item.post_id)));
+  expect(rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([{ holder: "fe" }]);
 }, 30_000);
 
 test("race: a send that commits before the end's transaction is bounced to its sender", async () => {

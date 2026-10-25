@@ -39,8 +39,7 @@ const NOT_ENDED: EndedSession = { held: [], wake: [] };
 
 /**
  * End session `id`. Callers are inside a BEGIN IMMEDIATE transaction and
- * poke `wake` after it commits; freed upload bytes go with the next blob
- * sweep. `why` details the release events (a reap names the dead pid).
+ * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
  * A session already ended is left alone.
  */

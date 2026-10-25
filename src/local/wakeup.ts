@@ -1,5 +1,9 @@
+import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+
+import { sweepBlobs } from "../core/attachments.ts";
 import { sockDir } from "../shared/sockdir.ts";
+import { SqliteBlobs } from "./blobs.ts";
 
 const SOCK_DIR = sockDir();
 
@@ -62,15 +66,17 @@ export function listenForWakeup(identity: string, onWake: WakeupHandler): () => 
 /**
  * After a transaction that ended sessions commits: their sockets go (an
  * ended ID never listens again, and a stale socket costs every probe the
- * retry ladder), and the addresses the end gave mail or posts are woken.
+ * retry ladder), the addresses the end gave mail or posts are woken, and
+ * the bytes of the uploads the end dropped are swept.
  */
-export async function deliverEnded(e: { ended: string[]; wake: string[] }, dir = SOCK_DIR): Promise<void> {
+export async function deliverEnded(db: Database, e: { ended: string[]; wake: string[] }, dir = SOCK_DIR): Promise<void> {
   for (const id of e.ended) {
     try {
       unlinkSync(sockPath(id, dir));
     } catch {}
   }
   await Promise.all(e.wake.map((h) => poke(h, dir)));
+  if (e.ended.length) await sweepBlobs(db, new SqliteBlobs(db));
 }
 
 export async function poke(identity: string, dir = SOCK_DIR): Promise<boolean> {

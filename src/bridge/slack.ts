@@ -36,7 +36,7 @@ export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
 async function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): Promise<void> {
   const { db, ended } = openLocalDb(localDbPath(env));
   try {
-    await deliverEnded(ended, sockDir(env));
+    await deliverEnded(db, ended, sockDir(env));
     const humans = humanHandles(db);
     if (humans.length === 0) await declareLocalHuman(db, handle, sockDir(env));
     else if (!humans.includes(handle)) {

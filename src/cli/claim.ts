@@ -94,7 +94,7 @@ async function localView(): Promise<LocalView> {
   const { deliverEnded } = await import("../local/wakeup.ts");
   const { db, ended, live } = openLocalDb();
   try {
-    await deliverEnded(ended);
+    await deliverEnded(db, ended);
     return { sessions: live, ancestors: ancestors() };
   } finally {
     db.close();
@@ -124,7 +124,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   const { callBoardTool } = await import("../core/tools.ts");
   const { holderOf } = await import("../core/bindings.ts");
   const { deliverEnded, poke } = await import("../local/wakeup.ts");
-  await deliverEnded(openEnded);
+  await deliverEnded(db, openEnded);
   // The human's handle speaks with the human's authority (#announce), which nothing an agent can run may borrow.
   if (isHuman(db, name)) throw new Error(`"${name}" is the human handle; claim commands can't act as it`);
   if (lastSeen(db, name) === null) throw new Error(`no session has used handle "${name}"${hint}`);

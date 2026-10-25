@@ -138,6 +138,22 @@ test("a key already served by a live process under another harness is refused at
   await owner.call("peer_list", {});
 }, 30_000);
 
+// #284 audit W13/P5(b): a second child of the same live harness waits for
+// the first to exit, then refuses while it still serves the session.
+test("a key served by a live process under the same harness is refused after the predecessor wait", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  const env = { BUS_SESSION_KEY: key, BUS_HARNESS_PID: String(process.pid) };
+  const owner = await localSession(dir, undefined, { extra: env });
+  const served = binding(id)!;
+  expect(served).toMatchObject({ pid: process.pid, harness_rule: "env" });
+  const err = await localSession(dir, undefined, { extra: env }).then(() => "started", (e: Error) => e.message);
+  expect(err).toContain(`id_collision: ${id} is served by the live process ${served.attached_pid}`);
+  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ attached_pid: served.attached_pid })]);
+  expect(binding(id)).toMatchObject({ attached_pid: served.attached_pid, detached_at: null });
+  await owner.call("peer_list", {});
+}, 30_000);
+
 test("a tools-only process sharing a live session's key is refused: it never attaches", async () => {
   const key = mintSessionKey();
   const id = idAddress(key);

@@ -820,11 +820,11 @@ export function viewers(db: Database): (handle: string) => boolean {
   return (h) => h.startsWith("~") || h.includes("/~") || ids.has(h);
 }
 
-// A live session with no name yet (#182): shown so the user and other agents
-// see what's running, never messageable, so it has no handle.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; self?: true };
+// A live session with no name yet (#182), addressed by its session ID
+// (#284), with the status it set as that ID.
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true };
 
-// `you` is left out for an unbound session: its "~" handle can't be addressed.
+// `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The session an alias's metadata comes from (#284): its holder, or once
@@ -857,16 +857,26 @@ export function who(
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
     const acc = access(db);
-    rows = (
-      db
-        .prepare(
-          `SELECT s.handle, s.mode, ${cols} FROM subscriptions s
-             LEFT JOIN aliases a ON a.address = s.handle
-             LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
-            WHERE s.board = ? ORDER BY s.handle`,
-        )
-        .all(b.name) as typeof rows
-    ).filter((r) => acc.canSee(r.handle, b));
+    // A subscription an unbound session took as its ID is listed under the
+    // name the session now holds (as queueLanes does), or as the ID with its
+    // own session's facts; a name's own subscription wins over its ID's.
+    const idCols = `COALESCE(a.last_seen, i.last_seen) AS last_seen, i.cwd, i.place,
+      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
+      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
+    const subs = db
+      .prepare(
+        `SELECT m.handle, m.mode, m.own, ${idCols} FROM (
+             SELECT COALESCE(ah.address, s.handle) AS handle, s.mode, ah.address IS NULL AS own
+               FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle WHERE s.board = ?) m
+           LEFT JOIN aliases a ON a.address = m.handle
+           LEFT JOIN ids i ON i.id = COALESCE(${ALIAS_SESSION_SQL}, m.handle)
+          ORDER BY m.handle, m.own DESC`,
+      )
+      .all(b.name) as (Row & { own: number })[];
+    rows = subs
+      .filter((r, n) => n === 0 || subs[n - 1]!.handle !== r.handle)
+      .map(({ own: _, ...r }) => r)
+      .filter((r) => acc.canSee(r.handle, b));
   } else {
     rows = db
       .prepare(
@@ -892,7 +902,7 @@ export function who(
       ...(r.launcher ? { launcher: true as const } : {}),
     };
   });
-  // Unbound sessions subscribe to nothing, so a board's roster has none.
+  // A board's roster lists its unbound subscribers by ID among its peers.
   const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
   const you = isViewer(handle) ? {} : { you: handle };
   if (opts.include_offline) return { ...you, peers: all, ...sessions };

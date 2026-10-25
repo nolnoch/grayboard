@@ -379,11 +379,12 @@ export function callBoardTool(
         optNum(a, "parent_id") ?? null,
         { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits }, strictIds: true },
       );
+      const isViewer = viewers(db);
       const result: BoardPostResult = {
         post_id: p.id,
         board: p.board,
         ...(p.attachments ? { attachments: p.attachments } : {}),
-        notified: wake.filter((h) => !viewers(db)(h)),
+        notified: wake.filter((h) => !isViewer(h)),
         ...(deferred.length ? { deferred } : {}),
         ...(unresolved.length ? { unresolved } : {}),
       };

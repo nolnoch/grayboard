@@ -245,7 +245,7 @@ if (!PUSH) {
     const r = n.ok
       ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
       : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
-    await deliverEnded(r.ended);
+    await deliverEnded(db, r.ended);
     if (r.ok) {
       bound = r.name;
       restored = r.restored;
@@ -253,12 +253,12 @@ if (!PUSH) {
     } else unboundNotes.push(restoreNote(rec.name, r.error));
   } else if (EXPLICIT && !attached) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
-    await deliverEnded(r.ended);
+    await deliverEnded(db, r.ended);
     if (r.ok) bound = r.name;
     else if (HUMAN) {
       // A bridge has no agent to read a candidate list; refuse loudly.
       console.error(`[grayboard] ${r.error}`);
-      await deliverEnded(endLocalSession(db, SESSION_ID));
+      await deliverEnded(db, endLocalSession(db, SESSION_ID));
       process.exit(1);
     } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
@@ -630,14 +630,24 @@ async function liveHandles(self: string[]): Promise<(h: string) => boolean> {
   return (h) => live.has(h);
 }
 
-// Live sessions with no name yet, for peer_list, delivering what ending the
-// dead ones it found produced.
+// Live sessions with no name yet, for peer_list, with the status each set as
+// its ID, delivering what ending the dead ones it found produced.
 async function unboundPeers(): Promise<UnboundPeer[]> {
   const { alive, ...ended } = liveSessions(db);
-  await deliverEnded(ended);
-  return alive
-    .filter((r) => r.name === null)
-    .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
+  await deliverEnded(db, ended);
+  const unbound = alive.filter((r) => r.name === null);
+  const statuses = new Map(
+    (
+      db
+        .prepare(`SELECT id, status, status_at FROM ids WHERE status IS NOT NULL AND id IN (SELECT value FROM json_each(?))`)
+        .all(JSON.stringify(unbound.map((r) => r.session_id))) as { id: string; status: string; status_at: number | null }[]
+    ).map((r) => [r.id, r]),
+  );
+  const now = Date.now();
+  return unbound.map((r) => {
+    const s = statuses.get(r.session_id);
+    return unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+  });
 }
 
 // Drain: emit unread direct messages and pending board items as channel
@@ -734,7 +744,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     await inflight;
     const previous = bound;
     const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
-    await deliverEnded(r.ended);
+    await deliverEnded(db, r.ended);
     if (!r.ok) return fail(r.error);
     // The row holds the new name from here: so does this process, whatever
     // follows fails, or the finally's drain would read a name it no longer holds.
@@ -816,7 +826,7 @@ const shutdown = async () => {
   }
   sessionEnded = true;
   if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
-  await Promise.race([deliverEnded(ended).catch(() => {}), Bun.sleep(SHUTDOWN_WAKE_MS)]);
+  await Promise.race([deliverEnded(db, ended).catch(() => {}), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   process.exit(0);
 };
 process.on("SIGINT", () => void shutdown());
@@ -827,7 +837,7 @@ process.stdin.on("end", () => void shutdown());
 process.stdin.on("close", () => void shutdown());
 // What this process's open ended (db.ts): bounces and releases to wake. After
 // the exit handlers, so a client gone during it still ends this session.
-await deliverEnded(openEnded);
+await deliverEnded(db, openEnded);
 
 if (DELIVER) {
   stopIdListening = listenForWakeup(SESSION_ID, onWake);

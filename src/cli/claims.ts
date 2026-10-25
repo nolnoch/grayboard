@@ -16,7 +16,7 @@ async function localClaims(prefix: string | undefined): Promise<ListedClaim[]> {
   const { deliverEnded } = await import("../local/wakeup.ts");
   const { db, ended } = openLocalDb();
   try {
-    await deliverEnded(ended);
+    await deliverEnded(db, ended);
     return listClaims(db, prefix).map(({ board: _b, ...c }) => c);
   } finally {
     db.close();

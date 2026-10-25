@@ -20,7 +20,7 @@ export function parseTtl(text: string): number {
 
 /** Show the declared human handle, or declare `handle` as it. */
 export async function runHuman(handle?: string): Promise<void> {
-  await deliverEnded(openEnded);
+  await deliverEnded(db, openEnded);
   if (handle === undefined) {
     const humans = humanHandles(db);
     console.log(humans.length ? humans.join("\n") : "No human handle declared. Declare yours: grayboard human <handle>");
@@ -41,7 +41,7 @@ export function declaredHuman(): string {
 
 /** Post an announcement as the human to every live session. */
 export async function runAnnounce(body: string, ttl?: string): Promise<void> {
-  await deliverEnded(openEnded);
+  await deliverEnded(db, openEnded);
   const human = declaredHuman();
   const ttl_ms = ttl === undefined ? undefined : parseTtl(ttl);
   // Probing a socket also wakes its session; it drains nothing until the post lands.
@@ -63,7 +63,7 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
 /** Create a board as the human. It starts quiet for them: replies to their
  * posts and @mentions still arrive, every other post doesn't. */
 export async function runBoardCreate(name: string, purpose: string): Promise<void> {
-  await deliverEnded(openEnded);
+  await deliverEnded(db, openEnded);
   const human = declaredHuman();
   const b = createBoard(db, human, name, purpose);
   subscribe(db, human, b.name, "quiet");

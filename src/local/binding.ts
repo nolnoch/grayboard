@@ -1,6 +1,7 @@
-// Local name binding (#182, #284). Every grayboard mcp process that owns
-// delivery writes a bindings row at start, keyed by its session ID: its
-// liveness (pid, start time, harness pid). Its facts are its ids row. A keyed
+// Local name binding (#182, #284). Every grayboard mcp process (tools-only
+// ones too) and every `tail` writes a bindings row at start, keyed by its
+// session ID: its liveness (pid, start time, harness pid). Its facts are its
+// ids row. A keyed
 // session (BUS_SESSION_KEY) lives as long as its harness: the row's pid is
 // the harness's, and the grayboard mcp child serving it attaches and detaches
 // (#284 decision 3). A name
@@ -415,16 +416,12 @@ export async function siblingGone(db: Database, name: string, harnessPid: number
   }
 }
 
-/**
- * This session ends (a clean exit, or a refusal at start). `held` is the
- * name it still held, if any, so the caller removes that name's socket.
- */
-export function endLocalSession(db: Database, sessionId: string): Ended & { held: string | null } {
+/** This session ends: a clean exit, or a refusal at start. */
+export function endLocalSession(db: Database, sessionId: string): Ended {
   return db.transaction(() => {
-    const r = end(db, sessionId, null, Date.now());
     const out: Ended = { ended: [], wake: [] };
-    merge(out, sessionId, r);
-    return { ...out, held: r.held[0] ?? null };
+    merge(out, sessionId, end(db, sessionId, null, Date.now()));
+    return out;
   }).immediate();
 }
 
@@ -475,7 +472,7 @@ export const QUEUED_FOR_SQL = `SELECT j.value AS name,
 export async function candidateNames(db: Database, suggested: string | null): Promise<Candidate[]> {
   const sessions = liveSessions(db);
   // The sessions this check found dead were ended: their bounces and releases wake now.
-  await deliverEnded(sessions);
+  await deliverEnded(db, sessions);
   const live = new Set(sessions.alive.map((r) => r.name).filter((n): n is string => n !== null));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);

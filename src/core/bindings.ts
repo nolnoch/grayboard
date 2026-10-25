@@ -268,8 +268,15 @@ export function bindTarget(a: Record<string, unknown>, bound: string | null, pus
 }
 
 /** peer_list's row for a live session with no name. */
-export function unboundPeer(sessionId: string, where: string | null, self: boolean): UnboundPeer {
-  return { session_id: sessionId, unbound: true, online: true, ...(where ? { where } : {}), ...(self ? { self: true } : {}) };
+export function unboundPeer(sessionId: string, where: string | null, self: boolean, status?: { text: string; age: string }): UnboundPeer {
+  return {
+    session_id: sessionId,
+    unbound: true,
+    online: true,
+    ...(where ? { where } : {}),
+    ...(status ? { status: status.text, status_age: status.age } : {}),
+    ...(self ? { self: true } : {}),
+  };
 }
 
 /**

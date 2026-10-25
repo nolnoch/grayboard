@@ -24,12 +24,12 @@ function fmt(p: Post): string {
 }
 
 export async function runTail(boardInput: string, backlog: number): Promise<void> {
-  await deliverEnded(openEnded);
+  await deliverEnded(db, openEnded);
   const board = normalizeBoard(boardInput);
   const handle = idAddress(mintSessionKey());
   registerSession(db, thisSession(handle), { viewer: true });
   // Ending it drops its subscription and pushes with every other trace.
-  const end = () => deliverEnded(endLocalSession(db, handle));
+  const end = () => deliverEnded(db, endLocalSession(db, handle));
 
   try {
     subscribe(db, handle, board, "push");
