@@ -192,12 +192,24 @@ class HelloTimeout extends Error {}
 // so a stuck server is an error, not a timeout. BUS_TEST_HELLO_MS shortens it
 // for tests.
 const HELLO_MS = Number(process.env.BUS_TEST_HELLO_MS) || 10_000;
-const helloWithin = (c: GrayboardClient): Promise<HelloOk> => Promise.race([
-  c.ready(),
-  new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new HelloTimeout(`no answer from grayboard server at ${serverUrl} within ${HELLO_MS / 1000}s`)), HELLO_MS),
-  ),
-]);
+// While the server rate-limits the hello, wait longer, still under that 30s (#210).
+const HELLO_LIMITED_MS = 25_000;
+const helloWithin = (c: GrayboardClient): Promise<HelloOk> => {
+  let timer: Timer | undefined;
+  const start = Date.now();
+  const deadline = new Promise<never>((_, reject) => {
+    const check = () => {
+      const limited = c.rateLimited();
+      const waited = Date.now() - start;
+      if (limited && waited < HELLO_LIMITED_MS) return void (timer = setTimeout(check, Math.min(1000, HELLO_LIMITED_MS - waited)));
+      reject(new HelloTimeout(limited
+        ? `the grayboard server at ${serverUrl} is rate-limiting this user's connections (${limited}); gave up after ${Math.round(waited / 1000)}s`
+        : `no answer from grayboard server at ${serverUrl} within ${HELLO_MS / 1000}s`));
+    };
+    timer = setTimeout(check, HELLO_MS);
+  });
+  return Promise.race([c.ready(), deadline]).finally(() => clearTimeout(timer));
+};
 
 const OLD_SERVER = "this grayboard server predates unbound sessions, so reads are unavailable until you bind a name; the server needs updating";
 // A bad_request on a read-only hello is taken for an old server; its message

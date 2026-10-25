@@ -16,6 +16,7 @@ export type AuditAction =
   | "auth.session_revoked"
   | "auth.user_disabled"
   | "auth.user_enabled"
+  | "hello.rate_limited"
   | "identity.created"
   | "identity.deleted"
   | "slack.linked"

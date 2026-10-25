@@ -38,10 +38,24 @@ export function sessionIdOf(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-/** One binding_events row. */
+/** One binding_events row, or one more repeat on a refusal's row. */
 export function logBinding(db: Database, sessionId: string, name: string, event: BindingEvent, detail: string | null = null, at = Date.now()): void {
+  // A retry loop refused for the same reason is one row with a count, not a
+  // row per attempt (#210).
+  if (event === "refused") {
+    const last = db.prepare(
+      `SELECT id, event, detail, COALESCE(last_at, at) AS seen FROM binding_events WHERE session_id = ? AND name = ? ORDER BY id DESC LIMIT 1`,
+    ).get(sessionId, name) as { id: number; event: string; detail: string | null; seen: number } | null;
+    if (last?.event === "refused" && last.detail === detail && at - last.seen <= REFUSED_COALESCE_MS) {
+      db.prepare(`UPDATE binding_events SET count = COALESCE(count, 1) + 1, last_at = ? WHERE id = ?`).run(at, last.id);
+      return;
+    }
+  }
   db.prepare(`INSERT INTO binding_events (session_id, name, event, at, detail) VALUES (?, ?, ?, ?, ?)`).run(sessionId, name, event, at, detail);
 }
+
+/** How long after a refusal an identical one from the same session joins its row. */
+export const REFUSED_COALESCE_MS = 60_000;
 
 /**
  * Whether `sessionId` holds `name` by the record: the latest bound or moved

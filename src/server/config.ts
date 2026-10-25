@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
+import { DEFAULT_HELLO_LIMIT, type HelloLimit } from "./hello_limit.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
@@ -24,6 +25,8 @@ export type Config = {
   attachmentLimits?: AttachmentLimits;
   // The bytes of attachments one user may store, sent or not.
   attachmentUserQuota?: number;
+  // Hellos per user: the burst, and the refill per second (#210).
+  helloLimit?: HelloLimit;
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -58,6 +61,7 @@ export function loadConfig(): Config {
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
+    helloLimit: parseHelloLimit(process.env),
     ...slackConfig(),
   };
 }
@@ -81,6 +85,21 @@ function parseAttachmentLimits(env: Record<string, string | undefined>): { attac
   const quota = bytes("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", DEFAULT_ATTACHMENT_USER_QUOTA);
   if (quota < total) throw new Error("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES can't be less than GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
   return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
+}
+
+function parseHelloLimit(env: Record<string, string | undefined>): HelloLimit {
+  const burst = env.GRAYBOARD_HELLO_BURST;
+  const perSec = env.GRAYBOARD_HELLO_PER_SEC;
+  if (burst !== undefined && burst !== "" && !/^[1-9][0-9]*$/.test(burst)) {
+    throw new Error(`GRAYBOARD_HELLO_BURST must be a positive whole number, not "${burst}"`);
+  }
+  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) > 0)) {
+    throw new Error(`GRAYBOARD_HELLO_PER_SEC must be a positive number, not "${perSec}"`);
+  }
+  return {
+    burst: burst ? Number(burst) : DEFAULT_HELLO_LIMIT.burst,
+    perSec: perSec ? Number(perSec) : DEFAULT_HELLO_LIMIT.perSec,
+  };
 }
 
 function parseReach(raw: string | undefined): HumanReach {

@@ -6,6 +6,7 @@ import {
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
+import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
 import {
   acknowledge,
   age,
@@ -79,6 +80,8 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
+  // Hellos per user: the burst, and the refill rate (#210).
+  helloLimit?: HelloLimit;
 };
 
 // Per server instance.
@@ -100,6 +103,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  helloLimiter: HelloLimiter;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -163,6 +167,14 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    // Logged and audited once per run of refusals, so a loop floods neither.
+    helloLimiter: new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+      start: (_id, email) => {
+        console.error(`[grayboard] rate-limiting hellos from ${email}`);
+        writeAudit(repo, "hello.rate_limited", email, null);
+      },
+      end: (_id, email, refused) => console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`),
+    }),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -309,6 +321,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
+      hub.helloLimiter.sweep();
       for (const ws of [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
@@ -334,6 +347,17 @@ function describeHolder(ws: Ws): string {
 async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const { repo, db, registry, holders } = hub;
   const reqId = m.req_id;
+  // First, before anything reads or writes the database. The Slack bridge's
+  // in-process connections are the server's own.
+  if (!ws.data.human) {
+    const t = hub.helloLimiter.take(ws.data.authed.user_id, ws.data.authed.user_email);
+    if (!t.ok) {
+      const secs = Math.ceil(t.retryAfterMs / 1000);
+      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${secs}s`, retry_after_ms: t.retryAfterMs });
+      ws.close();
+      return;
+    }
+  }
   const push = m.push !== false;
   // Whether this connection holds its name: a push one, or a hold one, whose
   // harness can't show pushes (#182 audit 2). A tools-only one doesn't.

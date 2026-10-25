@@ -102,7 +102,8 @@ export type CallOk      = { type: "call_ok";    req_id: string; result: unknown 
 export type BoardPush   = { type: "board_push"; item: Pending };
 // known: with identity_unknown, the user's names closest to the one asked for.
 // holder: with identity_in_use, the live session that holds the name.
-export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string };
+// retry_after_ms: on a rate_limited hello, the wait until one is accepted again.
+export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
 
 export type ServerMessage =
   | HelloOk | SendOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage

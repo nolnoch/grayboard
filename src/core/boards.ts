@@ -972,7 +972,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
-    db.prepare(`DELETE FROM binding_events WHERE at < ?`).run(olderThanMs);
+    db.prepare(`DELETE FROM binding_events WHERE COALESCE(last_at, at) < ?`).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();
 }

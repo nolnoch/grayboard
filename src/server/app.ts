@@ -20,7 +20,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
   const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake } = createWsHandlers(repo, db, {
-    humanReach, slackRunning: () => slack?.running ?? false, ...opts,
+    humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, ...opts,
   });
 
   // The deferred session-touch queue this server owns; stop() cancels it
