@@ -6,10 +6,16 @@ export type HelloLimit = { burst: number; perSec: number };
 
 export const DEFAULT_HELLO_LIMIT: HelloLimit = { burst: 60, perSec: 1 };
 
-// A run of refusals for one user: from the first refusal to the next
-// accepted hello, or to the sweep that finds the bucket refilled.
+// What the tripping hello asked for, carried to the streak's start so the
+// audit row says which session, name and place set it off.
+export type HelloContext = Record<string, unknown>;
+
+// A run of refusals for one user: from the first refusal until the bucket is
+// full again, seen by a take or by the sweep. Ending it at any accepted hello
+// would let a loop just faster than the refill alternate accept and refuse,
+// starting a new streak (and an audit row) at every refusal.
 export type StreakHooks = {
-  start(userId: number, email: string): void;
+  start(userId: number, email: string, ctx: HelloContext, retryAfterMs: number): void;
   end(userId: number, email: string, refused: number): void;
 };
 
@@ -27,15 +33,16 @@ export class HelloLimiter {
   ) {}
 
   /** Spend one hello for `userId`, or say how long until one is back. */
-  take(userId: number, email: string): Take {
+  take(userId: number, email: string, ctx: HelloContext = {}): Take {
     const b = this.refill(userId, email);
+    if (b.tokens >= this.limit.burst) this.endStreak(userId, b);
     if (b.tokens >= 1) {
       b.tokens -= 1;
-      this.endStreak(userId, b);
       return { ok: true };
     }
-    if (b.refused++ === 0) this.hooks.start(userId, email);
-    return { ok: false, retryAfterMs: Math.ceil(((1 - b.tokens) / this.limit.perSec) * 1000) };
+    const retryAfterMs = Math.ceil(((1 - b.tokens) / this.limit.perSec) * 1000);
+    if (b.refused++ === 0) this.hooks.start(userId, email, ctx, retryAfterMs);
+    return { ok: false, retryAfterMs };
   }
 
   /** Drop the buckets that have refilled, ending their streaks first. */

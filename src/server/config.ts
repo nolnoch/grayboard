@@ -72,13 +72,7 @@ const MAX_FILE_CEILING = 100 * 1024 * 1024;
 const MAX_TOTAL_CEILING = 250 * 1024 * 1024;
 
 function parseAttachmentLimits(env: Record<string, string | undefined>): { attachmentLimits: AttachmentLimits; attachmentUserQuota: number } {
-  const bytes = (name: string, fallback: number, ceiling = Infinity): number => {
-    const raw = env[name];
-    if (raw === undefined || raw === "") return fallback;
-    if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive number of bytes, not "${raw}"`);
-    if (Number(raw) > ceiling) throw new Error(`${name} can be at most ${ceiling} bytes`);
-    return Number(raw);
-  };
+  const bytes = (name: string, fallback: number, ceiling = Infinity) => positiveInt(env, name, fallback, ceiling, "bytes");
   const file = bytes("GRAYBOARD_ATTACHMENT_MAX_BYTES", DEFAULT_ATTACHMENT_LIMITS.file, MAX_FILE_CEILING);
   const total = bytes("GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_ATTACHMENT_LIMITS.total, MAX_TOTAL_CEILING);
   if (file > total) throw new Error("GRAYBOARD_ATTACHMENT_MAX_BYTES can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
@@ -87,19 +81,31 @@ function parseAttachmentLimits(env: Record<string, string | undefined>): { attac
   return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
 }
 
+// The rate's floor keeps the longest wait (one token, 1/perSec) inside a
+// client's startup window (src/plugin/mcp.ts), so a limited session can still
+// start; the burst's ceiling keeps a typo from switching the limit off.
+const MIN_HELLO_PER_SEC = 0.1;
+const MAX_HELLO_BURST = 10_000;
+
 function parseHelloLimit(env: Record<string, string | undefined>): HelloLimit {
-  const burst = env.GRAYBOARD_HELLO_BURST;
   const perSec = env.GRAYBOARD_HELLO_PER_SEC;
-  if (burst !== undefined && burst !== "" && !/^[1-9][0-9]*$/.test(burst)) {
-    throw new Error(`GRAYBOARD_HELLO_BURST must be a positive whole number, not "${burst}"`);
-  }
-  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) > 0)) {
-    throw new Error(`GRAYBOARD_HELLO_PER_SEC must be a positive number, not "${perSec}"`);
+  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) >= MIN_HELLO_PER_SEC)) {
+    throw new Error(`GRAYBOARD_HELLO_PER_SEC must be a number of at least ${MIN_HELLO_PER_SEC}, not "${perSec}"`);
   }
   return {
-    burst: burst ? Number(burst) : DEFAULT_HELLO_LIMIT.burst,
+    burst: positiveInt(env, "GRAYBOARD_HELLO_BURST", DEFAULT_HELLO_LIMIT.burst, MAX_HELLO_BURST, "hellos"),
     perSec: perSec ? Number(perSec) : DEFAULT_HELLO_LIMIT.perSec,
   };
+}
+
+// A positive whole-number setting: unset or empty takes the fallback.
+// Plain digits only, so "1e3" and " 8" don't slip through Number().
+function positiveInt(env: Record<string, string | undefined>, name: string, fallback: number, ceiling: number, unit: string): number {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive whole number of ${unit}, not "${raw}"`);
+  if (Number(raw) > ceiling) throw new Error(`${name} can be at most ${ceiling} ${unit}`);
+  return Number(raw);
 }
 
 function parseReach(raw: string | undefined): HumanReach {

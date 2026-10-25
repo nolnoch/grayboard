@@ -137,6 +137,9 @@ export class GrayboardClient {
         this.limited!.retryMs = null;
         return void this.reconnectIn(retryMs, `rate limited (${this.limited!.message})`);
       }
+      // Any other close (the network, the server going away) is not the
+      // limit: a stale reason would make startup wait it out and blame it.
+      this.limited = null;
       if (neverOpened) void this.checkToken();
       this.scheduleReconnect();
     };
@@ -200,7 +203,7 @@ export class GrayboardClient {
         // so a fleet doesn't come back in lockstep, and try again. ready()
         // stays pending; a caller's own deadline decides (#210).
         if (msg.code === "rate_limited" && !this.helloData && msg.req_id === this.helloId) {
-          this.limited = { message: msg.message, retryMs: Math.round((msg.retry_after_ms ?? this.backoffMs) * (1 + Math.random() / 2)) };
+          this.limited = { message: msg.message, retryMs: Math.round(retryWait(msg.retry_after_ms, this.backoffMs) * (1 + Math.random() / 2)) };
           this.ws?.close();
           break;
         }
@@ -291,7 +294,13 @@ export class GrayboardClient {
    *  Returns this connection's hello_ok, which a reconnect replaces. */
   assertConnected(): HelloOk {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
-      throw new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly");
+      const limited = this.rateLimited();
+      throw new Error(
+        this.refused ??
+          (limited
+            ? `not connected to the grayboard server: it is rate-limiting this user's connections (${limited}); reconnecting when it allows`
+            : "not connected to the grayboard server (reconnecting); try again shortly"),
+      );
     }
     return this.helloData;
   }
@@ -336,4 +345,14 @@ export class GrayboardClient {
     console.error(`[grayboard] ${reason}`);
     this.opts.onDead?.(reason);
   }
+}
+
+// The server's wait, trusted only within bounds: a missing, non-finite or
+// absurd value (a timer past 2^31 ms fires at once in Bun) falls back to the
+// backoff, so no server answer can make a hot reconnect loop.
+const MIN_RETRY_MS = 100;
+const MAX_RETRY_MS = 30_000;
+export function retryWait(serverMs: unknown, backoffMs: number): number {
+  if (typeof serverMs !== "number" || !Number.isFinite(serverMs) || serverMs < 0) return backoffMs;
+  return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, serverMs));
 }
