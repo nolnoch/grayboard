@@ -139,3 +139,60 @@ describe("factory bus", () => {
     }
   });
 });
+
+// The OpenCode translator wired into the module run loop (#265): a persona
+// resolving to a fixture agent renders the Task directive in the thread; an
+// unknown persona declines in-thread so the rotation/human path is visible.
+// No live OpenCode spawn happens here (no harness credentials in CI) — the
+// directive is the deliverable; the spawn itself is the launcher harness's.
+describe("opencode translator", () => {
+  test("a resolvable persona renders the Task directive; an unknown one declines in-thread", async () => {
+    token = await srv.login("you@example.com");
+    const sim = await srv.session(token, "sim");
+    // The fixture agents dir the module reads (OPENCODE_AGENTS_ROOT).
+    const agentsDir = join(dir, "agents-root", ".opencode", "agents");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(
+      join(agentsDir, "researcher.md"),
+      "---\nname: researcher\ndescription: A researcher persona for deep dives\nmodel: anthropic/claude-sonnet-4\n---\n# researcher\n",
+    );
+    const proc = Bun.spawn([process.execPath, join("adapters", "factory", "main.ts")], {
+      env: { ...process.env, ...factoryEnv(), GRAYBOARD_CREDENTIALS: "", OPENCODE_AGENTS_ROOT: join(dir, "agents-root") },
+      cwd: join(import.meta.dir, "..", ".."),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      await until(async () => {
+        const peers = (await call(sim.c, "peer_list")) as { peers: { handle: string; online?: boolean; launcher?: true }[] };
+        const f = peers.peers.find((p) => p.handle === "you@example.com/factory");
+        return f?.online === true && f.launcher === true;
+      }, 10_000, "the factory launcher to appear online");
+
+      // Resolvable persona: the directive replaces the skeleton receipt.
+      const r = (await call(sim.c, "delegate", { persona: "a researcher persona", task: "survey the factory", to: "factory" })) as { message_id: number };
+      await until(async () => {
+        const inbox = (await call(sim.c, "dm_inbox")) as { promised?: { id: number }[] };
+        return inbox.promised?.some((p) => p.id === r.message_id) === true;
+      }, 10_000, "the delegation promise to appear");
+      const thread = (await call(sim.c, "dm_thread", { thread: r.message_id })) as { body: string }[];
+      const reply = thread.find((m) => m.body.includes("@researcher"));
+      expect(reply).toBeDefined();
+      expect(reply?.body).toContain("survey the factory");
+      expect(reply?.body).not.toContain("[factory] received");
+
+      // Unknown persona: declined in-thread, naming the persona.
+      const r2 = (await call(sim.c, "delegate", { persona: "philosopher", task: "ponder", to: "factory" })) as { message_id: number };
+      await until(async () => {
+        const inbox = (await call(sim.c, "dm_inbox")) as { promised?: { id: number }[] };
+        return inbox.promised?.some((p) => p.id === r2.message_id) === true;
+      }, 10_000, "the second delegation promise to appear");
+      const thread2 = (await call(sim.c, "dm_thread", { thread: r2.message_id })) as { body: string }[];
+      expect(thread2.some((m) => m.body.includes("philosopher") && m.body.startsWith("[factory]"))).toBe(true);
+    } finally {
+      proc.kill();
+      await proc.exited;
+    }
+  });
+});
