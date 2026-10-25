@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
-import { piMissingBinaryScenario, piReenabledScenario, piScenario, piStdinClosedScenario, piUnboundScenario } from "../support/pi.ts";
+import { piChildScenario, piChildUnboundScenario, piMissingBinaryScenario, piReenabledScenario, piScenario, piStdinClosedScenario, piUnboundScenario } from "../support/pi.ts";
 
 let dir: string;
 
@@ -19,6 +19,8 @@ afterEach(async () => {
 });
 
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
+test("pi child (#244): a subagent bound by its launcher's bindings holds its own name and answers a DM on it, ignoring the leaked parent identity", () => piChildScenario(dir), 90_000);
+test("pi child unbound (#244): with no bindings the child runs read-only on the leaked env — a send is refused, no name taken", () => piChildUnboundScenario(dir), 90_000);
 test("pi unbound: reads work, writes are refused; bind and rebind through the extension's tool bind the session's one grayboard", () => piUnboundScenario(dir), 90_000);
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
