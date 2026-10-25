@@ -515,8 +515,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     // Only a push-mode owner advertises the capability (a hold or tools-only
-    // connection can't receive a delegation, so it must not be one), and its
-    // flag flip is audited (#184 review 4/6).
+    // connection can't receive a delegation, so it must not be one). Every
+    // owner hello rewrites the flag and audits it, changed or not (#184 review 4/6).
     if (push) {
       setLauncher(db, full, m.launcher === true);
       writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });

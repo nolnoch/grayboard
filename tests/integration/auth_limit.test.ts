@@ -83,7 +83,7 @@ test("valid traffic, 403s and 404s never spend; a 401 on any path does", async (
     expect((await get(srv, "/api/nothing-here", alice, X)).status).toBe(404);
   }
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
-  // requireAuth runs before routing: an unknown path with a bad token is a 401.
+  // An unknown path isn't a public route, so requireAuth answers it: a bad token is a 401, charged by chargeIf401.
   expect((await get(srv, "/api/nothing-here", "bad", X)).status).toBe(401);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
 });
