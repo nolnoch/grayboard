@@ -8,7 +8,7 @@
 //
 // The name rule itself (`[a-z0-9_-]{1,32}`) lives in src/shared/addressing.ts.
 import { isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { SESSION_ID } from "./bindings.ts";
+import { SESSION_ID } from "./session_id.ts";
 import { CoreError } from "./errors.ts";
 
 export type ParsedAddress =

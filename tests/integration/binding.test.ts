@@ -13,7 +13,7 @@ import { call, closeSessions, localSession, stopSession as stop, type Session } 
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
-import { crockford13 } from "../../src/core/bindings.ts";
+import { crockford13 } from "../../src/core/session_id.ts";
 
 let dir: string;
 

@@ -6,6 +6,8 @@ import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope } from "./addresses.ts";
 import { writeCoreAudit } from "./audit.ts";
+import { SESSION_ID_PATTERN } from "./session_id.ts";
+import { assertDeliverableId } from "./session_end.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -21,10 +23,13 @@ export function checkBody(body: unknown): string {
   }
   return body;
 }
-// @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
-// so plain email addresses in prose aren't mentions.
-const MENTION_RE =
-  /(?:^|[^\w@])@([a-z0-9._%+-]+(?:@[a-z0-9.-]+\.[a-z]{2,})?(?:\/[a-z0-9_-]{1,32})?)/gi;
+// @id:<13 Crockford> (a session, #284), @name, @local/name, @user@org.com/name.
+// Not preceded by a word char or @, so plain email addresses in prose aren't
+// mentions. A malformed @id:… is the alias "id", as before IDs.
+const MENTION_RE = new RegExp(
+  `(?:^|[^\\w@])@(${SESSION_ID_PATTERN}(?![0-9a-z])|[a-z0-9._%+-]+(?:@[a-z0-9.-]+\\.[a-z]{2,})?(?:\\/[a-z0-9_-]{1,32})?)`,
+  "gi",
+);
 
 export type SubMode = "push" | "digest" | "quiet";
 
@@ -89,7 +94,13 @@ export const openAccess = (db: Database): Access => ({
   announceBoard: ANNOUNCE_BOARD,
   canSee: () => true,
   checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
+  // An @id: is the session itself; one that can't receive refuses the post,
+  // as a direct message to it would (#284 S7, S9).
   resolveMention: (token) => {
+    if (addressParts(token)?.kind === "id") {
+      assertDeliverableId(db, token);
+      return token;
+    }
     if (!BOARD_NAME_RE.test(token)) return null;
     const row = db.prepare(`SELECT address FROM aliases WHERE address = ?`).get(token) as
       | { address: string }

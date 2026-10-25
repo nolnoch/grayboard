@@ -62,7 +62,7 @@ async function tail(board: string) {
 const endedAt = (id: string) => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, id)[0]!.ended_at;
 const subscribed = (id: string) => rows(`SELECT board FROM subscriptions WHERE handle = ?`, id).length > 0;
 
-test("a tail is a viewer session: it gets the board's posts, and isn't listed, notified or addressable", async () => {
+test("a tail is a viewer session: it gets the board's posts, and isn't listed, notified, sent to or mentioned", async () => {
   const be = await localSession(dir, "be");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   await be.call("board_post", { board: "e2e", body: "before" });
@@ -77,6 +77,7 @@ test("a tail is a viewer session: it gets the board's posts, and isn't listed, n
   const seen = await be.call("peer_list", { include_offline: true });
   expect(JSON.stringify(seen)).not.toContain(t.id);
   expect(await refusal(be, "dm_send", { to: t.id, body: "hi" })).toBe(`error: not_found: no session ${t.id}`);
+  expect(await refusal(be, "board_post", { board: "e2e", body: `@${t.id} hi` })).toBe(`error: not_found: no session ${t.id}`);
 }, 20_000);
 
 test("a tail stopped by a signal ends its session; one killed hard is ended by the next process to open the bus", async () => {

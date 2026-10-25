@@ -152,6 +152,33 @@ test("a DM to an ID that never existed is not_found; to an ended one, id_ended n
   expect(err).toContain("it held `fe`");
 }, 30_000);
 
+// #284 step 8: @id: mentions the session itself, bound or not; one that
+// can't receive refuses the post, as a DM to it would.
+test("an @id: mention reaches that session whatever it's bound to; an unknown, ended or tools-only ID refuses the post", async () => {
+  const be = await session("be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const s = await session();
+  const id = await sessionId(s);
+  const posted = await be.call("board_post", { board: "e2e", body: `@${id.toUpperCase()} look` });
+  expect(posted.notified).toEqual([id]);
+  await until(() => s.pushes.some((p) => p.content === `@${id.toUpperCase()} look`));
+  expect(s.pushes.find((p) => p.content === `@${id.toUpperCase()} look`)!.meta.reason).toBe("mention");
+  await s.call("bind", { name: "fe", create: true });
+  await be.call("board_post", { board: "e2e", body: `@${id} again` });
+  await until(() => s.pushes.some((p) => p.content === `@${id} again`));
+
+  const before = (await be.call("board_read", { board: "e2e" })).posts.length;
+  expect(await refusal(be, "board_post", { board: "e2e", body: "@id:0123456789abc hi" })).toBe("error: not_found: no session id:0123456789abc");
+  const tools = await localSession(dir, "sim", { extra: { BUS_PUSH: "off" } });
+  await tools.call("peer_list", {});
+  const toolsId = rows<{ id: string }>(`SELECT id FROM ids WHERE delivery = 'none'`)[0]!.id;
+  expect(await refusal(be, "board_post", { board: "e2e", body: `@${toolsId} hi` })).toBe(`error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to sim`);
+  await sigkill(pidOfId(id));
+  await session();
+  expect(await refusal(be, "board_post", { board: "e2e", body: `@${id} hi` })).toContain(`error: id_ended: ${id} ended at`);
+  expect((await be.call("board_read", { board: "e2e" })).posts.length).toBe(before);
+}, 30_000);
+
 test("race: a send that commits before the end's transaction is bounced to its sender", async () => {
   const be = await session("be");
   const s = await session();

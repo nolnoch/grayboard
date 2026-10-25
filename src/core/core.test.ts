@@ -522,6 +522,10 @@ test("mention tokens cover bare, local/name, and full addresses, not emails", ()
   ]);
 });
 
+test("#284: @id: plus 13 Crockford is a session mention; a malformed one is the alias \"id\", as before", () => {
+  expect(mentionTokens("@ID:0123456789ABC, @id:0123456789abcd @id:0123456789abi @id:0123456789abc.")).toEqual(["id:0123456789abc", "id"]);
+});
+
 test("mentions inside inline code or fenced blocks don't count", () => {
   expect(mentionTokens("see `@be` and `` `@fe` `` but ping @sim\n```\n@ghost\n```")).toEqual(["sim"]);
 });

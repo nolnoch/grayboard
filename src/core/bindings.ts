@@ -6,6 +6,7 @@ import type { Database } from "bun:sqlite";
 import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
+import { SESSION_ID, crockford13 } from "./session_id.ts";
 import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -22,24 +23,6 @@ export function mintSessionKey(): string {
 
 /** A session key's shape: 64 lowercase hex characters. */
 export const SESSION_KEY = /^[0-9a-f]{64}$/;
-
-// Crockford's base32, lowercased: no i, l, o or u, so an ID reads back
-// unambiguously. IDs are only ever compared, never decoded.
-const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
-
-/** 16 hex characters (64 bits) as 13 Crockford base32 characters. */
-export function crockford13(hex16: string): string {
-  let n = BigInt(`0x${hex16}`);
-  let out = "";
-  for (let i = 0; i < 13; i++) {
-    out = CROCKFORD[Number(n & 31n)]! + out;
-    n >>= 5n;
-  }
-  return out;
-}
-
-/** A session ID's shape: `id:` and 13 Crockford characters. */
-export const SESSION_ID = /^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/;
 
 /** The session ID a key stands for: the first 64 bits of its SHA-256, as an `id:` address. */
 export function idAddress(key: string): string {
