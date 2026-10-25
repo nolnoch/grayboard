@@ -11,20 +11,44 @@ const INSTALL = join(ROOT, "install.sh");
 
 let dir: string;
 
+// What the curl stub "downloads": the digest install.sh must verify against,
+// or a wrong one (STUB_DIGEST=wrong) that must refuse the install (#173).
+const STUB_BIN = "#!/bin/sh\necho 9.9.9\n";
+const STUB_SHA = `sha256:${new Bun.CryptoHasher("sha256").update(STUB_BIN).digest("hex")}`;
+const WRONG_SHA = `sha256:${"0".repeat(64)}`;
+const target = `${process.platform}-${process.arch}`;
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-install-"));
   mkdirSync(join(dir, "stubs"));
   mkdirSync(join(dir, "bin"));
+  for (const [name, digest] of [["digests", STUB_SHA], ["digests-wrong", WRONG_SHA]] as const) {
+    // Pretty-printed, like api.github.com serves (#173: the awk parse must
+    // survive GitHub's real shape, not just compact JSON).
+    writeFileSync(
+      join(dir, `${name}.json`),
+      JSON.stringify(
+        {
+          tag_name: "v9.9.9",
+          assets: ["grayboard", "grayboard-server"].map((bin) => ({ name: `${bin}-${target}`, digest })),
+        },
+        null,
+        2,
+      ),
+    );
+  }
   writeStub("sleep", "exit 0");
-  // -w: resolving "latest"; -o: a binary download; else the /healthz probe.
+  // -w: resolving "latest"; /repos/: the release API (digest lookup); -o: a binary
+  // download; else the /healthz probe.
   writeStub("curl", `
 args="$*"
 case "$args" in
   *"-w"*) echo "https://github.com/x/grayboard/releases/tag/v9.9.9"; exit 0 ;;
+  *"/repos/"*) echo "$args" >> "${dir}/api.log"; [ "$STUB_DIGEST" = "wrong" ] && f=digests-wrong.json || f=digests.json; cat "${dir}/$f"; exit 0 ;;
 esac
 out=""
 while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
-if [ -n "$out" ]; then printf '#!/bin/sh\\necho 9.9.9\\n' > "$out"; exit 0; fi
+if [ -n "$out" ]; then printf '%s' '${STUB_BIN}' > "$out"; exit 0; fi
 echo "$args" >> "${dir}/healthz.log"
 case "$STUB_HEALTH" in
   ok)    echo '{"ok":true,"version":"9.9.9"}' ;;
@@ -54,7 +78,7 @@ function writeStub(name: string, body: string) {
   chmodSync(p, 0o755);
 }
 
-type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string };
+type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; digest?: string };
 
 function install(s: Scenario) {
   const p = Bun.spawnSync(["bash", INSTALL], {
@@ -68,6 +92,7 @@ function install(s: Scenario) {
       STUB_STATE: s.state ?? "active",
       STUB_HEALTH: s.health ?? "ok",
       STUB_RESTART_RC: String(s.restartRc ?? 0),
+      ...(s.digest !== undefined ? { STUB_DIGEST: s.digest } : {}),
       ...(s.releasesUrl !== undefined ? { GRAYBOARD_RELEASES_URL: s.releasesUrl } : {}),
     },
   });
@@ -84,6 +109,32 @@ test("an upgrade restarts the unit and waits for /healthz on the env file's port
   expect(restarts()).toBe(1);
   expect(readFileSync(join(dir, "healthz.log"), "utf8")).toContain("http://127.0.0.1:9123/healthz");
   expect(readFileSync(join(dir, "bin", "grayboard-server.prev"), "utf8")).toBe("old");
+  // The install verified each binary against the release API's digest first (#173).
+  expect(readFileSync(join(dir, "api.log"), "utf8")).toContain("/releases/tags/v9.9.9");
+});
+
+test("a binary whose sha256 doesn't match the release's digest is refused; the old binary stays", () => {
+  const r = install({ digest: "wrong" });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain(`sha256 ${STUB_SHA.slice(7)}, but the release lists ${WRONG_SHA}`);
+  // Nothing replaced: the CLI never landed, the server binary is the old one, nothing restarted.
+  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
+  expect(restarts()).toBe(0);
+});
+
+test("a release that lists no digest for the asset is refused", () => {
+  // Pretty-printed, like the real API: the refusal is about the missing asset,
+  // not a parse quirk.
+  writeFileSync(
+    join(dir, "digests.json"),
+    JSON.stringify({ tag_name: "v9.9.9", assets: [] }, null, 2),
+  );
+  const r = install({});
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("the release lists no sha256 digest; refusing to install unverified");
+  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
+  expect(restarts()).toBe(0);
 });
 
 test("a server still reporting the old version fails the install with a rollback", () => {

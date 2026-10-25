@@ -18,6 +18,7 @@ import { ReleaseServer } from "../support/release_server.ts";
 import { ownUpdater, previousRelease, releaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
+import { copyFileSync } from "node:fs";
 
 const ASSET = `grayboard-${TARGET}`;
 const TAG = `v${pkg.version}`;
@@ -152,6 +153,37 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
 
   await expectOk(grayboard("setup", "-y", "--local"));
   expect(existsSync(CREDENTIALS())).toBe(false);
+}, 60_000);
+
+// `update` from a build of this tree versioned 0.0.0, so this tree's own
+// selfUpdate — the one that verifies the release digest (#173) — is what runs.
+test("update verifies the download against the release's sha256 digest", async () => {
+  label = "update-digest-verify";
+  const v0 = await buildCli(join(dir, "grayboard-v0.0.0"), "0.0.0");
+  mkdirSync(bin, { recursive: true });
+  const installed = async (): Promise<string> => (await expectOk(grayboard("--version"))).trim();
+  const reinstallV0 = () => {
+    copyFileSync(v0, join(bin, "grayboard"));
+    chmodSync(join(bin, "grayboard"), 0o755);
+  };
+
+  // A digest that doesn't match the download refuses the update and keeps the binary.
+  reinstallV0();
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } }, { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } });
+  const bad = await grayboard("update");
+  expect(bad.code, bad.out + bad.err).not.toBe(0);
+  expect(bad.err).toContain("failed verification");
+  expect(bad.err).toContain(`but the release lists sha256:${"0".repeat(64)}`);
+  expect(await installed()).toBe("0.0.0");
+
+  // The release's own digest (of the served file) lets the update land.
+  releases.stop();
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
+  reinstallV0();
+  const out = await expectOk(grayboard("update"));
+  expect(out).toContain(`Updated grayboard 0.0.0 → ${TAG} from ${releases.url}.`);
+  expect(await installed()).toBe(pkg.version);
+  expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
 }, 60_000);
 
 test(`update from ${FROM} replaces it with the build under test and refreshes its adapters`, async () => {
