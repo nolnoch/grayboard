@@ -310,11 +310,80 @@ test("a send whose answer is lost, though its files were bound, reports it lande
     expect(dm).toEqual({
       sent: true,
       attachment_ids: [row.id],
-      note: `sent, but the server's answer was lost (connection to the grayboard server was lost); its attachments (${row.id}) are bound to it. Don't send it again; dm_history or board_read shows it.`,
+      note: `sent, but the server's answer was lost (connection to the grayboard server was lost); its attachments (${row.id}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`,
     });
     // The bound upload wasn't released, and the message carries it.
     expect(row.message_id).toBeNumber();
     expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  } finally {
+    p.stop(true);
+  }
+}, 20_000);
+
+test("a lost answer says a retry is safe, and the retry replays the first result (#254)", async () => {
+  // The server's answers to the first send and the first post never arrive: the connection drops instead.
+  let lose = 0;
+  const p = proxy(() => undefined, (frame) => {
+    const msg = JSON.parse(frame) as { type: string };
+    if (lose === 0 || (msg.type !== "send_ok" && msg.type !== "call_ok")) return frame;
+    lose--;
+    setTimeout(() => p.drop(), 0);
+    return JSON.stringify({ ...msg, req_id: "lost" });
+  });
+  try {
+    const token = await login("alice@example.com");
+    await stopSession((await session(token, "fe")).c);
+    const be = await session(token, "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    const safe = "the write may have landed. Calling again with the same arguments within 10 minutes is safe: the server returns the first result instead of sending twice.";
+    lose = 1;
+    await expect(be.call("dm_send", { to: "fe", body: "once" })).rejects.toThrow(`error: the server's answer was lost (connection to the grayboard server was lost); ${safe}`);
+    const retry = await until(() => be.call("dm_send", { to: "fe", body: "once" }).catch(() => null), 10_000, "the reconnect");
+    const id = (srv.app.db.query("SELECT id FROM messages WHERE body = 'once'").all() as { id: number }[]).map((r) => r.id);
+    expect(id.length).toBe(1);
+    expect(retry).toMatchObject({ message_id: id[0], replayed: { ref: { kind: "message", id: id[0] } } });
+    expect(retry.note).toContain("To send it again on purpose, call with resend: true.");
+    // resend passes through the plugin's schema and frame.
+    expect((await be.call("dm_send", { to: "fe", body: "once", resend: true })).replayed).toBeUndefined();
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 2 });
+
+    await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+    lose = 1;
+    await expect(be.call("board_post", { board: "e2e", body: "posted once" })).rejects.toThrow(safe);
+    const post = await until(() => be.call("board_post", { board: "e2e", body: "posted once" }).catch(() => null), 10_000, "the reconnect");
+    expect(post.replayed.ref.kind).toBe("post");
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'").get()).toEqual({ n: 1 });
+    expect((await be.call("board_post", { board: "e2e", body: "posted once", resend: true })).replayed).toBeUndefined();
+
+    // A lost resend: repeating it with resend would send again, so the answer says so.
+    lose = 1;
+    await expect(be.call("dm_send", { to: "fe", body: "again", resend: true })).rejects.toThrow(
+      "It was a resend, so calling again with resend sends again; calling again without resend within 10 minutes returns its result instead.",
+    );
+  } finally {
+    p.stop(true);
+  }
+}, 30_000);
+
+test("a lost answer from a server that doesn't deduplicate says a retry may send twice", async () => {
+  // A server from before #254: its hello_ok has no write_dedup.
+  let lose = false;
+  const p = proxy(() => undefined, (frame) => {
+    const msg = JSON.parse(frame) as { type: string; write_dedup?: boolean };
+    if (msg.type === "hello_ok") {
+      delete msg.write_dedup;
+      return JSON.stringify(msg);
+    }
+    if (!lose || msg.type !== "send_ok") return frame;
+    lose = false;
+    setTimeout(() => p.drop(), 0);
+    return JSON.stringify({ ...msg, req_id: "lost" });
+  });
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    lose = true;
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(
+      "the write may have landed. This server doesn't deduplicate writes, so calling again may send twice: check dm_history, board_read or dm_inbox's promised list first.",
+    );
   } finally {
     p.stop(true);
   }

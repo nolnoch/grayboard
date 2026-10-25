@@ -466,6 +466,10 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
   if (res.changes > 0) logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
 }
 
+// The note on a redelivery's take event: release() reads it to tell a
+// decline's own redelivery from a later claim (#254).
+export const REDELIVERED_NOTE = "queue post (redelivered)";
+
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
 // offer the original post to the next eligible lane. The previous holder is
 // excluded - it held the post for a full TTL, or declined. With no other
@@ -482,7 +486,7 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   if (!b || !p || p.board !== b.name) return null;
   const lane = queueLanes(db, b, p.author).find((h) => h !== prevHolder);
   if (!lane) return null;
-  claimQueuePost(db, b.name, p, lane, now, "queue post (redelivered)");
+  claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
   return lane;
 }
 

@@ -164,6 +164,9 @@ export const DM_RETRACT_TOOL = {
   },
 };
 
+// A repeated dm_retract whose first answer was lost (#254): it landed.
+export const alreadyRetracted = (at: number) => `already retracted by you at ${new Date(at).toISOString()}`;
+
 export const retractRefusal = {
   notYours: (id: number) => `no message ${id} from you`,
   reached: (id: number, to: string) => `message ${id} already reached ${to}; send a correction instead`,

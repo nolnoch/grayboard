@@ -193,7 +193,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?, pending?, attachments?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?, attachments?, resend?): missing to; unknown recipient.",
   );
 }, 20_000);
 

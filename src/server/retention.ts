@@ -3,6 +3,7 @@ import type { Config } from "./config.ts";
 import { prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
+import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 
 export function pruneMessages(repo: Repo, cutoffMs: number): void {
   repo.messages.prune(cutoffMs);
@@ -25,7 +26,9 @@ function isFirstSundayOfMonth(d: Date): boolean {
 }
 
 // The nightly job: messages, posts and audit rows past retention, uploads
-// left unbound, then the bytes nothing names any more.
+// left unbound, write receipts past the dedup window (each write prunes its
+// own session's; this is the backstop for sessions that stopped writing),
+// then the bytes nothing names any more.
 export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now()): Promise<void> {
   try {
     // Board posts share the message retention window.
@@ -33,6 +36,7 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
     prunePosts(db, now - config.messageRetentionDays * 86_400_000);
     pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
     pruneUnbound(db, now - UNBOUND_TTL_MS);
+    repo.writeReceipts.prune(now - WRITE_DEDUP_WINDOW_MS);
   } catch (e) {
     console.error("[grayboard] retention failed:", e);
   }

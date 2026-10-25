@@ -18,7 +18,7 @@ import type { Database } from "bun:sqlite";
 import { CoreError } from "./errors.ts";
 import { humanHandles, lastSeen, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
-import type { ToolDef } from "./tools.ts";
+import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 
 // The launchers on the roster: handles whose live session opted in
 // (BUS_LAUNCHER=1, or the hello's launcher flag). Humans can't spawn — a
@@ -175,7 +175,7 @@ export function humanFallbackBody(b: { requester: string; persona: string; task:
 export const DELEGATE_TOOL: ToolDef = {
   name: "delegate",
   description:
-    "delegate(persona, task, to?, context?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
   inputSchema: {
     type: "object",
     properties: {
@@ -183,6 +183,7 @@ export const DELEGATE_TOOL: ToolDef = {
       task: { type: "string", description: `The task brief the subagent starts from. At most ${MAX_TASK_CHARS} chars; link longer material. Delivered as data.` },
       to: { type: "string", description: "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours." },
       context: { type: "string", description: `Optional. Extra context for the subagent. At most ${MAX_CONTEXT_CHARS} chars. Delivered as data.` },
+      resend: RESEND_PARAM,
     },
     required: ["persona", "task"],
   },

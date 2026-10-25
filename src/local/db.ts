@@ -2,6 +2,7 @@ import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments } from "../core/attachments.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
+import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
 
 export const db = openLocalDb();
 export const blobs = new SqliteBlobs(db);
@@ -205,20 +206,30 @@ export function sentPending(sender: string, since: number): Message[] {
 
 // Deletes a message `sender` sent that the recipient's session hasn't received
 // (it's past their cursor) and that has no reply, which would still point at
-// it. False if any of that doesn't hold.
+// it. False if any of that doesn't hold. Audited as message.retracted in the
+// same transaction: a repeated dm_retract is answered from that row (#254).
 export function retractMessage(sender: string, id: number): boolean {
   return db.transaction(() => {
     const retractable = db
       .prepare(
-        `SELECT 1 FROM messages WHERE id = ? AND sender = ?
+        `SELECT recipient FROM messages WHERE id = ? AND sender = ?
            AND id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = messages.recipient), 0)
            AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
       )
-      .get(id, sender);
+      .get(id, sender) as { recipient: string } | null;
     if (!retractable) return false;
     dropAttachments(db, "message", "?", id);
     db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
     db.prepare(`DELETE FROM dm_acks WHERE message_id = ?`).run(id);
+    writeCoreAudit(db, "message.retracted", sender, retractedTarget(id), { message_id: id, recipient: retractable.recipient });
     return true;
   }).immediate();
+}
+
+const retractedTarget = (id: number) => `message:${id}`;
+
+// When `sender` retracted message `id`, if it did.
+export function retractedAt(sender: string, id: number): number | undefined {
+  const row = lastCoreAudit(db, "message.retracted", retractedTarget(id));
+  return row && row.actor === sender ? row.at : undefined;
 }

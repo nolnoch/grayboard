@@ -99,8 +99,10 @@ export class TestServer {
   }
 }
 
-// A compiled grayboard-server (a release, or the build under test) as its own
-// process: dev auth, port 0, its DB at `dbPath` and its blobs beside it. Ready
+// A grayboard server as its own process: a compiled binary (a release, or the
+// build under test), or a command line (this tree's src/server/main.ts under
+// bun, so a sync testPause blocks only the server). Dev auth, port 0, its DB
+// at `dbPath` and its blobs beside it. Ready
 // once it prints the port it listens on. Its stdout and stderr are drained
 // into one log as they arrive, so it never blocks on a full pipe and log()
 // mid-run has both.
@@ -112,8 +114,8 @@ export class ServerProcess {
     private readonly drained: Promise<unknown>,
   ) {}
 
-  static async start(bin: string, dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
-    const proc = Bun.spawn([bin], {
+  static async start(bin: string | string[], dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
+    const proc = Bun.spawn(Array.isArray(bin) ? bin : [bin], {
       env: cleanEnv({ GRAYBOARD_DEV_AUTH: "1", GRAYBOARD_DB_PATH: dbPath, GRAYBOARD_PUBLIC_URL: "http://localhost", GRAYBOARD_HTTP_PORT: "0", ...extra }),
       stdin: "ignore",
       stdout: "pipe",

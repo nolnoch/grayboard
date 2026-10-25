@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { canSeeBoard, normalizeBoard, post, redeliverQueuePost } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -122,12 +122,32 @@ export function claim(
   }).immediate();
 }
 
-export function release(db: Database, handle: string, keyInput: string, note?: string): { wake: string[] } {
+// When `handle` released `key`, if nothing has happened to the key since: its
+// release is the key's latest event, or on a queue: key the one its own
+// redelivery directly followed. Otherwise undefined.
+function releasedBy(db: Database, key: string, handle: string): number | undefined {
+  const [last, prev] = db.prepare(`SELECT handle, event, note, at FROM claim_events WHERE key = ? ORDER BY id DESC LIMIT 2`).all(key) as
+    { handle: string; event: ClaimEvent; note: string | null; at: number }[];
+  if (last?.event === "release" && last.handle === handle) return last.at;
+  const redelivered = key.startsWith("queue:") && last?.event === "take" && last.note === REDELIVERED_NOTE;
+  if (redelivered && prev?.event === "release" && prev.handle === handle) return prev.at;
+  return undefined;
+}
+
+// releasedAt: this handle had already released the claim, at that time, and
+// nothing has happened to it since: a repeat whose first answer was lost
+// (#254) succeeds without a second release event or redelivery.
+export function release(db: Database, handle: string, keyInput: string, note?: string): { wake: string[]; releasedAt?: number } {
   const key = validKey(keyInput);
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
-    if (!cur || cur.expires_at <= Date.now()) throw new CoreError(`no active claim on "${key}"`);
-    if (cur.holder !== handle) throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
+    const active = !!cur && cur.expires_at > Date.now();
+    if (!active || cur.holder !== handle) {
+      const releasedAt = releasedBy(db, key, handle);
+      if (releasedAt !== undefined) return { wake: [], releasedAt };
+      if (!active) throw new CoreError(`no active claim on "${key}"`);
+      throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
+    }
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
     logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
     if (key.startsWith("queue:")) {

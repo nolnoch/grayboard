@@ -4,7 +4,9 @@
 import type { Database } from "bun:sqlite";
 
 import {
+  canSeeBoard,
   createBoard,
+  getBoard,
   isViewer,
   listBoards,
   muteThread,
@@ -24,6 +26,7 @@ import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
 import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 
 export type ToolDef = {
   name: string;
@@ -33,6 +36,11 @@ export type ToolDef = {
 };
 
 const BOARD = { type: "string", description: 'Board name, with or without the "#": "e2e" or "#e2e".' };
+
+// On the append writes (dm_send, board_post, delegate): a server answers an
+// identical call within its dedup window with the first one's result (#254,
+// src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
+export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
 
 export function boardTools(opts: { teams: boolean }): ToolDef[] {
   return [
@@ -72,7 +80,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?, attachments?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?, resend?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
@@ -80,6 +88,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
           attachments: ATTACHMENTS_PARAM,
+          resend: RESEND_PARAM,
         },
         required: ["board", "body"],
       },
@@ -296,11 +305,23 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
 
 export type ToolOutcome = { result: unknown; wake: string[] };
 
+// board_post's result.
+export type BoardPostResult = {
+  post_id: number;
+  board: string;
+  attachments?: AttachmentInfo[];
+  notified: string[];
+  deferred?: string[];
+  unresolved?: string[];
+};
+
 // What only the mode knows. online: does this handle have a live session?
 // attachmentLimits: the caps a post's files are bound under; a mode without
 // them can't post files.
 // unbound: the live sessions with no name yet, for peer_list (#182).
-export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[] };
+// `human`: the caller is the Slack bridge's human, exempt from #254's
+// answers from state.
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[]; human?: boolean };
 
 export function callBoardTool(
   db: Database,
@@ -316,9 +337,21 @@ export function callBoardTool(
 
     case "board_create": {
       const team = optStr(a, "team");
-      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null, {
-        kind: optStr(a, "kind"),
-      });
+      const scope = team ? `team:${team.toLowerCase()}` : null;
+      const kind = optStr(a, "kind");
+      // A repeat whose first answer was lost (#254) is answered from state:
+      // the caller made this board with these arguments. Other arguments get
+      // "already exists", and so does the Slack bridge's human, whose relay
+      // treats success as a fresh create.
+      const name = normalizeBoard(str(a, "name"));
+      const mine = ctx.human ? undefined : getBoard(db, name);
+      if (
+        mine && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
+        mine.purpose === str(a, "purpose").trim() && canSeeBoard(db, handle, name)
+      ) {
+        return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
+      }
+      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [] };
     }
 
@@ -334,17 +367,15 @@ export function callBoardTool(
         optNum(a, "parent_id") ?? null,
         { online: ctx.online, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
       );
-      return {
-        result: {
-          post_id: p.id,
-          board: p.board,
-          ...(p.attachments ? { attachments: p.attachments } : {}),
-          notified: wake.filter((h) => !isViewer(h)),
-          ...(deferred.length ? { deferred } : {}),
-          ...(unresolved.length ? { unresolved } : {}),
-        },
-        wake,
+      const result: BoardPostResult = {
+        post_id: p.id,
+        board: p.board,
+        ...(p.attachments ? { attachments: p.attachments } : {}),
+        notified: wake.filter((h) => !isViewer(h)),
+        ...(deferred.length ? { deferred } : {}),
+        ...(unresolved.length ? { unresolved } : {}),
       };
+      return { result, wake };
     }
 
     case "board_read": {
@@ -403,8 +434,8 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake } = release(db, handle, key, optStr(a, "note"));
-      return { result: `released ${key}`, wake };
+      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"));
+      return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake };
     }
 
     case "claim_watch":

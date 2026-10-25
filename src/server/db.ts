@@ -31,8 +31,20 @@ export type SlackLink = { user_id: number; email: string; slack_user: string; dm
 // last_id: the newest grayboard id in the thread, the parent for a reply.
 export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
+// An append write's receipt (#254, src/server/write_dedup.ts): which row the
+// first call made and the result it answered, so a repeat replays it.
+export type WriteReceipt = {
+  session: string; sender: string; fp: string; tool: string;
+  ref_kind: "message" | "post"; ref_id: number; result_json: string; at: number;
+};
+
+// A synchronous callback's result: a promise is refused at compile time, so
+// nothing can await between a transaction's reads and its writes.
+export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 
 export interface Repo {
+  // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
+  atomic<T>(fn: () => Sync<T>): T;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
     findByEmail(email: string): User | undefined;
@@ -118,6 +130,17 @@ export interface Repo {
     progress(userId: number, ref: string): unknown;
     setProgress(userId: number, ref: string, progress: unknown): void;
     clearProgress(userId: number, ref: string): void;
+  };
+  writeReceipts: {
+    // The receipt for (session, sender, fp) written after `since`.
+    find(session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
+    // Replaces any receipt for the same (session, sender, fp).
+    upsert(r: WriteReceipt): void;
+    // Whether the row a receipt names still exists (a retract or retention removes it).
+    refExists(kind: "message" | "post", id: number): boolean;
+    // Deletes receipts written at or before `before`: one session's, or all. Returns how many.
+    pruneSession(session: string, before: number): number;
+    prune(before: number): number;
   };
   // Attachment bytes, by sha256; the attachment rows are metadata in this database.
   blobs: BlobStore;
@@ -265,6 +288,23 @@ function initSchema(db: Database): void {
       acked_at    INTEGER NOT NULL,
       PRIMARY KEY (reader, message_id)
     );
+
+    -- Append writes' receipts (#254, src/server/write_dedup.ts): a repeat of
+    -- an identical call within the window replays result_json, the first
+    -- call's result without its frame, instead of writing again. Pruned on
+    -- write per session and nightly (src/server/retention.ts).
+    CREATE TABLE IF NOT EXISTS write_receipts (
+      session     TEXT NOT NULL,
+      sender      TEXT NOT NULL,
+      fp          TEXT NOT NULL,
+      tool        TEXT NOT NULL,
+      ref_kind    TEXT NOT NULL CHECK (ref_kind IN ('message','post')),
+      ref_id      INTEGER NOT NULL,
+      result_json TEXT NOT NULL,
+      at          INTEGER NOT NULL,
+      PRIMARY KEY (session, sender, fp)
+    );
+    CREATE INDEX IF NOT EXISTS idx_write_receipts_at ON write_receipts(at);
   `);
   // dm_send pending: the sender owes a follow-up in the thread.
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
@@ -274,6 +314,10 @@ function initSchema(db: Database): void {
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   return {
+    atomic<T>(fn: () => Sync<T>): T {
+      return db.transaction(fn).immediate() as T;
+    },
+
     users: {
       upsertByEmail(email, displayName) {
         const now = Date.now();
@@ -650,6 +694,32 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       clearProgress(userId, ref) {
         db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
+      },
+    },
+
+    writeReceipts: {
+      find(session, sender, fp, since) {
+        return db.query<WriteReceipt, [string, string, string, number]>(
+          "SELECT * FROM write_receipts WHERE session = ? AND sender = ? AND fp = ? AND at > ?",
+        ).get(session, sender, fp, since) ?? undefined;
+      },
+      upsert(r) {
+        db.run(
+          `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session, sender, fp) DO UPDATE SET
+             tool = excluded.tool, ref_kind = excluded.ref_kind, ref_id = excluded.ref_id, result_json = excluded.result_json, at = excluded.at`,
+          [r.session, r.sender, r.fp, r.tool, r.ref_kind, r.ref_id, r.result_json, r.at],
+        );
+      },
+      refExists(kind, id) {
+        const table = kind === "message" ? "messages" : "posts";
+        return !!db.query<{ x: number }, [number]>(`SELECT 1 AS x FROM ${table} WHERE id = ?`).get(id);
+      },
+      pruneSession(session, before) {
+        return db.run("DELETE FROM write_receipts WHERE session = ? AND at <= ?", [session, before]).changes;
+      },
+      prune(before) {
+        return db.run("DELETE FROM write_receipts WHERE at <= ?", [before]).changes;
       },
     },
 

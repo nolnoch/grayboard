@@ -36,6 +36,7 @@ import {
   insertMessage,
   receivedUnacked,
   retractMessage,
+  retractedAt,
   sentPending,
   setCursor,
   undeliveredFrom,
@@ -67,6 +68,7 @@ import {
   promised,
   queuedNote,
   retractRefusal,
+  alreadyRetracted,
   showPending,
   unanswered,
   undeliveredInstruction,
@@ -473,6 +475,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (name === "dm_retract") {
     const m = getMessage(a.message_id as number);
     const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+    // A repeat whose first answer was lost (#254): it landed.
+    const done = m ? undefined : retractedAt(IDENTITY, a.message_id as number);
+    if (done !== undefined) return text(`ok: ${alreadyRetracted(done)}`);
     if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(a.message_id as number));
     // A probe is a wakeup: a live recipient drains the message now.
     if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
@@ -503,6 +508,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
       ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+      human: HUMAN,
     };
     const { attachments: paths, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);

@@ -667,3 +667,30 @@ test("peer_status queue param is the explicit rotation opt-out; status text neve
   expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBeUndefined();
   expect(() => callBoardTool(db, "fe", "peer_status", { text: "", queue: "busy" })).toThrow(/queue/);
 });
+
+// #254: a repeat whose first answer was lost is answered from state.
+test("claim_release and board_create repeats answer from state; another's history still errors", () => {
+  claim(db, "be", "ticket:ENG-142");
+  expect(callBoardTool(db, "be", "claim_release", { key: "ticket:ENG-142" }).result).toBe("released ticket:ENG-142");
+  const at = (db.prepare(`SELECT at FROM claim_events WHERE event = 'release'`).get() as { at: number }).at;
+  expect(callBoardTool(db, "be", "claim_release", { key: "ticket:ENG-142" }).result).toBe(`already released by you at ${new Date(at).toISOString()}`);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events WHERE event = 'release'`).get()).toEqual({ n: 1 });
+  // Someone else took and released it since: the latest release isn't be's.
+  claim(db, "sim", "ticket:ENG-142");
+  release(db, "sim", "ticket:ENG-142");
+  expect(() => callBoardTool(db, "be", "claim_release", { key: "ticket:ENG-142" })).toThrow(/no active claim/);
+  // A claim that lapsed was never released.
+  claim(db, "fe", "dev:env");
+  db.prepare(`UPDATE claims SET expires_at = 1`).run();
+  expect(() => release(db, "fe", "dev:env")).toThrow(/no active claim/);
+
+  const made = callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }).result as { created_at: number };
+  const again = callBoardTool(db, "be", "board_create", { name: "#RUNS", purpose: "fixtures" }).result;
+  expect(again).toEqual({ ...made, note: `you created #runs at ${new Date(made.created_at).toISOString()}` });
+  expect(() => callBoardTool(db, "sim", "board_create", { name: "runs", purpose: "fixtures" })).toThrow(/already exists/);
+  // Only the same arguments are a repeat: another kind, scope or purpose is a different board.
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", kind: "queue" })).toThrow(/already exists/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "other" })).toThrow(/already exists/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", team: "core" })).toThrow(/team boards need distributed mode/);
+  expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }, { human: true })).toThrow(/already exists/);
+});

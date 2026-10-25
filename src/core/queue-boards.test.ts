@@ -254,3 +254,21 @@ test("a pre-kind database opens with the broadcast default", () => {
   const row = legacy.prepare(`SELECT kind FROM boards WHERE name = 'legacy'`).get() as { kind: string };
   expect(row.kind).toBe("broadcast");
 });
+
+test("a repeated decline (its answer lost, #254) succeeds without a second release or redelivery", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims it
+  release(db, "fe", claimKey(r.post.id), "not my lane"); // redelivered: sim holds it
+  const outbox = () => db.prepare(`SELECT handle, delivered_at, wake FROM outbox WHERE post_id = ? ORDER BY handle`).all(r.post.id);
+  const before = { outbox: outbox(), events: claimEvents(claimKey(r.post.id)) };
+  const again = release(db, "fe", claimKey(r.post.id), "not my lane");
+  expect(again).toEqual({ wake: [], releasedAt: expect.any(Number) });
+  expect(claimEvents(claimKey(r.post.id))).toEqual(before.events);
+  expect(outbox()).toEqual(before.outbox);
+  expect(listClaims(db).find((c) => c.key === claimKey(r.post.id))?.holder).toBe("sim");
+  // Once sim has acted on the key, fe's decline is history, and sim's is the latest.
+  release(db, "sim", claimKey(r.post.id), "pass"); // redelivered: fe holds it
+  expect(release(db, "sim", claimKey(r.post.id), "pass").releasedAt).toEqual(expect.any(Number));
+  // A TTL takeover isn't a release: the lapsed lane's call is refused as before.
+  sweepExpired(db, Date.now() + 31 * 60_000); // fe lapses; sim takes it
+  expect(() => release(db, "fe", claimKey(r.post.id))).toThrow(/held by sim/);
+});

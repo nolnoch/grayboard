@@ -47,12 +47,14 @@ export type HelloRequest = {
   launcher?: boolean;
 };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
-export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[] };
+// resend: true sends again though an identical send landed within the dedup
+// window (#254, src/server/write_dedup.ts); otherwise that one's result replays.
+export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean };
 // Hand work to a launcher session (#184): the server resolves the launcher
 // (explicit `to`, or any live one; none live → the requester's human) and
 // sends the payload pending. The reply is send_ok with `to` (and
 // human_fallback on the degrade path) added.
-export type DelegateRequest = { type: "delegate"; req_id: string; persona: string; task: string; context?: string; to?: string };
+export type DelegateRequest = { type: "delegate"; req_id: string; persona: string; task: string; context?: string; to?: string; resend?: boolean };
 export type HistoryRequest = { type: "history"; req_id: string; peer?: string; limit?: number; before_id?: number };
 export type ThreadRequest  = { type: "thread";  req_id: string; message_id: number };
 export type AckRequest     = { type: "ack";     req_id: string; message_ids: number[] };
@@ -88,23 +90,37 @@ export type HelloOk     = {
   moved?: string[];
   // A rebind whose claims stayed behind: why.
   not_moved?: string;
+  // This server deduplicates this session's append writes (#254): a hello
+  // with a session_key, so a reconnect keeps the session. A server from before
+  // #254, or a keyless hello, sends none, and a retry may write twice.
+  write_dedup?: boolean;
 };
-export type SendOk      = {
-  type: "send_ok"; req_id: string; message_id: number; delivered_now: boolean;
+// The row an append write made (#254): a direct message or a board post.
+export type WriteRef = { kind: "message" | "post"; id: number };
+// On a result that repeats an earlier identical call's (#254): when that one
+// landed and what it wrote. Nothing was written this time.
+export type Replayed = { first_at: string; ref: WriteRef };
+// A send's result without its frame: what the server stores to replay it.
+export type SendResult  = {
+  message_id: number; delivered_now: boolean;
   // Echoed when the request set it, so a client can tell this server recorded it.
   pending?: true;
   attachments?: AttachmentInfo[];
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
+  replayed?: Replayed;
 };
-// A delegation's send_ok: the ordinary fields plus which launcher took it
+export type SendOk      = { type: "send_ok"; req_id: string } & SendResult;
+// A delegation's result: the ordinary fields plus which launcher took it
 // (or the human fallback).
-export type DelegateOk  = SendOk & { to: string; human_fallback?: true };
+export type DelegateResult = SendResult & { to: string; human_fallback?: true };
+export type DelegateOk  = SendOk & DelegateResult;
 // Messages you sent carry delivered: whether they've reached the recipient's session.
 export type HistoryOk   = { type: "history_ok"; req_id: string; messages: (Message & { delivered?: boolean })[] };
 export type ThreadOk    = { type: "thread_ok";  req_id: string; messages: Message[] };
-export type AckOk       = { type: "ack_ok";     req_id: string };
+// note: a repeat answered from state, e.g. a dm_retract of a message already retracted (#254).
+export type AckOk       = { type: "ack_ok";     req_id: string; note?: string };
 export type InboxOk     = {
   type: "inbox_ok"; req_id: string; unanswered: InboxItem[]; promised?: PromiseItem[];
   undelivered_from_you?: { to: string; n: number; oldest_id: number; last_seen?: string }[];
@@ -165,6 +181,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.pending !== undefined && typeof m.pending !== "boolean") throw new Error("pending must be boolean");
       if (m.attachment_ids !== undefined && (!Array.isArray(m.attachment_ids) || !m.attachment_ids.every(x => typeof x === "number")))
         throw new Error("attachment_ids must be number[]");
+      if (m.resend !== undefined && typeof m.resend !== "boolean") throw new Error("resend must be boolean");
       return m as unknown as SendRequest;
     case "history":
       assertStr(m, "req_id");
@@ -199,6 +216,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       assertStr(m, "req_id"); assertStr(m, "persona"); assertStr(m, "task");
       if (m.context !== undefined && typeof m.context !== "string") throw new Error("context must be string");
       if (m.to !== undefined && typeof m.to !== "string") throw new Error("to must be string");
+      if (m.resend !== undefined && typeof m.resend !== "boolean") throw new Error("resend must be boolean");
       // SAFETY: every field of DelegateRequest was validated just above; the
       // cast only re-labels the parsed object.
       return m as unknown as DelegateRequest;
