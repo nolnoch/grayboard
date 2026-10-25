@@ -71,6 +71,20 @@ function initLocalSchema(db: Database): void {
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
   if (!msgCols.some((c) => c.name === "sender_id")) db.exec(`ALTER TABLE messages ADD COLUMN sender_id TEXT`);
+  // kind: 'bounce' for a message returned by an ended ID (#284 decision 10);
+  // null for an ordinary message.
+  if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
+  // The attachment model (#284 PR 2, S2). For a keyed session (BUS_SESSION_KEY)
+  // pid + proc_start are its harness's, whose exit ends the session, and
+  // attached_pid + attached_start are the grayboard mcp child serving it (null
+  // while detached, after the child exited and before a restart re-attaches).
+  // harness_rule: how the harness pid was found ('env': BUS_HARNESS_PID;
+  // 'ancestor': the first non-launcher ancestor). All null for an unkeyed
+  // session, whose own process is pid.
+  const bindingCols = new Set((db.prepare(`PRAGMA table_info(bindings)`).all() as { name: string }[]).map((c) => c.name));
+  for (const [col, type] of [["attached_pid", "INTEGER"], ["attached_start", "TEXT"], ["detached_at", "INTEGER"], ["harness_rule", "TEXT"]] as const) {
+    if (!bindingCols.has(col)) db.exec(`ALTER TABLE bindings ADD COLUMN ${col} ${type}`);
+  }
   initCoreSchema(db);
   // Every 1.x handle is an alias (#284), with its durable facts. Seeded on
   // every open, not once: a 1.x grayboard sharing this file may still add

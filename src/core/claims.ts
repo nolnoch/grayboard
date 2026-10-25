@@ -229,7 +229,7 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
 // the work was done, so the post says to check with them. Runs inside the
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
-function sweepIn(db: Database, now: number): string[] {
+export function sweepIn(db: Database, now: number): string[] {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
   for (const c of gone) {
