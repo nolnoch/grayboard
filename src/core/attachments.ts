@@ -127,22 +127,27 @@ export function bindAttachments(
   limits: AttachmentLimits,
 ): AttachmentInfo[] {
   if (ids.length === 0) return [];
-  const rows = db
-    .prepare(`SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?))`)
-    .all(JSON.stringify(ids)) as AttachmentRow[];
-  const byId = new Map(rows.map((r) => [r.id, r]));
+  const rows = unsentUploads(db, ids, uploader);
   // Each upload was checked alone when stored; the message's total is known only here.
   const tally = new SizeTally(limits, ids.length);
-  for (const id of ids) {
-    const r = byId.get(id);
-    if (!r || r.uploader !== uploader || r.message_id !== null || r.post_id !== null) {
-      throw new CoreError(`attachment ${id} isn't an unsent upload of yours`);
-    }
-    tally.add(`attachment ${id}`, r.size);
-  }
+  for (const r of rows) tally.add(`attachment ${r.id}`, r.size);
   const [col, value] = "message_id" in target ? ["message_id", target.message_id] : ["post_id", target.post_id];
   db.prepare(`UPDATE attachments SET ${col} = ? WHERE id IN (SELECT value FROM json_each(?))`).run(value, JSON.stringify(ids));
-  return ids.map((id) => info(byId.get(id)!));
+  return rows.map(info);
+}
+
+// `uploader`'s unsent uploads `ids`, in call order. Throws on an id that
+// isn't one: someone else's, unknown, or already on a message or post.
+function unsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
+  const rows = db
+    .prepare(`SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL`)
+    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
+  const by = new Map(rows.map((r) => [r.id, r]));
+  return ids.map((id) => {
+    const r = by.get(id);
+    if (!r) throw new CoreError(`attachment ${id} isn't an unsent upload of yours`);
+    return r;
+  });
 }
 
 // The blob digests of `uploader`'s unsent uploads `ids`, in call order: what
@@ -150,16 +155,18 @@ export function bindAttachments(
 // afresh under new ids while the blob is content-addressed. Refuses an id
 // bindAttachments would.
 export function uploadDigests(db: Database, ids: number[], uploader: string): string[] {
+  return ids.length === 0 ? [] : unsentUploads(db, ids, uploader).map((r) => r.sha256);
+}
+
+// Drops `uploader`'s unsent uploads `ids`, for a replayed write (#254): the
+// retry uploaded its files afresh and nothing will bind them. Run it inside
+// the replay's transaction; sweepBlobs after it commits deletes the bytes
+// (none, while the first write's copy names the blob).
+export function dropUnsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
   if (ids.length === 0) return [];
-  const rows = db
-    .prepare(`SELECT id, sha256 FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL`)
-    .all(JSON.stringify(ids), uploader) as { id: number; sha256: string }[];
-  const by = new Map(rows.map((r) => [r.id, r.sha256]));
-  return ids.map((id) => {
-    const sha = by.get(id);
-    if (sha === undefined) throw new CoreError(`attachment ${id} isn't an unsent upload of yours`);
-    return sha;
-  });
+  return db
+    .prepare(`DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`)
+    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
 }
 
 const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size, sha256: r.sha256 });

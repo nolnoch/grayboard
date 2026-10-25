@@ -1,4 +1,4 @@
-import { participant, type MessageRow, type Repo } from "./db.ts";
+import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import {
   parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type DelegateResult, type SendRequest, type SendResult, type ErrorCode,
   type WriteRef,
@@ -33,9 +33,8 @@ import {
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
-import { attachmentIds, sweepBlobs, uploadDigests } from "../core/attachments.ts";
+import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests } from "../core/attachments.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
-import type { Sync } from "./db.ts";
 import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
@@ -779,14 +778,26 @@ function deliverSend(hub: Hub, ws: Ws, msg: MessageRow): void {
 
 // An append write, deduplicated (#254): an identical call by this session
 // within the window answers with the first one's result. The Slack bridge's
-// humans are exempt: a person typing a line twice sent it twice.
+// humans are exempt: a person typing a line twice sent it twice. `uploads`:
+// the call's attachment ids; a replay releases them (the retry uploaded its
+// files afresh, and nothing will bind them), audited like any release.
 function writeOnce<W extends Written>(
-  hub: Hub, ws: Ws, tool: DedupTool, args: Record<string, unknown>, resend: boolean, write: () => Sync<W>,
+  hub: Hub, ws: Ws, tool: DedupTool, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
 ): DedupOutcome<W> {
-  if (ws.data.human) return { fresh: hub.repo.atomic(write) };
-  return dedupWrite(hub.repo, hub.now(), {
-    tool, session: ws.data.sessionId!, sender: ws.data.identityFull, actor: ws.data.authed.user_email, transport: "wss", args, resend,
-  }, write);
+  const { repo } = hub;
+  if (ws.data.human) return { fresh: repo.atomic(write) };
+  const { authed, identityFull: me } = ws.data;
+  const out = dedupWrite(repo, hub.now(), {
+    tool, session: ws.data.sessionId!, sender: me, actor: authed.user_email, transport: "wss", args, resend,
+  }, write, () => {
+    for (const row of dropUnsentUploads(hub.db, uploads, me)) {
+      writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
+        identity: me, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
+      });
+    }
+  });
+  if ("replay" in out && uploads.length > 0) void sweepBlobs(hub.db, repo.blobs);
+  return out;
 }
 
 function handleSend(hub: Hub, ws: Ws, m: SendRequest): void {
@@ -795,7 +806,7 @@ function handleSend(hub: Hub, ws: Ws, m: SendRequest): void {
     const p = prepareSend(hub, ws, m.recipient, m.body, m.parent_id ?? null, m.pending === true, m.attachment_ids);
     // Keyed by what the server resolved, so two spellings of one call collide.
     const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
-    out = writeOnce(hub, ws, "dm_send", args, m.resend === true, () => writeSend(hub, ws, p));
+    out = writeOnce(hub, ws, "dm_send", args, m.resend === true, p.ids, () => writeSend(hub, ws, p));
   } catch (e) {
     if (e instanceof SendRefused) return err(ws, m.req_id, e.code, e.message);
     throw e;
@@ -842,7 +853,7 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
   let picked: string | undefined;
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   try {
-    out = writeOnce(hub, ws, "delegate", args, m.resend === true, () => {
+    out = writeOnce(hub, ws, "delegate", args, m.resend === true, [], () => {
       const d = resolveDelegation(hub.db, ws.data.identityFull, { ...m, to }, online, humanReachable);
       picked = d.to;
       const w = writeSend(hub, ws, prepareSend(hub, ws, d.to, d.body, null, true, undefined));
@@ -937,15 +948,18 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, u
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
   try {
-    if (resend !== undefined && typeof resend !== "boolean") throw new CoreError("resend must be a boolean");
+    if (resend !== undefined && typeof resend !== "boolean") throw new CoreError("resend must be boolean");
     if (typeof postArgs.board !== "string") throw new CoreError("board must be a string");
+    // Checked before it's fingerprinted: a non-string body is a bad request, not a canonicalJson failure.
+    if (typeof postArgs.body !== "string") throw new CoreError("body must be a string");
+    const ids = attachmentIds(postArgs.attachment_ids);
     const fp = {
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
       parent_id: postArgs.parent_id ?? null,
-      attachments: uploadDigests(db, attachmentIds(postArgs.attachment_ids), me),
+      attachments: uploadDigests(db, ids, me),
     };
-    out = writeOnce(hub, ws, "board_post", fp, resend === true, () => {
+    out = writeOnce(hub, ws, "board_post", fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };

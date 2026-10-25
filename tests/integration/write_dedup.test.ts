@@ -207,9 +207,14 @@ describe("dedup and state answers (in process)", () => {
     };
     const withFile = await dm(be, "files", { attachment_ids: [await up("v1")] });
     // A retry uploads afresh: a new id, the same blob.
-    const reup = await dm(be, "files", { attachment_ids: [await up("v1")] });
+    const retryUpload = await up("v1");
+    const reup = await dm(be, "files", { attachment_ids: [retryUpload] });
     expect(reup.replayed.ref.id).toBe(withFile.message_id);
     expect(reup.attachments).toEqual(withFile.attachments);
+    // The replay released the retry's upload, audited; the first copy keeps the blob.
+    expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
+    expect(n(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released' AND target = 'attachment:${retryUpload}' AND detail LIKE '%"reason":"replayed"%'`)).toBe(1);
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = '${withFile.attachments[0].sha256}'`)).toBe(1);
     const other = await dm(be, "files", { attachment_ids: [await up("v2")] });
     expect(other.replayed).toBeUndefined();
     // Files are refused as bindAttachments would refuse them.
@@ -222,6 +227,19 @@ describe("dedup and state answers (in process)", () => {
     const reconnect = await session("be", { push: false, session_key: key });
     expect((await reconnect.request({ type: "send", recipient: "fe", body: "hello" })).replayed.ref.id).toBe(first.message_id);
     expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hello'")).toBe(2);
+  });
+
+  test("board_post: a replay releases the retry's upload; a non-string body is a bad request", async () => {
+    const be = await session("be");
+    expect((await be.call("board_create", { name: "e2e", purpose: "files" })).type).toBe("call_ok");
+    const up = async () => (await srv.upload(you, "be", "notes.md", "v1")).body.id as number;
+    const first = await be.call("board_post", { board: "e2e", body: "see file", attachment_ids: [await up()] });
+    const retryUpload = await up();
+    const retry = await be.call("board_post", { board: "e2e", body: "see file", attachment_ids: [retryUpload] });
+    expect(retry.result.replayed.ref.id).toBe(first.result.post_id);
+    expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
+    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
+    expect(await be.call("board_post", { board: "e2e", body: [[1]] })).toMatchObject({ type: "error", code: "bad_request", message: "body must be a string" });
   });
 
   test("the window runs on the hub's clock: a repeat after it sends", async () => {

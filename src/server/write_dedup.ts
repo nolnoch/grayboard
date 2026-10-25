@@ -71,11 +71,15 @@ export type DedupOutcome<W extends Written> =
 // Runs `write` unless an identical call by this session landed within the
 // window and its row still exists; then the stored result comes back marked
 // replayed, nothing else is written but a request.replayed audit row, and the
-// caller must push, wake and audit nothing. The lookup, the write, the
+// caller must push, wake and audit nothing; `onReplay` runs in the replay's
+// transaction, for what the repeat brought that nothing will use (its fresh
+// uploads). The lookup, the write, the
 // receipt and the audit row are one IMMEDIATE transaction (a savepoint inside
 // an open one): two calls can't interleave, and a write that throws leaves no
 // receipt. `now` is the hub's clock.
-export function dedupWrite<W extends Written>(repo: Repo, now: number, call: DedupCall, write: () => Sync<W>): DedupOutcome<W> {
+export function dedupWrite<W extends Written>(
+  repo: Repo, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
+): DedupOutcome<W> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
   return repo.atomic((): DedupOutcome<W> => {
@@ -92,6 +96,7 @@ export function dedupWrite<W extends Written>(repo: Repo, now: number, call: Ded
         writeAudit(repo, "request.replayed", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
         });
+        onReplay();
         return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
       }
     }
