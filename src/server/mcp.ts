@@ -2,11 +2,12 @@ import { McpServer, createMcpHandler, fromJsonSchema } from "@modelcontextprotoc
 import type { CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
 import { boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
+import { closestNames, unknownNameError } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
-import { extractBearer, verifySessionToken } from "./auth.ts";
+import { extractBearer, verifySessionToken, type TouchQueue } from "./auth.ts";
 import type { Repo } from "./db.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -20,7 +21,7 @@ const text = (value: unknown): CallToolResult => ({
 });
 
 // Bearer auth here is transitional; the retained HTTP/WS login contract is unchanged.
-export function createHostedMcp(application: Application, repo: Repo, opts: { trustedOrigin: string }) {
+export function createHostedMcp(application: Application, repo: Repo, opts: { trustedOrigin: string; touches: TouchQueue }) {
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   const permitsOrigin = (origin: string | null): boolean => {
     if (origin === null) return true;
@@ -36,12 +37,12 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   const handler = createMcpHandler(async ({ requestInfo }) => {
     if (!requestInfo || closed) throw new Error("MCP endpoint is closed");
     const raw = extractBearer(requestInfo);
-    const authed = raw && verifySessionToken(raw, repo);
+    const authed = raw && verifySessionToken(raw, repo, opts.touches);
     if (!authed) throw new Error("unauthenticated");
     const { session, info } = await application.selectIdentity(
       authed, requestInfo.headers.get("X-Grayboard-Identity")!,
       { deliver() {}, probe: async () => false, closed() {} },
-      { push: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
+      { push: false, create: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
     );
     if (closed || requestInfo.signal.aborted) {
       application.close(session);
@@ -64,7 +65,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       try {
         if (requestInfo.signal.aborted) return { ...text("error: request cancelled"), isError: true };
         // Recheck the token at dispatch as well as at the HTTP boundary.
-        if (!verifySessionToken(raw, repo)) return { ...text("error: unauthenticated"), isError: true };
+        if (!verifySessionToken(raw, repo, opts.touches)) return { ...text("error: unauthenticated"), isError: true };
         return text(call() ?? "ok");
       } catch (e) {
         const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
@@ -125,10 +126,15 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
       if (!permitsOrigin(req.headers.get("Origin"))) return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
       const token = extractBearer(req);
-      if (!token || !verifySessionToken(token, repo)) return Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 });
+      const authed = token && verifySessionToken(token, repo, opts.touches);
+      if (!authed) return Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 });
       const name = req.headers.get("X-Grayboard-Identity");
       if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
         return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
+      }
+      if (!repo.identities.findByUserAndName(authed.user_id, name.toLowerCase())) {
+        const known = closestNames(name.toLowerCase(), repo.identities.listForUser(authed.user_id).map(i => i.name).filter(n => n !== HUMAN_NAME));
+        return Response.json({ code: "identity_unknown", message: unknownNameError(name.toLowerCase(), known), known }, { status: 400 });
       }
       try { return await handler.fetch(req); } catch {
         return Response.json({ code: "internal", message: "internal error" }, { status: 500 });

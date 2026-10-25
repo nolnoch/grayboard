@@ -38,6 +38,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
+  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin, touches });
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -114,7 +115,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   const timers: ReturnType<typeof setInterval>[] = [];
   let stopRetention: (() => void) | undefined;
-  let stopped = false;
+  let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
     timers.push(startPing(), setInterval(sweepLimits, 30_000));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined);
@@ -139,15 +140,15 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // Owns everything startServer opened: idempotent, closes the database
     // once the server and every user of it (bridge, timers, expiry) is down.
     stop() {
-      if (stopped) return;
-      stopped = true;
+      if (stopPromise) return stopPromise;
       slack?.stop();
       for (const t of timers) clearInterval(t);
       stopRetention?.();
       stopExpiry();
       touches.cancelAll();
       server.stop(true);
-      return mcp.close().finally(() => db.close());
+      stopPromise = mcp.close().finally(() => db.close());
+      return stopPromise;
     },
   };
 }

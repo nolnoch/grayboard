@@ -90,9 +90,7 @@ export function createWsHandlers(application: Application) {
           },
         };
         application.selectIdentity(ws.data.authed, msg.identity, sink, {
-          push: msg.push,
-          where: msg.where,
-          resume: msg.resume,
+          ...msg,
           alive: () => ws.readyState === 1,
         }).then(({ session, info }) => {
           ws.data.session = session;
@@ -104,7 +102,7 @@ export function createWsHandlers(application: Application) {
           application.replay(session);
         }).catch(e => {
           if (!(e instanceof ApplicationError)) console.error("[grayboard] hello failed:", e);
-          err(ws, msg.req_id, e instanceof ApplicationError ? e.code : "internal", e instanceof ApplicationError ? e.message : "hello failed");
+          send(ws, { type: "error", req_id: msg.req_id, code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "hello failed", ...(e instanceof ApplicationError ? e.extra : {}) });
           ws.close();
         });
         return;

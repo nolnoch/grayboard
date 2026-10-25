@@ -1,14 +1,16 @@
+import type { HelloRequest } from "../shared/protocol.ts";
+import { MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, sessionIdOf, unboundPeer, unknownNameError, type Candidate } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo } from "./db.ts";
-import { HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address } from "../shared/addressing.ts";
+import { HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address } from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, setPlace, startSession, touchHandle, type CoreDb, type Pending, type PendingRef } from "../core/boards.ts";
+import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, startSession, touchHandle, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
-import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 
@@ -19,10 +21,12 @@ export type ApplicationCode =
   | "not_found"
   | "internal"
   | "superseded"
-  | "identity_in_use";
+  | "identity_in_use"
+  | "identity_unknown"
+  | "unbound";
 
 export class ApplicationError extends Error {
-  constructor(readonly code: ApplicationCode, message: string) {
+  constructor(readonly code: ApplicationCode, message: string, readonly extra: { known?: string[]; holder?: string } = {}) {
     super(message);
   }
 }
@@ -38,6 +42,9 @@ export type DeliverySink = {
   closed(error: ApplicationError): void;
 };
 export type IdentityInfo = {
+  candidates?: Candidate[];
+  moved?: string[];
+  not_moved?: string;
   identity_full: string;
   user_email: string;
   teams: string[];
@@ -64,10 +71,7 @@ export type ApplicationOptions = {
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
 };
-export type IdentityOptions = {
-  push?: boolean;
-  where?: string;
-  resume?: boolean;
+export type IdentityOptions = Omit<HelloRequest, "type" | "req_id" | "identity"> & {
   alive?: () => boolean;
 };
 
@@ -75,6 +79,10 @@ export type IdentityOptions = {
 export class ApplicationSession {
   readonly inflight = new Set<string>();
   active = true;
+  sessionId = "";
+  place: string | null = null;
+  readOnly = false;
+  owner = false;
   identityId = 0;
   identityName = "";
   identityFull = "";
@@ -98,6 +106,7 @@ type Hub = {
   repo: Repo;
   db: CoreDb;
   registry: Map<string, ApplicationSession>;
+  holders: Map<string, ApplicationSession>;
   probing: Map<string, Promise<boolean>>;
   sessions: Set<ApplicationSession>;
   probeMs: number;
@@ -124,6 +133,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     repo,
     db,
     registry: new Map(),
+    holders: new Map(),
     probing: new Map(),
     sessions: new Set(),
     probeMs: opts.probeMs ?? 2000,
@@ -132,51 +142,135 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   };
   const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
   const revoked = new Map<number, number>();
-  function close(session: ApplicationSession) {
+  function release(session: ApplicationSession, why: string) {
+    if (!session.owner) return;
+    session.owner = false;
+    logBinding(db, session.sessionId, session.identityFull, "released", why);
+  }
+  function close(session: ApplicationSession, why = "connection closed") {
     session.active = false;
     hub.sessions.delete(session);
-    if (hub.registry.get(session.identityFull) === session) {
-      hub.registry.delete(session.identityFull);
+    if (hub.registry.get(session.identityFull) === session) hub.registry.delete(session.identityFull);
+    if (hub.holders.get(session.identityFull) === session) {
+      hub.holders.delete(session.identityFull);
       touchHandle(db, session.identityFull);
     }
+    release(session, why);
   }
-  function terminate(session: ApplicationSession, error: ApplicationError) {
-    close(session);
+  function terminate(session: ApplicationSession, error: ApplicationError, why = error.message) {
+    close(session, why);
     session.sink.closed(error);
   }
-  function valid(session: ApplicationSession) {
+  function valid(session: ApplicationSession, allowUnbound = false) {
     if (!session.active || !hub.sessions.has(session)) fail("unauthenticated", "session is closed");
     if (repo.users.findById(session.authed.user_id)?.disabled_at != null) {
       terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"));
       fail("unauthenticated", "an admin signed this user out");
     }
+    if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
-  async function select(authed: AuthedUser, nameInput: string, sink: DeliverySink, options: IdentityOptions, human: boolean) {
-    const name = nameInput.toLowerCase();
-    if (!isValidIdentityName(name)) fail("bad_request", "invalid identity name");
-    if ((name === HUMAN_NAME) !== human) fail("bad_request", name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities");
-    const full = `${authed.user_email}/${name}`;
-    const session = new ApplicationSession(authed, sink, human, options.push !== false);
+  async function select(authed: AuthedUser, nameInput: string | undefined, sink: DeliverySink, m: IdentityOptions, human: boolean) {
+    const { holders, registry } = hub;
+    const push = m.push !== false;
+    const owns = push || m.hold === true;
+    const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
+    const session = new ApplicationSession(authed, sink, human, push);
+    session.sessionId = sessionId;
+    session.place = m.where ?? null;
     const epoch = revoked.get(authed.user_id);
-    const alive = () => session.active && (options.alive?.() ?? true) && (human || revoked.get(authed.user_id) === epoch);
-    // Every await can change the holder; nothing awaits between the final check and registration.
-    while (session.push) {
+    const alive = () => session.active && (m.alive?.() ?? true) && (human || revoked.get(authed.user_id) === epoch);
+    if (!alive() || repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
+    const infoFor = (full: string): IdentityInfo => ({
+      identity_full: full,
+      user_email: authed.user_email,
+      teams: repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name)),
+      human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+      attachment_limits: repo.attachmentLimits,
+    });
+    if (m.read_only) {
+      session.readOnly = true;
+      session.identityName = `~${sessionId}`;
+      session.identityFull = `${authed.user_email}/~${sessionId}`;
+      hub.sessions.add(session);
+      return { session, info: { ...infoFor(session.identityFull), candidates: candidates(hub, authed, m.suggested) } };
+    }
+    // An invalid name is logged cut to the longest valid length: it's the
+    // client's text, and the event only has to show what was tried.
+    const name = (nameInput ?? "").toLowerCase().slice(0, MAX_IDENTITY_LENGTH);
+    const full = `${authed.user_email}/${name}`;
+    // Only the connection that would hold the name logs: a tools-only one runs
+    // beside the session that owns it.
+    const refuse = (code: ApplicationCode, message: string, detail: string, extra: { known?: string[]; holder?: string } = {}): never => {
+      if (owns) logBinding(db, sessionId, full, "refused", detail);
+      throw new ApplicationError(code, message, extra);
+    };
+    if (!isValidIdentityName((nameInput ?? "").toLowerCase())) return refuse("bad_request", "invalid identity name", "invalid name");
+    if ((name === HUMAN_NAME) !== (human)) {
+      const why = name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities";
+      return refuse("bad_request", why, why);
+    }
+
+    // A typo would otherwise create a fresh name, and the DMs queued for the
+    // intended one would never arrive.
+    if (m.create === false && !repo.identities.findByUserAndName(authed.user_id, name)) {
+      const known = closestNames(name, repo.identities.listForUser(authed.user_id).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+      const message = unknownNameError(name, known);
+      return refuse("identity_unknown", message, message, { known });
+    }
+
+    // One live connection per identity. If the current holder still answers,
+    // refuse the newcomer: taking over would let a stray second session (e.g.
+    // a worktree that inherited .mcp.json) silently steal this identity's
+    // deliveries. A holder that doesn't answer is dead; replace it. Each await
+    // can change the registry (a close, another hello), so after one, check
+    // again from the top; between the last check and registry.set below
+    // nothing awaits (#69).
+    while (owns) {
       const inFlight = hub.probing.get(full);
       if (inFlight) {
+        // Another hello is probing the holder: whoever wins, it's settled after.
         await inFlight;
         if (!alive()) fail("unauthenticated", "session is closed");
         continue;
       }
-      const holder = hub.registry.get(full);
-      if (!holder) break;
+      const holder = holders.get(full);
+      if (!holder || holder === session) break;
       const probing = holder.sink.probe(hub.probeMs).catch(() => false).finally(() => {
         if (hub.probing.get(full) === probing) hub.probing.delete(full);
       });
       hub.probing.set(full, probing);
-      if (await probing) fail("identity_in_use", `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
+      const responding = await probing;
       if (!alive()) fail("unauthenticated", "session is closed");
-      if (hub.registry.get(full) === holder) terminate(holder, new ApplicationError("superseded", "a newer session connected with this identity"));
+      if (responding) {
+        const who = describeHolder(holder);
+        return refuse("identity_in_use", `identity "${name}" is already in use by ${who}; bind another name.`, who, { holder: who });
+      }
+      if (holders.get(full) === holder) {
+        terminate(holder, new ApplicationError("superseded", "a newer session connected with this identity"), `superseded by session ${sessionId}`);
+      }
     }
+
+    // A rebind names the name it leaves (#182 audit 3). Its claims move only
+    // if this session holds that name by the record and no other connection
+    // holds it live; that holds whether or not the old connection is open. A
+    // session holding another name live must name it: a late reconnect of a
+    // name it has left is refused, never taken for a rebind.
+    let from: string | null = null;
+    let notMoved: string | null = null;
+    if (owns) {
+      const fromFull = m.from === undefined ? null : `${authed.user_email}/${m.from.toLowerCase()}`;
+      const held = [...holders.values()].find((c) => c !== session && c.sessionId === sessionId && c.identityFull !== full);
+      if (held && held.identityFull !== fromFull) {
+        const was = held.identityName;
+        return refuse("identity_in_use", `this session holds "${was}" now; a hello for "${name}" that doesn't leave it is refused.`, `stale: the session holds "${was}"`);
+      }
+      if (fromFull !== null && fromFull !== full) {
+        const h = holders.get(fromFull);
+        if ((!h || h.sessionId === sessionId) && lastBoundBy(db, fromFull, sessionId)) from = fromFull;
+        else notMoved = `claims not moved: this session doesn't hold "${m.from}"`;
+      }
+    }
+
     if (!alive() || repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "an admin signed this user out");
     let identity = repo.identities.findByUserAndName(authed.user_id, name);
     if (!identity) {
@@ -184,40 +278,54 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       writeAudit(repo, "identity.created", authed.user_email, name, { lazy: true });
       onIdentityCreated(db, repo, authed.user_id, full);
     }
+
     session.identityId = identity.id;
     session.identityName = name;
     session.identityFull = full;
     hub.sessions.add(session);
-    if (session.push) {
-      hub.registry.set(full, session);
-      if (options.resume) {
-        touchHandle(db, full);
+    let moved: string[] | undefined;
+    if (owns) {
+      moved = [];
+      holders.set(full, session);
+      if (push) registry.set(full, session);
+      // A reconnect, or a restart taking its name back, is the same session: its status stays.
+      if (m.resume || m.restored_from) touchHandle(db, full);
+      else startSession(db, full, null);
+      setPlace(db, full, m.where ?? null);
+      session.owner = true;
+      if (from) {
+        // The old connection, which the client closes next, holds nothing now.
+        const prev = holders.get(from);
+        if (prev) {
+          holders.delete(from);
+          if (registry.get(from) === prev) registry.delete(from);
+          touchHandle(db, from);
+        }
+        moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
+        if (prev?.owner) release(prev, `rebound to ${full}`);
+        else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
+        logBinding(db, sessionId, full, "moved", from);
       } else {
-        startSession(db, full, null);
+        const how = m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null;
+        logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
       }
-      setPlace(db, full, options.where ?? null);
     } else {
       touchHandle(db, full);
     }
-    const info: IdentityInfo = {
-      identity_full: full,
-      user_email: authed.user_email,
-      teams: repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name)),
-      human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
-      attachment_limits: repo.attachmentLimits,
-    };
+
+    const info: IdentityInfo = { ...infoFor(full), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
     const notices = [...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)), ...claimsInstruction(listClaims(db, undefined, full), full)];
     if (notices.length) info.notices = notices;
     return { session, info };
   }
   const application = {
-    selectIdentity: (authed: AuthedUser, name: string, sink: DeliverySink, options: IdentityOptions = {}) => select(authed, name, sink, options, false),
+    selectIdentity: (authed: AuthedUser, name: string | undefined, sink: DeliverySink, options: IdentityOptions = {}) => select(authed, name, sink, options, false),
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman: (authed: AuthedUser, sink: DeliverySink) => select(authed, HUMAN_NAME, sink, {}, true),
     close,
     replay(session: ApplicationSession) {
-      valid(session);
-      if (!session.push || hub.registry.get(session.identityFull) !== session) return;
+      valid(session, true);
+      if (session.readOnly || !session.push || hub.registry.get(session.identityFull) !== session) return;
       const since = repo.cursors.get(session.identityId, "direct", session.identityFull);
       for (const message of repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])) {
         session.sink.deliver({ kind: "direct", message: showPending(message) });
@@ -267,7 +375,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       handleRetract(hub, session, id);
     },
     call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
-      valid(session);
+      valid(session, UNBOUND_READS.has(tool));
       const result = handleCall(hub, session, tool, args, publish);
       expiry.arm();
       return result;
@@ -297,6 +405,37 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   return application;
 }
 export type Application = ReturnType<typeof createApplication>;
+
+function describeHolder(session: ApplicationSession): string {
+  return `the live session ${session.sessionId}${session.place ? `, in ${session.place}` : ""}`;
+}
+
+function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
+  const { repo, db, holders } = hub;
+  const full = (n: string) => `${authed.user_email}/${n}`;
+  const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
+  const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
+  const queued = repo.messages.queuedTo(names.map(full));
+  const seen = sessionsSeen(db, names.map(full));
+  const claims = new Map<string, number>();
+  for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
+  const s = suggestedInput?.toLowerCase();
+  const suggested = s !== undefined && isValidIdentityName(s) && free(s) ? s : null;
+  return orderCandidates(
+    names.map((n) => ({
+      name: n, queued: queued.get(full(n)) ?? 0, claims: claims.get(full(n)) ?? 0,
+      last_seen: seen.get(full(n))?.last_seen ?? 0, where: seen.get(full(n))?.where ?? null,
+    })),
+    suggested,
+  ).slice(0, MAX_CANDIDATES);
+}
+
+// The user's live unbound sessions, for peer_list: never another user's.
+function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
+  return [...hub.sessions].filter(c => c.readOnly)
+    .filter((c) => c.authed.user_id === session.authed.user_id)
+    .map((c) => unboundPeer(c.sessionId!, c.place ?? null, c.sessionId === session.sessionId));
+}
 
 function resolvePeer(repo: Repo, session: ApplicationSession, input: string): Address {
   const { authed } = session;
@@ -432,6 +571,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     outcome = callBoardTool(db, session.identityFull, tool, args, {
       online: (h) => hub.registry.get(h)?.active === true,
       attachmentLimits: hub.repo.attachmentLimits,
+      ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),
     });
   } catch (e) {
     if (e instanceof CoreError) return fail("bad_request", e.message);

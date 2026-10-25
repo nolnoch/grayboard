@@ -25,7 +25,12 @@ afterEach(async () => {
 });
 async function login(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
-  return (await res.json() as { session_token: string }).session_token;
+  const token = (await res.json() as { session_token: string }).session_token;
+  const user = app.repo.users.findByEmail(email)!;
+  for (const name of ["be", "allowed"]) {
+    if (!app.repo.identities.findByUserAndName(user.id, name)) app.repo.identities.create(user.id, name);
+  }
+  return token;
 }
 async function connect(token: string, identity = "be", version = "2026-07-28", origin?: string) {
   const client = new Client({ name: "http-test", version: "1" }, {

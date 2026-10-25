@@ -154,3 +154,89 @@ test("hosted Slack has no dependency on the transitional wire adapter", async ()
   expect(source).not.toContain("HumanConn");
   expect(source).toContain("application.attachHuman");
 });
+
+test("unbound application sessions cannot use named operations or persist synthetic handles", async () => {
+  const { session, info } = await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true, session_key: "unbound-secret", suggested: "fresh" });
+  expect(session.identityId).toBe(0);
+  expect(info.candidates).toMatchObject([{ name: "fresh", fresh: true }]);
+  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
+  const operations = [
+    () => application.send(session, "be", "no"),
+    () => application.history(session),
+    () => application.thread(session, 1),
+    () => application.inbox(session),
+    () => application.receiptDirect(session, [1]),
+    () => application.receiptBoards(session, []),
+    () => application.acknowledgeDm(session, 1),
+    () => application.retract(session, 1),
+    () => application.call(session, "board_create", { name: "e2e", purpose: "no" }),
+  ];
+  for (const operation of operations) {
+    try { operation(); throw new Error("operation admitted"); } catch (e) { expect(e).toMatchObject({ code: "unbound" }); }
+  }
+  for (const tool of ["board_list", "peer_list", "claim_list"]) expect(() => application.call(session, tool, {})).not.toThrow();
+  application.replay(session);
+  expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
+  const peers = application.call(session, "peer_list", {}) as Record<string, unknown>;
+  expect(peers).not.toHaveProperty("you");
+  expect(peers.unbound_sessions).toMatchObject([{ self: true }]);
+  await application.selectIdentity(bob, undefined, delivery(sink()), { read_only: true, session_key: "bob-unbound-secret" });
+  expect((application.call(session, "peer_list", {}) as { unbound_sessions: unknown[] }).unbound_sessions).toHaveLength(1);
+  application.disconnectUser(alice.user_id);
+  expect(() => application.call(session, "board_list", {})).toThrow("session is closed");
+});
+
+test("hold owners block binding and candidates without push or online presence; release is once", async () => {
+  const out = sink();
+  const owner = (await application.selectIdentity(alice, "held", delivery(out), { push: false, hold: true, session_key: "hold-secret", where: "checkout" })).session;
+  application.call(owner, "peer_status", { text: "working" });
+  const tools = (await application.selectIdentity(alice, "held", delivery(sink()), { push: false })).session;
+  const observer = (await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true })).session;
+  expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false, status: "working" }]);
+  expect(tools.owner).toBe(false);
+  await expect(application.selectIdentity(alice, "held", delivery(sink()))).rejects.toMatchObject({ code: "identity_in_use", extra: { holder: expect.stringContaining("checkout") } });
+  const unbound = await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true, suggested: "held" });
+  expect(unbound.info.candidates).toEqual([]);
+  const sender = (await application.selectIdentity(bob, "sender", delivery(sink()))).session;
+  expect(application.send(sender, "alice@example.com/held", "queued").delivered_now).toBe(false);
+  application.replay(owner);
+  expect(out.events).toEqual([]);
+  application.close(owner);
+  application.close(owner);
+  const releases = store.db.query("SELECT * FROM binding_events WHERE name = ? AND event = 'released'").all(owner.identityFull);
+  expect(releases).toHaveLength(1);
+});
+
+test("unknown and reserved names are audited without creation; trusted human gets binding attribution", async () => {
+  await expect(application.selectIdentity(alice, "typo", delivery(sink()), { create: false, session_key: "typo-secret" })).rejects.toMatchObject({ code: "identity_unknown", extra: { known: [] } });
+  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  await expect(application.selectIdentity(alice, "human", delivery(sink()), { session_key: "human-secret" })).rejects.toMatchObject({ code: "bad_request" });
+  const human = (await application.attachHuman(alice, delivery(sink()))).session;
+  expect(human.sessionId).not.toBe("");
+  application.close(human);
+  expect(store.db.query("SELECT event FROM binding_events WHERE name = ? ORDER BY id").all(human.identityFull)).toEqual([{ event: "refused" }, { event: "bound" }, { event: "released" }]);
+});
+
+test("rebind acquires target before releasing source, moves claims not DMs, and refuses stale resume", async () => {
+  const oldOut = sink();
+  const old = (await application.selectIdentity(alice, "old", delivery(oldOut), { session_key: "rebind-secret" })).session;
+  application.call(old, "claim_take", { key: "file:src/e2e.ts" });
+  const blocker = (await application.selectIdentity(alice, "blocked", delivery(sink()))).session;
+  await expect(application.selectIdentity(alice, "blocked", delivery(sink()), { from: "old", session_key: "rebind-secret" })).rejects.toMatchObject({ code: "identity_in_use" });
+  expect(old.owner).toBe(true);
+  const nextOut = sink();
+  const next = await application.selectIdentity(alice, "next", delivery(nextOut), { from: "old", session_key: "rebind-secret" });
+  expect(next.info.moved).toEqual(["file:src/e2e.ts"]);
+  expect(old.owner).toBe(false);
+  expect(next.session.owner).toBe(true);
+  expect(store.db.query("SELECT holder FROM claims WHERE key = ?").get("file:src/e2e.ts")).toEqual({ holder: next.session.identityFull });
+  expect(store.db.query("SELECT * FROM claim_events WHERE key = ?").all("file:src/e2e.ts").length).toBeGreaterThan(1);
+  const sender = (await application.selectIdentity(bob, "sender", delivery(sink()))).session;
+  expect(application.send(sender, old.identityFull, "old mailbox").delivered_now).toBe(false);
+  expect(nextOut.events).toEqual([]);
+  await expect(application.selectIdentity(alice, "old", delivery(sink()), { resume: true, session_key: "rebind-secret" })).rejects.toMatchObject({ code: "identity_in_use" });
+  application.close(old);
+  expect(store.db.query("SELECT * FROM binding_events WHERE name = ? AND event = 'released'").all(old.identityFull)).toHaveLength(1);
+  application.close(blocker);
+});

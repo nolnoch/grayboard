@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createApplication, type DeliveryEvent } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
-import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
+import { hashToken, mintToken, createTouchQueue, type AuthedUser } from "./auth.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -15,12 +15,15 @@ let user: AuthedUser;
 let token: string;
 let blobDir: string;
 const clients: Client[] = [];
+let touches: ReturnType<typeof createTouchQueue>;
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
   application = createApplication(store.repo, store.db);
-  hosted = createHostedMcp(application, store.repo, { trustedOrigin: "https://grayboard.example.com:443" });
+  touches = createTouchQueue();
+  hosted = createHostedMcp(application, store.repo, { trustedOrigin: "https://grayboard.example.com:443", touches });
   const u = store.repo.users.upsertByEmail("alice@example.com", null);
+  store.repo.identities.create(u.id, "be");
   token = mintToken();
   const session = store.repo.sessions.create(u.id, hashToken(token), "test");
   user = { user_id: u.id, user_email: u.email, session_id: session.id };
@@ -29,9 +32,18 @@ afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
   await hosted.close();
   application.stopExpiry();
+  touches.cancelAll();
   await Bun.sleep(0);
   store.db.close();
   rmSync(blobDir, { recursive: true, force: true });
+});
+
+test("unknown HTTP names fail with closest names without creating a context or identity", async () => {
+  const response = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee" } }));
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ code: "identity_unknown", known: ["be"] });
+  expect(store.repo.identities.findByUserAndName(user.user_id, "bee")).toBeUndefined();
+  expect(hosted.activeContexts).toBe(0);
 });
 
 async function connect(version = "2026-07-28", intercept?: (response: Response) => Promise<void>) {
