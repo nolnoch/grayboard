@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 
 import { clientAddress, DEFAULT_TRUSTED_PROXIES, normalizeIp, parseCidr, rateKey, TrustedProxies } from "./client_addr.ts";
 
@@ -40,6 +40,31 @@ test("behind trusted proxies the walk from the right takes the first untrusted e
   expect(clientAddress("127.0.0.1", "10.0.0.7", lb)).toBe("10.0.0.7");
   expect(clientAddress("127.0.0.1", "198.51.100.1, garbage", loopback)).toBe("127.0.0.1");
   expect(clientAddress("127.0.0.1", "::ffff:198.51.100.1", loopback)).toBe("198.51.100.1");
+});
+
+test("hex-mapped IPv4 normalises to dotted", () => {
+  expect(normalizeIp("::ffff:7f00:1")).toBe("127.0.0.1");
+  expect(normalizeIp("::FFFF:C633:6401")).toBe("198.51.100.1");
+});
+
+test("forwarded-for entries with a port or brackets parse to the address", () => {
+  expect(clientAddress("::1", "198.51.100.1:5678", loopback)).toBe("198.51.100.1");
+  expect(clientAddress("::1", "[2001:db8::1]", loopback)).toBe("2001:db8::1");
+  expect(clientAddress("::1", "[2001:db8::1]:443", loopback)).toBe("2001:db8::1");
+  expect(clientAddress("::1", " [::ffff:198.51.100.1]:80 ", loopback)).toBe("198.51.100.1");
+});
+
+test("a trusted proxy's unparsable entry keys to the proxy and is logged once", () => {
+  const trusted = new TrustedProxies(DEFAULT_TRUSTED_PROXIES);
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect(clientAddress("127.0.0.1", "garbage", trusted)).toBe("127.0.0.1");
+    expect(clientAddress("127.0.0.1", "more-garbage", trusted)).toBe("127.0.0.1");
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(String(err.mock.calls[0]![0])).toContain(`trusted proxy 127.0.0.1 sent an X-Forwarded-For entry that isn't an address ("garbage")`);
+  } finally {
+    err.mockRestore();
+  }
 });
 
 test("IPv4 keys by address, IPv6 by its /64", () => {

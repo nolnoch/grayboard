@@ -194,17 +194,18 @@ test("after a confirmed 401 a running client stops retrying, and reconnects at o
   c.connect();
   await c.ready();
 
-  // The token is revoked and the connection drops: one reconnect (after the
-  // 1s backoff) is refused, and the probe confirms it.
+  // The token is revoked and the connection drops: the reconnect's check
+  // (after the 1s backoff) is refused, so no upgrade is tried: a dead token
+  // costs the address one failure per attempt.
   valid = "t2";
+  const upgrades = s.upgrades.length;
   (c as any).ws.close();
-  await until(() => s.whoami.length === 1, 3000);
-  const refusedAt = s.upgrades.length;
-  // The slow retry tries the old token once more, and is refused again; the
-  // backoff alone would have tried after 2s.
-  await until(() => s.whoami.length === 2, 4000);
-  expect(s.upgrades.length).toBe(refusedAt + 1);
-  expect(s.whoami[1]! - s.whoami[0]!).toBeGreaterThanOrEqual(2900);
+  await until(() => s.whoami.length === 2, 3000);
+  // The slow retry (3s, jittered up to 4.5s) checks the old token once more,
+  // and is refused again; the backoff alone would have tried after 2s.
+  await until(() => s.whoami.length === 3, 6000);
+  expect(s.upgrades.length).toBe(upgrades);
+  expect(s.whoami[2]! - s.whoami[1]!).toBeGreaterThanOrEqual(2900);
 
   // A new sign-in is seen at the next look (50ms), not at the slow retry.
   const t = Date.now();
@@ -224,14 +225,62 @@ test("on a limited address the client waits at least its own backoff, keeps doub
   c.connect();
   await until(() => c.rateLimited(), 2000);
   expect(c.rateLimited()).toMatchObject({ what: "this address after repeated authentication failures", message: "too many authentication failures from this address; retry in 1s" });
-  await until(() => s.upgrades.length === 3, 5000);
+  await until(() => s.whoami.length === 3, 5000);
   // 1s, then 2s: the floor is the backoff, which a 429 never resets.
-  expect(s.upgrades[1]! - s.upgrades[0]!).toBeGreaterThanOrEqual(1000);
-  expect(s.upgrades[2]! - s.upgrades[1]!).toBeGreaterThanOrEqual(2000);
+  expect(s.whoami[1]! - s.whoami[0]!).toBeGreaterThanOrEqual(1000);
+  expect(s.whoami[2]! - s.whoami[1]!).toBeGreaterThanOrEqual(2000);
+  // The checks were refused, so no upgrade was tried.
+  expect(s.upgrades).toEqual([]);
   open = true;
   await c.ready();
   expect(c.rateLimited()).toBeNull();
 }, 15_000);
+
+test("a 429 without grayboard's code is waited out by its Retry-After, and named as such", async () => {
+  let open = false;
+  const s = stub(() => (open ? "t" : "never"), () => new Response("busy", { status: 429, headers: { "Retry-After": "2" } }));
+  const c = new GrayboardClient(s.url, () => "t", "fe", mintSessionKey(), async () => {}, async () => {});
+  cleanup.push(() => c.close());
+  c.connect();
+  await until(() => c.rateLimited(), 2000);
+  expect(c.rateLimited()).toMatchObject({ what: "requests from this client", message: `HTTP 429 from ${s.url}, Retry-After 2` });
+  await until(() => s.whoami.length === 2, 5000);
+  // The header's 2s, not the 1s backoff.
+  expect(s.whoami[1]! - s.whoami[0]!).toBeGreaterThanOrEqual(2000);
+  open = true;
+  await c.ready();
+  expect(c.rateLimited()).toBeNull();
+}, 15_000);
+
+test("a token check that never answers is abandoned at its deadline and retried", async () => {
+  const checks: number[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, server) {
+      if (new URL(req.url).pathname === "/api/whoami") {
+        checks.push(Date.now());
+        // The first check stalls, as behind a proxy that never answers.
+        return checks.length === 1 ? new Promise<Response>(() => {}) : Response.json({});
+      }
+      if (server.upgrade(req)) return;
+      return new Response("no", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const m = JSON.parse(String(raw));
+        if (m.type === "hello") ws.send(JSON.stringify({ req_id: m.req_id, ...HELLO_OK }));
+      },
+    },
+  });
+  cleanup.push(() => server.stop(true));
+  const c = new GrayboardClient(`http://localhost:${server.port}`, () => "t", "fe", mintSessionKey(), async () => {}, async () => {}, true, undefined, { probeTimeoutMs: 200 });
+  cleanup.push(() => c.close());
+  c.connect();
+  await c.ready();
+  // The 200ms deadline, then the 1s backoff.
+  expect(checks.length).toBe(2);
+  expect(checks[1]! - checks[0]!).toBeGreaterThanOrEqual(1200);
+}, 10_000);
 
 test("at startup a limited address is waited out when the retry fits the window, and named when it doesn't", async () => {
   // Real time: the login spends one token and the bad call the other. A token

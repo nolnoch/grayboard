@@ -11,7 +11,19 @@ fi
 url="${1%/}/healthz"
 want="${2#v}"
 
-body="$(curl -fsSL --max-time 10 "$url")" || { echo "deploy_check: no healthy answer from ${url}" >&2; exit 1; }
+resp="$(curl -sSL --max-time 10 -w '\n%{http_code}' "$url")" || { echo "deploy_check: no healthy answer from ${url}" >&2; exit 1; }
+status="${resp##*$'\n'}"
+body="${resp%$'\n'*}"
+# The server refuses every request from an address it's limiting after
+# repeated authentication failures (#240), /healthz included.
+if [ "$status" = 429 ]; then
+  echo "deploy_check: ${url} is rate-limiting this address (${body}); run it from another address, or after the wait" >&2
+  exit 1
+fi
+if [ "$status" != 200 ]; then
+  echo "deploy_check: no healthy answer from ${url} (HTTP ${status}: ${body})" >&2
+  exit 1
+fi
 got="$(printf '%s' "$body" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
 case "$body" in *'"ok":true'*) ok=1 ;; *) ok=0 ;; esac
 if [ "$ok" != 1 ] || [ "$got" != "$want" ]; then

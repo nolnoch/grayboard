@@ -6,7 +6,14 @@ import { cleanEnv } from "../support/env.ts";
 import { ROOT } from "../support/paths.ts";
 
 let health: Record<string, unknown> = { ok: true, version: "1.2.3" };
-const srv = Bun.serve({ port: 0, fetch: (r) => (new URL(r.url).pathname === "/healthz" ? Response.json(health) : new Response("no", { status: 404 })) });
+let limited = false;
+const srv = Bun.serve({
+  port: 0,
+  fetch: (r) =>
+    new URL(r.url).pathname !== "/healthz" ? new Response("no", { status: 404 })
+    : limited ? Response.json({ code: "rate_limited", message: "too many authentication failures from this address; retry in 10s" }, { status: 429 })
+    : Response.json(health),
+});
 afterAll(() => srv.stop(true));
 
 async function check(url: string, tag: string): Promise<{ code: number; out: string }> {
@@ -28,4 +35,16 @@ test("fails on another version, on not ok, and on no answer", async () => {
   const none = await check("http://localhost:1", "v1.2.3");
   expect(none.code).toBe(1);
   expect(none.out).toContain("no healthy answer");
+});
+
+test("names the address limit when the server answers 429", async () => {
+  limited = true;
+  try {
+    const r = await check(`http://localhost:${srv.port}`, "v1.2.3");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("is rate-limiting this address");
+    expect(r.out).toContain("too many authentication failures from this address");
+  } finally {
+    limited = false;
+  }
 });

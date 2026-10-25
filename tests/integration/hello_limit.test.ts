@@ -143,7 +143,7 @@ function client(url: string): GrayboardClient {
 
 const HELLO_OK = { type: "hello_ok", identity_full: `${A}/fe`, user_email: A, teams: [] };
 
-test("the client waits the server's retry_after_ms, skips the token check, and reports why while it waits", async () => {
+test("the client waits the server's retry_after_ms and reports why while it waits", async () => {
   const s = stub((n) => (n === 1 ? { type: "error", code: "rate_limited", message: "slow down", retry_after_ms: 300 } : HELLO_OK));
   const c = client(s.url);
   await until(() => c.rateLimited()?.message === "slow down");
@@ -154,7 +154,8 @@ test("the client waits the server's retry_after_ms, skips the token check, and r
   expect(s.opens[1]! - s.opens[0]!).toBeGreaterThanOrEqual(300);
   // Under the 1s backoff: the server's wait was used, not the backoff.
   expect(s.opens[1]! - s.opens[0]!).toBeLessThan(950);
-  expect(s.whoami).toEqual([]);
+  // One token check per connect, none for the limit itself.
+  expect(s.whoami.length).toBe(2);
 });
 
 test("an open the server closes before hello_ok doesn't reset the backoff", async () => {

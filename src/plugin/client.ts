@@ -1,6 +1,7 @@
 import type { ServerMessage, ClientMessage, ErrorMessage, HelloOk, Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { describeLocation } from "../shared/identity.ts";
+import { HTTP_TIMEOUT_MS, describeFetchError } from "../shared/http.ts";
 
 // Server tool calls are single DB transactions; one unanswered this long never will be.
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -47,11 +48,19 @@ export type ClientOptions = {
   // the old one again anyway. Shortened by tests.
   tokenPollMs?: number;
   signedOutRetryMs?: number;
+  // The token check's deadline. Shortened by tests.
+  probeTimeoutMs?: number;
 };
 
 /** Why the server is refusing this client for now: what it limits, its
  *  message, and when the client tries again. */
 export type RateLimited = { what: string; message: string; retryAt: number };
+
+// What a token check found: go ahead, sign in again, wait, or no answer.
+type Probe =
+  | { kind: "ok" | "refused" }
+  | { kind: "limited"; what: string; retryAfterMs: unknown; message: string }
+  | { kind: "unanswered"; why: string };
 
 const TOKEN_POLL_MS = 5_000;
 const SIGNED_OUT_RETRY_MS = 5 * 60_000;
@@ -67,9 +76,10 @@ export class GrayboardClient {
   private refused: string | null = null; // set while the server refuses our token
   // Set while the server rate-limits this client, its user's hellos (#210)
   // or its address after auth failures (#240), until a hello is accepted:
-  // why, when the next try goes out, and for a hello the wait before it
+  // why, when the next try goes out, whether a hello said so (a probe's
+  // answer replaces only a probe's), and for a hello the wait before it
   // (null once used).
-  private limited: (RateLimited & { retryMs: number | null }) | null = null;
+  private limited: (RateLimited & { byHello: boolean; retryMs: number | null }) | null = null;
   private wasReady  = false; // a later hello is a reconnect, not a new session
   private helloId   = "";    // the req_id of this connection's hello
   private readyResolvers: Array<(err?: Error) => void> = [];
@@ -107,11 +117,48 @@ export class GrayboardClient {
 
   connect(): void {
     if (this.dead) return;
+    this.probeThenOpen().catch((e) => {
+      console.error(`[grayboard] connecting as ${this.who()} failed: ${(e as Error).message}`);
+      if (!this.dead) this.scheduleReconnect();
+    });
+  }
+
+  // Every connect asks over HTTP first (#240). A refused upgrade says only
+  // "Expected 101 status code", and probing after it would charge the address
+  // twice per dead token; probing before charges it once, and a 429 here means
+  // the address's bucket was already empty, not that the upgrade emptied it.
+  private async probeThenOpen(): Promise<void> {
+    const token = this.token();
+    const probe = await this.checkToken(token);
+    if (this.dead) return;
+    if (probe.kind === "refused") {
+      this.limited = null;
+      return this.awaitNewToken(token);
+    }
+    if (probe.kind === "unanswered") {
+      this.limited = null;
+      console.error(`[grayboard] the grayboard server didn't answer a token check (${probe.why})`);
+      return this.scheduleReconnect();
+    }
+    if (probe.kind === "limited") {
+      // The server's wait is a floor (#240): behind a shared address,
+      // returning the moment one token is back keeps the bucket empty for
+      // everyone, so the backoff keeps growing until a hello is accepted.
+      const wait = Math.round(Math.max(retryWait(probe.retryAfterMs, this.backoffMs), this.backoffMs) * (1 + Math.random() / 2));
+      this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+      this.limited = { what: probe.what, message: probe.message, byHello: false, retryMs: null, retryAt: Date.now() + wait };
+      return this.reconnectIn(wait, `rate limited (${probe.message})`);
+    }
+    if (!this.limited?.byHello) this.limited = null;
+    this.open(token);
+  }
+
+  private open(token: string): void {
     const url = `${this.serverUrl.replace(/^http/, "ws")}/ws`;
 
     // Bun extends WebSocket with a headers option (non-standard)
     this.ws = new (WebSocket as any)(url, {
-      headers: { Authorization: `Bearer ${this.token()}` },
+      headers: { Authorization: `Bearer ${token}` },
     }) as WebSocket;
 
     this.ws.onopen = () => {
@@ -149,18 +196,17 @@ export class GrayboardClient {
       const neverOpened = !this.helloData;
       this.ws = null;
       this.helloData = null;
-      // Rate-limited: the server said why it closed, so the token needs no
-      // check, and the wait is the server's, not the backoff's.
+      // Rate-limited: the server said why it closed, and the wait is the
+      // server's, not the backoff's.
       const retryMs = this.limited?.retryMs;
       if (retryMs != null) {
         this.limited!.retryMs = null;
         return void this.reconnectIn(retryMs, `rate limited (${this.limited!.message})`);
       }
-      // The probe says whether the address is limited, and clears the state if not.
-      if (neverOpened) return void this.afterFailedOpen();
-      // Any other close (the network, the server going away) is not the
-      // limit: a stale reason would make startup wait it out and blame it.
-      this.limited = null;
+      // Any other close after a hello_ok (the network, the server going away)
+      // is not the limit: a stale reason would make startup wait it out and
+      // blame it. Before one, the next connect's probe says.
+      if (!neverOpened) this.limited = null;
       this.scheduleReconnect();
     };
 
@@ -224,7 +270,7 @@ export class GrayboardClient {
         // stays pending; a caller's own deadline decides (#210).
         if (msg.code === "rate_limited" && !this.helloData && msg.req_id === this.helloId) {
           const retryMs = Math.round(retryWait(msg.retry_after_ms, this.backoffMs) * (1 + Math.random() / 2));
-          this.limited = { what: "this user's connections", message: msg.message, retryMs, retryAt: Date.now() + retryMs };
+          this.limited = { what: "this user's connections", message: msg.message, byHello: true, retryMs, retryAt: Date.now() + retryMs };
           this.ws?.close();
           break;
         }
@@ -268,39 +314,27 @@ export class GrayboardClient {
     }
   }
 
-  // A connection that never got hello_ok: the probe's answer decides what
-  // comes next, so it's awaited before any reconnect is scheduled.
-  private async afterFailedOpen(): Promise<void> {
-    const token = this.token();
-    const probe = await this.checkToken(token);
-    if (this.dead) return;
-    if (probe === "refused") {
-      this.limited = null;
-      return this.awaitNewToken(token);
+  // Whether the server takes this token, over HTTP. A 401 is fatal at
+  // startup; later, tool calls say to sign in again until a reconnect
+  // succeeds. A 429 is the address limit only when the body says so; any
+  // other (a proxy's, a load balancer's) is waited out by its Retry-After.
+  private async checkToken(token: string): Promise<Probe> {
+    const { probeTimeoutMs = HTTP_TIMEOUT_MS } = this.opts;
+    let r: Response;
+    let body: { code?: unknown; message?: unknown; retry_after_ms?: unknown } = {};
+    try {
+      r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(probeTimeoutMs) });
+      if (r.status === 429) body = await r.json().catch(() => ({}));
+    } catch (e) {
+      return { kind: "unanswered", why: describeFetchError(e, probeTimeoutMs) };
     }
-    if (probe !== "other") {
-      // The server's wait is a floor (#240): behind a shared address,
-      // returning the moment one token is back keeps the bucket empty for
-      // everyone, so the backoff keeps growing until a hello is accepted.
-      const wait = Math.round(Math.max(retryWait(probe.retryAfterMs, this.backoffMs), this.backoffMs) * (1 + Math.random() / 2));
-      this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
-      this.limited = { what: "this address after repeated authentication failures", message: probe.message, retryMs: null, retryAt: Date.now() + wait };
-      return this.reconnectIn(wait, `rate limited (${probe.message})`);
-    }
-    this.limited = null;
-    this.scheduleReconnect();
-  }
-
-  // A refused token fails the upgrade like anything else (Bun shows only
-  // "Expected 101 status code"), so ask over HTTP. At startup that's fatal;
-  // later, tool calls say to sign in again until a reconnect succeeds.
-  // A 429 is the address limit, which refused the upgrade too.
-  private async checkToken(token: string): Promise<"refused" | "other" | { retryAfterMs: unknown; message: string }> {
-    const r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
-    if (!r) return "other";
     if (r.status === 429) {
-      const body = (await r.json().catch(() => ({}))) as { message?: unknown; retry_after_ms?: unknown };
-      return { retryAfterMs: body.retry_after_ms, message: typeof body.message === "string" ? body.message : "429" };
+      if (body.code === "rate_limited") {
+        const message = typeof body.message === "string" ? body.message : "429";
+        return { kind: "limited", what: "this address after repeated authentication failures", retryAfterMs: body.retry_after_ms, message };
+      }
+      const retryAfter = r.headers.get("Retry-After");
+      return { kind: "limited", what: "requests from this client", retryAfterMs: retryAfterMs(retryAfter), message: `HTTP 429 from ${this.serverUrl}${retryAfter ? `, Retry-After ${retryAfter}` : ""}` };
     }
     this.refused = r.status === 401 ? this.refusedMessage(this.wasReady) : null;
     if (this.refused && !this.wasReady) {
@@ -308,22 +342,24 @@ export class GrayboardClient {
       const err = new Error(this.refused);
       for (const res of this.readyResolvers.splice(0)) res(err);
     }
-    return this.refused ? "refused" : "other";
+    return { kind: this.refused ? "refused" : "ok" };
   }
 
   // Each refused attempt costs the address an auth failure (#240), so a
   // fleet retrying a dead token would lock out everyone behind its NAT.
-  // Instead wait for a new sign-in, a local file read, or the slow retry.
+  // Instead wait for a new sign-in, a local file read, or the slow retry,
+  // jittered so a fleet signed out together doesn't come back in lockstep.
   private awaitNewToken(refusedToken: string): void {
     const { tokenPollMs = TOKEN_POLL_MS, signedOutRetryMs = SIGNED_OUT_RETRY_MS } = this.opts;
-    const giveUpAt = Date.now() + signedOutRetryMs;
-    console.error(`[grayboard] the server refused the token of ${this.who()}; reconnecting after a new sign-in, or in ${Math.round(signedOutRetryMs / 1000)}s`);
+    const retryMs = Math.round(signedOutRetryMs * (1 + Math.random() / 2));
+    const giveUpAt = Date.now() + retryMs;
+    console.error(`[grayboard] the server refused the token of ${this.who()}; reconnecting after a new sign-in, or in ${Math.round(retryMs / 1000)}s`);
     const tick = () => {
       if (this.dead) return;
       if (this.token() !== refusedToken || Date.now() >= giveUpAt) return this.connect();
       setTimeout(tick, Math.min(tokenPollMs, giveUpAt - Date.now()));
     };
-    setTimeout(tick, Math.min(tokenPollMs, signedOutRetryMs));
+    setTimeout(tick, Math.min(tokenPollMs, retryMs));
   }
 
   private scheduleReconnect(): void {
@@ -422,4 +458,13 @@ const MAX_RETRY_MS = 30_000;
 export function retryWait(serverMs: unknown, backoffMs: number): number {
   if (typeof serverMs !== "number" || !Number.isFinite(serverMs) || serverMs < 0) return backoffMs;
   return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, serverMs));
+}
+
+// A Retry-After header in ms: delay-seconds or an HTTP date; anything else
+// is undefined, which retryWait turns into the backoff.
+export function retryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  if (/^\d+$/.test(header.trim())) return Number(header.trim()) * 1000;
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }

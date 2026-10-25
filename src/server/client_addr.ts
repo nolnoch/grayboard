@@ -37,7 +37,7 @@ export class TrustedProxies {
   noteUnparsable(peer: string, entry: string): void {
     if (this.warnedUnparsable) return;
     this.warnedUnparsable = true;
-    console.error(`[grayboard] trusted proxy ${peer} sent an X-Forwarded-For entry that isn't an address (${JSON.stringify(entry.slice(0, 64))}); its clients share its rate-limit bucket`);
+    console.error(`[grayboard] trusted proxy ${peer} sent an X-Forwarded-For entry that isn't an address (${JSON.stringify(entry.trim().slice(0, 64))}); its clients share its rate-limit bucket`);
   }
 }
 
