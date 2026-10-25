@@ -175,10 +175,11 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: asset } }, opts);
   };
   const good = signSums(TAG, { [ASSET]: built });
+  const badTag = "v9.9.9/../../x";
   const refusals: [string, () => void, string][] = [
     ["a bad signature", () => serve(built, { signed: { [TAG]: { sig: sign("other\n") } } }), "the signature doesn't verify against SHA256SUMS"],
     ["a missing .sig", () => serve(built, { signed: { [TAG]: { sig: null } } }), `couldn't fetch the ${TAG} SHA256SUMS.sig`],
-    ["a missing SHA256SUMS", () => serve(built, { signed: { [TAG]: { sums: null } } }), `couldn't fetch the ${TAG} SHA256SUMS`],
+    ["a missing SHA256SUMS", () => serve(built, { signed: { [TAG]: { sums: null } } }), `couldn't fetch the ${TAG} SHA256SUMS from `],
     ["an unknown key id", () => serve(built, { signed: { [TAG]: signSums(TAG, { [ASSET]: built }, testKey("c")) } }), `unknown key id ${testKey("c").id}`],
     ["another release's SHA256SUMS", () => serve(built, { signed: { [TAG]: signSums("v0.0.1", { [ASSET]: built }) } }), `SHA256SUMS is signed for v0.0.1, not ${TAG}`],
     ["a binary SHA256SUMS doesn't list", () => serve(built, { signed: { [TAG]: signSums(TAG, {}) } }), `SHA256SUMS lists no ${ASSET}`],
@@ -186,6 +187,11 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     ["a binary that doesn't match SHA256SUMS", () => serve(v0, { signed: { [TAG]: good } }), "but SHA256SUMS lists"],
     ["an API digest that doesn't match", () => serve(built, { digests: { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } } }), `but the release API lists sha256:${"0".repeat(64)}`],
     ["a signed binary that doesn't report the tag", () => serve(v0), `reports '0.0.0', not ${TAG}`],
+    // Checked before the tag reaches a URL or the temp file's name.
+    ["a latest tag that isn't a release tag", () => {
+      releases?.stop();
+      releases = new ReleaseServer(REPO, badTag, { [badTag]: { [ASSET]: built } });
+    }, `the latest release's tag "${badTag}" isn't a release tag`],
   ];
   for (const [what, setup, why] of refusals) {
     setup();

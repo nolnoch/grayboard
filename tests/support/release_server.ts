@@ -43,8 +43,8 @@ export class ReleaseServer {
     if (path === `/${this.repo}/releases/latest`) return Response.redirect(`${this.url}/${this.repo}/releases/tag/${this.latest}`, 302);
     if (path === `/${this.repo}/releases/tag/${this.latest}`) return new Response("release page");
     const m = new RegExp(`^/${this.repo}/releases/download/([^/]+)/([^/]+)$`).exec(path);
-    const text = m && this.signed[m[1]!]?.[m[2]!];
-    if (text) return new Response(text);
+    const text = m ? this.signed[m[1]!]?.[m[2]!] : undefined;
+    if (text != null) return new Response(text);
     const file = m && this.assets[m[1]!]?.[m[2]!];
     if (file) return new Response(Bun.file(file));
     return new Response("Not Found", { status: 404 });
@@ -57,6 +57,7 @@ export class ReleaseServer {
     const assets = await Promise.all(
       Object.entries(served).map(async ([name, file]) => ({
         name,
+        size: Bun.file(file).size,
         digest: this.opts.digests?.[tag]?.[name] ?? `sha256:${new Bun.CryptoHasher("sha256").update(await Bun.file(file).arrayBuffer()).digest("hex")}`,
       })),
     );
