@@ -17,6 +17,7 @@ import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts"
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
+import { afterCommit } from "../core/sqlite.ts";
 
 export type ApplicationCode =
   | "unauthenticated"
@@ -148,13 +149,16 @@ function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void
     const key = refKey(refOf(item));
     if (session.inflight.has(key)) continue;
     session.inflight.add(key);
-    session.sink.deliver({ kind: "board", item });
+    try { session.sink.deliver({ kind: "board", item }); }
+    catch (error) { session.inflight.delete(key); throw error; }
   }
 }
 function wake(hub: Hub, handles: string[]): void {
   for (const h of handles) {
-    const session = hub.registry.get(h);
-    if (session?.active) drainBoards(session, hub.db, session.human);
+    afterCommit(hub.db, () => {
+      const session = hub.registry.get(h);
+      if (session?.active) drainBoards(session, hub.db, session.human);
+    });
   }
 }
 
@@ -190,9 +194,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     slackRunning: opts.slackRunning ?? (() => false),
     now: opts.now ?? Date.now,
     boardChanged(board) {
-      for (const observer of [...observers]) {
-        if (observer.board === board && observerLive(observer)) notify(() => observer.hooks.changed());
-      }
+      afterCommit(db, () => {
+        for (const observer of [...observers]) {
+          if (observer.board === board && observerLive(observer)) notify(() => observer.hooks.changed());
+        }
+      });
     },
   };
   const helloLimiter = new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
@@ -551,11 +557,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     replay(session: ApplicationSession) {
       valid(session, true);
       if (session.readOnly || !session.push || hub.registry.get(session.identityFull) !== session) return;
-      const since = repo.cursors.get(session.identityFull, "direct", session.identityFull);
-      for (const message of repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])) {
-        session.sink.deliver({ kind: "direct", message: showMessage(message) });
-      }
-      drainBoards(session, db, true);
+      afterCommit(db, () => {
+        valid(session, true);
+        if (hub.registry.get(session.identityFull) !== session) return;
+        const since = repo.cursors.get(session.identityFull, "direct", session.identityFull);
+        for (const message of repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])) {
+          session.sink.deliver({ kind: "direct", message: showMessage(message) });
+        }
+        drainBoards(session, db, true);
+      });
     },
     send(
       session: ApplicationSession,
@@ -622,7 +632,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session);
       for (const r of refs) {
         acknowledge(db, session.identityFull, r);
-        session.inflight.delete(refKey(r));
+        afterCommit(db, () => { session.inflight.delete(refKey(r)); });
       }
     },
     acknowledgeDm(session: ApplicationSession, id: number) {
@@ -638,13 +648,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
       const result = handleCall(hub, session, tool, args, publish);
-      expiry.arm();
+      afterCommit(db, () => expiry.arm());
       return result;
     },
     // Trusted committed domain operations, not client-supplied invalidations.
     boardsChanged,
     wake(handles: string[]) {
-      expiry.arm();
+      afterCommit(db, () => expiry.arm());
       wake(hub, handles);
     },
     disconnectUser(userId: number) {
@@ -833,7 +843,7 @@ function writeOnce<W extends Written>(
       });
     }
   });
-  if ("replay" in out && uploads.length > 0) void sweepBlobs(hub.db, repo.blobs);
+  if ("replay" in out && uploads.length > 0) afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
   return out;
 }
 
@@ -898,7 +908,7 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
     return true;
   });
   if (!retracted) return fail("bad_request", retractRefusal.replied(id));
-  void sweepBlobs(hub.db, repo.blobs);
+  afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
   return {};
 }
 
@@ -921,7 +931,8 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     return fail("internal", `${tool} failed`);
   }
   for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
-  publish?.(outcome.result);
+  // The transitional adapter publishes its answer before the resulting deliveries.
+  if (publish) afterCommit(db, () => publish(outcome.result));
   wake(hub, outcome.wake);
   return outcome.result;
 }

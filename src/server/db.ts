@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 import { setAccess } from "../core/boards.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import { openSqlite } from "../core/sqlite.ts";
+import { afterCommit, openSqlite } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -448,7 +448,7 @@ export class PrincipalTaken extends Error {
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   const observers = new Set<() => void>();
-  const changed = () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } };
+  const changed = () => afterCommit(db, () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } });
   const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
     const value = fn(...args);
     changed();
