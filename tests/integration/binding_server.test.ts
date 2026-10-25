@@ -524,6 +524,19 @@ test("11: a restart under the same harness takes its name back; a fresh harness 
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 }, 60_000);
 
+test("#211: a restored_from the name's history doesn't show is logged unverified and starts a fresh status", async () => {
+  const s = await session("api");
+  await s.call("peer_status", { text: "mid-task" });
+  await stop(s.c);
+  const { WsClient } = await import("../support/ws_client.ts");
+  const stranger = "0123456789abcdef";
+  const ws = new WsClient(srv.base, alice, "api", { hello: { restored_from: stranger } });
+  expect((await ws.connect()).type).toBe("hello_ok");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified` });
+  expect(rows<{ status: string | null }>("SELECT status FROM handles WHERE name = ?", `${A}/api`)[0]!.status).toBeNull();
+  ws.close();
+});
+
 test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
   const s = await session(null);
   const printed = await runCli(["tools", "--json"], { cwd: srv.dir, env: serverEnv(srv.dir, srv.base, alice, null) });

@@ -69,6 +69,18 @@ export function lastBoundBy(db: Database, name: string, sessionId: string): bool
   return row?.session_id === sessionId;
 }
 
+/**
+ * A hello's claim to restart `previous` (#211): honoured only when the name's
+ * latest bound or moved event is that session's, so the binding history never
+ * records a restart the bus didn't see, and a stranger's claim can't keep the
+ * name's status.
+ */
+export function restoreOf(db: Database, name: string, previous: string): { verified: boolean; detail: string } {
+  return lastBoundBy(db, name, previous)
+    ? { verified: true, detail: `restored: restart of session ${previous}` }
+    : { verified: false, detail: `restored_from ${previous} not verified` };
+}
+
 /** Whether the name's latest bound, moved or released event is a release. */
 export function lastWasRelease(db: Database, name: string): boolean {
   const row = db.prepare(

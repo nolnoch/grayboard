@@ -24,7 +24,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates,
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, restoreOf,
   sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -498,8 +498,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     moved = [];
     holders.set(full, ws);
     if (push) registry.set(full, ws);
-    // A reconnect, or a restart taking its name back, is the same session: its status stays.
-    if (m.resume || m.restored_from) touchHandle(db, full);
+    // A reconnect, or a verified restart taking its name back, is the same session: its status stays.
+    const restore = m.restored_from === undefined || m.resume ? null : restoreOf(db, full, m.restored_from);
+    if (m.resume || restore?.verified) touchHandle(db, full);
     else startSession(db, full, null);
     setPlace(db, full, m.where ?? null);
     ws.data.owner = true;
@@ -516,7 +517,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
       logBinding(db, sessionId, full, "moved", from);
     } else {
-      const how = m.resume ? "reconnect" : m.restored_from ? `restored: restart of session ${m.restored_from}` : null;
+      const how = m.resume ? "reconnect" : (restore?.detail ?? null);
       logBinding(db, sessionId, full, "bound", [how, notMoved].filter((d) => d !== null).join("; ") || null);
     }
   } else {
