@@ -12,6 +12,7 @@ import { runCli } from "../support/cli.ts";
 import { cleanEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, stopSession } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 let srv: TestServer;
 
@@ -135,17 +136,16 @@ test("a refused token says to sign in again: at startup, in a running session's 
 
   // A running session whose token is revoked (as by a database reset)...
   let token = await login("alice@example.com");
-  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop, true, msg);
+  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop, true, msg, { tokenPollMs: 200 });
   be.connect();
   await be.ready();
   await fetch(`${srv.base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
   (be as any).ws.close();
   await Bun.sleep(1500); // the first reconnect (after 1s) is refused
   await expect(be.request({ type: "inbox" })).rejects.toThrow("sign in; reconnecting");
-  // ...picks up a new sign-in on its next reconnect (2s later).
+  // ...picks up a new sign-in at its next look at the token.
   token = await login("alice@example.com");
-  await Bun.sleep(2500);
-  expect(await be.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok" });
+  await until(async () => (await be.request({ type: "inbox" }).catch(() => null))?.type === "inbox_ok", 3000);
   be.close();
 
   const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");

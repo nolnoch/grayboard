@@ -43,7 +43,14 @@ export type ClientOptions = {
   // The client stopped for good after it was ready: superseded, or its name
   // refused on a reconnect. It never exits the process; the session decides.
   onDead?: (reason: string) => void;
+  // After a refused token: how often to look for a new one, and when to try
+  // the old one again anyway. Shortened by tests.
+  tokenPollMs?: number;
+  signedOutRetryMs?: number;
 };
+
+const TOKEN_POLL_MS = 5_000;
+const SIGNED_OUT_RETRY_MS = 5 * 60_000;
 
 export class GrayboardClient {
   private ws: WebSocket | null = null;
@@ -146,8 +153,8 @@ export class GrayboardClient {
       // Any other close (the network, the server going away) is not the
       // limit: a stale reason would make startup wait it out and blame it.
       this.limited = null;
-      if (neverOpened) void this.checkToken();
-      this.scheduleReconnect();
+      if (neverOpened) void this.afterFailedOpen();
+      else this.scheduleReconnect();
     };
 
     this.ws.onerror = () => {
@@ -253,18 +260,45 @@ export class GrayboardClient {
     }
   }
 
+  // A connection that never got hello_ok: the probe's answer decides what
+  // comes next, so it's awaited before any reconnect is scheduled.
+  private async afterFailedOpen(): Promise<void> {
+    const token = this.token();
+    const refused = await this.checkToken(token);
+    if (this.dead) return;
+    if (refused) this.awaitNewToken(token);
+    else this.scheduleReconnect();
+  }
+
   // A refused token fails the upgrade like anything else (Bun shows only
   // "Expected 101 status code"), so ask over HTTP. At startup that's fatal;
   // later, tool calls say to sign in again until a reconnect succeeds.
-  private async checkToken(): Promise<void> {
-    const r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${this.token()}` } }).catch(() => null);
-    if (!r) return;
+  // Returns whether the server refused the token.
+  private async checkToken(token: string): Promise<boolean> {
+    const r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+    if (!r) return false;
     this.refused = r.status === 401 ? this.refusedMessage(this.wasReady) : null;
     if (this.refused && !this.wasReady) {
       this.dead = true;
       const err = new Error(this.refused);
       for (const res of this.readyResolvers.splice(0)) res(err);
     }
+    return this.refused !== null;
+  }
+
+  // Each refused attempt costs the address an auth failure (#240), so a
+  // fleet retrying a dead token would lock out everyone behind its NAT.
+  // Instead wait for a new sign-in, a local file read, or the slow retry.
+  private awaitNewToken(refusedToken: string): void {
+    const { tokenPollMs = TOKEN_POLL_MS, signedOutRetryMs = SIGNED_OUT_RETRY_MS } = this.opts;
+    const giveUpAt = Date.now() + signedOutRetryMs;
+    console.error(`[grayboard] the server refused the token of ${this.who()}; reconnecting after a new sign-in, or in ${Math.round(signedOutRetryMs / 1000)}s`);
+    const tick = () => {
+      if (this.dead) return;
+      if (this.token() !== refusedToken || Date.now() >= giveUpAt) return this.connect();
+      setTimeout(tick, Math.min(tokenPollMs, giveUpAt - Date.now()));
+    };
+    setTimeout(tick, Math.min(tokenPollMs, signedOutRetryMs));
   }
 
   private scheduleReconnect(): void {
