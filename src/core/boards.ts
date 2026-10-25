@@ -474,8 +474,11 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // sessions' instructions. attachments: the poster's unbound uploads to
 // carry, bound in the post's transaction under the mode's size caps.
 // author_id: the posting session's ID (#284), when the writer is a session.
+// addresses: the poster's address set (#284 S5), `handle` its primary; a
+// queue claim held by any of them is acked, and none of them is pushed the post.
 export type PostOpts = {
   online?: (handle: string) => boolean;
+  addresses?: string[];
   author_id?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; limits?: AttachmentLimits };
@@ -686,9 +689,9 @@ export function post(
     // release instead of an expire (#192 review). Another lane's reply leaves
     // the holder on the hook. No redelivery: handled is handled.
     if (parentId !== null && (b.kind ?? "broadcast") === "queue") {
-      ackQueueClaim(db, handle, `queue:${board}:${threadRoot(db, parentId)}`, now);
+      ackQueueClaim(db, opts.addresses ?? [handle], `queue:${board}:${threadRoot(db, parentId)}`, now);
     }
-    targets.delete(handle);
+    for (const a of opts.addresses ?? [handle]) targets.delete(a);
 
     const ins = db.prepare(
       `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,

@@ -230,7 +230,7 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   // The wakeup socket can't be renamed onto a non-empty directory.
   mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
   const err = await refusal(s, "bind", { name: "fe2", create: true });
-  expect(err).toContain('bound "fe2" (was "fe"); claims moved: ticket:ENG-142, but setting it up failed');
+  expect(err).toContain('bound "fe2" (was "fe"), but setting it up failed');
   expect(rows(`SELECT address FROM alias_holds WHERE address LIKE 'fe%'`)).toEqual([{ address: "fe2" }]);
   expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
   // fe is free: no listener left on it, and another session takes it.
@@ -240,7 +240,7 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   expect(readdirSync(dir).filter((f) => f.startsWith(".w"))).toEqual([]);
 }, 30_000);
 
-test("8, 13: a rebind moves claims, frees the old name, and delivers the new name's mail", async () => {
+test("8, 13: a rebind leaves claims on the old name, frees it, and delivers the new name's mail", async () => {
   const s = await session("fe");
   const be = await session("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
@@ -252,12 +252,12 @@ test("8, 13: a rebind moves claims, frees the old name, and delivers the new nam
 
   const result = await s.call("bind", { name: "fe2" });
   expect(result).toContain(`Bound to "fe2" (was "fe")`);
-  expect(result).toContain(`Your claims moved from "fe" to "fe2": ticket:ENG-142.`);
+  // #284 S6: claims stay with the address they were taken under.
+  expect(result).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
   await until(() => contents(s).includes("queued for fe2"));
-  expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual(["fe2"]);
-  expect(rows(`SELECT handle, event FROM claim_events WHERE key = 'ticket:ENG-142' AND event = 'moved'`)).toEqual([{ handle: "fe2", event: "moved" }]);
-  expect(await s.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
-  expect(await s.call("claim_list", {})).toEqual([]);
+  expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual(["fe"]);
+  expect(rows(`SELECT COUNT(*) AS n FROM claim_events WHERE event = 'moved'`)).toEqual([{ n: 0 }]);
+  expect(await refusal(s, "claim_release", { key: "ticket:ENG-142" })).toContain('"ticket:ENG-142" is held by fe, not you');
 
   expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "moved"]);
   expect(events("fe2").at(-1)!.detail).toBe("fe");
@@ -266,6 +266,7 @@ test("8, 13: a rebind moves claims, frees the old name, and delivers the new nam
   const other = await session();
   await other.call("bind", { name: "fe" });
   expect((await other.call("peer_list", {})).you).toBe("fe");
+  expect(await other.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
 }, 30_000);
 
 test("9: a DM sent mid-swap is never consumed under the new name", async () => {

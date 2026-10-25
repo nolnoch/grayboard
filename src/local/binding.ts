@@ -14,7 +14,7 @@ import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollision
 import { writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
-import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
+import { listClaims } from "../core/claims.ts";
 import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -266,7 +266,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
 }
 
 export type AcquireResult = (
-  | { ok: true; name: string; moved: Claim[]; restored: boolean }
+  | { ok: true; name: string; restored: boolean }
   | { ok: false; error: string; holder?: string; known?: string[] }
 ) & {
   /** A dead holder this acquire ended. */
@@ -293,8 +293,8 @@ function holdingSession(db: Database, name: string, sessionId: string | null = n
 }
 
 /**
- * Bind session `sessionId` to `name`, moving it off `previous` (a rebind)
- * with its claims. `create` allows a name that has never existed (startup
+ * Bind session `sessionId` to `name`, moving it off `previous` (a rebind).
+ * Claims stay with the name they were taken under (#284 S6). `create` allows a name that has never existed (startup
  * passes it for an explicit BUS_IDENTITY, as startup always created one).
  * `restartOf` is the session a restart takes the name back from: verified
  * against the name's history in the transaction that logs the bind (#211),
@@ -349,10 +349,9 @@ export async function acquireName(
     if (opts.previous) dropHold(db, opts.previous, sessionId);
     holdAlias(db, name, sessionId, now);
     const restart = opts.restartOf === undefined ? null : continuityOf(db, name, { restartOf: opts.restartOf });
-    const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
     if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
     logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? restart?.detail ?? null, now);
-    return { ok: true, name, moved, restored: restart?.verified ?? false, ended };
+    return { ok: true, name, restored: restart?.verified ?? false, ended };
   }).immediate();
 }
 

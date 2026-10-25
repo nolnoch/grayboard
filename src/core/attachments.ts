@@ -202,19 +202,21 @@ export function getAttachment(db: Database, id: number): AttachmentRow | undefin
 
 // Whether `handle` may fetch an attachment: one on a post, if it can see the
 // post's board; on a direct message, if dmVisible (the mode's sender or
-// recipient check) says so; an unbound upload, only its uploader.
+// recipient check) says so; an unbound upload, only its uploader: one of
+// `addresses`, the caller's address set (#284 S5).
 export function canReadAttachment(
   db: Database,
   handle: string,
   a: AttachmentRow,
   dmVisible: (messageId: number) => boolean,
+  addresses: string[] = [handle],
 ): boolean {
   if (a.post_id !== null) {
     const p = getPost(db, a.post_id);
     return !!p && canSeeBoard(db, handle, p.board);
   }
   if (a.message_id !== null) return dmVisible(a.message_id);
-  return a.uploader === handle;
+  return addresses.includes(a.uploader);
 }
 
 // Deletes the attachments of the messages or posts `ownersSql` selects (a

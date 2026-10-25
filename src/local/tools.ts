@@ -7,7 +7,11 @@ import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL } from "../shared/attachments.ts
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM } from "../shared/inbox.ts";
 
 export const LOCAL_TOOLS = [
-  BIND_TOOL,
+  {
+    ...BIND_TOOL,
+    description:
+      "bind(name, create?): take a bus name for this session once you know its task, or switch to another. Claims stay with the name they were taken under; DMs queued to the old name stay for its next holder. A name that has never existed needs create: true.",
+  },
   {
     name: "dm_send",
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have

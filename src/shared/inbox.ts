@@ -13,8 +13,9 @@ export const MAX_INBOX_DAYS = 30;
 export const PROMISE_DAYS = MAX_INBOX_DAYS;
 const SNIPPET = 300;
 
-// Candidates with no later message from `me` in the same thread.
-function lastWord<M extends Msg>(me: string, candidates: M[], threadOf: (id: number) => Msg[]): M[] {
+// Candidates with no later message from `me` (the session's address set,
+// #284 S5) in the same thread.
+function lastWord<M extends Msg>(me: string[], candidates: M[], threadOf: (id: number) => Msg[]): M[] {
   const threadById = new Map<number, Msg[]>();
   return candidates.filter((m) => {
     let t = threadById.get(m.id);
@@ -22,7 +23,7 @@ function lastWord<M extends Msg>(me: string, candidates: M[], threadOf: (id: num
       t = threadOf(m.id);
       for (const x of t) threadById.set(x.id, t);
     }
-    return !t.some((x) => x.sender === me && x.id > m.id);
+    return !t.some((x) => me.includes(x.sender) && x.id > m.id);
   });
 }
 
@@ -37,14 +38,14 @@ function item(m: Msg, now: number) {
 
 // Received messages still owed an answer: no later message from `me` in the
 // same thread. Candidates are already windowed and filtered of acks.
-export function unanswered(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
+export function unanswered(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, from: m.sender, ...item(m, now) }));
 }
 
 // Messages `me` sent pending that are still its latest in their thread: a
 // follow-up it promised. Candidates are `me`'s pending sends, windowed by
 // PROMISE_DAYS and filtered of its own acks.
-export function promised(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): PromiseItem[] {
+export function promised(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): PromiseItem[] {
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, to: m.recipient, ...item(m, now) }));
 }
 

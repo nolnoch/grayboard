@@ -12,7 +12,7 @@ import { openLocalDb } from "./open.ts";
 test("undeliveredFrom uses the reader PK, not a cursors scan", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const plan = db.prepare("EXPLAIN QUERY PLAN " + LOCAL_UNDELIVERED_FROM_SQL)
-    .all("be@example.com/be", Number.MAX_SAFE_INTEGER) as { detail: string }[];
+    .all(JSON.stringify(["be@example.com/be"]), Number.MAX_SAFE_INTEGER) as { detail: string }[];
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING");
   expect(detail).not.toContain("SCAN cursors");

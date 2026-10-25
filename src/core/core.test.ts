@@ -354,6 +354,32 @@ test("only the holder can release; claims announce on a board", () => {
   ]);
 });
 
+// #284 S5: a claim held by any of the caller's addresses is the caller's, and
+// keeps the address it was taken under; new claims go out as the primary.
+test("a claim held by any of the caller's addresses renews, releases and refuses watch as its holder", () => {
+  const ID = "id:0123456789abc";
+  const set = ["be", ID];
+  subscribe(db, "sim", "e2e", "push");
+  claim(db, ID, "lane:a", { board: "e2e" });
+  const renew = claim(db, "be", "lane:a", { note: "step 2", addresses: set });
+  expect(renew).toMatchObject({ ok: true, renewed: true, claim: { holder: ID, note: "step 2" } });
+  expect(claim(db, "be", "lane:b", { addresses: set })).toMatchObject({ ok: true, renewed: false, claim: { holder: "be" } });
+  expect(claim(db, "sim", "lane:a")).toMatchObject({ ok: false, held_by: ID });
+  expect(() => watch(db, "be", "lane:a", false, set)).toThrow(/you hold/);
+  expect(() => release(db, "be", "lane:a")).toThrow(`held by ${ID}`);
+  release(db, "be", "lane:a", "done", set);
+  // A repeat whose first answer was lost (#254) is answered from the event.
+  expect(release(db, "be", "lane:a", "done", set).releasedAt).toEqual(expect.any(Number));
+  const events = db.prepare(`SELECT handle, event FROM claim_events WHERE key = 'lane:a' ORDER BY id`).all();
+  expect(events).toEqual([{ handle: ID, event: "take" }, { handle: ID, event: "renew" }, { handle: "sim", event: "refused" }, { handle: ID, event: "release" }]);
+  expect(read(db, "sim", "e2e", { before_id: 999 }).posts.map((p) => [p.author, p.body])).toEqual([
+    [ID, "[claim] lane:a"],
+    [ID, "[update] lane:a — step 2"],
+    [ID, "[release] lane:a — done"],
+  ]);
+  expect(claimsInstruction(listClaims(db), set)[0]).toContain("Yours: lane:b");
+});
+
 test("a lapsed claim is announced on its board once, by the first sweep or takeover", () => {
   subscribe(db, "sim", "e2e", "push");
   claim(db, "be", "dev:freeze", { board: "e2e" });
@@ -441,9 +467,9 @@ test("the session-start claims list puts the session's own first and stays bound
   const at = Date.parse("2026-10-21T21:00:00Z");
   const c = (key: string, holder: string, note: string | null = null) =>
     ({ key, holder, note, board: null, acquired_at: 0, expires_at: at });
-  expect(claimsInstruction([], "be")).toEqual([]);
+  expect(claimsInstruction([], ["be"])).toEqual([]);
 
-  const [few] = claimsInstruction([c("a", "fe", "theirs"), c("b", "be", "mine")], "be");
+  const [few] = claimsInstruction([c("a", "fe", "theirs"), c("b", "be", "mine")], ["be"]);
   expect(few).toBe(
     "Active claims when this session started. Yours: b (until 2026-10-21T21:00Z: mine). Others': a. Respect them; claim_list shows holders and the current state.",
   );
@@ -453,7 +479,7 @@ test("the session-start claims list puts the session's own first and stays bound
     ...Array.from({ length: 50 }, (_, i) => c(`ticket:ENG-${1000 + i}`, "be-throughput")),
     ...Array.from({ length: 3 }, (_, i) => c(`ticket:ENG-${i}`, "be", "x".repeat(400))),
   ];
-  const [big] = claimsInstruction(many, "be");
+  const [big] = claimsInstruction(many, ["be"]);
   expect(big!.length).toBeLessThan(1400);
   expect(big).not.toContain("be-throughput");
   expect(big).toStartWith("Active claims when this session started. Yours: ticket:ENG-0 ");

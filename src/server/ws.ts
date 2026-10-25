@@ -611,7 +611,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // Before the claims: drained once, so a cut must not take it.
     ...(bridgeNotice ? [bridgeNotice] : []),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
-    ...claimsInstruction(listClaims(db, undefined, full), full),
+    ...claimsInstruction(listClaims(db, undefined, full), [full]),
   ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
@@ -1053,8 +1053,8 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
-  const owed = unanswered(me, repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
-  const promises = promised(me, repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
+  const owed = unanswered([me], repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
+  const promises = promised([me], repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(me).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };

@@ -115,6 +115,20 @@ test("a reply by the claim holder acks and releases the claim", () => {
   expect(claimEvents(claimKey(r.post.id)).filter((e) => e.event === "take").length).toBe(1);
 });
 
+// #284 S5: a queue post taken by a session's ID is acked by its reply as its
+// alias; the ack is logged under the holder, and the poster isn't pushed its
+// own reply under either address.
+test("a reply by any of the holder's addresses acks the claim as the holder", () => {
+  const ID = "id:0123456789abc";
+  const r = post(db, "be", "work", "work item"); // fe claims
+  db.prepare(`UPDATE claims SET holder = ? WHERE key = ?`).run(ID, claimKey(r.post.id));
+  subscribe(db, ID, "work", "push");
+  const reply = post(db, "fe", "work", "done", r.post.id, { addresses: ["fe", ID] });
+  expect(reply.wake).not.toContain(ID);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id))).toBe(false);
+  expect(claimEvents(claimKey(r.post.id)).at(-1)).toEqual({ event: "release", handle: ID });
+});
+
 test("a holder's reply after its claim lapsed, before the sweep, still acks; the sweep redelivers nothing (#234)", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
   db.prepare(`UPDATE claims SET expires_at = 1 WHERE key = ?`).run(claimKey(r.post.id));
