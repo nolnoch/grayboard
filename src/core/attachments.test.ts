@@ -41,11 +41,11 @@ import {
   saveTarget,
   checkAttachmentId,
   serverBusDir,
-  sha256Hex,
   sniffType,
   typedName,
   type AttachmentFile,
 } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 const file = (data: Uint8Array | string, filename = "f.txt", type = "text/plain"): AttachmentFile => ({

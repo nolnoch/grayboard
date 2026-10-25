@@ -8,9 +8,10 @@ import type { Database } from "bun:sqlite";
 import { canSeeBoard, getPost } from "./boards.ts";
 import { CoreError, TooLargeError } from "./errors.ts";
 import {
-  MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize, sha256Hex,
+  MAX_ATTACHMENTS, SizeTally, UNBOUND_TTL_MS, formatSize,
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
+import { sha256Hex } from "../shared/hash.ts";
 
 export type AttachmentRow = AttachmentInfo & {
   uploader: string;

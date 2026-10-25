@@ -6,7 +6,8 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
+import { localBusDir } from "../../src/shared/attachments.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
 import { runCli } from "../support/cli.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";

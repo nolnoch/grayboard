@@ -19,4 +19,7 @@ test("releasesOrigin: unset or empty is GitHub, trailing slashes go, http only t
   expect(releasesOrigin("http://[::1]:9")).toBe("http://[::1]:9");
   expect(() => releasesOrigin("http://mirror.example.com")).toThrow("must be https (or http to localhost): http://mirror.example.com");
   expect(() => releasesOrigin("mirror.example.com")).toThrow("isn't a URL");
+  for (const raw of ["http://localhost:@evil.example.com", "https://user:pw@mirror.example.com"]) {
+    expect(() => releasesOrigin(raw), raw).toThrow(`must not carry user info: ${raw}`);
+  }
 });

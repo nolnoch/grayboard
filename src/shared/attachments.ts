@@ -25,7 +25,6 @@ export const DEFAULT_ATTACHMENT_USER_QUOTA = 1024 * 1024 * 1024;
 // reader can check what it saved and match it against the audit log.
 export type AttachmentInfo = { id: number; filename: string; type: string; size: number; sha256: string };
 
-export const sha256Hex = (data: Uint8Array): string => createHash("sha256").update(data).digest("hex");
 
 export type AttachmentFile = { filename: string; type: string; data: Uint8Array };
 

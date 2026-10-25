@@ -8,7 +8,7 @@ import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "./adapters.ts" with { type: "macro" };
-import { selfUpdate } from "./update.ts";
+import { selfUpdate, type UpdateResult } from "./update.ts";
 import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
 
 function writeCredentials(creds: Credentials): void {
@@ -628,19 +628,19 @@ program
   .command("update")
   .description("Replace this binary with the latest release")
   .action(async () => {
-    let tag: string | null, origin: string;
+    let r: UpdateResult;
     try {
-      ({ tag, origin } = await selfUpdate(pkg.version));
+      r = await selfUpdate(pkg.version);
     } catch (e) {
       console.error(`[grayboard] update failed: ${(e as Error).message}`);
       process.exit(1);
     }
-    if (!tag) { console.log(`grayboard ${pkg.version} is the latest release (${origin}).`); return; }
-    console.log(`Updated grayboard ${pkg.version} → ${tag} from ${origin}. Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
+    if (!r.updated) { console.log(`grayboard ${pkg.version} is the latest release (${r.origin}).`); return; }
+    console.log(`Updated grayboard ${pkg.version} → ${r.tag} from ${r.origin} (SHA256SUMS signed by key ${r.keyId}). Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
     // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
     // command; `setup` reinstalls adapters there.
-    const r = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });
-    if (r.exitCode !== 0) console.log("If you use omp, opencode, or pi, run `grayboard setup` to refresh their adapters.");
+    const refresh = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "ignore" });
+    if (refresh.exitCode !== 0) console.log("If you use omp, opencode, or pi, run `grayboard setup` to refresh their adapters.");
   });
 
 program
