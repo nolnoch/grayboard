@@ -221,13 +221,17 @@ test("on a limited address the client waits at least its own backoff, keeps doub
 }, 15_000);
 
 test("at startup a limited address is waited out when the retry fits the window, and named when it doesn't", async () => {
-  // Real time: the login spends one token and the bad call the other.
-  const fits = new TestServer({ authFailLimit: { burst: 2, perSec: 4 } });
+  // Real time: the login spends one token and the bad call the other. A token
+  // takes 2s to refill, longer than the child takes to spawn, so its first
+  // connect is refused; the stderr check fails the test if it isn't, rather
+  // than letting a connect that was never limited pass as a wait.
+  const fits = new TestServer({ authFailLimit: { burst: 2, perSec: 0.5 } });
   cleanup.push(() => fits.stop());
   const alice = await fits.login(A);
   expect((await fetch(`${fits.base}/api/whoami`, { headers: { Authorization: "Bearer bad" } })).status).toBe(401);
   expect((await fetch(`${fits.base}/api/whoami`)).status).toBe(429);
-  const s = await fits.session(alice, "fe", { BUS_TEST_HELLO_MS: "300", BUS_TEST_HELLO_LIMITED_MS: "4000" });
+  const s = await fits.session(alice, "fe", { BUS_TEST_HELLO_MS: "300", BUS_TEST_HELLO_LIMITED_MS: "6000" });
+  expect(s.stderr()).toContain(`connection as "fe" rate limited (too many authentication failures from this address`);
   expect(s.c.getInstructions()).toContain(`identity "fe"`);
 
   const stuck = new TestServer({ authFailLimit: { burst: 2, perSec: 0.1 } });
