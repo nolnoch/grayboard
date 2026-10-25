@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { junit, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
@@ -45,6 +45,15 @@ const invalidXML: Record<string, string> = {
   "invalid-utf8": document('<testcase><system-out>UTF8MARKER</system-out></testcase>'),
   "oversize": " ".repeat(8 * 1024 * 1024) + document(),
   "multiple-outcomes": document('<testcase><failure/><skipped/></testcase>'),
+  "properties-unclosed": document('<properties><property name="ci" value="private"/><testcase/>'),
+  "properties-duplicate": document('<properties/><properties/><testcase/>'),
+  "property-duplicate": document('<properties><property name="ci" value="private"/><property name="ci" value="private"/></properties><testcase/>'),
+  "property-unknown": document('<properties><property name="unknown" value="private"/></properties><testcase/>'),
+  "property-missing-value": document('<properties><property name="commit"/></properties><testcase/>'),
+  "property-extra-attribute": document('<properties><property name="ci" value="private" extra="private"/></properties><testcase/>'),
+  "property-nested-outcome": document('<properties><property name="ci" value="private"><failure/></property></properties><testcase/>'),
+  "property-text": document('<properties><property name="ci" value="private">private</property></properties><testcase/>'),
+  "properties-count": document('<properties tests="1"/><testcase/>'),
 };
 for (const key of ["tests", "failures", "errors", "skipped"]) {
   const value = key === "tests" ? 2 : 1;
@@ -53,8 +62,11 @@ for (const key of ["tests", "failures", "errors", "skipped"]) {
   invalidXML[`suite-${key}`] = document(undefined, undefined, `${key}="${value}"`);
   invalidXML[`case-${key}`] = document(`<testcase ${key}="${value}"/>`);
 }
-for (const mode of ["assertion", "truncated", "crash", "provenance", "success", ...Object.keys(invalidXML)]) test(`hosted evidence allowlist: ${mode} never publishes raw diagnostics`, () => {
+for (const mode of ["assertion", "truncated", "crash", "provenance", "success", "cross-filesystem", ...Object.keys(invalidXML)]) test.skipIf(mode === "cross-filesystem" && process.platform !== "linux")(`hosted evidence allowlist: ${mode} never publishes raw diagnostics`, () => {
+  const success = mode === "success" || mode === "cross-filesystem";
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
+  const output = mode === "cross-filesystem" ? mkdtempSync("/dev/shm/gb-evidence-public-") : join(root, "public");
+  if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
   for (const dir of ["scripts", "src", "tests/e2e", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
@@ -62,7 +74,7 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
   const secrets = ["access-" + crypto.randomUUID(), "refresh-" + crypto.randomUUID(), "lease-" + crypto.randomUUID(), "fake-access-one", "synthetic-json-secret"];
   const payload = `import { test, expect } from "bun:test";\n${secrets.map((s, i) => `test(${JSON.stringify(s)}, () => { console.log(${JSON.stringify(s)}); expect(${JSON.stringify(s)}).toBe("other-${i}"); });`).join("\n")}`;
-  writeFileSync(join(root, "probe.ts"), mode === "success" ? 'import { test, expect } from "bun:test"; test("ok", () => expect(1).toBe(1));' : payload);
+  writeFileSync(join(root, "probe.ts"), success ? 'import { test, expect } from "bun:test"; test("ok", () => expect(1).toBe(1));' : payload);
   if (invalidXML[mode]) {
     const parts = invalidXML[mode]!.split("UTF8MARKER");
     writeFileSync(join(root, "injected.xml"), mode === "invalid-utf8" ? Buffer.concat([Buffer.from(parts[0]!), Buffer.from([0xff]), Buffer.from(parts[1]!)]) : invalidXML[mode]!);
@@ -107,22 +119,22 @@ esac
   git("init", "-q"); git("add", "scripts", "src", "tests", "adapters");
   git(...identity, "commit", "-qm", "fixture");
   expect(git("rev-parse", "--absolute-git-dir") === realpathSync(join(root, ".git"))).toBe(true);
-  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: join(root, "public"), PROBE_ROOT: root, PROBE_MODE: mode } });
+  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: output, GITHUB_SHA: secrets[1]!, GITHUB_SERVER_URL: "https://ci.example.com", GITHUB_REPOSITORY: "example/fixture", GITHUB_RUN_ID: secrets[0]!, PROBE_ROOT: root, PROBE_MODE: mode } });
   expect(metadata(join(parent, ".git"))).toBe(before);
   expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
-  const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(join(root, "public"));
+  const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(output);
   for (const value of secrets) { expect(terminal.includes(value)).toBe(false); expect(published.includes(value)).toBe(false); }
-  expect(result.exitCode).toBe(mode === "success" ? 0 : 1);
-  expect(readFileSync(join(root, "public/result"), "utf8")).toContain(mode === "success" ? "passed" : "failed");
-  const xml = readFileSync(join(root, "public/evidence/unit.xml"), "utf8");
-  expect(xml).toContain(mode === "success" ? 'failures="0"' : '<failure message="Private diagnostics withheld"/>');
+  expect(result.exitCode).toBe(success ? 0 : 1);
+  expect(readFileSync(join(output, "result"), "utf8")).toContain(success ? "passed" : "failed");
+  const xml = readFileSync(join(output, "evidence/unit.xml"), "utf8");
+  expect(xml).toContain(success ? 'failures="0"' : '<failure message="Private diagnostics withheld"/>');
   if (mode === "assertion") {
     expect(texts(join(root, "private"))).toContain(secrets[0]!);
     expect(xml).toContain('tests="5" failures="5"');
   }
-  const summary = JSON.parse(readFileSync(join(root, "public/evidence/summary.json"), "utf8"));
-  expect(summary.evidenceProcessed).toBe(mode === "assertion" || mode === "success");
-  if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(root, "public/evidence/result"), "utf8")).toBe("failed\n"); }
+  const summary = JSON.parse(readFileSync(join(output, "evidence/summary.json"), "utf8"));
+  expect(summary.evidenceProcessed).toBe(mode === "assertion" || success);
+  if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(output, "evidence/result"), "utf8")).toBe("failed\n"); }
 }, 30_000);
 
 test("fixture Git filtering covers documented local variables without clearing transport settings", () => {
@@ -136,6 +148,8 @@ test("JUnit rejects partial metadata and strips all names, diagnostics and attri
   expect(() => junit('<testsuites tests="1" failures="0" skipped="0">', false)).toThrow();
   const xml = junit(document('<testcase name="arbitrary-secret"><system-out>&amp;&lt;&gt;&quot;&apos;&#65;&#x1F600;</system-out></testcase>'), true);
   expect(xml).not.toContain("arbitrary-secret"); expect(xml).toContain('tests="2" failures="1"');
+  const properties = junit(document('<properties><property name="ci" value="https://ci.example.com/&amp;private-property"/><property name="commit" value="private-property"/></properties><testcase/>'), false);
+  expect(properties).toContain('tests="1" failures="0"'); expect(properties.includes("private-property")).toBe(false); expect(properties.includes("property")).toBe(false);
   expect(() => junit(" ".repeat(8 * 1024 * 1024) + document(), false)).toThrow();
   expect(() => junit(document('<testcase><system-out>\u0000</system-out></testcase>'), false)).toThrow();
 });

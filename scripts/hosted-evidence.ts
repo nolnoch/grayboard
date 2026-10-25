@@ -7,13 +7,13 @@ const hex = (value: unknown, length: number): value is string => typeof value ==
 const root = resolve(import.meta.dir, "..");
 
 // Repository-local/discovery settings and inherited command config must not escape a caller's checkout.
-const localGit = new Set(["GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_TEMPLATE_DIR"]);
+const localGit = new Set(["GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_INTERNAL_SUPER_PREFIX", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_TEMPLATE_DIR"]);
 export function repositoryGitEnv(inherited: NodeJS.ProcessEnv = process.env): Record<string, string> {
   return Object.fromEntries(Object.entries(inherited).filter(([key, value]) => value !== undefined && !localGit.has(key) && !/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key))) as Record<string, string>;
 }
 
 type Counts = { tests: number; failures: number; skipped: number };
-type Element = { name: string; attributes: Map<string, string>; counts: Counts; outcomes: number };
+type Element = { name: string; attributes: Map<string, string>; counts: Counts; outcomes: number; properties: Set<string>; metadata: number };
 
 // Bounded Bun JUnit subset, not a general XML parser: no DTD, PI, CDATA or namespaces.
 function junitCounts(raw: string): Counts {
@@ -43,7 +43,7 @@ function junitCounts(raw: string): Counts {
   }
   const stack: Element[] = [];
   let result: Counts | undefined;
-  const allowed: Record<string, string[]> = { testsuites: ["testsuite"], testsuite: ["testcase", "system-out", "system-err"], testcase: ["failure", "skipped", "system-out", "system-err"], failure: [], skipped: [], "system-out": [], "system-err": [] };
+  const allowed: Record<string, string[]> = { testsuites: ["testsuite"], testsuite: ["properties", "testcase", "system-out", "system-err"], properties: ["property"], property: [], testcase: ["failure", "skipped", "system-out", "system-err"], failure: [], skipped: [], "system-out": [], "system-err": [] };
   const close = () => {
     const node = stack.pop(); if (!node) invalid();
     if (node.name === "testcase") node.counts.tests = 1;
@@ -54,7 +54,13 @@ function junitCounts(raw: string): Counts {
     }
     const parent = stack.at(-1);
     if (!parent) { if (result) invalid(); result = node.counts; return; }
-    if (node.name === "failure" || node.name === "skipped") {
+    if (node.name === "properties") {
+      if (node.attributes.size || ++parent.metadata > 1) invalid();
+    } else if (node.name === "property") {
+      const key = node.attributes.get("name");
+      if ((key !== "ci" && key !== "commit") || node.attributes.size !== 2 || !node.attributes.has("value") || parent.properties.has(key)) invalid();
+      parent.properties.add(key);
+    } else if (node.name === "failure" || node.name === "skipped") {
       if (++parent.outcomes > 1) invalid();
       parent.counts[node.name === "failure" ? "failures" : "skipped"]++;
     } else {
@@ -65,7 +71,7 @@ function junitCounts(raw: string): Counts {
     if (raw[offset] !== "<") {
       const end = raw.indexOf("<", offset), value = raw.slice(offset, end === -1 ? raw.length : end);
       text(value);
-      if ((!stack.length || ["testsuites", "testsuite", "testcase"].includes(stack.at(-1)!.name)) && !/^[\t\r\n ]*$/.test(value)) invalid();
+      if ((!stack.length || ["testsuites", "testsuite", "testcase", "properties", "property"].includes(stack.at(-1)!.name)) && !/^[\t\r\n ]*$/.test(value)) invalid();
       offset += value.length; continue;
     }
     offset++;
@@ -88,7 +94,7 @@ function junitCounts(raw: string): Counts {
       const value = raw.slice(offset, end); if (value.includes("<")) invalid(); text(value);
       attributes.set(key, value); offset = end + 1;
     }
-    stack.push({ name: opening, attributes, counts: { tests: 0, failures: 0, skipped: 0 }, outcomes: 0 });
+    stack.push({ name: opening, attributes, counts: { tests: 0, failures: 0, skipped: 0 }, outcomes: 0, properties: new Set(), metadata: 0 });
     if (raw.startsWith("/>", offset)) { offset += 2; close(); } else offset++;
   }
   if (stack.length || !result) invalid();
@@ -141,12 +147,14 @@ async function main() {
   const output = resolve(destination, "evidence");
   if (existsSync(output)) throw new Error("Evidence destination occupied");
   const privateRoot = mkdtempSync(join(tmpdir(), "grayboard-evidence-"));
-  const raw = join(privateRoot, "raw"), safe = join(privateRoot, "safe");
+  const raw = join(privateRoot, "raw");
   mkdirSync(raw, { mode: 0o700 });
   const log = Bun.file(join(privateRoot, "diagnostics.log"));
   const child = Bun.spawn(["bash", join(root, "scripts/hosted-e2e.sh"), suite], { cwd: root, env: { ...process.env, GRAYBOARD_E2E_RUN_DIR: raw, GRAYBOARD_EVIDENCE_PRIVATE: "1" }, stdout: log, stderr: log });
   const runtimeExit = await child.exited;
-  mkdirSync(safe, { mode: 0o700 });
+  // Only constructed evidence is staged here; atomic rename requires the destination's filesystem.
+  mkdirSync(resolve(destination), { recursive: true });
+  const safe = mkdtempSync(join(resolve(destination), ".hosted-evidence-"));
   let exit = runtimeExit, processed = false;
   let xml = junit(undefined, true);
   try {
@@ -171,7 +179,6 @@ async function main() {
   writeFileSync(join(safe, "hosted.log"), `Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}; raw diagnostics withheld\n`);
   writeFileSync(join(safe, "exit"), `exit=${exit}\n`);
   writeFileSync(join(safe, "result"), exit === 0 ? "passed\n" : "failed\n");
-  mkdirSync(resolve(destination), { recursive: true });
   renameSync(safe, output);
   console.log(`Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}; private diagnostics withheld`);
   process.exitCode = exit === 0 ? 0 : 1;
