@@ -1,13 +1,17 @@
 // Local name binding (#182, #284). Every grayboard mcp process that owns
 // delivery writes a bindings row at start, keyed by its session ID: its
-// liveness (pid, start time, harness pid). Its facts are its ids row. A name
+// liveness (pid, start time, harness pid). Its facts are its ids row. A keyed
+// session (BUS_SESSION_KEY) lives as long as its harness: the row's pid is
+// the harness's, and the grayboard mcp child serving it attaches and detaches
+// (#284 decision 3). A name
 // is acquired by writing its alias_holds row inside one BEGIN IMMEDIATE
 // transaction, so two starters can't both win and a live holder whose event
 // loop is busy can't lose its name to a socket probe (#80). The wakeup socket
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, isHuman, isViewer, registerId } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, isViewer, registerId } from "../core/boards.ts";
+import { writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
@@ -15,7 +19,7 @@ import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
-import { aliveRows, commandName, isAlive, procStart } from "../shared/proc.ts";
+import { aliveRows, commandName, harnessAncestor, isAlive, procStart } from "../shared/proc.ts";
 import { localMail } from "./mailbox.ts";
 import { poke } from "./wakeup.ts";
 
@@ -31,47 +35,158 @@ export type SessionRow = {
   harness_pid: number | null;
   cwd: string | null;
   started_at: number;
+  // Keyed sessions only: how the harness pid was found, and the child
+  // serving the session (null while detached).
+  harness_rule: HarnessRule | null;
+  attached_pid: number | null;
+  attached_start: string | null;
 };
 
-const SESSION_SQL = `SELECT b.session_id, COALESCE(h.address, b.name) AS name, b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at
+/** How a keyed session's harness was found: BUS_HARNESS_PID, or its first non-launcher ancestor. */
+export type HarnessRule = "env" | "ancestor";
+
+/** A keyed session's harness: the process whose exit ends it. */
+export type Harness = { pid: number; proc_start: string | null; rule: HarnessRule };
+
+const SESSION_SQL = `SELECT b.session_id, COALESCE(h.address, b.name) AS name, b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at,
+    b.harness_rule, b.attached_pid, b.attached_start
   FROM bindings b LEFT JOIN ids i ON i.id = b.session_id LEFT JOIN alias_holds h ON h.id = b.session_id`;
 
-/** This process as a session row, unbound. */
-export function thisSession(sessionId: string, cwd = process.cwd()): SessionRow {
+/**
+ * This process as a session row, unbound. A keyed session's row lives by its
+ * `harness`, with this process attached; an unkeyed one's by this process.
+ */
+export function thisSession(sessionId: string, harness: Harness | null = null, cwd = process.cwd()): SessionRow {
   const proc_start = procStart(process.pid) ?? null;
   // Without it, liveness falls back to the pid alone: a reused pid would keep this row's name.
   if (proc_start === null) console.error(`[grayboard] can't read this process's start time; session ${sessionId}'s row records none`);
+  const harnessPid = harness?.pid ?? process.ppid;
   return {
     session_id: sessionId,
     name: null,
-    pid: process.pid,
-    proc_start,
-    harness: commandName(process.ppid),
-    harness_pid: process.ppid,
+    pid: harness?.pid ?? process.pid,
+    proc_start: harness ? harness.proc_start : proc_start,
+    harness: commandName(harnessPid),
+    harness_pid: harnessPid,
     cwd,
     started_at: Date.now(),
+    harness_rule: harness?.rule ?? null,
+    attached_pid: harness ? process.pid : null,
+    attached_start: harness ? proc_start : null,
   };
+}
+
+/**
+ * A keyed session's harness (#284 decision 3): `BUS_HARNESS_PID` when the
+ * orchestrator that minted the key set it, else this process's first
+ * non-launcher ancestor. An error string when neither names a live process.
+ */
+export function keyedHarness(env: Record<string, string | undefined> = process.env): Harness | string {
+  const raw = env.BUS_HARNESS_PID;
+  if (raw !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(raw)) return `BUS_HARNESS_PID must be a process id, not "${raw}"`;
+    const start = procStart(Number(raw));
+    if (start === undefined) return `BUS_HARNESS_PID ${raw} isn't a running process`;
+    return { pid: Number(raw), proc_start: start, rule: "env" };
+  }
+  const pid = harnessAncestor();
+  if (pid === null) return "BUS_SESSION_KEY needs a harness, and every ancestor of this process is a shell or package runner; set BUS_HARNESS_PID";
+  const start = procStart(pid);
+  if (start === undefined) return `harness pid ${pid} exited before this session registered`;
+  return { pid, proc_start: start, rule: "ancestor" };
 }
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
  * are its presence until it binds. Throws IdCollision when the ID already
- * has a row: an ID is never reused.
+ * has a row: an ID is never reused, and a keyed session's restart attaches
+ * (attachSession) instead.
  */
 export function registerSession(db: Database, s: SessionRow, launcher: boolean): void {
   db.transaction(() => {
     registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher }, s.started_at);
     db.prepare(
-      `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at) VALUES (?, ?, ?, ?, ?)`,
-    ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at);
+      `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
+    writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
+      keyed: s.harness_rule !== null, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
+    });
   }).immediate();
+}
+
+export type AttachResult = { ok: true; held: string | null } | { ok: false; error: string };
+
+// How long a restart waits for the child it replaces to exit.
+const ATTACH_WAIT_MS = 5000;
+
+/**
+ * Attach this process to keyed session `s.session_id`, whose ids row exists:
+ * a child restart under the same live harness is the same session, with its
+ * hold, status, subscriptions and queued mail (#284 decision 3). The
+ * predecessor may not have exited yet, so this waits up to `ms` for it,
+ * outside the lock, then re-reads the row inside one. Refused, and audited as
+ * id.collision, when the session has ended, another live child is attached,
+ * or the row isn't this harness's. `held` is the name the session holds.
+ */
+export async function attachSession(db: Database, s: SessionRow, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
+  // Only a child of this harness is worth waiting for; any other refuses.
+  const predecessor = () => {
+    const b = db.prepare(`SELECT pid, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
+      { pid: number; attached_pid: number | null; attached_start: string | null } | null;
+    return b && b.pid === s.pid && b.attached_pid !== null ? b : null;
+  };
+  for (const deadline = Date.now() + ms; ; await Bun.sleep(50)) {
+    const b = predecessor();
+    if (!b || !isAlive(b.attached_pid!, b.attached_start) || Date.now() >= deadline) break;
+  }
+  testPause("attach:before-txn");
+  return db.transaction((): AttachResult => {
+    const id = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(s.session_id) as { ended_at: number | null } | null;
+    const b = db.prepare(`SELECT pid, proc_start, harness_rule, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
+      Pick<SessionRow, "pid" | "proc_start" | "harness_rule" | "attached_pid" | "attached_start"> | null;
+    const refuse = (why: string, detail: Record<string, unknown> = {}): AttachResult => {
+      writeCoreAudit(db, "id.collision", s.session_id, s.session_id, { pid: process.pid, reason: why, ...detail });
+      return { ok: false, error: idCollisionText(s.session_id, why) };
+    };
+    if (!id) return refuse("has no session row");
+    if (id.ended_at !== null) return refuse(`ended at ${new Date(id.ended_at).toISOString()}`, { ended_at: id.ended_at });
+    if (!b) return refuse("has no process row (an older grayboard removed it)");
+    if (b.harness_rule === null) return refuse(`is an unkeyed session's (pid ${b.pid})`);
+    if (b.pid !== s.pid || b.proc_start !== s.proc_start) return refuse(`belongs to a session under harness pid ${b.pid}`, { harness_pid: b.pid });
+    if (b.attached_pid !== null && isAlive(b.attached_pid, b.attached_start)) {
+      return refuse(`is served by the live process ${b.attached_pid}`, { attached_pid: b.attached_pid });
+    }
+    db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
+      .run(s.attached_pid, s.attached_start, s.session_id);
+    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
+    const hold = db.prepare(`SELECT address FROM alias_holds WHERE id = ?`).get(s.session_id) as { address: string } | null;
+    return { ok: true, held: hold?.address ?? null };
+  }).immediate();
+}
+
+/**
+ * This keyed session's child exits while its harness lives: the session
+ * stays, detached, until a restart attaches or an opener finds the harness
+ * gone. Only the attached child detaches.
+ */
+export function detachSession(db: Database, sessionId: string): void {
+  db.transaction(() => {
+    const r = db.prepare(`UPDATE bindings SET attached_pid = NULL, attached_start = NULL, detached_at = ? WHERE session_id = ? AND attached_pid = ?`)
+      .run(Date.now(), sessionId, process.pid);
+    if (r.changes === 1) writeCoreAudit(db, "id.detached", sessionId, sessionId, { pid: process.pid });
+  }).immediate();
+}
+
+// "harness pid N" for a keyed row, whose pid is its harness's; "pid N" otherwise.
+function pidText(r: { pid: number; harness_rule: string | null }): string {
+  return `${r.harness_rule ? "harness pid" : "pid"} ${r.pid}`;
 }
 
 /** How a holder reads in a refusal: "pid 4242 (claude, in grayboard on main)". */
 export function describeHolder(r: SessionRow): string {
   const where = r.cwd ? describeLocation(r.cwd) : null;
   const what = [r.harness, where ? `in ${where}` : null].filter(Boolean).join(", ");
-  return `the live session ${r.session_id} (pid ${r.pid}${what ? `, ${what}` : ""})`;
+  return `the live session ${r.session_id} (${pidText(r)}${what ? `, ${what}` : ""})`;
 }
 
 // A live socket with no live session holding the name: a session from
@@ -114,9 +229,10 @@ function end(db: Database, sessionId: string, why: string | null, now: number): 
 export function reap(db: Database, rows: SessionRow[], now: number): Ended {
   const out: Ended = { ended: [], wake: [] };
   for (const r of rows) {
-    const cur = db.prepare(`SELECT pid, proc_start FROM bindings WHERE session_id = ?`).get(r.session_id) as { pid: number; proc_start: string | null } | null;
+    const cur = db.prepare(`SELECT pid, proc_start, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
+      { pid: number; proc_start: string | null; harness_rule: string | null } | null;
     if (!cur || isAlive(cur.pid, cur.proc_start)) continue;
-    merge(out, r.session_id, end(db, r.session_id, `reaped: pid ${cur.pid} is gone`, now));
+    merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now));
   }
   return out;
 }

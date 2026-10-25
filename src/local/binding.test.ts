@@ -14,7 +14,7 @@ import { openLocalDb } from "./open.ts";
 test("a dead row reaped twice logs one release", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abc";
-  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1 }, false);
+  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null }, false);
   holdAlias(db, "fe", id);
   const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
   db.transaction(() => reap(db, rows, 2)).immediate();

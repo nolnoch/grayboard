@@ -10,7 +10,7 @@ import {
 import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, mintSessionKey, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { SESSION_KEY, UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, mintSessionKey, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -48,9 +48,9 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { NOTHING_ENDED, acquireName, candidateNames, endLocalSession, liveSessions, registerSession, siblingGone, thisSession, type Ended } from "./binding.ts";
+import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
-import { launcherName } from "../shared/proc.ts";
+import { isAlive, launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -76,8 +76,28 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-// This process's session ID (#284), derived from a key minted at start.
-const SESSION_ID = idAddress(mintSessionKey());
+// BUS_SESSION_KEY: an orchestrator minted this session's key, so it knows
+// the ID before the process exists (#284 decision 2). The session is then an
+// attachment to its harness: it outlives this process, and a restart under
+// the same harness carries on as it (decision 3). Read once, here.
+const KEY = process.env.BUS_SESSION_KEY;
+if (KEY !== undefined && !SESSION_KEY.test(KEY)) {
+  console.error("[grayboard] BUS_SESSION_KEY must be 64 lowercase hex characters");
+  process.exit(1);
+}
+const KEYED = KEY !== undefined;
+if (!KEYED && process.env.BUS_HARNESS_PID !== undefined) {
+  console.error("[grayboard] BUS_HARNESS_PID names a keyed session's harness; set BUS_SESSION_KEY with it");
+  process.exit(1);
+}
+// A keyed session's harness, whose exit ends the session.
+const HARNESS = KEYED ? keyedHarness() : null;
+if (typeof HARNESS === "string") {
+  console.error(`[grayboard] ${HARNESS}`);
+  process.exit(1);
+}
+// This process's session ID (#284), derived from its key.
+const SESSION_ID = idAddress(KEY ?? mintSessionKey());
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
 // This bus's subdirectory of the default save directory.
@@ -159,9 +179,10 @@ let restored = false;
 let restoredFrom: string | null = null;
 // The name record (#182 decision 14), written by the session that owns
 // delivery whenever its name changes. The Slack bridge's child keeps none:
-// its name is fixed, and a restart that can't have it must fail loudly.
+// its name is fixed, and a restart that can't have it must fail loudly. Nor
+// does a keyed session: its restart re-attaches, name and all.
 const RECORD_DIR = sockDir();
-const RECORDS = PUSH && !HUMAN;
+const RECORDS = PUSH && !HUMAN && !KEYED;
 // A failed write costs only the restore after a restart; the bind itself stands.
 const writeName = (name: string | null) => {
   if (!RECORDS) return;
@@ -178,16 +199,30 @@ if (!PUSH) {
   // The session that owns delivery owns the name: it writes the session's
   // rows, its presence while unbound, and acquires through them.
   // Channels-off sessions too: they own the session, they just don't listen.
+  const self = thisSession(SESSION_ID, HARNESS);
+  // A keyed session restarting under its live harness: the open above ended
+  // it first if the harness had died, so attaching is refused then.
+  let attached = false;
   try {
-    registerSession(db, thisSession(SESSION_ID), EFFECTIVE_LAUNCHER);
+    registerSession(db, self, EFFECTIVE_LAUNCHER);
+    // The flag is the session's (ids.launcher), so it's audited once, here.
+    writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
-    writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid });
-    console.error(`[grayboard] ${e.message}`);
-    process.exit(1);
+    if (KEYED && e.endedAt === null) {
+      const r = await attachSession(db, self);
+      if (!r.ok) {
+        console.error(`[grayboard] ${r.error}`);
+        process.exit(1);
+      }
+      attached = true;
+      bound = r.held;
+    } else {
+      writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid });
+      console.error(`[grayboard] ${e.message}`);
+      process.exit(1);
+    }
   }
-  // The flag is the session's (ids.launcher), so it's audited once, here.
-  writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   if (RECORDS) sweepRecords(RECORD_DIR);
   // A restart under the same harness takes back its predecessor's name, ahead
   // of BUS_IDENTITY: it's the same session, mid-task.
@@ -205,7 +240,7 @@ if (!PUSH) {
       restored = r.restored;
       if (restored) restoredFrom = rec.session_id;
     } else unboundNotes.push(restoreNote(rec.name, r.error));
-  } else if (EXPLICIT) {
+  } else if (EXPLICIT && !attached) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
     await deliverEnded(r.ended);
     if (r.ok) bound = r.name;
@@ -216,7 +251,7 @@ if (!PUSH) {
       process.exit(1);
     } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
-  if (!bound) {
+  if (!bound && !KEYED) {
     const launcher = launcherName(process.ppid);
     if (launcher) unboundNotes.push(launcherNote(launcher));
   }
@@ -711,7 +746,9 @@ const shutdown = async () => {
   stopListening();
   let ended: Ended = NOTHING_ENDED;
   try {
-    if (PUSH) ended = endLocalSession(db, SESSION_ID);
+    // A keyed session outlives this process while its harness runs.
+    if (PUSH && HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);
+    else if (PUSH) ended = endLocalSession(db, SESSION_ID);
   } catch {
     // Same: shutdown must not throw.
   }

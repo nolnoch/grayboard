@@ -154,12 +154,12 @@ export type IdFacts = {
   launcher: boolean;
 };
 
-/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
 export function idCollisionText(id: string, why: string): string {
   return `id_collision: ${id} ${why}; start with a new session key`;
 }
 
+/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
 export class IdCollision extends CoreError {
   constructor(readonly id: string, readonly endedAt: number | null) {
     super(idCollisionText(id, endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`));
