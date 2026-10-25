@@ -147,13 +147,15 @@ test("peer_list shows where the client says it runs; a resumed hello keeps the s
   await watcher.connect();
   const be = async () => (await watcher.call("peer_list", { include_offline: true })).result.peers.find((p: any) => p.handle === "alice@example.com/be");
 
-  const first = client(alice, "be", { hello: { where: "api worktree stream \n on stream" } });
+  // One session: a resume keeps the status only under the session ID that last bound the name (#211).
+  const key = "c1".repeat(32);
+  const first = client(alice, "be", { hello: { session_key: key, where: "api worktree stream \n on stream" } });
   await first.connect();
   await first.call("peer_status", { text: "soaking" });
   expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
 
   await closeAndSettle(first);
-  const resumed = client(alice, "be", { hello: { where: "api worktree stream on main", resume: true } });
+  const resumed = client(alice, "be", { hello: { session_key: key, where: "api worktree stream on main", resume: true } });
   await resumed.connect();
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 

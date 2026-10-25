@@ -147,6 +147,7 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     serverUrl,
     currentToken,
     identity,
+    SESSION_KEY,
     async (msg: Message) => {
       const params = dmNotification(msg);
       if (await fromOwnHuman(c, msg.sender)) params.meta.human = "true";
@@ -160,7 +161,7 @@ function connect(identity: string | null, opts: { push: boolean; create?: boolea
     opts.push,
     (running) => signInHint(serverUrl, envToken) + (running && !envToken ? "; this session reconnects by itself after that" : ""),
     {
-      sessionKey: SESSION_KEY, hold: identity !== null && CHANNELS_OFF, from: opts.from, create: opts.create, suggested: SUGGESTED,
+      hold: identity !== null && CHANNELS_OFF, from: opts.from, create: opts.create, suggested: SUGGESTED,
       restoredFrom: opts.restoredFrom, onDead: (reason) => lost(c, reason),
     },
   );
