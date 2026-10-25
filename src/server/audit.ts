@@ -18,6 +18,8 @@ export type AuditAction =
   | "auth.user_enabled"
   | "bridge.notified"
   | "bridge.stopped"
+  | "hello.rate_limit_ended"
+  | "hello.rate_limited"
   | "identity.created"
   | "identity.deleted"
   | "slack.linked"

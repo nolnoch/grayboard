@@ -53,6 +53,9 @@ export class GrayboardClient {
 
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
+  // Set while the server rate-limits this client's hellos (#210): why, until
+  // a hello is accepted, and the wait before the next try (null once used).
+  private limited: { message: string; retryMs: number | null } | null = null;
   private wasReady  = false; // a later hello is a reconnect, not a new session
   private helloId   = "";    // the req_id of this connection's hello
   private readyResolvers: Array<(err?: Error) => void> = [];
@@ -94,7 +97,6 @@ export class GrayboardClient {
     }) as WebSocket;
 
     this.ws.onopen = () => {
-      this.backoffMs = 1000; // reset backoff on success
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
@@ -128,6 +130,16 @@ export class GrayboardClient {
       const neverOpened = !this.helloData;
       this.ws = null;
       this.helloData = null;
+      // Rate-limited: the server said why it closed, so the token needs no
+      // check, and the wait is the server's, not the backoff's.
+      const retryMs = this.limited?.retryMs;
+      if (retryMs != null) {
+        this.limited!.retryMs = null;
+        return void this.reconnectIn(retryMs, `rate limited (${this.limited!.message})`);
+      }
+      // Any other close (the network, the server going away) is not the
+      // limit: a stale reason would make startup wait it out and blame it.
+      this.limited = null;
       if (neverOpened) void this.checkToken();
       this.scheduleReconnect();
     };
@@ -146,6 +158,10 @@ export class GrayboardClient {
         this.helloData = msg;
         this.wasReady = true;
         this.refused = null;
+        this.limited = null;
+        // Reset on an accepted hello, not on open: a server that closes
+        // after every hello would otherwise be retried each second.
+        this.backoffMs = 1000;
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
         break;
@@ -183,6 +199,14 @@ export class GrayboardClient {
         break;
 
       case "error":
+        // Transient, never fatal: wait as long as the server says, jittered
+        // so a fleet doesn't come back in lockstep, and try again. ready()
+        // stays pending; a caller's own deadline decides (#210).
+        if (msg.code === "rate_limited" && !this.helloData && msg.req_id === this.helloId) {
+          this.limited = { message: msg.message, retryMs: Math.round(retryWait(msg.retry_after_ms, this.backoffMs) * (1 + Math.random() / 2)) };
+          this.ws?.close();
+          break;
+        }
         if (msg.code === "superseded") {
           this.die(`${this.identity ? `"${this.identity}" was taken over: ` : ""}${msg.message}`);
           break;
@@ -240,8 +264,17 @@ export class GrayboardClient {
   private scheduleReconnect(): void {
     const delay = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
-    console.error(`[grayboard] connection as ${this.who()} lost; reconnecting in ${delay}ms`);
+    this.reconnectIn(delay, "lost");
+  }
+
+  private reconnectIn(delay: number, why: string): void {
+    console.error(`[grayboard] connection as ${this.who()} ${why}; reconnecting in ${delay}ms`);
     setTimeout(() => this.connect(), delay);
+  }
+
+  /** Why the server is refusing this client's hellos for now, if it is. */
+  rateLimited(): string | null {
+    return this.limited?.message ?? null;
   }
 
   private who(): string {
@@ -261,7 +294,13 @@ export class GrayboardClient {
    *  Returns this connection's hello_ok, which a reconnect replaces. */
   assertConnected(): HelloOk {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
-      throw new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly");
+      const limited = this.rateLimited();
+      throw new Error(
+        this.refused ??
+          (limited
+            ? `not connected to the grayboard server: it is rate-limiting this user's connections (${limited}); reconnecting when it allows`
+            : "not connected to the grayboard server (reconnecting); try again shortly"),
+      );
     }
     return this.helloData;
   }
@@ -306,4 +345,14 @@ export class GrayboardClient {
     console.error(`[grayboard] ${reason}`);
     this.opts.onDead?.(reason);
   }
+}
+
+// The server's wait, trusted only within bounds: a missing, non-finite or
+// absurd value (a timer past 2^31 ms fires at once in Bun) falls back to the
+// backoff, so no server answer can make a hot reconnect loop.
+const MIN_RETRY_MS = 100;
+const MAX_RETRY_MS = 30_000;
+export function retryWait(serverMs: unknown, backoffMs: number): number {
+  if (typeof serverMs !== "number" || !Number.isFinite(serverMs) || serverMs < 0) return backoffMs;
+  return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, serverMs));
 }

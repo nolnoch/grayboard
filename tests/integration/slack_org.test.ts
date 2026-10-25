@@ -316,6 +316,21 @@ test("a fatal bridge stop tells the owner on their next hello, once", async () =
   expect(bridgeNotices[0]).toContain("link_disabled");
 });
 
+test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const { claim } = await import("../../src/core/claims.ts");
+  claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
+  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
+  const notices = ((await be.connect()).notices as string[] | undefined) ?? [];
+  const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
+  const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
+  expect(bridge).toBeGreaterThanOrEqual(0);
+  expect(claims).toBe(notices.length - 1);
+  expect(bridge).toBeLessThan(claims);
+});
+
 test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
   const alice = await login("alice@example.com");
   await link(alice);

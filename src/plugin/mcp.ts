@@ -192,12 +192,30 @@ class HelloTimeout extends Error {}
 // so a stuck server is an error, not a timeout. BUS_TEST_HELLO_MS shortens it
 // for tests.
 const HELLO_MS = Number(process.env.BUS_TEST_HELLO_MS) || 10_000;
-const helloWithin = (c: GrayboardClient): Promise<HelloOk> => Promise.race([
-  c.ready(),
-  new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new HelloTimeout(`no answer from grayboard server at ${serverUrl} within ${HELLO_MS / 1000}s`)), HELLO_MS),
-  ),
-]);
+// While the server rate-limits the hello, wait longer, still under that 30s
+// (#210). BUS_TEST_HELLO_LIMITED_MS shortens it for tests.
+const HELLO_LIMITED_MS = Number(process.env.BUS_TEST_HELLO_LIMITED_MS) || 25_000;
+// Startup is one window, whatever it takes: a restore's retries, then an
+// unbound hello, all count against the same absolute deadline.
+const STARTUP_LIMITED_BY = Date.now() + HELLO_LIMITED_MS;
+// Wait for hello_ok: HELLO_MS, or while the server rate-limits this client,
+// until `limitedBy` (an absolute time). Neither passes `limitedBy`.
+const helloWithin = (c: GrayboardClient, limitedBy: number): Promise<HelloOk> => {
+  let timer: Timer | undefined;
+  const start = Date.now();
+  const deadline = new Promise<never>((_, reject) => {
+    const check = () => {
+      const limited = c.rateLimited();
+      const left = limitedBy - Date.now();
+      if (limited && left > 0) return void (timer = setTimeout(check, Math.min(1000, left)));
+      reject(new HelloTimeout(limited
+        ? `the grayboard server at ${serverUrl} is rate-limiting this user's connections (${limited}); gave up after ${Math.round((Date.now() - start) / 1000)}s`
+        : `no answer from grayboard server at ${serverUrl} within ${Math.round((Date.now() - start) / 1000)}s`));
+    };
+    timer = setTimeout(check, Math.max(0, Math.min(HELLO_MS, limitedBy - start)));
+  });
+  return Promise.race([c.ready(), deadline]).finally(() => clearTimeout(timer));
+};
 
 const OLD_SERVER = "this grayboard server predates unbound sessions, so reads are unavailable until you bind a name; the server needs updating";
 // A bad_request on a read-only hello is taken for an old server; its message
@@ -236,7 +254,7 @@ async function helloAs(name: string, opts: { create: boolean; restoredFrom?: str
   for (;;) {
     const c = connect(name, { push: DELIVER, ...opts });
     try {
-      return { c, hello: await helloWithin(c) };
+      return { c, hello: await helloWithin(c, STARTUP_LIMITED_BY) };
     } catch (e) {
       c.close();
       if (!(e instanceof HelloRefused)) throw e;
@@ -275,7 +293,7 @@ if (!bound) {
   if (launcher) unboundNotes.push(launcherNote(launcher));
   const c = connect(null, { push: false });
   try {
-    hello = await helloWithin(c);
+    hello = await helloWithin(c, STARTUP_LIMITED_BY);
     client = c;
   } catch (e) {
     c.close();
@@ -541,7 +559,7 @@ async function connection(): Promise<GrayboardClient> {
   const c = connect(null, { push: false });
   client = c;
   try {
-    await helloWithin(c);
+    await helloWithin(c, Date.now() + HELLO_LIMITED_MS);
     return c;
   } catch (e) {
     if (client === c) client = null;
@@ -570,7 +588,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const next = connect(n.name, { push: DELIVER, create: a.create === true, ...(previous ? { from: previous } : {}) });
   let h: HelloOk;
   try {
-    h = await helloWithin(next);
+    h = await helloWithin(next, Date.now() + HELLO_LIMITED_MS);
   } catch (e) {
     if (!(e instanceof HelloTimeout)) {
       next.close();

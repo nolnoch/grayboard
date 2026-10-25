@@ -6,6 +6,7 @@ import {
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
+import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
 import {
   acknowledge,
   age,
@@ -79,6 +80,8 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
+  // Hellos per user: the burst, and the refill rate (#210).
+  helloLimit?: HelloLimit;
 };
 
 // Per server instance.
@@ -100,6 +103,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  helloLimiter: HelloLimiter;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -187,6 +191,17 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    // Logged and audited once per run of refusals, so a loop floods neither.
+    helloLimiter: new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+      start: (_id, email, ctx, retryAfterMs) => {
+        console.error(`[grayboard] rate-limiting hellos from ${email}`);
+        writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+      },
+      end: (_id, email, refused) => {
+        console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+        writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+      },
+    }),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -195,8 +210,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     open(_ws: Ws) {
       // wait for hello
     },
-    // The Slack bridge died fatally: hold the notice for the owner's next
-    // hello (any of their identities), drained once per user per stop.
+
     message(ws: Ws, rawData: string | Buffer) {
       const raw = typeof rawData === "string" ? rawData : rawData.toString("utf8");
 
@@ -334,6 +348,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
+      hub.helloLimiter.sweep();
       for (const ws of [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.readyState === 1 /* OPEN */) send(ws, { type: "ping" });
       }
@@ -359,6 +374,21 @@ function describeHolder(ws: Ws): string {
 async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const { repo, db, registry, holders } = hub;
   const reqId = m.req_id;
+  // First, before anything reads or writes the database. The Slack bridge's
+  // in-process connections are the server's own.
+  if (!ws.data.human) {
+    const t = hub.helloLimiter.take(ws.data.authed.user_id, ws.data.authed.user_email, {
+      session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+      ...(m.read_only ? { read_only: true } : { name: m.identity ?? null }),
+      place: m.where ?? null,
+    });
+    if (!t.ok) {
+      const secs = Math.ceil(t.retryAfterMs / 1000);
+      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${secs}s`, retry_after_ms: t.retryAfterMs });
+      ws.close();
+      return;
+    }
+  }
   const push = m.push !== false;
   // Whether this connection holds its name: a push one, or a hold one, whose
   // harness can't show pushes (#182 audit 2). A tools-only one doesn't.
@@ -511,18 +541,17 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     ...(moved ? { moved } : {}),
     ...(notMoved ? { not_moved: notMoved } : {}),
   };
-  const notices = [
-    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-    // Last, as the plugin appends notices: the longest, so the one a cut takes.
-    ...claimsInstruction(listClaims(db, undefined, full), full),
-  ];
   // Bridge-down notices drain on agent-session hellos only: the bridge's own
   // human hello (HumanConn) would steal the notice into a handshake nobody
   // reads, leaving the owner uninformed.
-  if (!ws.data.human) {
-    const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
-    if (bridgeNotice) notices.push(bridgeNotice);
-  }
+  const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
+  const notices = [
+    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    // Before the claims: drained once, so a cut must not take it.
+    ...(bridgeNotice ? [bridgeNotice] : []),
+    // Last, as the plugin appends notices: the longest, so the one a cut takes.
+    ...claimsInstruction(listClaims(db, undefined, full), full),
+  ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;
