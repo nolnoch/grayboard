@@ -17,6 +17,10 @@ const sessions = new Map<string, State>(), children = new Map<string, string>();
 const calls: { name: string; session: string; args: Record<string, unknown>; subscriber: boolean }[] = [];
 let nextOwnership = 0, codes = 0, refreshes = 0, callbackOrigin = "", mode = process.env.GRAYBOARD_NATIVE_MODE ?? "direct", target = "first";
 let ctx!: Context;
+let modelIssued = false;
+const parallelDispatch = new Set<string>(), streams = new Map<string, Set<symbol>>();
+const opened: { session: string; name: string; ownership: number }[] = [];
+const receipted = new Set<string>();
 const state = (id: string) => { if (!sessions.has(id)) sessions.set(id, { name: null, ownership: null, gen: 0 }); return sessions.get(id)!; };
 const fetch0 = globalThis.fetch;
 const json = (id: unknown, result: unknown) => Response.json({ jsonrpc: "2.0", id, result });
@@ -25,10 +29,15 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
   if (url.origin === callbackOrigin) return fetch0(req);
   if (url.origin === "https://model.example.com") {
-    const b = await req.json() as any, done = b.messages.some((m: any) => m.role === "tool");
-    const name = mode === "disabled" ? "grayboard_whoami" : mode === "code" ? "execute" : "grayboard_bind";
-    const args = mode === "disabled" ? {} : mode === "code" ? { code: `return await tools.grayboard.bind({name:${JSON.stringify(target)}})` } : { name: target };
-    const delta = done ? { content: "done" } : { role: "assistant", tool_calls: [{ index: 0, id: "call_fixture", type: "function", function: { name, arguments: JSON.stringify(args) } }] };
+    await req.json(); const done = modelIssued; modelIssued = true;
+    const ordinary = mode === "disabled" || target === "ordinary-child";
+    const name = mode === "code" ? "execute" : ordinary ? "grayboard_whoami" : "grayboard_bind";
+    const names = target === "parallel" && mode !== "code" ? ["parallel-first", "parallel-final"] : [target];
+    const tool_calls = names.map((value, index) => {
+      const args = mode === "code" ? { code: ordinary ? "return await tools.grayboard.whoami({})" : target === "parallel" ? 'return await Promise.all([tools.grayboard.bind({name:"parallel-first"}),tools.grayboard.bind({name:"parallel-final"})])' : `return await tools.grayboard.bind({name:${JSON.stringify(value)}})` } : ordinary ? {} : { name: value };
+      return { index, id: "call_fixture_" + index, type: "function", function: { name, arguments: JSON.stringify(args) } };
+    });
+    const delta = done ? { content: "done" } : { role: "assistant", tool_calls };
     return new Response("data: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + "\n\ndata: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: done ? "stop" : "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + "\n\ndata: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
   }
   if (url.origin !== issuer) throw new Error("Nonfixture network denied: " + url.origin);
@@ -55,26 +64,55 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const s = state(session);
   console.log("SUBSCRIBER_REQUEST", JSON.stringify({ method: b.method, session }));
   if (b.method === "subscriptions/listen") {
-    const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("data: " + JSON.stringify({ jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: { _meta: { "io.modelcontextprotocol/subscriptionId": b.id }, notifications: b.params.notifications } }) + "\n\n")); } });
+    const token = Symbol(); if (!streams.has(session)) streams.set(session, new Set());
+    const live = streams.get(session)!; live.add(token);
+    const stream = new ReadableStream({ start(c) {
+      const close = () => { live.delete(token); try { c.close(); } catch {} };
+      if (req.signal.aborted) { close(); return; }
+      req.signal.addEventListener("abort", close, { once: true });
+      c.enqueue(new TextEncoder().encode("data: " + JSON.stringify({ jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: { _meta: { "io.modelcontextprotocol/subscriptionId": b.id }, notifications: b.params.notifications } }) + "\n\n"));
+    }, cancel() { live.delete(token); } });
     return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
   }
-  if (b.method === "resources/read") return json(b.id, { resultType: "complete", ttlMs: 0, cacheScope: "private", contents: [{ uri: b.params.uri, mimeType: "application/json", text: '{"items":[]}' }] });
+  if (b.method === "resources/read") {
+    const items = s.name === "parallel-final" && !receipted.has(session) ? [{ id: "fixture:parallel", actionable: false, event: { text: "Final parallel digest" }, ownership: s.ownership, bind_gen: s.gen, name: s.name }] : [];
+    return json(b.id, { resultType: "complete", ttlMs: 0, cacheScope: "private", contents: [{ uri: b.params.uri, mimeType: "application/json", text: JSON.stringify({ items }) }] });
+  }
   if (b.method !== "tools/call") return json(b.id, {});
   const name = b.params.name, args = b.params.arguments ?? {}, subscriber = req.headers.get("X-Grayboard-Client") === "subscriber";
   calls.push({ name, session, args, subscriber }); console.log("MCP_CALL", JSON.stringify({ name, session, args, subscriber }));
-  if (name === "whoami") return json(b.id, result({ kind: "root", name: s.name, ownership: s.ownership, candidates: [] }));
+  if (name === "whoami") {
+    if (children.has(session)) return json(b.id, result({ kind: "child", root: children.get(session) }));
+    return json(b.id, result({ kind: "root", name: s.name, ownership: s.ownership, candidates: [] }));
+  }
   if (name === "bind") {
-    if (children.has(session)) { assert(sessions.has(children.get(session)!)); return json(b.id, result({ name: state(children.get(session)!).name!, ownership: state(children.get(session)!).ownership!, instructions: "Inherited root binding" })); }
+    if (children.has(session)) return json(b.id, { resultType: "complete", isError: true, content: [{ type: "text", text: "child_session: bind is root-only" }] });
+    if (args.name === "parallel-first" || args.name === "parallel-final") {
+      parallelDispatch.add(args.name);
+      await wait(async () => parallelDispatch.size, n => n === 2, "both native before hooks finished before first completion");
+      if (args.name === "parallel-final") {
+        await wait(async () => opened, os => os.some(o => o.session === session && o.name === "parallel-first"), "first completion lease before second completion");
+        console.log("PARALLEL_OVERLAP_ASSERTED", mode);
+      }
+    }
     s.name = args.name; s.ownership ??= ++nextOwnership; s.gen++; s.capability = undefined;
     return json(b.id, result({ name: s.name!, ownership: s.ownership, instructions: "Bound fixture" }));
   }
-  if (name === "session_register") { await Bun.sleep(80); for (const id of [...(args.via ?? []), args.child]) children.set(id, session); return json(b.id, result({ registered: true })); }
+  if (name === "session_register") { await Bun.sleep(80); children.set(args.child, session); return json(b.id, result({ registered: true })); }
   if (name === "session_end") { children.delete(session); s.name = null; s.ownership = null; s.capability = undefined; return json(b.id, result({ ended: true })); }
   if (name === "delivery_open") {
-    assert(s.name && s.ownership); s.capability = String(s.ownership).padStart(43, "a");
+    assert(s.name && s.ownership); opened.push({ session, name: s.name, ownership: s.ownership });
+    s.capability = String(s.ownership).padStart(40, "a") + String(s.gen).padStart(3, "0");
     return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user: { id: 1, email: "you@example.com" }, identity: s.name, identity_full: "you@example.com/" + s.name, issuer, resource } }));
   }
-  if (name.startsWith("delivery_")) { assert.equal(req.headers.get("X-Grayboard-Lease"), s.capability); return json(b.id, result({ ok: true })); }
+  if (name.startsWith("delivery_")) {
+    assert.equal(req.headers.get("X-Grayboard-Lease"), s.capability);
+    if (name === "delivery_receipt") {
+      assert.deepEqual(args.ids, ["fixture:parallel"]);
+      receipted.add(session);
+    }
+    return json(b.id, result({ ok: true }));
+  }
   throw new Error("Unexpected fixture tool: " + name);
 }) as typeof fetch;
 const fixture = Plugin.define({ id: "grayboard.native.fixture", async setup(c) {
@@ -122,7 +160,7 @@ try {
   assert.equal(calls.filter(c => c.name === "delivery_open").length, 0, "Approval alone never opens a lease");
   assert.equal(calls.filter(c => c.name === "bind").length, 0, "Approval alone never binds");
   async function invoke(id: string, name: string) {
-    target = name;
+    target = name; modelIssued = false;
     await host!.session.switchModel({ sessionID: id, model: { providerID: "fixture", id: "fixture" } });
     await host!.session.prompt({ sessionID: id, text: "Bind " + name }); await host!.session.wait({ sessionID: id });
   }
@@ -135,15 +173,30 @@ try {
   assert.equal(state(a.id).name, "first"); assert.equal(state(b.id).name, "second"); assert.notEqual(state(a.id).ownership, state(b.id).ownership);
   const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
-  await invoke(grandchild.id, "ignored-child-name");
+  await invoke(grandchild.id, "ordinary-child");
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id);
   assert(registration); assert.equal(registration.session, a.id); assert.deepEqual(registration.args.via, [child.id]); assert.equal(children.get(grandchild.id), a.id);
+  assert.equal(children.has(child.id), false, "via ancestry never implicitly registers an intermediate");
+  await invoke(child.id, "ordinary-child"); assert.equal(children.get(child.id), a.id);
+  await invoke(grandchild.id, "refused-child-control");
+  assert.equal(state(grandchild.id).ownership, null, "child bind is refused, not inherited as a successful root bind");
   assert.equal(calls.filter(c => c.name === "delivery_open").length, 2, "Children never receive their own leases");
   await host.session.update({ sessionID: child.id, archived: true });
   await wait(async () => calls, cs => cs.some(c => c.name === "session_end" && c.session === child.id), "child lifecycle");
   assert.equal(state(a.id).name, "first");
   await host.session.remove({ sessionID: a.id });
   await wait(async () => calls, cs => cs.some(c => c.name === "session_end" && c.session === a.id), "root lifecycle");
+  const parallel = await host.session.create({ location, title: "Parallel root", permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+  await rpc.enroll({ sessionID: parallel.id }, { location });
+  await invoke(parallel.id, "parallel");
+  await wait(async () => rpc.status({}, { location }), s => s.state === "active" && s.message.includes("parallel-final"), "final parallel binding active");
+  await wait(async () => streams.get(parallel.id)?.size, n => n === 1, "exactly one live final stream");
+  await wait(async () => receipted.has(parallel.id), Boolean, "final binding durable admission and receipt");
+  assert.equal((await host.session.context({ sessionID: parallel.id })).filter(m => m.type === "synthetic").length, 1);
+  assert.deepEqual(opened.filter(o => o.session === parallel.id).map(o => o.name), ["parallel-first", "parallel-final"]);
+  assert.equal(new Set(opened.filter(o => o.session === parallel.id).map(o => o.ownership)).size, 1);
+  assert.equal(calls.some(c => c.session === parallel.id && c.name === "delivery_release"), false);
+  console.log("PARALLEL_FINAL_ACTIVE", JSON.stringify({ mode, opens: opened.filter(o => o.session === parallel.id), liveStreams: streams.get(parallel.id)?.size }));
   await rpc.pause({}, { location }); assert.equal(state(b.id).name, null);
   assert.equal(codes, 1); assert.equal(refreshes, 0);
   console.log("NATIVE_HOST_OK", JSON.stringify({ mode, codes, refreshes, roots: [a.id, b.id], child: child.id, grandchild: grandchild.id, opens: calls.filter(c => c.name === "delivery_open").length }));

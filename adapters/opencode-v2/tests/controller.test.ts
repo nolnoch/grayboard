@@ -124,6 +124,29 @@ test("FOUR native rebinds preserve approval and reopen exactly once each without
     expect(r.rows.get("R")?.ownership).toBe(1);
   } finally { await r.controller.close(); }
 });
+test.each(["completion", "enroll", "pause", "session.archived", "session.deleted"])("parallel bind reconciliation respects %s", async transition => {
+  const r = runtime();
+  try {
+    r.bind("R", "initial"); await r.controller.enroll("R");
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 1);
+    await Promise.all([r.before("R", "grayboard_bind"), r.before("R", "grayboard_bind")]);
+    r.bind("R", "first"); await r.after("R", "first");
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2);
+    if (transition === "enroll") { await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_open").length === 3); }
+    else if (transition === "pause") await r.controller.pause();
+    else if (transition.startsWith("session.")) await r.controller.observe(transition, { sessionID: "R" });
+    r.bind("R", "final"); await r.after("R", "final");
+    if (transition === "completion" || transition === "enroll") {
+      await until(() => r.controller.status().state === "active" && r.controller.status().message.includes("final"));
+      expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(transition === "enroll" ? 4 : 3);
+      expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(0);
+      expect(r.rows.get("R")?.ownership).toBe(1);
+    } else {
+      expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(2);
+      expect(r.controller.status().state).toBe("paused");
+    }
+  } finally { await r.controller.close(); }
+});
 test("pause ends ownership, resume rebinds remembered name create:false; held name refuses once", async () => {
   const r = runtime();
   try {

@@ -258,28 +258,34 @@ export class Controller {
       this.routes.remember(path);
     }
     const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
-    if (r && event.tool === bindID && path.root === event.sessionID) await this.stop(r);
+    if (event.tool === bindID && path.root === event.sessionID) await this.serial(async () => {
+      const current = this.roots.get(path.root);
+      if (current) await this.stop(current);
+    });
   }
   async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
     if (!await this.native(event.tool)) return;
     const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
-    const r = this.roots.get(event.sessionID);
-    if (!r || r.paused || this.drifted) return;
-    try {
-      if (event.tool !== bindID) {
-        const output = event.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
-        if (output?.unbound === true && r.e.name) {
-          await this.stop(r); r.lease = undefined;
-          await this.prepare(r, true);
+    return this.serial(async () => {
+      const r = this.roots.get(event.sessionID);
+      if (!r || r.paused || this.drifted || this.stopped) return;
+      try {
+        if (event.tool !== bindID) {
+          const output = event.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
+          if (output?.unbound === true && r.e.name) {
+            await this.stop(r); r.lease = undefined;
+            await this.prepare(r, true);
+          }
+          return;
         }
-        return;
-      }
-      if (event.status === "completed") {
-        const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
-        if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || typeof output.instructions !== "string") throw new Error("Native bind completion lacked validated output");
-      }
-      await this.prepare(r, false);
-    } catch (error) { this.set(r, "approved", `Approval retained; lease unavailable: ${error instanceof Error ? error.message : "unknown refusal"}`); }
+        await this.stop(r);
+        if (event.status === "completed") {
+          const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
+          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || typeof output.instructions !== "string") throw new Error("Native bind completion lacked validated output");
+        }
+        await this.prepare(r, false);
+      } catch (error) { this.set(r, "approved", `Approval retained; lease unavailable: ${error instanceof Error ? error.message : "unknown refusal"}`); }
+    });
   }
   async observe(type: string, data: unknown) {
     if (this.stopped) return;
@@ -307,8 +313,11 @@ export class Controller {
       if (!path) return;
       const r = this.roots.get(path.root);
       if (id === path.root && r) {
-        r.paused = true; await this.stop(r); await this.release(r).catch(() => {});
-        await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released");
+        r.paused = true; r.epoch++; r.abort?.abort();
+        await this.serial(async () => {
+          await this.stop(r); await this.release(r).catch(() => {});
+          await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released");
+        });
       } else {
         const e = r?.e ?? await this.capture(path.root);
         await this.temporary(e, w => w.call("session_end"), id).catch(() => {});
