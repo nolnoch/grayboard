@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: the shared core (boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence); local-mode wakeup; harness adapters and push ownership; delegation (launchers, delegate); tool-surface rules; refused features
-invariants: at most one live session per handle; exactly one delivery owner per handle; posts are append-only; only a human handle starts posts on the announce board, which ignores agent subscriptions; new subscriptions start at the tip; digests never advance cursors; deferred pushes and digests never wake a session on their own; claims are atomic, expiring, and enforced state; core returns delivery plans and never delivers; access is checked inside the core; attachment paths are checked in the session's own MCP process before any byte leaves its host; an attachment binds to its message or post in the same transaction, only as its uploader's unsent upload, and is readable exactly where its message or post is; attachment bytes live outside SQL, put only after their row commits and swept only when no row names them; attachment_get never writes into a dot directory or through an existing name
+invariants: grayboard never spawns agents and never holds task state or knowledge (principle 7); at most one live session per handle; exactly one delivery owner per handle; posts are append-only; only a human handle starts posts on the announce board, which ignores agent subscriptions; new subscriptions start at the tip; digests never advance cursors; deferred pushes and digests never wake a session on their own; claims are atomic, expiring, and enforced state; core returns delivery plans and never delivers; access is checked inside the core; attachment paths are checked in the session's own MCP process before any byte leaves its host; an attachment binds to its message or post in the same transaction, only as its uploader's unsent upload, and is readable exactly where its message or post is; attachment bytes live outside SQL, put only after their row commits and swept only when no row names them; attachment_get never writes into a dot directory or through an existing name
 code-pointers: src/core/boards.ts, src/core/claims.ts, src/core/tools.ts, src/core/bindings.ts, src/core/delegation.ts, src/local/binding.ts, src/shared/namerecord.ts, src/core/schema.ts, src/core/attachments.ts, src/core/errors.ts, src/shared/attachments.ts, src/local/mcp.ts, src/local/blobs.ts, src/local/retention.ts, src/local/wakeup.ts, src/local/tail.ts, src/local/human.ts, src/shared/identity.ts, src/shared/inbox.ts, src/cli/session_start.ts, src/cli/claims.ts, src/cli/claim.ts, adapters/
 companions: architecture.md (server-side access, WS delivery), slack-bridge.md (human handles)
 ```
@@ -17,6 +17,10 @@ These decide new features. A change that breaks one needs an explicit decision.
 4. **Enforced state beats conventions.** A norm agents would invent in free text (`HOLD`, `owner`) becomes an operation with real semantics.
 5. **Append-only.** Nothing is edited or deleted by agents; retention is operator policy.
 6. **Harness-neutral core.** Coordination logic lives in `src/core/`; harnesses are adapters. A feature isn't skipped because one harness has a native version (Claude Code's `SendMessage`/`ListAgents` reach only Claude Code sessions). Harness-only conveniences that the core can't know neutrally (busy/idle, `notify_when_idle`) aren't copied.
+7. **The interconnect, not the orchestrator or the store.** grayboard owns addresses, mailboxes, boards, claims and presence, and nothing else. It never spawns or dispatches agents, never picks a harness, model or persona, and never holds task state or knowledge. Task state means configuration, prompts, skills, transcripts and handoff notes. Orchestrators, skill catalogs, knowledge stores and event systems do those jobs and coordinate *through* grayboard. When one of them needs a hook, grayboard emits an event (mail queued for a dormant name) or carries an opaque reference (an alias's task reference, #284), and never absorbs the job. Why:
+   - Each component stays adoptable on its own.
+   - grayboard prunes on a retention clock, and task state and knowledge must outlive it: messages aren't knowledge.
+   - Each absorbed job widens the attack surface and the tool surface that every agent pays for (principle 2).
 
 ## 2. Core shape
 
@@ -142,6 +146,10 @@ Refused (don't add without reopening the decision):
 - Reactions, join/leave presence pushes, profiles, follower graphs: `peer_list` answers presence when asked; claims cover "what I'm doing".
 - Message signatures or per-agent crypto identity: on a trusted bus the transport enforces identity.
 - Copying harness-only conveniences (principle 6).
+- Spawning agents: per-harness spawn adapters, harness- or model-aware routing, and personas as grayboard objects. Dispatch is an orchestrator's job (principle 7). Delegation (§13) carries a request to an agent that launches. Its auto-pick stays "the first live launcher of the requester's user" and gains no selection logic.
+- Task state and knowledge on the bus: resume records, prompt or skill storage, scoped memory (#108). This is principle 7: an alias carries only an opaque task reference (#284), and handoff notes go to a knowledge store, not a board.
+- Several live sessions on one name (fleet lanes, #124; the question was closed "no" on #114). One live session per task name is the invariant (§3); spread work across sessions with claims and queue boards, never with a shared name.
+- Triggers and event routing (the event fabric): grayboard emits events for other systems to act on, and doesn't schedule or route on them.
 
 Deferred (each must re-justify itself): a one-line `role` per handle in `peer_list`; pinned posts (`purpose` covers most of it); claim queues; full-text search; a web UI; `tail` in server mode; DMs as two-member boards.
 
