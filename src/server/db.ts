@@ -1,19 +1,29 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
+import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { openSqlite } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { DiskBlobs } from "./blobs.ts";
 
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 export type Identity = { id: number; user_id: number; name: string; created_at: number };
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number };
-
+// attachments: present on reads when the message carries files.
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; attachments?: AttachmentInfo[] };
+// Only a direct message's sender and recipient can see it, its thread, or
+// the files it carries. One you're not in reads as missing, so its existence
+// doesn't leak.
+export function participant(m: MessageRow | undefined, me: string): m is MessageRow {
+  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
+}
 // The statement `cursors.directFor` executes, exported so the EXPLAIN pin
 // (db.test.ts) runs the SQL the code runs — a hand-copied query in the test
 // can drift back to the old `= x OR range` form while the code keeps the
@@ -60,7 +70,10 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean): MessageRow;
+    // attachmentIds: the sender's unbound uploads, bound in the insert's
+    // transaction (a refused id throws CoreError and nothing is written).
+    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[]): MessageRow;
+    // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
@@ -70,6 +83,9 @@ export interface Repo {
     // previous id, not beforeId - 1.
     previousBetween(a: string, b: string, beforeId: number): number;
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    // Direct messages to each of recipients still past its cursor, sent by
+    // someone else; recipients with none are absent.
+    queuedTo(recipients: string[]): Map<string, number>;
     // Direct messages from sender still past each recipient's cursor, per recipient.
     undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
     // Direct messages to reader since `since` that it hasn't acked, oldest first.
@@ -93,6 +109,9 @@ export interface Repo {
   };
   audit: {
     write(row: AccessLogRow): void;
+    // The most recent row for this action+target, for dedup windows and
+    // "has this happened recently" checks. Undefined when none exists.
+    last(action: string, target: string): AccessLogRow | undefined;
     prune(olderThanMs: number): void;
   };
   slack: {
@@ -108,19 +127,43 @@ export interface Repo {
     addThread(userId: number, t: SlackThread): void;
     // Moves a thread's reply target forward, never back.
     advanceThread(userId: number, threadTs: string, id: number): void;
+    // How far an outbound item got in Slack, keyed by its grayboard ref
+    // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
+    progress(userId: number, ref: string): unknown;
+    setProgress(userId: number, ref: string, progress: unknown): void;
+    clearProgress(userId: number, ref: string): void;
   };
+  // Attachment bytes, by sha256; the attachment rows are metadata in this database.
+  blobs: BlobStore;
+  // The server's per-file and per-message caps; insert binds files under them.
+  attachmentLimits: AttachmentLimits;
+  // The bytes of attachments one user may store, sent or not.
+  attachmentUserQuota: number;
 }
 
-export function openDatabase(path: string, humanReach: HumanReach = "team"): { db: Database; repo: Repo } {
+export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
+
+// undeliveredFrom: messages a sender has sent that the recipient's read point
+// hasn't reached. The read point is the last delivered-and-handled message id
+// (cursors.last_seen_id); unread = `id > read point` — a message is counted
+// undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
+// plan of the exact statement the code executes, not a hand-copied drift.
+export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+             LEFT JOIN cursors c ON c.stream_type = 'direct' AND c.stream_ref = m.recipient
+            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+            GROUP BY m.recipient ORDER BY m.recipient`;
+
+export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
-  db.exec(
-    "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA auto_vacuum = INCREMENTAL;",
-  );
-  initSchema(db);
-  initCoreSchema(db);
-  const repo = makeRepo(db);
-  setAccess(db, serverAccess(repo, humanReach));
+  // auto_vacuum first: it takes effect only before the file's first page is
+  // written, and the WAL switch writes it.
+  const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", (d) => {
+    initSchema(d);
+    initCoreSchema(d);
+  });
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
+  setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
   return { db, repo };
 }
 
@@ -223,6 +266,15 @@ function initSchema(db: Database): void {
       PRIMARY KEY (user_id, thread_ts),
       UNIQUE (user_id, kind, board, root_id)
     );
+    -- An outbound item partway into Slack (src/bridge/relay.ts Progress), so
+    -- a restart neither reposts it nor shares its files twice. The outbox
+    -- itself is the hub's unacked pushes.
+    CREATE TABLE IF NOT EXISTS slack_progress (
+      user_id   INTEGER NOT NULL REFERENCES users(id),
+      ref       TEXT NOT NULL,
+      progress  TEXT NOT NULL,
+      PRIMARY KEY (user_id, ref)
+    );
 
     -- Received direct messages marked handled without a reply (dm_ack).
     CREATE TABLE IF NOT EXISTS dm_acks (
@@ -237,7 +289,8 @@ function initSchema(db: Database): void {
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
 }
 
-function makeRepo(db: Database): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
+  const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   return {
     users: {
       upsertByEmail(email, displayName) {
@@ -359,13 +412,15 @@ function makeRepo(db: Database): Repo {
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false) {
-        const r = db.run(
-          `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0],
-        );
-        return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(Number(r.lastInsertRowid))!;
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = []) {
+        return db.transaction(() => {
+          const row = db.query<MessageRow, [string, string, string, string, number | null, number, number]>(
+            `INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, pending)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          ).get(sender, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
+          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id }, attachmentLimits);
+          return attachments.length ? { ...row, attachments } : row;
+        })();
       },
       getById(id) {
         return db.query<MessageRow, [number]>("SELECT * FROM messages WHERE id = ?").get(id) ?? undefined;
@@ -374,36 +429,36 @@ function makeRepo(db: Database): Repo {
         const cap = Math.min(limit, 200);
         if (peer) {
           if (beforeId !== undefined) {
-            return db.query<MessageRow, [string, string, string, string, number, number]>(
+            return att(db.query<MessageRow, [string, string, string, string, number, number]>(
               `SELECT * FROM messages
                WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                  AND recipient_type = 'user' AND id < ?
                ORDER BY id DESC LIMIT ?`,
-            ).all(identityFull, peer, peer, identityFull, beforeId, cap);
+            ).all(identityFull, peer, peer, identityFull, beforeId, cap));
           }
-          return db.query<MessageRow, [string, string, string, string, number]>(
+          return att(db.query<MessageRow, [string, string, string, string, number]>(
             `SELECT * FROM messages
              WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
                AND recipient_type = 'user'
              ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, peer, peer, identityFull, cap);
+          ).all(identityFull, peer, peer, identityFull, cap));
         }
         if (beforeId !== undefined) {
-          return db.query<MessageRow, [string, string, number, number]>(
+          return att(db.query<MessageRow, [string, string, number, number]>(
             `SELECT * FROM messages
              WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user')) AND id < ?
              ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, identityFull, beforeId, cap);
+          ).all(identityFull, identityFull, beforeId, cap));
         }
-        return db.query<MessageRow, [string, string, number]>(
+        return att(db.query<MessageRow, [string, string, number]>(
           `SELECT * FROM messages
            WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user'))
            ORDER BY id DESC LIMIT ?`,
-        ).all(identityFull, identityFull, cap);
+        ).all(identityFull, identityFull, cap));
       },
       // The whole thread containing message `id`: walk up to its root, then down.
       thread(id) {
-        return db.query<MessageRow, [number]>(`
+        return att(db.query<MessageRow, [number]>(`
           WITH RECURSIVE up(id, parent_id) AS (
             SELECT id, parent_id FROM messages WHERE id = ?
             UNION ALL
@@ -415,7 +470,7 @@ function makeRepo(db: Database): Repo {
             SELECT m.id FROM messages m JOIN tree t ON m.parent_id = t.id
           )
           SELECT m.* FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
-        `).all(id);
+        `).all(id));
       },
       previousBetween(a, b, beforeId) {
         // The previous message ADDRESSED TO the recipient: a reply from the
@@ -439,7 +494,16 @@ function makeRepo(db: Database): Repo {
           all.push(...rows);
         }
         all.sort((a, b) => a.id - b.id);
-        return all;
+        return att(all);
+      },
+      queuedTo(recipients) {
+        const rows = db.query<{ recipient: string; n: number }, [string]>(
+          `SELECT m.recipient, COUNT(*) AS n FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
+              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c WHERE c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
+            GROUP BY m.recipient`,
+        ).all(JSON.stringify(recipients));
+        return new Map(rows.map((r) => [r.recipient, r.n]));
       },
       undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
         // A single range predicate (>= recipient and < recipient$, every
@@ -447,45 +511,41 @@ function makeRepo(db: Database): Repo {
         // every `recipient#lane` cursor row and can use the index, unlike a
         // substr prefix compare or an OR of equality and range.
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
-          `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE((SELECT MAX(c.last_seen_id) FROM cursors c
-                                    WHERE c.stream_type = 'direct'
-                                      AND (c.stream_ref >= m.recipient AND c.stream_ref < m.recipient || '$')), 0)
-              AND m.created_at < ?
-            GROUP BY m.recipient ORDER BY m.recipient`,
+          UNDELIVERED_FROM_SQL,
         ).all(sender, olderThan);
       },
       receivedUnacked(reader, since) {
-        return db.query<MessageRow, [string, number]>(
+        return att(db.query<MessageRow, [string, number]>(
           `SELECT * FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(reader, since);
+        ).all(reader, since));
       },
       sentPending(sender, since) {
-        return db.query<MessageRow, [string, number]>(
+        return att(db.query<MessageRow, [string, number]>(
           `SELECT * FROM messages m
             WHERE m.recipient_type = 'user' AND m.sender = ? AND m.pending = 1 AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(sender, since);
+        ).all(sender, since));
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
       },
       retract(sender, id) {
         return db.transaction(() => {
-          const { changes } = db.run(
-            `DELETE FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+          const retractable = db.query<{ x: number }, [number, string]>(
+            `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT MAX(last_seen_id) FROM cursors
                                    WHERE stream_type = 'direct' AND stream_ref = messages.recipient), 0)
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
-            [id, sender],
-          );
-          if (changes) db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
-          return changes > 0;
+          ).get(id, sender);
+          if (!retractable) return false;
+          dropAttachments(db, "message", "?", id);
+          db.run("DELETE FROM messages WHERE id = ?", [id]);
+          db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
+          return true;
         })();
       },
       prune(olderThanMs) {
@@ -499,6 +559,7 @@ function makeRepo(db: Database): Repo {
             "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages WHERE created_at < ?)",
             [olderThanMs],
           );
+          dropAttachments(db, "message", "SELECT id FROM messages WHERE created_at < ?", olderThanMs);
           db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
         })();
       },
@@ -541,6 +602,15 @@ function makeRepo(db: Database): Repo {
           [row.at, row.actor, row.action, row.target, row.detail],
         );
       },
+      last(action, target) {
+        return (
+          db
+            .query<AccessLogRow, [string, string]>(
+              "SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1",
+            )
+            .get(action, target) ?? undefined
+        );
+      },
       prune(olderThanMs) {
         db.run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
       },
@@ -564,12 +634,14 @@ function makeRepo(db: Database): Repo {
       },
       link(userId, slackUser, dmChannel) {
         db.transaction(() => {
-          // Threads live in the old account's DM; a new account starts fresh.
-          db.run(
-            `DELETE FROM slack_threads WHERE user_id = ?
-               AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
-            [userId, userId, slackUser, dmChannel],
-          );
+          // Threads and progress live in the old account's DM; a new account starts fresh.
+          for (const table of ["slack_threads", "slack_progress"]) {
+            db.run(
+              `DELETE FROM ${table} WHERE user_id = ?
+                 AND NOT EXISTS (SELECT 1 FROM slack_links WHERE user_id = ? AND slack_user = ? AND dm_channel = ?)`,
+              [userId, userId, slackUser, dmChannel],
+            );
+          }
           db.run(
             `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
@@ -580,6 +652,7 @@ function makeRepo(db: Database): Repo {
       unlink(userId) {
         db.transaction(() => {
           db.run("DELETE FROM slack_threads WHERE user_id = ?", [userId]);
+          db.run("DELETE FROM slack_progress WHERE user_id = ?", [userId]);
           db.run("DELETE FROM slack_links WHERE user_id = ?", [userId]);
         })();
       },
@@ -604,6 +677,24 @@ function makeRepo(db: Database): Repo {
       advanceThread(userId, threadTs, id) {
         db.run("UPDATE slack_threads SET last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?", [id, userId, threadTs]);
       },
+      progress(userId, ref) {
+        const r = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
+        return r ? JSON.parse(r.progress) : undefined;
+      },
+      setProgress(userId, ref, progress) {
+        db.run(
+          `INSERT INTO slack_progress (user_id, ref, progress) VALUES (?, ?, ?)
+           ON CONFLICT(user_id, ref) DO UPDATE SET progress = excluded.progress`,
+          [userId, ref, JSON.stringify(progress)],
+        );
+      },
+      clearProgress(userId, ref) {
+        db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
+      },
     },
+
+    blobs,
+    attachmentLimits,
+    attachmentUserQuota,
   };
 }

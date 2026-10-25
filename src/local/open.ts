@@ -1,13 +1,14 @@
 // Opens (and creates or upgrades) a local-mode bus database. Separate from
 // db.ts, which opens this process's bus on import, so the Slack bridge can open
 // the bus its child will use.
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 
 import { ANNOUNCE_BOARD, ensureBoard } from "../core/boards.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { openSqlite } from "../core/sqlite.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
@@ -16,12 +17,11 @@ export function localDbPath(env: Record<string, string | undefined> = process.en
 export function openLocalDb(path = localDbPath()): Database {
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const db = new Database(path);
+  return openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
+}
+
+function initLocalSchema(db: Database): void {
   db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA foreign_keys = ON;
-    PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       sender      TEXT    NOT NULL,
@@ -59,6 +59,25 @@ export function openLocalDb(path = localDbPath()): Database {
       claimer    TEXT NOT NULL,
       claimed_at INTEGER NOT NULL,
       delivered_at INTEGER
+    );
+    -- One row per live grayboard mcp process (binding.ts, #182). name is the
+    -- bus name it holds, NULL while unbound; UNIQUE makes a name's holder
+    -- one row, taken inside BEGIN IMMEDIATE. pid + proc_start say whether
+    -- the holder still runs; harness_pid is the process that launched it.
+    CREATE TABLE IF NOT EXISTS bindings (
+      session_id   TEXT PRIMARY KEY,
+      name         TEXT UNIQUE,
+      pid          INTEGER NOT NULL,
+      proc_start   TEXT,
+      harness      TEXT,
+      harness_pid  INTEGER,
+      cwd          TEXT,
+      started_at   INTEGER NOT NULL,
+      bound_at     INTEGER
+    );
+    -- When a session last ran retention (retention.ts); one row.
+    CREATE TABLE IF NOT EXISTS retention_runs (
+      id        INTEGER PRIMARY KEY CHECK (id = 1),
     );
   `);
   // dm_claims.delivered_at, added after the claims themselves (D1: the
@@ -101,5 +120,4 @@ export function openLocalDb(path = localDbPath()): Database {
     DELETE FROM handles WHERE name LIKE '~%';
   `);
   ensureBoard(db, ANNOUNCE_BOARD, "Your user's announcements to every live session. Only a human starts posts here; reply in the thread to acknowledge.", null, "grayboard");
-  return db;
 }

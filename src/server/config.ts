@@ -1,7 +1,14 @@
+import { dirname, join } from "node:path";
+
 import type { HumanReach } from "./can_send.ts";
+import { DEFAULT_HELLO_LIMIT, type HelloLimit } from "./hello_limit.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
+import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
 export type Config = {
   dbPath: string;
+  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside the database.
+  blobDir: string;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -14,6 +21,12 @@ export type Config = {
   admins: string[];
   // Who can reach another user's human; default "team".
   humanReach?: HumanReach;
+  // Attachment size caps per file and per message; default local mode's.
+  attachmentLimits?: AttachmentLimits;
+  // The bytes of attachments one user may store, sent or not.
+  attachmentUserQuota?: number;
+  // Hellos per user: the burst, and the refill per second (#210).
+  helloLimit?: HelloLimit;
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
@@ -36,18 +49,63 @@ export function loadConfig(): Config {
 
   return {
     dbPath,
-    httpPort: parseInt(process.env.GRAYBOARD_HTTP_PORT ?? "8080", 10),
+    blobDir: process.env.GRAYBOARD_BLOB_DIR || join(dirname(dbPath), "blobs"),
+    httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
-    messageRetentionDays: parseInt(process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS ?? "90", 10),
-    auditRetentionDays:   parseInt(process.env.GRAYBOARD_AUDIT_RETENTION_DAYS   ?? "90", 10),
+    messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
+    auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
+    ...parseAttachmentLimits(process.env),
+    helloLimit: parseHelloLimit(process.env),
     ...slackConfig(),
   };
+}
+
+// The most an operator may raise the caps to. An upload's body is held in
+// memory while it's checked (src/server/uploads.ts bounds how many at once).
+const MAX_FILE_CEILING = 100 * 1024 * 1024;
+const MAX_TOTAL_CEILING = 250 * 1024 * 1024;
+
+function parseAttachmentLimits(env: Record<string, string | undefined>): { attachmentLimits: AttachmentLimits; attachmentUserQuota: number } {
+  const bytes = (name: string, fallback: number, ceiling = Infinity) => positiveInt(env, name, fallback, ceiling, "bytes");
+  const file = bytes("GRAYBOARD_ATTACHMENT_MAX_BYTES", DEFAULT_ATTACHMENT_LIMITS.file, MAX_FILE_CEILING);
+  const total = bytes("GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_ATTACHMENT_LIMITS.total, MAX_TOTAL_CEILING);
+  if (file > total) throw new Error("GRAYBOARD_ATTACHMENT_MAX_BYTES can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
+  const quota = bytes("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", DEFAULT_ATTACHMENT_USER_QUOTA);
+  if (quota < total) throw new Error("GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES can't be less than GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES");
+  return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
+}
+
+// The rate's floor keeps the longest wait (one token, 1/perSec) inside a
+// client's startup window (src/plugin/mcp.ts), so a limited session can still
+// start; the burst's ceiling keeps a typo from switching the limit off.
+const MIN_HELLO_PER_SEC = 0.1;
+const MAX_HELLO_BURST = 10_000;
+
+function parseHelloLimit(env: Record<string, string | undefined>): HelloLimit {
+  const perSec = env.GRAYBOARD_HELLO_PER_SEC;
+  if (perSec !== undefined && perSec !== "" && !(/^[0-9]*\.?[0-9]+$/.test(perSec) && Number(perSec) >= MIN_HELLO_PER_SEC)) {
+    throw new Error(`GRAYBOARD_HELLO_PER_SEC must be a number of at least ${MIN_HELLO_PER_SEC}, not "${perSec}"`);
+  }
+  return {
+    burst: positiveInt(env, "GRAYBOARD_HELLO_BURST", DEFAULT_HELLO_LIMIT.burst, MAX_HELLO_BURST, "hellos"),
+    perSec: perSec ? Number(perSec) : DEFAULT_HELLO_LIMIT.perSec,
+  };
+}
+
+// A positive whole-number setting: unset or empty takes the fallback.
+// Plain digits only, so "1e3" and " 8" don't slip through Number().
+function positiveInt(env: Record<string, string | undefined>, name: string, fallback: number, ceiling: number, unit: string): number {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive whole number of ${unit}, not "${raw}"`);
+  if (Number(raw) > ceiling) throw new Error(`${name} can be at most ${ceiling} ${unit}`);
+  return Number(raw);
 }
 
 function parseReach(raw: string | undefined): HumanReach {
@@ -75,4 +133,24 @@ function requireEnv(name: string): string {
   const val = process.env[name];
   if (!val) throw new Error(`Required env var ${name} is not set`);
   return val;
+}
+
+// Retention days parse through the shared rule (src/core/boards.ts's parseRetentionDays,
+// the same one local mode's BUS_RETENTION_DAYS uses): a positive whole number of days, or
+// unset for the default — refusing to start otherwise. NaN here would make every
+// `created_at < cutoff` false and silently prune nothing.
+function retentionDays(name: string, raw: string | undefined, fallback: number): number {
+  const days = parseRetentionDays(raw, fallback);
+  if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
+  return days;
+}
+
+// Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so
+// "1e3", "0x1F90" and " 8080 " don't slip through Number().
+function parsePort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 8080;
+  if (!/^\d+$/.test(raw) || Number(raw) > 65535) {
+    throw new Error(`GRAYBOARD_HTTP_PORT must be a port between 0 and 65535, not "${raw}"`);
+  }
+  return Number(raw);
 }

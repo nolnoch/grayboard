@@ -7,10 +7,16 @@
 // tools, so roster checks, wakeups, and identity uniqueness come for free.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
 import { busMode } from "../cli/api.ts";
-import { declareHuman, humanHandles } from "../core/boards.ts";
+import { humanHandles } from "../core/boards.ts";
+import { declareLocalHuman } from "../local/binding.ts";
 import { localDbPath, openLocalDb } from "../local/open.ts";
+import { sockDir } from "../shared/sockdir.ts";
 import { ConfigError, configPath, loadConfig } from "./config.ts";
 import { Relay, type Bus, type ChannelParams } from "./relay.ts";
 import { SocketMode } from "./socket.ts";
@@ -26,11 +32,11 @@ export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
 // The child's BUS_HUMAN=1 only asserts that its handle is the declared human,
 // so declare it here, on the human's side of the tool boundary: on first run
 // if nobody is declared, refused if someone else is.
-function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): void {
+async function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): Promise<void> {
   const db = openLocalDb(localDbPath(env));
   try {
     const humans = humanHandles(db);
-    if (humans.length === 0) declareHuman(db, handle);
+    if (humans.length === 0) await declareLocalHuman(db, handle, sockDir(env));
     else if (!humans.includes(handle)) {
       throw new ConfigError(`"${humans[0]}" is the declared human handle, but ${configPath(env)} says "${handle}"; fix one (grayboard human <handle>)`);
     }
@@ -55,12 +61,17 @@ export async function startSlackBridge(
     throw new ConfigError("the Slack bridge runs in local mode only; on a grayboard server, use its Slack app instead (grayboard slack link). To relay this machine's local bus instead, pass --mode local");
   }
   const cfg = loadConfig(env);
-  declareBridgeHuman(cfg.handle, env);
+  await declareBridgeHuman(cfg.handle, env);
   const web = new SlackWeb(cfg.botToken, cfg.apiUrl);
   const app = new SlackWeb(cfg.appToken, cfg.apiUrl);
 
   const me = await web.call<{ user_id: string; team?: string }>("auth.test");
   const store = new Store(cfg.dbPath);
+  // Files cross the tool boundary as paths, the way an agent's do, through
+  // one private directory the bridge owns and declares to its child as an
+  // attach root; nothing else under the temp directory is readable to it.
+  // Resolved, as the child compares resolved paths.
+  const scratchRoot = realpathSync(await mkdtemp(join(tmpdir(), "grayboard-slack-")));
 
   let finish!: (code: number) => void;
   const done = new Promise<number>((r) => (finish = r));
@@ -77,20 +88,51 @@ export async function startSlackBridge(
     relay?.stop();
     await client.close().catch(() => {});
     store.close();
+    await rm(scratchRoot, { recursive: true, force: true });
     finish(code);
   };
 
+  const call: Bus["call"] = async (name, args) => {
+    const r = await client.callTool({ name, arguments: args });
+    const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
+    // The scratch path means nothing to the Slack owner the error goes to.
+    if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "").replaceAll(`${scratchRoot}/`, "") };
+    try {
+      return { ok: true, value: JSON.parse(text) };
+    } catch {
+      return { ok: true, value: text };
+    }
+  };
+  // A subdirectory of the scratch root per call, removed once it returns.
+  const scratch = async <T>(use: (dir: string) => Promise<T>): Promise<T> => {
+    const dir = await mkdtemp(join(scratchRoot, "call-"));
+    try {
+      return await use(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
   const bus: Bus = {
-    async call(name, args) {
-      const r = await client.callTool({ name, arguments: args });
-      const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
-      if (r.isError) return { ok: false, error: text.replace(/^error:\s*/, "") };
-      try {
-        return { ok: true, value: JSON.parse(text) };
-      } catch {
-        return { ok: true, value: text };
-      }
-    },
+    call,
+    attachment: (id) =>
+      scratch(async (dir) => {
+        const r = await call("attachment_get", { id, dir });
+        if (!r.ok) throw new Error(r.error);
+        const v = r.value as { path: string; filename: string; type: string; size: number; sha256: string };
+        return { id, filename: v.filename, type: v.type, size: v.size, sha256: v.sha256, data: new Uint8Array(await readFile(v.path)) };
+      }),
+    withFiles: (files, send) =>
+      scratch(async (dir) => {
+        // One directory per file, so two files of the same name keep it.
+        const paths: string[] = [];
+        for (const [i, f] of files.entries()) {
+          await mkdir(join(dir, String(i)));
+          const path = join(dir, String(i), f.filename);
+          await writeFile(path, f.data, { mode: 0o600 });
+          paths.push(path);
+        }
+        return send({ attachments: paths });
+      }),
   };
 
   relay = new Relay(store, bus, web, {
@@ -99,6 +141,8 @@ export async function startSlackBridge(
     log,
     debug,
     onFatal: (reason) => void stop(1, `stopping: ${reason}`),
+    // Local mode has no audit log; the bridge's log is the trail.
+    onFileSent: (f) => log(`attachment ${f.attachment} (sha256 ${f.sha256}) → Slack file ${f.slack_file} in thread ${f.thread_ts ?? "unknown"}`),
   });
 
   // Pushes can arrive as soon as the handshake completes.
@@ -114,12 +158,14 @@ export async function startSlackBridge(
   // since the human's reachability rides on it) and distinct from any agent
   // session of the same handle name.
   childEnv.BUS_LANE = "bridge";
+  childEnv.BUS_ATTACH_ROOTS = [childEnv.BUS_ATTACH_ROOTS, scratchRoot].filter(Boolean).join(delimiter);
   const args = mode === "local" ? [...mcp.args, "--mode", "local"] : mcp.args;
   const transport = new StdioClientTransport({ command: mcp.command, args, env: childEnv, stderr: "inherit" });
   try {
     await client.connect(transport);
   } catch (e) {
     store.close();
+    await rm(scratchRoot, { recursive: true, force: true });
     throw new Error(`couldn't start grayboard as "${cfg.handle}" (is another session using that handle?): ${(e as Error).message}`);
   }
   // Without the child, nothing reaches the bus: exit and let a supervisor restart us.

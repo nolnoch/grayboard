@@ -10,15 +10,19 @@ on:
         description: "Tag to release as (e.g. v0.1.0). Required for manual runs."
         required: true
 
+# Read-only by default; only the publish job can write (it creates the release).
 permissions:
-  contents: write   # needed to create the release
+  contents: read
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       # `grayboard update` checks the downloaded binary reports the tag's version.
       - name: Tag matches package.json version
@@ -31,28 +35,25 @@ jobs:
             exit 1
           fi
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup
         with:
-          bun-version: latest
-
-      # The pi end-to-end test runs the real pi CLI, which needs Node >= 22.19.
-      - uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+          node: "true"
+          release-cache: "true"
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
         run: bun run typecheck
 
       - name: Test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
         run: bun test
 
   build:
     name: Build ${{ matrix.target }}
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     strategy:
       fail-fast: false
@@ -68,54 +69,114 @@ jobs:
             bun_target: bun-darwin-arm64
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@v7.0.1
         with:
-          bun-version: latest
+          persist-credentials: false
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Compile binaries for ${{ matrix.target }}
         run: |
           mkdir -p dist
-          bun build --compile --target=${{ matrix.bun_target }} src/cli/main.ts    --outfile dist/grayboard-${{ matrix.target }}
-          bun build --compile --target=${{ matrix.bun_target }} src/server/main.ts --outfile dist/grayboard-server-${{ matrix.target }}
+          bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/cli/main.ts"    --outfile "$GITHUB_WORKSPACE/dist/grayboard-${{ matrix.target }}"
+          bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/server/main.ts" --outfile "$GITHUB_WORKSPACE/dist/grayboard-server-${{ matrix.target }}"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: binaries-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish release
+  # The compiled binaries, before they're published: --version, the pi
+  # scenario and a server round trip (tests/e2e/binaries.e2e.ts).
+  e2e:
+    name: E2E ${{ matrix.target }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+          - target: darwin-arm64
+            runner: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+        with:
+          node: "true"
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist
+
+      - name: Binaries suite
+        env:
+          GRAYBOARD_E2E_BIN_DIR: ${{ github.workspace }}/dist
+          GRAYBOARD_E2E_TAG: ${{ inputs.tag || github.ref_name }}
+          GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
+        run: |
+          chmod +x dist/*   # artifacts don't keep the executable bit
+          scripts/e2e.sh binaries
+
+      - name: Upload run dir
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: e2e-binaries-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-run
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Every v1.x release's databases and installs upgrade to this tree.
+  upgrade-matrix:
+    name: Upgrade matrix
+    permissions:
+      contents: read
+      issues: write   # e2e.yml's tracking-issue job asks for it; that job runs only on schedule
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: upgrade-matrix
+
+  release:
+    name: Publish release
+    needs: [build, e2e, upgrade-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # creates the release
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # The binaries only: the e2e jobs' run dirs are artifacts too.
+      - name: Download the binaries
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: binaries-*
           path: dist
           merge-multiple: true
 
       - name: Resolve tag
         id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}

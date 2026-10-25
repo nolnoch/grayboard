@@ -1,0 +1,46 @@
+name: Set up grayboard
+description: Pinned Bun, optionally Node for the real pi CLI, dependencies, and optionally the cached release binaries the upgrade tests use.
+
+inputs:
+  node:
+    description: "true: install Node (the pi scenario runs the real pi CLI, which needs Node >= 22.19)"
+    default: "false"
+  release-cache:
+    description: "true: restore and save .e2e-cache/releases, keyed by the latest release and this tree's version"
+    default: "false"
+  token:
+    description: "GITHUB_TOKEN, to look up the latest release for the cache key"
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2.2.0
+      with:
+        bun-version: 1.4.4
+
+    - if: inputs.node == 'true'
+      uses: actions/setup-node@v7.1.0
+      with:
+        node-version: lts/*
+
+    - name: Install dependencies
+      shell: bash
+      run: bun install --frozen-lockfile
+
+    # The per-push upgrade tests download the latest and previous releases'
+    # binaries; tests/support/releases.ts checks each against the release's
+    # sha256, so a stale entry is downloaded again, never trusted.
+    - if: inputs.release-cache == 'true'
+      id: latest
+      name: Latest release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: echo "tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" >> "$GITHUB_OUTPUT"
+
+    - if: inputs.release-cache == 'true'
+      uses: actions/cache@v6.1.0
+      with:
+        path: .e2e-cache/releases
+        key: e2e-releases-${{ runner.os }}-${{ runner.arch }}-${{ steps.latest.outputs.tag }}-${{ hashFiles('package.json') }}

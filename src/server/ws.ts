@@ -1,33 +1,44 @@
-import type { MessageRow, Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk, type ErrorCode } from "../shared/protocol.ts";
+import { participant, type MessageRow, type Repo } from "./db.ts";
+import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type SendOk, type ErrorCode } from "../shared/protocol.ts";
 import {
-  HUMAN_NAME, HUMAN_RESERVED, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
+  HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
+import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
 import {
-  CoreError,
   acknowledge,
   age,
   endLane,
   laneStreamRef,
+  checkBody,
   lastSeen,
   MAIN_LANE,
   pendingFor,
   refOf,
+  sessionsSeen,
   setPlace,
   startSession,
   touchHandle,
   touchHandleIfExists,
   type CoreDb,
   type PendingRef,
+  type UnboundPeer,
 } from "../core/boards.ts";
+import {
+  MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf,
+  sessionIdOf, unboundPeer, unknownNameError, type Candidate,
+} from "../core/bindings.ts";
+import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
-import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
+import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, dmBody, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
@@ -53,6 +64,16 @@ export type WsData = {
   // The server's Slack bridge holding a user's human identity: the only
   // connection allowed the reserved name, and drained like a human's session.
   human?: true;
+  // The client process's session ID (#182): derived from its session key, or
+  // minted here for a client from before session IDs. Keys binding_events.
+  sessionId?: string;
+  // Where the client runs, from its hello.
+  place?: string | null;
+  // An unbound session's read-only connection: its handle is
+  // <email>/~<session id>, which no hello can name, and it may only read.
+  readOnly?: true;
+  // This connection holds its name: its close logs the release.
+  owner?: true;
 };
 
 // What the hub needs of a connection: a client's WebSocket, or an in-process
@@ -60,7 +81,7 @@ export type WsData = {
 export type Conn = {
   data: WsData;
   readonly readyState: number;
-  send(data: string): unknown;
+  send(data: string): void;
   close(): void;
 };
 
@@ -76,12 +97,18 @@ export type WsOptions = {
   // pings close a half-open socket.
   pingIntervalMs?: number;
   pingMissLimit?: number;
+  // Hellos per user: the burst, and the refill rate (#210).
+  helloLimit?: HelloLimit;
 };
 
 // Per server instance.
 type Hub = {
   // identity_full -> the one push owner (the delivery slot; rotation moves it)
   registry: Map<string, Ws>;
+  // identity_full -> the connection that holds the name: registry's, or a
+  // hold connection (push: false, hold: true), which is pinged and probed
+  // but never pushed to and not online (#182 audit 2).
+  holders: Map<string, Ws>;
   // identity_full -> the probe a hello is running against its holder
   probing: Map<string, Promise<boolean>>;
   // Tools-only connections (hello push: false, or demoted lanes): pinged,
@@ -91,6 +118,8 @@ type Hub = {
   // that lane key (registry owner or a demoted lane). Tools-only connections
   // claim no lane key.
   laneHolders: Map<string, Ws>;
+  // Unbound sessions' read-only connections: pinged, shown by peer_list.
+  readOnly: Set<Ws>;
   repo: Repo;
   db: CoreDb;
   probeMs: number;
@@ -98,6 +127,7 @@ type Hub = {
   slackRunning: () => boolean;
   pingIntervalMs: number;
   pingMissLimit: number;
+  helloLimiter: HelloLimiter;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -114,6 +144,7 @@ function refKey(r: PendingRef): string {
 }
 
 const laneKeyOf = (full: string, lane: string): string => `${full}\u0000${lane}`;
+const LANE_RE = /^[a-z0-9_-]{1,32}$/;
 
 // Every live connection of one identity (its fleet), owner and tools-only.
 function fleetConns(hub: Hub, full: string): Ws[] {
@@ -145,6 +176,30 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
+// The bridge-down notice is durable, not hub memory: a fatal stop writes a
+// `bridge.stopped` audit row per linked user (src/server/slack.ts), and the
+// drain writes `bridge.notified`. An unsuppressed death newer than the last
+// delivery is still owed — across a restart too, which is why it lives in
+// the audit log — and drains once, at the user's next agent-session hello.
+// Reads and the write run synchronously, so two hellos of one user can't
+// both deliver.
+function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+  const target = `${email}/${HUMAN_NAME}`;
+  const stop = repo.audit.last("bridge.stopped", target);
+  if (!stop) return undefined;
+  let detail: { reason?: string; at?: string; suppressed?: boolean };
+  try {
+    detail = stop.detail ? (JSON.parse(stop.detail) as typeof detail) : {};
+  } catch {
+    return undefined;
+  }
+  if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  const notified = repo.audit.last("bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
+}
+
 // Does the connection answer a ping within ms? The plugin pongs every ping.
 function probe(ws: Ws, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -169,10 +224,21 @@ function probe(ws: Ws, ms: number): Promise<boolean> {
 
 export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const hub: Hub = {
-    registry: new Map(), probing: new Map(), toolsOnly: new Set(), laneHolders: new Map(), repo, db,
+    registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), laneHolders: new Map(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
     pingIntervalMs: opts.pingIntervalMs ?? 30_000, pingMissLimit: opts.pingMissLimit ?? 3,
+    // Logged and audited once per run of refusals, so a loop floods neither.
+    helloLimiter: new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+      start: (_id, email, ctx, retryAfterMs) => {
+        console.error(`[grayboard] rate-limiting hellos from ${email}`);
+        writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+      },
+      end: (_id, email, refused) => {
+        console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+        writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+      },
+    }),
   };
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
@@ -245,11 +311,18 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           ws.close();
           return;
         }
-        handleHello(hub, ws, msg.req_id, msg.identity, msg.push !== false, msg.where, msg.resume === true, msg.lane, msg.explicit === true).catch((e) => {
+        handleHello(hub, ws, msg).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
           ws.close();
         });
+        return;
+      }
+
+      // Every handler below reads ws.data.identityFull as a name's: a
+      // read-only connection has none, so it gets only the unbound reads.
+      if (ws.data.readOnly && !(msg.type === "call" && UNBOUND_READS.has(msg.tool))) {
+        err(ws, msg.req_id, "unbound", UNBOUND_ERROR);
         return;
       }
 
@@ -261,7 +334,10 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
             err(ws, msg.req_id, "bad_request", "already authenticated");
             break;
           case "send":
-            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true);
+            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
+            break;
+          case "delegate":
+            handleDelegate(hub, ws, msg.req_id, msg);
             break;
           case "history":
             handleHistory(ws, msg.req_id, msg.peer, msg.limit, msg.before_id, repo);
@@ -309,6 +385,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
 
     close(ws: Ws) {
       hub.toolsOnly.delete(ws);
+      hub.readOnly.delete(ws);
       const full = ws.data.identityFull;
       if (full) {
         const key = laneKeyOf(full, ws.data.lane);
@@ -325,10 +402,12 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
           hub.registry.delete(full);
           rotateOwner(full, ws.data.lane, "close");
         }
+        if (hub.holders.get(full) === ws) hub.holders.delete(full);
         // Only a handle that still exists: a deleted identity's close must
         // not re-insert it into the roster (#73).
         touchHandleIfExists(hub.db, full);
       }
+      if (ws.data.owner) release(hub, ws, "connection closed");
       ws.data.onPong = undefined;
     },
   };
@@ -336,7 +415,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   // Auth is checked at the upgrade only. When an admin revokes or disables a
   // user, close their connections (#70): reconnecting then fails auth. The
   // Slack bridge's humans have their own path (SlackBridge.userChanged).
-  const conns = () => [...hub.registry.values(), ...hub.toolsOnly].filter((ws) => !ws.data.human);
+  const conns = () => [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly].filter((ws) => !ws.data.human);
   const disconnectUser = (userId: number) => {
     for (const ws of conns()) {
       if (ws.data.authed.user_id !== userId) continue;
@@ -359,7 +438,8 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   const startPing = () =>
     setInterval(() => {
       revalidate();
-      for (const ws of [...hub.registry.values(), ...hub.toolsOnly]) {
+      hub.helloLimiter.sweep();
+      for (const ws of [...hub.holders.values(), ...hub.toolsOnly, ...hub.readOnly]) {
         if (ws.data.human || ws.readyState !== 1 /* OPEN */) continue;
         send(ws, { type: "ping" });
         ws.data.missedPings = (ws.data.missedPings ?? 0) + 1;
@@ -414,33 +494,87 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
   };
 }
 
-async function handleHello(
-  hub: Hub, ws: Ws, reqId: string, identityInput: string, push: boolean, where?: string, resume = false, laneInput?: string, explicit = false,
-): Promise<void> {
-  const { repo, db, registry } = hub;
-  const name = identityInput.toLowerCase();
-  if (!isValidIdentityName(name)) {
-    err(ws, reqId, "bad_request", "invalid identity name");
-    ws.close();
-    return;
-  }
-  if ((name === HUMAN_NAME) !== (ws.data.human === true)) {
-    err(ws, reqId, "bad_request", name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities");
-    ws.close();
-    return;
-  }
-  let lane = MAIN_LANE;
-  if (laneInput !== undefined) {
-    lane = laneInput.toLowerCase();
-    if (!/^[a-z0-9_-]{1,32}$/.test(lane)) {
-      err(ws, reqId, "bad_request", `invalid lane "${laneInput}": 1-32 chars, a-z 0-9 _ -`);
+// A connection that held its name gives it up: logged once, by whichever of
+// close, supersede or rebind comes first.
+function release(hub: Hub, ws: Ws, why: string): void {
+  ws.data.owner = undefined;
+  logBinding(hub.db, ws.data.sessionId!, ws.data.identityFull, "released", why);
+}
+
+function describeHolder(ws: Ws): string {
+  return `the live session ${ws.data.sessionId}${ws.data.place ? `, in ${ws.data.place}` : ""}`;
+}
+
+async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
+  const { repo, db, registry, holders } = hub;
+  const reqId = m.req_id;
+  // First, before anything reads or writes the database. The Slack bridge's
+  // in-process connections are the server's own.
+  if (!ws.data.human) {
+    const t = hub.helloLimiter.take(ws.data.authed.user_id, ws.data.authed.user_email, {
+      session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+      ...(m.read_only ? { read_only: true } : { name: m.identity ?? null }),
+      place: m.where ?? null,
+    });
+    if (!t.ok) {
+      const secs = Math.ceil(t.retryAfterMs / 1000);
+      send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${secs}s`, retry_after_ms: t.retryAfterMs });
       ws.close();
       return;
     }
   }
+  const push = m.push !== false;
+  // Whether this connection holds its name: a push one, or a hold one, whose
+  // harness can't show pushes (#182 audit 2). A tools-only one doesn't.
+  const owns = push || m.hold === true;
+  // Derived from the client's secret, so no connection can present another
+  // session's ID (#182 audit 4). A client from before session IDs gets one
+  // here, so its events have a key.
+  const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
+  ws.data.sessionId = sessionId;
+  ws.data.place = m.where ?? null;
+  if (m.read_only) return helloReadOnly(hub, ws, reqId, sessionId, m.suggested);
 
+  // An invalid name is logged cut to the longest valid length: it's the
+  // client's text, and the event only has to show what was tried.
+  const name = m.identity!.toLowerCase().slice(0, MAX_IDENTITY_LENGTH);
   const { authed } = ws.data;
   const full = `${authed.user_email}/${name}`;
+  // Only the connection that would hold the name logs: a tools-only one runs
+  // beside the session that owns it.
+  const refuse = (code: ErrorCode, message: string, detail: string, extra: { known?: string[]; holder?: string } = {}) => {
+    if (owns) logBinding(db, sessionId, full, "refused", detail);
+    send(ws, { type: "error", req_id: reqId, code, message, ...extra });
+    ws.close();
+  };
+  if (!isValidIdentityName(m.identity!.toLowerCase())) return refuse("bad_request", "invalid identity name", "invalid name");
+  if ((name === HUMAN_NAME) !== (ws.data.human === true)) {
+    const why = name === HUMAN_NAME ? HUMAN_RESERVED : "the Slack bridge holds only human identities";
+    return refuse("bad_request", why, why);
+  }
+  // The lane this session joins (the fleet model, #114): BUS_LANE wins;
+  // default "main". A second push session on the same lane is refused or
+  // supersedes; on another lane it joins as a tool lane (demoted, below).
+  let lane = MAIN_LANE;
+  if (m.lane !== undefined) {
+    lane = m.lane.toLowerCase();
+    if (!LANE_RE.test(lane)) {
+      refuse("bad_request", `invalid lane "${m.lane}": 1-32 chars, a-z 0-9 _ -`, "invalid lane");
+      return;
+    }
+  }
+  // An explicit join (BUS_IDENTITY) suppresses the worktree suffix: the
+  // identity is literal, the worktree becomes the lane key (#114).
+  const explicit = m.explicit === true;
+
+  // A typo would otherwise create a fresh name, and the DMs queued for the
+  // intended one would never arrive.
+  if (m.create === false && !repo.identities.findByUserAndName(authed.user_id, name)) {
+    const known = closestNames(name, repo.identities.listForUser(authed.user_id).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+    const message = unknownNameError(name, known);
+    refuse("identity_unknown", message, message, { known });
+    return;
+  }
 
   // One push session per lane key. If its holder still answers, refuse the
   // newcomer: taking over would let a stray second session silently steal
@@ -453,7 +587,7 @@ async function handleHello(
   // one, check again from the top; between the last check and the writes
   // below nothing awaits (#69).
   const key = laneKeyOf(full, lane);
-  while (push) {
+  while (owns) {
     const inFlight = hub.probing.get(key);
     if (inFlight) {
       // Another hello is probing this lane's holder: whoever wins, it's settled after.
@@ -468,19 +602,21 @@ async function handleHello(
       });
       hub.probing.set(key, probing);
       if (await probing) {
-        err(ws, reqId, "identity_in_use",
-          `identity "${name}" is already in use by a live session on lane "${lane}". Give this session a different BUS_IDENTITY or BUS_LANE.`);
-        ws.close();
+        const who = describeHolder(holder);
+        refuse("identity_in_use",
+          `identity "${name}" is already in use by ${who} on lane "${lane}"; give this session a different BUS_IDENTITY or BUS_LANE.`, who, { holder: who });
         return;
       }
       if (ws.readyState !== 1 /* OPEN */) return;
       if (hub.laneHolders.get(key) === holder) {
         err(holder, undefined, "superseded", "a newer session connected with this identity and lane");
+        if (holder.data.owner) release(hub, holder, `superseded by session ${sessionId}`);
         holder.close();
         // Its close handler may not have run yet; take its places now, so the
         // writes below don't race it.
         hub.toolsOnly.delete(holder);
         if (hub.registry.get(full) === holder) hub.registry.delete(full);
+        if (hub.holders.get(full) === holder) hub.holders.delete(full);
         hub.laneHolders.delete(key);
       }
       continue;
@@ -518,6 +654,28 @@ async function handleHello(
     break;
   }
 
+  // A rebind names the name it leaves (#182 audit 3). Its claims move only
+  // if this session holds that name by the record and no other connection
+  // holds it live; that holds whether or not the old connection is open. A
+  // session holding another name live must name it: a late reconnect of a
+  // name it has left is refused, never taken for a rebind.
+  let from: string | null = null;
+  let notMoved: string | null = null;
+  if (owns) {
+    const fromFull = m.from === undefined ? null : `${authed.user_email}/${m.from.toLowerCase()}`;
+    const held = [...holders.values()].find((c) => c !== ws && c.data.sessionId === sessionId && c.data.identityFull !== full);
+    if (held && held.data.identityFull !== fromFull) {
+      const was = held.data.identityName;
+      refuse("identity_in_use", `this session holds "${was}" now; a hello for "${name}" that doesn't leave it is refused.`, `stale: the session holds "${was}"`);
+      return;
+    }
+    if (fromFull !== null && fromFull !== full) {
+      const h = holders.get(fromFull);
+      if ((!h || h.data.sessionId === sessionId) && lastBoundBy(db, fromFull, sessionId)) from = fromFull;
+      else notMoved = `claims not moved: this session doesn't hold "${m.from}"`;
+    }
+  }
+
   let identity = repo.identities.findByUserAndName(authed.user_id, name);
   const created = !identity;
   if (!identity) {
@@ -551,10 +709,9 @@ async function handleHello(
   // field that says so. Lane-aware clients always send their lane, so only
   // old clients hit this; they see the refusal they have always seen.
   const owner = registry.get(full);
-  if (push && laneInput === undefined && owner && owner !== ws && owner.data.lane !== MAIN_LANE) {
-    err(ws, reqId, "identity_in_use",
-      `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`);
-    ws.close();
+  if (push && m.lane === undefined && owner && owner !== ws && owner.data.lane !== MAIN_LANE) {
+    refuse("identity_in_use",
+      `identity "${name}" is already in use by a live session. Give this session a different BUS_IDENTITY.`, "old client on a fleet");
     return;
   }
   const demoted = push && !!owner && owner !== ws;
@@ -567,12 +724,50 @@ async function handleHello(
   ws.data.joinedAt     = Date.now();
   ws.data.ready        = true;
 
-  if (push) {
-    hub.laneHolders.set(key, ws);
-    startSession(db, full, null, lane, { push_capable: true, resume });
-    setPlace(db, full, where ?? null, lane);
-    if (demoted) hub.toolsOnly.add(ws);
-    else registry.set(full, ws);
+  let moved: string[] | undefined;
+  if (owns) {
+    moved = [];
+    holders.set(full, ws);
+    if (push) {
+      hub.laneHolders.set(key, ws);
+      if (demoted) hub.toolsOnly.add(ws);
+      else registry.set(full, ws);
+    }
+    // A reconnect, or a restart taking its name back, is the same session, so
+    // its status stays, once the name's history shows it (#211). The session
+    // ID comes from the client's secret, so a reconnect proves itself; a
+    // restore names a public ID. A rebind is neither: it logs `moved`.
+    // The lane row carries the per-lane state (cwd/place/status); the
+    // handle's columns stay as the pre-lanes display fallback (#114).
+    const continued = m.from !== undefined ? null
+      : m.resume ? continuityOf(db, full, { reconnect: sessionId })
+      : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
+      : null;
+    startSession(db, full, null, lane, { push_capable: push, resume: continued?.verified === true || m.resume === true });
+    setPlace(db, full, m.where ?? null, lane);
+    // Only a push-mode owner advertises the capability (a hold, demoted or
+    // tools-only connection can't receive a delegation, so it must not be
+    // one), and its flag flip is audited (#184 review 4/6).
+    if (push && !demoted) {
+      setLauncher(db, full, m.launcher === true);
+      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+    }
+    ws.data.owner = true;
+    if (from) {
+      // The old connection, which the client closes next, holds nothing now.
+      const prev = holders.get(from);
+      if (prev) {
+        holders.delete(from);
+        if (registry.get(from) === prev) registry.delete(from);
+        touchHandle(db, from);
+      }
+      moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
+      if (prev?.data.owner) release(hub, prev, `rebound to ${full}`);
+      else if (!lastWasRelease(db, from)) logBinding(db, sessionId, from, "released", `rebound to ${full}`);
+      logBinding(db, sessionId, full, "moved", from);
+    } else {
+      logBinding(db, sessionId, full, "bound", [continued?.detail ?? null, notMoved].filter((d) => d !== null).join("; ") || null);
+    }
     writeAudit(repo, "lane.joined", authed.user_email, name, { lane, push_granted: !demoted, created });
   } else {
     hub.toolsOnly.add(ws);
@@ -588,13 +783,25 @@ async function handleHello(
     user_email: authed.user_email,
     teams,
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    attachment_limits: repo.attachmentLimits,
+    ...(moved ? { moved } : {}),
+    ...(notMoved ? { not_moved: notMoved } : {}),
     ...(lane !== MAIN_LANE ? { lane } : {}),
     ...(demoted ? { push_granted: false, owner_lane: owner!.data.lane } : {}),
   };
+  // Bridge-down notices drain on agent-session hellos only: the bridge's own
+  // human hello (HumanConn) would steal the notice into a handshake nobody
+  // reads, leaving the owner uninformed.
+  const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
   const notices = [
     ...(created ? [`New identity "${full}" created for you by this session.`] : []),
     ...(demoted ? [`Push delivery for this identity is owned by lane "${owner!.data.lane}"; this session joined as a tool lane and takes over when that lane ends.`] : []),
+    // Only a push owner that opted in pays for the launcher instruction; a
+    // hold, demoted or tools-only connection can't receive a delegation.
+    ...(m.launcher && push && !demoted ? launcherInstruction() : []),
     ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    // Before the claims: drained once, so a cut must not take it.
+    ...(bridgeNotice ? [bridgeNotice] : []),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
   ];
@@ -629,35 +836,97 @@ async function handleHello(
   if (!demoted) drainBoards(ws, db, true);
 }
 
-// A bare name means your own identity of that name, else the one identity
-// anyone has with it (as @name does in a post). Null once it has answered
-// the request with why not.
-function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
+// An unbound session's connection: reads only, as <email>/~<session id>.
+// It writes no handles row (that would put it in dm_send's roster); the hub's
+// readOnly set is its presence.
+function helloReadOnly(hub: Hub, ws: Ws, reqId: string, sessionId: string, suggested?: string): void {
+  const { repo, readOnly } = hub;
   const { authed } = ws.data;
+  readOnly.add(ws);
+  ws.data.readOnly     = true;
+  ws.data.identityId   = 0;
+  ws.data.identityName = `~${sessionId}`;
+  ws.data.identityFull = `${authed.user_email}/~${sessionId}`;
+  ws.data.ready        = true;
+  send(ws, {
+    type: "hello_ok",
+    req_id: reqId,
+    identity_full: ws.data.identityFull,
+    user_email: authed.user_email,
+    teams: repo.teams.listForUser(authed.user_id).map(t => formatTeamAddress(t.name)),
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    attachment_limits: repo.attachmentLimits,
+    candidates: candidates(hub, authed, suggested),
+  });
+}
+
+// The user's free names, for an unbound session to bind: `suggested` (the
+// checkout's default) first, then the most pending work. Live names and the
+// human are left out.
+function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
+  const { repo, db, holders } = hub;
+  const full = (n: string) => `${authed.user_email}/${n}`;
+  const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
+  const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
+  const queued = repo.messages.queuedTo(names.map(full));
+  const seen = sessionsSeen(db, names.map(full));
+  const claims = new Map<string, number>();
+  for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
+  const s = suggestedInput?.toLowerCase();
+  const suggested = s !== undefined && isValidIdentityName(s) && free(s) ? s : null;
+  return orderCandidates(
+    names.map((n) => ({
+      name: n, queued: queued.get(full(n)) ?? 0, claims: claims.get(full(n)) ?? 0,
+      last_seen: seen.get(full(n))?.last_seen ?? 0, where: seen.get(full(n))?.where ?? null,
+    })),
+    suggested,
+  ).slice(0, MAX_CANDIDATES);
+}
+
+// The user's live unbound sessions, for peer_list: never another user's.
+function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
+  return [...hub.readOnly]
+    .filter((c) => c.data.authed.user_id === ws.data.authed.user_id)
+    .map((c) => unboundPeer(c.data.sessionId!, c.data.place ?? null, c.data.sessionId === ws.data.sessionId));
+}
+
+// A bare name means your own identity of that name, else the one identity
+// anyone has with it (as @name does in a post). The pure core of resolvePeer,
+// shared with delegate's `to` resolution (#184 review 7): both take bare and
+// mixed-case names through the same path.
+function resolvePeerInput(repo: Repo, email: string, userId: number, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
   if (isValidIdentityName(input)) {
     const name = input.toLowerCase();
-    if (repo.identities.findByUserAndName(authed.user_id, name)) {
-      input = formatDirectAddress(authed.user_email, name);
+    if (repo.identities.findByUserAndName(userId, name)) {
+      input = formatDirectAddress(email, name);
     } else if (name === HUMAN_NAME) {
       // Every linked user has one; listing them would only leak who linked.
-      err(ws, reqId, "not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
-      return null;
+      return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
     } else {
       const all = repo.identities.findAllByName(name);
       if (all.length !== 1) {
         const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
-        err(ws, reqId, "not_found", `${which}; peer_list shows exact handles`);
-        return null;
+        return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
       }
       input = formatDirectAddress(all[0]!.email, name);
     }
   }
   try {
-    return parseAddress(input);
+    return { address: parseAddress(input) };
   } catch (e) {
-    err(ws, reqId, "bad_request", String(e));
+    return { error: String(e), code: "bad_request" };
+  }
+}
+
+// Null once it has answered the request with why not.
+function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
+  const { authed } = ws.data;
+  const r = resolvePeerInput(repo, authed.user_email, authed.user_id, input);
+  if ("error" in r) {
+    err(ws, reqId, r.code, r.error);
     return null;
   }
+  return r.address;
 }
 
 function handleSend(
@@ -668,17 +937,29 @@ function handleSend(
   body: string,
   parentId: number | null,
   pending: boolean,
-): void {
+  attachmentIdsRaw: unknown,
+  extra: Record<string, unknown> & { note?: string } = {},
+  // A caller that needs the reply shaped (delegate's result builder) applies
+  // it here — the same object is sent and returned, so the two can't drift.
+  shapeOk?: (ok: SendOk) => SendOk,
+): { ok?: SendOk; refused?: string } {
   const { repo, db, registry } = hub;
+  let ids: number[];
   try {
-    dmBody(body);
+    checkBody(body);
+    ids = attachmentIds(attachmentIdsRaw);
   } catch (e) {
-    return err(ws, reqId, "bad_request", (e as Error).message);
+    err(ws, reqId, "bad_request", (e as Error).message);
+    return { refused: (e as Error).message };
   }
 
   const { authed } = ws.data;
-  const parsed = resolvePeer(repo, ws, reqId, recipientStr);
-  if (!parsed) return;
+  const parsedR = resolvePeerInput(repo, authed.user_email, authed.user_id, recipientStr);
+  if ("error" in parsedR) {
+    err(ws, reqId, parsedR.code, parsedR.error);
+    return { refused: parsedR.error };
+  }
+  const parsed = parsedR.address;
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
@@ -689,34 +970,51 @@ function handleSend(
   };
 
   if (parsed.kind === "team") {
-    err(ws, reqId, "bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
-    return;
+    const why = `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`;
+    err(ws, reqId, "bad_request", why);
+    return { refused: why };
   }
 
   const recipientUser = repo.users.findByEmail(parsed.email);
   if (!recipientUser) {
-    err(ws, reqId, "not_found", `user "${parsed.email}" not found`);
-    return;
+    const why = `user "${parsed.email}" not found`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
   const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
   if (!recipientIdentity) {
-    err(ws, reqId, "not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
-    return;
+    const why = `identity "${parsed.full}" not found; peer_list shows exact handles`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) {
     err(ws, reqId, decision.code, decision.reason);
-    return;
+    return { refused: decision.reason };
   }
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.identityFull)) {
-    err(ws, reqId, "not_found", `parent_id ${parentId} is not a message you sent or received`);
-    return;
+    const why = `parent_id ${parentId} is not a message you sent or received`;
+    err(ws, reqId, "not_found", why);
+    return { refused: why };
   }
 
-  const msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending);
-  const p = pending ? { pending: true as const } : {};
+  let msg: MessageRow;
+  try {
+    msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending, ids);
+  } catch (e) {
+    if (e instanceof CoreError) {
+      err(ws, reqId, "bad_request", e.message);
+      return { refused: e.message };
+    }
+    throw e;
+  }
+  for (const a of msg.attachments ?? []) {
+    writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: parsed.full });
+  }
+  const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
+  const { note: extraNote, ...restExtra } = extra ?? {};
   let deliveredNow = false;
   const recipientWs = registry.get(parsed.full);
   if (recipientWs?.data.ready) {
@@ -733,23 +1031,76 @@ function handleSend(
   const fleet = truth && (truth.live_lanes > 1 || truth.read_lanes.length > 0)
     ? { live_lanes: truth.live_lanes, ...(truth.read_lanes.length ? { read_lanes: truth.read_lanes } : {}) }
     : undefined;
-
-  if (deliveredNow) {
-    send(ws, { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p, ...fleet });
-    return;
-  }
   const seen = lastSeen(db, parsed.full);
-  send(ws, {
-    type: "send_ok",
-    req_id: reqId,
-    message_id: msg.id,
-    delivered_now: false,
-    ...p,
-    ...fleet,
-    ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
-    undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
-    note: queuedNote(parsed.full, seen),
-  });
+  const ok: SendOk = deliveredNow
+    ? { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p, ...fleet, ...restExtra, ...(extraNote ? { note: extraNote } : {}) }
+    : {
+        type: "send_ok",
+        req_id: reqId,
+        message_id: msg.id,
+        delivered_now: false,
+        ...p,
+        ...fleet,
+        ...restExtra,
+        ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+        undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
+        note: [queuedNote(parsed.full, seen), extraNote].filter(Boolean).join(" "),
+      };
+  const shaped = shapeOk ? shapeOk(ok) : ok;
+  send(ws, shaped);
+  return { ok: shaped };
+}
+
+// A delegation request (#184): resolve the launcher (or fall back to the
+// requester's human) in core, then deliver it as a pending DM through the
+// ordinary send path. `to` resolves like dm_send's recipient (bare and
+// mixed-case names included, #184 review 7); the human fallback checks real
+// Slack reachability, not a last_seen row (review 10). Every outcome is
+// audited: which launcher resolution picked and why, or the refusal (#184
+// review 4). The reply is a DelegateOk — the send_ok fields plus `to` and,
+// on the degrade path, human_fallback.
+function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): void {
+  const { repo } = hub;
+  const { authed } = ws.data;
+  let to: string | undefined;
+  if (m.to !== undefined) {
+    const r = resolvePeerInput(repo, authed.user_email, authed.user_id, m.to);
+    if ("error" in r) {
+      // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
+      writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: r.error, to: m.to });
+      return err(ws, reqId, r.code, r.error);
+    }
+    to = r.address.full;
+  }
+  const online = (h: string) => hub.registry.get(h)?.data.ready === true;
+  // The human fallback's reachability is the server's own knowledge: the
+  // bridge is running and this user is linked. A last_seen row is not
+  // reachability (#191: an unlinked or stopped bridge queues into the void).
+  const humanReachable = () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id);
+  let d;
+  try {
+    d = resolveDelegation(hub.db, ws.data.identityFull, { ...m, to }, online, humanReachable);
+  } catch (e) {
+    if (e instanceof CoreError) {
+      writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: e.message, to: m.to });
+      return err(ws, reqId, "bad_request", e.message);
+    }
+    throw e;
+  }
+  // The result is built by the same builder local uses (review 13): the
+  // extra carries nothing delegation-specific, so the modes can't drift.
+  const sent = handleSend(hub, ws, reqId, d.to, d.body, null, true, undefined, {}, (ok) => ({ ...ok, ...delegateOkFields(d, ok) }));
+  if (sent.ok) {
+    writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+      requester: ws.data.identityFull,
+      via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
+      message_id: sent.ok.message_id,
+    });
+  } else {
+    // A refused send (canSend, a missing identity, a bad body) is a refusal,
+    // not a request (#184 review 4).
+    writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: sent.refused ?? "send refused", to: d.to });
+  }
 }
 
 // Fleet delivery truth for send_ok: how many of the recipient identity's
@@ -781,6 +1132,7 @@ function handleRetract(hub: Hub, ws: Ws, reqId: string, id: number): void {
   }
   if (!repo.messages.retract(ws.data.identityFull, id)) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
   send(ws, { type: "ack_ok", req_id: reqId });
+  void sweepBlobs(hub.db, repo.blobs);
 }
 
 function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<string, unknown>): void {
@@ -794,11 +1146,19 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
       online: (h) => hub.registry.get(h)?.data.ready === true,
       lane: ws.data.lane,
+      attachmentLimits: hub.repo.attachmentLimits,
+      ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
     });
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);
     return err(ws, reqId, "internal", `${tool} failed`);
+  }
+  if (tool === "board_post") {
+    const r = outcome.result as { post_id: number; board: string; attachments?: AttachmentInfo[] };
+    for (const a of r.attachments ?? []) {
+      writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, post_id: r.post_id, board: r.board });
+    }
   }
   send(ws, { type: "call_ok", req_id: reqId, result: outcome.result });
   wake(hub, outcome.wake);
@@ -859,12 +1219,6 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
     ...(promises.length ? { promised: promises } : {}),
     ...(queued.length ? { undelivered_from_you: queued } : {}),
   });
-}
-
-// Only a message's sender and recipient can see it, or thread from it. A
-// message you're not in reads as missing, so its existence doesn't leak.
-function participant(m: MessageRow | undefined, me: string): m is MessageRow {
-  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
 }
 
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {

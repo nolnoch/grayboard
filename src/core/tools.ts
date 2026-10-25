@@ -4,7 +4,6 @@
 import type { Database } from "bun:sqlite";
 
 import {
-  CoreError,
   createBoard,
   isViewer,
   listBoards,
@@ -12,14 +11,19 @@ import {
   normalizeBoard,
   post,
   read,
+  setQueueParticipation,
   setStatus,
   subscribe,
   who,
   type Pending,
   type Post,
   type SubMode,
+  type UnboundPeer,
 } from "./boards.ts";
+import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
+import { attachmentIds } from "./attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type ToolDef = {
   name: string;
@@ -41,12 +45,17 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "board_create",
       description:
-        `board_create(name, purpose${opts.teams ? ", team?" : ""}): create a board (a shared, durable topic); you're subscribed in push mode. Check board_list first so you don't make a near-duplicate.`,
+        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", description: 'Board name, e.g. "e2e" or "#e2e". [a-z0-9_-], max 32.' },
           purpose: { type: "string", description: "One line: what this board is for." },
+          kind: {
+            type: "string",
+            enum: ["broadcast", "queue"],
+            description: 'Optional. "queue": each post wakes exactly one subscriber (work rotation). Default "broadcast" fans out to every push subscriber.',
+          },
           ...(opts.teams
             ? {
                 team: {
@@ -63,13 +72,14 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
+          attachments: ATTACHMENTS_PARAM,
         },
         required: ["board", "body"],
       },
@@ -122,10 +132,13 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "peer_status",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        'peer_status(text): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
+        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
       inputSchema: {
         type: "object",
-        properties: { text: { type: "string", description: "At most 200 chars. Empty clears." } },
+        properties: {
+          text: { type: "string", description: "At most 200 chars. Empty clears." },
+          queue: { type: "string", enum: ["on", "off"], description: 'Optional. "off" leaves queue-board rotations until "on"; kept across restarts.' },
+        },
         required: ["text"],
       },
     },
@@ -208,7 +221,11 @@ export function claimsInstruction(claims: Claim[], self: string): string[] {
   const others = claims.filter((c) => c.holder !== self).map((c) => c.key);
   const all = [...mine, ...others];
   let shown = 0;
-  for (let room = MAX_CLAIMS_CHARS; shown < all.length && (room -= all[shown]!.length + 2) >= 0; shown++);
+  let room = MAX_CLAIMS_CHARS;
+  while (shown < all.length && room >= all[shown]!.length + 2) {
+    room -= all[shown]!.length + 2;
+    shown++;
+  }
   const parts = [];
   if (shown > 0 && mine.length > 0) parts.push(`Yours: ${mine.slice(0, shown).join("; ")}.`);
   if (shown > mine.length) parts.push(`Others': ${others.slice(0, shown - mine.length).join(", ")}.`);
@@ -286,7 +303,10 @@ export type ToolOutcome = { result: unknown; wake: string[] };
 // What only the mode knows. online: does this handle have a live session?
 // lane: the acting session's lane key, when it has one (peer_status routes
 // to its own lane; claim events record it for audit).
-export type ToolContext = { online?: (handle: string) => boolean; lane?: string };
+// attachmentLimits: the caps a post's files are bound under; a mode without
+// them can't post files.
+// unbound: the live sessions with no name yet, for peer_list (#182).
+export type ToolContext = { online?: (handle: string) => boolean; lane?: string; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[] };
 
 export function callBoardTool(
   db: Database,
@@ -302,23 +322,29 @@ export function callBoardTool(
 
     case "board_create": {
       const team = optStr(a, "team");
-      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null);
+      const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), team ? `team:${team.toLowerCase()}` : null, {
+        kind: optStr(a, "kind"),
+      });
       return { result: b, wake: [] };
     }
 
     case "board_post": {
+      // Paths name files on the agent's host: its MCP process reads, checks
+      // and uploads them, and passes the upload ids as attachment_ids.
+      if (a.attachments !== undefined) throw new CoreError("attachments must be read by the session's grayboard MCP process; this one can't");
       const { post: p, wake, deferred, unresolved } = post(
         db,
         handle,
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online },
+        { online: ctx.online, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
       );
       return {
         result: {
           post_id: p.id,
           board: p.board,
+          ...(p.attachments ? { attachments: p.attachments } : {}),
           notified: wake.filter((h) => !isViewer(h)),
           ...(deferred.length ? { deferred } : {}),
           ...(unresolved.length ? { unresolved } : {}),
@@ -338,9 +364,15 @@ export function callBoardTool(
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
     }
 
-    case "peer_status":
+    case "peer_status": {
+      const queue = optStr(a, "queue");
+      if (queue !== undefined && queue !== "on" && queue !== "off") {
+        throw new CoreError(`queue must be "on" or "off"`);
+      }
       setStatus(db, handle, str(a, "text"), ctx.lane);
+      if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");
       return { result: "ok", wake: [] };
+    }
 
     case "board_subscribe": {
       const mode = str(a, "mode") as SubMode | "off";
@@ -360,7 +392,7 @@ export function callBoardTool(
     case "peer_list": {
       if (!ctx.online) throw new CoreError("peer_list isn't available in this mode");
       const board = optStr(a, "board");
-      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online);
+      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online, ctx.unbound);
       return { result: r, wake: [] };
     }
 
@@ -391,6 +423,23 @@ export function callBoardTool(
   throw new CoreError(`unknown tool: ${name}`);
 }
 
+// A message's or post's files, in its channel meta. attachment_get isn't
+// alwaysLoad, so the notification that carries files names it; one without
+// files costs nothing.
+function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefined): void {
+  if (!list?.length) return;
+  meta.attachments = formatAttachmentsMeta(list);
+  meta.files_tool = "attachment_get(id, dir?) saves one; ids lead each item";
+}
+
+// The channel notification for a direct message. Same shape in every mode.
+export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+  const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+  addFiles(meta, msg.attachments);
+  return { content: msg.body, meta };
+}
+
 // The channel notification for a board item. Same shape in every mode.
 export function boardNotification(item: Pending): { content: string; meta: Record<string, string> } {
   if (item.kind === "push") {
@@ -403,6 +452,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       created_at: String(p.created_at),
     };
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
+    addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }

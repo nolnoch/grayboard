@@ -3,7 +3,9 @@
 // inside a session), never through an agent's tools.
 import { db } from "./db.ts";
 import { poke } from "./wakeup.ts";
-import { ANNOUNCE_BOARD, CoreError, createBoard, declareHuman, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { declareLocalHuman } from "./binding.ts";
+import { ANNOUNCE_BOARD, createBoard, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import { parseTtl as parseDuration } from "../shared/ttl.ts";
 
@@ -17,7 +19,7 @@ export function parseTtl(text: string): number {
 }
 
 /** Show the declared human handle, or declare `handle` as it. */
-export function runHuman(handle?: string): void {
+export async function runHuman(handle?: string): Promise<void> {
   if (handle === undefined) {
     const humans = humanHandles(db);
     console.log(humans.length ? humans.join("\n") : "No human handle declared. Declare yours: grayboard human <handle>");
@@ -25,7 +27,7 @@ export function runHuman(handle?: string): void {
   }
   const h = handle.toLowerCase();
   if (!isValidIdentityName(h)) throw new CoreError(`invalid handle "${handle}": 1–32 chars, a-z 0-9 _ -`);
-  declareHuman(db, h);
+  await declareLocalHuman(db, h);
   console.log(`"${h}" is the human handle. Agent sessions can no longer use it; the Slack bridge and grayboard announce speak as it.`);
 }
 

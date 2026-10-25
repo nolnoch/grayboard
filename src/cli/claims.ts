@@ -4,7 +4,7 @@
 // grayboard's own error, which a hook treats as non-blocking (fails open).
 import { existsSync } from "node:fs";
 import { busMode, makeClient } from "./api.ts";
-import { actingIdentity, busHandle } from "./claim.ts";
+import { actingName, busHandle } from "./claim.ts";
 
 export type ListedClaim = { key: string; holder: string; note: string | null; acquired_at: number; expires_at: number };
 
@@ -27,9 +27,9 @@ async function serverClaims(prefix: string | undefined): Promise<ListedClaim[]> 
 }
 
 // This session's handle, as the bus names it, or undefined if it can't be told.
-function self(mode: "local" | "server", as?: string): string | undefined {
+async function self(mode: "local" | "server", as?: string): Promise<string | undefined> {
   try {
-    return busHandle(actingIdentity(as).name, mode);
+    return busHandle((await actingName(as, mode)).name, mode);
   } catch {
     return undefined;
   }
@@ -49,7 +49,7 @@ export async function runClaims(opts: { prefix?: string; json?: boolean; include
     console.error(`[grayboard] claims: ${(e as Error).message}`);
     return 1;
   }
-  const me = opts.includeSelf ? undefined : self(mode, opts.as);
+  const me = opts.includeSelf ? undefined : await self(mode, opts.as);
   const held = me ? claims.filter((c) => c.holder !== me) : claims;
   if (opts.json) console.log(JSON.stringify(held, null, 2));
   else if (held.length) console.error(["Active claims; check with the holder before going ahead:", ...held.map(formatClaim)].join("\n"));

@@ -7,20 +7,22 @@ labels: enhancement
 
 ## Problem
 
-<!-- What is missing today; who it hurts. One paragraph. -->
+<!-- 2-5 bullets: what is missing today; who it hurts. -->
 
-## Idea
+## Value
 
-<!-- The proposal in a few sentences. -->
+<!-- 2-5 bullets: what solving it buys. -->
 
-## Examples
+## Proposed solution
 
-<!-- Concrete usage: handles, board trees, CLI/MCP calls, message flows. -->
+<!-- 2-5 bullets: the approach. -->
 
-## Open questions
+## Details
 
-<!-- What is undecided. Owned guesses welcome; mark them as guesses. -->
+<!-- Verbose detail for agent needs: examples, open questions, relations to other issues. -->
 
-## Relations
+## Acceptance criteria
 
-<!-- Related issues, PRs, and docs/future/ pages. Remove this section if none. -->
+<!-- 2-5 checkable statements, each verifiable by a run. This section is the spec the work is audited against. -->
+
+<!-- Apply the surface label on filing: server, local, core, cli, adapters, bridge, or ci -->

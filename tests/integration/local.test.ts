@@ -2,23 +2,24 @@
 // `grayboard mcp --mode local` driven by an MCP client, sharing a temp database
 // and socket directory. Covers liveness in `who`, which only works across processes.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-
-const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
+import { basename, join } from "node:path";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
+import { runCli } from "../support/cli.ts";
+import { localEnv } from "../support/env.ts";
+import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { until } from "../support/until.ts";
 
 let dir: string;
-const open: Client[] = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-local-"));
 });
 
 afterEach(async () => {
-  await Promise.all(open.splice(0).map((c) => c.close().catch(() => {})));
+  await closeSessions();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -31,36 +32,10 @@ function busEnv(identity?: string, lane?: string): Record<string, string> {
   return { ...env, ...(identity ? { BUS_IDENTITY: identity } : {}), ...(lane ? { BUS_LANE: lane } : {}) } as Record<string, string>;
 }
 
-async function start(identity: string | undefined, cwd = dir, args = [CLI, "mcp", "--mode", "local"], lane?: string): Promise<Client> {
-  const c = new Client({ name: "test", version: "0" });
-  await c.connect(
-    new StdioClientTransport({ command: process.execPath, args, cwd, env: busEnv(identity, lane), stderr: "ignore" }),
-  );
-  open.push(c);
-  return c;
-}
+const session = (identity: string | undefined, cwd = dir, args?: string[]): Promise<Session> => localSession(dir, identity, { cwd, args });
 
-// Like start, collecting channel notifications. Like Claude Code, it drops
-// any that arrive before it has sent `initialized`.
-async function startCollecting(identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> {
-  const pushes: string[] = [];
-  const c = new Client({ name: "test", version: "0" });
-  let initialized = false;
-  c.fallbackNotificationHandler = async (n) => {
-    if (initialized && n.method === "notifications/claude/channel") pushes.push((n.params as { content: string }).content);
-  };
-  await c.connect(
-    new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv(identity, lane), stderr: "ignore" }),
-  );
-  initialized = true;
-  open.push(c);
-  return { c, pushes };
-}
-
-async function stop(c: Client): Promise<void> {
-  open.splice(open.indexOf(c), 1);
-  await c.close();
-  await Bun.sleep(200); // let the process exit and drop its socket
+async function start(identity: string | undefined, cwd = dir, args?: string[]): Promise<Client> {
+  return (await session(identity, cwd, args)).c;
 }
 
 async function call(c: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
@@ -73,6 +48,8 @@ async function call(c: Client, name: string, args: Record<string, unknown> = {})
     return body; // e.g. board_subscribe's "ok: ..."
   }
 }
+
+const contents = (s: Session) => s.pushes.map((p) => p.content);
 
 test("who: live sessions are online; a stopped one is offline with last_seen", async () => {
   const be = await start("be");
@@ -99,20 +76,67 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   ]);
 }, 20_000);
 
-test("a session with an explicit identity in a linked worktree joins that identity's fleet, lane per worktree", async () => {
+test("a worktree session's handle follows the explicit-identity rule, the worktree as its lane", async () => {
   const wt = join(dir, "repo", ".wt", "stream");
   mkdirSync(join(dir, "repo", ".git", "worktrees"), { recursive: true });
   mkdirSync(wt, { recursive: true });
   writeFileSync(join(wt, ".git"), `gitdir: ${join(dir, "repo", ".git", "worktrees", "stream")}\n`);
 
-  // Both sessions share the identity "be" — the worktree is a lane now, not
-  // a look-alike handle — and run side by side, which the old guard refused.
+  // An explicit BUS_IDENTITY is literal: no worktree suffix — the worktree
+  // is the session's lane, not a look-alike handle.
   const main = await start("be", join(dir, "repo"));
+  const sim = await start("sim", wt);
+  expect((await call(sim, "peer_list")).you).toBe("sim");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "sim"]);
+
+  // A BUS_IDENTITY that re-delivers the repo's pin is derived, not explicit:
+  // the session starts unbound (#182), with the derived worktree name
+  // ("be-stream", the suffix composes) first among its candidates. The pin
+  // lives in the main checkout; the worktree session resolves it through
+  // the repo.
+  writeFileSync(join(dir, "repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
   const stream = await start("be", wt);
-  expect((await call(stream, "peer_list")).you).toBe("be");
-  const rows = (await call(main, "peer_list")).peers.filter((p: any) => p.handle === "be");
-  expect(rows.map((p: any) => p.lane)).toEqual([undefined, "stream"]);
+  expect(stream.getInstructions()).toContain('Candidates (free now): be-stream (this checkout\'s default:');
+  expect((await call(stream, "peer_list")).you).toBeUndefined();
+  await call(stream, "bind", { name: "be-stream", create: true });
+  expect((await call(stream, "peer_list")).you).toBe("be-stream");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream", "sim"]);
 }, 20_000);
+
+test("an explicit identity is lowercased, the server's rule (#181); an invalid one refuses startup", async () => {
+  // The server lowercases and validates at hello; local now does at startup,
+  // so one configuration yields one handle in both modes (#181).
+  const upper = await start("Gray");
+  expect((await call(upper, "peer_list")).you).toBe("gray");
+
+  // A name invalid after lowercasing refuses to start, with the reason.
+  await expect(session("Gray!")).rejects.toThrow(/invalid identity name/);
+}, 20_000);
+
+test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", async () => {
+  // No repo pin: a BUS_IDENTITY from a user-level registration (claude mcp
+  // add -e, pi's user mcp.json) is a chosen task name, literal in every
+  // worktree. Both sessions resolve to "task": the second starts unbound,
+  // its instructions name the holder, and the first keeps the name (one
+  // live session per handle; #182).
+  const repo = join(dir, "repo2");
+  mkdirSync(join(repo, ".git", "worktrees"), { recursive: true });
+  for (const wt of ["alpha", "beta"]) {
+    const path = join(repo, ".wt", wt);
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, ".git"), `gitdir: ${join(repo, ".git", "worktrees", wt)}\n`);
+  }
+
+  const first = await start("task", join(repo, ".wt", "alpha"));
+  expect((await call(first, "peer_list")).you).toBe("task");
+  const second = await start("task", join(repo, ".wt", "beta"));
+  expect(second.getInstructions()).toContain('BUS_IDENTITY asked for "task", but');
+  expect((await call(second, "peer_list")).you).toBeUndefined();
+  const refused = await second.callTool({ name: "bind", arguments: { name: "task" } });
+  expect(refused.isError).toBe(true);
+  // The first session still owns the name and answers calls.
+  expect((await call(first, "peer_list")).you).toBe("task");
+
 
 test("lanes of one identity run side by side; each DM is delivered exactly once across the fleet, never fanned out", async () => {
   const a = await startCollecting("be", "research");
@@ -649,22 +673,29 @@ test("a stale lane socket file from a crash is taken over, not a lockout", async
   await call(sim, "dm_send", { to: "be", body: "anyone there?" });
   await Bun.sleep(300);
   expect(be.pushes).toContain("anyone there?");
+||||||| 07c76bb
+  expect((await call(stream, "peer_list")).you).toBe("be-stream");
+  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
-  const api = await start(undefined, repo, [CLI, "mcp"]);
-  const be = await start("be", dir, [CLI, "mcp"]);
+  // No BUS_IDENTITY: unbound, the repo's name its first candidate (#182).
+  const api = await start(undefined, repo, ["mcp"]);
+  const be = await start("be", dir, ["mcp"]);
+  // api has never existed: the candidate says binding it needs create.
+  expect(api.getInstructions()).toContain("Candidates (free now): api (this checkout's default: new: bind with create: true)");
+  await call(api, "bind", { name: "api", create: true });
   expect((await call(api, "peer_list")).you).toBe("api");
   expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
 }, 20_000);
 
 test("grayboard mcp: a signed-out credentials file fails instead of falling back to local", async () => {
   writeFileSync(join(dir, "credentials"), "");
-  const p = Bun.spawn([process.execPath, CLI, "mcp"], { cwd: dir, env: busEnv("be"), stdin: "ignore", stderr: "pipe" });
-  expect(await p.exited).toBe(1);
-  expect(await new Response(p.stderr).text()).toContain("signed out");
+  const r = await runCli(["mcp"], { cwd: dir, env: busEnv("be") });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("signed out");
 }, 20_000);
 
 test("grayboard mcp --mode local overrides a signed-in credentials file", async () => {
@@ -682,11 +713,7 @@ test("dm_send to a handle that never connected is an error, not a silent queue",
 
 test("dm_thread from any message returns the whole thread; pushes carry parent_id", async () => {
   const be = await start("be");
-  const fe = await start("fe");
-  const pushes: Record<string, string>[] = [];
-  fe.fallbackNotificationHandler = async (n) => {
-    pushes.push((n.params as { meta: Record<string, string> }).meta);
-  };
+  const { c: fe, pushes } = await session("fe");
   const root = await call(be, "dm_send", { to: "fe", body: "q" });
   const reply = await call(fe, "dm_send", { to: "be", body: "a", parent_id: root.message_id });
   const leaf = await call(be, "dm_send", { to: "fe", body: "thanks", parent_id: reply.message_id });
@@ -696,7 +723,7 @@ test("dm_thread from any message returns the whole thread; pushes carry parent_i
   await expect(call(sim, "dm_thread", { thread: root.message_id })).rejects.toThrow(/not found/);
   await expect(call(sim, "dm_send", { to: "be", body: "x", parent_id: root.message_id })).rejects.toThrow(/not a message you/);
   await Bun.sleep(300);
-  expect(pushes.find((m) => m.message_id === String(leaf.message_id))?.parent_id).toBe(String(reply.message_id));
+  expect(pushes.find((p) => p.meta.message_id === String(leaf.message_id))?.meta.parent_id).toBe(String(reply.message_id));
 }, 20_000);
 
 test("peer_list shows where a session runs and its status; a restart clears the status", async () => {
@@ -724,7 +751,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?, pending?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?, attachments?): missing to; unknown recipient.",
   );
 }, 20_000);
 
@@ -838,28 +865,26 @@ test("a send to a long-idle handle says so; dm_retract withdraws it until it's d
   expect(await call(be, "dm_retract", { message_id: wrong.message_id })).toBe("ok");
   expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.body)).toEqual(["first", "also"]);
 
-  const fe = await startCollecting("fe");
+  const fe = await session("fe");
   await Bun.sleep(500);
-  expect(fe.pushes).toEqual(["first", "also"]);
+  expect(contents(fe)).toEqual(["first", "also"]);
   await expect(call(be, "dm_retract", { message_id: followup.message_id })).rejects.toThrow(/already reached fe/);
 }, 20_000);
 
 test("identity create --mcp names a missing directory instead of failing with ENOENT", async () => {
-  const create = async (path: string) => {
-    const p = Bun.spawn([process.execPath, CLI, "identity", "create", "be", "--mcp", path], { cwd: dir, env: busEnv(), stdout: "pipe", stderr: "pipe" });
-    return { code: await p.exited, err: await new Response(p.stderr).text() };
-  };
+  const create = (path: string) => runCli(["identity", "create", "be", "--mcp", path], { cwd: dir, env: busEnv() });
   const bad = await create("nope/.mcp.json");
   expect(bad.code).toBe(1);
   expect(bad.err).toMatch(/directory \S*\/nope doesn't exist/);
-  expect((await create(".mcp.json")).code).toBe(0);
+  const ok = await create(".mcp.json");
+  expect(ok.code).toBe(0);
+  // The pin is a suggestion; the output says how to bind at start (#182).
+  expect(ok.out).toContain(`"be" is pinned as this checkout's default`);
+  expect(ok.out).toContain("set BUS_IDENTITY in the launch command to bind at start");
 }, 20_000);
 
 test("grayboard claims: exits 2 when another session holds a match, 0 otherwise", async () => {
-  const claims = async (identity: string, ...args: string[]) => {
-    const p = Bun.spawn([process.execPath, CLI, "claims", ...args], { cwd: dir, env: busEnv(identity), stdout: "pipe", stderr: "pipe" });
-    return { code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() };
-  };
+  const claims = (identity: string, ...args: string[]) => runCli(["claims", ...args], { cwd: dir, env: busEnv(identity) });
   expect((await claims("fe")).code).toBe(0); // no bus yet
   const be = await start("be");
   await call(be, "claim_take", { key: "dev:env", note: "migrating", ttl_minutes: 60 });
@@ -876,19 +901,25 @@ test("grayboard claims: exits 2 when another session holds a match, 0 otherwise"
 }, 20_000);
 
 // The CLI as a lane's shell runs it: env and cwd decide the handle.
-async function gb(identity: string | undefined, cwd: string, ...args: string[]): Promise<{ code: number; out: string; err: string }> {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd, env: busEnv(identity), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
-  return { code, out, err };
-}
+const gb = (identity: string | undefined, cwd: string, ...args: string[]) => runCli(args, { cwd, env: busEnv(identity) });
 
-test("grayboard claim take/release acts as the directory's session; held exits 2", async () => {
+test("grayboard claim take/release acts as the shell's bound session; held exits 2", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
-  const api = await start(undefined, repo, [CLI, "mcp"]);
+  const api = await start(undefined, repo, ["mcp"]);
   const be = await start("be");
 
-  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the directory name)\n" });
+  // Each session runs under its own harness stand-in, none of them an
+  // ancestor of the CLI, so the checkout picks (#182 decision 18); the
+  // ancestor rule is src/cli/claim.test.ts's. An unbound session has no name
+  // to act as: refuse, never guess.
+  const unbound = await gb(undefined, repo, "whoami");
+  expect(unbound.code).toBe(1);
+  expect(unbound.err).toContain("hasn't bound a name yet");
+  await call(api, "bind", { name: "api", create: true });
+  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout)\n" });
+  const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
+  expect((await gb(undefined, elsewhere, "whoami")).err).toContain("no live session runs this shell or this checkout");
   expect(JSON.parse((await gb("be", dir, "--json", "whoami")).out)).toEqual({ handle: "be", source: "BUS_IDENTITY" });
 
   const took = await gb(undefined, repo, "claim", "take", "sandbox:sbx-1", "--ttl", "2h", "--note", "smoke");
@@ -922,7 +953,7 @@ test("grayboard claim refuses a handle no session has used, and the human's hand
 
 test("grayboard claim watch: the session is pushed the release", async () => {
   const be = await start("be");
-  const sim = await startCollecting("sim");
+  const sim = await session("sim");
   await call(be, "board_create", { name: "e2e", purpose: "x" });
   await call(sim.c, "board_subscribe", { board: "e2e", mode: "quiet" });
   await call(be, "claim_take", { key: "sandbox:sbx-1", board: "e2e" });
@@ -930,25 +961,25 @@ test("grayboard claim watch: the session is pushed the release", async () => {
   expect(w.code, w.err).toBe(0);
   await call(be, "claim_release", { key: "sandbox:sbx-1", note: "done" });
   await Bun.sleep(300);
-  expect(sim.pushes).toEqual(["[release] sandbox:sbx-1 — done cc @sim"]);
+  expect(contents(sim)).toEqual(["[release] sandbox:sbx-1 — done cc @sim"]);
 }, 20_000);
 
 test("claim_watch: a quiet subscriber is pushed the release of the claim it waits on", async () => {
   const be = await start("be");
-  const sim = await startCollecting("sim");
+  const sim = await session("sim");
   await call(be, "board_create", { name: "dev-deploys", purpose: "x" });
   await call(sim.c, "board_subscribe", { board: "dev-deploys", mode: "quiet" });
   await call(be, "claim_take", { key: "dev:env", board: "dev-deploys" });
   await call(sim.c, "claim_watch", { key: "dev:env" });
   await call(be, "claim_release", { key: "dev:env", note: "done" });
   await Bun.sleep(300);
-  expect(sim.pushes).toEqual(["[release] dev:env — done cc @sim"]);
+  expect(contents(sim)).toEqual(["[release] dev:env — done cc @sim"]);
 }, 20_000);
 
 test("a thread reply to a bystander waits for its next wake, here a DM", async () => {
   const be = await start("be");
   const fe = await start("fe");
-  const sim = await startCollecting("sim");
+  const sim = await session("sim");
   await call(be, "board_create", { name: "ops", purpose: "x" });
   await call(be, "board_subscribe", { board: "ops", mode: "off" });
   const root = await call(be, "board_post", { board: "ops", body: "root" });
@@ -957,10 +988,10 @@ test("a thread reply to a bystander waits for its next wake, here a DM", async (
   const reply = await call(be, "board_post", { board: "ops", body: "answer for fe", parent_id: mid.post_id });
   expect(reply).toMatchObject({ notified: ["fe"], deferred: ["sim"] });
   await Bun.sleep(300);
-  expect(sim.pushes).toEqual([]); // both replies to the thread are deferred for sim
+  expect(contents(sim)).toEqual([]); // both replies to the thread are deferred for sim
   await call(fe, "dm_send", { to: "sim", body: "ping" });
   await Bun.sleep(300);
-  expect(sim.pushes).toEqual(["ping", "fe asks", "answer for fe"]);
+  expect(contents(sim)).toEqual(["ping", "fe asks", "answer for fe"]);
 }, 20_000);
 
 test("dm_send and dm_history check body and limit as server mode does", async () => {
@@ -979,16 +1010,16 @@ test("a message queued while offline is pushed when the session starts", async (
   await stop(await start("be"));
   const fe = await start("fe");
   expect((await call(fe, "dm_send", { to: "be", body: "queued dm" })).delivered_now).toBe(false);
-  const be = await startCollecting("be");
+  const be = await session("be");
   await Bun.sleep(500);
-  expect(be.pushes).toEqual(["queued dm"]);
+  expect(contents(be)).toEqual(["queued dm"]);
 }, 20_000);
 
 test("the reply and recovery tools ask Claude Code to load them upfront", async () => {
   const c = await start("be");
   const { tools } = await c.listTools();
   const upfront = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name).sort();
-  expect(upfront).toEqual(["board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
+  expect(upfront).toEqual(["bind", "board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
 test("a Claude Code session started without a channels flag runs tools-only and is warned", async () => {
@@ -1000,42 +1031,35 @@ test("a Claude Code session started without a channels flag runs tools-only and 
   const host = join(dir, "host.ts");
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
 Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
-  const session = async (identity: string, flags: string[]) => {
-    const c = new Client({ name: "test", version: "0" });
-    const env = { ...busEnv(identity), CLAUDECODE: "1" };
-    await c.connect(new StdioClientTransport({ command: fake, args: [host, ...flags, "::", CLI, "mcp", "--mode", "local"], cwd: dir, env, stderr: "ignore" }));
-    open.push(c);
-    return c;
-  };
+  const claude = async (identity: string, flags: string[]) =>
+    (await localSession(dir, identity, { extra: { CLAUDECODE: "1" }, via: [fake, host, ...flags, "::"] })).c;
   const texts = async (c: Client) => ((await c.callTool({ name: "peer_list", arguments: {} })).content as { text: string }[]).map((t) => t.text);
 
-  const off = await session("be", []);
+  const off = await claude("be", []);
   expect(off.getInstructions()).toStartWith("Warning: this Claude Code session was started without");
   expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(true);
   expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(false); // first tool result only
 
-  const on = await session("fe", ["--dangerously-load-development-channels", "server:grayboard"]);
+  const on = await claude("fe", ["--dangerously-load-development-channels", "server:grayboard"]);
   expect(on.getInstructions()).not.toContain("Warning:");
   expect((await texts(on)).some((t) => t.startsWith("Warning:"))).toBe(false);
 
-  // The flagless session would drop pushes yet mark them delivered: it takes
-  // none, so peers see it offline and a session with channels gets them later.
+  // The flagless session would drop pushes yet mark them delivered: it holds
+  // its name but takes none, so a DM waits. A session with channels can't
+  // take the name while it's held (#182); once the flagless one exits, it
+  // binds the name and gets what waited.
   expect((await call(on, "dm_send", { to: "be", body: "waits" })).delivered_now).toBe(false);
-  const be = await startCollecting("be");
-  await Bun.sleep(500);
-  expect(be.pushes).toEqual(["waits"]);
+  const be = await session("be");
+  expect(be.c.getInstructions()).toContain('BUS_IDENTITY asked for "be", but');
+  await stop(off);
+  await be.call("bind", { name: "be" });
+  await until(() => contents(be).length > 0);
+  expect(contents(be)).toEqual(["waits"]);
 }, 20_000);
 
-async function cli(...args: string[]): Promise<{ code: number; out: string; err: string }> {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: busEnv(), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
-  return { code, out, err };
-}
+const cli = (...args: string[]) => runCli(args, { cwd: dir, env: busEnv() });
 
-async function exitOf(identity: string, extra: Record<string, string> = {}): Promise<{ code: number; err: string }> {
-  const p = Bun.spawn([process.execPath, CLI, "mcp", "--mode", "local"], { cwd: dir, env: { ...busEnv(identity), ...extra }, stdin: "ignore", stderr: "pipe" });
-  return { code: await p.exited, err: await new Response(p.stderr).text() };
-}
+const exitOf = (identity: string, extra: Record<string, string> = {}) => runCli(["mcp", "--mode", "local"], { cwd: dir, env: busEnv(identity, extra) });
 
 test("the human's handle: BUS_HUMAN needs a declaration, and agents can't take it by name", async () => {
   expect(await exitOf("alex", { BUS_HUMAN: "1" })).toMatchObject({ code: 1, err: expect.stringContaining("grayboard human alex") });
@@ -1061,13 +1085,7 @@ test("grayboard board create makes a board as the human; agents see it", async (
 
 test("grayboard announce reaches live sessions marked human; a TTL carries it into new sessions", async () => {
   await cli("human", "alex");
-  const pushes: { content: string; meta: Record<string, string> }[] = [];
-  const be = new Client({ name: "test", version: "0" });
-  be.fallbackNotificationHandler = async (n) => {
-    if (n.method === "notifications/claude/channel") pushes.push(n.params as (typeof pushes)[number]);
-  };
-  await be.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp", "--mode", "local"], cwd: dir, env: busEnv("be"), stderr: "ignore" }));
-  open.push(be);
+  const { c: be, pushes } = await session("be");
   await stop(await start("fe"));
   await expect(call(be, "board_post", { board: "announce", body: "relayed: stop" })).rejects.toThrow(/only your user starts posts/);
 
@@ -1078,4 +1096,60 @@ test("grayboard announce reaches live sessions marked human; a TTL carries it in
 
   const fe = await start("fe");
   expect(fe.getInstructions()).toMatch(/announcements still in effect \(human="true"\): post \d+ from alex, in effect until .*: merge freeze/);
+}, 20_000);
+
+test("attachments: sent with a DM or post, shown on reads and pushes, fetched by readers only", async () => {
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
+  writeFileSync(join(dir, "shot.png"), png);
+  writeFileSync(join(dir, "notes.md"), "# notes");
+  writeFileSync(join(dir, ".env"), "TOKEN=x");
+  const be = await start("be");
+  const { c: fe, pushes } = await session("fe");
+  const sim = await start("sim");
+
+  await expect(call(be, "dm_send", { to: "fe", body: "x", attachments: [".env"] })).rejects.toThrow(/dotfiles/);
+  await expect(call(be, "dm_send", { to: "fe", body: "x", attachments: ["/etc/hosts"] })).rejects.toThrow(/outside the directories/);
+  const sent = await call(be, "dm_send", { to: "fe", body: "see these", attachments: ["shot.png", join(dir, "notes.md")] });
+  const [shot, notes] = sent.attachments;
+  expect(shot).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) });
+  expect(notes).toMatchObject({ filename: "notes.md", type: "text/markdown", size: 7 });
+
+  await Bun.sleep(300);
+  const meta = pushes.find((p) => p.meta.message_id === String(sent.message_id))!.meta;
+  expect(meta.files_tool).toMatch(/^attachment_get\(id/);
+  expect(meta.attachments).toBe(`${shot.id}:shot.png image/png 10B sha256:${sha256Hex(png)}; ${notes.id}:notes.md text/markdown 7B sha256:${sha256Hex(new TextEncoder().encode("# notes"))}`);
+  expect((await call(fe, "dm_thread", { thread: sent.message_id }))[0].attachments).toEqual(sent.attachments);
+  expect((await call(fe, "dm_inbox")).unanswered[0].attachments).toEqual(sent.attachments);
+
+  const saved = await call(fe, "attachment_get", { id: shot.id });
+  expect(saved.path).toBe(join(dir, "saved", localBusDir(join(dir, "bus.db")), `${shot.id}-shot.png`));
+  expect(new Uint8Array(readFileSync(saved.path))).toEqual(png);
+  mkdirSync(join(dir, "out"));
+  expect((await call(fe, "attachment_get", { id: notes.id, dir: "out" })).path).toBe(join(realpathSync(dir), "out", `${notes.id}-notes.md`));
+  await expect(call(fe, "attachment_get", { id: notes.id, dir: "/" })).rejects.toThrow(/outside the directories/);
+  await expect(call(sim, "attachment_get", { id: shot.id })).rejects.toThrow(/no attachment/);
+
+  await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(fe, "board_subscribe", { board: "e2e", mode: "push" });
+  await expect(call(be, "board_post", { board: "e2e", body: "x", parent_id: 9999, attachments: ["shot.png"] })).rejects.toThrow(/parent_id/);
+  const posted = await call(be, "board_post", { board: "e2e", body: "shot", attachments: ["shot.png"] });
+  expect(posted.attachments).toEqual([{ id: expect.any(Number), filename: "shot.png", type: "image/png", size: png.length, sha256: sha256Hex(png) }]);
+  await Bun.sleep(300);
+  expect(pushes.find((p) => p.meta.post_id === String(posted.post_id))!.meta.attachments).toBe(`${posted.attachments[0].id}:shot.png image/png 10B sha256:${sha256Hex(png)}`);
+  expect((await call(sim, "board_read", { board: "e2e" })).posts[0].attachments).toEqual(posted.attachments);
+  expect((await call(sim, "attachment_get", { id: posted.attachments[0].id })).size).toBe(png.length);
+
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(join(dir, "bus.db"));
+  const count = () => (db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get() as { n: number }).n;
+  // The refused post released its upload; the blob is shared by content.
+  expect(count()).toBe(3);
+  expect((db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs`).get() as { n: number }).n).toBe(2);
+
+  await stop(fe);
+  const queued = await call(be, "dm_send", { to: "fe", body: "oops", attachments: ["notes.md"] });
+  expect(count()).toBe(4);
+  expect(await call(be, "dm_retract", { message_id: queued.message_id })).toBe("ok");
+  expect(count()).toBe(3);
+  db.close();
 }, 20_000);

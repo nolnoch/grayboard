@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeEach } from "bun:test";
-import { Glob } from "bun";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, DIRECT_FOR_SQL, type Repo } from "./db.ts";
+import { Glob } from "bun";
+import { openDatabase, DIRECT_FOR_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import { startSession, laneStreamRef } from "../core/boards.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
   // claim_events.lane column. Deployed databases must open under new code,
   // so reopen the same FILE and assert both come back and data survives.
   const path = join(mkdtempSync(join(tmpdir(), "gb-db-")), "bus.db");
-  const { db, repo } = openDatabase(path);
+  const { db, repo } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const user = repo.users.upsertByEmail("you@example.com", null);
   const identity = repo.identities.create(user.id, "be");
   // A pre-lanes writer's DM cursor: identity-scoped, no lane suffix.
@@ -45,7 +45,7 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
   db.exec("ALTER TABLE claim_events DROP COLUMN lane");
   db.close();
 
-  const { db: db2, repo: repo2 } = openDatabase(path);
+  const { db: db2, repo: repo2 } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const kept = repo2.identities.findByUserAndName(user.id, "be");
   expect(kept?.id).toBe(identity.id);
   // The identity-scoped row is the main lane's stream by format (backfill
@@ -61,13 +61,21 @@ test("a pre-lanes database opens under the new code, lanes recreated additively"
 
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
+// auto_vacuum applies only before the file's first page is written (#170).
+test("a new database file gets auto_vacuum=INCREMENTAL", () => {
+  const { db } = openDatabase(join(mkdtempSync(join(tmpdir(), "gb-db-")), "bus.db"), { blobDir: join(tmpdir(), "gb-db-blobs") });
+  expect(db.prepare("PRAGMA auto_vacuum").get()).toEqual({ auto_vacuum: 2 });
+  expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+  db.close();
+});
+
 describe("Repo", () => {
   let db: ReturnType<typeof openDatabase>["db"];
   let repo: Repo;
 
   beforeEach(() => {
     // Use an in-memory DB for each test
-    const { db: d, repo: r } = openDatabase(":memory:");
+    const { db: d, repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
     db = d;
     repo = r;
   });
@@ -213,4 +221,21 @@ describe("Repo", () => {
     repo.audit.prune(Date.now()); // prune everything older than now
     // No assertion on rows (no SELECT on audit in Repo) but prune should not throw
   });
+});
+
+// ── #130: the undeliveredFrom plan ────────────────────────────────────────────
+
+test("undeliveredFrom uses the stream index, never a cursors scan", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const sender = repo.users.upsertByEmail("a@example.com", null);
+  repo.identities.create(sender.id, "fe");
+  const recip = repo.users.upsertByEmail("b@example.com", null);
+  const ri = repo.identities.create(recip.id, "be");
+  repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+  repo.cursors.advance(ri.id, "direct", "b@example.com/be", 1);
+  const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
+    .all("a@example.com/fe", Number.MAX_SAFE_INTEGER) as { detail: string }[];
+  const detail = plan.map(p => p.detail).join(" ");
+  expect(detail).toContain("USING INDEX idx_cursors_stream");
+  expect(detail).not.toContain("SCAN cursors");
 });

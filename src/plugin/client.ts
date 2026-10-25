@@ -1,4 +1,4 @@
-import type { ServerMessage, ClientMessage, HelloOk, Message } from "../shared/protocol.ts";
+import type { ServerMessage, ClientMessage, ErrorMessage, HelloOk, Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { describeLocation } from "../shared/identity.ts";
 
@@ -11,15 +11,60 @@ export type PushCallback = (msg: Message) => Promise<void>;
 export type BoardPushCallback = (item: Pending) => Promise<void>;
 export type ReadyCallback = (data: HelloOk) => void;
 
+/** The server refused this client's hello: its code, and with it the holder (the closest names are in the message). */
+export class HelloRefused extends Error {
+  readonly code: ErrorMessage["code"];
+  readonly holder?: string;
+  constructor(m: ErrorMessage) {
+    super(m.message);
+    this.code = m.code;
+    this.holder = m.holder;
+  }
+}
+
+export type ClientOptions = {
+  // With push false: hold the name all the same (probed, claims move), for a
+  // harness that can't show pushes (#182 audit 2).
+  hold?: boolean;
+  // The name a bind leaves, whose claims move to this one: sent on the first
+  // hello only, as a reconnect leaves nothing.
+  from?: string;
+  // false: refuse a name that has never existed (identity_unknown).
+  create?: boolean;
+  // A read-only hello's suggested name, listed first among its candidates.
+  suggested?: string | null;
+  // This session's harness can spawn subagents, so delegate requests may
+  // land here (#184). Sent on every hello; the server records it on the
+  // handle's row and peer_list shows it.
+  launcher?: boolean;
+  // The session ID of the process this one restarted from, whose name it
+  // takes back (#182 decision 14): sent on the first hello only.
+  restoredFrom?: string;
+  // This session's lane key within the identity's fleet (#114). Sent in
+  // hello even when "main", so a server can tell a lane-aware client from
+  // an older one; a server predating lanes ignores it (and its one-session
+  // refusal still applies).
+  lane?: string;
+  // True when the identity came from BUS_IDENTITY: an explicit join, which
+  // a lanes-aware server treats as attach-or-refuse (never a lazy create).
+  explicit?: boolean;
+  // The client stopped for good after it was ready: superseded, or its name
+  // refused on a reconnect. It never exits the process; the session decides.
+  onDead?: (reason: string) => void;
+};
+
 export class GrayboardClient {
   private ws: WebSocket | null = null;
   private backoffMs = 1000;
   private counter   = 0;
   private pending   = new Map<string, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
-  private dead      = false; // set on a terminal close; do not reconnect
+  private dead      = false; // set on superseded, refusal or close; do not reconnect
 
   private helloData: HelloOk | null = null;
   private refused: string | null = null; // set while the server refuses our token
+  // Set while the server rate-limits this client's hellos (#210): why, until
+  // a hello is accepted, and the wait before the next try (null once used).
+  private limited: { message: string; retryMs: number | null } | null = null;
   private wasReady  = false; // a later hello is a reconnect, not a new session
   private helloId   = "";    // the req_id of this connection's hello
   private readyResolvers: Array<(err?: Error) => void> = [];
@@ -28,7 +73,12 @@ export class GrayboardClient {
     private readonly serverUrl: string,
     // Read on each connect, so signing in again takes effect on the next reconnect.
     private readonly token: () => string,
-    private readonly identity: string,
+    // null: an unbound session's read-only connection, with no name.
+    private readonly identity: string | null,
+    // This process's session key (#182 audit 4): the server derives the
+    // session ID it keys binding events on from it, and a reconnect keeps its
+    // status only under the ID that last bound the name (#211).
+    private readonly sessionKey: string,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
     // false: a tools-only connection that never receives pushes.
@@ -36,14 +86,7 @@ export class GrayboardClient {
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
-    // This session's lane key within the identity's fleet. Sent in hello
-    // even when "main", so a server can tell a lane-aware client from an
-    // older one; a server predating lanes ignores it (and its one-session
-    // refusal still applies).
-    private readonly lane: string | null = null,
-    // True when the identity came from BUS_IDENTITY: an explicit join, which
-    // a lanes-aware server treats as attach-or-refuse (never a lazy create).
-    private readonly explicit = false,
+    private readonly opts: ClientOptions = {},
   ) {}
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
@@ -67,17 +110,21 @@ export class GrayboardClient {
     }) as WebSocket;
 
     this.ws.onopen = () => {
-      this.backoffMs = 1000; // reset backoff on success
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
+      const { hold, from, create, suggested, restoredFrom } = this.opts;
       this.send({
-        type: "hello", req_id: this.helloId, identity: this.identity,
-        ...(this.push ? {} : { push: false }),
+        type: "hello", req_id: this.helloId,
+        ...(this.identity === null
+          ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
+          : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
+        ...(this.opts.launcher ? { launcher: true } : {}),
+        session_key: this.sessionKey,
         ...(where ? { where } : {}),
-        ...(this.wasReady ? { resume: true } : {}),
-        ...(this.lane ? { lane: this.lane } : {}),
-        ...(this.explicit ? { explicit: true } : {}),
+        ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
+        ...(this.opts.lane ? { lane: this.opts.lane } : {}),
+        ...(this.opts.explicit ? { explicit: true } : {}),
       });
     };
 
@@ -90,10 +137,25 @@ export class GrayboardClient {
     this.ws.onclose = () => {
       for (const p of this.pending.values()) p.reject(new Error("connection to the grayboard server was lost"));
       this.pending.clear();
-      if (this.dead) return;
+      if (this.dead) {
+        // A deliberate stop (a bind's swap, supersede, exit): said once, so a
+        // reconnect that shouldn't happen shows as the line below instead.
+        if (this.wasReady) console.error(`[grayboard] connection as ${this.who()} closed; not reconnecting`);
+        return;
+      }
       const neverOpened = !this.helloData;
       this.ws = null;
       this.helloData = null;
+      // Rate-limited: the server said why it closed, so the token needs no
+      // check, and the wait is the server's, not the backoff's.
+      const retryMs = this.limited?.retryMs;
+      if (retryMs != null) {
+        this.limited!.retryMs = null;
+        return void this.reconnectIn(retryMs, `rate limited (${this.limited!.message})`);
+      }
+      // Any other close (the network, the server going away) is not the
+      // limit: a stale reason would make startup wait it out and blame it.
+      this.limited = null;
       if (neverOpened) void this.checkToken();
       this.scheduleReconnect();
     };
@@ -104,11 +166,18 @@ export class GrayboardClient {
   }
 
   private handleServerMessage(msg: ServerMessage): void {
+    // A dead client hands nothing to the agent and acks nothing: what was
+    // pushed to it stays queued for its name's next holder (#182 decision 6).
+    if (this.dead) return;
     switch (msg.type) {
       case "hello_ok":
         this.helloData = msg;
         this.wasReady = true;
         this.refused = null;
+        this.limited = null;
+        // Reset on an accepted hello, not on open: a server that closes
+        // after every hello would otherwise be retried each second.
+        this.backoffMs = 1000;
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
         break;
@@ -152,6 +221,14 @@ export class GrayboardClient {
         break;
 
       case "error":
+        // Transient, never fatal: wait as long as the server says, jittered
+        // so a fleet doesn't come back in lockstep, and try again. ready()
+        // stays pending; a caller's own deadline decides (#210).
+        if (msg.code === "rate_limited" && !this.helloData && msg.req_id === this.helloId) {
+          this.limited = { message: msg.message, retryMs: Math.round(retryWait(msg.retry_after_ms, this.backoffMs) * (1 + Math.random() / 2)) };
+          this.ws?.close();
+          break;
+        }
         if (msg.code === "lost_ownership") {
           // The heartbeat found this connection half-open (a sleep, a
           // SIGSTOP) or a newer lane took over delivery. Not terminal: the
@@ -162,23 +239,22 @@ export class GrayboardClient {
           break;
         }
         if (msg.code === "superseded") {
-          this.dead = true;
-          console.error("[grayboard] connection superseded by a newer session — exiting");
-          process.exit(1);
+          this.die(`${this.identity ? `"${this.identity}" was taken over: ` : ""}${msg.message}`);
+          break;
         }
         // The server refused the hello itself (e.g. a reserved or invalid
         // name): retrying gets the same answer, so give up with its reason (#74).
         const helloRefused = !this.helloData && msg.req_id === this.helloId && msg.code === "bad_request";
-        if (msg.code === "identity_in_use" || helloRefused) {
+        if (msg.code === "identity_in_use" || msg.code === "identity_unknown" || helloRefused) {
           // Another live session holds this identity, or can't have it. Don't retry.
-          this.dead = true;
           if (this.readyResolvers.length) {
-            const err = new Error(msg.message);
+            this.dead = true;
+            this.ws?.close();
+            const err = new HelloRefused(msg);
             for (const r of this.readyResolvers.splice(0)) r(err);
           } else {
             // Refused while reconnecting: e.g. another session owns it now.
-            console.error(`[grayboard] ${msg.message} — exiting`);
-            process.exit(1);
+            this.die(msg.message);
           }
           break;
         }
@@ -219,7 +295,21 @@ export class GrayboardClient {
   private scheduleReconnect(): void {
     const delay = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+    this.reconnectIn(delay, "lost");
+  }
+
+  private reconnectIn(delay: number, why: string): void {
+    console.error(`[grayboard] connection as ${this.who()} ${why}; reconnecting in ${delay}ms`);
     setTimeout(() => this.connect(), delay);
+  }
+
+  /** Why the server is refusing this client's hellos for now, if it is. */
+  rateLimited(): string | null {
+    return this.limited?.message ?? null;
+  }
+
+  private who(): string {
+    return this.identity === null ? "an unbound session" : `"${this.identity}"`;
   }
 
   private send(msg: ClientMessage): void {
@@ -230,15 +320,32 @@ export class GrayboardClient {
     return `c${++this.counter}`;
   }
 
+  /** Throws unless requests can go out now: before hello_ok the server
+   *  rejects them and closes the socket, so a caller fails fast instead.
+   *  Returns this connection's hello_ok, which a reconnect replaces. */
+  assertConnected(): HelloOk {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
+      const limited = this.rateLimited();
+      throw new Error(
+        this.refused ??
+          (limited
+            ? `not connected to the grayboard server: it is rate-limiting this user's connections (${limited}); reconnecting when it allows`
+            : "not connected to the grayboard server (reconnecting); try again shortly"),
+      );
+    }
+    return this.helloData;
+  }
+
   /** Send a request and wait for the corresponding response. */
   request<T extends ServerMessage>(msg: { type: string; [key: string]: unknown }): Promise<T> {
     return new Promise((resolve, reject) => {
-      // Before hello_ok the server rejects requests and closes the socket,
-      // so fail fast instead of leaving the tool call hanging.
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloData) {
-        reject(new Error(this.refused ?? "not connected to the grayboard server (reconnecting); try again shortly"));
+      try {
+        this.assertConnected();
+      } catch (e) {
+        reject(e);
         return;
       }
+      const ws = this.ws!;
       const req_id = this.nextId();
       const full = { ...msg, req_id } as ClientMessage;
       // Backstop for an answer that never names this req_id (#40): fail the tool call instead of hanging it.
@@ -249,12 +356,34 @@ export class GrayboardClient {
         resolve: (m) => { clearTimeout(timer); resolve(m as T); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      this.ws.send(JSON.stringify(full));
+      ws.send(JSON.stringify(full));
     });
   }
 
   close(): void {
     this.dead = true;
     this.ws?.close();
+    const err = new Error("closed");
+    for (const r of this.readyResolvers.splice(0)) r(err);
   }
+
+  private die(reason: string): void {
+    this.dead = true;
+    this.ws?.close();
+    this.helloData = null;
+    const err = new Error(reason);
+    for (const r of this.readyResolvers.splice(0)) r(err);
+    console.error(`[grayboard] ${reason}`);
+    this.opts.onDead?.(reason);
+  }
+}
+
+// The server's wait, trusted only within bounds: a missing, non-finite or
+// absurd value (a timer past 2^31 ms fires at once in Bun) falls back to the
+// backoff, so no server answer can make a hot reconnect loop.
+const MIN_RETRY_MS = 100;
+const MAX_RETRY_MS = 30_000;
+export function retryWait(serverMs: unknown, backoffMs: number): number {
+  if (typeof serverMs !== "number" || !Number.isFinite(serverMs) || serverMs < 0) return backoffMs;
+  return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, serverMs));
 }

@@ -111,6 +111,10 @@ export function resolveIdentity(base: string, cwd = process.cwd()): string {
  * a harness re-delivering that pin, not an explicit override — comparing
  * against the first pin alone would treat omp's own pin as explicit and
  * drop its worktree suffix, orphaning that handle's mail and claims.
+ *
+ * Echo detection only: `isExplicitIdentity` alone reads this. Default
+ * naming stays `pinnedIdentity`'s `.mcp.json` alone, unchanged from before
+ * the PR (#182 is where default resolution is specified further).
  */
 export function pinnedIdentities(cwd = process.cwd()): string[] {
   const pins: string[] = [];

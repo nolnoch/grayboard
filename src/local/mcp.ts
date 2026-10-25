@@ -7,21 +7,28 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { CoreError, activeAnnouncements, age, endLane, humanHandles, isHuman, lastSeen, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef } from "../core/boards.ts";
+import { activeAnnouncements, checkBody, age, endLane, humanHandles, isHuman, lastSeen, MAIN_LANE, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, touchLane, laneStreamRef, type UnboundPeer } from "../core/boards.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { writeCoreAudit } from "../core/audit.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { isQueueBoard } from "../core/boards.ts";
+import { retentionDays, startLocalRetention } from "./retention.ts";
+import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachments.ts";
 import {
-  BOARD_INSTRUCTIONS,
   announcementsInstruction,
   claimsInstruction,
   boardNotification,
+  dmNotification,
   humanInstruction,
-  boardTools,
   callBoardTool,
   isBoardTool,
 } from "../core/tools.ts";
 import {
   ackMessage,
   claimDm,
+  blobs,
   db,
   getCursor,
   getHistory,
@@ -44,21 +51,27 @@ import {
   undeliveredFrom,
   type Message,
   unreadFor,
+  withUploads,
 } from "./db.ts";
 import { assertLaneFree, laneAlive, listenForWakeup, poke, pokeLanes } from "./wakeup.ts";
-import { sessionIdentity, sessionLane } from "../shared/identity.ts";
+import { localDbPath } from "./open.ts";
+import { sockDir } from "../shared/sockdir.ts";
+import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
+import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
+import { launcherName } from "../shared/proc.ts";
+import { LOCAL_TOOLS } from "./tools.ts";
+import { describeLocation, isExplicitIdentity, sessionIdentity, sessionLane } from "../shared/identity.ts";
+import { LateCancels } from "../shared/latecancel.ts";
+import { testPause } from "../shared/testpause.ts";
+import { BindGate } from "../shared/bindgate.ts";
+import { normalizeIdentityName } from "../shared/addressing.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  DM_ACK_TOOL,
-  DM_INBOX_INSTRUCTION,
-  DM_INBOX_TOOL,
-  DM_RETRACT_TOOL,
-  PENDING_PARAM,
   PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
-  dmBody,
   historyLimit,
   inboxDays,
   promised,
@@ -70,20 +83,27 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-const IDENTITY: string = sessionIdentity();
+// This process, for run metadata and binding history (#182). Not an address.
+const SESSION_ID = mintSessionId();
+// Directories this session may attach files from and save them to.
+const ROOTS = attachRoots();
+// This bus's subdirectory of the default save directory.
+const BUS_DIR = localBusDir(localDbPath());
+const RETENTION_DAYS = retentionDays();
+if (RETENTION_DAYS === null) {
+  console.error(`[grayboard] BUS_RETENTION_DAYS must be a whole number of days, not "${process.env.BUS_RETENTION_DAYS}"`);
+  process.exit(1);
+}
 // This session's lane within the identity's fleet: BUS_LANE, else the
 // worktree's name when the identity was explicit, else the default. Several
-// sessions of one identity run side by side, one per lane.
+// sessions of one identity run side by side, one per lane. The NAME comes
+// later (#182): the session starts unbound and binds; the lane is this
+// process's, for whatever name it binds.
 const LANE: string = sessionLane() ?? MAIN_LANE;
-// This lane's DM-cursor stream: the identity's own row for the default lane
-// (pre-lanes rows unchanged), `identity#<lane>` for the rest, so lanes never
-// ack away each other's pending messages.
-const READER: string = laneStreamRef(IDENTITY, LANE);
-console.error(`[grayboard] local mode, identity "${IDENTITY}", lane "${LANE}"`);
+console.error(`[grayboard] local mode, lane "${LANE}"`);
 
-// BUS_PUSH=off: tools only. For harnesses without Claude channels, where a
-// separate adapter owns the wakeup socket and delivery. Draining here would
-// consume messages into a void.
+// BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
+// has no adapter. Draining here would consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
@@ -91,11 +111,43 @@ const PUSH = process.env.BUS_PUSH !== "off";
 // human="true". Without it, the human's handle is refused, so an agent can't
 // take it by name.
 const HUMAN = process.env.BUS_HUMAN === "1";
-if (HUMAN !== isHuman(db, IDENTITY)) {
+// BUS_LAUNCHER=1: this session's harness can spawn subagents, so delegate
+// requests may land here (#184). It grants nothing by itself: the session is
+// telling peers what its harness can do, and it's the one that acts on a
+// delegation request when one arrives by DM.
+const LAUNCHER = process.env.BUS_LAUNCHER === "1";
+// A launcher must be able to RECEIVE delegation requests: a tools-only
+// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
+// the name, has no socket, and never touches the launcher flag (a sidecar
+// must not overwrite the owner's opt-in).
+const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
+// A session binds a name at start only when told which (#182): an explicit
+// BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
+// child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
+// the resolved name is only the first suggestion, and the session starts
+// unbound: binding delivers the name's queued DMs and hands it the name's
+// claims, which should follow the agent knowing its task.
+const EXPLICIT = HUMAN || isExplicitIdentity();
+const resolved = (() => {
+  try {
+    return normalizeIdentityName(HUMAN && process.env.BUS_IDENTITY ? process.env.BUS_IDENTITY : sessionIdentity());
+  } catch (e) {
+    return { ok: false as const, error: (e as Error).message };
+  }
+})();
+// A tools-only process (a harness without an adapter) uses the resolved name
+// as it always has, without acquiring it.
+const NAMED = EXPLICIT || !PUSH;
+if (!resolved.ok && NAMED) {
+  console.error(`[grayboard] ${resolved.error}`);
+  process.exit(1);
+}
+const SUGGESTED = resolved.ok ? resolved.name : null;
+if (NAMED && HUMAN !== isHuman(db, SUGGESTED!)) {
   console.error(
     HUMAN
-      ? `[grayboard] BUS_HUMAN=1, but "${IDENTITY}" isn't the declared human handle; declare it with: grayboard human ${IDENTITY}`
-      : `[grayboard] "${IDENTITY}" is your user's handle; an agent session can't use it. Pick another BUS_IDENTITY.`,
+      ? `[grayboard] BUS_HUMAN=1, but "${SUGGESTED}" isn't the declared human handle; declare it with: grayboard human ${SUGGESTED}`
+      : `[grayboard] "${SUGGESTED}" is your user's handle; an agent session can't use it. Pick another BUS_IDENTITY.`,
   );
   process.exit(1);
 }
@@ -106,6 +158,86 @@ if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no cha
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
 
+// The bus name this session holds, or null while unbound. bind() changes it,
+// only between drains.
+let bound: string | null = null;
+// Why this session started unbound, for its instructions.
+const unboundNotes: string[] = [];
+// The name came back from the name record and the name's history shows the
+// recorded session (#211): the same harness session, so its peer status stays.
+let restored = false;
+// The name record (#182 decision 14), written by the session that owns
+// delivery whenever its name changes. The Slack bridge's child keeps none:
+// its name is fixed, and a restart that can't have it must fail loudly.
+const RECORD_DIR = sockDir();
+const RECORDS = PUSH && !HUMAN;
+// A failed write costs only the restore after a restart; the bind itself stands.
+const writeName = (name: string | null) => {
+  if (!RECORDS) return;
+  try {
+    writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+  } catch (e) {
+    console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
+  }
+};
+if (!PUSH) bound = SUGGESTED;
+else {
+  // The session that owns delivery owns the name: it writes the bindings row,
+  // its presence while unbound, and acquires through it. Channels-off
+  // sessions too: they own the session, they just don't listen.
+  registerSession(db, thisSession(SESSION_ID));
+  if (RECORDS) sweepRecords(RECORD_DIR);
+  // A restart under the same harness takes back its predecessor's name, ahead
+  // of BUS_IDENTITY: it's the same session, mid-task.
+  const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
+  if (rec?.name) {
+    const n = normalizeIdentityName(rec.name);
+    // The process it replaces may not have exited yet.
+    if (n.ok) await siblingGone(db, n.name, process.ppid);
+    const r = n.ok
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
+      : { ok: false as const, error: n.error };
+    if (r.ok) {
+      bound = r.name;
+      restored = r.restored;
+    } else unboundNotes.push(restoreNote(rec.name, r.error));
+  } else if (EXPLICIT) {
+    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
+    if (r.ok) bound = r.name;
+    else if (HUMAN) {
+      // A bridge has no agent to read a candidate list; refuse loudly.
+      console.error(`[grayboard] ${r.error}`);
+      endSession(db, SESSION_ID);
+      process.exit(1);
+    } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
+  }
+  if (!bound) {
+    const launcher = launcherName(process.ppid);
+    if (launcher) unboundNotes.push(launcherNote(launcher));
+  }
+  writeName(bound);
+}
+console.error(`[grayboard] local mode, session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
+
+// What a session bound to `name` is told (core's boundInstructions), with
+// local mode's human and announcement sentences, and its claims last: the
+// longest, and the one to lose if the client cuts the text.
+function localBoundInstructions(name: string, general: boolean): string[] {
+  return boundInstructions(
+    name,
+    general,
+    () => [
+      ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
+      ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
+      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
+    ],
+    [
+      ...undeliveredInstruction(undeliveredFrom(name, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+      ...claimsInstruction(listClaims(db), name),
+    ],
+  );
+}
+
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
   {
@@ -113,99 +245,19 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
+    // Unbound: one sentence and the candidates. The rest only matters once
+    // a name receives anything, so bind's result carries it.
     instructions: [
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      `You are identity "${IDENTITY}"${LANE !== MAIN_LANE ? `, lane "${LANE}"` : ""} on the grayboard bus, which coordinates between agents.`,
-      `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
-      DM_INBOX_INSTRUCTION,
-      ...BOARD_INSTRUCTIONS,
-      ...humanInstruction(humanHandles(db).filter((h) => h !== IDENTITY)),
-      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
-      ...undeliveredInstruction(undeliveredFrom(IDENTITY, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-      `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
-      // Last: the longest, and the one to lose if the client cuts the text.
-      ...claimsInstruction(listClaims(db), IDENTITY),
+      ...(bound ? localBoundInstructions(bound, true) : [unboundInstruction(await candidateNames(db, SUGGESTED), unboundNotes)]),
     ].join(" "),
   },
 );
 
 // Tool discovery
 
-const TOOLS = [
-  {
-    name: "dm_send",
-    // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
-    // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
-    _meta: { "anthropic/alwaysLoad": true },
-    description: `dm_send(to, body, parent_id?, pending?): message one other agent by exact handle (peer_list). You are "${IDENTITY}". Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        to: {
-          type: "string",
-          description: "The peer's exact handle, as peer_list shows it.",
-        },
-        body: {
-          type: "string",
-          description: "Message body. Plain text or markdown.",
-        },
-        parent_id: {
-          type: "number",
-          description:
-            "Optional. message_id this is replying to; sets the thread parent.",
-        },
-        pending: PENDING_PARAM,
-      },
-      required: ["to", "body"],
-    },
-  },
-  {
-    name: "dm_history",
-    description:
-      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        peer: {
-          type: "string",
-          description:
-            "Optional. Only return messages between you and this peer identity.",
-        },
-        limit: {
-          type: "number",
-          description: "Max messages to return (default 20, max 200).",
-        },
-        before_id: {
-          type: "number",
-          description:
-            "Return messages with id strictly less than this; use for pagination.",
-        },
-      },
-    },
-  },
-  {
-    name: "dm_thread",
-    _meta: { "anthropic/alwaysLoad": true },
-    description:
-      "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        thread: {
-          type: "number",
-          description: "Any message_id in the thread.",
-        },
-      },
-      required: ["thread"],
-    },
-  },
-  DM_INBOX_TOOL,
-  DM_ACK_TOOL,
-  DM_RETRACT_TOOL,
-...boardTools({ teams: false }),
-];
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: LOCAL_TOOLS }));
 
 // Tool dispatch
 
@@ -223,9 +275,19 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
+// A bind that completed after it was cancelled, for the next tool result; it
+// carries the instructions too, as the bind's result would have, for adapters
+// that keep them in the system prompt.
+let missedBindNotice: string | null = null;
+let instructionsStale = false;
+// What a result the client dropped carried, for the next one.
+const requeued: string[] = [];
 const notices = (): string[] => {
-  const out = channelsNoticePending ? [CHANNELS_OFF_NOTICE] : [];
+  const out = requeued.splice(0);
+  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
+  if (missedBindNotice) out.push(missedBindNotice);
+  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -234,20 +296,39 @@ const notices = (): string[] => {
 // sweep's delete makes each lapse post once.
 const expiry = claimExpiryTimer(db, (handles) => void wakeAll(handles));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+const gate = new BindGate();
+const late = new LateCancels();
+mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
-  touchHandle(db, IDENTITY);
-  const r = await call(name, args as Record<string, unknown>);
+  const run = async () => {
+    // An unbound session writes no handles row: it would join dm_send's roster.
+    if (bound) touchHandle(db, bound);
+    return call(name, args, signal);
+  };
+  const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
+    await (name === "bind" ? gate.bind(run) : gate.call(run));
   expiry.arm();
+  // A cancelled call's result is dropped: its notices wait for the next one.
+  if (signal.aborted) return r;
   const extra = notices();
-  return extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  if (instructionsStale && !out.structuredContent && bound) {
+    instructionsStale = false;
+    out = { ...out, structuredContent: { name: bound, instructions: localBoundInstructions(bound, true) } };
+  }
+  late.answer(requestId, () => {
+    if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    requeued.push(...extra);
+    if (out.structuredContent) instructionsStale = true;
+  });
+  return out;
 });
 
-async function call(name: string, args: Record<string, unknown>): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
-  const bad = checkArgs(TOOLS, name, args);
+async function call(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+  const bad = checkArgs(LOCAL_TOOLS, name, args);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   try {
-    return await dispatch(name, args);
+    return await dispatch(name, args, signal);
   } catch (err) {
     if (err instanceof CoreError) {
       return { ...text(`error: ${err.message}`), isError: true };
@@ -256,10 +337,80 @@ async function call(name: string, args: Record<string, unknown>): Promise<{ cont
   }
 }
 
-// Only a message's sender and recipient can see it or thread from it.
-const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
+async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal) {
+  if (name === "bind") return bind(a, signal);
+  if (!bound && !UNBOUND_TOOLS.has(name)) return { ...text(`error: ${UNBOUND_ERROR}`), isError: true };
+  // Unbound reads go as this session's viewer handle: "~" handles are never
+  // identities and own no subscriptions, so a read advances no cursor.
+  const IDENTITY = bound ?? `~${SESSION_ID}`;
+  // Only a message's sender and recipient can see it or thread from it.
+  const mine = (m: Message | undefined): m is Message => !!m && (m.sender === IDENTITY || m.recipient === IDENTITY);
 
-async function dispatch(name: string, a: Record<string, unknown>) {
+  if (name === "delegate") {
+    // Resolve the launcher and build the payload (core), then deliver it as
+    // this mode's DM, pending: the promise shows in dm_inbox until the
+    // requester settles the thread (#184). Same result fields as dm_send, via
+    // the shared builder, so the modes can't drift.
+    const live = await liveHandles(IDENTITY);
+    // A launcher inside its bind swap still answers under its old name: filter
+    // it like dm_send does (a released name's socket isn't the session).
+    const online = (h: string) => live(h) && !lastWasRelease(db, h);
+    let d;
+    try {
+      d = resolveDelegation(db, IDENTITY, a, online);
+    } catch (e) {
+      if (e instanceof CoreError) {
+        writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message });
+        return { ...text(`error: ${e.message}`), isError: true };
+      }
+      throw e;
+    }
+    // The window a re-pick races: the liveness snapshot above is taken once,
+    // the delivery pokes again below. Tests force the overlap here (a socket
+    // that dies between the two) — #246 review 12/16.
+    testPause("delegate:after-resolve");
+    checkBody(d.body);
+    // The message id tracks the pick that owns the work: a re-pick replaces
+    // both (review 16).
+    let msgId = (await insertMessage(IDENTITY, d.to, d.body, null, true, [])).id;
+    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
+    const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
+    let delivered = await deliver(d.to);
+    if (!delivered && !d.humanFallback) {
+      // The pick may have landed in a bind swap: re-resolve once, excluding
+      // the launcher that didn't take it. The first message is retracted
+      // first — left queued, that name's next holder would drain it and
+      // spawn the same work again (#246 review 16) — and the re-pick only
+      // proceeds when the retraction wins; otherwise the request stays
+      // queued for the first pick, which the catch below treats as fine.
+      try {
+        const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
+        if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
+          const id2 = (await insertMessage(IDENTITY, d2.to, d2.body, null, true, [])).id;
+          writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
+          d = d2;
+          msgId = id2;
+          delivered = await deliver(d2.to);
+        }
+      } catch {
+        // No second launcher: the request stays queued for the first pick's
+        // name; its next holder drains it.
+      }
+    }
+    const seen = lastSeen(db, d.to);
+    const base = delivered
+      ? { message_id: msgId, delivered_now: true, pending: true as const }
+      : {
+          message_id: msgId,
+          delivered_now: false,
+          pending: true as const,
+          note: queuedNote(d.to, seen),
+          ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+          undelivered_from_you: undeliveredFrom(IDENTITY).find((u) => u.recipient === d!.to)?.n ?? 1,
+        };
+    return text(JSON.stringify(delegateOkFields(d, base)));
+  }
+
   if (name === "dm_send") {
     const { to: recipient, body, parent_id, pending } = a as {
       to: string;
@@ -267,7 +418,7 @@ async function dispatch(name: string, a: Record<string, unknown>) {
       parent_id?: number;
       pending?: boolean;
     };
-    dmBody(body);
+    checkBody(body);
     if (!rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
@@ -280,8 +431,11 @@ async function dispatch(name: string, a: Record<string, unknown>) {
         isError: true,
       };
     }
-    const id = insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true);
-    const p = pending ? { pending: true } : {};
+    const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
+    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
+    const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
+    // A socket that answers for a released name is a bind's swap window: the
+    // DM stays queued for the name's next holder (#182 audit 29).
     // Fleet delivery truth, like the server's send_ok: how many of the
     // recipient's lanes are live, and which had read past this point — the
     // sender's previous message ADDRESSED TO the recipient (directional: an
@@ -290,7 +444,8 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     // back-and-forth), not `id - 1`: ids are global, and an unrelated pair
     // may hold the id in between. Surfaced only when it says more than the
     // default, so single-session results stay unchanged.
-    const { live, any: delivered } = await pokeLanes(recipient);
+    const { live, any: deliveredRaw } = await pokeLanes(recipient);
+    const delivered = deliveredRaw && !lastWasRelease(db, recipient);
     const fleet: Record<string, unknown> = {};
     if (recipient === IDENTITY || live > 1) {
       const prev = previousBetween(IDENTITY, recipient, id);
@@ -351,7 +506,7 @@ async function dispatch(name: string, a: Record<string, unknown>) {
 
   if (name === "dm_retract") {
     const id = a.message_id as number;
-    const m = getMessage(id);
+    const m = getMessage(a.message_id as number);
     const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
     if (!m || m.sender !== IDENTITY) return refuse(retractRefusal.notYours(id));
     // A probe is a wakeup: a live recipient drains the message now. Reached
@@ -364,13 +519,38 @@ async function dispatch(name: string, a: Record<string, unknown>) {
     if (!retractMessage(IDENTITY, m.id)) {
       return refuse(reached(m.id, m.recipient) ? retractRefusal.reached(id, m.recipient) : retractRefusal.replied(id));
     }
+    await sweepBlobs(db, blobs);
     return text("ok");
   }
 
+  if (name === "attachment_get") {
+    const id = checkAttachmentId(a.id);
+    const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
+    const row = getAttachment(db, id);
+    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)))) {
+      return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
+    }
+    const path = await saveAttachment(row, await blobs.get(row.sha256), target);
+    return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
+  }
+
   if (isBoardTool(name)) {
-    // Only a human can start an announcement, which reaches the sessions live now.
-    const ctx = name === "peer_list" || (name === "board_post" && HUMAN) ? { online: await liveHandles(), lane: LANE } : { lane: LANE };
-    const { result, wake } = callBoardTool(db, IDENTITY, name, a, ctx);
+    // Only a human can start an announcement, which reaches the sessions live
+    // now. A queue board's rotation prefers live lanes, so it needs the probe
+    // too; other posts don't pay for it.
+    const queuePost = name === "board_post" && isQueueBoard(db, typeof a.board === "string" ? a.board : "");
+    const ctx = {
+      ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
+      lane: LANE,
+      ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
+      attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+    };
+    const { attachments: paths, ...args } = a;
+    const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
+    // Bound in the post's transaction; a refused post releases the uploads.
+    const { result, wake } = await withUploads(IDENTITY, files, (ids) =>
+      db.transaction(() => callBoardTool(db, IDENTITY, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
+    );
     // The response must reach the caller before the wake fires. A woken
     // sibling can round-trip a reply faster than the poster's own follow-up
     // bookkeeping (the bridge relay registers its thread map only once this
@@ -386,11 +566,18 @@ async function dispatch(name: string, a: Record<string, unknown>) {
 
 // Which handles have a live session, by probing each wakeup socket. A probe is
 // also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
-async function liveHandles(): Promise<(h: string) => boolean> {
-  const others = rosterHandles(db).filter((h) => h !== IDENTITY);
+async function liveHandles(self: string): Promise<(h: string) => boolean> {
+  const others = rosterHandles(db).filter((h) => h !== self);
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   return (h) => live.has(h);
+}
+
+// Live sessions with no name yet, for peer_list.
+function unboundPeers(): UnboundPeer[] {
+  return liveSessions(db)
+    .filter((r) => r.name === null)
+    .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
 }
 
 // Drain: emit unread direct messages and pending board items as channel
@@ -406,6 +593,10 @@ let draining = false;
 // arms an immediate retry, and a poke arriving during the tail rides the
 // rerun to deliver at once.
 let rerunDrain = false;
+// The running drain, so concurrent wakes join it instead of stacking.
+let inflight: Promise<void> | null = null;
+// Set while bind swaps names: no drain starts, so none mixes the two names.
+let swapping = false;
 // Test seam (BUS_TEST_DRAIN_TAIL_MS): delays the tail between the last
 // scan and the expiry check, widening the window in which a skipped claim
 // can expire mid-drain — so the post-tail expiry check (claimed row as the
@@ -442,8 +633,21 @@ let markInitialized!: () => void;
 const initialized = new Promise<void>((r) => { markInitialized = r; });
 mcp.oninitialized = () => markInitialized();
 
-async function drainToClaude(): Promise<void> {
+// A wakeup during a drain joins it: the loop re-queries until empty.
+function drainToClaude(): Promise<void> {
+  if (swapping) return Promise.resolve();
+  inflight ??= drainLoop().finally(() => {
+    inflight = null;
+  });
+  return inflight;
+}
+
+async function drainLoop(): Promise<void> {
   await initialized;
+  // Read once: a cursor written under one name must never get another's ids.
+  const name = bound;
+  if (!name) return;
+  const reader = laneStreamRef(name, LANE);
   if (draining) {
     rerunDrain = true;
     return;
@@ -455,18 +659,18 @@ async function drainToClaude(): Promise<void> {
     // Lazy sweep first (ruling 3): local sockets have no close event, so any
     // draining reader ends lanes whose session crashed — kind "session"
     // rows, past a grace window, whose lane socket no longer answers.
-    await sweepStaleLanes();
-    touchLane(db, IDENTITY, LANE);
+    await sweepStaleLanes(name);
+    touchLane(db, name, LANE);
     // A sibling lane may have handled messages this lane never saw: sync to
     // the identity's read point before draining (any lane's reading is the
     // identity reading), so this lane never replays what a sibling already
     // delivered. The read point is held back by undelivered claims (D1): a
     // message no agent received stays ahead of the cursor, visible to a
     // takeover, never synced past.
-    const readPoint = readPointFor(IDENTITY);
-    if (readPoint > getCursor(READER)) setCursor(READER, readPoint);
+    const readPoint = readPointFor(name);
+    if (readPoint > getCursor(reader)) setCursor(reader, readPoint);
     while (true) {
-      const batch = unreadFor(READER);
+      const batch = unreadFor(reader);
       // Deliver DMs first, then decide the board wake: a deferred item may
       // only ride along with a DM THIS lane claimed and delivered — a
       // sibling's claim is not this lane's wake (D2; deferred pushes and
@@ -480,28 +684,23 @@ async function drainToClaude(): Promise<void> {
         // cursor alone; the read point holds until the sibling delivers or
         // the claim expires and any lane takes it over (at-least-once at the
         // claim level, exactly-once per attempt).
-        const outcome = claimDm(msg.id, READER);
+        const outcome = claimDm(msg.id, reader);
         if (outcome === "skip") continue;
         if (outcome === "claimed") {
-          const meta: Record<string, string> = {
-            message_id: String(msg.id),
-            from: msg.sender,
-            created_at: String(msg.created_at),
-          };
-          if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
-          if (isHuman(db, msg.sender)) meta.human = "true";
+          const params = dmNotification(msg);
+          if (isHuman(db, msg.sender)) params.meta.human = "true";
           await mcp.notification({
             method: "notifications/claude/channel",
-            params: { content: msg.body, meta },
+            params,
           });
           markClaimDelivered(msg.id);
           deliveredDm = true;
         }
         // The marker says an agent received it; the cursor may only move
         // when no earlier undelivered claim holds the read point back (D1).
-        if (!undeliveredClaimBelow(IDENTITY, msg.id)) setCursor(READER, msg.id);
+        if (!undeliveredClaimBelow(name, msg.id)) setCursor(reader, msg.id);
       }
-      const boardItems = pendingFor(db, IDENTITY, { all: firstDrain || HUMAN || deliveredDm });
+      const boardItems = pendingFor(db, name, { all: firstDrain || HUMAN || deliveredDm });
       firstDrain = false;
       if (batch.length === 0 && boardItems.length === 0) break;
       for (const item of boardItems) {
@@ -511,25 +710,25 @@ async function drainToClaude(): Promise<void> {
           method: "notifications/claude/channel",
           params,
         });
-        markDelivered(db, IDENTITY, item);
+        markDelivered(db, name, item);
       }
       // Every DM in the batch is claimed by a sibling (and nothing else to
       // do): nothing more for this lane — the siblings' deliveries move the
       // read point, and this lane's next drain syncs past them.
       if (!deliveredDm && boardItems.length === 0) break;
-    }
-    // A claim this drain skipped may belong to a claimer that died: nothing
-    // else fires the takeover (the next DM or poke could be hours away), so
-    // arm one retry for the claim's expiry moment — clamped to now by
-    // armClaimRetry when the claim already expired, an immediate retry
-    // (round-8 N1). Null means no undelivered claim exists at all, so
-    // clearing an earlier arm is safe (round-6 item 2).
-    if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
-    const expiry = nextClaimExpiry(IDENTITY);
-    if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
-    else if (claimRetry !== null) {
-      clearTimeout(claimRetry);
-      claimRetry = null;
+      // A claim this drain skipped may belong to a claimer that died: nothing
+      // else fires the takeover (the next DM or poke could be hours away), so
+      // arm one retry for the claim's expiry moment — clamped to now by
+      // armClaimRetry when the claim already expired, an immediate retry
+      // (round-8 N1). Null means no undelivered claim exists at all, so
+      // clearing an earlier arm is safe (round-6 item 2).
+      if (DRAIN_TAIL_TEST_MS > 0) await Bun.sleep(DRAIN_TAIL_TEST_MS);
+      const expiry = nextClaimExpiry(name);
+      if (expiry !== null) armClaimRetry(expiry - Date.now() + 50);
+      else if (claimRetry !== null) {
+        clearTimeout(claimRetry);
+        claimRetry = null;
+      }
     }
     } while (rerunDrain);
   } finally {
@@ -544,7 +743,7 @@ async function drainToClaude(): Promise<void> {
 // (kind "bridge") are sticky: exempt, the human's reachability rides on them.
 const STALE_LANE_MS = 60_000;
 
-async function sweepStaleLanes(): Promise<void> {
+async function sweepStaleLanes(name: string): Promise<void> {
   // Delivery-marker claims outlive any concurrent scan by a day; then go.
   pruneDmClaims();
   const rows = db.prepare(`SELECT handle, lane, last_seen FROM lanes WHERE kind = 'session'`).all() as {
@@ -553,42 +752,113 @@ async function sweepStaleLanes(): Promise<void> {
   const now = Date.now();
   for (const r of rows) {
     if (now - r.last_seen < STALE_LANE_MS) continue;
-    if (r.handle === IDENTITY && r.lane === LANE) continue; // ours: alive by construction
+    if (r.handle === name && r.lane === LANE) continue; // ours: alive by construction
     if (await laneAlive(r.handle, r.lane)) continue;
     endLane(db, r.handle, r.lane);
     console.error(`[grayboard] swept stale lane ${r.handle}#${r.lane}`);
   }
 }
 
-// Startup: refuse a duplicate lane before the MCP handshake so the client
-// shows the server as failed. Then connect MCP so notifications are accepted,
-// bind the lane's wakeup socket (bind-first), and replay what arrived while
-// offline — this lane's own stream, seeded from the default lane's cursor so
-// joining a fleet doesn't replay the identity's history.
-if (DELIVER) await assertLaneFree(IDENTITY, LANE);
-// A tools-only server runs beside the session that owns the identity; leave its status alone.
-if (DELIVER) startSession(db, IDENTITY, process.cwd(), LANE, { kind: HUMAN ? "bridge" : "session", push_capable: true });
-else touchHandle(db, IDENTITY);
-// Seed this lane's cursor to the identity's read point (the MAX across its
-// lanes, held back by undelivered claims — D1): a fresh or rejoining lane
-// must not replay what a sibling already handled — including an identity
-// that only ever ran on non-main lanes — and must not sync past a message
-// still claimed and undelivered, which would strand it.
-{
-  const readPoint = readPointFor(IDENTITY);
-  if (readPoint > 0) setCursor(READER, readPoint);
-}
-await mcp.connect(new StdioServerTransport());
+const onWake = () => {
+  // A wakeup may follow another session's claim_take.
+  expiry.arm();
+  drainToClaude().catch((err) => {
+    console.error("grayboard drain error:", err);
+  });
+};
+let stopListening = () => {};
 
-let cleanup = () => {};
+// bind(name, create?): take a name, or move to another (#182). The new name
+// is acquired first (its row, in one transaction, with this session's claims
+// moved to it); only then does the old name's socket close. Drains stop for
+// the swap, so a DM to the old name is either delivered under it before the
+// swap or stays queued for its next holder; never consumed under the new one.
+// It runs behind the gate, so no tool call overlaps it (#182 audit 11).
+async function bind(a: Record<string, unknown>, signal: AbortSignal) {
+  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  const n = bindTarget(a, bound, PUSH);
+  if ("result" in n) return n.result;
+  swapping = true;
+  try {
+    await inflight;
+    const previous = bound;
+    const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
+    if (!r.ok) return fail(r.error);
+    // The row holds the new name from here: so does this process, whatever
+    // follows fails, or the finally's drain would read a name it no longer holds.
+    bound = n.name;
+    writeName(bound);
+    firstDrain = true;
+    testPause("bind:after-acquire");
+    try {
+      if (DELIVER) {
+        // The fleet model (#114): this session's lane of the new name's
+        // fleet. A same-lane collision refuses the bind (the name was
+        // acquired; the failure path releases it — the catch below).
+        await assertLaneFree(n.name, LANE);
+        stopListening();
+        stopListening = () => {};
+        stopListening = listenForWakeup(n.name, LANE, onWake);
+      }
+      if (previous) touchHandle(db, previous);
+      startSession(db, n.name, process.cwd(), LANE, { kind: HUMAN ? "bridge" : "session", push_capable: PUSH });
+      if (PUSH) {
+        setLauncher(db, n.name, EFFECTIVE_LAUNCHER);
+        writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
+      }
+    } catch (e) {
+      const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
+      console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
+      throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}${moved}, but setting it up failed: ${(e as Error).message}`);
+    }
+    console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
+    const ok = bindOk(n.name, previous, r.moved.map((c) => c.key), (general) => localBoundInstructions(n.name, general));
+    // A cancelled call's result is dropped (pi and opencode cancel on abort).
+    if (signal.aborted) {
+      missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      instructionsStale = true;
+    }
+    return ok;
+  } finally {
+    swapping = false;
+    if (DELIVER && bound) onWake();
+  }
+}
+
+
+// Startup: the name (if any) is already acquired. Connect MCP so
+// notifications are accepted, listen on the name's wakeup socket, and replay
+// what arrived while offline.
+// A tools-only server runs beside the session that owns the identity, and a
+// restored name is the same session restarted: leave their status alone.
+if (bound && PUSH && !restored) startSession(db, bound, process.cwd(), LANE, { kind: HUMAN ? "bridge" : "session", push_capable: PUSH });
+else if (bound) touchHandle(db, bound);
+if (bound && PUSH) {
+  setLauncher(db, bound, EFFECTIVE_LAUNCHER);
+  writeCoreAudit(db, "handle.launcher_set", bound, bound, { on: EFFECTIVE_LAUNCHER });
+}
+const transport = new StdioServerTransport();
+await mcp.connect(transport);
+late.watch(transport);
+// Prunes the bus at most once a day across the sessions that share it.
+startLocalRetention(db, blobs, RETENTION_DAYS);
+
 const shutdown = () => {
   // Clean exits drop their own lane now; a crash leaves it for the sweep.
   try {
-    endLane(db, IDENTITY, LANE);
+    if (bound) endLane(db, bound, LANE);
   } catch (err) {
     console.error("grayboard lane cleanup failed:", err);
   }
-  cleanup();
+  // The socket goes first, while the row still holds the name, so nobody
+  // takes the name with this socket still in place.
+  stopListening();
+  try {
+    if (PUSH) endSession(db, SESSION_ID);
+  } catch {
+    // Same: shutdown must not throw.
+  }
+  if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
@@ -598,15 +868,8 @@ process.on("SIGTERM", shutdown);
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
-if (DELIVER) {
-  cleanup = await listenForWakeup(IDENTITY, LANE, () => {
-    // A wakeup may follow another session's claim_take.
-    expiry.arm();
-    drainToClaude().catch((err) => {
-      console.error("grayboard drain error:", err);
-    });
-  });
-
+if (DELIVER && bound) {
+  stopListening = listenForWakeup(bound, LANE, onWake);
   drainToClaude().catch((err) => {
     console.error("grayboard initial drain error:", err);
   });

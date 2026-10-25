@@ -3,24 +3,25 @@
 // with its own `grayboard mcp` child; agents are separate `grayboard mcp`
 // processes driven by MCP clients, as in local.test.ts.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { join } from "node:path";
 
 import { startSlackBridge, type BridgeHandle } from "../../src/bridge/slack.ts";
 import { FakeSlack } from "./fake_slack.ts";
+import { localEnv } from "../support/env.ts";
+import { call, closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
+import { CLI } from "../support/paths.ts";
+import { until } from "../support/until.ts";
 
-const CLI = resolve(import.meta.dir, "../../src/cli/main.ts");
-const MCP = { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] };
+const ARGS = ["mcp", "--mode", "local"];
+const MCP = { command: process.execPath, args: [CLI, ...ARGS] };
 const CHANNEL = "G0PRIVATE";
 const OWNER = "U0OWNER";
 
 let dir: string;
 let slack: FakeSlack;
 let bridge: BridgeHandle | null;
-const open: Client[] = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-slack-"));
@@ -30,29 +31,17 @@ beforeEach(() => {
 
 afterEach(async () => {
   await bridge?.stop();
-  await Promise.all(open.splice(0).map((c) => c.close().catch(() => {})));
+  await closeSessions();
   slack.stop();
   rmSync(dir, { recursive: true, force: true });
 });
 
-function env(identity?: string): Record<string, string> {
-  const e: Record<string, string | undefined> = {
-    ...process.env,
-    BUS_DB_PATH: join(dir, "bus.db"),
-    BUS_SOCK_DIR: dir,
-    GRAYBOARD_CREDENTIALS: join(dir, "credentials"),
-    GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
-    GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
-    SLACK_API_URL: slack.api,
-  };
-  delete e.BUS_IDENTITY;
-  delete e.BUS_HUMAN;
-  delete e.GRAYBOARD_TOKEN;
-  delete e.SLACK_APP_TOKEN;
-  delete e.SLACK_BOT_TOKEN;
-  if (identity) e.BUS_IDENTITY = identity;
-  return e as Record<string, string>;
-}
+const slackVars = (): Record<string, string> => ({
+  GRAYBOARD_SLACK_CONFIG: join(dir, "slack.json"),
+  GRAYBOARD_SLACK_DB: join(dir, "slack-bridge.db"),
+  SLACK_API_URL: slack.api,
+});
+const env = (identity?: string): Record<string, string> => localEnv(dir, identity, slackVars());
 
 function writeConfig(extra: Record<string, unknown> = {}, mode = 0o600): void {
   const path = join(dir, "slack.json");
@@ -66,45 +55,7 @@ async function startBridge(): Promise<BridgeHandle> {
   return bridge;
 }
 
-type Agent = { c: Client; pushes: { content: string; meta: Record<string, string> }[] };
-
-async function agent(identity: string): Promise<Agent> {
-  const pushes: Agent["pushes"] = [];
-  const c = new Client({ name: "test", version: "0" });
-  c.fallbackNotificationHandler = async (n) => {
-    if (n.method === "notifications/claude/channel") pushes.push(n.params as Agent["pushes"][number]);
-  };
-  await c.connect(new StdioClientTransport({ ...MCP, cwd: dir, env: env(identity), stderr: "ignore" }));
-  open.push(c);
-  return { c, pushes };
-}
-
-async function stopAgent(a: Agent): Promise<void> {
-  open.splice(open.indexOf(a.c), 1);
-  await a.c.close();
-  await Bun.sleep(200);
-}
-
-async function call(c: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
-  const r = await c.callTool({ name, arguments: args });
-  const body = (r.content as { text: string }[])[0]!.text;
-  if (r.isError) throw new Error(body);
-  try {
-    return JSON.parse(body);
-  } catch {
-    return body;
-  }
-}
-
-async function until<T>(f: () => T | undefined | null | false, ms = 5000): Promise<T> {
-  const end = Date.now() + ms;
-  for (;;) {
-    const v = f();
-    if (v) return v;
-    if (Date.now() > end) throw new Error("timed out waiting");
-    await Bun.sleep(20);
-  }
-}
+const agent = (identity: string): Promise<Session> => localSession(dir, identity, { extra: slackVars() });
 
 test("an agent's DM becomes a Slack thread; the reply reaches only that agent, marked human", async () => {
   const be = await agent("be");
@@ -180,7 +131,7 @@ test("board mentions forward with the board's name; a reply posts in the board t
 test("top-level @handle and #board start conversations; mistakes get an answer", async () => {
   const be = await agent("be");
   const sim = await agent("sim");
-  await stopAgent(sim);
+  await stopSession(sim.c);
   await startBridge();
   await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
 
@@ -237,6 +188,99 @@ test("a post Slack can't take stays in the outbox and goes out when it can", asy
   expect(ok.thread_ts).toBeUndefined();
 }, 30_000);
 
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const share = (files: Record<string, any>[]) => ({ extra: { subtype: "file_share", files } });
+const firstId = (meta: string) => Number(meta.split(":")[0]);
+
+test("an agent's attachments and text reach Slack as one message, whose thread maps back", async () => {
+  const be = await agent("be");
+  await startBridge();
+  writeFileSync(join(dir, "shot.png"), PNG);
+  writeFileSync(join(dir, "notes.md"), "# notes\n");
+  const q = await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png", "notes.md"] });
+  const s = await until(() => slack.shares()[0]);
+  expect(s).toMatchObject({ channel_id: CHANNEL, blocks: [{ type: "markdown", text: "**be** see attached" }] });
+  // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
+  expect(s.username).toBeUndefined();
+  expect(s.thread_ts).toBeUndefined();
+  expect(s.files.map((f: { title: string }) => f.title)).toEqual(["shot.png", "notes.md"]);
+  expect(slack.uploaded.get(s.files[0].id)).toEqual(PNG);
+  expect(new TextDecoder().decode(slack.uploaded.get(s.files[1].id))).toBe("# notes\n");
+  expect(slack.calls.find((c) => c.method === "files.getUploadURLExternal")!.body).toEqual({ filename: "shot.png", length: String(PNG.length) });
+  expect(slack.posts()).toEqual([]);
+
+  // Slack's answer doesn't name the message; files.info's shares do, and the thread maps to it.
+  slack.say("thanks", { thread_ts: s.ts });
+  const got = await until(() => be.pushes.find((p) => p.content === "thanks"));
+  expect(got.meta.parent_id).toBe(String(q.message_id));
+  // The agent's follow-up with a file lands in that thread.
+  await call(be.c, "dm_send", { to: "alex", body: "one more", parent_id: Number(got.meta.message_id), attachments: ["notes.md"] });
+  const s2 = await until(() => slack.shares()[1]);
+  expect(s2).toMatchObject({ thread_ts: s.ts, blocks: [{ type: "markdown", text: "**be** one more" }] });
+}, 30_000);
+
+test("a file Slack refuses still lets the text through with a warning, and goes back to its sender", async () => {
+  const be = await agent("be");
+  slack.refuseUploads = "file_type_not_allowed";
+  await startBridge();
+  writeFileSync(join(dir, "shot.png"), PNG);
+  const q = await call(be.c, "dm_send", { to: "alex", body: "see attached", attachments: ["shot.png"] });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("**be** see attached")));
+  expect(top.markdown_text).toBe("**be** see attached\n\n⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
+  expect(slack.shares()).toEqual([]);
+  const back = await until(() => be.pushes.find((p) => p.meta.from === "alex"));
+  expect(back.meta.parent_id).toBe(String(q.message_id));
+  expect(back.content).toBe(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack, so the human hasn't seen them: shot.png: file_type_not_allowed. The text did reach them.`);
+}, 30_000);
+
+test("files the owner shares in Slack ride on the reply or the new conversation", async () => {
+  const be = await agent("be");
+  await startBridge();
+  await call(be.c, "dm_send", { to: "alex", body: "send the log?" });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text === "**be** send the log?"));
+
+  // Files only, in the thread: the body names them.
+  slack.say("", { thread_ts: slackTsOf(top), ...share([slack.host("run.log", "line 1\nline 2\n")]) });
+  const got = await until(() => be.pushes.find((p) => p.meta.attachments));
+  expect(got.content).toBe("run.log");
+  expect(got.meta.attachments).toMatch(/^\d+:run\.log text\/plain 14B sha256:[0-9a-f]{64}$/);
+  const saved = await call(be.c, "attachment_get", { id: firstId(got.meta.attachments), dir });
+  expect(readFileSync(saved.path, "utf8")).toBe("line 1\nline 2\n");
+
+  // Top level, and a file the event names only by id (files.info has the rest).
+  const m = slack.say("@be the screenshot", share([slack.host("shot.png", PNG, { idOnly: true })]));
+  const got2 = await until(() => be.pushes.find((p) => p.content === "the screenshot"));
+  expect(got2.meta.attachments).toMatch(/^\d+:shot\.png image\/png 12B sha256:[0-9a-f]{64}$/);
+  expect(new Uint8Array(readFileSync((await call(be.c, "attachment_get", { id: firstId(got2.meta.attachments), dir })).path))).toEqual(PNG);
+  await until(() => slack.reactions().find((r) => r.timestamp === m.ts));
+
+  // "#board" alone with a file is a whole post.
+  await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(be.c, "board_subscribe", { board: "e2e", mode: "push" });
+  slack.say("#e2e", share([slack.host("plan.md", "1. ship\n")]));
+  const post = await until(() => be.pushes.find((p) => p.meta.board === "e2e"));
+  expect(post.content).toBe("plan.md");
+  expect(post.meta.attachments).toMatch(/^\d+:plan\.md text\/markdown 8B sha256:[0-9a-f]{64}$/);
+}, 30_000);
+
+test("a Slack file that can't come along refuses the whole message, in its thread", async () => {
+  const be = await agent("be");
+  await startBridge();
+  const answer = async (text: string, files: Record<string, any>[]) => {
+    const { ts } = slack.say(text, share(files));
+    return (await until(() => slack.posts().find((p) => p.thread_ts === ts))).markdown_text as string;
+  };
+  expect(await answer("@be binary", [slack.host("blob.bin", new Uint8Array([0, 1, 2]))])).toBe(
+    "⚠️ not sent: file blob.bin: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text",
+  );
+  expect(await answer("@be big", [slack.host("big.png", PNG, { size: 11 * 1024 * 1024 })])).toBe("⚠️ not sent: file big.png: 11MB exceeds the 10MB limit per file");
+  // What Slack serves an app without files:read is its sign-in page, not the file.
+  expect(await answer("@be scoped", [slack.host("x.png", PNG, { size: 5 })])).toMatch(/^⚠️ not sent: file x\.png: Slack didn't serve it \(does the app have files:read/);
+  expect(await answer("@be many", Array.from({ length: 6 }, (_, i) => slack.host(`${i}.md`, "x")))).toBe("⚠️ not sent: at most 5 attachments per message");
+  expect(await answer("new #docs specs", [slack.host("a.md", "x")])).toBe('⚠️ not created: files don\'t come along when making a board; make #docs first, then post them with "#docs …"');
+  expect(be.pushes).toEqual([]);
+}, 30_000);
+
 test("agents learn about the human: instructions, peer_list; digests stay off Slack", async () => {
   const before = await agent("be");
   expect(before.c.getInstructions()).not.toContain("Humans on this bus");
@@ -266,7 +310,10 @@ test("#announce from Slack reaches every live agent marked human; acks come back
   await until(() => fe.pushes.find((p) => p.content === "shutting down in 30 min"));
   await call(be.c, "board_post", { board: "announce", body: "be: ack", parent_id: Number(got.meta.post_id) });
   expect((await until(() => slack.posts().find((p) => p.markdown_text?.includes("be: ack")))).thread_ts).toBe(a.ts);
-  await Bun.sleep(300);
+  // Barrier: a later post in the thread that does reach fe; be's ack, if it
+  // were fanned out to fe, is ahead of it in fe's outbox.
+  await call(be.c, "board_post", { board: "announce", body: "probe @fe", parent_id: Number(got.meta.post_id) });
+  await until(() => fe.pushes.find((p) => p.content === "probe @fe"));
   expect(fe.pushes.some((p) => p.content === "be: ack")).toBe(false);
 }, 30_000);
 

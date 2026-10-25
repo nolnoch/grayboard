@@ -1,11 +1,24 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
+import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
+import { CoreError } from "./errors.ts";
+import { ackQueueClaim, logEvent } from "./claims.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+
+// A post's or direct message's body, checked alike in both modes (#75).
+export function checkBody(body: unknown): string {
+  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
+  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
+    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
+  }
+  return body;
+}
 // @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
 // so plain email addresses in prose aren't mentions.
 const MENTION_RE =
@@ -21,6 +34,7 @@ export type Board = {
   scope: string | null;
   created_by: string;
   created_at: number;
+  kind?: string;
 };
 export type Post = {
   id: number;
@@ -31,6 +45,8 @@ export type Post = {
   created_at: number;
   // An announcement's TTL; null (or absent, from older peers) otherwise.
   expires_at?: number | null;
+  // Present on reads and pushes when the post carries files.
+  attachments?: AttachmentInfo[];
 };
 
 export type Pending =
@@ -42,7 +58,6 @@ export type PendingRef =
   | { kind: "push"; post_id: number }
   | { kind: "digest"; board: string; latest_id: number };
 
-export class CoreError extends Error {}
 
 // ── access policy ────────────────────────────────────────────────────────────
 
@@ -229,12 +244,17 @@ export function lanesFor(db: Database, handle: string): LaneRow[] {
   return db.prepare(`SELECT * FROM lanes WHERE handle = ? ORDER BY lane`).all(handle) as LaneRow[];
 }
 
-/** Make `handle` the one declared human handle (`grayboard human`). */
-export function declareHuman(db: Database, handle: string): void {
+/**
+ * Make `handle` the one declared human handle (`grayboard human`). `guard`
+ * runs first inside the same write transaction and throws to refuse: local
+ * mode checks there that no live agent session holds the handle (#79).
+ */
+export function declareHuman(db: Database, handle: string, guard?: () => void): void {
   db.transaction(() => {
+    guard?.();
     touchHandle(db, handle);
     db.prepare(`UPDATE handles SET human = (name = ?)`).run(handle);
-  })();
+  }).immediate();
 }
 
 /** Server mode: one handle per linked user is a human; set or clear one. */
@@ -280,6 +300,14 @@ export function setStatus(db: Database, handle: string, text: string, lane?: str
   db.prepare(`UPDATE handles SET status = ?, status_at = ? WHERE name = ?`).run(t || null, t ? now : null, handle);
 }
 
+// Queue boards skip a lane that opted out (peer_status queue:"off"); it
+// persists across restarts until the lane opts back in. Status text never
+// affects the rotation (#192 review): it's free text for humans and peers.
+export function setQueueParticipation(db: Database, handle: string, on: boolean): void {
+  touchHandle(db, handle);
+  db.prepare(`UPDATE handles SET queue_off = ? WHERE name = ?`).run(on ? null : 1, handle);
+}
+
 // A duration as one short unit: 45m, 6h, 14d.
 export function age(ms: number): string {
   const m = Math.round(ms / 60_000);
@@ -305,17 +333,20 @@ export function createBoard(
   name: string,
   purpose: string,
   scope: string | null = null,
+  opts: { kind?: string } = {},
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  const kind = opts.kind ?? "broadcast";
+  if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
   if (denied) throw new CoreError(denied);
   const res = db
     .prepare(
-      `INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO boards (name, purpose, scope, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
     )
-    .run(board, purpose.trim(), scope, handle, Date.now());
+    .run(board, purpose.trim(), scope, handle, Date.now(), kind);
   if (res.changes === 0) throw new CoreError(`board #${board} already exists`);
   subscribe(db, handle, board, "push");
   return getBoard(db, board)!;
@@ -471,13 +502,111 @@ function resolveMentions(
 }
 
 // wake: handles to wake now. deferred: thread participants whose push waits
-// for their next wake.
+// for their next wake. post.attachments: those bound to the post.
+
+// A queue-kind board's claim TTL: how long a lane holds a post before
+// sweepExpired redelivers it to the next lane. Matches the claims default
+// (claims.ts DEFAULT_TTL_MIN).
+const QUEUE_CLAIM_TTL_MS = 30 * 60_000;
+
+// Whether the named board routes each post to one lane (queue kind). Unknown
+// or invalid names answer false: the post call reports the real error.
+export function isQueueBoard(db: Database, input: string): boolean {
+  try {
+    return (getBoard(db, normalizeBoard(input))?.kind ?? "broadcast") === "queue";
+  } catch {
+    return false;
+  }
+}
+
 export type PostResult = { post: Post; wake: string[]; deferred: string[]; unresolved: string[] };
 
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
-// sessions' instructions.
-export type PostOpts = { online?: (handle: string) => boolean; ttl_ms?: number };
+// sessions' instructions. attachments: the poster's unbound uploads to
+// carry, bound in the post's transaction under the mode's size caps.
+export type PostOpts = {
+  online?: (handle: string) => boolean;
+  ttl_ms?: number;
+  attachments?: { ids: number[]; limits?: AttachmentLimits };
+};
+
+// Eligible lanes for a queue board's rotation, least-recently-woken first
+// (never-woken first, then by handle). A lane is a push subscriber who isn't
+// the poster, hasn't opted out (peer_status queue:"off"), and isn't a
+// read-only viewer. With `online`, live lanes come first; offline lanes are
+// the fallback in the same order, so an empty live set still delivers.
+export function queueLanes(
+  db: Database,
+  b: Board,
+  poster: string,
+  opts: { online?: (handle: string) => boolean } = {},
+): string[] {
+  const a = access(db);
+  const rows = (
+    db
+      .prepare(
+        `SELECT s.handle FROM subscriptions s JOIN handles h ON h.name = s.handle
+         WHERE s.board = ? AND s.mode = 'push' AND s.handle != ? AND h.queue_off IS NULL
+         ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
+                    WHERE o2.handle = s.handle AND p2.board = s.board) ASC NULLS FIRST, s.handle ASC`,
+      )
+      .all(b.name, poster) as { handle: string }[]
+  )
+    .map((r) => r.handle)
+    .filter((h) => !isViewer(h) && a.canSee(h, b));
+  if (!opts.online) return rows;
+  const live = rows.filter((h) => opts.online!(h));
+  return [...live, ...rows.filter((h) => !opts.online!(h))];
+}
+
+// The claim IS the delivery: the picked lane holds the post until it acks (a
+// reply), declines (claim_release), or the TTL lapses (sweepExpired
+// redelivers it to the next lane). At-least-once: the claim key is the
+// idempotency token. The claim does not announce on the board - the delivery
+// IS the visibility, and an announce would cascade back through the queue
+// rotation. Caller is inside post's transaction.
+function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post"): void {
+  const key = `queue:${board}:${p.id}`;
+  const expires = now + QUEUE_CLAIM_TTL_MS;
+  // Redelivery to a lane that already had this post resets its push, so the
+  // re-offer actually reaches it (at-least-once).
+  db.prepare(
+    `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, 'subscription', 1)
+     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
+  ).run(lane, p.id);
+  const res = db
+    .prepare(
+      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(key, lane, note, board, now, expires);
+  // The claim is the idempotency token: when a row already holds the key,
+  // this run isn't the lane's delivery and must not read as one in the
+  // audit - the lane's reply-ack checks the claim's holder, not the outbox
+  // (#192 review).
+  if (res.changes > 0) logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
+}
+
+// A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
+// offer the original post to the next eligible lane. The previous holder is
+// excluded - it held the post for a full TTL, or declined. With no other
+// lane, the post sits readable on the board (the documented v1 behavior for
+// an empty rotation). Presence-blind: the sweep has no online predicate, so
+// an offline lane holds the re-offer in its outbox until it wakes, and its
+// own TTL lapse re-rotates. Caller is inside a transaction. Returns the lane
+// woken, or null when there is no next lane.
+export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): string | null {
+  const m = /^queue:([^:]+):(\d+)$/.exec(key);
+  if (!m) return null;
+  const b = getBoard(db, m[1]!);
+  const p = getPost(db, Number(m[2]));
+  if (!b || !p || p.board !== b.name) return null;
+  const lane = queueLanes(db, b, p.author).find((h) => h !== prevHolder);
+  if (!lane) return null;
+  claimQueuePost(db, b.name, p, lane, now, "queue post (redelivered)");
+  return lane;
+}
 
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
@@ -494,10 +623,7 @@ export function post(
 ): PostResult {
   const b = visibleBoard(db, handle, boardInput);
   const board = b.name;
-  if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
-  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
-    throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
-  }
+  checkBody(body);
   if (parentId !== null) {
     const parent = getPost(db, parentId);
     if (!parent || parent.board !== board) {
@@ -517,6 +643,8 @@ export function post(
   if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
   }
+  const files = opts.attachments ?? { ids: [] };
+  if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
 
   return db.transaction((): PostResult => {
     const now = Date.now();
@@ -526,6 +654,7 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null) as Post;
+    const attachments = files.limits ? bindAttachments(db, files.ids, handle, { post_id: p.id }, files.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
@@ -540,29 +669,71 @@ export function post(
         mode: SubMode;
       }[]
     ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
-    for (const s of subs) if (s.mode === "push") targets.set(s.handle, { reason: "subscription", wake: true });
-    if (announcement) {
-      for (const h of rosterHandles(db)) {
-        if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
+    // A queue-kind board delivers each top-level post to exactly ONE
+    // subscriber: the claim IS the delivery. A resolved @mention is direct
+    // addressing (it bypasses the rotation); with none, the rotation picks the
+    // least-recently-woken eligible subscriber and claims the post (TTL
+    // takeover releases it to the next wake). Replies follow thread semantics
+    // and release the claimer's claim.
+    const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
+    let unresolved: string[] = [];
+    if (queue) {
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      unresolved = u;
+      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
+      if (mentioned.length === 0) {
+        // Eligible lanes, least-recently-woken first, live lanes preferred: a
+        // post claimed by an offline lane would sit for the full TTL while
+        // live lanes idle (#192 review).
+        const picked = queueLanes(db, b, handle, { online: opts.online })[0];
+        if (picked) {
+          targets.set(picked, { reason: "subscription", wake: true });
+          claimQueuePost(db, board, p, picked, now);
+        }
+        // No eligible subscriber: the post sits on the board (readable there)
+        // until a lane subscribes; documented v1 behavior.
       }
-    } else if (parentId !== null) {
-      const root = threadRoot(db, parentId);
-      const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
-      const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
-      for (const author of authors) {
-        if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
-        // Your user's replies wake the whole thread; a push-mode subscriber
-        // still gets every post as it lands.
-        const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
-        targets.set(author, { reason: "thread", wake });
+    } else {
+      // The announce board ignores agents' subscriptions (viewers like `tail`
+      // still get it): an announcement reaches the sessions live now, as a
+      // mention so it doesn't read as subscribed traffic, and an agent's ack
+      // reaches only the announcer, not every earlier acker. A queue board's
+      // subscribers are LANES, not audience: replies follow thread semantics
+      // only, so one lane's work chatter doesn't wake the whole fleet.
+      const queueBoard = (b.kind ?? "broadcast") === "queue";
+      for (const s of subs)
+        if (s.mode === "push" && !queueBoard) targets.set(s.handle, { reason: "subscription", wake: true });
+      if (announcement) {
+        for (const h of rosterHandles(db)) {
+          if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
+        }
+      } else if (parentId !== null) {
+        const root = threadRoot(db, parentId);
+        const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
+        const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
+        for (const author of authors) {
+          if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
+          // Your user's replies wake the whole thread; a push-mode subscriber
+          // still gets every post as it lands.
+          const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
+          targets.set(author, { reason: "thread", wake });
+        }
+        // Muting drops thread and subscription pushes; the mention pass below
+        // runs after this, so an @mention still lands.
+        const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
+        for (const m of muted) targets.delete(m.handle);
       }
-      // Muting drops thread and subscription pushes; the mention pass below
-      // runs after this, so an @mention still lands.
-      const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
-      for (const m of muted) targets.delete(m.handle);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      unresolved = u;
+      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
-    const { handles: mentioned, unresolved } = resolveMentions(db, body, handle, b);
-    for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
+    // A queue-board reply by the claim holder acks the work: the claim
+    // releases with an ack note, so the handled post's audit chain ends in a
+    // release instead of an expire (#192 review). Another lane's reply leaves
+    // the holder on the hook. No redelivery: handled is handled.
+    if (parentId !== null && (b.kind ?? "broadcast") === "queue") {
+      ackQueueClaim(db, handle, `queue:${board}:${threadRoot(db, parentId)}`, now);
+    }
     targets.delete(handle);
 
     const ins = db.prepare(
@@ -573,7 +744,7 @@ export function post(
     // Digest subscribers aren't woken: their notice rides with their next wake.
     const all = [...targets];
     return {
-      post: p,
+      post: attachments.length ? { ...p, attachments } : p,
       wake: all.filter(([, t]) => t.wake).map(([h]) => h),
       deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
       unresolved,
@@ -622,12 +793,20 @@ export type Peer = {
   status?: string;
   status_age?: string;
   human?: true;
+  queue_off?: true;
+  launcher?: true;
 };
-// Read-only viewers (`grayboard tail`) subscribe under "~" handles, which no
-// identity can have. They aren't agents: keep them out of the roster.
-export const isViewer = (handle: string): boolean => handle.startsWith("~");
+// Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
+// "~" handles, which no identity can have: locally "~<id>", on a server
+// "<email>/~<id>". They aren't agents: keep them out of the roster.
+export const isViewer = (handle: string): boolean => handle.startsWith("~") || handle.includes("/~");
 
-export type WhoResult = { you: string; peers: Peer[]; offline_hidden?: number };
+// A live session with no name yet (#182): shown so the user and other agents
+// see what's running, never messageable, so it has no handle.
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; self?: true };
+
+// `you` is left out for an unbound session: its "~" handle can't be addressed.
+export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The roster: every handle that has connected (the `handles` table), or a
 // board's subscribers. `online` comes from the mode: a live session that will
@@ -637,8 +816,9 @@ export function who(
   handle: string,
   opts: { board?: string; include_offline?: boolean },
   online: (h: string) => boolean,
+  unbound: UnboundPeer[] = [],
 ): WhoResult {
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null };
+  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
@@ -646,7 +826,7 @@ export function who(
     rows = (
       db
         .prepare(
-          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human FROM subscriptions s
+          `SELECT s.handle, s.mode, h.last_seen, h.cwd, h.place, h.status, h.status_at, h.human, h.queue_off, h.launcher FROM subscriptions s
              LEFT JOIN handles h ON h.name = s.handle
             WHERE s.board = ? ORDER BY s.handle`,
         )
@@ -654,7 +834,7 @@ export function who(
     ).filter((r) => a.canSee(r.handle, b));
   } else {
     rows = db
-      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human FROM handles ORDER BY name`)
+      .prepare(`SELECT name AS handle, last_seen, cwd, place, status, status_at, human, queue_off, launcher FROM handles ORDER BY name`)
       .all() as typeof rows;
   }
   // Live lanes render one row each (`lane` shown only when not the default);
@@ -687,6 +867,8 @@ export function who(
       ...(where ? { where } : {}),
       ...(status ? { status, status_age: age(now - (status_at ?? now)) } : {}),
       ...(base.human ? { human: true as const } : {}),
+      ...(base.queue_off ? { queue_off: true as const } : {}),
+      ...(base.launcher ? { launcher: true as const } : {}),
     };
   };
   const all: Peer[] = [];
@@ -695,16 +877,27 @@ export function who(
     if (lanes?.length) for (const lr of lanes) all.push(render(r.handle, r, lr));
     else all.push(render(r.handle, r, null));
   }
-  if (opts.include_offline) return { you: handle, peers: all };
+  // Unbound sessions subscribe to nothing, so a board's roster has none.
+  const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
+  const you = isViewer(handle) ? {} : { you: handle };
+  if (opts.include_offline) return { ...you, peers: all, ...sessions };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
-  return { you: handle, peers, ...(hidden ? { offline_hidden: hidden } : {}) };
+  return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
 // When a handle last had a session, or null if it never connected.
 export function lastSeen(db: Database, handle: string): number | null {
   const row = db.prepare(`SELECT last_seen FROM handles WHERE name = ?`).get(handle) as { last_seen: number } | undefined;
   return row?.last_seen ?? null;
+}
+
+/** When and where each of `handles` last had a session; those that never connected are absent. */
+export function sessionsSeen(db: Database, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
+  const rows = db
+    .prepare(`SELECT name, last_seen, cwd, place FROM handles WHERE name IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify(handles)) as { name: string; last_seen: number; cwd: string | null; place: string | null }[];
+  return new Map(rows.map((r) => [r.name, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
 /** Every handle in the roster, for a mode that must check liveness up front. */
@@ -801,7 +994,7 @@ export function read(
     )
     .get(handle, board, handle, handle) as { n: number };
 
-  return { board, posts, unread_remaining: remaining.n };
+  return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
 }
 
 // ── delivery ─────────────────────────────────────────────────────────────────
@@ -828,12 +1021,16 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   };
 
   const out: Pending[] = [];
-  const pushes = db
-    .prepare(
-      `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
-        WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
-    )
-    .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[];
+  const pushes = withAttachments(
+    db,
+    "post",
+    db
+      .prepare(
+        `SELECT o.reason, o.wake, p.* FROM outbox o JOIN posts p ON p.id = o.post_id
+          WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
+      )
+      .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[],
+  );
   for (const { reason, wake, ...p } of pushes) {
     if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
     else acknowledge(db, handle, { kind: "push", post_id: p.id });
@@ -841,6 +1038,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 
   // Digest: unread exists and nothing has been sent since the last catch-up.
+  // Queue-kind boards are excluded: their posts deliver to exactly one
+  // subscriber, so they never count as digest unread for the others.
   const digests = db
     .prepare(
       `SELECT s.board, s.cursor,
@@ -848,7 +1047,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
                  AND p.author != ? AND ${NOT_PUSHED}) AS unread,
               (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ? AND ${NOT_PUSHED}) AS latest_id
          FROM subscriptions s
-        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor`,
+        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
+          AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
     )
     .all(handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
@@ -899,6 +1099,19 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
 
 // ── retention ────────────────────────────────────────────────────────────────
 
+// How long messages and posts keep, unless the operator (or a local user) says otherwise.
+export const DEFAULT_RETENTION_DAYS = 90;
+
+// The one retention-days rule, shared by the server (GRAYBOARD_*_RETENTION_DAYS) and
+// local (BUS_RETENTION_DAYS): unset/empty returns the fallback; otherwise a positive
+// whole number of days, or null to refuse. NaN here would make every `created_at <
+// cutoff` comparison false and silently prune nothing, so both modes parse through
+// this and never re-type the rule (#151).
+export function parseRetentionDays(raw: string | undefined, fallback: number): number | null {
+  if (raw === undefined || raw === "") return fallback;
+  return /^[1-9]\d*$/.test(raw) ? Number(raw) : null;
+}
+
 // Operator retention, not an agent operation. Replies outlive their pruned
 // parents as thread roots.
 export function prunePosts(db: Database, olderThanMs: number): void {
@@ -907,8 +1120,15 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
+    dropAttachments(db, "post", old, olderThanMs);
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
+    // Each name's latest bound or moved event outlives retention: who holds a
+    // name by the record (lastBoundBy, continuityOf) is read from it (#211).
+    db.prepare(
+      `DELETE FROM binding_events WHERE COALESCE(last_at, at) < ? AND id NOT IN
+         (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`,
+    ).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
   })();
 }

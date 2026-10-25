@@ -12,6 +12,8 @@ oauth_config:
     bot:
       - chat:write
       - chat:write.customize
+      - files:read
+      - files:write
       - groups:history
       - reactions:write
 settings:

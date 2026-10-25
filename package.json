@@ -1,6 +1,6 @@
 {
   "name": "grayboard",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "description": "Durable Claude-to-Claude message bus over the channels protocol",
   "type": "module",
   "private": true,
@@ -14,8 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build": "bun run build:cli && bun run build:server",
-    "build:cli": "bun build --compile src/cli/main.ts    --outfile dist/grayboard",
-    "build:server": "bun build --compile src/server/main.ts --outfile dist/grayboard-server"
+    "build:cli": "bash scripts/build_scratch.sh bun build --compile \"$PWD/src/cli/main.ts\"    --outfile \"$PWD/dist/grayboard\"",
+    "build:server": "bash scripts/build_scratch.sh bun build --compile \"$PWD/src/server/main.ts\" --outfile \"$PWD/dist/grayboard-server\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.3.0",
+    "@opencode-ai/plugin": "1.19.4",
     "@types/bun": "latest",
     "typescript": "^5.0.0"
   }
