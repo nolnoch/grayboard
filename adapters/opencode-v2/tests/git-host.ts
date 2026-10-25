@@ -67,6 +67,7 @@ try {
   assert(local.tui?.endsWith("/tui.js"));
   assert.equal((await Host.load(local.server!) as typeof server).default.id, "grayboard");
   assert.equal((await Host.load(local.tui!) as typeof tui).default.id, "grayboard.tui");
+  writeFileSync(join(root, "installed.txt"), directory);
   console.log("INSTALLED_DIRECTORY", directory);
   console.log("SOURCE_ENTRIES", JSON.stringify(entries));
   console.log("GIT_SOURCE_HOST_OK", target);

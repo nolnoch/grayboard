@@ -5,7 +5,7 @@ import { LeaseUnavailable, Wire } from "./wire.js";
 import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
 import { SessionRoutes, resolveRoot } from "./sessions.js";
 
-export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
+export type Options = { mcpName: string; issuer?: string; name?: string };
 export type Status = { state: string; message: string; sessionID?: string };
 type Root = { e: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 type Invocation = { tool: string; sessionID: string; id: string };
@@ -45,6 +45,8 @@ export class Controller {
   }
   private async path(sessionID: string) {
     const path = await resolveRoot(sessionID, id => this.ctx.session.get({ sessionID: id }));
+    this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
+    for (const [index, id] of path.via.entries()) this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
     return path;
   }
@@ -173,6 +175,8 @@ export class Controller {
                 await this.guard(r, epoch, signal);
                 await this.ctx.session.synthetic({ sessionID: e.sessionID, id: stableID(e, item.id, lease.identity), text: render(item), delivery: "queue", resume: item.actionable, metadata: { source: "grayboard" } });
                 await this.guard(r, epoch, signal);
+                await wire!.call("delivery_renew");
+                await this.guard(r, epoch, signal);
               }, async ids => {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
@@ -198,7 +202,7 @@ export class Controller {
           if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
         } else if (error instanceof Error && /identity_in_use|already in use|identity_unknown/.test(error.message)) throw error;
         else failures++;
-        this.set(r, "retrying", "Revalidating the approved root before reopening delivery");
+        this.set(r, "retrying", `Revalidating the approved root before reopening delivery: ${error instanceof Error ? error.message : "transport failure"}`);
         await sleep(Math.min(8000, 250 * 2 ** failures), signal);
       } finally { await wire?.close().catch(() => {}); }
     }
@@ -226,7 +230,9 @@ export class Controller {
     if (!Array.isArray(ids)) return;
     for (const id of ids) {
       if (typeof id !== "string" || this.stopped) continue;
-      const session = await this.activeRoot(id);
+      let session: Awaited<ReturnType<Context["session"]["get"]>>;
+      try { session = await this.activeRoot(id); }
+      catch { continue; }
       const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
       const e = saved?.enrollment;
       if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
@@ -258,8 +264,16 @@ export class Controller {
     if (!await this.native(event.tool)) return;
     const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
     const r = this.roots.get(event.sessionID);
-    if (event.tool !== bindID || !r || r.paused || this.drifted) return;
+    if (!r || r.paused || this.drifted) return;
     try {
+      if (event.tool !== bindID) {
+        const output = event.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
+        if (output?.unbound === true && r.e.name) {
+          await this.stop(r); r.lease = undefined;
+          await this.prepare(r, true);
+        }
+        return;
+      }
       if (event.status === "completed") {
         const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
         if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || typeof output.instructions !== "string") throw new Error("Native bind completion lacked validated output");
@@ -276,7 +290,7 @@ export class Controller {
         if (path.root === id) {
           try {
             const e = await this.capture(id);
-            await this.temporary(e, w => w.call("bind", { name: this.options.name, create: this.options.create === true, where: this.ctx.location.directory }));
+            await this.temporary(e, w => w.call("bind", { name: this.options.name, create: false, where: this.ctx.location.directory }));
             this.state = { state: "unenrolled", sessionID: id, message: `Bound ${this.options.name}; receiving still requires human approval` };
           } catch (error) { this.state = { state: "unbound", sessionID: id, message: error instanceof Error ? error.message : "Configured binding refused" }; }
         }

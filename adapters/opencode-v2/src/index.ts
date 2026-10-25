@@ -8,7 +8,6 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
     mcpName: typeof ctx.options.mcpName === "string" ? ctx.options.mcpName : "grayboard",
     issuer: typeof ctx.options.issuer === "string" ? ctx.options.issuer : "",
     name: typeof ctx.options.name === "string" ? ctx.options.name : undefined,
-    create: ctx.options.create === true,
   };
   const controller = new Controller(ctx, options);
   let restoring: Promise<unknown> = Promise.resolve();

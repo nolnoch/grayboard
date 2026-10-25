@@ -61,7 +61,7 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: "bound" } } });
-  return { controller, rows, storage, nodes, calls, admissions, batches, bind, before, after, f, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("approval without name does not bind, lease, admit or receipt; native completion opens once", async () => {
   const r = runtime();
@@ -100,7 +100,7 @@ test("before awaits G registration directly under R via C, rejects missing ances
 test("retained routes close children independently, child-first and root-first lifecycle are idempotent", async () => {
   const r = runtime();
   try {
-    r.bind("R", "be"); await r.controller.enroll("R"); await r.before("G"); await r.before("C");
+    r.bind("R", "be"); await r.controller.enroll("R"); await r.before("G");
     r.nodes.delete("C"); await r.controller.observe("session.deleted", { sessionID: "C" });
     expect(r.rows.get("R")?.name).toBe("be");
     await r.controller.observe("session.deleted", { sessionID: "C" });
@@ -136,6 +136,32 @@ test("pause ends ownership, resume rebinds remembered name create:false; held na
     expect(r.calls.filter(c => c.name === "bind")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
+test("restart skips ended roots, restores another root, and resumes a paused durable name", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    r.nodes.delete("R"); await r.controller.observe("session.deleted", { sessionID: "R" });
+    await r.controller.pause(); await r.controller.close();
+    restarted = r.restart(); await restarted.restore();
+    expect(restarted.status().state).toBe("paused");
+    await restarted.enroll("B"); await until(() => restarted!.status().state === "active");
+    expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+test("ordinary native unbound result rebinds the durable name once with create:false", async () => {
+  const r = runtime();
+  try {
+    r.bind("R", "be"); await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "active");
+    r.rows.delete("R");
+    await r.controller.after({ sessionID: "R", tool: "grayboard_whoami", id: "call", status: "completed", result: { output: { unbound: true, name: null, ownership: null } } });
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "be", create: false, where: "/worktree" }]);
+    await r.before("G");
+    expect(r.calls.at(-1)?.args).toEqual({ child: "G", via: ["C"] });
+  } finally { await r.controller.close(); }
+});
 test("pause during awaited admission suppresses receipt without pretending host write was recalled", async () => {
   const r = runtime(); let unblock!: () => void;
   try {
@@ -146,6 +172,24 @@ test("pause during awaited admission suppresses receipt without pretending host 
     expect(r.admissions).toHaveLength(1);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
     expect(r.admissions[0]?.sessionID).toBe("R");
+  } finally { await r.controller.close(); }
+});
+test.each(["session.archived", "session.deleted", "credential.switched", "rebind", "expiry"])("%s during host admission suppresses stale receipt", async mode => {
+  const r = runtime(); let unblock!: () => void;
+  try {
+    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.admission(() => new Promise(resolve => { unblock = resolve; }));
+    await r.controller.enroll("R"); await until(() => !!unblock);
+    let ending: Promise<unknown> | undefined;
+    if (mode === "credential.switched") ending = r.controller.observe(mode, { integrationID: "native-integration" });
+    else if (mode === "rebind") ending = r.before("R", "grayboard_bind");
+    else if (mode === "expiry") r.rows.delete("R");
+    else { r.nodes.delete("R"); ending = r.controller.observe(mode, { sessionID: "R" }); }
+    await Bun.sleep(5); unblock(); await ending;
+    if (mode === "expiry") await until(() => r.controller.status().state === "retrying");
+    await Bun.sleep(10);
+    expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
   } finally { await r.controller.close(); }
 });
 test("configuration away-and-back during host admission remains latched and sends no receipt", async () => {
