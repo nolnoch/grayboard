@@ -276,7 +276,7 @@ test("OAuth challenges and actual scope precede identity validation on every met
     for (const [token, status, error] of [[legacy, 401, "invalid_token"], [expired, 401, "invalid_token"], [delivery, 403, "insufficient_scope"], ["wrong", 401, "invalid_token"]] as const) {
       const response = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } });
       expect(response.status).toBe(status);
-      expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="grayboard:tools", error="${error}"`);
+      expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${error}"`);
     }
   }
   expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "unselected")).toBeUndefined();
@@ -381,7 +381,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
       expect(response.headers.has("WWW-Authenticate")).toBe(false);
       expect(await response.text()).not.toMatch(/SELECT|secret|private|sqlite/);
     } else {
-      expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="grayboard:tools", error="invalid_token"`);
+      expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="grayboard:delivery grayboard:tools", error="invalid_token"`);
       await response.arrayBuffer();
     }
     expect(checks).toBe(2);
