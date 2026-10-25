@@ -12,6 +12,8 @@ import { mintSessionKey } from "../../src/core/bindings.ts";
 import type { Conn, WsData } from "../../src/server/ws.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
+import { localEnv } from "../support/env.ts";
+import { runCli } from "../support/cli.ts";
 import { ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
@@ -356,5 +358,12 @@ describe("state answers in local mode", () => {
     expect(await call(be, "board_create", { name: "e2e", purpose: "fixtures" })).toEqual({ ...made, note: `you created #e2e at ${new Date(made.created_at).toISOString()}` });
 
     expect(await call(be, "board_post", { board: "e2e", body: "x", resend: true })).toMatchObject({ post_id: expect.any(Number) });
+  }, 30_000);
+
+  test("the local Slack bridge's human keeps \"already exists\" on a board_create repeat", async () => {
+    expect((await runCli(["human", "alex"], { env: localEnv(dir), cwd: dir })).code).toBe(0);
+    const { c: bridge } = await localSession(dir, "alex", { extra: { BUS_HUMAN: "1" } });
+    await call(bridge, "board_create", { name: "slack-made", purpose: "fixtures" });
+    await expect(call(bridge, "board_create", { name: "slack-made", purpose: "fixtures" })).rejects.toThrow("already exists");
   }, 30_000);
 });

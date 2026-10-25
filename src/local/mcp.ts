@@ -508,6 +508,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
       ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+      human: HUMAN,
     };
     const { attachments: paths, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
