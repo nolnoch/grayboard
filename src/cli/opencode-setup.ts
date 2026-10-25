@@ -99,6 +99,13 @@ function publicClientId(value: unknown): value is string {
 }
 
 export function isHostedGrayboard(value: unknown): boolean {
+  if (object(value) && value.type === "remote" && Object.keys(value).every(k => ["type", "url"].includes(k))) {
+    try { hostedEndpoint(value.url); return true; } catch { return false; }
+  }
+  return isLegacyHostedGrayboard(value);
+}
+
+function isLegacyHostedGrayboard(value: unknown): boolean {
   if (!object(value) || value.type !== "remote" || !object(value.headers) || !identity(value.headers["X-Grayboard-Identity"]) ||
       !object(value.oauth) || !publicClientId(value.oauth.client_id) ||
       typeof value.oauth.scope !== "string" ||
@@ -175,7 +182,7 @@ function packageReference(entry: unknown): string | undefined {
 function grayboardPackage(entry: unknown, base: string): boolean {
   const ref = packageReference(entry);
   if (!ref) return false;
-  if (/^grayboard-opencode(?:@|$)/.test(ref)) return true;
+  if (/^grayboard-opencode(?:@|$)/.test(ref) || /^github:nolnoch\/grayboard#.+::path:adapters\/opencode-v2$/.test(ref)) return true;
   if (ref.includes("grayboard") && /\.[jt]s$/.test(ref)) fail("Configured Grayboard plugin file requires manual migration");
   if (!isAbsolute(ref) && !ref.startsWith(".") && !ref.startsWith("file:")) return false;
   try {
@@ -185,7 +192,7 @@ function grayboardPackage(entry: unknown, base: string): boolean {
 }
 
 export type OpenCodeSetupOptions = {
-  url: string; clientId: string; identity: string; plugin: string; config: string;
+  url: string; config: string; revision?: string; plugin?: string; name?: string; create?: boolean;
   migrate?: boolean; dryRun?: boolean;
 };
 
@@ -195,9 +202,11 @@ type Move = { path: string; backup: string; source: string };
 export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean } {
   const url = hostedEndpoint(opts.url);
   if (!url.startsWith("https://")) fail("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
-  if (!publicClientId(opts.clientId)) fail("Public OAuth client ID must be a literal 1–512 printable non-space ASCII string without OpenCode substitutions");
-  if (!identity(opts.identity)) fail("Identity must be a lowercase simple agent name, not human or a full handle");
-  const plugin = pluginDirectory(opts.plugin);
+  if (opts.name !== undefined && !identity(opts.name)) fail("Name must be a lowercase simple agent name, not human or a full handle");
+  if (opts.create && !opts.name) fail("--create requires an explicit --name");
+  if (opts.plugin && opts.revision) fail("Choose --revision or installed-directory --plugin, not both");
+  if (!opts.plugin && !/^[0-9a-f]{40}$/.test(opts.revision ?? "")) fail("Git plugin setup requires --revision with a full lowercase 40-character commit hash; alternatively supply an installed --plugin directory");
+  const plugin = opts.plugin ? pluginDirectory(opts.plugin) : `github:nolnoch/grayboard#${opts.revision}::path:adapters/opencode-v2`;
   const path = resolve(opts.config);
   if (![".json", ".jsonc"].includes(extname(path))) fail("Select an explicit JSON or JSONC config file");
   if (!statSync(dirname(path)).isDirectory()) fail("Config parent directory must exist");
@@ -205,7 +214,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const other = document(sibling(path)).value;
   if (other.mcp?.grayboard !== undefined || other.mcp?.servers?.grayboard !== undefined ||
       [other.plugins, other.plugin].some(list => list?.some((entry: unknown) => grayboardPackage(entry, dirname(path))))) fail("Sibling config defines Grayboard; resolve the selected scope's conflicting files manually");
-  const desired = { type: "remote", url, headers: { "X-Grayboard-Identity": opts.identity }, oauth: { client_id: opts.clientId, scope: scopes } };
+  const desired = { type: "remote", url };
   const cfg = current.value;
   const old = cfg.mcp?.grayboard;
   const native = cfg.mcp?.servers?.grayboard;
@@ -216,7 +225,8 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const pluginIndex = ownedPlugins[0];
   const priorPlugin = pluginIndex === undefined ? undefined : cfg.plugins[pluginIndex];
   if (object(priorPlugin) && Object.keys(priorPlugin).some(k => !["package", "options"].includes(k))) fail("Unknown Grayboard plugin fields");
-  const pluginEntry = object(priorPlugin) ? { ...priorPlugin, package: plugin } : { package: plugin };
+  const pluginEntry: ObjectValue = object(priorPlugin) ? { ...priorPlugin, package: plugin } : { package: plugin };
+  if (opts.name !== undefined) pluginEntry.options = { ...pluginEntry.options, name: opts.name, create: !!opts.create };
   const moves: Move[] = [];
   const adapterPaths = [join(dirname(path), "plugin", "grayboard.ts")];
   if (basename(dirname(path)) !== ".opencode") adapterPaths.push(join(dirname(path), ".opencode", "plugin", "grayboard.ts"));
@@ -248,9 +258,14 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     if (cfg.plugins === undefined) set(["plugins"], [pluginEntry]);
     else set(["plugins", -1], pluginEntry);
   } else if (!isDeepStrictEqual(priorPlugin, pluginEntry)) {
-    // Change only the source; user enrollment/options are not ours to reset.
-    if (object(priorPlugin)) set(["plugins", pluginIndex, "package"], plugin);
-    else set(["plugins", pluginIndex], pluginEntry);
+    // Preserve unrelated option bytes and enrollment.
+    if (object(priorPlugin)) {
+      if (priorPlugin.package !== plugin) set(["plugins", pluginIndex, "package"], plugin);
+      if (opts.name !== undefined) {
+        set(["plugins", pluginIndex, "options", "name"], opts.name);
+        set(["plugins", pluginIndex, "options", "create"], !!opts.create);
+      }
+    } else set(["plugins", pluginIndex], pluginEntry);
   }
   const changed = text !== current.text;
   const configBackup = path + backupSuffix;

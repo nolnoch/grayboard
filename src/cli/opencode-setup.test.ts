@@ -18,7 +18,7 @@ function fixture() {
   // Configurator fixture only, not proof of the production plugin's runtime contract.
   writeFileSync(join(plugin, "index.js"), "export default { id: 'grayboard', setup() {} };\n");
   const config = join(root, "opencode.jsonc");
-  const opts: OpenCodeSetupOptions = { url: "https://grayboard.example.com/mcp", clientId: "operator-public", identity: "fe", plugin, config };
+  const opts: OpenCodeSetupOptions = { url: "https://grayboard.example.com/mcp", plugin, config };
   const run = (extra: Partial<OpenCodeSetupOptions> = {}) => setupOpenCode({ ...opts, ...extra }, source);
   const read = () => parse(readFileSync(config, "utf8"));
   const adapter = join(root, "plugin", "grayboard.ts");
@@ -37,7 +37,7 @@ for (const eol of ["\n", "\r\n"]) test(`JSONC preserves unrelated bytes/line end
   const text = readFileSync(f.config, "utf8");
   for (const fragment of [unrelated, server, plugin]) expect(text).toContain(fragment.replaceAll('\n', eol));
   if (eol === '\r\n') expect(text.replaceAll('\r\n', '')).not.toContain('\n');
-  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url, headers: { "X-Grayboard-Identity": "fe" }, oauth: { client_id: "operator-public", scope: "grayboard:tools grayboard:delivery" } });
+  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
   expect(f.read().plugins[1]).toEqual({ package: f.plugin });
   expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
   expect(readFileSync(f.config, "utf8")).toBe(text);
@@ -62,14 +62,14 @@ for (const text of ["", "[]", "null", '{"mcp":[]}', '{"mcp":{"servers":[]}}', '{
 
 for (const url of ["http://remote.example.com/mcp", "https://user:password@example.com/mcp", "https://example.com/mcp?token=secret", "https://example.com/mcp#fragment", "https://example.com/mcp?", "https://example.com/mcp#", "https://example.com//mcp", "https://example.com/a/../mcp", "https://example.com/%2e/mcp", "https://example.com/a\\mcp", "https://example.com/mcp/", "https://EXAMPLE.com/mcp", "https://example.com:443/mcp"]) test(`unsafe/ambiguous endpoint refuses: ${url}`, () => expect(() => hostedEndpoint(url)).toThrow());
 for (const url of ["https://grayboard.example.com/team/mcp", "http://127.0.0.1:8080/mcp", "http://localhost:8080/mcp", "http://[::1]:8080/mcp"]) test(`explicit endpoint accepts: ${url}`, () => expect(hostedEndpoint(url)).toBe(url));
-for (const identity of ["human", "Human", "FE", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid identity refuses: ${identity}`, () => {
+for (const name of ["human", "Human", "FE", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid name refuses: ${name}`, () => {
   const f = fixture();
-  expect(() => f.run({ identity })).toThrow();
+  expect(() => f.run({ name })).toThrow();
   expect(existsSync(f.config)).toBe(false);
 });
-for (const clientId of ["", " ", "has space", "line\nbreak", "a".repeat(513), "é"]) test("invalid public client ID refuses before writes", () => {
+for (const revision of [undefined, "master", "abc123", "a".repeat(39), "A".repeat(40), "{env:REVISION}"]) test("Git source requires explicit full commit hash", () => {
   const f = fixture();
-  expect(() => f.run({ clientId })).toThrow();
+  expect(() => f.run({ plugin: undefined, revision })).toThrow();
   expect(existsSync(f.config)).toBe(false);
 });
 
@@ -200,7 +200,7 @@ test("migration dry-run validates all inputs without creating backups or moving 
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
   expect(existsSync(f.config + ".grayboard-backup")).toBe(false);
   expect(existsSync(f.adapter + ".grayboard-backup")).toBe(false);
-  expect(() => f.run({ migrate: true, identity: "human" })).toThrow();
+  expect(() => f.run({ migrate: true, name: "human" })).toThrow();
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
 });
 
@@ -229,16 +229,16 @@ test("unrecognized commands and remote secrets refuse migration", () => {
   }
 });
 
-test("changed recognized hosted entry requires migration; scope/identity mismatches refuse recognition", () => {
+test("recognized fixed-header profile migrates explicitly to native OAuth defaults", () => {
   const f = fixture();
-  f.run();
-  expect(isHostedGrayboard(f.read().mcp.servers.grayboard)).toBe(true);
-  expect(() => f.run({ identity: "be" })).toThrow("--migrate");
-  f.run({ identity: "be", migrate: true });
-  const entry = f.read().mcp.servers.grayboard;
-  expect(entry.headers["X-Grayboard-Identity"]).toBe("be");
-  expect(isHostedGrayboard({ ...entry, oauth: { ...entry.oauth, scope: "grayboard:tools" } })).toBe(false);
-  expect(isHostedGrayboard({ ...entry, headers: { "X-Grayboard-Identity": "human" } })).toBe(false);
+  const legacy = { type: "remote", url: f.opts.url, headers: { "X-Grayboard-Identity": "fe" }, oauth: { client_id: "operator-public", scope: "grayboard:tools grayboard:delivery" } };
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: legacy } } }));
+  expect(isHostedGrayboard(legacy)).toBe(true);
+  expect(() => f.run()).toThrow("--migrate");
+  f.run({ migrate: true });
+  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
+  expect(isHostedGrayboard({ ...legacy, oauth: { ...legacy.oauth, scope: "grayboard:tools" } })).toBe(false);
+  expect(isHostedGrayboard({ ...legacy, headers: { "X-Grayboard-Identity": "human" } })).toBe(false);
 });
 
 test("plugin source migration preserves option bytes/enrollment and unrelated entries", () => {
@@ -283,7 +283,7 @@ function invoke(f: ReturnType<typeof fixture>, args: string[]) {
   return Bun.spawnSync([process.execPath, cli, ...args], { cwd: f.root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 }
 function cliArgs(f: ReturnType<typeof fixture>) {
-  return ["setup-opencode", "--url", f.opts.url, "--client-id", f.opts.clientId, "--identity", f.opts.identity, "--plugin", f.plugin, "--config", f.config];
+  return ["setup-opencode", "--url", f.opts.url, "--plugin", f.plugin, "--config", f.config];
 }
 function fakeOpenCode(f: ReturnType<typeof fixture>) {
   mkdirSync(join(f.root, "bin"));
@@ -301,7 +301,7 @@ for (const credentials of ["", "signed-out-or-private-token\n"]) test("CLI opt-i
   expect(dry.exitCode, dry.stderr.toString()).toBe(0);
   expect(dry.stdout.toString()).toContain("Sign-in PENDING");
   expect(dry.stdout.toString()).not.toContain("do-not-print-this");
-  expect(dry.stdout.toString()).not.toContain(f.opts.clientId);
+  expect(dry.stdout.toString()).not.toContain("client_secret");
   expect(readFileSync(f.config, "utf8")).toBe(before);
   expect(readdirSync(f.root).sort()).toEqual(files);
   const result = invoke(f, cliArgs(f));
@@ -364,20 +364,56 @@ for (const legacy of [
   }
 });
 
-test("literal printable public IDs remain valid without interpreting unrelated braces", () => {
+test("default Git source needs no client, name, options or installed directory", () => {
   const f = fixture();
-  const clientId = "operator:public-{literal}_123/~+";
-  f.run({ clientId });
-  expect(f.read().mcp.servers.grayboard.oauth.client_id).toBe(clientId);
-  expect(isHostedGrayboard(f.read().mcp.servers.grayboard)).toBe(true);
+  const revision = "a".repeat(40);
+  f.run({ plugin: undefined, revision });
+  expect(f.read().plugins).toEqual([{ package: `github:nolnoch/grayboard#${revision}::path:adapters/opencode-v2` }]);
+  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
+  expect(f.run({ plugin: undefined, revision }).changed).toBe(false);
+  expect(() => f.run({ revision })).toThrow("not both");
+});
+
+test("Git references are owned for sibling/duplicate refusal and explicit revision migration", () => {
+  const f = fixture();
+  const revision = "a".repeat(40);
+  const entry = { package: `github:nolnoch/grayboard#${revision}::path:adapters/opencode-v2` };
+  writeFileSync(f.config.slice(0, -1), JSON.stringify({ plugins: [entry] }));
+  expect(() => f.run({ plugin: undefined, revision })).toThrow("Sibling");
+  rmSync(f.config.slice(0, -1));
+  writeFileSync(f.config, JSON.stringify({ plugins: [entry, entry] }));
+  expect(() => f.run({ migrate: true })).toThrow("Conflicting");
+  writeFileSync(f.config, JSON.stringify({ plugins: [entry] }));
+  expect(() => f.run()).toThrow("--migrate");
+  f.run({ migrate: true });
+  expect(f.read().plugins).toEqual([{ package: f.plugin }]);
+});
+
+test("CLI emits the minimal Git/native profile without plugin installation or name", () => {
+  const f = fixture();
+  const revision = "b".repeat(40);
+  const result = invoke(f, ["setup-opencode", "--url", f.opts.url, "--revision", revision, "--config", f.config]);
+  expect(result.exitCode, result.stderr.toString()).toBe(0);
+  expect(f.read().plugins).toEqual([{ package: `github:nolnoch/grayboard#${revision}::path:adapters/opencode-v2` }]);
+  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
+});
+
+test("optional name explicitly defaults create false and preserves unrelated plugin option bytes", () => {
+  const f = fixture();
+  expect(() => f.run({ create: true })).toThrow("requires");
+  f.run({ name: "fe" });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false });
+  expect(() => f.run({ name: "be", create: true })).toThrow("--migrate");
+  f.run({ name: "be", create: true, migrate: true });
+  expect(f.read().plugins[0].options).toEqual({ name: "be", create: true });
 });
 
 for (const directive of ["{env:PRIVATE_TOKEN}", "{file:./private-token}", "prefix-{env:PRIVATE_TOKEN}-suffix", "prefix-{file:./private-token}-suffix"]) test("public client ID and emitted plugin path reject substitutions before writes", () => {
   const f = fixture();
   const before = readdirSync(f.root).sort();
-  expect(() => f.run({ clientId: directive })).toThrow();
+  expect(() => f.run({ plugin: undefined, revision: directive })).toThrow();
   expect(readdirSync(f.root).sort()).toEqual(before);
-  const result = invoke(f, [...cliArgs(f), "--client-id", directive, "--dry-run"]);
+  const result = invoke(f, [...cliArgs(f), "--revision", directive, "--dry-run"]);
   expect(result.exitCode).toBe(1);
   expect(result.stderr.toString()).not.toContain(directive);
   expect(readdirSync(f.root).sort()).toEqual(before);

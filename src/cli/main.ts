@@ -491,16 +491,17 @@ program
   .command("setup-opencode")
   .description("Configure an explicitly selected OpenCode V2 hosted MCP scope; no login or package installation")
   .requiredOption("--url <endpoint>", "Hosted MCP endpoint ending in /mcp")
-  .requiredOption("--client-id <id>", "Operator-provided public OAuth client ID")
-  .requiredOption("--identity <name>", "Simple agent identity")
-  .requiredOption("--plugin <directory>", "Installed grayboard-opencode package directory")
+  .option("--revision <sha>", "Full Git commit hash for the default Git/subdirectory plugin source")
+  .option("--plugin <directory>", "Fallback: installed grayboard-opencode directory instead of Git")
+  .option("--name <name>", "Optional startup mailbox binding; does not enroll delivery")
+  .option("--create", "Explicitly allow creating the configured name (default false)")
   .requiredOption("--config <path>", "Selected OpenCode JSON/JSONC file")
   .option("--migrate", "Explicitly migrate recognized Grayboard entries and back up owned adapters")
   .option("--dry-run", "Validate and report targeted changes without filesystem writes")
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, ADAPTERS[1]!.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and installed-directory plugin${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
     } catch (e) {
