@@ -62,17 +62,32 @@ for (const key of ["tests", "failures", "errors", "skipped"]) {
   invalidXML[`suite-${key}`] = document(undefined, undefined, `${key}="${value}"`);
   invalidXML[`case-${key}`] = document(`<testcase ${key}="${value}"/>`);
 }
-for (const mode of ["assertion", "truncated", "crash", "provenance", "success", "cross-filesystem", ...Object.keys(invalidXML)]) test.skipIf(mode === "cross-filesystem" && process.platform !== "linux")(`hosted evidence allowlist: ${mode} never publishes raw diagnostics`, () => {
-  const success = mode === "success" || mode === "cross-filesystem";
+const matrixReady = '{"phase":"prepare","state":"started"}\n{"phase":"prepare","state":"finished","exit":0}\n';
+const matrixModes: Record<string, { raw: string; exit: number }> = {
+  "matrix-success": { raw: matrixReady + Array.from({ length: 29 }, (_, i) => JSON.stringify({ phase: "case", id: i + 1, state: "started" }) + "\n" + JSON.stringify({ phase: "case", id: i + 1, state: "finished", exit: 0 }) + "\n").join(""), exit: 0 },
+  "matrix-prepare": { raw: matrixReady.split("\n")[0]! + "\n", exit: 1 },
+  "matrix-interrupted": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n', exit: 143 },
+  "matrix-exit": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n{"phase":"case","id":1,"state":"finished","exit":7}\n', exit: 7 },
+  "matrix-malformed": { raw: matrixReady + '{"secret":"SECRET"}\n', exit: 0 },
+  "matrix-truncated": { raw: matrixReady.slice(0, -1), exit: 0 },
+  "matrix-oversized": { raw: "SECRET".repeat(2000), exit: 0 },
+};
+for (const mode of ["assertion", "truncated", "crash", "provenance", "success", "cross-filesystem", ...Object.keys(invalidXML), ...Object.keys(matrixModes)]) test.skipIf(mode === "cross-filesystem" && process.platform !== "linux")(`hosted evidence allowlist: ${mode} never publishes raw diagnostics`, () => {
+  const matrixMode = matrixModes[mode];
+  const success = mode === "success" || mode === "cross-filesystem" || mode === "matrix-success";
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
   const output = mode === "cross-filesystem" ? mkdtempSync("/dev/shm/gb-evidence-public-") : join(root, "public");
   if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
   for (const dir of ["scripts", "src", "tests/e2e", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
-  for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
+  for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
   writeFileSync(join(root, "tests/e2e/opencode-config.ts"), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
   const secrets = ["access-" + crypto.randomUUID(), "refresh-" + crypto.randomUUID(), "lease-" + crypto.randomUUID(), "fake-access-one", "synthetic-json-secret"];
+  if (matrixMode) {
+    writeFileSync(join(root, "injected-matrix"), matrixMode.raw.replaceAll("SECRET", secrets[0]!));
+    cpSync(join(checkout, "adapters/opencode-v2/tests/real-races.sh"), join(root, "adapters/opencode-v2/tests/real-races.sh"));
+  }
   const payload = `import { test, expect } from "bun:test";\n${secrets.map((s, i) => `test(${JSON.stringify(s)}, () => { console.log(${JSON.stringify(s)}); expect(${JSON.stringify(s)}).toBe("other-${i}"); });`).join("\n")}`;
   writeFileSync(join(root, "probe.ts"), success ? 'import { test, expect } from "bun:test"; test("ok", () => expect(1).toBe(1));' : payload);
   if (invalidXML[mode]) {
@@ -92,6 +107,7 @@ install)
  exit 0 ;;
 run)
  shift
+ if [ "$1" = test:host-races ]; then cp "$PROBE_ROOT/injected-matrix" "$GRAYBOARD_E2E_RUN_DIR/matrix.jsonl"; printf '%s' '${secrets[0]}' >&2; exit ${matrixMode?.exit ?? 1}; fi
  if [ "$1" != test ]; then exit 0; fi
  shift
  if [ -f "$PROBE_ROOT/injected.xml" ]; then cp "$PROBE_ROOT/injected.xml" "$GRAYBOARD_E2E_RUN_DIR/unit.xml"; printf '%s' '${secrets[0]}' >&2; exit 0; fi
@@ -119,7 +135,7 @@ esac
   git("init", "-q"); git("add", "scripts", "src", "tests", "adapters");
   git(...identity, "commit", "-qm", "fixture");
   expect(git("rev-parse", "--absolute-git-dir") === realpathSync(join(root, ".git"))).toBe(true);
-  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: output, GITHUB_SHA: secrets[1]!, GITHUB_SERVER_URL: "https://ci.example.com", GITHUB_REPOSITORY: "example/fixture", GITHUB_RUN_ID: secrets[0]!, PROBE_ROOT: root, PROBE_MODE: mode } });
+  const result = Bun.spawnSync(["bash", "scripts/e2e.sh", matrixMode ? "hosted-matrix" : "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: output, GITHUB_SHA: secrets[1]!, GITHUB_SERVER_URL: "https://ci.example.com", GITHUB_REPOSITORY: "example/fixture", GITHUB_RUN_ID: secrets[0]!, PROBE_ROOT: root, PROBE_MODE: mode } });
   expect(metadata(join(parent, ".git"))).toBe(before);
   expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
   const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(output);
@@ -133,7 +149,17 @@ esac
     expect(xml).toContain('tests="5" failures="5"');
   }
   const summary = JSON.parse(readFileSync(join(output, "evidence/summary.json"), "utf8"));
-  expect(summary.evidenceProcessed).toBe(mode === "assertion" || success);
+  expect(summary.evidenceProcessed).toBe(mode === "assertion" || success || ["matrix-prepare", "matrix-interrupted", "matrix-exit"].includes(mode));
+  const names = readdirSync(join(output, "evidence"));
+  const allowlist = ["exit", "hosted.log", "provenance.json", "result", "source-revision", "source-status", "summary.json", "unit.xml", ...(matrixMode ? ["matrix.json"] : [])];
+  expect(names.every(name => allowlist.includes(name))).toBe(true);
+  expect(names.includes("matrix.json")).toBe(!!matrixMode);
+  if (matrixMode) {
+    const data = JSON.parse(readFileSync(join(output, "evidence/matrix.json"), "utf8"));
+    expect(data.phase).toBe(mode === "matrix-success" ? "complete" : mode === "matrix-prepare" ? "prepare" : ["matrix-interrupted", "matrix-exit"].includes(mode) ? "case" : "invalid");
+    expect(summary.runtimeExit).toBe(matrixMode.exit);
+    expect(names.length).toBe(summary.evidenceProcessed ? 9 : 6);
+  }
   if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(output, "evidence/result"), "utf8")).toBe("failed\n"); }
 }, 30_000);
 

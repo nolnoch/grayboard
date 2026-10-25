@@ -38,7 +38,16 @@ case "${1:-}" in
   git) bun run test:git ;;
   host) bun run test:host ;;
   live) GRAYBOARD_TEST_CODEMODE=1 GRAYBOARD_TEST_CIMD_LIVE=1 bun run test:host ;;
-  matrix) bun run test:host-races ;;
+  matrix)
+    bun "$root/scripts/hosted-matrix.ts" "$package/tests/real-races.sh"
+    mkdir "$scratch/matrix-bin"
+    printf '#!/usr/bin/env bash\nexec bun "$GRAYBOARD_MATRIX_SHIM" "$@"\n' > "$scratch/matrix-bin/sh"
+    chmod 700 "$scratch/matrix-bin/sh"
+    export GRAYBOARD_MATRIX_SHELL="$(command -v sh)" GRAYBOARD_MATRIX_PACKAGE="$package"
+    export GRAYBOARD_MATRIX_SHIM="$root/scripts/hosted-matrix-shell.ts" GRAYBOARD_MATRIX_OBSERVATIONS="$GRAYBOARD_E2E_RUN_DIR/matrix.jsonl"
+    printf '{"phase":"prepare","state":"started"}\n' > "$GRAYBOARD_MATRIX_OBSERVATIONS"
+    PATH="$scratch/matrix-bin:$PATH" bun run test:host-races
+    ;;
   native) bun run test:native-host ;;
   durable) bun run test:durable-host ;;
   config|public)

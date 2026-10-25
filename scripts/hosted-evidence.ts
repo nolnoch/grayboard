@@ -1,6 +1,7 @@
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { matrixObservation } from "./hosted-matrix.ts";
 
 const suites = ["strict", "git", "config", "public", "host", "live", "matrix", "native", "durable"];
 const hex = (value: unknown, length: number): value is string => typeof value === "string" && new RegExp(`^[a-f0-9]{${length}}$`).test(value);
@@ -127,8 +128,8 @@ export function provenance(value: any, checkout = root) {
   return { bun: "1.4.4", installed: value.installed, publicInstalled: value.publicInstalled, installedChecks, publicChecks, mismatches, backend: entries(value.backend, false), drivers: entries(value.drivers, false) };
 }
 
-function readJUnit(path: string): string {
-  const maximum = 8 * 1024 * 1024, bytes = Buffer.alloc(maximum + 1), fd = openSync(path, "r");
+function readJUnit(path: string, maximum = 8 * 1024 * 1024): string {
+  const bytes = Buffer.alloc(maximum + 1), fd = openSync(path, "r");
   let length = 0;
   try {
     while (length < bytes.length) {
@@ -157,7 +158,9 @@ async function main() {
   const safe = mkdtempSync(join(resolve(destination), ".hosted-evidence-"));
   let exit = runtimeExit, processed = false;
   let xml = junit(undefined, true);
+  let matrix: ReturnType<typeof matrixObservation> | { phase: "invalid"; state: "failed" } = { phase: "invalid", state: "failed" };
   try {
+    if (suite === "matrix") matrix = matrixObservation(readJUnit(join(raw, "matrix.jsonl"), 8192), runtimeExit);
     const data = provenance(JSON.parse(readFileSync(join(raw, "provenance.json"), "utf8")));
     if (data.mismatches.length) exit = 1;
     if (suite === "strict" && runtimeExit === 0 && !existsSync(join(raw, "unit.xml"))) throw new Error("Missing JUnit");
@@ -174,6 +177,7 @@ async function main() {
     xml = junit(undefined, true);
   }
   const summary = { suite, runtimeExit, exit, evidenceProcessed: processed, diagnostics: "withheld; private TMPDIR/grayboard-evidence-* only" };
+  if (suite === "matrix") writeFileSync(join(safe, "matrix.json"), JSON.stringify(matrix, null, 2) + "\n");
   writeFileSync(join(safe, "unit.xml"), xml);
   writeFileSync(join(safe, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
   writeFileSync(join(safe, "hosted.log"), `Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}; raw diagnostics withheld\n`);
