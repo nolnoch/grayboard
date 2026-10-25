@@ -163,10 +163,12 @@ export function moveClaims(db: Database, from: string, to: string, now = Date.no
 // inside the caller's transaction; returns whether `handle` held it.
 export function ackQueueClaim(db: Database, handle: string, key: string, now = Date.now()): boolean {
   const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
-  if (!cur || cur.expires_at <= now || cur.holder !== handle) return false;
+  // A lapsed row the sweep hasn't reached is still the holder's: the reply
+  // handled the post, so redelivering it would duplicate the work (#234).
+  if (!cur || cur.holder !== handle) return false;
   db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
   watchersCc(db, key, true);
-  logEvent(db, "release", handle, { ...cur, note: "ack" }, now);
+  logEvent(db, "release", handle, { ...cur, note: cur.expires_at <= now ? "ack (late)" : "ack" }, now);
   return true;
 }
 
