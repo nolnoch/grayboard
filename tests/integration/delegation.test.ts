@@ -44,6 +44,10 @@ test("local: a delegate request lands on the live launcher, harness-neutral, tra
   expect(r.to).toBe("be");
   expect(r.delivered_now).toBe(true);
   expect(r.human_fallback).toBeUndefined();
+  // The delivered note is the builder's, the same string the server sends
+  // (review 13).
+  expect(r.note).toContain("Recipient was online; pushed.");
+  expect(r.note).toContain("settle the thread");
 
   // The launcher was pushed the payload: persona and task, the parent-relay
   // floor and its invariant, and no model names.
@@ -128,15 +132,23 @@ test("server: the hello's launcher flag records the capability; delegate deliver
     const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
     expect(peers.find((p) => p.handle === "you@example.com/be")?.launcher).toBe(true);
 
-    // A bare name resolves like dm_send's recipient (#184 review 7); the
-    // plugin forwards context.
+    // A bare name resolves like dm_send's recipient (#184 review 7) — and a
+    // mixed-case one too (review 15). The delivered note is the shared
+    // builder's, the same string local sends (review 13).
     const r = await call(sim.c, "delegate", { persona: "a doc agent", task: "draft the README intro", to: "be", context: "audience: first-time users" });
     expect(r.to).toBe("you@example.com/be");
     expect(r.delivered_now).toBe(true);
-    await until(() => be.pushes.length > 0, 10_000, "the launcher's push");
-    const payload = String(be.pushes[be.pushes.length - 1]!.content);
+    expect(r.note).toContain("Recipient was online; pushed.");
+    expect(r.note).toContain("settle the thread");
+    const mixed = await call(sim.c, "delegate", { persona: "a doc agent", task: "t2", to: "Be" });
+    expect(mixed.to).toBe("you@example.com/be");
+    await until(() => be.pushes.length > 1, 10_000, "the second push");
+    // Each delegate's push carries its own brief: the first with its context,
+    // the mixed-case one without.
+    const payload = String(be.pushes[0]!.content);
     expect(payload).toContain('"persona": "a doc agent"');
     expect(payload).toContain('"context": "audience: first-time users"');
+    expect(String(be.pushes[1]!.content)).toContain('"task": "t2"');
 
     // sim's dm_inbox shows be's report; one dm_ack settles the thread.
     await call(be.c, "dm_send", { to: "sim", body: "Result: drafted.", parent_id: r.message_id });
@@ -145,7 +157,9 @@ test("server: the hello's launcher flag records the capability; delegate deliver
       return (after.unanswered ?? []).some((m: any) => m.from === "you@example.com/be");
     }, 10_000, "the result to arrive");
     const thread = await call(sim.c, "dm_thread", { thread: r.message_id });
-    await call(sim.c, "dm_ack", { message_id: [r.message_id, thread.at(-1).id] });
+    // Both delegations' threads are settled: the mixed-case one is its own
+    // promise.
+    await call(sim.c, "dm_ack", { message_id: [r.message_id, mixed.message_id, thread.at(-1).id] });
     const settled = await call(sim.c, "dm_inbox");
     expect((settled.promised ?? []).some((p: any) => p.to === "you@example.com/be")).toBe(false);
   } finally {
@@ -160,7 +174,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
     const aliceBe = await srv.session(alice, "be", { BUS_LAUNCHER: "1" });
-    const bobBe = await srv.session(bob, "be", { BUS_LAUNCHER: "1" });
+    await srv.session(bob, "be", { BUS_LAUNCHER: "1" });
     const bobSim = await srv.session(bob, "sim");
 
     // Auto-pick: bob's own launcher takes it, never alice's (whose handle
@@ -223,14 +237,20 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   // A sidecar under the launcher's name without BUS_LAUNCHER — the §13
   // subagent pattern — must not clear the owner's opt-in.
   await localSession(dir, "be", { extra: { BUS_PUSH: "off" } });
-  const after = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
+  const after = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];
   expect(after.find((p) => p.handle === "be")?.launcher).toBe(true);
 
-  // And a push-off session with BUS_LAUNCHER=1 doesn't advertise either
-  // (review 6, local half): it can't receive a delegation.
-  await localSession(dir, "be", { extra: { BUS_PUSH: "off", BUS_LAUNCHER: "1" } });
-  const after2 = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
-  expect(after2.find((p) => p.handle === "be")?.launcher).toBe(true);
+  // And a push-off session that binds a fresh name is not a launcher either
+  // (review 6, local half): it can't receive a delegation, so its flag never
+  // reaches the roster, and its instructions carry no launcher sentence.
+  const solo = await localSession(dir, "solo", { extra: { BUS_PUSH: "off", BUS_LAUNCHER: "1" } });
+  const soloPeers = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];
+  expect(soloPeers.find((p) => p.handle === "solo")?.launcher).toBeUndefined();
+  // Its instructions carry no launcher sentence: it can't act on a request.
+  expect(solo.c.getInstructions()).not.toContain("You're a launcher session");
+  // The positive control proves both observables: a push launcher's
+  // instructions do carry the sentence (review 6: the gate, both modes).
+  expect(be.c.getInstructions()).toContain("You're a launcher session");
 }, 30_000);
 
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
@@ -252,3 +272,117 @@ test("server: the human fallback checks Slack reachability (review 10)", async (
     srv.stop();
   }
 }, 30_000);
+
+test("local: a re-pick retracts the missed pick's message and returns the new one's id (review 16/12)", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const bo = await localSession(dir, "bo", { extra: { BUS_LAUNCHER: "1" } });
+  // sim pauses between resolution and delivery — the exact window the re-pick
+  // races (review 12: the liveness snapshot is a poke, delivery pokes again).
+  const goFile = join(dir, "pause-release");
+  const sim = await localSession(dir, "sim", { extra: { BUS_TEST_PAUSE: "delegate:after-resolve", BUS_TEST_PAUSE_FILE: goFile } });
+
+  const pending = call(sim.c, "delegate", { persona: "a researcher", task: "t" });
+  await until(() => sim.stderr().includes("test pause hit: delegate:after-resolve"), 10_000, "sim to hit the pause");
+
+  // be was the pick (first by name) and its socket dies inside the window:
+  // the snapshot called it live, the delivery poke misses.
+  rmSync(join(dir, "sock.be"));
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(goFile, "go");
+  const r = await pending;
+  expect(r.to).toBe("bo");
+  expect(r.delivered_now).toBe(true);
+
+  // The result's message id is the message bo took, and nothing for be
+  // remains queued.
+  const { Database } = await import("bun:sqlite");
+  const bus = new Database(join(dir, "bus.db"), { readonly: true });
+  try {
+    const row = bus.query(`SELECT recipient FROM messages WHERE id = ?`).get(r.message_id) as any;
+    expect(row.recipient).toBe("bo");
+    const stranded = bus.query(`SELECT COUNT(*) AS n FROM messages WHERE sender = 'sim' AND recipient = 'be'`).get() as any;
+    expect(stranded.n).toBe(0);
+  } finally {
+    bus.close();
+  }
+  await until(() => bo.pushes.length > 0, 10_000, "the re-picked launcher's push");
+  expect(be.pushes.length).toBe(0);
+
+  // The promise tracks the launcher that took the work.
+  const inbox = await call(sim.c, "dm_inbox");
+  expect((inbox.promised ?? []).some((p: any) => p.to === "bo")).toBe(true);
+  expect((inbox.promised ?? []).some((p: any) => p.to === "be")).toBe(false);
+}, 30_000);
+
+test("server: a hold owner with the launcher flag isn't advertised or instructed (review 6)", async () => {
+  const srv = new TestServer();
+  try {
+    const token = await srv.login("you@example.com");
+    // A hold connection owns its name but can't receive pushes: the flag and
+    // the instruction are gated on push mode (review 6). The positive
+    // control proves both observables: a push launcher is advertised and
+    // instructed.
+    const pusher = srv.client(token, "be", { hello: { launcher: true } });
+    const pushHello = await pusher.connect();
+    expect(pushHello.type).toBe("hello_ok");
+    expect((pushHello.notices ?? []).join("\n")).toContain("You're a launcher session");
+
+    const held = srv.client(token, "bo", { push: false, hello: { hold: true, launcher: true } });
+    const heldHello = await held.connect();
+    expect(heldHello.type).toBe("hello_ok");
+    expect((heldHello.notices ?? []).join("\n")).not.toContain("You're a launcher session");
+
+    const sim = await srv.session(token, "sim");
+    const peers = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];
+    expect(peers.find((p) => p.handle === "you@example.com/bo")?.launcher).toBeUndefined();
+    await expect(call(sim.c, "delegate", { persona: "p", task: "t", to: "bo" })).rejects.toThrow(/isn't a launcher session/);
+  } finally {
+    srv.stop();
+  }
+}, 30_000);
+
+test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
+  const { FakeSlack } = await import("./fake_slack.ts");
+  const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
+  const srv = new TestServer({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  try {
+    await srv.app.slackReady;
+    const token = await srv.login("alice@example.com");
+    // Link, so the human is really reachable: the bridge is running and the
+    // user is linked (review 10's reachability, not a last_seen row).
+    const r = await srv.api(token, "POST", "/api/slack/link");
+    slack.say(`link ${r.body.code}`);
+    await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
+
+    const sim = await srv.session(token, "sim");
+    const req = await call(sim.c, "delegate", { persona: "a researcher", task: "t" });
+    expect(req.to).toBe("alice@example.com/human");
+    expect(req.human_fallback).toBe(true);
+    expect(req.note).toContain("settle the thread");
+
+    // The request is audited with its via (review 4).
+    const audits = srv.app.db.query(`SELECT action, target, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const requested = audits.filter((a) => a.action === "delegation.requested");
+    expect(requested).toHaveLength(1);
+    expect(JSON.parse(requested[0]!.detail).via).toBe("human_fallback");
+    expect(requested[0]!.target).toBe("alice@example.com/human");
+
+    // A refusal never masquerades as a request: with the human's identity
+    // row gone (a broken unlink's state), the send is refused — and the
+    // audit says refused, with no id-less requested row beside it.
+    srv.app.db.exec(`DELETE FROM identities WHERE name = 'human'`);
+    await expect(call(sim.c, "delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
+    const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);
+    const lastRefused = after.filter((a) => a.action === "delegation.refused").at(-1)!;
+    expect(JSON.parse(lastRefused.detail).reason).toMatch(/not found/);
+
+    // An unresolvable `to` is audited as a refusal too (review 4).
+    await expect(call(sim.c, "delegate", { persona: "p", task: "t", to: "ghost" })).rejects.toThrow();
+    const final = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid`).all() as any[];
+    expect(JSON.parse(final.at(-1)!.detail).reason).toBeTruthy();
+  } finally {
+    srv.stop();
+    slack.stop();
+  }
+}, 40_000);

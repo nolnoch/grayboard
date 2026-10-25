@@ -210,7 +210,11 @@ export function delegateNote(): string {
 
 // The fields every mode's delegate result carries: the dm_send-shaped base
 // (built by the mode's send path) plus which launcher took it and whether it
-// degraded to the human. One builder, so the modes can't drift.
+// degraded to the human. One builder, so the modes can't drift: the delivered
+// note is the builder's too — a delivered push says so, a queued one carries
+// the queue note the mode computed.
+const DELIVERED_NOTE = "Recipient was online; pushed.";
+
 export function delegateOkFields(
   d: Delegation,
   base: { message_id: number; delivered_now: boolean; pending?: true; recipient_last_seen?: string; undelivered_from_you?: number; note?: string },
@@ -219,6 +223,6 @@ export function delegateOkFields(
     ...base,
     to: d.to,
     ...(d.humanFallback ? { human_fallback: true as const } : {}),
-    note: [base.note, DELEGATE_NOTE].filter(Boolean).join(" "),
+    note: [base.delivered_now ? DELIVERED_NOTE : base.note, DELEGATE_NOTE].filter(Boolean).join(" "),
   };
 }

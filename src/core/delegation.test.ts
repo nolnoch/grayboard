@@ -243,6 +243,11 @@ describe("result note and fields (#246 review 8/13)", () => {
     expect(out.note).toContain("queued");
     expect(out.note).toContain("settle the thread");
     expect(out.undelivered_from_you).toBe(3);
+    // A delivered push says so, in every mode — the builder owns the note,
+    // even when the mode passed none (review 13).
+    const delivered = delegateOkFields({ to: "be", body: "b" }, { message_id: 2, delivered_now: true });
+    expect(delivered.note).toContain("Recipient was online; pushed.");
+    expect(delivered.note).toContain("settle the thread");
     // No human fallback: the key is absent.
     const plain = delegateOkFields({ to: "be", body: "b" }, { message_id: 1, delivered_now: true, note: "" });
     expect("human_fallback" in plain).toBe(false);

@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { delegateOkFields, delegateNote, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -348,20 +348,31 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       }
       throw e;
     }
+    // The window a re-pick races: the liveness snapshot above is taken once,
+    // the delivery pokes again below. Tests force the overlap here (a socket
+    // that dies between the two) — #246 review 12/16.
+    testPause("delegate:after-resolve");
     checkBody(d.body);
-    const { id } = await insertMessage(IDENTITY, d.to, d.body, null, true, []);
-    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: id });
+    // The message id tracks the pick that owns the work: a re-pick replaces
+    // both (review 16).
+    let msgId = (await insertMessage(IDENTITY, d.to, d.body, null, true, [])).id;
+    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
     if (!delivered && !d.humanFallback) {
       // The pick may have landed in a bind swap: re-resolve once, excluding
-      // the launcher that didn't take it.
+      // the launcher that didn't take it. The first message is retracted
+      // first — left queued, that name's next holder would drain it and
+      // spawn the same work again (#246 review 16) — and the re-pick only
+      // proceeds when the retraction wins; otherwise the request stays
+      // queued for the first pick, which the catch below treats as fine.
       try {
         const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
-        if (d2.to !== d.to && !d2.humanFallback) {
-          const { id: id2 } = await insertMessage(IDENTITY, d2.to, d2.body, null, true, []);
+        if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
+          const id2 = (await insertMessage(IDENTITY, d2.to, d2.body, null, true, [])).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
           d = d2;
+          msgId = id2;
           delivered = await deliver(d2.to);
         }
       } catch {
@@ -371,9 +382,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     }
     const seen = lastSeen(db, d.to);
     const base = delivered
-      ? { message_id: id, delivered_now: true, pending: true as const, note: "Recipient was online; pushed." }
+      ? { message_id: msgId, delivered_now: true, pending: true as const }
       : {
-          message_id: id,
+          message_id: msgId,
           delivered_now: false,
           pending: true as const,
           note: queuedNote(d.to, seen),
