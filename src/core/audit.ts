@@ -14,7 +14,7 @@
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
 
 export function writeCoreAudit(
   db: Database,

@@ -182,4 +182,16 @@ test("the harness is the first ancestor past a launcher, or BUS_HARNESS_PID; a b
   expect(await fail({ BUS_SESSION_KEY: "abc" })).toContain("BUS_SESSION_KEY must be 64 lowercase hex characters");
   expect(await fail({ BUS_HARNESS_PID: String(process.pid) })).toContain("set BUS_SESSION_KEY with it");
   expect(await fail({ BUS_SESSION_KEY: mintSessionKey(), BUS_HARNESS_PID: "0" })).toContain("BUS_HARNESS_PID must be a process id");
+  // Audit S4 (#329): a live process this one doesn't run under would keep the
+  // session alive past its real harness. Audit W11: a tools-only process's
+  // liveness is its own, so it never resolves a harness to refuse over.
+  const stranger = Bun.spawn(["sleep", "30"]);
+  try {
+    expect(await fail({ BUS_SESSION_KEY: mintSessionKey(), BUS_HARNESS_PID: String(stranger.pid) })).toContain(`BUS_HARNESS_PID ${stranger.pid} isn't an ancestor of this process`);
+    const toolsKey = mintSessionKey();
+    await localSession(dir, "api", { extra: { BUS_PUSH: "off", BUS_SESSION_KEY: toolsKey, BUS_HARNESS_PID: String(stranger.pid) } });
+    expect(rows(`SELECT delivery FROM ids WHERE id = ?`, idAddress(toolsKey))).toEqual([{ delivery: "none" }]);
+  } finally {
+    stranger.kill();
+  }
 }, 30_000);

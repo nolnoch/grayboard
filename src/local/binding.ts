@@ -19,9 +19,9 @@ import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
-import { aliveRows, commandName, harnessAncestor, isAlive, procStart } from "../shared/proc.ts";
+import { aliveRows, ancestors, commandName, harnessAncestor, isAlive, procStart } from "../shared/proc.ts";
 import { localMail } from "./mailbox.ts";
-import { poke } from "./wakeup.ts";
+import { deliverEnded, poke } from "./wakeup.ts";
 
 // A session as binding reads it: its bindings row (liveness), its ids row's
 // harness and cwd, and the name it holds, if any: its hold, or for a 1.x
@@ -87,6 +87,10 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
     if (!/^[1-9][0-9]*$/.test(raw)) return `BUS_HARNESS_PID must be a process id, not "${raw}"`;
     const start = procStart(Number(raw));
     if (start === undefined) return `BUS_HARNESS_PID ${raw} isn't a running process`;
+    // Only a process this one runs under can be its harness: any other (pid
+    // 1, an unrelated long-lived process) would keep the session alive after
+    // its real harness is gone.
+    if (!ancestors().includes(Number(raw))) return `BUS_HARNESS_PID ${raw} isn't an ancestor of this process`;
     return { pid: Number(raw), proc_start: start, rule: "env" };
   }
   const pid = harnessAncestor();
@@ -139,7 +143,7 @@ const ATTACH_WAIT_MS = 5000;
  * id.collision, when the session has ended, another live child is attached,
  * or the row isn't this harness's. `held` is the name the session holds.
  */
-export async function attachSession(db: Database, s: SessionRow, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
+export async function attachSession(db: Database, s: SessionRow, human: boolean, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
   // Only a child of this harness is worth waiting for; any other refuses.
   const predecessor = () => {
     const b = db.prepare(`SELECT pid, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
@@ -168,10 +172,15 @@ export async function attachSession(db: Database, s: SessionRow, ms = ATTACH_WAI
     if (b.attached_pid !== null && isAlive(b.attached_pid, b.attached_start)) {
       return refuse(`is served by the live process ${b.attached_pid}`, { attached_pid: b.attached_pid });
     }
+    const hold = db.prepare(`SELECT address FROM alias_holds WHERE id = ?`).get(s.session_id) as { address: string } | null;
+    // The human's handle carries its authority (#announce): a restart takes
+    // it back only as the human's bridge, and the bridge only the human's.
+    if (hold && isHuman(db, hold.address) !== human) {
+      return refuse(human ? `holds "${hold.address}", which isn't the declared human handle` : `holds the human handle "${hold.address}", and this process isn't BUS_HUMAN=1`);
+    }
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
     writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
-    const hold = db.prepare(`SELECT address FROM alias_holds WHERE id = ?`).get(s.session_id) as { address: string } | null;
     return { ok: true, held: hold?.address ?? null };
   }).immediate();
 }
@@ -269,15 +278,34 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const orphans = db.prepare(ORPHAN_SQL).all() as { id: string }[];
   if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
   testPause("end:before-txn");
-  const ended = db.transaction(() => {
-    const now = Date.now();
-    const out = reap(db, dead, now);
-    for (const { id } of orphans) {
-      if (db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(id)) continue;
-      merge(out, id, endSession(db, localMail(db), id, { why: "its process row was removed by an older grayboard", now }));
+  // Each candidate ends in its own transaction (#284 S3): one end that fails
+  // is logged and audited, and leaves the others ended and this opener
+  // working, instead of failing every process that opens the bus.
+  const ended: Ended = { ended: [], wake: [] };
+  const each = (id: string, run: (now: number) => Ended) => {
+    try {
+      const r = db.transaction(() => run(Date.now())).immediate();
+      ended.ended.push(...r.ended);
+      for (const h of r.wake) if (!ended.wake.includes(h)) ended.wake.push(h);
+    } catch (err) {
+      console.error(`grayboard: ending dead session ${id} failed:`, err);
+      try {
+        writeCoreAudit(db, "id.end_failed", id, id, { error: String(err), by_pid: process.pid });
+      } catch {
+        // The audit write failing too is in the stderr line above.
+      }
     }
-    return out;
-  }).immediate();
+  };
+  for (const r of dead) each(r.session_id, (now) => reap(db, [r], now));
+  for (const { id } of orphans) {
+    each(id, (now) => {
+      const out: Ended = { ended: [], wake: [] };
+      if (!db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(id)) {
+        merge(out, id, endSession(db, localMail(db), id, { why: "its process row was removed by an older grayboard", now }));
+      }
+      return out;
+    });
+  }
   return { alive, ...ended };
 }
 
@@ -445,7 +473,10 @@ export const QUEUED_FOR_SQL = `SELECT j.value AS name,
  * used. Live names, viewers and humans are left out.
  */
 export async function candidateNames(db: Database, suggested: string | null): Promise<Candidate[]> {
-  const live = new Set(liveSessions(db).alive.map((r) => r.name).filter((n): n is string => n !== null));
+  const sessions = liveSessions(db);
+  // The sessions this check found dead were ended: their bounces and releases wake now.
+  await deliverEnded(sessions);
+  const live = new Set(sessions.alive.map((r) => r.name).filter((n): n is string => n !== null));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const agent = agentName(db);

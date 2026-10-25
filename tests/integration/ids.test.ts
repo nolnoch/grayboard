@@ -222,3 +222,17 @@ test("race: a send that reaches the write lock after the end is refused with id_
   expect(await opener.p.exited).toBe(0);
   expect(be.pushes.filter((p) => p.meta.kind === "bounce")).toEqual([]);
 }, 30_000);
+
+// Audit F3 (#329): `grayboard claim` as a name acts as the session holding
+// it, address set and all, so it can release a claim that session took
+// under its ID before it bound.
+test("the CLI acting as a bound name releases a claim its session took as the ID", async () => {
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("claim_take", { key: "ticket:ENG-9" });
+  await s.call("bind", { name: "fe", create: true });
+  expect(rows<{ holder: string }>(`SELECT holder FROM claims WHERE key = 'ticket:ENG-9'`)).toEqual([{ holder: id }]);
+  const r = await runCli(["--as", "fe", "claim", "release", "ticket:ENG-9"], { cwd: dir, env: localEnv(dir) });
+  expect(r.code).toBe(0);
+  expect(rows(`SELECT key FROM claims`)).toEqual([]);
+}, 30_000);

@@ -185,15 +185,20 @@ test("the rotation prefers live lanes and falls back to offline ones", () => {
 });
 
 // #284 S6: an unbound live session is a lane by its ID; once it holds an
-// alias the alias is the lane, and an ended ID is none.
-test("an unbound live ID subscribed to a queue is a lane; bound or ended, it isn't", () => {
+// alias the alias is the lane (audit W9: the subscription stays under the
+// ID, so the session stays in the rotation), and an ended ID is none.
+test("an unbound live ID subscribed to a queue is a lane by its ID, then by the alias it binds; ended, none", () => {
   const ID = "id:0123456789abc";
   registerId(db, { id: ID, principal: null, launcher: false });
   subscribe(db, ID, "work", "push");
   const lanes = () => queueLanes(db, getBoard(db, "work")!, "be").sort();
   expect(lanes()).toEqual(["fe", ID, "sim"].sort());
   expect(post(db, "be", "work", "for the live one", null, { online: (h) => h === ID }).wake).toEqual([ID]);
+  ensureAlias(db, "qa", "test");
   holdAlias(db, "qa", ID);
+  expect(lanes()).toEqual(["fe", "qa", "sim"]);
+  expect(post(db, "be", "work", "for the bound one", null, { online: (h) => h === "qa" }).wake).toEqual(["qa"]);
+  setQueueParticipation(db, "qa", false);
   expect(lanes()).toEqual(["fe", "sim"]);
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(ID);
   db.prepare(`UPDATE ids SET ended_at = 1 WHERE id = ?`).run(ID);

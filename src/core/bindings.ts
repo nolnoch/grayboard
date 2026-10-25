@@ -57,6 +57,11 @@ export function dropHold(db: Database, address: string, id: string): void {
   db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);
 }
 
+/** The session holding `address` now, or null. */
+export function holderOf(db: Database, address: string): string | null {
+  return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
+}
+
 /** At server start: no connection outlives the server, so no hold is live. */
 export function clearHolds(db: Database): void {
   db.prepare(`DELETE FROM alias_holds`).run();

@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
-import { IdCollision, prunePosts } from "../core/boards.ts";
-import { acquireName, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
+import { claim, watch } from "../core/claims.ts";
+import { acquireName, attachSession, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -69,6 +70,44 @@ test("a hold whose bindings row a 1.x reap deleted is swept and its session ende
   expect(liveSessions(db)).toMatchObject({ alive: [], ended: [id] });
   expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
   expect((db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null }).ended_at).not.toBeNull();
+});
+
+// Audit A6 (#329): one dead session whose end throws doesn't roll back the
+// others' ends or fail the opener; the failure is audited.
+test("a dead session whose end fails is audited and the others still end", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const bad = "id:0123456789abe", good = "id:0123456789abf";
+  for (const id of [bad, good]) registerSession(db, { ...thisSession(id), pid: 999999, proc_start: null });
+  createBoard(db, "be", "work", "work items");
+  claim(db, bad, "ticket:ENG-5", { board: "work" });
+  watch(db, "qa", "ticket:ENG-5");
+  setAccess(db, { ...openAccess(db), resolveMention: () => { throw new Error("disk on fire"); } });
+
+  expect(liveSessions(db)).toMatchObject({ alive: [], ended: [good] });
+  expect(db.prepare(`SELECT id FROM ids WHERE ended_at IS NOT NULL`).all()).toEqual([{ id: good }]);
+  const failed = db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.end_failed'`).get() as { target: string; detail: string };
+  expect(failed.target).toBe(bad);
+  expect(JSON.parse(failed.detail)).toMatchObject({ error: "Error: disk on fire", by_pid: process.pid });
+});
+
+// Audit S3 (#329): a keyed restart takes back the human's handle only as the
+// human's bridge, and the bridge takes back only the human's handle.
+test("a keyed attach is refused when the held handle and BUS_HUMAN disagree", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abe";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self);
+  declareHuman(db, "boss");
+  holdAlias(db, "boss", id);
+  // The previous child is gone; the harness (this process) lives.
+  db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: false, error: expect.stringContaining(`holds the human handle "boss", and this process isn't BUS_HUMAN=1`) });
+  expect(await attachSession(db, self, true)).toEqual({ ok: true, held: "boss" });
+  db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+  holdAlias(db, "fe", id);
+  db.prepare(`DELETE FROM alias_holds WHERE address = 'boss'`).run();
+  expect(await attachSession(db, self, true)).toMatchObject({ ok: false, error: expect.stringContaining(`holds "fe", which isn't the declared human handle`) });
 });
 
 // #210: a retry loop refused for the same reason is one row with a count.

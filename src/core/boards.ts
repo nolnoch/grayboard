@@ -535,9 +535,11 @@ export type PostOpts = {
 // Eligible lanes for a queue board's rotation, least-recently-woken first
 // (never-woken first, then by handle). A lane is a push subscriber who isn't
 // the poster, hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer: an alias, or a session ID that holds none (#284 S8; a
-// bound session's lane is its alias, and an ID can't opt out). With `online`, live lanes come first; offline lanes are
-// the fallback in the same order, so an empty live set still delivers.
+// read-only viewer. A session's lane is the alias it holds, else its ID
+// (#284 S8; an ID can't opt out), whichever address it subscribed under: a
+// session that subscribed unbound stays in the rotation after it binds. With
+// `online`, live lanes come first; offline lanes are the fallback in the same
+// order, so an empty live set still delivers.
 export function queueLanes(
   db: Database,
   b: Board,
@@ -549,13 +551,16 @@ export function queueLanes(
   const rows = (
     db
       .prepare(
-        `SELECT s.handle FROM subscriptions s LEFT JOIN aliases h ON h.address = s.handle
-         LEFT JOIN ids i ON i.id = s.handle
-         WHERE s.board = ? AND s.mode = 'push' AND s.handle != ?
-           AND (h.address IS NOT NULL AND h.queue_off IS NULL
-                OR i.id IS NOT NULL AND i.ended_at IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id))
+        `WITH lanes AS (
+           SELECT COALESCE(ah.address, s.handle) AS lane FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle
+           WHERE s.board = ?1 AND s.mode = 'push')
+         SELECT l.lane AS handle FROM lanes l LEFT JOIN aliases h ON h.address = l.lane
+         LEFT JOIN ids i ON i.id = l.lane
+         WHERE l.lane != ?2
+           AND (h.address IS NOT NULL AND h.queue_off IS NULL OR i.id IS NOT NULL AND i.ended_at IS NULL)
+         GROUP BY l.lane
          ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                    WHERE o2.handle = s.handle AND p2.board = s.board) ASC NULLS FIRST, s.handle ASC`,
+                    WHERE o2.handle = l.lane AND p2.board = ?1) ASC NULLS FIRST, l.lane ASC`,
       )
       .all(b.name, poster) as { handle: string }[]
   )

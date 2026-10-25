@@ -77,6 +77,11 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
+// BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
+// has no adapter. Draining here would consume messages into a void. It is
+// still a session (#284 S7): its own ID, which its writes carry, but one that
+// receives nothing.
+const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_SESSION_KEY: an orchestrator minted this session's key, so it knows
 // the ID before the process exists (#284 decision 2). The session is then an
 // attachment to its harness: it outlives this process, and a restart under
@@ -91,8 +96,9 @@ if (!KEYED && process.env.BUS_HARNESS_PID !== undefined) {
   console.error("[grayboard] BUS_HARNESS_PID names a keyed session's harness; set BUS_SESSION_KEY with it");
   process.exit(1);
 }
-// A keyed session's harness, whose exit ends the session.
-const HARNESS = KEYED ? keyedHarness() : null;
+// A keyed session's harness, whose exit ends the session. A tools-only
+// process's liveness is its own (registerSession below), so it has none.
+const HARNESS = KEYED && PUSH ? keyedHarness() : null;
 if (typeof HARNESS === "string") {
   console.error(`[grayboard] ${HARNESS}`);
   process.exit(1);
@@ -109,11 +115,6 @@ if (RETENTION_DAYS === null) {
   process.exit(1);
 }
 
-// BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
-// has no adapter. Draining here would consume messages into a void. It is
-// still a session (#284 S7): its own ID, which its writes carry, but one that
-// receives nothing.
-const PUSH = process.env.BUS_PUSH !== "off";
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
 // (`grayboard human`), whose messages and posts reach agents marked
@@ -220,7 +221,7 @@ if (!PUSH) {
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
     if (KEYED && e.endedAt === null) {
-      const r = await attachSession(db, self);
+      const r = await attachSession(db, self, HUMAN);
       if (!r.ok) {
         console.error(`[grayboard] ${r.error}`);
         process.exit(1);
@@ -806,7 +807,7 @@ const shutdown = async () => {
   let ended: Ended = NOTHING_ENDED;
   try {
     // A keyed session outlives this process while its harness runs.
-    if (PUSH && HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);
+    if (HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);
     else ended = endLocalSession(db, SESSION_ID);
   } catch (err) {
     // Same: shutdown must not throw, but a session left unended is the

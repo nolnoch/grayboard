@@ -62,7 +62,8 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
 
 /** Create a board as the human. It starts quiet for them: replies to their
  * posts and @mentions still arrive, every other post doesn't. */
-export function runBoardCreate(name: string, purpose: string): void {
+export async function runBoardCreate(name: string, purpose: string): Promise<void> {
+  await deliverEnded(openEnded);
   const human = declaredHuman();
   const b = createBoard(db, human, name, purpose);
   subscribe(db, human, b.name, "quiet");
