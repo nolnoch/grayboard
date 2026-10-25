@@ -79,9 +79,9 @@ export function claim(
   // see. A public take would let any handle squat a future post's key - the
   // audit would record a delivery that never happened, and the lane's
   // reply-ack would fail (#192 review).
-  if (key.startsWith("queue:"))
+  if (key.startsWith("queue:") || key.startsWith("delegation:"))
     throw new CoreError(
-      `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
+      `claim keys starting "${key.startsWith("queue:") ? "queue:" : "delegation:"}" are reserved for delivery machinery; pick up that work through its own flow instead`,
     );
   expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
   const board = opts.board ? normalizeBoard(opts.board) : null;
@@ -194,7 +194,11 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 }
 
 // Claims are visible to everyone on the bus. The announcing board's name is
-// hidden from handles that can't see that board.
+// hidden from handles that can't see that board. Delegation takeover claims
+// (keyspace `delegation:<message id>`, src/core/delegation.ts) carry no
+// board: they're scoped like delegation itself, to the requester's own user
+// (#246 review's scope ruling) — other users don't learn a delegation is
+// outstanding, or on which handle.
 export function listClaims(db: Database, prefix?: string, viewer?: string): Claim[] {
   const rows = db
     .prepare(
@@ -202,7 +206,18 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
-  return rows.map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
+  return rows
+    .filter((c) => !c.key.startsWith("delegation:") || sameUserScope(viewer, c.holder))
+    .map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
+}
+
+// Server handles are `email/name`; local handles are bare names on a
+// one-user bus. Mirrors sameUser in src/core/delegation.ts (inlined: claims
+// can't import delegation — delegation imports this module).
+function sameUserScope(requester: string, candidate: string): boolean {
+  const cut = requester.lastIndexOf("/");
+  if (cut === -1) return true;
+  return candidate.startsWith(requester.slice(0, cut + 1));
 }
 
 // Delete lapsed claims and say so on their boards. The holder never confirmed
@@ -210,7 +225,10 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
 function sweepIn(db: Database, now: number): string[] {
-  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
+  // Delegation takeover claims are consumed only by sweepDelegationClaims:
+  // their redelivery needs the mode's delivery machinery, and a quiet delete
+  // here would drop the takeover (#242).
+  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? AND key NOT LIKE 'delegation:%' RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
   for (const c of gone) {
     logEvent(db, "expire", c.holder, c, now);
@@ -236,12 +254,36 @@ export function sweepExpired(db: Database, now = Date.now()): { wake: string[] }
   return db.transaction(() => ({ wake: sweepIn(db, now) })).immediate();
 }
 
-// One timer, armed for the next expiry of a claim with a board, so a lapse is
-// announced when it happens. Call arm() after anything that may have added a
-// claim (a tool call, a wakeup); it only ever moves the timer earlier.
+// Delegation takeover claims (keyspace `delegation:`, src/core/delegation.ts)
+// are consumed only here: the generic sweep leaves them (see sweepIn), and
+// their redelivery needs the mode's delivery machinery, supplied as
+// `deliver` — given the lapsed claim, it delivers the request to its next
+// launcher (or the human) and returns the handle to wake, or null. The
+// delete inside the transaction makes each lapse redeliver once, however
+// many sessions sweep.
+export function sweepDelegationClaims(db: Database, now: number, deliver: (c: Claim) => string | null): string[] {
+  return db.transaction(() => {
+    const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? AND key LIKE 'delegation:%' RETURNING *`).all(now) as Claim[];
+    const wake = new Set<string>();
+    for (const c of gone) {
+      logEvent(db, "expire", c.holder, c, now);
+      const lane = deliver(c);
+      if (lane) wake.add(lane);
+    }
+    return [...wake];
+  }).immediate();
+}
+
+// One timer, armed for the next expiry of a claim with a board — or a
+// delegation takeover claim (#242), whose lapse needs the mode's delivery
+// machinery: `onDelegationLapse` runs the mode's delegation sweep (it calls
+// sweepDelegationClaims with its own deliver callback) and returns the
+// handles to wake. Call arm() after anything that may have added a claim (a
+// tool call, a wakeup); it only ever moves the timer earlier.
 export function claimExpiryTimer(
   db: Database,
   onWake: (handles: string[]) => void,
+  onDelegationLapse?: () => string[],
 ): { arm(): void; stop(): void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
@@ -256,7 +298,9 @@ export function claimExpiryTimer(
     at = Infinity;
     try {
       const { wake } = sweepExpired(db);
-      if (wake.length) onWake(wake);
+      const takeover = onDelegationLapse ? onDelegationLapse() : [];
+      const all = [...new Set([...wake, ...takeover])];
+      if (all.length) onWake(all);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
       return set(Date.now() + 5_000);
@@ -264,7 +308,9 @@ export function claimExpiryTimer(
     arm();
   };
   const arm = () => {
-    const row = db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as {
+    const row = db
+      .prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL OR key LIKE 'delegation:%'`)
+      .get() as {
       next: number | null;
     };
     if (row.next !== null && row.next < at) set(row.next);

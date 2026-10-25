@@ -156,11 +156,18 @@ export function initCoreSchema(db: Database): void {
   // Session context, added after the roster: where the session runs (cwd in
   // local mode; place, as the client described it, in server mode) and a
   // free-text status it set, both reset when a session starts; and whether the
-  // handle is a declared human's (`grayboard human`), which persists.
+  // handle is a declared human's (`grayboard human`), which persists. Each
+  // column gets its own literal statement: identifiers can't be parameters,
+  // so the allowlist IS the statement list.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"], ["launcher", "INTEGER"]]) {
-    if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
-  }
+  if (!handleCols.has("cwd")) db.exec("ALTER TABLE handles ADD COLUMN cwd TEXT");
+  if (!handleCols.has("place")) db.exec("ALTER TABLE handles ADD COLUMN place TEXT");
+  if (!handleCols.has("status")) db.exec("ALTER TABLE handles ADD COLUMN status TEXT");
+  if (!handleCols.has("status_at")) db.exec("ALTER TABLE handles ADD COLUMN status_at INTEGER");
+  if (!handleCols.has("human")) db.exec("ALTER TABLE handles ADD COLUMN human INTEGER");
+  if (!handleCols.has("queue_off")) db.exec("ALTER TABLE handles ADD COLUMN queue_off INTEGER");
+  if (!handleCols.has("launcher")) db.exec("ALTER TABLE handles ADD COLUMN launcher INTEGER");
+  if (!handleCols.has("last_delegated_at")) db.exec("ALTER TABLE handles ADD COLUMN last_delegated_at INTEGER");
 
   // An announcement's TTL (`grayboard announce --ttl`); null for other posts.
   const postCols = db.prepare(`PRAGMA table_info(posts)`).all() as { name: string }[];
@@ -174,9 +181,8 @@ export function initCoreSchema(db: Database): void {
   // A refused binding event's repeats (#210): NULL count means 1, NULL
   // last_at means at.
   const bindingCols = new Set((db.prepare(`PRAGMA table_info(binding_events)`).all() as { name: string }[]).map((c) => c.name));
-  for (const col of ["count", "last_at"]) {
-    if (!bindingCols.has(col)) db.exec(`ALTER TABLE binding_events ADD COLUMN ${col} INTEGER`);
-  }
+  if (!bindingCols.has("count")) db.exec("ALTER TABLE binding_events ADD COLUMN count INTEGER");
+  if (!bindingCols.has("last_at")) db.exec("ALTER TABLE binding_events ADD COLUMN last_at INTEGER");
 
   // Local databases from before board scopes.
   const cols = db.prepare(`PRAGMA table_info(boards)`).all() as { name: string }[];

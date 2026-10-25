@@ -28,10 +28,21 @@ import {
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import {
+  ackDelegationClaim,
+  claimDelegation,
+  DELEGATION_KEY_PREFIX,
+  delegateOkFields,
+  humanDegrade,
+  launcherInstruction,
+  nextLauncher,
+  resolveDelegation,
+  setLauncher,
+  touchDelegated,
+} from "../core/delegation.ts";
 import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo } from "../shared/attachments.ts";
-import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims, moveClaims, sweepDelegationClaims, type Claim } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
   PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
@@ -104,6 +115,9 @@ type Hub = {
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: HelloLimiter;
+  // Set once the claim-expiry timer exists: a delivered delegation's
+  // takeover claim re-arms it (#242).
+  armExpiry?: () => void;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -203,8 +217,13 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
       },
     }),
   };
-  // Announces claims that lapse on their boards.
-  const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles));
+  // Announces claims that lapse on their boards, and runs the delegation
+  // takeover sweep when a takeover claim lapses (#242): the request is
+  // re-offered to the requester's next launcher, or degraded to their human.
+  const expiry = claimExpiryTimer(db, (handles) => wake(hub, handles), () =>
+    sweepDelegationClaims(db, Date.now(), (c) => redeliverTakeover(hub, c)),
+  );
+  hub.armExpiry = expiry.arm;
 
   const handlers = {
     open(_ws: Ws) {
@@ -291,6 +310,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
               break;
             }
             repo.messages.ack(ws.data.identityFull, m.id);
+            // The requester settling the delegation's promise ends the takeover:
+            // nobody should re-offer work the requester gave up on (#242).
+            ackDelegationClaim(db, me, m.id);
             send(ws, { type: "ack_ok", req_id: msg.req_id });
             break;
           }
@@ -757,6 +779,10 @@ function handleSend(
   for (const a of msg.attachments ?? []) {
     writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: parsed.full });
   }
+  // A reply in a delegation request's thread settles its takeover claim: the
+  // launcher's reply acks the work, the requester's settles it (#242). Other
+  // replies are unaffected — the claim's holder/requester check gates.
+  if (parentId !== null) ackDelegationClaim(db, ws.data.identityFull, parentId);
   const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
 
   const { note: extraNote, ...restExtra } = extra ?? {};
@@ -794,6 +820,44 @@ function handleSend(
 // audited: which launcher resolution picked and why, or the refusal (#184
 // review 4). The reply is a DelegateOk — the send_ok fields plus `to` and,
 // on the degrade path, human_fallback.
+// A delegation's takeover claim lapsed: the launcher went silent (a crash, a
+// /clear mid-work, a context wrap). Re-offer the request to the requester's
+// next launcher — the original body verbatim plus a redelivery marker that
+// carries the request id (the dedup token the launcher instruction's
+// "already handled" rule keys on). No other launcher: the request degrades
+// to the requester's human, the same fallback the first resolve would have
+// taken, checked now. Returns the handle to wake, or null.
+function redeliverTakeover(hub: Hub, c: Claim): string | null {
+  const requester = c.note ?? "";
+  const requestId = Number(c.key.slice(DELEGATION_KEY_PREFIX.length));
+  const orig = hub.repo.messages.getById(requestId);
+  if (!requester || !orig || orig.sender !== requester || orig.recipient_type !== "user") return null;
+  const online = (h: string) => hub.registry.get(h)?.data.ready === true;
+  const body = `${orig.body}\n\n[redelivered] This request was first delivered to another launcher that didn't report back (request ${requestId}); if you already handled it, don't act again.`;
+  const deliverTo = (to: string, text: string, audit: Record<string, unknown>): number => {
+    const m = hub.repo.messages.insert(requester, "user", to, text, null, true, []);
+    writeAudit(hub.repo, "delegation.requested", requester, to, { ...audit, message_id: m.id });
+    touchDelegated(hub.db, to, Date.now());
+    const ws = hub.registry.get(to);
+    if (ws?.data.ready) send(ws, { type: "push", message: showPending(m) });
+    return m.id;
+  };
+  const lane = nextLauncher(hub.db, requester, c.holder, online);
+  if (lane) {
+    const id = deliverTo(lane, body, { via: "auto", redelivered_from: c.holder });
+    claimDelegation(hub.db, id, lane, requester);
+    return lane;
+  }
+  const user = hub.repo.users.findByEmail(requester.split("/")[0] ?? "");
+  const reachable = () => hub.slackRunning() && !!user && !!hub.repo.slack.linkFor(user.id);
+  const d = humanDegrade(hub.db, requester, reachable);
+  if (d) {
+    deliverTo(d.to, d.body, { via: "human_fallback", redelivered_from: c.holder });
+    return null;
+  }
+  return null;
+}
+
 function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): void {
   const { repo } = hub;
   const { authed } = ws.data;
@@ -831,6 +895,14 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
       via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
       message_id: sent.ok.message_id,
     });
+    // The takeover claim: a delivered request that its launcher goes silent
+    // on is re-offered to the next launcher after the TTL (#242). The human
+    // fallback takes none — a person isn't taken over.
+    if (!d.humanFallback) {
+      touchDelegated(hub.db, d.to, Date.now());
+      claimDelegation(hub.db, sent.ok.message_id, d.to, ws.data.identityFull);
+      hub.armExpiry?.();
+    }
   } else {
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).

@@ -386,3 +386,113 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     slack.stop();
   }
 }, 40_000);
+
+// Rotation (#242): an auto-picked delegation spreads across the user's live
+// launchers instead of feeding the first by name until it saturates.
+test("local: auto-pick rotates across the live launchers (#242)", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const ad = await localSession(dir, "ad", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+
+  const r1 = await call(sim.c, "delegate", { persona: "a researcher", task: "first brief" });
+  const r2 = await call(sim.c, "delegate", { persona: "a researcher", task: "second brief" });
+  // Never-delegated launchers first (name order), then the runner-up: the
+  // second request goes to the OTHER launcher. Reverting the rotation order
+  // (back to first-by-name) sends both to ad and fails here.
+  expect(r1.to).toBe("ad");
+  expect(r2.to).toBe("be");
+  await until(() => be.pushes.length > 0 && ad.pushes.length > 0, 10_000, "both launches' pushes");
+  expect(String(ad.pushes[0]!.content)).toContain('"task": "first brief"');
+  expect(String(be.pushes[0]!.content)).toContain('"task": "second brief"');
+}, 30_000);
+
+// Takeover (#242): a launcher that takes a request and goes silent loses it
+// to the next launcher when the TTL lapses — the requester's process runs
+// the takeover sweep (it wrote the claim), with a test-short TTL.
+test("local: a silent launcher's request is taken over by the next launcher (#242)", async () => {
+  const ad = await localSession(dir, "ad", { extra: { BUS_LAUNCHER: "1" } });
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  // The requester's process wrote the claim and runs the sweep; its TTL is
+  // the test lever.
+  const sim = await localSession(dir, "sim", { extra: { GRAYBOARD_DELEGATION_TTL_MS: "600" } });
+
+  const r = await call(sim.c, "delegate", { persona: "a researcher", task: "takeover probe" });
+  expect(r.to).toBe("ad");
+
+  // be takes over: the re-offer carries the original brief and the
+  // redelivery marker with the request id (the dedup token).
+  await until(() => be.pushes.length > 0, 15_000, "the takeover redelivery");
+  const payload = String(be.pushes.at(-1)!.content);
+  expect(payload).toContain("[redelivered]");
+  expect(payload).toContain(`request ${r.message_id}`);
+  expect(payload).toContain('"task": "takeover probe"');
+}, 30_000);
+
+test("local: the launcher's thread reply settles the takeover — no redelivery (#242)", async () => {
+  const ad = await localSession(dir, "ad", { extra: { BUS_LAUNCHER: "1" } });
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim", { extra: { GRAYBOARD_DELEGATION_TTL_MS: "600" } });
+
+  const r = await call(sim.c, "delegate", { persona: "a researcher", task: "takeover probe" });
+  expect(r.to).toBe("ad");
+
+  // ad replies in the request's thread right away — that acks the takeover.
+  await until(() => ad.pushes.length > 0, 10_000, "the launcher's push");
+  await call(ad.c, "dm_send", { to: "sim", body: "spawned", parent_id: r.message_id });
+
+  // Negative window: the TTL is long past; a takeover here would mean the
+  // reply didn't release the claim. Bounded, because the assertion is that
+  // nothing ever arrives.
+  const deadline = Date.now() + 1_500;
+  await until(() => Date.now() > deadline, 8_000, "the takeover window to pass");
+  expect(be.pushes.every((p) => !String(p.content).includes("takeover probe"))).toBe(true);
+}, 30_000);
+
+test("local: the requester's dm_ack settles the takeover too (#242)", async () => {
+  const ad = await localSession(dir, "ad", { extra: { BUS_LAUNCHER: "1" } });
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim", { extra: { GRAYBOARD_DELEGATION_TTL_MS: "600" } });
+
+  const r = await call(sim.c, "delegate", { persona: "a researcher", task: "takeover probe" });
+  expect(r.to).toBe("ad");
+  await call(sim.c, "dm_ack", { message_id: r.message_id });
+
+  const deadline = Date.now() + 1_500;
+  await until(() => Date.now() > deadline, 8_000, "the takeover window to pass");
+  expect(be.pushes.every((p) => !String(p.content).includes("takeover probe"))).toBe(true);
+}, 30_000);
+
+test("server: rotation and takeover run on the server's timer (#242)", async () => {
+  // The server runs in-process: the TTL lever is the test process's env.
+  const prevTtl = process.env.GRAYBOARD_DELEGATION_TTL_MS;
+  process.env.GRAYBOARD_DELEGATION_TTL_MS = "600";
+  const srv = new TestServer();
+  try {
+    const token = await srv.login("you@example.com");
+    const be = await srv.session(token, "be", { BUS_LAUNCHER: "1" });
+    const ad = await srv.session(token, "ad", { BUS_LAUNCHER: "1" });
+    const sim = await srv.session(token, "sim");
+
+    const r1 = await call(sim.c, "delegate", { persona: "a researcher", task: "first brief" });
+    expect(r1.to).toBe("you@example.com/ad");
+    const r2 = await call(sim.c, "delegate", { persona: "a researcher", task: "second brief" });
+    expect(r2.to).toBe("you@example.com/be");
+
+    // ad never replies: the server's takeover sweep re-offers the first
+    // request to be, whose push carries the marker.
+    await until(() => be.pushes.length > 1, 15_000, "the takeover redelivery");
+    const payload = String(be.pushes.at(-1)!.content);
+    expect(payload).toContain("[redelivered]");
+    expect(payload).toContain(`request ${r1.message_id}`);
+    expect(payload).toContain('"task": "first brief"');
+
+    // The takeover claim's audit chain: the re-offer was a delegation
+    // request to be, from the takeover sweep.
+    const audits = srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = 'delegation.requested' ORDER BY rowid`).all() as any[];
+    expect(audits.some((a) => a.target === "you@example.com/be" && JSON.parse(a.detail).redelivered_from === "you@example.com/ad")).toBe(true);
+  } finally {
+    if (prevTtl === undefined) delete process.env.GRAYBOARD_DELEGATION_TTL_MS;
+    else process.env.GRAYBOARD_DELEGATION_TTL_MS = prevTtl;
+    srv.stop();
+  }
+}, 45_000);
