@@ -136,6 +136,30 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
+// The bridge-down notice is durable, not hub memory: a fatal stop writes a
+// `bridge.stopped` audit row per linked user (src/server/slack.ts), and the
+// drain writes `bridge.notified`. An unsuppressed death newer than the last
+// delivery is still owed — across a restart too, which is why it lives in
+// the audit log — and drains once, at the user's next agent-session hello.
+// Reads and the write run synchronously, so two hellos of one user can't
+// both deliver.
+function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+  const target = `${email}/${HUMAN_NAME}`;
+  const stop = repo.audit.last("bridge.stopped", target);
+  if (!stop) return undefined;
+  let detail: { reason?: string; at?: string; suppressed?: boolean };
+  try {
+    detail = stop.detail ? (JSON.parse(stop.detail) as typeof detail) : {};
+  } catch {
+    return undefined;
+  }
+  if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  const notified = repo.audit.last("bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
+}
+
 // Does the connection answer a ping within ms? The plugin pongs every ping.
 function probe(ws: Ws, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -171,7 +195,8 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions = {}) {
     open(_ws: Ws) {
       // wait for hello
     },
-
+    // The Slack bridge died fatally: hold the notice for the owner's next
+    // hello (any of their identities), drained once per user per stop.
     message(ws: Ws, rawData: string | Buffer) {
       const raw = typeof rawData === "string" ? rawData : rawData.toString("utf8");
 
@@ -491,6 +516,13 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(db, undefined, full), full),
   ];
+  // Bridge-down notices drain on agent-session hellos only: the bridge's own
+  // human hello (HumanConn) would steal the notice into a handshake nobody
+  // reads, leaving the owner uninformed.
+  if (!ws.data.human) {
+    const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
+    if (bridgeNotice) notices.push(bridgeNotice);
+  }
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
   if (!push) return;

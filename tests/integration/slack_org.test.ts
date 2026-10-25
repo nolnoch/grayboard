@@ -301,6 +301,127 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   await until(() => posted("while disabled"));
 }, 30_000);
 
+test("a fatal bridge stop tells the owner on their next hello, once", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
+
+  const { WsClient } = await import("../support/ws_client.ts");
+  const be = new WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  const bridgeNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  expect(bridgeNotices).toHaveLength(1);
+  expect(bridgeNotices[0]).toContain("your Slack bridge stopped at ");
+  expect(bridgeNotices[0]).toContain("link_disabled");
+});
+
+test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
+  const first = await be.connect();
+  expect(((first.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+
+  // A second bridge instance (the server-restart analog) re-attaches the same
+  // user and dies fatally again inside the dedup window: the death records,
+  // the notice doesn't repeat.
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const second = new SlackBridge({
+    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
+  });
+  await second.start();
+  second.stop({ fatal: true, detail: "second fatal" });
+
+  const fe = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "fe");
+  const hello = await fe.connect();
+  const againNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  expect(againNotices).toHaveLength(0);
+  const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
+  expect(count.n).toBe(2);
+});
+
+test("a bridge that fails at boot tells its linked users, via the durable links", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  // A fresh bridge against a dead Slack URL throws at auth.test before any
+  // link is attached: exactly the boot-time failure app.ts makes fatal. The
+  // notify loop must run over the durable links, whose map is not empty.
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const boot = new SlackBridge({
+    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: "http://127.0.0.1:1/api/",
+  });
+  await boot.start().catch((e) => boot.stop({ fatal: true, detail: `not started: ${(e as Error).message}` }));
+
+  const row = srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human");
+  expect(row).toBeDefined();
+  expect(JSON.parse(row!.detail!)).toMatchObject({ reason: expect.stringMatching(/not started/) });
+
+  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  expect(((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+});
+
+// A restart inside the dedup window must not lose an armed-but-undelivered
+// notice: the dedup counts notices delivered, not deaths recorded.
+test("an armed but undelivered notice survives a restart inside the dedup window", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  // Death #1 arms a notice nobody has collected: no hello since.
+  srv.app.slack.stop({ fatal: true, detail: "token revoked" });
+
+  // The restart analog: a second bridge over the same database re-attaches
+  // and dies fatally again inside the dedup window. The owner is told once,
+  // of the newest death.
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const second = new SlackBridge({
+    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
+  });
+  await second.start();
+  second.stop({ fatal: true, detail: "token revoked again" });
+
+  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  const bridgeNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  expect(bridgeNotices).toHaveLength(1);
+  expect(bridgeNotices[0]).toContain("token revoked again");
+});
+
+// The guard at the drain site (only agent-session hellos drain) is what keeps
+// the bridge's own human hello from consuming the notice into a handshake
+// nobody reads: this test fails when the `if (!ws.data.human)` guard is removed.
+test("the bridge's own human hello doesn't drain the owner's notice", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "died" });
+  // A restarted bridge attaches the same user: its attach sends a human hello.
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const second = new SlackBridge({
+    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
+  });
+  await second.start();
+
+  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  expect(((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+});
+
+test("a deliberate bridge teardown stays silent (no audit row, no notice)", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop();
+  const { WsClient } = await import("../support/ws_client.ts");
+  const be = new WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  expect((hello.notices as string[] | undefined) ?? []).toHaveLength(0);
+  expect(srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human")).toBeUndefined();
+});
+
 test("a bridge that failed to start issues no codes", async () => {
   const down = serve("http://127.0.0.1:1/api/");
   try {
@@ -312,3 +433,26 @@ test("a bridge that failed to start issues no codes", async () => {
     down.stop();
   }
 }, 30_000);
+
+test("a fatal stop with no linked users writes nothing user-facing", async () => {
+  const down = serve("http://127.0.0.1:1/api/");
+  try {
+    await down.app.slackReady;
+    // The start failure is fatal, but with zero linked users there is nobody
+    // to tell and no user-facing row to write: the notify loop never runs.
+    const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
+    expect(rows.n).toBe(0);
+  } finally {
+    down.stop();
+  }
+}, 30_000);
+
+test("helloOk.human.linked is false while the bridge is down", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "recheck" });
+  const { WsClient } = await import("../support/ws_client.ts");
+  const be = new WsClient(srv.base, alice, "be");
+  const hello = await be.connect();
+  expect(hello.human?.linked).toBe(false);
+});
