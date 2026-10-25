@@ -103,6 +103,8 @@ export class Relay {
   // Slack → bus events, one at a time in arrival order: a reply reads its
   // thread's last_id, which the message before it may still be sending.
   private inbound: Promise<void> = Promise.resolve();
+  // Slack events queued or running on `inbound`.
+  private inboundPending = 0;
 
   constructor(
     private readonly store: RelayStore,
@@ -215,7 +217,14 @@ export class Relay {
         await this.upload(x.attachments, progress);
         save();
       }
-      const row = this.store.thread(x.kind, x.board, x.root);
+      let row = this.store.thread(x.kind, x.board, x.root);
+      // The owner's message that started this thread may still be mapping it:
+      // its bus call hands the agent the root's id before it returns (#232).
+      if (!row && this.inboundPending) {
+        this.debug(`outbox: ${x.kind} ${x.id} waits on ${this.inboundPending} Slack event(s) before threading`);
+        await this.inbound;
+        row = this.store.thread(x.kind, x.board, x.root);
+      }
       const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
       // The item's message ts; null when Slack took it but never said where.
       let ts: string | null | undefined;
@@ -381,7 +390,11 @@ export class Relay {
    * Settles when this one has been handled; never rejects.
    */
   onEvent(payload: Record<string, any>): Promise<void> {
-    const run = this.inbound.then(() => this.handle(payload)).catch((e) => this.log(`slack event failed: ${(e as Error).message}`));
+    this.inboundPending++;
+    const run = this.inbound
+      .then(() => this.handle(payload))
+      .catch((e) => this.log(`slack event failed: ${(e as Error).message}`))
+      .finally(() => this.inboundPending--);
     this.inbound = run;
     return run;
   }

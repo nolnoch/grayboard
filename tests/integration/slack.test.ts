@@ -310,7 +310,10 @@ test("#announce from Slack reaches every live agent marked human; acks come back
   await until(() => fe.pushes.find((p) => p.content === "shutting down in 30 min"));
   await call(be.c, "board_post", { board: "announce", body: "be: ack", parent_id: Number(got.meta.post_id) });
   expect((await until(() => slack.posts().find((p) => p.markdown_text?.includes("be: ack")))).thread_ts).toBe(a.ts);
-  await Bun.sleep(300);
+  // Barrier: a later post in the thread that does reach fe; be's ack, if it
+  // were fanned out to fe, is ahead of it in fe's outbox.
+  await call(be.c, "board_post", { board: "announce", body: "probe @fe", parent_id: Number(got.meta.post_id) });
+  await until(() => fe.pushes.find((p) => p.content === "probe @fe"));
   expect(fe.pushes.some((p) => p.content === "be: ack")).toBe(false);
 }, 30_000);
 
