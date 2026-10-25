@@ -34,7 +34,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   }) : undefined;
   const slackReady = slack?.start().catch((e) => {
     console.error(`[grayboard slack] not started: ${(e as Error).message}`);
-    slack.stop();
+    // A boot-time failure (bad bot token, Slack outage) is fatal, not
+    // deliberate: every linked user's human is silently offline and must be
+    // told. The stopped latch makes the subsequent onFatal stop a no-op.
+    slack.stop({ fatal: true, detail: `not started: ${(e as Error).message}` });
   });
 
   // Room for four messages' worth of upload bodies at once, one per user.
@@ -96,6 +99,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     server,
     repo,
     db,
+    handlers,
+    // Exposed for tests: the bridge instance, to drive fatal stops directly.
+    slack,
     // The heartbeat's auth re-check, for tests that run without it.
     revalidate,
     // Settles once the Slack bridge is up, or has given up.

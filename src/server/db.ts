@@ -95,6 +95,9 @@ export interface Repo {
   };
   audit: {
     write(row: AccessLogRow): void;
+    // The most recent row for this action+target, for dedup windows and
+    // "has this happened recently" checks. Undefined when none exists.
+    last(action: string, target: string): AccessLogRow | undefined;
     prune(olderThanMs: number): void;
   };
   slack: {
@@ -557,6 +560,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         db.run(
           "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
           [row.at, row.actor, row.action, row.target, row.detail],
+        );
+      },
+      last(action, target) {
+        return (
+          db
+            .query<AccessLogRow, [string, string]>(
+              "SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1",
+            )
+            .get(action, target) ?? undefined
         );
       },
       prune(olderThanMs) {

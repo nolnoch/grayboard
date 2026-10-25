@@ -16,6 +16,8 @@ export type AuditAction =
   | "auth.session_revoked"
   | "auth.user_disabled"
   | "auth.user_enabled"
+  | "bridge.notified"
+  | "bridge.stopped"
   | "hello.rate_limit_ended"
   | "hello.rate_limited"
   | "identity.created"
