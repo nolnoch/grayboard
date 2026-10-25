@@ -13,8 +13,10 @@ async function localClaims(prefix: string | undefined): Promise<ListedClaim[]> {
   const { localDbPath, openLocalDb } = await import("../local/open.ts");
   if (!existsSync(localDbPath())) return [];
   const { listClaims } = await import("../core/claims.ts");
-  const db = openLocalDb();
+  const { deliverEnded } = await import("../local/wakeup.ts");
+  const { db, ended } = openLocalDb();
   try {
+    await deliverEnded(ended);
     return listClaims(db, prefix).map(({ board: _b, ...c }) => c);
   } finally {
     db.close();

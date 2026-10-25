@@ -17,7 +17,7 @@ const NOW = 1_800_000_000_000;
 let dir: string, db: Database, blobs: SqliteBlobs;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-retention-"));
-  db = openLocalDb(join(dir, "bus.db"));
+  db = openLocalDb(join(dir, "bus.db")).db;
   blobs = new SqliteBlobs(db);
 });
 afterEach(() => {

@@ -16,8 +16,8 @@ const ID = "id:0123456789abc";
 const OTHER = "id:0123456789abd";
 
 function bus() {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-end-")), "bus.db"));
-  for (const id of [ID, OTHER]) registerId(db, { id, principal: null }, 1);
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-end-")), "bus.db")).db;
+  for (const id of [ID, OTHER]) registerId(db, { id, principal: null, launcher: false }, 1);
   for (const a of ["be", "fe", "qa"]) ensureAlias(db, a, a, 1);
   return db;
 }

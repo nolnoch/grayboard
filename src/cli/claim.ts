@@ -91,10 +91,11 @@ async function localView(): Promise<LocalView> {
   const { ancestors } = await import("../shared/proc.ts");
   const { localDbPath, openLocalDb } = await import("../local/open.ts");
   if (!existsSync(localDbPath())) return { sessions: [], ancestors: ancestors() };
-  const { liveSessions } = await import("../local/binding.ts");
-  const db = openLocalDb();
+  const { deliverEnded } = await import("../local/wakeup.ts");
+  const { db, ended, live } = openLocalDb();
   try {
-    return { sessions: liveSessions(db), ancestors: ancestors() };
+    await deliverEnded(ended);
+    return { sessions: live, ancestors: ancestors() };
   } finally {
     db.close();
   }

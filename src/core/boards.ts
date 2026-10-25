@@ -186,11 +186,6 @@ export function touchId(db: Database, id: string, now = Date.now()): void {
   db.prepare(`UPDATE ids SET last_seen = ? WHERE id = ?`).run(now, id);
 }
 
-/** A local session ended (#284): its ID is never taken again. */
-export function endId(db: Database, id: string, now = Date.now()): void {
-  db.prepare(`UPDATE ids SET ended_at = ? WHERE id = ? AND ended_at IS NULL`).run(now, id);
-}
-
 /**
  * A restart that took its predecessor's name back is the same harness
  * session (#211): its peer status carries over from the earlier session.

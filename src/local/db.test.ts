@@ -10,7 +10,7 @@ import { openLocalDb } from "./open.ts";
 // #130: the local undeliveredFrom join keys on the cursors PK (reader), so the
 // plan must SEARCH by that key — a SCAN here means the index/PK was lost.
 test("undeliveredFrom uses the reader PK, not a cursors scan", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const plan = db.prepare("EXPLAIN QUERY PLAN " + LOCAL_UNDELIVERED_FROM_SQL)
     .all("be@example.com/be", Number.MAX_SAFE_INTEGER) as { detail: string }[];
   const detail = plan.map(p => p.detail).join(" ");
@@ -21,7 +21,7 @@ test("undeliveredFrom uses the reader PK, not a cursors scan", () => {
 // #182 audit 27: an unbound start counts queued DMs for its candidate names
 // only, by an index search per name; a SCAN of messages means it lost that.
 test("candidate queue counts search messages by recipient, never scan it", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const plan = db.prepare("EXPLAIN QUERY PLAN " + QUEUED_FOR_SQL).all(JSON.stringify(["fe", "be"])) as { detail: string }[];
   const detail = plan.map((p) => p.detail).join(" ");
   expect(detail).toContain("SEARCH m USING INDEX idx_messages_recipient_id (recipient=? AND id>?)");

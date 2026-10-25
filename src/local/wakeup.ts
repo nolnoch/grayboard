@@ -59,6 +59,20 @@ export function listenForWakeup(identity: string, onWake: WakeupHandler): () => 
   };
 }
 
+/**
+ * After a transaction that ended sessions commits: their sockets go (an
+ * ended ID never listens again, and a stale socket costs every probe the
+ * retry ladder), and the addresses the end gave mail or posts are woken.
+ */
+export async function deliverEnded(e: { ended: string[]; wake: string[] }, dir = SOCK_DIR): Promise<void> {
+  for (const id of e.ended) {
+    try {
+      unlinkSync(sockPath(id, dir));
+    } catch {}
+  }
+  await Promise.all(e.wake.map((h) => poke(h, dir)));
+}
+
 export async function poke(identity: string, dir = SOCK_DIR): Promise<boolean> {
   return canConnect(sockPath(identity, dir));
 }

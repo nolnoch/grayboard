@@ -4,7 +4,10 @@ import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withA
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
 
-export const db = openLocalDb();
+const opened = openLocalDb();
+export const db = opened.db;
+/** The sessions this process's open ended; its entry point delivers them. */
+export const openEnded = opened.ended;
 export const blobs = new SqliteBlobs(db);
 
 // Stores files as `uploader`'s unbound uploads, then runs `send`, a write

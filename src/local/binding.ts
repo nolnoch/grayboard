@@ -7,14 +7,16 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, endId, ensureAlias, humanHandles, isHuman, isViewer, registerId } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, isHuman, isViewer, registerId } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
+import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
 import { aliveRows, commandName, isAlive, procStart } from "../shared/proc.ts";
+import { localMail } from "./mailbox.ts";
 import { poke } from "./wakeup.ts";
 
 // A session as binding reads it: its bindings row (liveness), its ids row's
@@ -83,53 +85,77 @@ function noRowHolder(db: Database, name: string, deadRow: boolean): string {
     : "a live session from an older grayboard (its wakeup socket answers; no live session holds the name)";
 }
 
-// The session ends: its liveness row and its holds go, each release is
-// logged, and its ID is marked ended. A 1.x process's name is its bindings
-// row's. Callers are inside a transaction. Returns the names it held.
-function end(db: Database, sessionId: string, why: string | null, now: number): string[] {
-  const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
-  const holds = (db.prepare(`DELETE FROM alias_holds WHERE id = ? RETURNING address`).all(sessionId) as { address: string }[]).map((r) => r.address);
-  const held = [...new Set([...holds, ...(row?.name ? [row.name] : [])])];
-  for (const name of held) logBinding(db, sessionId, name, "released", why, now);
-  endId(db, sessionId, now);
-  return held;
+/**
+ * Sessions a transaction ended, for its caller to act on once it commits:
+ * `wake` the addresses it gave mail or posts (deliverEnded), and remove the
+ * ended IDs' sockets, which never listen again.
+ */
+export type Ended = { ended: string[]; wake: string[] };
+
+export const NOTHING_ENDED: Ended = { ended: [], wake: [] };
+
+function merge(into: Ended, id: string, r: EndedSession): void {
+  into.ended.push(id);
+  for (const h of r.wake) if (!into.wake.includes(h)) into.wake.push(h);
 }
 
-// Holds whose session has no bindings row: a 1.x process reaped it, which
-// deletes only the row. Their sessions are over. Call inside a transaction.
-function sweepOrphanHolds(db: Database, now: number): void {
-  const gone = db.prepare(`DELETE FROM alias_holds WHERE id NOT IN (SELECT session_id FROM bindings) RETURNING id`).all() as { id: string }[];
-  for (const { id } of gone) endId(db, id, now);
+// The session ends (core/session_end.ts): its liveness row goes, and with
+// it everything deliverable against its ID. A 1.x process's name is its
+// bindings row's. Callers are inside a transaction.
+function end(db: Database, sessionId: string, why: string | null, now: number): EndedSession {
+  const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
+  return endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now });
 }
 
 // Reap rows whose process is gone. Callers are inside a transaction. The
-// rows were read before it, so another process may have reaped one already:
-// only the process whose delete removed the row ends the session.
-export function reap(db: Database, rows: SessionRow[], now: number): void {
+// rows were judged before it, so each is re-read and re-probed here: another
+// process may have reaped it already (only the one whose delete removed the
+// row ends the session), or a keyed session's child may have re-attached.
+export function reap(db: Database, rows: SessionRow[], now: number): Ended {
+  const out: Ended = { ended: [], wake: [] };
   for (const r of rows) {
-    if (!db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(r.session_id)) continue;
-    end(db, r.session_id, `reaped: pid ${r.pid} is gone`, now);
+    const cur = db.prepare(`SELECT pid, proc_start FROM bindings WHERE session_id = ?`).get(r.session_id) as { pid: number; proc_start: string | null } | null;
+    if (!cur || isAlive(cur.pid, cur.proc_start)) continue;
+    merge(out, r.session_id, end(db, r.session_id, `reaped: pid ${cur.pid} is gone`, now));
   }
+  return out;
 }
 
-/** Every live session row, reaping the dead ones. */
-export function liveSessions(db: Database): SessionRow[] {
+// Unended IDs with no bindings row: an older grayboard sharing the file
+// reaped the row, which deletes only that. Every live local session has one,
+// so these sessions are over.
+const ORPHAN_SQL = `SELECT id FROM ids WHERE ended_at IS NULL AND id NOT IN (SELECT session_id FROM bindings)`;
+
+/**
+ * Every live session row, ending the dead ones: those whose process is gone,
+ * and orphans (ORPHAN_SQL). The probe runs before the write lock; each
+ * candidate is re-checked inside it.
+ */
+export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const rows = db.prepare(SESSION_SQL).all() as SessionRow[];
   const { alive, dead } = aliveRows(rows);
-  const orphans = !!db.prepare(`SELECT 1 FROM alias_holds WHERE id NOT IN (SELECT session_id FROM bindings) LIMIT 1`).get();
-  if (dead.length || orphans) {
-    db.transaction(() => {
-      const now = Date.now();
-      reap(db, dead, now);
-      sweepOrphanHolds(db, now);
-    }).immediate();
-  }
-  return alive;
+  const orphans = db.prepare(ORPHAN_SQL).all() as { id: string }[];
+  if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
+  testPause("end:before-txn");
+  const ended = db.transaction(() => {
+    const now = Date.now();
+    const out = reap(db, dead, now);
+    for (const { id } of orphans) {
+      if (db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(id)) continue;
+      merge(out, id, endSession(db, localMail(db), id, { why: "its process row was removed by an older grayboard", now }));
+    }
+    return out;
+  }).immediate();
+  return { alive, ...ended };
 }
 
-export type AcquireResult =
+export type AcquireResult = (
   | { ok: true; name: string; moved: Claim[]; restored: boolean }
-  | { ok: false; error: string; holder?: string; known?: string[] };
+  | { ok: false; error: string; holder?: string; known?: string[] }
+) & {
+  /** A dead holder this acquire ended. */
+  ended: Ended;
+};
 
 // Whether a roster name is an agent's: not a viewer's, nor a human's.
 function agentName(db: Database): (name: string) => boolean {
@@ -175,9 +201,10 @@ export async function acquireName(
   testPause("bind:before-txn");
   return db.transaction((): AcquireResult => {
     const now = Date.now();
+    let ended = NOTHING_ENDED;
     const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
       logBinding(db, sessionId, name, "refused", extra.holder ?? error, now);
-      return { ok: false, error, ...extra };
+      return { ok: false, error, ...extra, ended };
     };
     testPause("bind:in-txn");
     if (!opts.allowHuman && (name === HUMAN_NAME || isHuman(db, name))) {
@@ -192,7 +219,7 @@ export async function acquireName(
       const who = describeHolder(holder);
       return refuse(`"${name}" is held by ${who}`, { holder: who });
     }
-    if (holder) reap(db, [holder], now);
+    if (holder) ended = reap(db, [holder], now);
     if (sockLive) {
       const who = noRowHolder(db, name, before !== null || holder !== null);
       return refuse(`"${name}" is held by ${who}`, { holder: who });
@@ -209,7 +236,7 @@ export async function acquireName(
     const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
     if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
     logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? restart?.detail ?? null, now);
-    return { ok: true, name, moved, restored: restart?.verified ?? false };
+    return { ok: true, name, moved, restored: restart?.verified ?? false, ended };
   }).immediate();
 }
 
@@ -229,12 +256,16 @@ export async function siblingGone(db: Database, name: string, harnessPid: number
 }
 
 /**
- * The session ends: its rows go, its ID is marked ended, and each release is
- * logged. Returns the name it still held, if any, so the caller removes that
- * name's socket.
+ * This session ends (a clean exit, or a refusal at start). `held` is the
+ * name it still held, if any, so the caller removes that name's socket.
  */
-export function endSession(db: Database, sessionId: string): string | null {
-  return db.transaction(() => end(db, sessionId, null, Date.now())[0] ?? null).immediate();
+export function endLocalSession(db: Database, sessionId: string): Ended & { held: string | null } {
+  return db.transaction(() => {
+    const r = end(db, sessionId, null, Date.now());
+    const out: Ended = { ended: [], wake: [] };
+    merge(out, sessionId, r);
+    return { ...out, held: r.held[0] ?? null };
+  }).immediate();
 }
 
 /**
@@ -282,7 +313,7 @@ export const QUEUED_FOR_SQL = `SELECT j.value AS name,
  * used. Live names, viewers and humans are left out.
  */
 export async function candidateNames(db: Database, suggested: string | null): Promise<Candidate[]> {
-  const live = new Set(liveSessions(db).map((r) => r.name).filter((n): n is string => n !== null));
+  const live = new Set(liveSessions(db).alive.map((r) => r.name).filter((n): n is string => n !== null));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const agent = agentName(db);

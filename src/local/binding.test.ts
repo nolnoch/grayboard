@@ -12,14 +12,14 @@ import { openLocalDb } from "./open.ts";
 // #182 audit 29: two processes that read the same dead row both reap it;
 // only the one whose delete removed it logs the release.
 test("a dead row reaped twice logs one release", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abc";
   registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1 }, false);
   holdAlias(db, "fe", id);
   const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
   db.transaction(() => reap(db, rows, 2)).immediate();
   db.transaction(() => reap(db, rows, 3)).immediate();
-  expect(db.prepare(`SELECT name, event, detail FROM binding_events`).all()).toEqual([{ name: "fe", event: "released", detail: "reaped: pid 999999 is gone" }]);
+  expect(db.prepare(`SELECT name, event, detail FROM binding_events`).all()).toEqual([{ name: "fe", event: "released", detail: "session_end: reaped: pid 999999 is gone" }]);
   // The reap ends the session (#284): its hold goes and its ID is never taken again.
   expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
@@ -27,7 +27,7 @@ test("a dead row reaped twice logs one release", () => {
 
 // #284 decision 2: an ID with any ids row, live or ended, is never registered again.
 test("registering an ID that has a row, live or ended, throws IdCollision", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const s = { ...thisSession("id:0123456789abe"), pid: 999999, proc_start: null };
   registerSession(db, s, false);
   expect(() => registerSession(db, s, false)).toThrow(new IdCollision(s.session_id, null));
@@ -40,7 +40,7 @@ test("registering an ID that has a row, live or ended, throws IdCollision", () =
 // row's name alone. A HEAD acquire treats that live row as the holder, and a
 // HEAD hold writes bindings.name too, so the 1.x holder check sees it.
 test("a live 1.x holder blocks a HEAD acquire; a HEAD hold mirrors into bindings.name", async () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const name = `a2-${process.pid}`;
   db.prepare(`INSERT INTO bindings (session_id, name, pid, proc_start, harness_pid, started_at, bound_at) VALUES ('0123456789abcdef', ?, ?, ?, NULL, 1, 1)`)
     .run(name, process.pid, procStart(process.pid) ?? null);
@@ -61,19 +61,19 @@ test("a live 1.x holder blocks a HEAD acquire; a HEAD hold mirrors into bindings
 // #284 audit A4: a 1.x reap deletes only the bindings row. The hold it left
 // is swept, and its session ended, by the next HEAD read of live sessions.
 test("a hold whose bindings row a 1.x reap deleted is swept and its session ended", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abe";
   registerSession(db, { ...thisSession(id), pid: 999999, proc_start: null }, false);
   holdAlias(db, "fe", id);
   db.prepare(`DELETE FROM bindings WHERE session_id = ?`).run(id);
-  expect(liveSessions(db)).toEqual([]);
+  expect(liveSessions(db)).toMatchObject({ alive: [], ended: [id] });
   expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
   expect((db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null }).ended_at).not.toBeNull();
 });
 
 // #210: a retry loop refused for the same reason is one row with a count.
 test("a session's identical refusals within the window share a row; anything else inserts", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const s1 = "0123456789abcdef", s2 = "fedcba9876543210";
   logBinding(db, s1, "fe", "refused", "held by be", 1000);
   logBinding(db, s1, "fe", "refused", "held by be", 2000);
@@ -106,7 +106,7 @@ test("a session's identical refusals within the window share a row; anything els
 // #211: retention keeps each name's latest bound or moved event, which says
 // who holds the name by the record; everything else past the window goes.
 test("retention keeps each name's latest bound or moved event", () => {
-  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db"));
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const [s1, s2] = ["0123456789abcdef", "fedcba9876543210"];
   logBinding(db, s1, "fe", "bound", null, 1000);
   logBinding(db, s2, "fe", "bound", null, 2000);

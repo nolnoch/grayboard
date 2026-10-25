@@ -34,6 +34,7 @@ import {
   getMessage,
   getThread,
   insertMessage,
+  openEnded,
   receivedUnacked,
   retractMessage,
   retractedAt,
@@ -45,9 +46,9 @@ import {
   withUploads,
 } from "./db.ts";
 import { localDbPath } from "./open.ts";
-import { listenForWakeup, poke } from "./wakeup.ts";
+import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { acquireName, candidateNames, endSession, liveSessions, registerSession, siblingGone, thisSession } from "./binding.ts";
+import { NOTHING_ENDED, acquireName, candidateNames, endLocalSession, liveSessions, registerSession, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
@@ -197,7 +198,8 @@ if (!PUSH) {
     if (n.ok) await siblingGone(db, n.name, process.ppid);
     const r = n.ok
       ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
-      : { ok: false as const, error: n.error };
+      : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
+    await deliverEnded(r.ended);
     if (r.ok) {
       bound = r.name;
       restored = r.restored;
@@ -205,11 +207,12 @@ if (!PUSH) {
     } else unboundNotes.push(restoreNote(rec.name, r.error));
   } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
+    await deliverEnded(r.ended);
     if (r.ok) bound = r.name;
     else if (HUMAN) {
       // A bridge has no agent to read a candidate list; refuse loudly.
       console.error(`[grayboard] ${r.error}`);
-      endSession(db, SESSION_ID);
+      await deliverEnded(endLocalSession(db, SESSION_ID));
       process.exit(1);
     } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
@@ -523,7 +526,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const queuePost = name === "board_post" && isQueueBoard(db, typeof a.board === "string" ? a.board : "");
     const ctx = {
       ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(IDENTITY) } : {}),
-      ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
+      ...(name === "peer_list" ? { unbound: await unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
       human: HUMAN,
       ...(WRITER_ID ? { session: WRITER_ID } : {}),
@@ -550,9 +553,12 @@ async function liveHandles(self: string): Promise<(h: string) => boolean> {
   return (h) => live.has(h);
 }
 
-// Live sessions with no name yet, for peer_list.
-function unboundPeers(): UnboundPeer[] {
-  return liveSessions(db)
+// Live sessions with no name yet, for peer_list, delivering what ending the
+// dead ones it found produced.
+async function unboundPeers(): Promise<UnboundPeer[]> {
+  const { alive, ...ended } = liveSessions(db);
+  await deliverEnded(ended);
+  return alive
     .filter((r) => r.name === null)
     .map((r) => unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID));
 }
@@ -636,6 +642,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     await inflight;
     const previous = bound;
     const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
+    await deliverEnded(r.ended);
     if (!r.ok) return fail(r.error);
     // The row holds the new name from here: so does this process, whatever
     // follows fails, or the finally's drain would read a name it no longer holds.
@@ -683,8 +690,17 @@ await mcp.connect(transport);
 late.watch(transport);
 // Prunes the bus at most once a day across the sessions that share it.
 startLocalRetention(db, blobs, RETENTION_DAYS);
+// What this process's open ended (db.ts): bounces and releases to wake.
+await deliverEnded(openEnded);
 
-const shutdown = () => {
+// How long exit waits for the end's wakeups: they're conveniences (mail and
+// posts are durable, and each recipient's next wake drains them), so a
+// stuck socket mustn't hold the exit.
+const SHUTDOWN_WAKE_MS = 2000;
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   try {
     if (bound) touchAlias(db, bound);
   } catch {
@@ -693,20 +709,22 @@ const shutdown = () => {
   // The socket goes first, while the row still holds the name, so nobody
   // takes the name with this socket still in place.
   stopListening();
+  let ended: Ended = NOTHING_ENDED;
   try {
-    if (PUSH) endSession(db, SESSION_ID);
+    if (PUSH) ended = endLocalSession(db, SESSION_ID);
   } catch {
     // Same: shutdown must not throw.
   }
   if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
+  await Promise.race([deliverEnded(ended).catch(() => {}), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   process.exit(0);
 };
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
 // Exit when the client goes away. Otherwise the wakeup listener keeps an
 // orphan alive that holds the identity and blocks the next session.
-process.stdin.on("end", shutdown);
-process.stdin.on("close", shutdown);
+process.stdin.on("end", () => void shutdown());
+process.stdin.on("close", () => void shutdown());
 
 if (DELIVER && bound) {
   stopListening = listenForWakeup(bound, onWake);

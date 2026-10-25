@@ -9,15 +9,24 @@ import { dirname } from "node:path";
 import { ANNOUNCE_BOARD, ensureBoard } from "../core/boards.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { openSqlite } from "../core/sqlite.ts";
+import { liveSessions, type Ended, type SessionRow } from "./binding.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
 }
 
-export function openLocalDb(path = localDbPath()): Database {
+/**
+ * The bus, open, with the sessions this open ended and the live ones it
+ * found: every opener ends the dead sessions it finds before serving (#284
+ * decision 3), in its own transaction after the schema's. The caller passes
+ * `ended` to deliverEnded (wakeup.ts) once it can await.
+ */
+export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended; live: SessionRow[] } {
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
+  const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
+  const { alive, ...ended } = liveSessions(db);
+  return { db, ended, live: alive };
 }
 
 function initLocalSchema(db: Database): void {

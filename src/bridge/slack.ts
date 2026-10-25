@@ -15,6 +15,7 @@ import { delimiter, join } from "node:path";
 import { busMode } from "../cli/api.ts";
 import { humanHandles } from "../core/boards.ts";
 import { declareLocalHuman } from "../local/binding.ts";
+import { deliverEnded } from "../local/wakeup.ts";
 import { localDbPath, openLocalDb } from "../local/open.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { ConfigError, configPath, loadConfig } from "./config.ts";
@@ -33,8 +34,9 @@ export type BridgeHandle = { stop: () => Promise<void>; done: Promise<number> };
 // so declare it here, on the human's side of the tool boundary: on first run
 // if nobody is declared, refused if someone else is.
 async function declareBridgeHuman(handle: string, env: Record<string, string | undefined>): Promise<void> {
-  const db = openLocalDb(localDbPath(env));
+  const { db, ended } = openLocalDb(localDbPath(env));
   try {
+    await deliverEnded(ended, sockDir(env));
     const humans = humanHandles(db);
     if (humans.length === 0) await declareLocalHuman(db, handle, sockDir(env));
     else if (!humans.includes(handle)) {

@@ -4,8 +4,8 @@
 // per-process handle and listens on its own wakeup socket, so posters poke it.
 // It never posts, never becomes an alias (so it can't be @mentioned),
 // and only moves its own cursor.
-import { db } from "./db.ts";
-import { listenForWakeup, poke } from "./wakeup.ts";
+import { db, openEnded } from "./db.ts";
+import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { normalizeBoard, subscribe, type Post } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { withAttachments } from "../core/attachments.ts";
@@ -35,6 +35,7 @@ async function sweepStale(): Promise<void> {
 }
 
 export async function runTail(boardInput: string, backlog: number): Promise<void> {
+  await deliverEnded(openEnded);
   const board = normalizeBoard(boardInput);
   const handle = `${PREFIX}${process.pid}`;
   await sweepStale();

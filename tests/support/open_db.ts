@@ -12,7 +12,7 @@ import { openDatabase } from "../../src/server/db.ts";
 
 const [kind, path, go] = process.argv.slice(2) as [string, string, string];
 const open = {
-  local: () => openLocalDb(path).close(),
+  local: () => openLocalDb(path).db.close(),
   bridge: () => new Store(path).db.close(),
   server: () => openDatabase(path, { blobDir: join(dirname(path), "blobs") }).db.close(),
 }[kind];

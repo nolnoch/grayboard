@@ -1,8 +1,8 @@
 // `grayboard human`, `grayboard announce` and `grayboard board create`: the human's own commands on the
 // local bus. They run in the human's terminal (or as `! grayboard announce …`
 // inside a session), never through an agent's tools.
-import { db } from "./db.ts";
-import { poke } from "./wakeup.ts";
+import { db, openEnded } from "./db.ts";
+import { deliverEnded, poke } from "./wakeup.ts";
 import { declareLocalHuman } from "./binding.ts";
 import { ANNOUNCE_BOARD, createBoard, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
@@ -20,6 +20,7 @@ export function parseTtl(text: string): number {
 
 /** Show the declared human handle, or declare `handle` as it. */
 export async function runHuman(handle?: string): Promise<void> {
+  await deliverEnded(openEnded);
   if (handle === undefined) {
     const humans = humanHandles(db);
     console.log(humans.length ? humans.join("\n") : "No human handle declared. Declare yours: grayboard human <handle>");
@@ -40,6 +41,7 @@ export function declaredHuman(): string {
 
 /** Post an announcement as the human to every live session. */
 export async function runAnnounce(body: string, ttl?: string): Promise<void> {
+  await deliverEnded(openEnded);
   const human = declaredHuman();
   const ttl_ms = ttl === undefined ? undefined : parseTtl(ttl);
   // Probing a socket also wakes its session; it drains nothing until the post lands.

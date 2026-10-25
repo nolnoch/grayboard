@@ -371,7 +371,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect((await next.call("peer_list", {})).you).toBe("fe");
   const ev = events("fe");
   expect(ev.map((e) => e.event)).toEqual(["bound", "released", "bound"]);
-  expect(ev[1]!.detail).toMatch(/^reaped: pid \d+ is gone$/);
+  expect(ev[1]!.detail).toMatch(/^session_end: reaped: pid \d+ is gone$/);
   // A clean exit logs its release, and keeps its name record for a restart under its harness.
   await stop(next.c);
   expect(events("fe").at(-1)!.event).toBe("released");
