@@ -145,6 +145,23 @@ export function bindAttachments(
   return ids.map((id) => info(byId.get(id)!));
 }
 
+// The blob digests of `uploader`'s unsent uploads `ids`, in call order: what
+// a write's fingerprint keys its files by (#254), since every attempt uploads
+// afresh under new ids while the blob is content-addressed. Refuses an id
+// bindAttachments would.
+export function uploadDigests(db: Database, ids: number[], uploader: string): string[] {
+  if (ids.length === 0) return [];
+  const rows = db
+    .prepare(`SELECT id, sha256 FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL`)
+    .all(JSON.stringify(ids), uploader) as { id: number; sha256: string }[];
+  const by = new Map(rows.map((r) => [r.id, r.sha256]));
+  return ids.map((id) => {
+    const sha = by.get(id);
+    if (sha === undefined) throw new CoreError(`attachment ${id} isn't an unsent upload of yours`);
+    return sha;
+  });
+}
+
 const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size, sha256: r.sha256 });
 
 // Each row with its attachments added, for those that have any.

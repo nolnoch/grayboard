@@ -474,6 +474,10 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
 // an offline lane holds the re-offer in its outbox until it wakes, and its
 // own TTL lapse re-rotates. Caller is inside a transaction. Returns the lane
 // woken, or null when there is no next lane.
+// The note on a redelivery's take event: release() reads it to tell a
+// decline's own redelivery from a later claim (#254).
+export const REDELIVERED_NOTE = "queue post (redelivered)";
+
 export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): string | null {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
   if (!m) return null;
@@ -482,7 +486,7 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   if (!b || !p || p.board !== b.name) return null;
   const lane = queueLanes(db, b, p.author).find((h) => h !== prevHolder);
   if (!lane) return null;
-  claimQueuePost(db, b.name, p, lane, now, "queue post (redelivered)");
+  claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
   return lane;
 }
 

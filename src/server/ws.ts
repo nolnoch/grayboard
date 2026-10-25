@@ -1,5 +1,8 @@
 import { participant, type MessageRow, type Repo } from "./db.ts";
-import { parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type SendOk, type ErrorCode } from "../shared/protocol.ts";
+import {
+  parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type DelegateRequest, type DelegateResult, type SendRequest, type SendResult, type ErrorCode,
+  type WriteRef,
+} from "../shared/protocol.ts";
 import {
   HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
 } from "../shared/addressing.ts";
@@ -12,6 +15,7 @@ import {
   age,
   checkBody,
   lastSeen,
+  normalizeBoard,
   pendingFor,
   refOf,
   sessionsSeen,
@@ -27,14 +31,16 @@ import {
   sessionIdOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
-import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
+import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
-import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
-import type { AttachmentInfo } from "../shared/attachments.ts";
+import { attachmentIds, sweepBlobs, uploadDigests } from "../core/attachments.ts";
+import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
+import type { Sync } from "./db.ts";
+import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onIdentityCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
@@ -80,7 +86,8 @@ export type WsOptions = {
   humanReach?: HumanReach;
   // Whether the Slack bridge is up; a linked human is reachable only then.
   slackRunning?: () => boolean;
-  // The rate limiters' clock; tests move it instead of sleeping.
+  // The hub's clock: the rate limiters' and the write-dedup window's
+  // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
 };
 
@@ -104,6 +111,7 @@ type Hub = {
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
+  now: () => number;
 };
 
 function send(ws: Ws, msg: ServerMessage): void {
@@ -192,6 +200,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     registry: new Map(), holders: new Map(), probing: new Map(), toolsOnly: new Set(), readOnly: new Set(), repo, db,
     probeMs: opts.probeMs ?? 2000, humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    now: opts.now ?? Date.now,
     // Logged and audited once per run of refusals, so a loop floods neither.
     // Keyed by email, which is unique per user.
     helloLimiter: new RateLimiter(opts.helloLimit, {
@@ -268,7 +277,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
             err(ws, msg.req_id, "bad_request", "already authenticated");
             break;
           case "send":
-            handleSend(hub, ws, msg.req_id, msg.recipient, msg.body, msg.parent_id ?? null, msg.pending === true, msg.attachment_ids);
+            handleSend(hub, ws, msg);
             break;
           case "delegate":
             handleDelegate(hub, ws, msg.req_id, msg);
@@ -675,36 +684,36 @@ function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address 
   return r.address;
 }
 
-function handleSend(
-  hub: Hub,
-  ws: Ws,
-  reqId: string,
-  recipientStr: string,
-  body: string,
-  parentId: number | null,
-  pending: boolean,
-  attachmentIdsRaw: unknown,
-  extra: Record<string, unknown> & { note?: string } = {},
-  // A caller that needs the reply shaped (delegate's result builder) applies
-  // it here — the same object is sent and returned, so the two can't drift.
-  shapeOk?: (ok: SendOk) => SendOk,
-): { ok?: SendOk; refused?: string } {
-  const { repo, db, registry } = hub;
+// A send the server refuses: answered as an error frame with this code.
+class SendRefused extends Error {
+  constructor(readonly code: ErrorCode, message: string) {
+    super(message);
+  }
+}
+
+// A send checked and resolved, ready to write: `to` is the recipient's full
+// handle, `digests` its files' blob digests in call order.
+type PreparedSend = { to: string; body: string; parentId: number | null; pending: boolean; ids: number[]; digests: string[] };
+
+// Checks a send and resolves its recipient, writing nothing; throws SendRefused.
+function prepareSend(
+  hub: Hub, ws: Ws, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+): PreparedSend {
+  const { repo, db } = hub;
+  const { authed } = ws.data;
   let ids: number[];
+  let digests: string[];
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
+    digests = uploadDigests(db, ids, ws.data.identityFull);
   } catch (e) {
-    err(ws, reqId, "bad_request", (e as Error).message);
-    return { refused: (e as Error).message };
+    if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
+    throw e;
   }
 
-  const { authed } = ws.data;
   const parsedR = resolvePeerInput(repo, authed.user_email, authed.user_id, recipientStr);
-  if ("error" in parsedR) {
-    err(ws, reqId, parsedR.code, parsedR.error);
-    return { refused: parsedR.error };
-  }
+  if ("error" in parsedR) throw new SendRefused(parsedR.code, parsedR.error);
   const parsed = parsedR.address;
 
   const principal: SendPrincipal = {
@@ -715,76 +724,86 @@ function handleSend(
     identity_full: ws.data.identityFull,
   };
 
-  if (parsed.kind === "team") {
-    const why = `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`;
-    err(ws, reqId, "bad_request", why);
-    return { refused: why };
-  }
+  if (parsed.kind === "team") throw new SendRefused("bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
 
   const recipientUser = repo.users.findByEmail(parsed.email);
-  if (!recipientUser) {
-    const why = `user "${parsed.email}" not found`;
-    err(ws, reqId, "not_found", why);
-    return { refused: why };
-  }
+  if (!recipientUser) throw new SendRefused("not_found", `user "${parsed.email}" not found`);
   const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
-  if (!recipientIdentity) {
-    const why = `identity "${parsed.full}" not found; peer_list shows exact handles`;
-    err(ws, reqId, "not_found", why);
-    return { refused: why };
-  }
+  if (!recipientIdentity) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
-  if (!decision.allow) {
-    err(ws, reqId, decision.code, decision.reason);
-    return { refused: decision.reason };
-  }
+  if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.identityFull)) {
-    const why = `parent_id ${parentId} is not a message you sent or received`;
-    err(ws, reqId, "not_found", why);
-    return { refused: why };
+    throw new SendRefused("not_found", `parent_id ${parentId} is not a message you sent or received`);
   }
+  return { to: parsed.full, body, parentId, pending, ids, digests };
+}
 
+// Writes the message and builds its result. Runs inside the caller's
+// transaction; whether the recipient is live is read here, with nothing
+// awaited before deliverSend pushes, so the result says what happens.
+function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { msg: MessageRow } {
+  const { repo, db, registry } = hub;
   let msg: MessageRow;
   try {
-    msg = repo.messages.insert(ws.data.identityFull, "user", parsed.full, body, parentId, pending, ids);
+    msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids);
   } catch (e) {
-    if (e instanceof CoreError) {
-      err(ws, reqId, "bad_request", e.message);
-      return { refused: e.message };
-    }
+    if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
   }
-  for (const a of msg.attachments ?? []) {
-    writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: parsed.full });
-  }
-  const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
-
-  const { note: extraNote, ...restExtra } = extra ?? {};
-  let deliveredNow = false;
-  const recipientWs = registry.get(parsed.full);
-  if (recipientWs?.data.ready) {
-    send(recipientWs, { type: "push", message: showPending(msg) });
-    deliveredNow = true;
-  }
-
-  const seen = lastSeen(db, parsed.full);
-  const ok: SendOk = deliveredNow
-    ? { type: "send_ok", req_id: reqId, message_id: msg.id, delivered_now: true, ...p, ...restExtra, ...(extraNote ? { note: extraNote } : {}) }
+  const f = { ...(p.pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
+  const seen = lastSeen(db, p.to);
+  const payload: SendResult = registry.get(p.to)?.data.ready
+    ? { message_id: msg.id, delivered_now: true, ...f }
     : {
-        type: "send_ok",
-        req_id: reqId,
         message_id: msg.id,
         delivered_now: false,
-        ...p,
-        ...restExtra,
+        ...f,
         ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
-        undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
-        note: [queuedNote(parsed.full, seen), extraNote].filter(Boolean).join(" "),
+        undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === p.to)?.n ?? 1,
+        note: queuedNote(p.to, seen),
       };
-  const shaped = shapeOk ? shapeOk(ok) : ok;
-  send(ws, shaped);
-  return { ok: shaped };
+  return { payload, ref: { kind: "message", id: msg.id }, msg };
+}
+
+// After a fresh send's commit (never a replay's): its files' audit rows and
+// the push to a live recipient.
+function deliverSend(hub: Hub, ws: Ws, msg: MessageRow): void {
+  for (const a of msg.attachments ?? []) {
+    writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: msg.recipient });
+  }
+  const recipientWs = hub.registry.get(msg.recipient);
+  if (recipientWs?.data.ready) send(recipientWs, { type: "push", message: showPending(msg) });
+}
+
+// An append write, deduplicated (#254): an identical call by this session
+// within the window answers with the first one's result. The Slack bridge's
+// humans are exempt: a person typing a line twice sent it twice.
+function writeOnce<W extends Written>(
+  hub: Hub, ws: Ws, tool: DedupTool, args: Record<string, unknown>, resend: boolean, write: () => Sync<W>,
+): DedupOutcome<W> {
+  if (ws.data.human) return { fresh: hub.repo.atomic(write) };
+  return dedupWrite(hub.repo, hub.now(), {
+    tool, session: ws.data.sessionId!, sender: ws.data.identityFull, actor: ws.data.authed.user_email, transport: "wss", args, resend,
+  }, write);
+}
+
+function handleSend(hub: Hub, ws: Ws, m: SendRequest): void {
+  let out: DedupOutcome<Written<SendResult> & { msg: MessageRow }>;
+  try {
+    const p = prepareSend(hub, ws, m.recipient, m.body, m.parent_id ?? null, m.pending === true, m.attachment_ids);
+    // Keyed by what the server resolved, so two spellings of one call collide.
+    const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
+    out = writeOnce(hub, ws, "dm_send", args, m.resend === true, () => writeSend(hub, ws, p));
+  } catch (e) {
+    if (e instanceof SendRefused) return err(ws, m.req_id, e.code, e.message);
+    throw e;
+  }
+  if ("replay" in out) return send(ws, { type: "send_ok", req_id: m.req_id, ...out.replay });
+  // Committed, not yet answered: a lost answer's window (tests force it here).
+  testPause("write:after-commit");
+  deliverSend(hub, ws, out.fresh.msg);
+  send(ws, { type: "send_ok", req_id: m.req_id, ...out.fresh.payload });
 }
 
 // A delegation request (#184): resolve the launcher (or fall back to the
@@ -794,7 +813,11 @@ function handleSend(
 // Slack reachability, not a last_seen row (review 10). Every outcome is
 // audited: which launcher resolution picked and why, or the refusal (#184
 // review 4). The reply is a DelegateOk — the send_ok fields plus `to` and,
-// on the degrade path, human_fallback.
+// on the degrade path, human_fallback. Deduplicated as a delegate (#254):
+// the fingerprint is the request as given, taken before resolution picks a
+// launcher, and the resolution, the send and its audit row run inside the
+// dedup'd write, so a replay resolves nothing. The inner send isn't
+// deduplicated itself: it would collide a later plain dm_send of the same body.
 function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): void {
   const { repo } = hub;
   const { authed } = ws.data;
@@ -813,44 +836,69 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
   // bridge is running and this user is linked. A last_seen row is not
   // reachability (#191: an unlinked or stopped bridge queues into the void).
   const humanReachable = () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id);
-  let d;
+  const args = { to: to ?? null, persona: m.persona, task: m.task, context: m.context ?? null };
+  // Where a refused send was headed, for its audit row.
+  let picked: string | undefined;
+  let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   try {
-    d = resolveDelegation(hub.db, ws.data.identityFull, { ...m, to }, online, humanReachable);
+    out = writeOnce(hub, ws, "delegate", args, m.resend === true, () => {
+      const d = resolveDelegation(hub.db, ws.data.identityFull, { ...m, to }, online, humanReachable);
+      picked = d.to;
+      const w = writeSend(hub, ws, prepareSend(hub, ws, d.to, d.body, null, true, undefined));
+      // The result is built by the same builder local uses (review 13): the
+      // extra carries nothing delegation-specific, so the modes can't drift.
+      const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
+      writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+        requester: ws.data.identityFull,
+        via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
+        message_id: w.msg.id,
+      });
+      return { payload, ref: w.ref, msg: w.msg };
+    });
   } catch (e) {
+    // Written after the rollback, so the refusal's row stays.
     if (e instanceof CoreError) {
       writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: e.message, to: m.to });
       return err(ws, reqId, "bad_request", e.message);
     }
-    throw e;
-  }
-  // The result is built by the same builder local uses (review 13): the
-  // extra carries nothing delegation-specific, so the modes can't drift.
-  const sent = handleSend(hub, ws, reqId, d.to, d.body, null, true, undefined, {}, (ok) => ({ ...ok, ...delegateOkFields(d, ok) }));
-  if (sent.ok) {
-    writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
-      requester: ws.data.identityFull,
-      via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
-      message_id: sent.ok.message_id,
-    });
-  } else {
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
-    writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: sent.refused ?? "send refused", to: d.to });
+    if (e instanceof SendRefused) {
+      writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: e.message, to: picked });
+      return err(ws, reqId, e.code, e.message);
+    }
+    throw e;
   }
+  if ("replay" in out) return send(ws, { type: "send_ok", req_id: reqId, ...out.replay });
+  testPause("write:after-commit");
+  deliverSend(hub, ws, out.fresh.msg);
+  send(ws, { type: "send_ok", req_id: reqId, ...out.fresh.payload });
 }
 
 // The cursor moves only when the recipient acks, so a live recipient may hold
-// a pushed message past it: liveness counts as reached too.
+// a pushed message past it: liveness counts as reached too. A repeat of a
+// retract that landed (its answer lost, #254) is answered from its audit row.
 function handleRetract(hub: Hub, ws: Ws, reqId: string, id: number): void {
   const { repo, registry } = hub;
+  const me = ws.data.identityFull;
   const m = repo.messages.getById(id);
-  if (!m || m.recipient_type !== "user" || m.sender !== ws.data.identityFull) {
+  if (!m) {
+    const done = repo.audit.last("message.retracted", `message:${id}`);
+    const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
+    if (done && by === me) return send(ws, { type: "ack_ok", req_id: reqId, note: alreadyRetracted(done.at) });
+  }
+  if (!m || m.recipient_type !== "user" || m.sender !== me) {
     return err(ws, reqId, "not_found", retractRefusal.notYours(id));
   }
   if (registry.get(m.recipient)?.data.ready || repo.cursors.directFor(m.recipient) >= m.id) {
     return err(ws, reqId, "bad_request", retractRefusal.reached(id, m.recipient));
   }
-  if (!repo.messages.retract(ws.data.identityFull, id)) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
+  const retracted = repo.atomic(() => {
+    if (!repo.messages.retract(me, id)) return false;
+    writeAudit(repo, "message.retracted", ws.data.authed.user_email, `message:${id}`, { message_id: id, sender: me, recipient: m.recipient });
+    return true;
+  });
+  if (!retracted) return err(ws, reqId, "bad_request", retractRefusal.replied(id));
   send(ws, { type: "ack_ok", req_id: reqId });
   void sweepBlobs(hub.db, repo.blobs);
 }
@@ -861,26 +909,58 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     err(ws, reqId, "bad_request", `unknown tool: ${tool}`);
     return;
   }
+  const ctx: ToolContext = {
+    online: (h: string) => hub.registry.get(h)?.data.ready === true,
+    attachmentLimits: hub.repo.attachmentLimits,
+    ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
+  };
+  if (tool === "board_post") return handleBoardPost(hub, ws, reqId, args, ctx);
   let outcome;
   try {
-    outcome = callBoardTool(db, ws.data.identityFull, tool, args, {
-      online: (h) => hub.registry.get(h)?.data.ready === true,
-      attachmentLimits: hub.repo.attachmentLimits,
-      ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
-    });
+    outcome = callBoardTool(db, ws.data.identityFull, tool, args, ctx);
   } catch (e) {
     if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);
     return err(ws, reqId, "internal", `${tool} failed`);
   }
-  if (tool === "board_post") {
-    const r = outcome.result as { post_id: number; board: string; attachments?: AttachmentInfo[] };
-    for (const a of r.attachments ?? []) {
-      writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, post_id: r.post_id, board: r.board });
-    }
-  }
   send(ws, { type: "call_ok", req_id: reqId, result: outcome.result });
   wake(hub, outcome.wake);
+}
+
+// board_post, deduplicated (#254): a repeat replays the first post's result,
+// and a queue board gets no second work item.
+function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, unknown>, ctx: ToolContext): void {
+  const { db, repo } = hub;
+  const me = ws.data.identityFull;
+  const { resend, ...postArgs } = args;
+  let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
+  try {
+    if (resend !== undefined && typeof resend !== "boolean") throw new CoreError("resend must be a boolean");
+    if (typeof postArgs.board !== "string") throw new CoreError("board must be a string");
+    const fp = {
+      board: normalizeBoard(postArgs.board),
+      body: postArgs.body,
+      parent_id: postArgs.parent_id ?? null,
+      attachments: uploadDigests(db, attachmentIds(postArgs.attachment_ids), me),
+    };
+    out = writeOnce(hub, ws, "board_post", fp, resend === true, () => {
+      const o = callBoardTool(db, me, "board_post", postArgs, ctx);
+      const r = o.result as BoardPostResult;
+      return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };
+    });
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    console.error("[grayboard] board_post failed:", e);
+    return err(ws, reqId, "internal", "board_post failed");
+  }
+  if ("replay" in out) return send(ws, { type: "call_ok", req_id: reqId, result: out.replay });
+  testPause("write:after-commit");
+  const r = out.fresh.payload;
+  for (const a of r.attachments ?? []) {
+    writeAudit(repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
+  }
+  send(ws, { type: "call_ok", req_id: reqId, result: r });
+  wake(hub, out.fresh.wake);
 }
 
 function handleHistory(

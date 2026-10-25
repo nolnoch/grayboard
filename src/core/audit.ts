@@ -1,11 +1,12 @@
 // Local mode's audit trail (the server's is src/server/audit.ts through the
 // Repo facade). The delegation slice writes the same actions both modes
-// write: delegation.requested, delegation.refused, handle.launcher_set.
+// write: delegation.requested, delegation.refused, handle.launcher_set; and
+// message.retracted, which a repeated dm_retract is answered from (#254).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "delegation.requested" | "delegation.refused" | "handle.launcher_set";
+export type CoreAuditAction = "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "message.retracted";
 
 export function writeCoreAudit(
   db: Database,
@@ -21,4 +22,15 @@ export function writeCoreAudit(
     target,
     detail ? JSON.stringify(detail) : null,
   );
+}
+
+// The newest row for this action and target, or undefined.
+export function lastCoreAudit(
+  db: Database,
+  action: CoreAuditAction,
+  target: string,
+): { at: number; actor: string | null; detail: string | null } | undefined {
+  return (db
+    .prepare(`SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`)
+    .get(action, target) as { at: number; actor: string | null; detail: string | null } | null) ?? undefined;
 }

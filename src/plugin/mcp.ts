@@ -10,7 +10,7 @@ import { GrayboardClient, HelloRefused } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
-import type { Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
+import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk } from "../shared/protocol.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import {
@@ -422,6 +422,7 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
           ...(a.parent_id !== undefined ? { parent_id: a.parent_id } : {}),
           ...(a.pending === true ? { pending: true } : {}),
           ...(ids.length ? { attachment_ids: ids } : {}),
+          ...(a.resend === true ? { resend: true } : {}),
         }),
       );
       // A server from before pending ignores the field, which would lose the promise silently.
@@ -434,29 +435,14 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       // The server resolves the launcher (or falls back to your human) and
       // sends the payload pending; the reply carries `to` and, on the degrade
       // path, human_fallback (#184).
-      let rest: Omit<DelegateOk, "type" | "req_id">;
-      try {
-        const r = await client.request<DelegateOk>({
-          type: "delegate",
-          persona: a.persona,
-          task: a.task,
-          ...(a.context !== undefined ? { context: a.context } : {}),
-          ...(a.to !== undefined ? { to: a.to } : {}),
-        });
-        const { type: _frame, req_id: _req, ...body } = r;
-        rest = body;
-      } catch (e) {
-        const msg = (e as Error).message;
-        // A lost answer (a disconnect around the send) is not a failed
-        // delegation: the request may have landed, and a blind retry spawns
-        // the work twice (#184 review 11; the general dedup is #254). A
-        // server refusal (an `error` frame rejects as "code: message") is
-        // surfaced as-is.
-        if (/was lost|no answer from the grayboard server/.test(msg)) {
-          return text(`error: the delegation's answer was lost (${msg}); check dm_inbox's promised list before retrying — the request may have landed and a retry would spawn the work twice.`);
-        }
-        throw e;
-      }
+      const { type: _frame, req_id: _req, ...rest } = await client.request<DelegateOk>({
+        type: "delegate",
+        persona: a.persona,
+        task: a.task,
+        ...(a.context !== undefined ? { context: a.context } : {}),
+        ...(a.to !== undefined ? { to: a.to } : {}),
+        ...(a.resend === true ? { resend: true } : {}),
+      });
       return text(rest);
     }
     if (name === "dm_history") {
@@ -482,8 +468,8 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };
     }
     if (name === "dm_retract") {
-      await client.request({ type: "dm_retract", message_id: a.message_id });
-      return text("ok");
+      const r = await client.request<AckOk>({ type: "dm_retract", message_id: a.message_id });
+      return text(r.note ? `ok: ${r.note}` : "ok");
     }
     if (name === "dm_thread") {
       return text((await client.request<ThreadOk>({ type: "thread", message_id: a.thread })).messages);
@@ -511,12 +497,22 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
     if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
+    if (APPEND_WRITES.has(name) && isLostAnswer(e as Error)) return { ...text(`error: ${lostAnswer((e as Error).message)}`), isError: true };
     // The HTTP API (attachments) refused the token, as a WS hello would have.
     if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
     // Server errors arrive as "code: message"; show them to the agent.
     return { ...text(`error: ${(e as Error).message}`), isError: true };
   }
 }
+
+// The writes the server deduplicates (#254, src/server/write_dedup.ts).
+const APPEND_WRITES = new Set(["dm_send", "board_post", "delegate"]);
+// A disconnect around the call, or no answer in time: not a refusal (an
+// `error` frame rejects as "code: message"), so the write may have landed.
+const isLostAnswer = (e: Error) => /was lost|no answer from the grayboard server/.test(e.message);
+// One sentence for every append write: the server makes the retry safe.
+const lostAnswer = (why: string) =>
+  `the server's answer was lost (${why}); the write may have landed. Calling again with the same arguments within 10 minutes is safe: the server returns the first result instead of sending twice.`;
 
 // The server's HTTP API as this session's user, with the current token.
 const api = () => new ApiClient(serverUrl, currentToken());
