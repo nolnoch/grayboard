@@ -11,6 +11,13 @@
 import { readFileSync } from "node:fs";
 import { ClientBus, type FactoryBus } from "./bus.ts";
 import { isDelegationBody, parseDelegation, receiptBody } from "./delegate.ts";
+import type { Translator } from "./translate.ts";
+import piTranslator from "./pi/translate.ts";
+
+// The spawn translators, in try order: the first whose harness can serve the
+// persona handles the request; when none does, the skeleton receipt answers.
+// One import + one entry per harness (#243 and its per-harness follow-ups).
+const translators: Translator[] = [piTranslator];
 
 export type FactoryOptions = {
   serverUrl: string;
@@ -60,9 +67,17 @@ async function runLoop(bus: FactoryBus): Promise<void> {
     if (!isDelegationBody(msg.body)) continue;
     const d = parseDelegation(msg.body);
     if (!d) continue;
+    // The first translator whose harness can serve the persona renders the
+    // native spawn call; none — the receipt. One reply per request, keyed by
+    // the request's message id (a redelivered DM must not produce a second).
+    let body: string | null = null;
+    for (const t of translators) {
+      body = t.translate(d);
+      if (body !== null) break;
+    }
     await bus.send({
       to: d.requester,
-      body: receiptBody(d),
+      body: body ?? receiptBody(d),
       threadId: msg.id,
       idempotencyKey: `receipt:${msg.id}`,
     });
