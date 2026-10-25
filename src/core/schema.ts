@@ -135,7 +135,6 @@ export function initCoreSchema(db: Database): void {
       ended_at   INTEGER NOT NULL,
       PRIMARY KEY (handle, lane)
     );
-=======
     -- Which session held which name, and when (#182): the join between a
     -- session's run metadata and a name. event: bound, moved (a rebind;
     -- detail has the old name), released, refused (detail has the holder or

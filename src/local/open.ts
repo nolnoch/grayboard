@@ -78,6 +78,7 @@ function initLocalSchema(db: Database): void {
     -- When a session last ran retention (retention.ts); one row.
     CREATE TABLE IF NOT EXISTS retention_runs (
       id        INTEGER PRIMARY KEY CHECK (id = 1),
+      last_run  INTEGER NOT NULL
     );
   `);
   // dm_claims.delivered_at, added after the claims themselves (D1: the

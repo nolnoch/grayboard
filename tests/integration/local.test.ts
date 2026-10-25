@@ -8,8 +8,20 @@ import { basename, join } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { localBusDir, sha256Hex } from "../../src/shared/attachments.ts";
 import { runCli } from "../support/cli.ts";
-import { localEnv } from "../support/env.ts";
-import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { CLI } from "../support/paths.ts";
+import { call, closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
+
+// Both test styles stop sessions: the PR's fleet tests hold the raw Client,
+// master's bind-era tests hold the Session. One stop for both. (Duck-typed:
+// Client is a type-only import.)
+const stop = async (x: Client | Session): Promise<void> => {
+  if (typeof (x as Client).close === "function" && !("harnessPid" in x)) {
+    await (x as Client).close();
+    await Bun.sleep(200); // let the process exit and drop its socket
+    return;
+  }
+  await stopSession(x as Session);
+};
 import { until } from "../support/until.ts";
 
 let dir: string;
@@ -32,11 +44,17 @@ function busEnv(identity?: string, lane?: string): Record<string, string> {
   return { ...env, ...(identity ? { BUS_IDENTITY: identity } : {}), ...(lane ? { BUS_LANE: lane } : {}) } as Record<string, string>;
 }
 
+// Fleet helpers (#124): a session on a named lane of its identity. The
+// collecting form returns its channel pushes as strings.
+const startCollecting = async (identity: string, lane?: string): Promise<{ c: Client; pushes: string[] }> => {
+  const s = await localSession(dir, identity, { args: ["mcp"], extra: lane ? { BUS_LANE: lane } : {} });
+  return { c: s.c, pushes: s.pushes.map((p) => p.content) };
+};
+const start = async (identity: string | undefined, cwd = dir, args?: string[], lane?: string): Promise<Client> =>
+  (await localSession(dir, identity, { cwd, args, extra: lane ? { BUS_LANE: lane } : {} })).c;
+
 const session = (identity: string | undefined, cwd = dir, args?: string[]): Promise<Session> => localSession(dir, identity, { cwd, args });
 
-async function start(identity: string | undefined, cwd = dir, args?: string[]): Promise<Client> {
-  return (await session(identity, cwd, args)).c;
-}
 
 async function call(c: Client, name: string, args: Record<string, unknown> = {}): Promise<any> {
   const r = await c.callTool({ name, arguments: args });
@@ -136,7 +154,7 @@ test("two worktree sessions with one user-scope BUS_IDENTITY collide loudly", as
   expect(refused.isError).toBe(true);
   // The first session still owns the name and answers calls.
   expect((await call(first, "peer_list")).you).toBe("task");
-
+}, 20_000);
 
 test("lanes of one identity run side by side; each DM is delivered exactly once across the fleet, never fanned out", async () => {
   const a = await startCollecting("be", "research");
@@ -673,9 +691,6 @@ test("a stale lane socket file from a crash is taken over, not a lockout", async
   await call(sim, "dm_send", { to: "be", body: "anyone there?" });
   await Bun.sleep(300);
   expect(be.pushes).toContain("anyone there?");
-||||||| 07c76bb
-  expect((await call(stream, "peer_list")).you).toBe("be-stream");
-  expect((await call(main, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["be", "be-stream"]);
 }, 20_000);
 
 test("grayboard mcp: local mode when signed out, named after the repo", async () => {
