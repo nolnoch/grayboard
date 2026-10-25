@@ -72,7 +72,7 @@ export class Controller {
     if (!saved?.enabled || !same(saved.enrollment, e)) { r.paused = true; throw new Refusal("root", "Root approval changed; explicitly enroll again"); }
     check();
   }
-  private async wire(e: Enrollment, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000)) {
+  private async wire(e: Enrollment, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>) {
     const key = `rejectedAccess:${e.integrationID}:${e.connectionID}`;
     let accessHash: string | undefined;
     const wire = new this.Transport(e.configuration, { token: async () => {
@@ -83,7 +83,7 @@ export class Controller {
     }, onUnauthorized: async () => {
       if (accessHash) await this.ctx.storage.set(key, accessHash);
       throw new Refusal("auth", "Restore authentication through native MCP; the plugin never refreshes credentials");
-    } }, signal, sessionID);
+    } }, signal, sessionID, beforeRetry);
     await wire.connect();
     return wire;
   }
@@ -142,12 +142,12 @@ export class Controller {
     });
   }
   private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal) {
-    let failures = 0, recoveries = 0;
+    let failures = 0, recoveries = 0, throttles = 0;
     while (!signal.aborted && failures < 8) {
       let wire: Wire | undefined;
       try {
         await this.guard(r, epoch, signal);
-        wire = await this.wire(e, e.sessionID, signal);
+        wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         const current = bindingOf(await wire.call("whoami"));
         if (!current.name) {
           r.lease = undefined;
@@ -181,6 +181,7 @@ export class Controller {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
               });
+              throttles = 0;
               if (items.length === 100) dirty = true;
             }
             if (closed) throw new Error("Subscription closed");
@@ -203,7 +204,10 @@ export class Controller {
         } else if (error instanceof Error && /identity_in_use|already in use|identity_unknown/.test(error.message)) throw error;
         else failures++;
         this.set(r, "retrying", `Revalidating the approved root before reopening delivery: ${error instanceof Error ? error.message : "transport failure"}`);
-        await sleep(Math.min(8000, 250 * 2 ** failures), signal);
+        if (wire?.admissionRetryAfterMs) {
+          if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");
+          await sleep(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
+        } else await sleep(Math.min(8000, 250 * 2 ** failures), signal);
       } finally { await wire?.close().catch(() => {}); }
     }
     if (failures >= 8) throw new Error("Retry limit reached; explicitly enroll again");

@@ -10,7 +10,7 @@ for scenario in pause archive delete rebind enrollment account account-away-back
     GRAYBOARD_PACKAGE_TEST_DIR="$base/$scenario-$boundary" GRAYBOARD_TEST_REAL_RACE="$scenario" GRAYBOARD_TEST_RACE_BOUNDARY="$boundary" sh tests/real-run.sh
   done
 done
-for scenario in outage digest-reload native-refresh; do
+for scenario in outage digest-reload native-refresh admission admission-account; do
   GRAYBOARD_PACKAGE_TEST_DIR="$base/$scenario" GRAYBOARD_TEST_REAL_RACE="$scenario" sh tests/real-run.sh
 done
 for boundary in before after; do

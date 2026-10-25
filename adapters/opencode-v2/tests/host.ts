@@ -20,7 +20,7 @@ const installed = readFileSync(join(root, "installed.txt"), "utf8").trim();
 const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
-const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [] };
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], ...(process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? {} : { helloLimit: { burst: 10000, perSec: 10000 } }) };
 const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
@@ -30,6 +30,7 @@ const raceGate: AdmissionGate = { holding: false, boundary: process.env.GRAYBOAR
 const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null; accessHash: string }[] = [];
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
 const nativeCompleted: string[] = [], wrappers: string[] = [];
+let subscriberThrottles = 0;
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
@@ -53,6 +54,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
   }
   const res = await fetch0(new Request(`http://127.0.0.1:${app.server.port}` + url.pathname + url.search, req));
+  if (res.status === 429 && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberThrottles++;
   if (b?.method === "tools/call" && req.headers.get("X-Grayboard-Client") === "subscriber") { const text = await res.clone().text(); if (text.includes('"isError":true')) console.log("SUBSCRIBER_ERROR", b.params.name, text); }
   if (b?.params?.name === "delivery_open" && res.ok) {
     const body = await res.clone().text();
@@ -129,7 +131,44 @@ try {
   const projected = await ctx.integration.connection.resolve(selected); if (projected?.type === "oauth") console.log("NATIVE_GRANT_METADATA", JSON.stringify({ issuer: projected.metadata?.issuer, scope: projected.metadata?.scope, serverUrl: projected.metadata?.serverUrl, clientID: (projected.metadata?.client as { client_id?: string })?.client_id }));
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools");
   let rpc = host.rpc(Grayboard);
-  if (process.env.GRAYBOARD_TEST_REAL_RACE === "native-refresh") {
+  if (process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission")) {
+    const s = await makeRoot("Default admission recovery");
+    await rpc.enroll({ sessionID: s.id, name: "admission", create: true }, { location });
+    await wait(() => app.mcp.activeLeases, n => n === 1, "default-limit initial lease");
+    const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth");
+    const { Client, StreamableHTTPClientTransport } = await import("@modelcontextprotocol/client");
+    const drain = new Client({ name: "default-admission-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+    let last: Response | undefined;
+    await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
+    let refused = false;
+    for (let id = 0; id < 100; id++) {
+      const raw = "refused-admission-" + id;
+      try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
+      catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
+      const response = last!;
+      if (response.status !== 429) { assert(response.ok); continue; }
+      const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
+      assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
+      assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
+      assert.equal(row(raw), null, "Refused admission creates no hosted source row"); refused = true; break;
+    }
+    await drain.close();
+    assert(refused, "Unmodified production default burst is enforced");
+    const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false); app.application.wake(["you@example.com/admission"]);
+    if (process.env.GRAYBOARD_TEST_REAL_RACE === "admission-account") {
+      await wait(() => subscriberThrottles, n => n > 0, "subscriber actual HTTP429 before account transition");
+      email = "other@example.com"; await signIn(native.integrationID);
+      await wait(() => rpc.status({}, { location }), s => s.state === "paused", "account transition aborts admission retry");
+      await Bun.sleep(1200);
+      assert.equal(admissions.length, 0); assert.equal(app.repo.cursors.directFor("you@example.com/admission"), 0);
+      console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
+    } else {
+      await wait(() => app.repo.cursors.directFor("you@example.com/admission"), n => n === message.id, "actual plugin recovers shared default admission", 30_000);
+      assert(subscriberThrottles > 0); assert(admissions.length >= 1); assert.equal(new Set(admissions.map(input => input.id)).size, 1); assert(admissions.every(input => input.sessionID === s.id));
+      await host.session.wait({ sessionID: s.id });
+      console.log("REAL_DEFAULT_ADMISSION_RECOVERY_OK", { subscriberThrottles, cursor: message.id, admissions: admissions.length });
+    }
+  } else if (process.env.GRAYBOARD_TEST_REAL_RACE === "native-refresh") {
     const s = await makeRoot("Native host owns refresh");
     await rpc.enroll({ sessionID: s.id, name: "refresh", create: true }, { location });
     await wait(() => app.mcp.activeLeases, n => n === 1, "native refresh initial lease");

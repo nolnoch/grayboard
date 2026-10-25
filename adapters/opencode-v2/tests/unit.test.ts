@@ -1,9 +1,47 @@
 import { expect, test } from "bun:test";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
+import { Wire } from "../src/wire.js";
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
 export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", name: "be" };
 export const identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };
+async function retryWire(mode: "success" | "guard" | "abort" | "untyped") {
+  const original = globalThis.fetch, abort = new AbortController();
+  const requests: { token: string | null; body: string }[] = [];
+  let tokens = 0, guards = 0;
+  const wire = new Wire(enrollment.configuration, { token: async () => `native-${++tokens}` }, abort.signal, enrollment.sessionID, async () => { guards++; if (mode === "guard") throw new Error("Observed root drift"); });
+  wire.client.connect = async transport => {
+    await transport.start();
+    try { await transport.send({ jsonrpc: "2.0", method: "notifications/test" }); }
+    finally { await transport.close(); }
+  };
+  globalThis.fetch = (async (input, init) => {
+    const request = new Request(input, init);
+    requests.push({ token: request.headers.get("Authorization"), body: await request.text() });
+    if (requests.length > 1) return new Response(null, { status: 202 });
+    if (mode === "abort") setTimeout(() => abort.abort(), 1);
+    return Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "limited", data: { code: mode === "untyped" ? "other" : "rate_limited", retry_after_ms: mode === "abort" ? 1000 : 5 } } }, { status: 429 });
+  }) as typeof fetch;
+  try {
+    if (mode === "success") await wire.connect();
+    else await expect(wire.connect()).rejects.toThrow();
+    return { requests, tokens, guards, retryAfter: wire.admissionRetryAfterMs };
+  } finally { globalThis.fetch = original; abort.abort(); }
+}
+test("typed HTTP429 retries the identical request only after guard and fresh native access", async () => {
+  const result = await retryWire("success");
+  expect(result.requests.map(r => r.token)).toEqual(["Bearer native-1", "Bearer native-2"]);
+  expect(result.requests[0]!.body).toBe(result.requests[1]!.body);
+  expect(result.guards).toBe(1); expect(result.retryAfter).toBe(5);
+});
+test("HTTP429 retry stops on observed drift or abort and ignores untyped refusals", async () => {
+  for (const mode of ["guard", "abort", "untyped"] as const) {
+    const result = await retryWire(mode);
+    expect(result.requests).toHaveLength(1);
+    expect(result.tokens).toBe(1);
+    expect(result.guards).toBe(mode === "guard" ? 1 : 0);
+  }
+});
 test("enrollment fingerprint pins all logical fields independently of key order", () => {
   const hash = enrollmentHash(enrollment);
   expect(enrollmentHash({ ...enrollment, configuration: Object.fromEntries(Object.entries(enrollment.configuration).reverse()) as typeof enrollment.configuration })).toBe(hash);

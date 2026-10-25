@@ -12,12 +12,13 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
   const storage = new Map<string, unknown>(), calls: { sessionID: string; name: string; args: Record<string, unknown> }[] = [], admissions: { sessionID: string; id: string; resume: boolean }[] = [];
   const batches = new Map<string, Item[]>();
   let holdRegister: (() => Promise<void>) | undefined, admit: (() => Promise<void>) | undefined, holdReceipt = false, refuseBind = false;
-  let ownership = 0;
+  let ownership = 0, throttledReads = 0;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
+    admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
     constructor(_config: unknown, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string) {}
     async connect() {}
@@ -45,7 +46,10 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
       }
       return { ok: true };
     }
-    async read() { return { items: batches.get(this.sessionID) ?? [] }; }
+    async read() {
+      if (throttledReads > 0) { throttledReads--; this.admissionRetryAfterMs = 100; throw new Error("typed HTTP429"); }
+      return { items: batches.get(this.sessionID) ?? [] };
+    }
     async listen() { return { closed: new Promise<void>(() => {}), close: async () => {} }; }
   }
   const ctx = {
@@ -61,8 +65,21 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
+test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
+  const r = runtime();
+  try {
+    r.bind("R", "be"); r.throttle(2);
+    r.batches.set("R", [{ id: "direct:throttled", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    const started = Date.now(); await r.controller.enroll("R");
+    for (let i = 0; i < 500 && !r.calls.some(c => c.name === "delivery_receipt"); i++) await Bun.sleep(10);
+    expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(3);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(2900);
+    expect(r.admissions).toHaveLength(1);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(1);
+  } finally { await r.controller.close(); }
+}, 10000);
 test("approval without name does not bind, lease, admit or receipt; native completion opens once", async () => {
   const r = runtime();
   try {
