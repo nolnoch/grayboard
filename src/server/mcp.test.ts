@@ -27,7 +27,7 @@ const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
-  application = createApplication(store.repo, store.db);
+  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = issuedOAuth(store.repo, oauth.resource);
@@ -202,47 +202,68 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const client = await connect(version, async response => {
     last = { status: response.status, retryAfter: response.headers.get("Retry-After"), body: await response.clone().text() };
   });
-  const admit = application.admitIdentity;
+  const select = hosted.sessions.snapshot;
   const secret = "SELECT token FROM /private/database.sqlite alice@example.com";
   for (const error of [new Error(secret), new ApplicationError("internal", secret), { code: "rate_limited", message: secret, extra: { retry_after_ms: 1250 } }, ...[0, -1, NaN, Infinity].map(retry_after_ms => new ApplicationError("rate_limited", secret, { retry_after_ms }))]) {
-    for (const preflight of [true, false]) {
-      application.admitIdentity = () => {
-        if (preflight) throw error;
-        return async () => { throw error; };
-      };
-      await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
-      expect(last.status).toBe(500);
-      expect(last.retryAfter).toBeNull();
-      expect(last.body).not.toContain(secret);
-      expect(last.body).not.toContain("retry_after_ms");
-    }
+    hosted.sessions.snapshot = async () => { throw error; };
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(500);
+    expect(last.retryAfter).toBeNull();
+    expect(last.body).not.toContain(secret);
+    expect(last.body).not.toContain("retry_after_ms");
   }
-  application.admitIdentity = () => { throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 }); };
+  hosted.sessions.snapshot = async () => { throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 }); };
   await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
   expect(last.status).toBe(429);
   expect(last.retryAfter).toBe("2");
   expect(JSON.parse(last.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32000, data: { code: "rate_limited", retry_after_ms: 1250 } } });
   expect(last.body).not.toContain(secret);
-  application.admitIdentity = admit;
+  hosted.sessions.snapshot = select;
   expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
   expect(last.status).toBe(200);
   expect(last.retryAfter).toBeNull();
   let selections = 0;
-  application.admitIdentity = (...args) => {
-    const select = admit(...args);
-    return async sink => {
-      const n = ++selections;
-      await Promise.resolve();
-      if (n === 1) throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 });
-      return select(sink);
-    };
+  hosted.sessions.snapshot = async (...args) => {
+    const n = ++selections;
+    await Promise.resolve();
+    if (n === 1) throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 });
+    return select(...args);
   };
   const results = await Promise.allSettled([client.callTool({ name: "board_list", arguments: {} }), client.callTool({ name: "board_list", arguments: {} })]);
   expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
   expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
   expect(selections).toBe(2);
-  application.admitIdentity = admit;
-  expect(hosted.activeContexts).toBe(0);
+  hosted.sessions.snapshot = select;
+  expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
+});
+
+for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: native delegation uses the bound root and retains own-user targeting`, async () => {
+  const owner = await application.selectIdentity(user, "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const foreign = issuedOAuth(store.repo, oauth.resource, "bob@example.com").authed;
+  const other = await application.selectIdentity(foreign, "outsider", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  try {
+    const client = await connect(version);
+    expect((await client.listTools()).tools.some(t => t.name === "delegate")).toBe(true);
+    const refused = await client.callTool({ name: "delegate", arguments: { persona: "researcher", task: "inspect the invariant", to: "bob@example.com/outsider" } });
+    expect(refused.isError).toBe(true);
+    expect(application.history(other.session)).toEqual([]);
+    const result = await client.callTool({ name: "delegate", arguments: { persona: "researcher", task: "inspect the invariant", to: "launcher" } });
+    expect(result.isError).not.toBe(true);
+    const messages = application.history(owner.session);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.sender).toBe("alice@example.com/be");
+    expect(messages[0]!.body).toContain('"persona": "researcher"');
+    expect(store.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'").get()).toEqual({ n: 1 });
+  } finally { application.close(owner.session); application.close(other.session); }
+});
+
+test("hosted bind does not inherit a previous WS launcher's opt-in", async () => {
+  const prior = await application.selectIdentity(user, "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  application.close(prior.session);
+  const client = await connect();
+  expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
+  expect(store.db.query("SELECT launcher FROM handles WHERE name = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
+  expect(store.db.query("SELECT detail FROM access_log WHERE action = 'handle.launcher_set' AND target = ? ORDER BY rowid DESC LIMIT 1").get("alice@example.com/launcher")).toEqual({ detail: '{"on":false}' });
 });
 
 test("internal operation failures are redacted, including paths and SQL", async () => {

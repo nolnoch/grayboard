@@ -3,6 +3,7 @@ import { Client, StreamableHTTPClientTransport, PROTOCOL_VERSION_META_KEY, CLIEN
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
 
 test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaustion is isolated", async () => {
   let now = 0;
@@ -42,7 +43,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   });
   let last: { status: number; retryAfter: string | null; body: string } | undefined;
   try {
-    const token = await srv.login("alice@example.com");
+    const { token, authed } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     const user = srv.app.repo.users.findByEmail("alice@example.com")!;
     srv.app.repo.aliases.create(user.email, "be");
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
@@ -69,7 +70,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(last!.retryAfter).toBe(String(Math.ceil(error.data.retry_after_ms / 1000)));
     expect(error).toMatchObject({ code: -32000, data: { code: "rate_limited" } });
     expect(last!.body).not.toContain(user.email);
-    expect(srv.app.mcp.activeContexts).toBe(0);
+    expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
+    await expect(srv.app.application.selectIdentity(authed, undefined, { deliver() {}, probe: async () => false, closed() {} }, { read_only: true, push: false })).rejects.toMatchObject({ code: "rate_limited" });
+    expect(srv.app.repo.hosted.all()).toEqual([]);
     const before = srv.app.db.query("SELECT * FROM boards").all();
     await expect(client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "must not dispatch" } })).rejects.toThrow();
     expect(last!.status).toBe(429);
@@ -83,7 +86,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(last!.status).toBe(200);
     expect(last!.retryAfter).toBeNull();
     expect(srv.app.db.query("SELECT * FROM boards").all()).toEqual(before);
-    expect(srv.app.mcp.activeContexts).toBe(0);
+    expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
   } finally {
     await client.close();
     await srv.stop();

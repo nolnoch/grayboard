@@ -83,7 +83,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
   const token = await login();
-  const launcher = new WsClient(base, token, "allowed", { hello: { launcher: true } });
+  const launcher = new WsClient(base, await legacyLogin(), "allowed", { hello: { launcher: true } });
   wsClients.push(launcher);
   expect((await launcher.connect()).type).toBe("hello_ok");
   const client = await connect(token, "be", version);

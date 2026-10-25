@@ -265,10 +265,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
-  function admit(authed: AuthedUser, nameInput: string | undefined, m: IdentityOptions) {
+  function admit(authed: AuthedUser, nameInput: string | undefined, m: IdentityOptions, sessionId?: string | null) {
     const limiter = m.transport === "hosted" ? hostedRequestLimiter : helloLimiter;
     const t = limiter.take(authed.user_email, {
-      session_id: m.session_key ? idAddress(m.session_key) : null,
+      session_id: sessionId !== undefined ? sessionId : m.session_key ? idAddress(m.session_key) : null,
       ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
       place: m.where ?? null,
     });
@@ -486,6 +486,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     repo,
     hostedHolder(full: string) { return hub.holders.get(full); },
+    admitHosted(authed: AuthedUser, sessionId: string | null) { admit(authed, undefined, { read_only: true }, sessionId); },
     hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
     hostedSession(authed: AuthedUser, id: string, name: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
       const session = new ApplicationSession(authed, sink, false, push);
@@ -537,6 +538,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           .run(`${authed.user_email}/${previous}`, full);
       }
       setPlace(db, full, place);
+      setLauncher(db, full, false);
+      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: false });
       return { moved, notMoved };
     },
     hostedRefused(id: string, full: string, detail: string) { logBinding(db, id, full, "refused", detail); },

@@ -3,6 +3,7 @@ import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@mo
 import { z } from "zod";
 import { boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
 import { CoreError } from "../core/errors.ts";
+import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
@@ -76,7 +77,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, isAuthorized: principal => oauth.isAuthorized(principal) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
-  const exchanges = new AsyncLocalStorage<{ request: Request; meta?: unknown; refusal?: Response; context?: Context; legacy?: Legacy }>();
+  const exchanges = new AsyncLocalStorage<{ request: Request; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy }>();
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
     if (exchange) exchange.refusal = response;
@@ -100,8 +101,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (principal instanceof Response) return refuse(principal);
     const routing = sessionContext(principal, exchanges.getStore()?.meta);
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
-    try { selected = await hosted.snapshot(principal, routing); }
-    catch (error) {
+    try {
+      application.admitHosted(principal.authed, "id" in routing ? routing.id : null);
+      selected = await hosted.snapshot(principal, routing);
+    } catch (error) {
+      const exchange = exchanges.getStore();
+      if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
+        const retryAfterMs = error.extra.retry_after_ms;
+        exchange.refusal = Response.json({ jsonrpc: "2.0", id: exchange.id ?? null,
+          error: { code: -32000, message: "too many connections; retry after the indicated delay", data: { code: "rate_limited", retry_after_ms: retryAfterMs } },
+        }, { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } });
+      }
       if (!closed && !request.signal.aborted && error instanceof ApplicationError && error.code === "unauthenticated") {
         const refusal = oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
@@ -366,8 +376,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
-        const parsed = body.parsedBody as { params?: { _meta?: unknown } } | undefined;
-        return await exchanges.run({ request: req, meta: parsed?.params?._meta }, async () => {
+        const parsed = body.parsedBody as { id?: string | number | null; params?: { _meta?: unknown } } | undefined;
+        return await exchanges.run({ request: req, meta: parsed?.params?._meta, id: parsed?.id }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
@@ -502,6 +512,10 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
     inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional() }),
   }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
+  server.registerTool(DELEGATE_TOOL.name, {
+    description: DELEGATE_TOOL.description,
+    inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+  }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
   server.registerTool("dm_history", {
     description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
     inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
