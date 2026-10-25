@@ -123,6 +123,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   return {
     server,
+    application,
     mcp,
     repo,
     db,

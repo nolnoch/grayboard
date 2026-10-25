@@ -104,7 +104,7 @@ export class SlackBridge implements SlackLinker {
    * silently, because the operator knows. The fatal shape — Slack ended the
    * connection, or startup failed — records one `bridge.stopped` audit row per
    * linked user; that row is the pending notice, drained by the user's next
-   * agent-session hello (src/server/ws.ts), deduped to one delivered notice
+   * agent-session selection (src/server/application.ts), deduped to one delivered notice
    * per user per BRIDGE_NOTIFY_DEDUP_MS so a flapping bridge can't spam its
    * owner.
    */

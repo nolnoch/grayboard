@@ -344,7 +344,7 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   // the notice doesn't repeat.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();
@@ -366,7 +366,7 @@ test("a bridge that fails at boot tells its linked users, via the durable links"
   // notify loop must run over the durable links, whose map is not empty.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const boot = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: "http://127.0.0.1:1/api/",
   });
   await boot.start().catch((e) => boot.stop({ fatal: true, detail: `not started: ${(e as Error).message}` }));
@@ -393,7 +393,7 @@ test("an armed but undelivered notice survives a restart inside the dedup window
   // of the newest death.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();
@@ -406,9 +406,7 @@ test("an armed but undelivered notice survives a restart inside the dedup window
   expect(bridgeNotices[0]).toContain("token revoked again");
 });
 
-// The guard at the drain site (only agent-session hellos drain) is what keeps
-// the bridge's own human hello from consuming the notice into a handshake
-// nobody reads: this test fails when the `if (!ws.data.human)` guard is removed.
+// Trusted human attachment must not consume the owner's notice.
 test("the bridge's own human hello doesn't drain the owner's notice", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -416,7 +414,7 @@ test("the bridge's own human hello doesn't drain the owner's notice", async () =
   // A restarted bridge attaches the same user: its attach sends a human hello.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();

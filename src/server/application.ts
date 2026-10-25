@@ -128,6 +128,25 @@ function wake(hub: Hub, handles: string[]): void {
   }
 }
 
+// The audit log keeps an undelivered bridge death owed across restarts.
+// Selection reads and records delivery synchronously, so only one agent gets it.
+function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+  const target = `${email}/${HUMAN_NAME}`;
+  const stop = repo.audit.last("bridge.stopped", target);
+  if (!stop) return undefined;
+  let detail: { reason?: string; at?: string; suppressed?: boolean };
+  try {
+    detail = stop.detail ? (JSON.parse(stop.detail) as typeof detail) : {};
+  } catch {
+    return undefined;
+  }
+  if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  const notified = repo.audit.last("bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
+}
+
 export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptions = {}) {
   const hub: Hub = {
     repo,
@@ -315,6 +334,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
     const info: IdentityInfo = { ...infoFor(full), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
     const notices = [...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)), ...claimsInstruction(listClaims(db, undefined, full), full)];
+    // The bridge's human attachment must not consume the owner's notice.
+    if (!human) {
+      const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
+      if (bridgeNotice) notices.push(bridgeNotice);
+    }
     if (notices.length) info.notices = notices;
     return { session, info };
   }
