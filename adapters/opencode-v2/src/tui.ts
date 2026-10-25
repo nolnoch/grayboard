@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode/plugin/tui";
+import * as Plugin from "@opencode/plugin/tui/plugin";
 import { Grayboard } from "./rpc.js";
 export default Plugin.define({ id: "grayboard.tui", setup(context) {
   const rpc = context.client.rpc(Grayboard);

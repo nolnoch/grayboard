@@ -4,7 +4,17 @@ Standalone OpenCode **v2** integration for hosted Grayboard. Version 1.10.0 targ
 
 The native HTTP MCP connection supplies agent tools, server instructions, sign-in, credential storage and refresh. This package supplements it with an in-process `2026-07-28` resource subscriber and durable root-session admission. It registers no agent tools and creates no OAuth grant or refresh handler.
 
-## Build and install
+## Install from Git
+
+Use OpenCode 2.1.4 and a reviewed, publicly available **full 40-character commit hash** containing this package:
+
+```sh
+opencode plugin add 'github:nolnoch/grayboard#<FULL_40_CHARACTER_SHA>::path:adapters/opencode-v2'
+```
+
+Replace the placeholder with the complete hash; do not use a mutable branch, tag or abbreviated hash. The same quoted target can be used as the `plugins` package value below. Confirm that the revision is on GitHub before recommending it to others. Git installation loads packaged TypeScript source directly, with no build command or lifecycle hook required. A tarball installation is a separate option, not verification of the Git target.
+
+## Build and install locally
 
 This directory is an independent package; root typechecking does not cover it.
 
@@ -12,11 +22,11 @@ This directory is an independent package; root typechecking does not cover it.
 bun install --frozen-lockfile
 bun run typecheck
 bun test
-bun run build
+bun run build:package
 npm pack --ignore-scripts
 ```
 
-The package is not published by these commands. Install the resulting tarball into a dedicated directory, or use this built package directory. OpenCode loads a package/directory, not a tarball URL. Loadable root `index.js`/`tui.js` entries and the main/optional `./tui` package exports are included for directory discovery; generated `dist/`, dependencies and tarballs are ignored.
+The package is not published by these commands. Install the resulting tarball into a dedicated directory, or use this package directory with dependencies installed. OpenCode loads a package/directory, not a tarball URL. Both package exports and directory-discovery wrappers load `src/`; optional generated `dist/` is included when explicitly built before packing, but is never required for installation. The compiler command is deliberately named `build:package`: a script named `build` triggers unnecessary Pacote Git preparation, whose nested npm launcher is absent in the published OpenCode 2.1.4 SDK installer. No install/prepare/prepack hooks are used. The command-only TUI imports the public `tui/plugin` definition subpath without pulling optional Solid rendering peers into source loading.
 
 Example `opencode.json` (replace the registered example server/client and directory):
 
@@ -82,6 +92,8 @@ Admissions and receipts are serialized. Each item is rendered as untrusted chann
 Pause/reload/shutdown cancels the loop and closes streams. Cleanup releases an old lease only with fresh access and a still-matching public binding. It never retargets cleanup or uses a cached credential after an account/configuration change; otherwise the server's thirty-second expiry removes ownership. In particular, embedded-host shutdown can make public MCP/integration services unavailable before plugin cleanup, so shutdown may rely on that bounded expiry rather than an immediate release; an explicit pause while the host is running releases promptly. Deleted/archived roots are rechecked before admission and receipt. In-flight public guard/admission races cannot be made atomic by this package.
 
 ## Verification
+
+`GRAYBOARD_PACKAGE_TEST_DIR=/path/to/fresh/approved/scratch bun run test:git` creates a disposable source-only Git repository outside the real checkout, pins its full hash and subdirectory, and lets the actual installed OpenCode 2.1.4 SDK host install/load it from configuration with scripts disabled. It asserts active server/TUI/RPC discovery, imports the installed source entries through the published host loader, checks inert unenrolled RPC status and directory wrappers, and rejects any dependence on `dist/`. This verifies local Git transport, not availability of a future GitHub revision or interactive TUI rendering.
 
 `bun test` covers deterministic IDs, payload bounds and contiguous-prefix failure/retry semantics. `bun run test:host` builds and packs the package, installs the local tarball into a directory, checks exports, strictly typechecks the fixture, then loads the installed main entry in the actual embedded OpenCode 2.1.4 runtime. Set an approved isolated scratch directory first:
 

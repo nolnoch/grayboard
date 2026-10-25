@@ -1,1 +1,1 @@
-export { default, Grayboard } from "./dist/index.js";
+export { default, Grayboard } from "./src/index.ts";

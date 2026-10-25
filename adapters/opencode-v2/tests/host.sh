@@ -10,7 +10,7 @@ cp tests/host.ts "$GRAYBOARD_PACKAGE_TEST_DIR/source/adapters/opencode-v2/tests/
 ln -sfn "$PWD/node_modules" "$GRAYBOARD_PACKAGE_TEST_DIR/source/node_modules"
 fixture="$GRAYBOARD_PACKAGE_TEST_DIR/source/adapters/opencode-v2/tests/host.ts"
 tooling="$PWD/node_modules"
-bun run build
+bun run build:package
 npm pack --ignore-scripts --pack-destination "$GRAYBOARD_PACKAGE_TEST_DIR"
 cd "$GRAYBOARD_PACKAGE_TEST_DIR"
 mkdir -p tool-bin
@@ -23,7 +23,7 @@ env -i PATH="$probePath" HOME="$PWD/home" XDG_CONFIG_HOME="$PWD/home/config" XDG
 cat > exports.mjs <<'JS'
 import plugin, { Grayboard } from 'grayboard-opencode';
 const tui = import.meta.resolve('grayboard-opencode/tui');
-if (!plugin || !Grayboard || !tui.endsWith('/tui.js')) throw new Error('Missing package exports');
+if (!plugin || !Grayboard || !tui.endsWith('/src/tui.ts')) throw new Error('Missing package exports');
 JS
 env -i PATH="$probePath" HOME="$PWD/home" TMPDIR="$PWD/tmp" bun exports.mjs
 env -i PATH="$probePath" HOME="$PWD/home" TMPDIR="$PWD/tmp" bun "$tooling/typescript/bin/tsc" --noEmit --strict --skipLibCheck --target ESNext --module ESNext --moduleResolution Bundler --allowImportingTsExtensions --resolveJsonModule --typeRoots "$tooling/@types" --types bun "$fixture"
