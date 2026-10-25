@@ -110,11 +110,10 @@ if (RETENTION_DAYS === null) {
 }
 
 // BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
-// has no adapter. Draining here would consume messages into a void.
+// has no adapter. Draining here would consume messages into a void. It is
+// still a session (#284 S7): its own ID, which its writes carry, but one that
+// receives nothing.
 const PUSH = process.env.BUS_PUSH !== "off";
-// The session ID this process's writes carry: a tools-only process registers
-// no session (#284 PR 2 gives it one), so its writes carry none.
-const WRITER_ID = PUSH ? SESSION_ID : null;
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
 // (`grayboard human`), whose messages and posts reach agents marked
@@ -196,6 +195,16 @@ const writeName = (name: string | null) => {
 if (!PUSH) {
   bound = SUGGESTED;
   ensureAlias(db, bound!, bound!);
+  // Its liveness is its own process, keyed or not: it ends on exit, and a
+  // key shared with a live session collides rather than attaching.
+  try {
+    registerSession(db, thisSession(SESSION_ID), false, bound!);
+  } catch (e) {
+    if (!(e instanceof IdCollision)) throw e;
+    writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid, tools_only: true });
+    console.error(`[grayboard] ${e.message}`);
+    process.exit(1);
+  }
 } else {
   // The session that owns delivery owns the name: it writes the session's
   // rows, its presence while unbound, and acquires through them.
@@ -353,7 +362,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   const { name, arguments: args = {} } = req.params;
   const run = async () => {
     if (bound) touchAlias(db, bound);
-    if (PUSH) touchId(db, SESSION_ID);
+    touchId(db, SESSION_ID);
     return call(name, args, signal);
   };
   const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
@@ -424,7 +433,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     checkBody(d.body);
     // The message id tracks the pick that owns the work: a re-pick replaces
     // both (review 16).
-    let msgId = (await insertMessage(IDENTITY, WRITER_ID, d.to, d.body, null, true, [])).id;
+    let msgId = (await insertMessage(IDENTITY, SESSION_ID, d.to, d.body, null, true, [])).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
@@ -438,7 +447,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       try {
         const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
-          const id2 = (await insertMessage(IDENTITY, WRITER_ID, d2.to, d2.body, null, true, [])).id;
+          const id2 = (await insertMessage(IDENTITY, SESSION_ID, d2.to, d2.body, null, true, [])).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
           d = d2;
           msgId = id2;
@@ -487,7 +496,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, WRITER_ID, recipient, body, parent_id ?? null, pending === true, ids));
+    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids));
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
@@ -582,7 +591,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       ...(name === "peer_list" ? { unbound: await unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
       human: HUMAN,
-      ...(WRITER_ID ? { session: WRITER_ID } : {}),
+      session: SESSION_ID,
       addresses: ADDRS,
     };
     const { attachments: paths, ...args } = a;
@@ -781,7 +790,7 @@ const shutdown = async () => {
   try {
     // A keyed session outlives this process while its harness runs.
     if (PUSH && HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);
-    else if (PUSH) ended = endLocalSession(db, SESSION_ID);
+    else ended = endLocalSession(db, SESSION_ID);
   } catch {
     // Same: shutdown must not throw.
   }

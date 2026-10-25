@@ -107,6 +107,17 @@ test("a key already served by a live process under another harness is refused at
   await owner.call("peer_list", {});
 }, 30_000);
 
+test("a tools-only process sharing a live session's key is refused: it never attaches", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  const owner = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key } });
+  const err = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } }).then(() => "started", (e: Error) => e.message);
+  expect(err).toContain(`id_collision: ${id} is a live session's; start with a new session key`);
+  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ ended_at: null, tools_only: true })]);
+  expect(binding(id)).toMatchObject({ pid: owner.harnessPid, detached_at: null });
+  expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "push", ended_at: null }]);
+}, 30_000);
+
 test("the harness is the first ancestor past a launcher, or BUS_HARNESS_PID; a bad key or a harness pid without a key refuses to start", async () => {
   const viaSh = mintSessionKey();
   const sh = await localSession(dir, undefined, { via: SH, extra: { BUS_SESSION_KEY: viaSh } });

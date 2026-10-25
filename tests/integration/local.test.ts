@@ -358,6 +358,9 @@ test("grayboard claim take/release acts as the shell's bound session; held exits
   expect(unbound.code).toBe(1);
   expect(unbound.err).toContain("hasn't bound a name yet");
   await call(api, "bind", { name: "api", create: true });
+  // A tools-only process beside it in the checkout (#284 S7) owns no shell:
+  // the bound session is still the only candidate.
+  await localSession(dir, "api", { cwd: repo, extra: { BUS_PUSH: "off" } });
   expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout)\n" });
   const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
   expect((await gb(undefined, elsewhere, "whoami")).err).toContain("no live session runs this shell or this checkout");

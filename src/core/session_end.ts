@@ -115,9 +115,9 @@ export function bounceBody(id: string, endedAt: number, held: string[]): string 
  * existed, or pruned past retention), a viewer (not_found) or a tools-only
  * session (no_delivery, naming the alias its owner writes as).
  */
-export function assertDeliverableId(db: Database, id: string, owner?: () => string | null): void {
-  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, viewer FROM ids WHERE id = ?`).get(id) as
-    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; viewer: number }
+export function assertDeliverableId(db: Database, id: string): void {
+  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
+    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
     | null;
   if (!r || r.viewer) throw new CoreError(`not_found: no session ${id}`);
   if (r.ended_at != null) {
@@ -125,7 +125,6 @@ export function assertDeliverableId(db: Database, id: string, owner?: () => stri
     throw new CoreError(`id_ended: ${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
   }
   if (r.delivery === "none") {
-    const alias = owner?.();
-    throw new CoreError(`no_delivery: ${id} is a tools-only session and receives nothing${alias ? `; send to ${alias}` : ""}`);
+    throw new CoreError(`no_delivery: ${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
   }
 }

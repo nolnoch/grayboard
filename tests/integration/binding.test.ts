@@ -502,7 +502,7 @@ test("13 (decision 13): `grayboard tools` prints what the session serves; bind's
 
 // #284 audit B1/W1: a write carries the writing session's ID; a tools-only
 // process registers no session, so its writes carry none.
-test("#284: messages and posts carry the owner session's ID; a tools-only process's carry null", async () => {
+test("#284 S7: a tools-only process is its own session: its writes carry its ID, it can't be sent to, it isn't listed, it ends on exit", async () => {
   const owner = await session("be");
   await owner.call("board_create", { name: "e2e", purpose: "test" });
   const tools = await session("be", { extra: { BUS_PUSH: "off" } });
@@ -511,7 +511,18 @@ test("#284: messages and posts carry the owner session's ID; a tools-only proces
     await s.call("board_post", { board: "e2e", body: `post ${tag}` });
   }
   const id = holderOf("be")!;
+  const toolsId = rows<{ id: string }>(`SELECT id FROM ids WHERE delivery = 'none'`)[0]!.id;
   expect(id).toMatch(/^id:[0-9a-z]{13}$/);
-  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: null }]);
-  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: null }]);
+  expect(toolsId).toMatch(/^id:[0-9a-z]{13}$/);
+  expect(toolsId).not.toBe(id);
+  expect(rows(`SELECT writes_as, ended_at FROM ids WHERE id = ?`, toolsId)).toEqual([{ writes_as: "be", ended_at: null }]);
+  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: toolsId }]);
+  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: toolsId }]);
+  // Mail it could never read is refused now, pointed at the alias it writes as.
+  expect(await refusal(owner, "dm_send", { to: toolsId, body: "hi" })).toBe(`error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to be`);
+  const other = await session();
+  expect(((await other.call("peer_list", {})).unbound_sessions as { session_id: string }[]).map((u) => u.session_id)).toEqual([await sessionId(other)]);
+  await stop(tools.c);
+  await until(() => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, toolsId)[0]!.ended_at !== null);
+  expect(holderOf("be")).toBe(id);
 }, 20_000);

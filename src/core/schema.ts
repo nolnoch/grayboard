@@ -210,10 +210,12 @@ export function initCoreSchema(db: Database): void {
   // Session end and kinds (#284 PR 2). held_aliases_json: the aliases the ID
   // held when it ended, for the id_ended hint and bounces. delivery: 'push'
   // (default) or 'none', a tools-only process (BUS_PUSH=off) that receives
-  // nothing. viewer: a `grayboard tail` session, never listed or addressable.
+  // nothing; writes_as: the alias such a process writes as, which a send to
+  // its ID is pointed at. viewer: a `grayboard tail` session, never listed or addressable.
   const idCols = new Set((db.prepare(`PRAGMA table_info(ids)`).all() as { name: string }[]).map((c) => c.name));
   if (!idCols.has("held_aliases_json")) db.exec(`ALTER TABLE ids ADD COLUMN held_aliases_json TEXT`);
   if (!idCols.has("delivery")) db.exec(`ALTER TABLE ids ADD COLUMN delivery TEXT NOT NULL DEFAULT 'push'`);
+  if (!idCols.has("writes_as")) db.exec(`ALTER TABLE ids ADD COLUMN writes_as TEXT`);
   if (!idCols.has("viewer")) {
     db.exec(`ALTER TABLE ids ADD COLUMN viewer INTEGER NOT NULL DEFAULT 0`);
     // A local tail's 1.x `~tail-<pid>` handle had its rows swept by the next

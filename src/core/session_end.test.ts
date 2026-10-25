@@ -109,6 +109,6 @@ test("a send to an ID is refused when it ended, has no row, is a viewer or recei
   expect(() => assertDeliverableId(db, "id:0123456789abz")).toThrow("not_found");
   db.prepare(`UPDATE ids SET viewer = 1 WHERE id = ?`).run(OTHER);
   expect(() => assertDeliverableId(db, OTHER)).toThrow("not_found");
-  db.prepare(`UPDATE ids SET viewer = 0, delivery = 'none' WHERE id = ?`).run(OTHER);
-  expect(() => assertDeliverableId(db, OTHER, () => "be")).toThrow(`no_delivery: ${OTHER} is a tools-only session and receives nothing; send to be`);
+  db.prepare(`UPDATE ids SET viewer = 0, delivery = 'none', writes_as = 'be' WHERE id = ?`).run(OTHER);
+  expect(() => assertDeliverableId(db, OTHER)).toThrow(`no_delivery: ${OTHER} is a tools-only session and receives nothing; send to be`);
 });

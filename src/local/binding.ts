@@ -98,17 +98,19 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
- * are its presence until it binds. Throws IdCollision when the ID already
- * has a row: an ID is never reused, and a keyed session's restart attaches
- * (attachSession) instead.
+ * are its presence until it binds. A tools-only process (#284 S7) passes the
+ * alias it writes as, `writesAs`: it never binds, and receives nothing.
+ * Throws IdCollision when the ID already has a row: an ID is never reused,
+ * and a keyed session's restart attaches (attachSession) instead.
  */
-export function registerSession(db: Database, s: SessionRow, launcher: boolean): void {
+export function registerSession(db: Database, s: SessionRow, launcher: boolean, writesAs?: string): void {
   db.transaction(() => {
-    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher }, s.started_at);
+    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs }, s.started_at);
     db.prepare(
       `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
     writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
+      ...(writesAs === undefined ? {} : { tools_only: true, writes_as: writesAs }),
       keyed: s.harness_rule !== null, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     });
   }).immediate();
@@ -243,13 +245,17 @@ export function reap(db: Database, rows: SessionRow[], now: number): Ended {
 const ORPHAN_SQL = `SELECT id FROM ids WHERE ended_at IS NULL AND id NOT IN (SELECT session_id FROM bindings)`;
 
 /**
- * Every live session row, ending the dead ones: those whose process is gone,
- * and orphans (ORPHAN_SQL). The probe runs before the write lock; each
+ * Every live session row that receives, ending the dead ones: those whose
+ * process is gone, and orphans (ORPHAN_SQL). Tools-only processes (#284 S7)
+ * are ended like any session but never returned: they own no shell, take no
+ * name and can't be reached. The probe runs before the write lock; each
  * candidate is re-checked inside it.
  */
 export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const rows = db.prepare(SESSION_SQL).all() as SessionRow[];
-  const { alive, dead } = aliveRows(rows);
+  const { alive: live, dead } = aliveRows(rows);
+  const toolsOnly = new Set((db.prepare(`SELECT id FROM ids WHERE delivery = 'none' AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
+  const alive = live.filter((r) => !toolsOnly.has(r.session_id));
   const orphans = db.prepare(ORPHAN_SQL).all() as { id: string }[];
   if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
   testPause("end:before-txn");

@@ -152,6 +152,8 @@ export type IdFacts = {
   cwd?: string | null;
   place?: string | null;
   launcher: boolean;
+  // A tools-only process (#284 S7): receives nothing, writes as this alias.
+  writesAs?: string;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -171,8 +173,8 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): void {
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null);
 }
 
 /** The principal of session `id`'s row, or undefined when it has none. */
