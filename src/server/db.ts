@@ -582,7 +582,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
           ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
-          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id }, attachmentLimits);
+          const attachments = bindAttachments(db, attachmentIds, [sender], { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
       },

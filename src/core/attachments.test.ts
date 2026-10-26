@@ -370,7 +370,7 @@ describe("storage", () => {
   test("a quota caps the bytes a principal's uploads store in all, sent or not", async () => {
     const quota = { principal: "you@example.com", unsent: 1000, stored: 10 };
     const sent = await store("you@example.com/be", file("123456"), { quota });
-    bindAttachments(db, [sent.id], "you@example.com/be", { message_id: msg("you@example.com/be") }, LIMITS);
+    bindAttachments(db, [sent.id], ["you@example.com/be"], { message_id: msg("you@example.com/be") }, LIMITS);
     await expect(store("you@example.com/fe", file("12345"), { quota })).rejects.toThrow(/your stored attachments would exceed 10B/);
     expect((await store("you@example.com/fe", file("1234"), { quota })).size).toBe(4);
     expect(uploadedBytes(db, "you@example.com", false)).toBe(10);
@@ -392,8 +392,8 @@ describe("storage", () => {
   test("bind checks the message's total against the limits it's given", async () => {
     const ids = [(await store("be", file("x".repeat(20)))).id, (await store("be", file("y".repeat(20)))).id];
     const limits = { file: 100, total: 30 };
-    expect(() => bindAttachments(db, ids, "be", { message_id: msg() }, limits)).toThrow("attachments exceed 30B in all");
-    expect(bindAttachments(db, ids.slice(0, 1), "be", { message_id: msg() }, limits).length).toBe(1);
+    expect(() => bindAttachments(db, ids, ["be"], { message_id: msg() }, limits)).toThrow("attachments exceed 30B in all");
+    expect(bindAttachments(db, ids.slice(0, 1), ["be"], { message_id: msg() }, limits).length).toBe(1);
   });
 
   test("identical bytes share one blob; a sweep deletes it once the last attachment naming it goes", async () => {
@@ -403,8 +403,8 @@ describe("storage", () => {
     expect([blobCount(db), byteCount(db)]).toEqual([1, 1]);
     const m1 = msg();
     const m2 = msg("fe", "be");
-    bindAttachments(db, [a.id], "be", { message_id: m1 }, LIMITS);
-    bindAttachments(db, [b.id], "fe", { message_id: m2 }, LIMITS);
+    bindAttachments(db, [a.id], ["be"], { message_id: m1 }, LIMITS);
+    bindAttachments(db, [b.id], ["fe"], { message_id: m2 }, LIMITS);
     dropAttachments(db, "message", "?", m1);
     expect(getAttachment(db, a.id)).toBeUndefined();
     expect(await sweepBlobs(db, blobs)).toBe(0);
@@ -420,7 +420,7 @@ describe("storage", () => {
   test("releasing drops only the caller's own unsent upload, and its bytes once nothing names them", async () => {
     const mine = await store("be", file("a"));
     const bound = await store("be", file("b"));
-    bindAttachments(db, [bound.id], "be", { message_id: msg() }, LIMITS);
+    bindAttachments(db, [bound.id], ["be"], { message_id: msg() }, LIMITS);
     expect(await releaseUpload(db, blobs, mine.id, "fe")).toBeNull();
     expect(await releaseUpload(db, blobs, bound.id, "be")).toBeNull();
     expect((await releaseUpload(db, blobs, mine.id, "be"))?.id).toBe(mine.id);
@@ -454,14 +454,22 @@ describe("storage", () => {
     expect(new TextDecoder().decode(await blobs.get(a.sha256))).toBe("raced");
   });
 
+  // #284 S5: an upload binds for any address of the sending session.
+  test("binding takes an upload of any of the sender's addresses, and no one else's", async () => {
+    const asA = await store("a", file("x"));
+    const other = await store("t", file("y"));
+    expect(bindAttachments(db, [asA.id], ["b", "a", "id:0123456789abc"], { message_id: msg() }, LIMITS).map((r) => r.id)).toEqual([asA.id]);
+    expect(() => bindAttachments(db, [other.id], ["b", "a"], { message_id: msg() }, LIMITS)).toThrow(`attachment ${other.id} isn't an unsent upload of yours`);
+  });
+
   test("binding takes only the caller's unbound uploads", async () => {
     const mine = await store("be", file("a"));
     const theirs = await store("fe", file("b"));
     const m = msg();
-    expect(() => bindAttachments(db, [theirs.id], "be", { message_id: m }, LIMITS)).toThrow(`attachment ${theirs.id} isn't an unsent upload of yours`);
-    expect(() => bindAttachments(db, [999], "be", { message_id: m }, LIMITS)).toThrow("isn't an unsent upload");
-    expect(bindAttachments(db, [mine.id], "be", { message_id: m }, LIMITS)).toEqual([{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1, sha256: mine.sha256 }]);
-    expect(() => bindAttachments(db, [mine.id], "be", { message_id: msg() }, LIMITS)).toThrow("isn't an unsent upload");
+    expect(() => bindAttachments(db, [theirs.id], ["be"], { message_id: m }, LIMITS)).toThrow(`attachment ${theirs.id} isn't an unsent upload of yours`);
+    expect(() => bindAttachments(db, [999], ["be"], { message_id: m }, LIMITS)).toThrow("isn't an unsent upload");
+    expect(bindAttachments(db, [mine.id], ["be"], { message_id: m }, LIMITS)).toEqual([{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1, sha256: mine.sha256 }]);
+    expect(() => bindAttachments(db, [mine.id], ["be"], { message_id: msg() }, LIMITS)).toThrow("isn't an unsent upload");
     expect(withAttachments(db, "message", [{ id: m }, { id: m + 100 }])).toEqual([
       { id: m, attachments: [{ id: mine.id, filename: "f.txt", type: "text/plain", size: 1, sha256: mine.sha256 }] },
       { id: m + 100 },
@@ -523,7 +531,7 @@ describe("storage", () => {
   test("who may fetch: board viewers, the DM's two ends, an upload's uploader", async () => {
     const m = msg("be", "fe");
     const onDm = await store("be", file("dm"));
-    bindAttachments(db, [onDm.id], "be", { message_id: m }, LIMITS);
+    bindAttachments(db, [onDm.id], ["be"], { message_id: m }, LIMITS);
     const dm = (h: string) => (id: number) => {
       const row = db.prepare(`SELECT sender, recipient FROM messages WHERE id = ?`).get(id) as { sender: string; recipient: string };
       return row.sender === h || row.recipient === h;

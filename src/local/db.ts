@@ -45,8 +45,8 @@ export type Message = {
 const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending, kind`;
 const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
 
-// Stores the message from session `senderId` and binds the sender's uploads
-// `ids` to it, in one transaction. A session ID recipient is checked in that
+// Stores the message from session `senderId` and binds the uploads `ids` of
+// any of `uploaders` (the session's addresses, #284 S5) to it, in one transaction. A session ID recipient is checked in that
 // transaction, so the send can't race the session's end (#284 S8): it's
 // refused once the end has the lock, and bounced by it if it landed first.
 export function insertMessage(
@@ -57,6 +57,7 @@ export function insertMessage(
   parent_id: number | null,
   pending = false,
   ids: number[] = [],
+  uploaders: string[] = [sender],
 ): { id: number; attachments: AttachmentInfo[] } {
   testPause("send:before-txn");
   return db.transaction(() => {
@@ -69,7 +70,7 @@ export function insertMessage(
       )
       .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
-    return { id, attachments: bindAttachments(db, ids, sender, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
+    return { id, attachments: bindAttachments(db, ids, uploaders, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
 }
 

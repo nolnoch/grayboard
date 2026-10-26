@@ -1003,7 +1003,7 @@ function prepareSend(
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
-    digests = uploadDigests(db, ids, ws.data.primary);
+    digests = uploadDigests(db, ids, [ws.data.primary]);
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
@@ -1079,7 +1079,7 @@ function writeOnce<W extends Written>(
   const out = dedupWrite(repo, hub.now(), {
     tool, session: ws.data.sessionId!, sender: me, actor: authed.user_email, transport: "wss", args, resend,
   }, write, () => {
-    for (const row of dropUnsentUploads(hub.db, uploads, me)) {
+    for (const row of dropUnsentUploads(hub.db, uploads, [me])) {
       writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
         identity: me, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
@@ -1253,7 +1253,7 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, u
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
       parent_id: postArgs.parent_id ?? null,
-      attachments: uploadDigests(db, ids, me),
+      attachments: uploadDigests(db, ids, [me]),
     };
     out = writeOnce(hub, ws, "board_post", fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);
@@ -1320,7 +1320,7 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
-  const owed = unanswered(mine, repo.messages.receivedUnacked(mine, since), (id) => repo.messages.thread(id));
+  const owed = unanswered(mine, repo.messages.receivedUnacked(mine, since), (id) => repo.messages.thread(id), ws.data.primary);
   const promises = promised(mine, repo.messages.sentPending(mine, hub.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(mine).map((u) => {
     const seen = lastSeen(db, u.recipient);

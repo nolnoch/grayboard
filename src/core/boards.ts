@@ -682,7 +682,7 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null) as Post;
-    const attachments = files.limits ? bindAttachments(db, files.ids, handle, { post_id: p.id }, files.limits) : [];
+    const attachments = files.limits ? bindAttachments(db, files.ids, opts.addresses ?? [handle], { post_id: p.id }, files.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };

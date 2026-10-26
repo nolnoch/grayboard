@@ -10,7 +10,7 @@ import {
 import { IdCollision, parseAliasMeta, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { TOOLS_ONLY_BIND, bindMissed, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -440,6 +440,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   // What this session reads mail, claims and uploads as; IDENTITY is the
   // primary it writes as.
   const ADDRS = addresses();
+  // What `as` may name (#284 S3): the human's session acts only as its handle.
+  const AS_ADDRS = HUMAN ? [IDENTITY] : ADDRS;
   // Only a message's sender and recipient can see it or thread from it.
   const mine = (m: Message | undefined): m is Message => !!m && (ADDRS.includes(m.sender) || ADDRS.includes(m.recipient));
 
@@ -515,6 +517,10 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       parent_id?: number;
       pending?: boolean;
     };
+    const parent = parent_id === undefined ? undefined : getMessage(parent_id);
+    // `as` wins; a reply defaults to the held alias its parent reached or was
+    // sent as (#284 S4); else the primary.
+    const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, held) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
     const parsed = addressParts(to);
@@ -525,15 +531,16 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
         isError: true,
       };
     }
-    if (parent_id !== undefined && !mine(getMessage(parent_id))) {
+    if (parent_id !== undefined && !mine(parent)) {
       return {
         ...text(`error: parent_id ${parent_id} is not a message you sent or received`),
         isError: true,
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids));
-    const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
+    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, ADDRS));
+    // The result names the sender whenever it isn't the primary.
+    const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
     const delivered = (await poke(recipient)) && !lastWasRelease(db, recipient);
@@ -562,7 +569,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
   if (name === "dm_inbox") {
     const since = Date.now() - inboxDays(a.days) * 86_400_000;
-    const owed = unanswered(ADDRS, receivedUnacked(ADDRS, since), getThread);
+    const owed = unanswered(ADDRS, receivedUnacked(ADDRS, since), getThread, IDENTITY);
     const promises = promised(ADDRS, sentPending(ADDRS, Date.now() - PROMISE_DAYS * 86_400_000), getThread);
     const queued = undeliveredFrom(ADDRS).map((u) => {
       const seen = lastSeen(db, u.recipient);
@@ -630,11 +637,12 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       session: SESSION_ID,
       addresses: ADDRS,
     };
-    const { attachments: paths, ...args } = a;
+    const actor = boardActor(db, name, a, { addresses: ADDRS, asAddresses: AS_ADDRS, ownScope: null });
+    const { attachments: paths, as: _as, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
     // Bound in the post's transaction; a refused post releases the uploads.
-    const { result, wake } = await withUploads(IDENTITY, files, (ids) =>
-      db.transaction(() => callBoardTool(db, IDENTITY, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
+    const { result, wake } = await withUploads(actor, files, (ids) =>
+      db.transaction(() => callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
     );
     await wakeAll(wake);
     return text(result);
@@ -713,7 +721,7 @@ async function drainLoop(): Promise<void> {
       if (batch.length > 0) any = true;
       for (const msg of batch) {
         if (shuttingDown) return;
-        const params = dmNotification(msg);
+        const params = dmNotification(msg, primary());
         if (isHuman(db, msg.sender)) params.meta.human = "true";
         await mcp.notification({ method: "notifications/claude/channel", params });
         if (sessionEnded) return;

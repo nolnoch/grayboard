@@ -121,17 +121,18 @@ export function attachmentIds(v: unknown): number[] {
 }
 
 // Binds uploads to the message or post just written. Run it inside that
-// write's transaction: each id must be `uploader`'s and still unbound, or the
-// write rolls back with it.
+// write's transaction: each id must be an unbound upload of one of
+// `uploaders` (the sending session's addresses, #284 S5), or the write rolls
+// back with it.
 export function bindAttachments(
   db: Database,
   ids: number[],
-  uploader: string,
+  uploaders: string[],
   target: AttachTarget,
   limits: AttachmentLimits,
 ): AttachmentInfo[] {
   if (ids.length === 0) return [];
-  const rows = unsentUploads(db, ids, uploader);
+  const rows = unsentUploads(db, ids, uploaders);
   // Each upload was checked alone when stored; the message's total is known only here.
   const tally = new SizeTally(limits, ids.length);
   for (const r of rows) tally.add(`attachment ${r.id}`, r.size);
@@ -140,12 +141,15 @@ export function bindAttachments(
   return rows.map(info);
 }
 
-// `uploader`'s unsent uploads `ids`, in call order. Throws on an id that
-// isn't one: someone else's, unknown, or already on a message or post.
-function unsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
+// The unsent uploads `ids` of any of `uploaders`, in call order. Throws on
+// an id that isn't one: someone else's, unknown, or already on a message or
+// post.
+function unsentUploads(db: Database, ids: number[], uploaders: string[]): AttachmentRow[] {
   const rows = db
-    .prepare(`SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL`)
-    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
+    .prepare(
+      `SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?1)) AND uploader IN (SELECT value FROM json_each(?2)) AND message_id IS NULL AND post_id IS NULL`,
+    )
+    .all(JSON.stringify(ids), JSON.stringify(uploaders)) as AttachmentRow[];
   const by = new Map(rows.map((r) => [r.id, r]));
   return ids.map((id) => {
     const r = by.get(id);
@@ -154,23 +158,25 @@ function unsentUploads(db: Database, ids: number[], uploader: string): Attachmen
   });
 }
 
-// The blob digests of `uploader`'s unsent uploads `ids`, in call order: what
+// The blob digests of `uploaders`' unsent uploads `ids`, in call order: what
 // a write's fingerprint keys its files by (#254), since every attempt uploads
 // afresh under new ids while the blob is content-addressed. Refuses an id
 // bindAttachments would.
-export function uploadDigests(db: Database, ids: number[], uploader: string): string[] {
-  return ids.length === 0 ? [] : unsentUploads(db, ids, uploader).map((r) => r.sha256);
+export function uploadDigests(db: Database, ids: number[], uploaders: string[]): string[] {
+  return ids.length === 0 ? [] : unsentUploads(db, ids, uploaders).map((r) => r.sha256);
 }
 
-// Drops `uploader`'s unsent uploads `ids`, for a replayed write (#254): the
+// Drops `uploaders`' unsent uploads `ids`, for a replayed write (#254): the
 // retry uploaded its files afresh and nothing will bind them. Run it inside
 // the replay's transaction; sweepBlobs after it commits deletes the bytes
 // (none, while the first write's copy names the blob).
-export function dropUnsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
+export function dropUnsentUploads(db: Database, ids: number[], uploaders: string[]): AttachmentRow[] {
   if (ids.length === 0) return [];
   return db
-    .prepare(`DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`)
-    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
+    .prepare(
+      `DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?1)) AND uploader IN (SELECT value FROM json_each(?2)) AND message_id IS NULL AND post_id IS NULL RETURNING *`,
+    )
+    .all(JSON.stringify(ids), JSON.stringify(uploaders)) as AttachmentRow[];
 }
 
 const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size, sha256: r.sha256 });

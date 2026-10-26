@@ -42,7 +42,7 @@ describe("runLocalRetention", () => {
     const reply = message(NOW - 1 * DAY, old);
     db.prepare(`INSERT INTO dm_acks (reader, message_id, acked_at) VALUES ('fe', ?, ?)`).run(old, NOW - 91 * DAY);
     const a = await storeAttachment(db, blobs, "be", file("old.txt"), { now: NOW - 91 * DAY });
-    bindAttachments(db, [a.id], "be", { message_id: old }, DEFAULT_ATTACHMENT_LIMITS);
+    bindAttachments(db, [a.id], ["be"], { message_id: old }, DEFAULT_ATTACHMENT_LIMITS);
 
     createBoard(db, "be", "e2e", "tests");
     const oldPost = post(db, "be", "e2e", "old").post.id;

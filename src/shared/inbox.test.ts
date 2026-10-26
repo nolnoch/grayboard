@@ -16,7 +16,7 @@ test("a promise stands until the promiser's next message in the thread", () => {
   // A later pending message supersedes the earlier one: only the latest stands.
   expect(promised(["be"], [thread[1]!, thread[3]!], threadOf, 0).map((p) => p.id)).toEqual([4]);
   // unanswered is the same rule from the other side.
-  expect(unanswered(["be"], [thread[2]!], threadOf, 0)).toEqual([]);
+  expect(unanswered(["be"], [thread[2]!], threadOf, "be", 0)).toEqual([]);
 });
 
 test("rows show pending and kind only when they're set", () => {

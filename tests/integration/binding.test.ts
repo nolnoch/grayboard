@@ -714,3 +714,91 @@ test("#284 S7: a tools-only process is its own session: its writes carry its ID,
   await until(() => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, toolsId)[0]!.ended_at !== null);
   expect(holderOf("be")).toBe(id);
 }, 20_000);
+
+const senderOf = (id: number) => rows<{ sender: string }>(`SELECT sender FROM messages WHERE id = ?`, id)[0]!.sender;
+
+test("#284 S3: as on dm_send, board_post and claim_take names one of the session's addresses", async () => {
+  const peer = await session("peer");
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("bind", { name: "a", create: true });
+  await s.call("bind", { name: "b", create: true });
+  const t = await session("c");
+
+  const plain = await s.call("dm_send", { to: "peer", body: "1" });
+  expect([senderOf(plain.message_id as number), plain.sent_as]).toEqual(["a", undefined]);
+  const asB = await s.call("dm_send", { to: "peer", body: "2", as: "b" });
+  expect([senderOf(asB.message_id as number), asB.sent_as]).toEqual(["b", "b"]);
+  const asId = await s.call("dm_send", { to: "peer", body: "3", as: id });
+  expect(senderOf(asId.message_id as number)).toBe(id);
+  for (const other of ["zzz", "c"]) {
+    expect(await refusal(s, "dm_send", { to: "peer", body: "x", as: other })).toBe(`error: "${other}" isn't one of this session's addresses: a, b, ${id}`);
+  }
+
+  // Files go out as the sender: uploaded as b, bound to b's message.
+  writeFileSync(join(dir, "f.txt"), "f");
+  const withFile = await s.call("dm_send", { to: "peer", body: "4", as: "b", attachments: [join(dir, "f.txt")] });
+  expect(rows<{ uploader: string }>(`SELECT uploader FROM attachments WHERE message_id = ?`, withFile.message_id as number)).toEqual([{ uploader: "b" }]);
+
+  await s.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const post = await s.call("board_post", { board: "e2e", body: "as b", as: "b" });
+  expect(rows<{ author: string }>(`SELECT author FROM posts WHERE id = ?`, post.post_id as number)).toEqual([{ author: "b" }]);
+  expect(await refusal(s, "board_post", { board: "e2e", body: "x", as: "c" })).toBe(`error: "c" isn't one of this session's addresses: a, b, ${id}`);
+
+  expect((await s.call("claim_take", { key: "k", as: "b" })).claim).toMatchObject({ holder: "b" });
+  // An instance-scoped claim: taken as the ID.
+  expect((await s.call("claim_take", { key: "k2", as: id })).claim).toMatchObject({ holder: id });
+  // Renewing as another of the session's addresses moves nothing (decision 20).
+  expect((await s.call("claim_take", { key: "k", as: "a" })).claim).toMatchObject({ holder: "b" });
+  expect(await refusal(t, "claim_take", { key: "k3", as: "a" })).toContain(`"a" isn't one of this session's addresses: c, `);
+}, 30_000);
+
+test("#284 S3: the human's session acts only as its handle", async () => {
+  expect((await runCli(["human", "alex"], { cwd: dir, env: localEnv(dir) })).code).toBe(0);
+  const peer = await session("peer");
+  const h = await session("alex", { extra: { BUS_HUMAN: "1" } });
+  const id = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = 'alex'`)[0]!.id;
+  expect(await refusal(h, "dm_send", { to: "peer", body: "x", as: id })).toBe(`error: "${id}" isn't one of this session's addresses: alex`);
+  expect(senderOf((await h.call("dm_send", { to: "peer", body: "y", as: "alex" })).message_id as number)).toBe("alex");
+}, 30_000);
+
+test("#284 S4: a reply goes as the held alias its parent reached or was sent as; else the primary", async () => {
+  const peer = await session("peer");
+  const s = await session();
+  const id = await sessionId(s);
+  // Mail to the ID before any bind is answered as the alias bound since.
+  const toId = await peer.call("dm_send", { to: id, body: "to the id" });
+  await s.call("bind", { name: "a", create: true });
+  await s.call("bind", { name: "b", create: true });
+  const r0 = await s.call("dm_send", { to: "peer", body: "r0", parent_id: toId.message_id });
+  expect(senderOf(r0.message_id as number)).toBe("a");
+
+  // Mail to b: pushed with to "b" (b isn't the primary), listed with it, answered as b.
+  s.pushes.splice(0);
+  const toB = await peer.call("dm_send", { to: "b", body: "to b" });
+  const toA = await peer.call("dm_send", { to: "a", body: "to a" });
+  const pushed = await until(() => {
+    const b = s.pushes.find((p) => p.meta.message_id === String(toB.message_id));
+    const a = s.pushes.find((p) => p.meta.message_id === String(toA.message_id));
+    return a && b ? { a, b } : undefined;
+  }, 10_000, "both DMs pushed");
+  expect([pushed.b.meta.to, pushed.a.meta.to]).toEqual(["b", undefined]);
+  const inbox = (await s.call("dm_inbox", {})).unanswered as { id: number; to?: string }[];
+  expect(inbox.find((m) => m.id === toB.message_id)?.to).toBe("b");
+  expect(inbox.find((m) => m.id === toA.message_id)?.to).toBeUndefined();
+  const r1 = await s.call("dm_send", { to: "peer", body: "r1", parent_id: toB.message_id });
+  expect([senderOf(r1.message_id as number), r1.sent_as]).toEqual(["b", "b"]);
+  // as wins.
+  const r2 = await s.call("dm_send", { to: "peer", body: "r2", parent_id: toB.message_id, as: "a" });
+  expect([senderOf(r2.message_id as number), r2.sent_as]).toEqual(["a", undefined]);
+  // Its own thread, as its sender.
+  const r3 = await s.call("dm_send", { to: "peer", body: "r3", parent_id: r1.message_id });
+  expect(senderOf(r3.message_id as number)).toBe("b");
+
+  // b unbound and taken by t: a reply to mail that reached b is refused, not sent as a.
+  const toB2 = await peer.call("dm_send", { to: "b", body: "to b again" });
+  await s.call("unbind", { name: "b" });
+  const t = await session();
+  await t.call("bind", { name: "b" });
+  expect(await refusal(s, "dm_send", { to: "peer", body: "x", parent_id: toB2.message_id })).toBe(`error: parent_id ${toB2.message_id} is not a message you sent or received`);
+}, 30_000);

@@ -4,7 +4,7 @@ import type { AttachmentInfo } from "./attachments.ts";
 
 type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
+export type InboxItem = { id: number; from: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
 export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
@@ -39,8 +39,9 @@ function item(m: Msg, now: number) {
 
 // Received messages still owed an answer: no later message from `me` in the
 // same thread. Candidates are already windowed and filtered of acks.
-export function unanswered(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
-  return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, from: m.sender, ...item(m, now) }));
+// A row names the address the mail came to when it isn't `primary` (#284 S4).
+export function unanswered(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], primary: string, now = Date.now()): InboxItem[] {
+  return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, from: m.sender, ...(m.recipient !== primary ? { to: m.recipient } : {}), ...item(m, now) }));
 }
 
 // Messages `me` sent pending that are still its latest in their thread: a

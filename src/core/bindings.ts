@@ -8,7 +8,7 @@ import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import type { UnboundPeer } from "./boards.ts";
+import { canSeeBoard, normalizeBoard, type UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
@@ -116,6 +116,42 @@ export function actingAs(input: string, addresses: string[], ownScope: string | 
   const address = p?.kind === "bare" && ownScope !== null ? `${ownScope}/${p.name}` : p?.address;
   if (address !== undefined && p?.kind !== "team" && addresses.includes(address)) return address;
   throw new CoreError(`"${input}" isn't one of this session's addresses: ${addresses.join(", ")}`);
+}
+
+/**
+ * The address a board tool acts as (#284 S3, S14): `as` when given
+ * (board_post, claim_take), checked against `asAddresses`; for a board read,
+ * post or subscription without it, the first of `addresses` (primary first,
+ * the ID last) that can see the board, else the primary, whose refusal
+ * stands. Every other tool acts as the primary. Callers resolve it before
+ * callBoardTool and pass the args without `as`.
+ */
+export function boardActor(
+  db: Database,
+  tool: string,
+  args: Record<string, unknown>,
+  s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
+): string {
+  const primary = s.addresses[0]!;
+  if (args.as !== undefined) return actingAs(String(args.as), s.asAddresses, s.ownScope);
+  if ((tool !== "board_read" && tool !== "board_post" && tool !== "board_subscribe") || typeof args.board !== "string") return primary;
+  let board: string;
+  try {
+    board = normalizeBoard(args.board);
+  } catch {
+    return primary;
+  }
+  return s.addresses.find((h) => canSeeBoard(db, h, board)) ?? primary;
+}
+
+/**
+ * The address a DM reply goes out as without `as` (#284 S4): the parent's
+ * recipient, else its sender, when that is an alias the session holds; null
+ * means the primary. The ID is never picked, so a thread that reached the ID
+ * before a bind moves onto an alias that outlives the session.
+ */
+export function replySender(parent: { sender: string; recipient: string }, holds: string[]): string | null {
+  return [parent.recipient, parent.sender].find((a) => holds.includes(a)) ?? null;
 }
 
 /**

@@ -44,6 +44,9 @@ const BOARD = { type: "string", description: 'Board name, with or without the "#
 // src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
 export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
 
+// On the writes a session can make as another of its addresses (#284 S3).
+export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
+
 export function boardTools(opts: { teams: boolean }): ToolDef[] {
   return [
     {
@@ -82,7 +85,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?, attachments?, resend?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
@@ -91,6 +94,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
           attachments: ATTACHMENTS_PARAM,
           resend: RESEND_PARAM,
+          as: AS_PARAM,
         },
         required: ["board", "body"],
       },
@@ -160,7 +164,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "claim_take",
       description:
-        'claim_take(key, ttl_minutes? | until?, note?, board?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
+        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
       inputSchema: {
         type: "object",
         properties: {
@@ -172,6 +176,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
           },
           note: { type: "string", description: "Optional. What you're doing with it." },
           board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on." },
+          as: AS_PARAM,
         },
         required: ["key"],
       },
@@ -348,6 +353,8 @@ export function callBoardTool(
   ctx: ToolContext = {},
 ): ToolOutcome {
   const a = args ?? {};
+  // `handle` is already the acting address (boardActor).
+  if (a.as !== undefined) throw new Error(`${name}: "as" must be resolved by boardActor before callBoardTool`);
   switch (name) {
     case "board_list":
       return { result: listBoards(db, handle), wake: [] };
@@ -485,8 +492,14 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 }
 
 // The channel notification for a direct message. Same shape in every mode.
-export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+// `to` names the address the mail came to when it isn't the session's
+// `primary` (#284 S4): a one-address session pays nothing for it.
+export function dmNotification(
+  msg: { id: number; sender: string; recipient?: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] },
+  primary?: string,
+): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary) meta.to = msg.recipient;
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
   if (msg.kind) meta.kind = msg.kind;
   addFiles(meta, msg.attachments);
