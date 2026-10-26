@@ -20,7 +20,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, sweepHellos, sweepSessions } = createWsHandlers(repo, db, {
+  const { handlers, startPing, revalidate, disconnectUser, accessChanged, stopExpiry, wake, sweepHellos, sweepSessions } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts, helloLimit: config.helloLimit,
   });
   const authGate = new AuthGate(repo, {
@@ -96,7 +96,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: handlers,

@@ -29,9 +29,9 @@ import {
 import {
   closestNames, continuityOf, dropHold, holdAlias, holderOf, idAddress, logBinding, unboundPeer, unknownNameError, type Continuity,
 } from "../core/bindings.ts";
-import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
+import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
-import { ownScope } from "../core/resolver.ts";
+import { ownScope, type Principal } from "../core/resolver.ts";
 import { assertDeliverableId, endSession } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
@@ -40,6 +40,7 @@ import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./w
 import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
+import { mayActIn } from "./access.ts";
 import {
   PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
@@ -412,12 +413,19 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     const ids = db.prepare(`SELECT id FROM ids WHERE principal = ? AND ended_at IS NULL AND viewer = 0`).all(email) as { id: string }[];
     endIds(hub, ids.map((r) => r.id), "revoked");
   };
-  // Catches a user disabled while one of their hellos was in flight.
+  // Catches a user disabled while one of their hellos was in flight, and an
+  // alias its session's principal may no longer act as (S9's backstop to
+  // accessChanged).
   const revalidate = () => {
     for (const id of new Set(conns().map((ws) => ws.data.authed.user_id))) {
       if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
     }
+    recheckAliases(hub, null);
   };
+  // What a principal may act in changed (S9): a team leave or removal now,
+  // #270's grants later. Its sessions stop acting as aliases it lost now,
+  // not when they next bind.
+  const accessChanged = (principal: string) => recheckAliases(hub, principal);
 
   // Heartbeat: keeps idle connections open through proxies.
   const startPing = () =>
@@ -429,7 +437,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     }, 30_000);
 
   return {
-    handlers, startPing, revalidate, disconnectUser, stopExpiry: expiry.stop,
+    handlers, startPing, revalidate, disconnectUser, accessChanged, stopExpiry: expiry.stop,
     sweepSessions: (now = hub.now()) => sweepSessions(hub, now),
     sweepHellos: () => hub.helloLimiter.sweep(),
     wake: (handles: string[]) => wake(hub, handles),
@@ -486,6 +494,75 @@ function detach(hub: Hub, ws: Ws): void {
   if (hub.holders.get(id) === ws) hub.holders.delete(id);
   for (const a of ws.data.addresses) if (hub.registry.get(a) === ws) hub.registry.delete(a);
 }
+
+// A session acting as an alias: holding it, or a tools-only connection
+// writing as it. Live or in its grace. principal: the session's principal.
+type AliasUse = { id: string; principal: string; address: string; scope_kind: ScopeKind; scope_ref: string; held: boolean };
+
+function aliasUses(hub: Hub, principal: string | null): AliasUse[] {
+  return hub.db.prepare(
+    `SELECT * FROM (
+       SELECT h.id, i.principal, a.address, a.scope_kind, a.scope_ref, 1 AS held FROM alias_holds h
+         JOIN ids i ON i.id = h.id JOIN aliases a ON a.address = h.address
+        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL
+       UNION ALL
+       SELECT i.id, i.principal, a.address, a.scope_kind, a.scope_ref, 0 FROM ids i JOIN aliases a ON a.address = i.writes_as
+        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL)
+     WHERE ?1 IS NULL OR principal = ?1`,
+  ).all(principal).map((r: any) => ({ ...r, held: r.held === 1 })) as AliasUse[];
+}
+
+// Re-checks the aliases that sessions act as (S9) against mayActIn, for one
+// principal's sessions or (null) every session's, and revokes the ones it
+// now refuses.
+function recheckAliases(hub: Hub, principal: string | null): void {
+  const revoked: (AliasUse & { reason: string })[] = [];
+  for (const u of aliasUses(hub, principal)) {
+    const p = hub.repo.principals.findByName(u.principal);
+    const reason = p ? mayActIn(hub.repo, p, u) : `principal ${u.principal} no longer exists`;
+    if (reason) revoked.push({ ...u, reason });
+  }
+  revokeAliases(hub, revoked);
+}
+
+// Takes aliases from sessions whose principals may no longer act in their
+// scopes (S9). A holder keeps its ID: its hold is released, and a live one
+// is told by an alias_lost frame and acts as its ID from here. A tools-only
+// connection writes only as its writes_as, so it has nothing left to be:
+// its session ends, and its reconnect's hello is refused.
+function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void {
+  if (!uses.length) return;
+  const { repo, db, registry } = hub;
+  const ended: string[] = [];
+  for (const u of uses) {
+    const { reason } = u;
+    const ws = hub.holders.get(u.id);
+    if (!u.held) {
+      writeAudit(repo, "alias.revoked", u.principal, u.address, { session: u.id, writes_as: true, reason });
+      if (ws) {
+        detach(hub, ws);
+        err(ws, undefined, "forbidden", `this connection wrote as "${u.address}", and ${reason}`);
+        ws.close();
+      }
+      ended.push(u.id);
+      continue;
+    }
+    repo.atomic(() => {
+      dropHold(db, u.address, u.id);
+      logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
+      writeAudit(repo, "alias.revoked", u.principal, u.address, { session: u.id, reason });
+    });
+    if (!ws || ws.data.bound !== u.address) continue;
+    if (registry.get(u.address) === ws) registry.delete(u.address);
+    ws.data.bound = undefined;
+    ws.data.primary = u.id;
+    ws.data.addresses = [u.id];
+    send(ws, { type: "alias_lost", alias: u.address, reason });
+  }
+  endIds(hub, ended, "revoked");
+}
+
+const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: authed.user_email });
 
 type IdRow = { principal: string | null; ended_at: number | null; place: string | null };
 
@@ -680,7 +757,7 @@ function helloHuman(hub: Hub, ws: Ws, m: HelloRequest): void {
 
 // What a bind or a tools-only hello's writes_as names (#284 S9): a bare name
 // in the caller's own person scope, or scope/name in a scope the caller may
-// act in: its own person scope, or a team it belongs to. Never `human`:
+// act in (mayActIn). Never `human`:
 // canSend treats any */human as a human.
 // A refusal carries the address when the input parsed as one, so the
 // refusal is logged against it; an unparseable name has none.
@@ -704,16 +781,10 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
     throw e;
   }
   if (scope.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
-  const ref = scope.scope_ref!;
-  if (scope.scope_kind === "service") return { code: "forbidden", error: `"${address}" is a service principal's; service principals arrive with #270`, address };
-  if (scope.scope_kind === "person" && ref !== authed.user_email) {
-    return { code: "forbidden", error: `"${address}" is in ${ref}'s scope; bind a name in your own, or in a team's you belong to`, address };
-  }
-  if (scope.scope_kind === "team") {
-    const team = repo.teams.findByName(ref);
-    if (!team || !repo.teams.isMember(team.id, authed.user_id)) return { code: "forbidden", error: `you aren't a member of team ${ref}, so you can't act as "${address}"`, address };
-  }
-  return { address, scope: { ...scope, scope_ref: ref } };
+  const t = { ...scope, scope_ref: scope.scope_ref! };
+  const no = mayActIn(repo, userPrincipal(authed), t);
+  if (no) return { code: "forbidden", error: `you can't act as "${address}": ${no}; bind a name in your own scope, or in a team's you belong to`, address };
+  return { address, scope: t };
 }
 
 // An alias a bind or a writes_as names is created on first use (S9), by

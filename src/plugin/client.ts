@@ -1,4 +1,4 @@
-import { PROTO, type ServerMessage, type ClientMessage, type ErrorMessage, type HelloOk, type Message } from "../shared/protocol.ts";
+import { PROTO, type ServerMessage, type ClientMessage, type AliasLost, type ErrorMessage, type HelloOk, type Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -50,6 +50,8 @@ export type ClientOptions = {
   // session's row and peer_list shows it.
   launcher?: boolean;
   onReady?: ReadyCallback;
+  // The server released an alias this session held (#284 S9).
+  onAliasLost?: (m: AliasLost) => void;
   // The client stopped for good after it was ready: superseded, or its
   // session refused on a reconnect. It never exits the process; the session decides.
   onDead?: (reason: string) => void;
@@ -276,6 +278,10 @@ export class GrayboardClient {
         );
         break;
       }
+
+      case "alias_lost":
+        this.opts.onAliasLost?.(msg);
+        break;
 
       case "ping":
         if (this.ws?.readyState === WebSocket.OPEN) {

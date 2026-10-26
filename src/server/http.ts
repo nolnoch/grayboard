@@ -370,11 +370,12 @@ function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: C
   return any ? { team: any, audit: { as_admin: true } } : null;
 }
 
-function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb, sessions: SessionHooks): Response {
   const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
   repo.teams.removeMember(team.id, authed.user_id);
   onTeamLeft(db, repo, team, authed.user_email);
+  sessions.accessChanged(authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
   return json({ ok: true });
 }
@@ -394,7 +395,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   return json({ ok: true });
 }
 
-async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
   const managed = managedTeam(teamName, authed, repo, config);
   if (!managed) return notFound();
   const { team } = managed;
@@ -407,6 +408,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
   }
   repo.teams.removeMember(team.id, user.id);
   onTeamLeft(db, repo, team, email);
+  sessions.accessChanged(email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
 }
@@ -459,9 +461,18 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 
 // ── main router ──────────────────────────────────────────────────────────────
 
+// What the WebSocket side does when an HTTP action changes who a user's
+// sessions may be: a revoked or disabled user's sessions end; a user who
+// left a team stops acting as its aliases (#284 S9).
+export type SessionHooks = {
+  disconnectUser: (userId: number) => void;
+  // principal: a principal's name; its sessions' aliases are re-checked.
+  accessChanged: (principal: string) => void;
+};
+
 export async function handleHttp(
   req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
-  disconnectUser: (userId: number) => void,
+  sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
 ): Promise<Response> {
@@ -516,9 +527,9 @@ export async function handleHttp(
   if (teamOp) {
     const [, teamName, action] = teamOp;
     if (action === "join"    && method === "POST") return teamJoin();
-    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db);
+    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db, sessions);
     if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db, config);
-    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config);
+    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config, sessions);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
   }
 
@@ -526,8 +537,8 @@ export async function handleHttp(
     const decision = canAdmin(authed.user_email, config.admins);
     if (!decision.allow) return forbidden(decision.reason);
   }
-  if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, disconnectUser);
-  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, disconnectUser, slack);
+  if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
+  if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
 
   return notFound();

@@ -9,11 +9,11 @@ import { join } from "node:path";
 import { GrayboardClient, ServerRefused, retryWait } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
-import { normalizeIdentityName } from "../shared/addressing.ts";
 import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk, BindOk, BindRequest } from "../shared/protocol.ts";
 import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
+import { normalizeAliasName } from "../core/addresses.ts";
 import {
   TOOLS_ONLY_BIND, bindMissed, bindOk, boundInstructions, envSessionKey, heldNote, idAddress, launcherNote, leftNote, mintSessionKey, restoreNote, unboundInstruction,
 } from "../core/bindings.ts";
@@ -88,10 +88,11 @@ const KEYED = KEY !== undefined;
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY, not a harness re-delivering the repo's pin. Otherwise the
 // resolved name is only the first suggestion, and the session starts unbound.
+// It may carry a scope (eng/build); the server judges it at bind.
 const EXPLICIT = isExplicitIdentity();
 const resolved = (() => {
   try {
-    return normalizeIdentityName(sessionIdentity());
+    return normalizeAliasName(sessionIdentity());
   } catch (e) {
     return { ok: false as const, error: (e as Error).message };
   }
@@ -182,6 +183,16 @@ const client: GrayboardClient = new GrayboardClient(
     onReady: (h, rekeyedFrom) => {
       hello = h;
       if (started) reattached(h, rekeyedFrom);
+    },
+    // Its user left the alias's team: the session carries on as its ID.
+    onAliasLost: (m) => {
+      if (bound !== m.alias) return;
+      bound = null;
+      boundNotices = [];
+      writeName(null);
+      nameNotice = `This session lost its bus name "${short(m.alias)}": ${m.reason}. It acts as its ID (${client.id}) now: bind(name) to take another.`;
+      instructionsStale = true;
+      console.error(`[grayboard] session ${client.id} lost "${m.alias}": ${m.reason}`);
     },
     // Taken over by another process with this key, or a keyed session that
     // ended during an outage: nothing here can carry on as it.

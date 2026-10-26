@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { idAddress } from "../core/bindings.ts";
 import { endSession } from "../core/session_end.ts";
 import { registerId, type Board, type CoreDb } from "../core/boards.ts";
-import { serverAccess } from "./access.ts";
+import { mayActIn, serverAccess } from "./access.ts";
 import { openDatabase, type Repo } from "./db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
@@ -153,4 +153,20 @@ describe("resolveMention", () => {
   test("a team broadcast is never a mention", () => {
     expect(access.resolveMention("team:eng", AUTHOR, ENG, true)).toBeNull();
   });
+});
+
+// Who may bind or write as an alias (#284 S9), keyed by principal.
+test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", () => {
+  const bob = { kind: "user" as const, name: "bob@example.com" };
+  const may = (p: Parameters<typeof mayActIn>[1], kind: "person" | "team" | "service", ref: string) => mayActIn(repo, p, { scope_kind: kind, scope_ref: ref });
+  expect(may(bob, "person", "bob@example.com")).toBeNull();
+  expect(may(bob, "person", "wade@example.com")).toBe("wade@example.com's scope isn't bob@example.com's");
+  expect(may(bob, "team", "eng")).toBeNull();
+  expect(may(bob, "team", "ops")).toBe("bob@example.com isn't a member of team ops");
+  expect(may(bob, "team", "nosuch")).toBe("bob@example.com isn't a member of team nosuch");
+  expect(may(bob, "service", "ci")).toBe("service principals arrive with #270");
+  expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("service principals arrive with #270");
+  expect(may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
+  repo.teams.removeMember(repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id);
+  expect(may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");
 });

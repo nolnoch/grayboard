@@ -39,6 +39,17 @@ export function addressParts(input: string): ParsedAddress | null {
   return scope.includes("@") ? null : { kind: "alias", address: s, scope, scopeKind: "principal", name };
 }
 
+/**
+ * A name a server session may bind (#284 S9), lowercased: a bare name (the
+ * caller's own scope) or scope/name. Whether the caller may act in that
+ * scope is the server's to judge at bind.
+ */
+export function normalizeAliasName(raw: string): { ok: true; name: string } | { ok: false; error: string } {
+  const p = addressParts(raw);
+  if (p?.kind === "bare" || p?.kind === "alias") return { ok: true, name: p.address };
+  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+}
+
 /** Who owns an alias's scope: a person, a team or a service principal. */
 export type ScopeKind = "person" | "team" | "service";
 

@@ -108,6 +108,9 @@ export type BindOk      = {
   left?: string[]; notices?: string[];
 };
 export type EndOk       = { type: "end_ok"; req_id: string };
+// The server released an alias this session held (#284 S9: its user left the
+// alias's team). The session keeps its ID and acts as it from here.
+export type AliasLost   = { type: "alias_lost"; alias: string; reason: string };
 // The row an append write made (#254): a direct message or a board post.
 export type WriteRef = { kind: "message" | "post"; id: number };
 // On a result that repeats an earlier identical call's (#254): when that one
@@ -150,7 +153,7 @@ export type BoardPush   = { type: "board_push"; item: Pending };
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
 
 export type ServerMessage =
-  | HelloOk | BindOk | EndOk | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
+  | HelloOk | BindOk | EndOk | AliasLost | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
   | CallOk | BoardPush | InboxOk;
 
 export type ErrorCode =

@@ -4,7 +4,7 @@
 // aliases and to its members' addresses. A session bound to `eng/x` acts as
 // eng: it sees eng's boards, not its binder's other teams'. Installed on the
 // database by openDatabase, so every core call is checked.
-import { addressParts } from "../core/addresses.ts";
+import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Access, Board, CoreDb } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
@@ -17,15 +17,25 @@ function teamOf(scope: string | null): string | null {
   return scope?.startsWith("team:") ? scope.slice(5) : null;
 }
 
+// Whether principal p may act in a scope: bind an alias there, or write as
+// one (#284 S9). Null when it may; else why not. Keyed by principal, not by
+// email: a user acts in its own person scope and in the teams it belongs to.
+// Service scopes, and service principals acting anywhere, wait for #270's
+// grants.
+export function mayActIn(repo: Repo, p: Principal, scope: { scope_kind: ScopeKind; scope_ref: string }): string | null {
+  const ref = scope.scope_ref;
+  if (scope.scope_kind === "service" || p.kind === "service") return "service principals arrive with #270";
+  if (p.kind !== "user") return `${p.name} is a ${p.kind}, not a user`;
+  if (scope.scope_kind === "person") return ref === p.name ? null : `${ref}'s scope isn't ${p.name}'s`;
+  const userId = repo.principals.findByName(p.name)?.user_id;
+  const team = repo.teams.findByName(ref);
+  return userId != null && team && repo.teams.isMember(team.id, userId) ? null : `${p.name} isn't a member of team ${ref}`;
+}
+
 export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "team"): Access {
   // Whether p acts inside team `teamName`: the team itself, or a member.
-  const inTeam = (p: Principal, teamName: string): boolean => {
-    if (p.kind === "team") return p.name === teamName;
-    if (p.kind !== "user") return false;
-    const user = repo.users.findByEmail(p.name);
-    const team = repo.teams.findByName(teamName);
-    return !!user && !!team && repo.teams.isMember(team.id, user.id);
-  };
+  const inTeam = (p: Principal, teamName: string): boolean =>
+    p.kind === "team" ? p.name === teamName : mayActIn(repo, p, { scope_kind: "team", scope_ref: teamName }) === null;
 
   const canSee = (handle: string, board: Board): boolean => {
     const p = repo.resolver.principalOf(handle);
