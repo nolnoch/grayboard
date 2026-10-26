@@ -32,7 +32,7 @@ case "${1:-}" in
   strict)
     bun install --frozen-lockfile
     bun run typecheck
-    bun run test --reporter=junit --reporter-outfile="$GRAYBOARD_E2E_RUN_DIR/unit.xml"
+    bun run test --reporter=junit --reporter-outfile="$GRAYBOARD_E2E_RUN_DIR/unit.xml" tests/reload-state.test.ts
     bun run build:package
     ;;
   git) bun run test:git ;;

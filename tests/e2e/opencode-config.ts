@@ -7,6 +7,8 @@ import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { setupOpenCode } from "../../src/cli/opencode-setup.ts";
 import { startServer } from "../../src/server/app.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../helpers/hosted.ts";
 import { createBoard, post, subscribe } from "../../src/core/boards.ts";
 
@@ -31,7 +33,7 @@ assert(!/"(?:oauth|headers|options|client_id|scope|name)"/.test(generated));
 assert.equal(setupOpenCode(options, "").changed, false);
 assert.equal(readFileSync(configPath, "utf8"), generated);
 let google = 0, cimd = 0, receipts = 0, models = 0, callbackOrigin = "";
-const app = startServer({ dbPath: join(root, "config.sqlite"), blobDir: join(root, "config-blobs"), httpPort: 0, googleClientId: "fixture", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [] }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email: "you@example.com", displayName: "Fixture" }; }, cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } } });
+const app = startServer({ dbPath: join(root, "config.sqlite"), blobDir: join(root, "config-blobs"), httpPort: 0, googleClientId: "fixture", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email: "you@example.com", displayName: "Fixture" }; }, cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } } });
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
@@ -109,7 +111,7 @@ try {
   assert.equal(app.mcp.activeLeases, 0);
   await rpc.enroll({ sessionID: session.id }, { location });
   assert.equal(app.mcp.activeLeases, 0, "Approval alone cannot bind or create a mailbox");
-  assert.equal((app.db.prepare("SELECT count(*) AS n FROM handles WHERE name = ?").get("you@example.com/be") as { n: number }).n, 0);
+  assert.equal(app.repo.aliases.find("you@example.com", "be"), undefined);
   await rpc.enroll({ sessionID: session.id, name: "be", create: true }, { location });
   await wait(() => app.mcp.activeLeases, n => n === 1);
   const board = createBoard(app.db, "you@example.com/be", "config-fixture", "Config fixture");

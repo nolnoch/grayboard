@@ -223,7 +223,7 @@ The installed directory is `$HOME/.local/share/grayboard-opencode/node_modules/g
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [{ "package": "github:nolnoch/grayboard#5821ef7e50b96ba68e6f7a35068099937693d3a0::path:adapters/opencode-v2" }],
+  "plugins": [{ "package": "github:nolnoch/grayboard#4604e8b8fe0cdcbacfc5edf3ef8f169a6733ac58::path:adapters/opencode-v2" }],
   "mcp": {
     "servers": {
       "grayboard": {
@@ -257,7 +257,7 @@ The companion uses the connected server's public RPC; it does not start Grayboar
 ```sh
 bun src/cli/main.ts setup-opencode \
   --url https://grayboard.example.com/mcp \
-  --revision 5821ef7e50b96ba68e6f7a35068099937693d3a0 \
+  --revision 4604e8b8fe0cdcbacfc5edf3ef8f169a6733ac58 \
   --config /absolute/selected/opencode.jsonc --dry-run
 ```
 
@@ -830,7 +830,7 @@ bash scripts/e2e.sh hosted-live
 bash scripts/e2e.sh hosted-matrix
 bash scripts/e2e.sh hosted-native
 bash scripts/e2e.sh hosted-durable
-GRAYBOARD_PUBLIC_REVISION=5821ef7e50b96ba68e6f7a35068099937693d3a0 bash scripts/e2e.sh hosted-public
+GRAYBOARD_PUBLIC_REVISION=4604e8b8fe0cdcbacfc5edf3ef8f169a6733ac58 bash scripts/e2e.sh hosted-public
 ```
 
 `bun run test` explicitly runs `src` and `tests`, not nested package tests. `test:opencode` performs the package's own frozen install, strict typecheck, unit tests and explicit `build:package`; root typechecking does not cover it. Install the independent dependencies first with `(cd adapters/opencode-v2 && bun install --frozen-lockfile)` when running host suites directly. The host fixtures use source-only full-SHA Git/subdirectory installs through actual OpenCode 2.1.4, without `dist` or build/install hooks. Normal actual-backend and live production-CIMD CodeMode suites exercise native binding, account/configuration guards and durable replay. The actual-backend matrix covers issued races, default admission throttling, expiry and crash recovery; native/durable fake-MCP suites separately exercise public host hooks. No fake-MCP result substitutes for actual-backend acceptance.
