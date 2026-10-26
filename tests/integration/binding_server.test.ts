@@ -407,6 +407,43 @@ test("a session ended during an outage reconnects on a new ID and takes its alia
   }
 }, 30_000);
 
+// Audit P1 (#345): a tools-only session binds nothing, so a rekey sends no
+// bind: its new hello writes as its name again, and it keeps writing as it.
+test("a tools-only session ended during an outage reconnects on a new ID still writing as its name", async () => {
+  const dbDir = mkdtempSync(join(tmpdir(), "gb-db-"));
+  const dbPath = join(dbDir, "gb.db");
+  let clock = Date.now();
+  srv.stop();
+  srv = new TestServer({ dbPath }, { now: () => clock });
+  alice = await srv.login(A);
+  const s = await session("be", { extra: { BUS_PUSH: "off" } });
+  await s.call("dm_send", { to: `${A}/be`, body: "before" });
+  const old = rows<{ id: string }>(`SELECT id FROM ids WHERE writes_as = ?`, `${A}/be`)[0]!.id;
+  let next: TestServer | undefined;
+  try {
+    await whileStopped(s, async () => {
+      const port = srv.app.server.port!;
+      srv.app.stop();
+      next = new TestServer({ dbPath, httpPort: port }, { now: () => clock });
+      clock += GRACE_MS + 1;
+      next.app.sweepSessions();
+    });
+    const db = next!.app.db;
+    const r = await until(() => s.c.callTool({ name: "dm_send", arguments: { to: `${A}/be`, body: "after" } }).then((r) => (r.isError ? null : r)), 10_000, "the reconnect");
+    const now = (db.query(`SELECT id FROM ids WHERE writes_as = ? AND ended_at IS NULL`).get(`${A}/be`) as { id: string }).id;
+    expect(now).not.toBe(old);
+    expect(db.query(`SELECT sender, sender_id FROM messages WHERE body = 'after'`).get()).toEqual({ sender: `${A}/be`, sender_id: now });
+    expect((r.content as { text: string }[]).slice(1).map((c) => c.text)).toContain(
+      `This session's ID changed from ${old} to ${now}: it was disconnected past the server's grace, so the old session ended and DMs sent to the old ID bounce.`,
+    );
+    expect(db.query(`SELECT COUNT(*) AS n FROM binding_events`).get()).toEqual({ n: 0 });
+    expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
+  } finally {
+    next?.stop();
+    rmSync(dbDir, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("16, 18: raw binds: create: false, lazy create; a hello needs a key, and an unbound connection reads its user's boards and writes as its ID", async () => {
   await srv.api(alice, "POST", "/api/teams", { name: "eng" });
   const be = srv.client(alice, "be");
@@ -528,12 +565,51 @@ test("11: a restore waiting out a crashed predecessor's grace binds once the swe
   expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
 }, 30_000);
 
+// Audit P7 (#345): the user's bind limit refuses the restore's bind with a
+// wait; the restore retries after it, as the startup bind does.
+test("11: a restore refused by the bind limit retries after the wait it was given", async () => {
+  srv.stop();
+  let clock = Date.now();
+  srv = new TestServer({ helloLimit: { burst: 10, perSec: 1 } }, { now: () => clock });
+  alice = await srv.login(A);
+  let s = await session("api", { extra: pauseEnv("restore:before-bind") });
+  const before = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)[0]!.id;
+  const crashed = clock;
+  const restarted = s.restart("crash");
+  // As above: the startup bind's refusal waits one sweep tick.
+  await until(() => s.stderr().includes("test pause hit: restore:before-bind"));
+  clock = crashed + GRACE_MS - 1;
+  release("restore:before-bind");
+  s = await restarted;
+  expect(s.c.getInstructions()).toContain(`so this session is restoring it`);
+  const after = await sessionId(s);
+  // Spend the rest of alice's hellos; the clock stands still, so none refill.
+  for (;;) {
+    const r = await srv.client(alice, null).connect();
+    if (r.type === "error") {
+      expect(r.code).toBe("rate_limited");
+      break;
+    }
+  }
+  // The grace runs out and frees the alias; the restore's bind is limited.
+  clock += 1;
+  srv.app.sweepSessions();
+  await until(() => /restoring "alice@example\.com\/api" retries in \d+ms: rate_limited/.test(s.stderr()), SWEEP_MS + 5000, "the limited restore");
+  expect(rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([]);
+  clock += 2000;
+  await until(() => rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`).length > 0, 5000, "the retried restore");
+  expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: after }]);
+  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restored: restart of session ${before}` });
+  expect(s.stderr()).not.toContain(`didn't restore`);
+}, 30_000);
+
 test("#211: a restored_from the name's history doesn't show is logged unverified and starts a fresh status", async () => {
   const s = await session("api");
   await s.call("peer_status", { text: "mid-task" });
   const prior = events("api").at(-1)!.session_id;
   await stop(s.c);
-  const stranger = "id:0123456789abc";
+  // One of alice's own sessions (a stranger's fails the principal check first).
+  const stranger = await sessionId(await session(null));
   const ws = srv.client(alice, "api", { bind: { restored_from: stranger } });
   expect((await ws.connect()).bind_ok.restored).toEqual({ verified: false, detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });

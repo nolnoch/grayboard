@@ -13,29 +13,10 @@ import { createHash } from "node:crypto";
 
 import { writeAudit } from "./audit.ts";
 import type { Repo, Sync } from "./db.ts";
-import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
+import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { Replayed, WriteRef } from "../shared/protocol.ts";
 
 export type DedupTool = "dm_send" | "board_post" | "delegate";
-
-// Sorted keys, no whitespace, strings encoded as JSON (UTF-8), no Unicode
-// normalization. A key whose value is undefined is left out, as
-// JSON.stringify does; any other value JSON can't carry is refused, so two
-// different calls can never encode alike.
-export function canonicalJson(v: unknown): string {
-  if (v === null || typeof v === "boolean" || typeof v === "string") return JSON.stringify(v);
-  if (typeof v === "number") {
-    if (!Number.isFinite(v)) throw new TypeError(`canonicalJson: ${v} isn't JSON`);
-    return JSON.stringify(v);
-  }
-  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
-  if (typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    const keys = Object.keys(o).filter((k) => o[k] !== undefined).sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
-  }
-  throw new TypeError(`canonicalJson: a ${typeof v} isn't JSON`);
-}
 
 // Hex sha256 of the call. `args` are the arguments after the server resolved
 // them (a recipient's full handle, a normalized board, attachments by blob

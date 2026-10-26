@@ -95,9 +95,7 @@ export type HelloOk     = {
   // linked: whether anyone reads it (the user has linked Slack).
   human?: { handle: string; linked: boolean };
   // This server's attachment size caps, for the client's checks before upload.
-  attachment_limits?: AttachmentLimits;
-  // This server deduplicates this session's append writes (#254).
-  write_dedup?: boolean;
+  attachment_limits: AttachmentLimits;
 };
 // alias: the full address bound. restored: a restore's or a reconnect-after-
 // end's continuity, checked against the alias's history. left: the claims

@@ -366,15 +366,10 @@ test("a lost answer says a retry is safe, and the retry replays the first result
   }
 }, 30_000);
 
-test("a lost answer from a server that doesn't deduplicate says a retry may send twice", async () => {
-  // A server from before #254: its hello_ok has no write_dedup.
+test("a repeat of a lost write after the session's name changed is refused until resend: the server can't match it (A2)", async () => {
   let lose = false;
   const p = proxy(() => undefined, (frame) => {
-    const msg = JSON.parse(frame) as { type: string; write_dedup?: boolean };
-    if (msg.type === "hello_ok") {
-      delete msg.write_dedup;
-      return JSON.stringify(msg);
-    }
+    const msg = JSON.parse(frame) as { type: string };
     if (!lose || msg.type !== "send_ok") return frame;
     lose = false;
     setTimeout(() => p.drop(), 0);
@@ -383,9 +378,18 @@ test("a lost answer from a server that doesn't deduplicate says a retry may send
   try {
     const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
     lose = true;
-    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(
-      "the write may have landed. This server doesn't deduplicate writes, so calling again may send twice: check dm_history, board_read or dm_inbox's promised list first.",
-    );
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow("Calling again with the same arguments within 10 minutes is safe");
+    await until(() => be.call("peer_list", {}).catch(() => null), 10_000, "the reconnect");
+    // The dedup key holds the sender: as "ops", the repeat would write again.
+    await be.call("bind", { name: "ops", create: true });
+    const refused = "this repeats a dm_send whose answer was lost as alice@example.com/be; this session has changed since, so the server can't match the repeat to it, and the first may have landed.";
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 1 });
+    expect((await be.call("dm_send", { to: "be", body: "once", resend: true })).replayed).toBeUndefined();
+    // Settled: a further repeat goes out, and the server replays the resend.
+    expect((await be.call("dm_send", { to: "be", body: "once" })).replayed).toBeDefined();
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 2 });
   } finally {
     p.stop(true);
   }
@@ -446,27 +450,6 @@ const helloRewrite = (edit: (hello: Record<string, unknown>) => void) => (frame:
   edit(msg);
   return JSON.stringify(msg);
 };
-
-test("attachments against a server from before them: hello_ok without limits says the server needs updating", async () => {
-  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
-  writeFileSync(join(dir, "notes.md"), "# notes");
-  let uploads = 0;
-  const old = proxy(
-    (_, u) => (u.pathname.startsWith("/api/attachments") && ++uploads ? Response.json({ code: "not_found", message: "not found" }, { status: 404 }) : undefined),
-    helloRewrite((h) => delete h.attachment_limits),
-  );
-  try {
-    const alice = await login("alice@example.com");
-    const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${old.port}` });
-    const outdated = "this server doesn't take attachments; it needs updating";
-    await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(outdated);
-    await expect(be.call("attachment_get", { id: 1 })).rejects.toThrow(outdated);
-    expect(uploads).toBe(0);
-    expect(await be.call("dm_send", { to: "be", body: "plain" })).toMatchObject({ message_id: expect.any(Number) });
-  } finally {
-    old.stop(true);
-  }
-}, 20_000);
 
 test("the plugin takes attachment limits from the hello_ok of each reconnect", async () => {
   const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
@@ -538,9 +521,10 @@ test("attachment_get saves nothing unless the bytes match the server's Repr-Dige
     const save = join(dir, "saved");
     const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${bad.port}`, GRAYBOARD_ATTACHMENTS_DIR: save });
     const [notes] = (await be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).attachments;
-    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the server sent no digest; it needs updating`);
+    const mismatch = `attachment ${notes.id}: the bytes received don't match the server's sha256`;
+    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(mismatch);
     mode = "alter";
-    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the bytes received don't match the server's sha256`);
+    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(mismatch);
     // The default directory exists (resolved before the download); nothing is in it.
     expect(readdirSync(save, { recursive: true }).filter((n) => String(n).endsWith("notes.md"))).toEqual([]);
   } finally {

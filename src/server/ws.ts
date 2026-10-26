@@ -770,7 +770,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   ]);
   send(ws, {
     type: "hello_ok", req_id: reqId, id, ...(bound ? { bound } : {}), ...helloOkFields(hub, authed),
-    write_dedup: true, ...(notices.length ? { notices } : {}),
+    ...(notices.length ? { notices } : {}),
   });
   if (!push) return;
   // Mail and board items for every address, the alias's included: what

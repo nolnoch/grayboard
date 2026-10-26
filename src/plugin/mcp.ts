@@ -10,7 +10,7 @@ import { GrayboardClient, ServerRefused, retryWait } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk, BindOk, BindRequest } from "../shared/protocol.ts";
-import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
+import { canonicalJson, WRITE_DEDUP_WINDOW_MS, WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
@@ -291,7 +291,11 @@ function restoreLater(alias: string, restoredFrom: string, ms: number): void {
         instructionsStale = true;
         console.error(`[grayboard] session ${client.id} restored "${ok.alias}"`);
       } catch (e) {
-        if (e instanceof ServerRefused && e.code === "alias_held" && e.retryAfterMs !== undefined) return restoreLater(alias, restoredFrom, e.retryAfterMs);
+        // A holder in its grace, or the user's bind limit: both say when to retry.
+        if (e instanceof ServerRefused && (e.code === "alias_held" || e.code === "rate_limited") && e.retryAfterMs !== undefined) {
+          console.error(`[grayboard] session ${client.id} restoring "${alias}" retries in ${e.retryAfterMs}ms: ${e.code}`);
+          return restoreLater(alias, restoredFrom, e.retryAfterMs);
+        }
         restoring = null;
         nameNotice = restoreNote(short(alias), reason(e as Error));
         console.error(`[grayboard] session ${client.id} didn't restore "${alias}": ${(e as Error).message}`);
@@ -324,6 +328,12 @@ function reattached(h: HelloOk, rekeyedFrom: string | null): void {
   }
   const changed = `This session's ID changed from ${idAddress(rekeyedFrom)} to ${h.id}: it was disconnected past the server's grace, so the old session ended and DMs sent to the old ID bounce.`;
   instructionsStale = true;
+  // A tools-only session binds nothing: its new hello wrote as its writes_as
+  // again, so it still writes as `bound`.
+  if (!PUSH) {
+    nameNotice = changed;
+    return;
+  }
   const alias = bound;
   if (alias === null) {
     nameNotice = changed;
@@ -491,6 +501,8 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
   const bad = checkArgs(SERVER_TOOLS, name, a);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   if (name === "bind") return bind(a, signal);
+  const repeat = APPEND_WRITES.has(name) ? unmatchedRetry(name, a) : null;
+  if (repeat) return { ...text(`error: ${repeat}`), isError: true };
   try {
     // What uploads and downloads act as: what the connection acts as.
     const me = bound ?? client.id;
@@ -567,9 +579,8 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       const { res, data } = await api().download(`/api/attachments/${id}?as=${encodeURIComponent(me)}`, limits.file);
       // Checked before anything is saved: the bytes must be the ones the server stored.
       const sha256 = sha256Hex(data);
-      const want = digestSha256(res.headers.get("repr-digest"));
-      if (!want) throw new Error(`attachment ${id}: the server sent no digest; it needs updating`);
-      if (want !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
+      // A missing digest is a mismatch: every 2.x server sends one.
+      if (digestSha256(res.headers.get("repr-digest")) !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
       const info = {
         id,
         filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
@@ -584,7 +595,8 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
   } catch (e) {
     if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
     if (APPEND_WRITES.has(name) && isLostAnswer(e as Error)) {
-      return { ...text(`error: ${lostAnswer((e as Error).message, client.dedupsWrites, a.resend === true)}`), isError: true };
+      lostWrites.set(writeKey(name, a), { session: client.id, sender: bound ?? client.id, at: Date.now() });
+      return { ...text(`error: ${lostAnswer((e as Error).message, a.resend === true)}`), isError: true };
     }
     // The HTTP API (attachments) refused the token, as a WS hello would have.
     if (e instanceof ApiError && e.status === 401) return { ...text(`error: ${signInHint(serverUrl, envToken)}`), isError: true };
@@ -598,25 +610,50 @@ const APPEND_WRITES = new Set(["dm_send", "board_post", "delegate"]);
 // A disconnect around the call, or no answer in time: not a refusal (an
 // `error` frame rejects as "code: message"), so the write may have landed.
 const isLostAnswer = (e: Error) => /was lost|no answer from the grayboard server/.test(e.message);
-// One answer for every append write. The retry is safe only when the server
-// deduplicates (its hello_ok said so) and the call didn't force a resend.
-const lostAnswer = (why: string, dedup: boolean, resend: boolean) =>
+// One answer for every append write. The retry is safe unless the call
+// forced a resend: a retry the server can't match is refused before it goes
+// out (unmatchedRetry).
+const lostAnswer = (why: string, resend: boolean) =>
   `the server's answer was lost (${why}); the write may have landed. ` +
-  (!dedup
-    ? "This server doesn't deduplicate writes, so calling again may send twice: check dm_history, board_read or dm_inbox's promised list first."
-    : resend
-      ? `It was a resend, so calling again with resend sends again; calling again without resend within ${WRITE_DEDUP_WINDOW_TEXT} returns its result instead.`
-      : `Calling again with the same arguments within ${WRITE_DEDUP_WINDOW_TEXT} is safe: the server returns the first result instead of sending twice.`);
+  (resend
+    ? `It was a resend, so calling again with resend sends again; calling again without resend within ${WRITE_DEDUP_WINDOW_TEXT} returns its result instead.`
+    : `Calling again with the same arguments within ${WRITE_DEDUP_WINDOW_TEXT} is safe: the server returns the first result instead of sending twice.`);
 
-// The server's HTTP API as this session's user, with the current token.
+// Append writes whose answer was lost, by tool and arguments, with the
+// session and sender they went out as: the server's dedup key
+// (src/server/write_dedup.ts) holds both. The lost request was rejected when
+// its connection closed, before any reconnect could rekey the session.
+const lostWrites = new Map<string, { session: string; sender: string; at: number }>();
+const writeKey = (name: string, a: Record<string, unknown>) => {
+  const { resend: _resend, ...args } = a;
+  return canonicalJson({ tool: name, args });
+};
+
+// A repeat of a lost write after the session's ID changed (a rekey past the
+// grace) or its name did (a bind or restore) reaches the server under another
+// key, so it would write twice: refused, unless the call forces a resend.
+// A repeat under the same key goes out; the server replays the first result.
+function unmatchedRetry(name: string, a: Record<string, unknown>): string | null {
+  const now = Date.now();
+  for (const [k, w] of lostWrites) if (now - w.at >= WRITE_DEDUP_WINDOW_MS) lostWrites.delete(k);
+  const key = writeKey(name, a);
+  const lost = lostWrites.get(key);
+  if (!lost) return null;
+  // Either answer settles it: the server's, or the agent's resend.
+  if (a.resend === true || (lost.session === client.id && lost.sender === (bound ?? client.id))) {
+    lostWrites.delete(key);
+    return null;
+  }
+  const was = lost.session === client.id ? `as ${lost.sender}` : `from session ${lost.session}`;
+  return `this repeats a ${name} whose answer was lost ${was}; this session has changed since, so the server can't match the repeat to it, and the first may have landed. Check dm_history, board_read or dm_inbox's promised list; to send it anyway, call again with resend: true.`;
+}
+
 const api = () => new ApiClient(serverUrl, currentToken());
 
 // The live connection's attachment limits, which every hello_ok (a reconnect's
-// too) carries. A server from before attachments sends none.
+// too) carries.
 function attachmentLimits(): AttachmentLimits {
-  const limits = client.assertConnected().attachment_limits;
-  if (!limits) throw new Error("this server doesn't take attachments; it needs updating");
-  return limits;
+  return client.assertConnected().attachment_limits;
 }
 
 // Reads and checks the files an agent named (all before any is sent), uploads
