@@ -13,6 +13,7 @@ import { sessionContext } from "../../../src/server/hosted.ts";
 import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
+import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
@@ -29,6 +30,9 @@ let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
 const admissions: Parameters<Context["session"]["synthetic"]>[0][] = [];
+const admitted: typeof admissions = [];
+const suspendedModel = { target: "", entered: barrier(), released: barrier() };
+let pendingAdmissions = 0;
 const raceGate: AdmissionGate = { holding: false, boundary: process.env.GRAYBOARD_TEST_RACE_BOUNDARY === "after" ? "after" : "before", inputs: [], accepted: [], models: [], entered() {}, released: Promise.resolve() };
 const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null; accessHash: string }[] = [];
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
@@ -72,7 +76,11 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   const p = Provider.ID.make("fixture");
   await c.provider.transform(e => e.add({ info: { ...Provider.Info.empty(p), name: "Fixture", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: "https://model.example.com/v1" } }, models: [{ ...Model.Info.default(p, Model.ID.make("fixture")), name: "Fixture" }] }));
   await c.session.hook("title", e => { e.result = "Fixture"; });
-  await c.session.hook("http.request", e => { if (e.kind === "primary") raceGate.models.push(e.sessionID); });
+  await c.session.hook("http.request", async e => {
+    if (e.kind !== "primary") return;
+    raceGate.models.push(e.sessionID);
+    if (e.sessionID === suspendedModel.target) { suspendedModel.entered.release(); await suspendedModel.released.promise; }
+  });
   await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
 } });
 const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({ ...c, session: new Proxy(c.session, { get(s, k) {
@@ -80,7 +88,10 @@ const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({
     admissions.push(structuredClone(input)); raceGate.inputs.push(structuredClone(input));
     if (held) { entered?.(); await new Promise<void>(r => { release = r; }); }
     if (raceGate.holding && raceGate.boundary === "before") { raceGate.entered(); await raceGate.released; }
-    const value = await s.synthetic(input); raceGate.accepted.push(value);
+    pendingAdmissions++;
+    let value: Awaited<ReturnType<typeof s.synthetic>>;
+    try { value = await s.synthetic(input); admitted.push(structuredClone(input)); raceGate.accepted.push(value); }
+    finally { pendingAdmissions--; }
     if (raceGate.holding && raceGate.boundary === "after") { raceGate.entered(); await raceGate.released; }
     return value;
   };
@@ -326,9 +337,23 @@ try {
   await wait(() => receiptAttempts, n => n > receiptsBeforeLoss, "lost receipt attempted after real durable admission");
   await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "lost receipt retry boundary before host reload");
   const lostInput = admissions.find(x => x.text.includes("Replay after host reload"))!;
+  await wait(() => admitted.some(x => x.id === lostInput.id), Boolean, "actual lost-receipt admission returned");
+  const cursorBeforeReload = app.repo.cursors.directFor("you@example.com/r4");
+  const settledSessions = await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
+  assert(settledSessions.includes(lostInput.sessionID), "Actual target participates in the complete owned-session drain");
+  // No remaining controlled producer: tools, admission holds and race drivers are all idle.
+  assert.equal(target, undefined); assert.equal(held, false); assert.equal(raceGate.holding, false); assert.equal(pendingAdmissions, 0);
+  assertStable(join(root, "host.sqlite"), lostInput);
+  assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
+  assert.equal(app.repo.cursors.directFor("you@example.com/r4"), cursorBeforeReload);
+  assert.equal(dropReceipt, true); assert.equal((await rpc.status({}, { location })).state, "retrying");
+  assert.equal(pendingAdmissions, 0); assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
+  assertStable(join(root, "host.sqlite"), lostInput);
+  assert.deepEqual(admitted.find(input => input.id === lostInput.id), lostInput, "Exact stable envelope survives actual admission");
   await host.close(); host = undefined; dropReceipt = false;
+  assert.equal(app.repo.cursors.directFor("you@example.com/r4"), cursorBeforeReload);
   assert(app.repo.cursors.directFor("you@example.com/r4") < lost.id);
-  await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: lostInput, location }));
+  await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: lostInput, location, settled: true, settledSessions }));
   const reloadProcess = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port) }, stdout: "inherit", stderr: "inherit" });
   assert.equal(await reloadProcess.exited, 0, "Separate installed-host reload process passes");
   const childReload = await Bun.file(join(root, "real-reload-result.json")).json();
@@ -340,6 +365,35 @@ try {
   const replay = [...admissions, ...childReload.inputs as Parameters<Context["session"]["synthetic"]>[0][]].filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
   assert.equal((await host.session.context({ sessionID: a.id })).filter(m => m.id === replay[0]!.id).length, 1);
   console.log("REAL_HOST_RELOAD_STABLE_ID_OK", { replay: replay.length, cursor: lost.id });
+
+  // Separate regression: unfinished SDK execution resumes before duplicate forwarding.
+  await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
+  suspendedModel.target = a.id; dropReceipt = true; const suspendedReceipts = receiptAttempts;
+  const suspendedDM = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Suspended SDK execution across reload", null, false);
+  app.application.wake(["you@example.com/r4"]);
+  await bounded(suspendedModel.entered.promise, 20_000, "Target model reached owned suspension barrier");
+  await wait(() => admitted.find(x => x.text.includes("Suspended SDK execution across reload")), Boolean, "suspended input admission returned");
+  await wait(() => receiptAttempts, n => n > suspendedReceipts, "suspended lost receipt attempted");
+  await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "suspended lost receipt retrying");
+  const suspendedInput = admitted.find(x => x.text.includes("Suspended SDK execution across reload"))!;
+  await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }), a.id);
+  assertStable(join(root, "host.sqlite"), suspendedInput);
+  assert(sessionStates(join(root, "host.sqlite")).some(s => s.id === a.id && s.time_suspended !== null), "Target must actually be suspended before close");
+  assert.equal(dropReceipt, true); assert.equal(pendingAdmissions, 0);
+  const suspendedCursor = app.repo.cursors.directFor("you@example.com/r4"); assert(suspendedCursor < suspendedDM.id);
+  await host.close(); host = undefined; suspendedModel.released.release(); suspendedModel.target = ""; dropReceipt = false;
+  assertStable(join(root, "host.sqlite"), suspendedInput);
+  assert(sessionStates(join(root, "host.sqlite")).some(s => s.id === a.id && s.time_suspended !== null));
+  assert.equal(app.repo.cursors.directFor("you@example.com/r4"), suspendedCursor);
+  await Bun.write(join(root, "real-suspended.json"), JSON.stringify({ pid: process.pid, input: suspendedInput, location }));
+  const suspendedReload = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "suspended-resume" }, stdout: "inherit", stderr: "inherit" });
+  assert.equal(await suspendedReload.exited, 0, "Separate suspended SDK resume regression passes");
+  const suspendedResult = await Bun.file(join(root, "real-suspended-result.json")).json();
+  assert.deepEqual(suspendedResult.models, [a.id]);
+  assert.equal(app.repo.cursors.directFor("you@example.com/r4"), suspendedDM.id);
+  console.log("REAL_SUSPENDED_RESUME_BEFORE_REPLAY_OK");
+  host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
+  await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
   const timelyOwnership = row(a.id)!.ownership_id;
   await host.close(); host = undefined; await app.stop(); app = start();
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
@@ -395,4 +449,4 @@ try {
   assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);
   console.log("REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
   }
-} finally { release?.(); raceGate.holding = false; await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
+} finally { suspendedModel.released.release(); release?.(); raceGate.holding = false; await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
