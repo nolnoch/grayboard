@@ -146,7 +146,7 @@ function authLogout(authed: AuthedUser, repo: Repo): Response {
 }
 
 function whoami(authed: AuthedUser, repo: Repo): Response {
-  const identities = repo.aliases.listFor(authed.user_email).map(i => i.name);
+  const identities = repo.aliases.listForScope("person", authed.user_email).map(i => i.name);
   const teams      = repo.teams.listForUser(authed.user_id).map(t => t.name);
   return json({ email: authed.user_email, identities, teams });
 }
@@ -167,7 +167,7 @@ function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: 
   if (!name) return badRequest("identity required");
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return forbidden(humanReason);
-  if (!repo.aliases.find(authed.user_email, name)) {
+  if (!repo.aliases.find(`${authed.user_email}/${name}`)) {
     return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
   return `${authed.user_email}/${name}`;
@@ -194,7 +194,7 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreD
 // ── identities ────────────────────────────────────────────────────────────────
 
 function identityList(authed: AuthedUser, repo: Repo): Response {
-  return json(repo.aliases.listFor(authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
+  return json(repo.aliases.listForScope("person", authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
 async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
@@ -203,9 +203,9 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid identity name");
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
-  const existing = repo.aliases.find(authed.user_email, name);
+  const existing = repo.aliases.find(`${authed.user_email}/${name}`);
   if (existing) return conflict(`identity "${name}" already exists`);
-  const identity = repo.aliases.create(authed.user_email, name);
+  const identity = repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
   writeAudit(repo, "alias.created", authed.user_email, identity.address);
   onAliasCreated(db, repo, authed.user_id, identity.address);
   return json({ name: identity.name, created_at: identity.created_at }, 201);
@@ -214,9 +214,9 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
 function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
-  const existing = repo.aliases.find(authed.user_email, name);
+  const existing = repo.aliases.find(`${authed.user_email}/${name}`);
   if (!existing) return notFound();
-  repo.aliases.remove(authed.user_email, name);
+  repo.aliases.remove(existing.address);
   forgetHandle(db, existing.address);
   writeAudit(repo, "alias.deleted", authed.user_email, existing.address);
   return json({ ok: true });

@@ -213,8 +213,9 @@ export class SlackBridge implements SlackLinker {
     repo.slack.unlink(userId);
     // Unread DMs to an identity nobody reads would only pile up; a later link
     // starts from the newest message (see linkUser).
-    repo.aliases.remove(link.email, HUMAN_NAME);
-    forgetHandle(db, `${link.email}/${HUMAN_NAME}`);
+    const handle = `${link.email}/${HUMAN_NAME}`;
+    repo.aliases.remove(handle);
+    forgetHandle(db, handle);
     writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
     return true;
   }
@@ -249,13 +250,13 @@ export class SlackBridge implements SlackLinker {
     this.detach(user.id);
     repo.slack.link(user.id, slackUser, channel);
     const handle = `${user.email}/${HUMAN_NAME}`;
-    if (!repo.aliases.find(user.email, HUMAN_NAME)) {
+    if (!repo.aliases.find(handle)) {
       // Start from now: drop what queued for an earlier link's alias.
       forgetHandle(db, handle);
-      repo.aliases.create(user.email, HUMAN_NAME);
+      repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
       writeAudit(repo, "alias.created", user.email, handle, { slack: true });
       onAliasCreated(db, repo, user.id, handle);
-      const newest = repo.messages.history(handle, undefined, 1)[0];
+      const newest = repo.messages.history([handle], undefined, 1)[0];
       if (newest) repo.cursors.advance(handle, "direct", handle, newest.id);
     }
     markHuman(db, handle, true);

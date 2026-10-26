@@ -52,7 +52,7 @@ export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Acces
       const prefix = slash >= 0 ? token.slice(0, slash) : null;
       const candidates = repo.aliases
         .findAllByName(name)
-        .map((i) => `${i.email}/${i.name}`)
+        .map((i) => i.address)
         .filter((h) => {
           if (prefix === null) return true;
           const email = emailOf(h)!;

@@ -446,8 +446,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
 
   // A typo would otherwise create a fresh name, and the DMs queued for the
   // intended one would never arrive.
-  if (m.create === false && !repo.aliases.find(authed.user_email, name)) {
-    const known = closestNames(name, repo.aliases.listFor(authed.user_email).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+  if (m.create === false && !repo.aliases.find(full)) {
+    const known = closestNames(name, repo.aliases.listForScope("person", authed.user_email).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
     const message = unknownNameError(name, known);
     refuse("identity_unknown", message, message, { known });
     return;
@@ -520,8 +520,8 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     }
   }
 
-  if (!repo.aliases.find(authed.user_email, name)) {
-    repo.aliases.create(authed.user_email, name);
+  if (!repo.aliases.find(full)) {
+    repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
     writeAudit(repo, "alias.created", authed.user_email, full, { lazy: true, ...(ws.data.human ? {} : { session: sessionId }) });
     onAliasCreated(db, repo, authed.user_id, full);
   }
@@ -607,7 +607,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const bridgeNotice = ws.data.human ? undefined : owedBridgeNotice(repo, authed.user_email);
   const notices = [
     ...(m.launcher && push && owns ? launcherInstruction() : []),
-    ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+    ...undeliveredInstruction(repo.messages.undeliveredFrom([full], Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
     // Before the claims: drained once, so a cut must not take it.
     ...(bridgeNotice ? [bridgeNotice] : []),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
@@ -655,7 +655,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
   const { repo, db, holders } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
   const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
-  const names = repo.aliases.listFor(authed.user_email).map((i) => i.name).filter(free);
+  const names = repo.aliases.listForScope("person", authed.user_email).map((i) => i.name).filter(free);
   const queued = repo.messages.queuedTo(names.map(full));
   const seen = sessionsSeen(db, names.map(full));
   const claims = new Map<string, number>();
@@ -685,7 +685,7 @@ function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
 function resolvePeerInput(repo: Repo, email: string, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
   if (isValidIdentityName(input)) {
     const name = input.toLowerCase();
-    if (repo.aliases.find(email, name)) {
+    if (repo.aliases.find(formatDirectAddress(email, name))) {
       input = formatDirectAddress(email, name);
     } else if (name === HUMAN_NAME) {
       // Every linked user has one; listing them would only leak who linked.
@@ -693,10 +693,10 @@ function resolvePeerInput(repo: Repo, email: string, input: string): { address: 
     } else {
       const all = repo.aliases.findAllByName(name);
       if (all.length !== 1) {
-        const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
+        const which = all.length ? `several identities are named "${name}": ${all.map(i => i.address).sort().join(", ")}` : `no identity is named "${name}"`;
         return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
       }
-      input = formatDirectAddress(all[0]!.email, name);
+      input = all[0]!.address;
     }
   }
   try {
@@ -760,7 +760,7 @@ function prepareSend(
 
   const recipientUser = repo.users.findByEmail(parsed.email);
   if (!recipientUser) throw new SendRefused("not_found", `user "${parsed.email}" not found`);
-  if (!repo.aliases.find(recipientUser.email, parsed.name)) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
+  if (!repo.aliases.find(formatDirectAddress(recipientUser.email, parsed.name))) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
@@ -791,7 +791,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
         delivered_now: false,
         ...f,
         ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
-        undelivered_from_you: repo.messages.undeliveredFrom(ws.data.identityFull).find((u) => u.recipient === p.to)?.n ?? 1,
+        undelivered_from_you: repo.messages.undeliveredFrom([ws.data.identityFull]).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
       };
   return { payload, ref: { kind: "message", id: msg.id }, msg };
@@ -1038,7 +1038,7 @@ function handleHistory(
     return cursors.get(to)!;
   };
   // Newest `lim` before beforeId, shown oldest first as in local mode.
-  const messages = repo.messages.history(me, peerFull, lim, beforeId).reverse().map((m) =>
+  const messages = repo.messages.history([me], peerFull, lim, beforeId).reverse().map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
   send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showMessage) });
@@ -1053,9 +1053,9 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
-  const owed = unanswered([me], repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
-  const promises = promised([me], repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
-  const queued = repo.messages.undeliveredFrom(me).map((u) => {
+  const owed = unanswered([me], repo.messages.receivedUnacked([me], since), (id) => repo.messages.thread(id));
+  const promises = promised([me], repo.messages.sentPending([me], Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
+  const queued = repo.messages.undeliveredFrom([me]).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
   });

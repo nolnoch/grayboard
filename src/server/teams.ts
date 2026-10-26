@@ -23,11 +23,11 @@ function follow(db: CoreDb, handle: string, team: Team): void {
 
 export function onTeamJoined(db: CoreDb, repo: Repo, team: Team, email: string): void {
   ensureTeamBoard(db, team, email);
-  for (const alias of repo.aliases.listFor(email)) follow(db, alias.address, team);
+  for (const alias of repo.aliases.listForScope("person", email)) follow(db, alias.address, team);
 }
 
 export function onTeamLeft(db: CoreDb, repo: Repo, team: Team, email: string): void {
-  for (const alias of repo.aliases.listFor(email)) unsubscribeScope(db, alias.address, teamScope(team.name));
+  for (const alias of repo.aliases.listForScope("person", email)) unsubscribeScope(db, alias.address, teamScope(team.name));
 }
 
 export function onAliasCreated(db: CoreDb, repo: Repo, userId: number, handle: string): void {
