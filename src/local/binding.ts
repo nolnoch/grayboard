@@ -459,12 +459,15 @@ export function setHeldMeta(db: Database, sessionId: string, name: string, meta:
   }).immediate();
 }
 
+/** How long a restart waits, in all, for the process it replaces to exit. */
+export const SIBLING_WAIT_MS = 5000;
+
 /**
  * Wait up to `ms` for the live session holding `name` from under the same
  * harness (`harnessPid`) to exit: a restarted grayboard can start before the
  * process it replaces has released the name. True once no such holder is left.
  */
-export async function siblingGone(db: Database, name: string, harnessPid: number, ms = 5000): Promise<boolean> {
+export async function siblingGone(db: Database, name: string, harnessPid: number, ms = SIBLING_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + ms;
   for (;;) {
     const row = holdingSession(db, name);

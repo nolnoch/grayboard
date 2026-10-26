@@ -365,6 +365,9 @@ test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes 
   expect(await refusal(s, "bind", { name: "fe2", create: true, meta: { task: "x".repeat(201) } })).toContain("meta.task must be at most 200 chars");
   expect(holderOf("fe2")).toBeUndefined();
   expect(labels("fe")).toMatchObject({ task: null, owner: "be" });
+  // Each is audited, as the server audits it (audit F3).
+  expect(events("fe").map((e) => e.event)).toEqual(["bound", "refused", "refused", "refused", "refused"]);
+  expect(events("fe2").map((e) => e.event)).toEqual(["refused"]);
 }, 30_000);
 
 test("#284 AC 8: the session's model shows on the alias it holds; the alias's task stays with the alias", async () => {
@@ -519,6 +522,21 @@ test("#211: a name record whose session the name's history doesn't show restores
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(statusOf("api")).toBeNull();
+}, 30_000);
+
+test("audit S7: a name record past MAX_HOLDS restores the first names and reports the rest untried", async () => {
+  let s = await session(null);
+  await s.call("bind", { name: "api", create: true });
+  const path = join(dir, `bind.${s.harnessPid}`);
+  const extra = Array.from({ length: 9 }, (_, i) => `n${i}`);
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), names: ["api", ...extra] }));
+  const started = Date.now();
+  s = await s.restart("crash");
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expect((await s.call("peer_list", {})).you).toBe("api");
+  const text = s.c.getInstructions()!;
+  for (const n of extra.slice(7)) expect(text).toContain(`held "${n}", but a session holds at most 8 names`);
+  expect(text).not.toContain(`held "n0", but a session holds at most`);
 }, 30_000);
 
 // #259, local half: a session ID is public, but locally the proof of descent

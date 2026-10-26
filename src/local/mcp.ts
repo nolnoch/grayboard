@@ -7,10 +7,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, parseAliasMeta, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, logBinding, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -49,7 +49,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, siblingGone, thisSession, type Ended } from "./binding.ts";
+import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { isAlive, launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
@@ -254,11 +254,15 @@ if (WRITES_AS) {
   // (#284 S10). Each is judged on its own; the first taken is the primary.
   const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
   if (rec?.names.length) {
-    const missed: { name: string; why: string }[] = [];
-    for (const name of rec.names) {
+    // A record is this machine's file, not proof: past MAX_HOLDS its names
+    // are reported, not tried.
+    const missed = rec.names.slice(MAX_HOLDS).map((name) => ({ name, why: `a session holds at most ${MAX_HOLDS} names` }));
+    // The process it replaces may not have exited yet: one wait for all of
+    // its names, not one per name.
+    const deadline = Date.now() + SIBLING_WAIT_MS;
+    for (const name of rec.names.slice(0, MAX_HOLDS)) {
       const n = normalizeIdentityName(name);
-      // The process it replaces may not have exited yet.
-      if (n.ok) await siblingGone(db, n.name, process.ppid);
+      if (n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
       const r = n.ok
         ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
         : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
@@ -800,7 +804,14 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it binds nothing`);
   const n = bareName(String(a.name), "bind");
   if (!n.ok) return fail(n.error);
-  const meta = a.meta === undefined ? undefined : parseAliasMeta(a.meta);
+  let meta: AliasMetaSet | undefined;
+  try {
+    meta = a.meta === undefined ? undefined : parseAliasMeta(a.meta);
+  } catch (e) {
+    // Audited like the server's refusal of the same bind.
+    if (e instanceof CoreError) logBinding(db, SESSION_ID, n.name, "refused", e.message);
+    throw e;
+  }
   if (held.includes(n.name)) {
     if (meta && !setHeldMeta(db, SESSION_ID, n.name, meta)) throw new Error(`grayboard: session ${SESSION_ID} lost its hold on "${n.name}"`);
     return text(`already bound to "${n.name}"`);
@@ -855,7 +866,15 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
     const before = primary();
     stopListening(n.name);
     testPause("unbind:before-txn");
-    const released = releaseName(db, SESSION_ID, n.name);
+    let released: boolean;
+    try {
+      released = releaseName(db, SESSION_ID, n.name);
+    } catch (e) {
+      // The row still holds the name: answer on its socket again, or a
+      // retried unbind or bind finds it held and nothing re-listens.
+      listen(n.name);
+      throw e;
+    }
     held = held.filter((h) => h !== n.name);
     writeNames();
     if (!released) return text(notHolding(n.name));

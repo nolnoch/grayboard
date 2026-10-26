@@ -283,7 +283,7 @@ export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-export const cleanPlace = (place: string | null): string | null => place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
+export const cleanPlace = (place: string | null): string | null => (place === null ? "" : oneLine(place)).slice(0, 200) || null;
 
 // Server mode: where the session runs, as its client described it.
 export function setPlace(db: Database, id: string, place: string | null): void {
@@ -415,6 +415,11 @@ const NOT_PUSHED = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.
 const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.post_id = p.id
   AND (o.wake = 1 OR o.delivered_at IS NOT NULL))`;
 
+// A post not written by the reader's session (#284 S5): neither as the
+// reader's address nor by the session that is it or holds it, whichever of
+// its addresses it wrote as. Binds the reader's address three times.
+const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND p.author_id = COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?))`;
+
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
 // What a board call without `as` acts for (#284 S14, #366): "read"
@@ -432,14 +437,14 @@ function boardViews(db: Database, handles: string[], board: string | null): { ha
             (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
               (SELECT COUNT(*) FROM posts p
-                WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
+                WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
        FROM boards b
        LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
       WHERE ? IS NULL OR b.name = ?
       ORDER BY b.name`,
   );
   const a = access(db);
-  return handles.flatMap((h) => (q.all(h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
+  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
 }
 
 // The view a use acts as, from one board's views in address order.
@@ -874,7 +879,7 @@ export function parseAliasMeta(v: unknown): AliasMetaSet {
   if (typeof v !== "object" || v === null || Array.isArray(v)) throw new CoreError("meta must be an object of labels");
   const out: AliasMetaSet = {};
   for (const [k, raw] of Object.entries(v)) {
-    if (!(ALIAS_META_KEYS as readonly string[]).includes(k)) throw new CoreError(`unknown meta key "${k}"; known: ${ALIAS_META_KEYS.join(", ")}`);
+    if (!(ALIAS_META_KEYS as readonly string[]).includes(k)) throw new CoreError(`unknown meta key ${JSON.stringify(oneLine(k).slice(0, 40))}; known: ${ALIAS_META_KEYS.join(", ")}`);
     if (typeof raw !== "string") throw new CoreError(`meta.${k} must be a string`);
     const t = oneLine(raw);
     if (t.length > MAX_LABEL) throw new CoreError(`meta.${k} must be at most ${MAX_LABEL} chars`);
@@ -1174,10 +1179,10 @@ export function read(
     posts = sub
       ? (db
           .prepare(
-            `SELECT ${P_POST_COLS} FROM posts p WHERE board = ? AND id > ? AND author != ? AND ${NOT_PUSHED_YET}
+            `SELECT ${P_POST_COLS} FROM posts p WHERE board = ? AND id > ? AND ${NOT_OWN} AND ${NOT_PUSHED_YET}
               ORDER BY id ASC LIMIT ?`,
           )
-          .all(board, sub.cursor, handle, handle, limit) as Post[])
+          .all(board, sub.cursor, handle, handle, handle, handle, limit) as Post[])
       : [];
     if (posts.length === 0) {
       posts = (
@@ -1205,9 +1210,9 @@ export function read(
     .prepare(
       `SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s
          ON s.board = p.board AND s.handle = ?
-        WHERE p.board = ? AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}`,
+        WHERE p.board = ? AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}`,
     )
-    .get(handle, board, handle, handle) as { n: number };
+    .get(handle, board, handle, handle, handle, handle) as { n: number };
 
   return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
 }
@@ -1259,13 +1264,13 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
     .prepare(
       `SELECT s.board, s.cursor,
               (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
-                 AND p.author != ? AND ${NOT_PUSHED}) AS unread,
-              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ? AND ${NOT_PUSHED}) AS latest_id
+                 AND ${NOT_OWN} AND ${NOT_PUSHED}) AS unread,
+              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND ${NOT_OWN} AND ${NOT_PUSHED}) AS latest_id
          FROM subscriptions s
         WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
           AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
     )
-    .all(handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
+    .all(handle, handle, handle, handle, handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
     if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
       out.push({ kind: "digest", board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! });

@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  cleanPlace,
+  parseAliasMeta,
   acknowledge,
   activeAnnouncements,
   createBoard,
@@ -891,4 +893,34 @@ test("claim_release and board_create repeats answer from state; another's histor
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "other" })).toThrow(/already exists/);
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", team: "core" })).toThrow(/team boards need distributed mode/);
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }, { human: true })).toThrow(/already exists/);
+});
+
+test("a place and an unknown meta key are single bounded lines", () => {
+  expect(cleanPlace("host\u0007 /repo\u001b[31m\n  lane")).toBe("host /repo[31m lane");
+  expect(cleanPlace(null)).toBeNull();
+  expect(cleanPlace(" \u0000 ")).toBeNull();
+  const key = `k\n${"x".repeat(500)}`;
+  expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
+});
+
+// #284 S5 (audit P2): a session's own post is not unread on any of its
+// addresses, whichever one it wrote as.
+test("a post written as one alias is not unread, digested or read back on the session's others", () => {
+  const S = "id:000000000000s";
+  registerId(db, { id: S, principal: null, launcher: false });
+  for (const a of ["a", "b"]) seen(a);
+  holdAlias(db, "a", S, 100);
+  holdAlias(db, "b", S, 101);
+  subscribe(db, "a", "e2e", "digest");
+  subscribe(db, S, "e2e", "digest");
+  post(db, "b", "e2e", "mine", null, { addresses: ["b", "a", S], author_id: S });
+  for (const h of ["a", S]) {
+    expect(listBoards(db, [h])[0]!.unread).toBe(0);
+    expect(pendingFor(db, h, { all: true })).toEqual([]);
+    expect(read(db, h, "e2e").unread_remaining).toBe(0);
+  }
+  // Another session's post is still unread for both.
+  post(db, "sim", "e2e", "theirs");
+  expect(listBoards(db, ["a"])[0]!.unread).toBe(1);
+  expect(pendingFor(db, S, { all: true })).toMatchObject([{ kind: "digest", board: "e2e", unread: 1 }]);
 });
