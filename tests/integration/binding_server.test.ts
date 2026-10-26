@@ -1104,3 +1104,35 @@ test("#259: a stray refused a while its holder lives takes it after the end, unv
   const sent = await x.request({ type: "send", recipient: "bob@example.com/fe", body: "who am i" });
   expect(rows(`SELECT sender FROM messages WHERE id = ?`, sent.message_id)).toEqual([{ sender: `${A}/b` }]);
 });
+
+// #284 S11 on the server: the principal is the signed-in user.
+test("#284 S11: whoami over the server names the ID, the holds oldest first and the principal", async () => {
+  const s = await session(null);
+  const id = await sessionId(s);
+  expect(await s.call("whoami", {})).toEqual({ id, primary: id, aliases: [], principal: A });
+  await s.call("bind", { name: "zed", create: true });
+  await s.call("bind", { name: "alpha", create: true });
+  expect(await s.call("whoami", {})).toEqual({ id, primary: `${A}/zed`, aliases: [`${A}/zed`, `${A}/alpha`], principal: A });
+  const tools = await session("fe", { extra: { BUS_PUSH: "off" } });
+  expect(await tools.call("whoami", {})).toMatchObject({ primary: `${A}/fe`, aliases: [], principal: A, writes_as: `${A}/fe` });
+}, 30_000);
+
+// #284 S1: the primary is the first alias bound, even when binds share a
+// millisecond: bound_at is made monotonic per session, so neither the clock
+// nor the address order decides. The restore loop binds in record order.
+test("#284 S1: with the server's clock frozen, the first alias bound stays the primary, through a restart's restore", async () => {
+  srv.stop();
+  const frozen = Date.now();
+  srv = new TestServer({}, { now: () => frozen });
+  alice = await srv.login(A);
+  let s = await session("zed");
+  await s.call("bind", { name: "alpha", create: true });
+  await s.call("bind", { name: "mid", create: true });
+  const order = () => rows<{ address: string }>(`SELECT address FROM alias_holds ORDER BY bound_at`).map((r) => r.address);
+  expect(order()).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
+  expect((await s.call("whoami", {})).primary).toBe(`${A}/zed`);
+  s = await s.restart("reconnect");
+  expect(order()).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
+  expect((await s.call("whoami", {})).aliases).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
+  expect(s.c.getInstructions()).toStartWith(`You are identity "zed"`);
+}, 40_000);

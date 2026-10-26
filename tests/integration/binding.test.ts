@@ -802,3 +802,108 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
   await t.call("bind", { name: "b" });
   expect(await refusal(s, "dm_send", { to: "peer", body: "x", parent_id: toB2.message_id })).toBe(`error: parent_id ${toB2.message_id} is not a message you sent or received`);
 }, 30_000);
+
+// #284 S11: whoami names the session, its holds oldest first, and what it sends as.
+test("#284 S11: whoami lists the ID, the primary and the holds oldest first; a tools-only process names its writes_as", async () => {
+  const s = await session();
+  const id = await sessionId(s);
+  expect(await s.call("whoami", {})).toEqual({ id, primary: id, aliases: [], principal: null });
+  await s.call("bind", { name: "zed", create: true });
+  await s.call("bind", { name: "alpha", create: true });
+  expect(await s.call("whoami", {})).toEqual({ id, primary: "zed", aliases: ["zed", "alpha"], principal: null });
+  await s.call("unbind", { name: "zed" });
+  expect(await s.call("whoami", {})).toEqual({ id, primary: "alpha", aliases: ["alpha"], principal: null });
+
+  const tools = await session("fe", { extra: { BUS_PUSH: "off" } });
+  expect(await tools.call("whoami", {})).toEqual({ id: expect.stringMatching(/^id:/), primary: "fe", aliases: [], principal: null, writes_as: "fe" });
+}, 30_000);
+
+// #284 AC 3: a reply goes to the alias a message was sent as, so it follows
+// that alias's holder.
+test("#284 AC 3: a reply to a send as b reaches the session; once b moves to another session, the next reply reaches that one", async () => {
+  const s = await session("a");
+  await s.call("bind", { name: "b", create: true });
+  const peer = await session("fe");
+  const sent = await s.call("dm_send", { to: "fe", body: "from b", as: "b" });
+  await until(() => contents(peer).includes("from b"));
+  await peer.call("dm_send", { to: "b", body: "reply one", parent_id: sent.message_id });
+  await until(() => contents(s).includes("reply one"));
+
+  await s.call("unbind", { name: "b" });
+  const t = await session();
+  await t.call("bind", { name: "b" });
+  await peer.call("dm_send", { to: "b", body: "reply two", parent_id: sent.message_id });
+  await until(() => contents(t).includes("reply two"));
+  // Barrier: a DM to a drains after anything for s.
+  await peer.call("dm_send", { to: "a", body: "probe" });
+  await until(() => contents(s).includes("probe"));
+  expect(contents(s)).not.toContain("reply two");
+}, 30_000);
+
+// #284 S4: files go out as the reply's sender, which the parent decides.
+test("#284 S4: a reply defaulting to b uploads its files as b", async () => {
+  const peer = await session("peer");
+  const s = await session("a");
+  await s.call("bind", { name: "b", create: true });
+  const toB = await peer.call("dm_send", { to: "b", body: "to b" });
+  writeFileSync(join(dir, "f.txt"), "f");
+  const r = await s.call("dm_send", { to: "peer", body: "with file", parent_id: toB.message_id, attachments: [join(dir, "f.txt")] });
+  expect(r.sent_as).toBe("b");
+  expect(rows<{ uploader: string }>(`SELECT uploader FROM attachments WHERE message_id = ?`, r.message_id as number)).toEqual([{ uploader: "b" }]);
+}, 30_000);
+
+test("#361: a post pending for two held aliases is pushed once and delivered for both", async () => {
+  const be = await session("be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const s = await session("a");
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("bind", { name: "b", create: true });
+  // Local picks the primary for a board tool (S14): make b the primary to subscribe it.
+  await s.call("unbind", { name: "a" });
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("bind", { name: "a" });
+  expect(rows(`SELECT handle FROM subscriptions WHERE board = 'e2e' AND handle IN ('a', 'b') ORDER BY handle`)).toEqual([{ handle: "a" }, { handle: "b" }]);
+
+  await be.call("board_post", { board: "e2e", body: "once" });
+  const delivered = () => rows<{ handle: string }>(`SELECT o.handle FROM outbox o JOIN posts p ON p.id = o.post_id WHERE p.body = 'once' AND o.delivered_at IS NOT NULL ORDER BY o.handle`);
+  await until(() => delivered().length === 2);
+  expect(delivered()).toEqual([{ handle: "a" }, { handle: "b" }]);
+  await be.call("dm_send", { to: "b", body: "probe" });
+  await until(() => contents(s).includes("probe"));
+  expect(contents(s).filter((c) => c === "once")).toHaveLength(1);
+}, 30_000);
+
+// #259 with several aliases (spec AC 6): the stray keeps writing as b while
+// refused a, and taking a after p dies brings a's mail and claims, not p's
+// status, and leaves its primary b.
+test("#259: a stray holding b, refused a while p lives, takes a after p dies: mail and claims, no status, primary still b", async () => {
+  const p = await session("a");
+  await p.call("peer_status", { text: "p's task" });
+  await p.call("claim_take", { key: "ticket:ENG-7" });
+  const pid = holderOf("a")!;
+  const x = await session("b");
+  expect(await refusal(x, "bind", { name: "a" })).toContain(`"a" is in use by the live session`);
+  expect(senderOf((await x.call("dm_send", { to: "a", body: "from b" })).message_id as number)).toBe("b");
+
+  await sigkill(pidOf("a"));
+  const peer = await session("fe");
+  await peer.call("dm_send", { to: "a", body: "for a" });
+  await x.call("bind", { name: "a" });
+  await until(() => contents(x).includes("for a"));
+  expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([{ holder: "a" }]);
+  const xid = holderOf("b")!;
+  const tail = events("a").filter((e) => e.event !== "refused").slice(-2);
+  expect(tail[0]).toMatchObject({ session_id: pid, event: "released", detail: expect.stringMatching(/^session_end: /) });
+  expect(tail[1]).toEqual({ session_id: xid, event: "bound", detail: null });
+  expect(statusOf("a")).toBeNull();
+  expect(senderOf((await x.call("dm_send", { to: "fe", body: "who" })).message_id as number)).toBe("b");
+}, 30_000);
+
+// #284 decision 8: a claim taken as the ID is listed under the ID.
+test("#284: claim_list shows a claim taken as the session's ID under that ID", async () => {
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("claim_take", { key: "ticket:ENG-9" });
+  const peer = await session("fe");
+  expect(((await peer.call("claim_list", {})) as { key: string; holder: string }[]).find((c) => c.key === "ticket:ENG-9")).toMatchObject({ holder: id });
+}, 30_000);
