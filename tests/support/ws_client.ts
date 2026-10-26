@@ -1,28 +1,48 @@
-// A raw protocol client over the server's WebSocket: hello, requests by
-// req_id, and an inbox of everything not awaited.
+// A raw protocol client over the server's WebSocket: a proto-2 hello (#284),
+// then a bind of its alias, requests by req_id, and an inbox of everything
+// not awaited.
 import { expect } from "bun:test";
-import type { ServerMessage } from "../../src/shared/protocol.ts";
+import { randomBytes } from "node:crypto";
+import { PROTO, type ServerMessage } from "../../src/shared/protocol.ts";
 
 export type Any = ServerMessage & Record<string, any>;
-// headers: extra upgrade headers (an X-Forwarded-For, to come from another address).
-export type WsClientOptions = { pong?: boolean; push?: boolean; hello?: Record<string, unknown>; headers?: Record<string, string> };
+// key: the session key (64 hex), minted when absent. hello: extra hello
+// fields; bind: extra bind fields. headers: extra upgrade headers (an
+// X-Forwarded-For, to come from another address). push: false with no hold
+// is a tools-only connection, whose identity is its writes_as.
+export type WsClientOptions = {
+  pong?: boolean; push?: boolean; hold?: boolean; key?: string;
+  hello?: Record<string, unknown>; bind?: Record<string, unknown>; headers?: Record<string, string>;
+};
+
+export const mintKey = (): string => randomBytes(32).toString("hex");
 
 export class WsClient {
   ws!: WebSocket;
   inbox: Any[] = [];
+  readonly key: string;
+  // The session's ID, from hello_ok.
+  id = "";
   private waiters: { pred: (m: Any) => boolean; resolve: (m: Any) => void; reject: (e: Error) => void }[] = [];
   private n = 0;
 
   constructor(
     private base: string,
     private token: string,
-    // null: a read-only hello (#182), with no identity and push: false.
+    // The alias to bind after the hello; null stays an unbound session.
     private identity: string | null,
     private opts: WsClientOptions = {},
-  ) {}
+  ) {
+    this.key = opts.key ?? mintKey();
+  }
 
-  // Resolves with hello_ok, or the error that refused the hello.
-  connect(): Promise<Any> {
+  private get toolsOnly(): boolean {
+    return this.opts.push === false && this.opts.hold !== true;
+  }
+
+  // Resolves with hello_ok (its bind_ok as .bind_ok when it bound), or the
+  // error that refused the hello or the bind.
+  async connect(): Promise<Any> {
     this.ws = new (WebSocket as any)(`${this.base.replace("http", "ws")}/ws`, {
       headers: { Authorization: `Bearer ${this.token}`, ...this.opts.headers },
     });
@@ -38,11 +58,26 @@ export class WsClient {
     this.ws.onerror = () => this.fail("socket error");
     this.ws.onopen = () =>
       this.ws.send(JSON.stringify({
-        type: "hello", req_id: "h",
-        ...(this.identity === null ? { read_only: true, push: false } : { identity: this.identity }),
-        ...(this.opts.push === false ? { push: false } : {}), ...this.opts.hello,
+        type: "hello", req_id: "h", proto: PROTO, session_key: this.key,
+        ...(this.opts.push === false ? { push: false } : {}),
+        ...(this.opts.hold ? { hold: true } : {}),
+        ...(this.toolsOnly && this.identity !== null ? { writes_as: this.identity } : {}),
+        ...this.opts.hello,
       }));
-    return this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
+    const ok = await this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
+    if (ok.type !== "hello_ok") return ok;
+    this.id = ok.id;
+    if (this.identity === null || this.toolsOnly || ok.bound === this.qualified(ok)) return ok;
+    const b = await this.bind(this.identity, this.opts.bind);
+    return b.type === "bind_ok" ? { ...ok, bind_ok: b } : b;
+  }
+
+  private qualified(ok: Any): string {
+    return this.identity!.includes("/") ? this.identity! : `${ok.user_email}/${this.identity}`;
+  }
+
+  bind(alias: string, extra: Record<string, unknown> = {}): Promise<Any> {
+    return this.request({ type: "bind", alias, ...extra });
   }
 
   next(pred: (m: Any) => boolean, ms = 1000): Promise<Any> {
@@ -66,7 +101,7 @@ export class WsClient {
   }
 
   private get label(): string {
-    return this.identity ?? "read-only";
+    return this.identity ?? (this.id || "unbound");
   }
 
   private fail(why: string): void {

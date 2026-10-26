@@ -10,7 +10,7 @@
 // core.
 import type { Database } from "bun:sqlite";
 
-import { writeCoreAudit } from "./audit.ts";
+import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
 import { logBinding } from "./bindings.ts";
@@ -41,13 +41,14 @@ const NOT_ENDED: EndedSession = { held: [], wake: [] };
  * End session `id`. Callers are inside a BEGIN IMMEDIATE transaction and
  * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
+ * `audit`: where the id.ended row goes (the server's access_log); audit_log when absent.
  * A session already ended is left alone.
  */
 export function endSession(
   db: Database,
   mail: MailPort,
   id: string,
-  opts: { why?: string | null; legacyNames?: string[]; now?: number } = {},
+  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
   const row = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null } | null;
@@ -103,7 +104,7 @@ export function endSession(
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(id);
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
-  writeCoreAudit(db, "id.ended", id, id, {
+  (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
     held,
     why: opts.why ?? null,
     bounced,

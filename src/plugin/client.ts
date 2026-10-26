@@ -1,54 +1,64 @@
-import type { ServerMessage, ClientMessage, ErrorMessage, HelloOk, Message } from "../shared/protocol.ts";
+import { PROTO, type ServerMessage, type ClientMessage, type ErrorMessage, type HelloOk, type Message } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
+import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { HTTP_TIMEOUT_MS, describeFetchError } from "../shared/http.ts";
 
 // Server tool calls are single DB transactions; one unanswered this long never will be.
 const REQUEST_TIMEOUT_MS = 30_000;
+// Once a session has had a hello_ok, its reconnects must land inside the
+// server's 30 s grace (#284 S4): the backoff stops at 8 s (12 s with jitter),
+// and the pre-open token check gives up after 5 s.
+const RESUME_BACKOFF_MAX_MS = 8_000;
+const RESUME_PROBE_MS = 5_000;
 
 // Both resolve once the item has been handed to the agent; it's acked after
 // that, so a failed handoff is resent on the next connection.
 export type PushCallback = (msg: Message) => Promise<void>;
 export type BoardPushCallback = (item: Pending) => Promise<void>;
-export type ReadyCallback = (data: HelloOk) => void;
+// Every hello_ok, a reconnect's too. `rekeyedFrom`: the key of the session
+// that ended during the outage, when this hello started a new one (#284 S4).
+export type ReadyCallback = (data: HelloOk, rekeyedFrom: string | null) => void;
 
-/** The server refused this client's hello: its code, and with it the holder (the closest names are in the message). */
-export class HelloRefused extends Error {
+/** The server refused a hello (`holder` unset) or a request: its code and what came with it. */
+export class ServerRefused extends Error {
   readonly code: ErrorMessage["code"];
   readonly holder?: string;
-  constructor(m: ErrorMessage) {
-    super(m.message);
+  readonly retryAfterMs?: number;
+  constructor(m: ErrorMessage, message = m.message) {
+    super(message);
     this.code = m.code;
     this.holder = m.holder;
+    this.retryAfterMs = m.retry_after_ms;
   }
 }
 
 export type ClientOptions = {
-  // With push false: hold the name all the same (probed, claims move), for a
-  // harness that can't show pushes (#182 audit 2).
+  // false: a hold or tools-only connection that never receives pushes.
+  push?: boolean;
+  // With push false: a session all the same, which binds and holds an alias,
+  // for a harness that can't show pushes (#182 audit 2).
   hold?: boolean;
-  // The name a bind leaves, whose claims move to this one: sent on the first
-  // hello only, as a reconnect leaves nothing.
-  from?: string;
-  // false: refuse a name that has never existed (identity_unknown).
-  create?: boolean;
-  // A read-only hello's suggested name, listed first among its candidates.
-  suggested?: string | null;
+  // With push false and no hold: a tools-only connection, which writes as
+  // this alias of the session that owns delivery (#284 S7).
+  writesAs?: string;
+  // The key came from BUS_SESSION_KEY (#284 S10): sent as keyed, and an
+  // ended session is fatal, since a keyed process never mints a replacement.
+  keyed?: boolean;
   // This session's harness can spawn subagents, so delegate requests may
   // land here (#184). Sent on every hello; the server records it on the
-  // handle's row and peer_list shows it.
+  // session's row and peer_list shows it.
   launcher?: boolean;
-  // The session ID of the process this one restarted from, whose name it
-  // takes back (#182 decision 14): sent on the first hello only.
-  restoredFrom?: string;
-  // The client stopped for good after it was ready: superseded, or its name
-  // refused on a reconnect. It never exits the process; the session decides.
+  onReady?: ReadyCallback;
+  // The client stopped for good after it was ready: superseded, or its
+  // session refused on a reconnect. It never exits the process; the session decides.
   onDead?: (reason: string) => void;
   // After a refused token: how often to look for a new one, and when to try
   // the old one again anyway. Shortened by tests.
   tokenPollMs?: number;
   signedOutRetryMs?: number;
-  // The token check's deadline. Shortened by tests.
+  // The token check's deadline before a hello_ok (after one, RESUME_PROBE_MS
+  // caps it). Shortened by tests.
   probeTimeoutMs?: number;
 };
 
@@ -86,26 +96,29 @@ export class GrayboardClient {
   private wasReady  = false; // a later hello is a reconnect, not a new session
   private helloId   = "";    // the req_id of this connection's hello
   private readyResolvers: Array<(err?: Error) => void> = [];
+  // Set from an ended session's resume refusal until the new key's hello_ok:
+  // the old key, which the session's re-bind presents as proof of descent.
+  private rekeyedFrom: string | null = null;
 
   constructor(
     private readonly serverUrl: string,
     // Read on each connect, so signing in again takes effect on the next reconnect.
     private readonly token: () => string,
-    // null: an unbound session's read-only connection, with no name.
-    private readonly identity: string | null,
-    // This process's session key (#182 audit 4): the server derives the
-    // session ID it keys binding events on from it, and a reconnect keeps its
-    // status only under the ID that last bound the name (#211).
-    private readonly sessionKey: string,
+    // This session's key (#284): the server derives the session's ID from
+    // it, and possession of it is what re-attaches a reconnect.
+    private key: string,
     private readonly onPush: PushCallback,
     private readonly onBoardPush: BoardPushCallback,
-    // false: a tools-only connection that never receives pushes.
-    private readonly push = true,
     // What to say when the server refuses the token: at startup (fatal), or
     // in tool results while a running session waits to reconnect.
     private readonly refusedMessage = (_running: boolean) => "the grayboard server refused this session's token; sign in again",
     private readonly opts: ClientOptions = {},
   ) {}
+
+  /** This session's ID: a new one after an outage past the grace (unkeyed only). */
+  get id(): string {
+    return idAddress(this.key);
+  }
 
   /** Resolves once hello_ok is received. Rejects if the client dies first. */
   ready(): Promise<HelloOk> {
@@ -148,7 +161,7 @@ export class GrayboardClient {
       // returning the moment one token is back keeps the bucket empty for
       // everyone, so the backoff keeps growing until a hello is accepted.
       const wait = Math.round(Math.max(retryWait(probe.retryAfterMs, this.backoffMs), this.backoffMs) * (1 + Math.random() / 2));
-      this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+      this.backoffMs = this.nextBackoff();
       this.limited = { what: probe.what, message: probe.message, byHello: false, retryMs: null, retryAt: Date.now() + wait };
       return this.reconnectIn(wait, `rate limited (${probe.message})`);
     }
@@ -168,16 +181,15 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
-      const { hold, from, create, suggested, restoredFrom } = this.opts;
+      const { push = true, hold, writesAs, keyed, launcher } = this.opts;
       this.send({
-        type: "hello", req_id: this.helloId,
-        ...(this.identity === null
-          ? { read_only: true, push: false, ...(suggested ? { suggested } : {}) }
-          : { identity: this.identity, ...(this.push ? {} : { push: false, ...(hold ? { hold } : {}) }), ...(create !== undefined ? { create } : {}) }),
-        ...(this.opts.launcher ? { launcher: true } : {}),
-        session_key: this.sessionKey,
+        type: "hello", req_id: this.helloId, proto: PROTO, session_key: this.key,
+        ...(keyed ? { keyed: true } : {}),
+        ...(push ? {} : hold ? { push: false, hold: true } : { push: false, writes_as: writesAs }),
+        ...(launcher ? { launcher: true } : {}),
         ...(where ? { where } : {}),
-        ...(this.wasReady ? { resume: true } : { ...(restoredFrom ? { restored_from: restoredFrom } : {}), ...(from ? { from } : {}) }),
+        // A new key's hello starts a session; it resumes nothing.
+        ...(this.wasReady && this.rekeyedFrom === null ? { resume: true } : {}),
       });
     };
 
@@ -234,6 +246,9 @@ export class GrayboardClient {
         this.backoffMs = 1000;
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
+        const rekeyedFrom = this.rekeyedFrom;
+        this.rekeyedFrom = null;
+        this.opts.onReady?.(msg, rekeyedFrom);
         break;
 
       case "push": {
@@ -279,21 +294,31 @@ export class GrayboardClient {
           break;
         }
         if (msg.code === "superseded") {
-          this.die(`${this.identity ? `"${this.identity}" was taken over: ` : ""}${msg.message}`);
+          this.die(`session ${this.id} was taken over: ${msg.message}`);
           break;
         }
-        // The server refused the hello itself (e.g. a reserved or invalid
-        // name): retrying gets the same answer, so give up with its reason (#74).
-        const helloRefused = !this.helloData && msg.req_id === this.helloId && msg.code === "bad_request";
-        if (msg.code === "identity_in_use" || msg.code === "identity_unknown" || helloRefused) {
-          // Another live session holds this identity, or can't have it. Don't retry.
+        // A resume refused because the session ended during the outage (its
+        // grace ran out): an unkeyed session carries on under a new key at
+        // once, and re-binds its alias with the old key as proof (#284 S4).
+        if (msg.code === "id_collision" && !this.helloData && msg.req_id === this.helloId && this.wasReady && !this.opts.keyed && this.rekeyedFrom === null) {
+          console.error(`[grayboard] session ${this.id} was refused on reconnect (${msg.message}); starting a new session`);
+          this.rekeyedFrom = this.key;
+          this.key = mintSessionKey();
+          this.backoffMs = 1000;
+          this.ws?.close();
+          break;
+        }
+        // The server refused the hello itself (an ended or colliding key, a
+        // writes_as it may not use): retrying gets the same answer, so give
+        // up with its reason (#74).
+        if (!this.helloData && msg.req_id === this.helloId && msg.code !== "internal") {
           if (this.readyResolvers.length) {
             this.dead = true;
             this.ws?.close();
-            const err = new HelloRefused(msg);
+            const err = new ServerRefused(msg);
             for (const r of this.readyResolvers.splice(0)) r(err);
           } else {
-            // Refused while reconnecting: e.g. another session owns it now.
+            // Refused while reconnecting: a keyed session that ended, say.
             this.die(msg.message);
           }
           break;
@@ -302,7 +327,7 @@ export class GrayboardClient {
           const p = this.pending.get(msg.req_id);
           if (p) {
             this.pending.delete(msg.req_id);
-            p.reject(new Error(`${msg.code}: ${msg.message}`));
+            p.reject(new ServerRefused(msg, `${msg.code}: ${msg.message}`));
           }
         }
         break;
@@ -324,13 +349,14 @@ export class GrayboardClient {
   // other (a proxy's, a load balancer's) is waited out by its Retry-After.
   private async checkToken(token: string): Promise<Probe> {
     const { probeTimeoutMs = HTTP_TIMEOUT_MS } = this.opts;
+    const timeoutMs = this.wasReady ? Math.min(probeTimeoutMs, RESUME_PROBE_MS) : probeTimeoutMs;
     let r: Response;
     let body: { code?: unknown; message?: unknown; retry_after_ms?: unknown } = {};
     try {
-      r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(probeTimeoutMs) });
+      r = await fetch(`${this.serverUrl}/api/whoami`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs) });
       if (r.status === 429) body = await r.json().catch(() => ({}));
     } catch (e) {
-      return { kind: "unanswered", why: describeFetchError(e, probeTimeoutMs) };
+      return { kind: "unanswered", why: describeFetchError(e, timeoutMs) };
     }
     if (r.status === 429) {
       if (body.code === "rate_limited") {
@@ -368,8 +394,13 @@ export class GrayboardClient {
 
   private scheduleReconnect(): void {
     const delay = this.backoffMs;
-    this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+    this.backoffMs = this.nextBackoff();
     this.reconnectIn(delay, "lost");
+  }
+
+  // Doubling, to 30 s before a first hello_ok and to 8 s after one.
+  private nextBackoff(): number {
+    return Math.min(this.backoffMs * 2, this.wasReady ? RESUME_BACKOFF_MAX_MS : 30_000);
   }
 
   private reconnectIn(delay: number, why: string): void {
@@ -385,7 +416,7 @@ export class GrayboardClient {
   }
 
   private who(): string {
-    return this.identity === null ? "an unbound session" : `"${this.identity}"`;
+    return `session ${this.id}`;
   }
 
   private send(msg: ClientMessage): void {
@@ -439,6 +470,18 @@ export class GrayboardClient {
       });
       ws.send(JSON.stringify(full));
     });
+  }
+
+  /**
+   * A clean exit (#284 S4): an unkeyed session ends at once, so it asks the
+   * server to end it, waiting at most `ms` for the answer; a keyed one only
+   * closes, leaving its orchestrator the grace to restart it. Then closes.
+   */
+  async end(ms: number): Promise<void> {
+    if (!this.opts.keyed && this.helloData) {
+      await Promise.race([this.request({ type: "end" }).catch((e) => console.error(`[grayboard] ending ${this.who()} failed: ${(e as Error).message}`)), Bun.sleep(ms)]);
+    }
+    this.close();
   }
 
   close(): void {

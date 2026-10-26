@@ -16,6 +16,16 @@ import type { Database } from "bun:sqlite";
 
 export type CoreAuditAction = "alias.created" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
 
+/**
+ * Where a core function shared by both modes writes its audit row: local
+ * mode's audit_log (writeCoreAudit), or the server's access_log through its
+ * Repo (#342), so each mode keeps one trail its retention and readers cover.
+ */
+export type AuditSink = (action: CoreAuditAction, actor: string, target: string | null, detail?: Record<string, unknown>) => void;
+
+/** The local sink: audit_log in `db`. */
+export const coreAuditSink = (db: Database): AuditSink => (action, actor, target, detail) => writeCoreAudit(db, action, actor, target, detail);
+
 export function writeCoreAudit(
   db: Database,
   action: CoreAuditAction,

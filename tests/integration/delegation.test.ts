@@ -213,6 +213,7 @@ test("server: a launcher that can't receive isn't advertised or instructed (revi
     const token = await srv.login("you@example.com");
     // A tools-only connection beside the owner: it never becomes the
     // launcher, whatever its env says.
+    await srv.session(token, "be");
     await srv.session(token, "be", { BUS_LAUNCHER: "1", BUS_PUSH: "off" });
     const sim = await srv.session(token, "sim");
     const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
@@ -341,9 +342,9 @@ test("server: a hold owner with the launcher flag isn't advertised or instructed
     expect(pushHello.type).toBe("hello_ok");
     expect((pushHello.notices ?? []).join("\n")).toContain("You're a launcher session");
 
-    const held = srv.client(token, "bo", { push: false, hello: { hold: true, launcher: true } });
+    const held = srv.client(token, "bo", { push: false, hold: true, hello: { launcher: true } });
     const heldHello = await held.connect();
-    expect(heldHello.type).toBe("hello_ok");
+    expect(heldHello).toMatchObject({ type: "hello_ok" });
     expect((heldHello.notices ?? []).join("\n")).not.toContain("You're a launcher session");
 
     const sim = await srv.session(token, "sim");

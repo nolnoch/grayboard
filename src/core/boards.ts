@@ -811,13 +811,12 @@ export type Peer = {
 };
 /**
  * Which handles are read-only viewers, kept out of the roster, rotations and
- * notified lists: a `grayboard tail` session (ids.viewer, #284 S9), and the
- * "~" handles no identity can have: a 1.x local tail's "~tail-<pid>", and a
- * server's "<email>/~<id>" (until PR 3). Read once per call.
+ * notified lists: a `grayboard tail` session (ids.viewer, #284 S9). Read
+ * once per call.
  */
 export function viewers(db: Database): (handle: string) => boolean {
   const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
-  return (h) => h.startsWith("~") || h.includes("/~") || ids.has(h);
+  return (h) => ids.has(h);
 }
 
 // A live session with no name yet (#182), addressed by its session ID

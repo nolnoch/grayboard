@@ -157,15 +157,11 @@ test("2: a Slack-bridge child on a held human name still exits", async () => {
   expect(r.err).toContain(`"alex" is held by the live session`);
 }, 20_000);
 
-test("4: a never-seen name needs create; the refusal lists the closest names, not viewers", async () => {
+test("4: a never-seen name needs create; the refusal lists the closest names", async () => {
   await stop((await session("fe")).c);
-  const db = new Database(join(dir, "bus.db"));
-  db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~fe', 'person', '~fe', 1, 1)`).run();
-  db.close();
   const s = await session();
   const err = await refusal(s, "bind", { name: "fee" });
   expect(err).toContain(`no name "fee" has ever been used; closest: fe.`);
-  expect(err).not.toContain("~fe");
   expect(events("fee")).toEqual([{ session_id: await sessionId(s), event: "refused", detail: expect.stringContaining("closest: fe") }]);
 }, 20_000);
 

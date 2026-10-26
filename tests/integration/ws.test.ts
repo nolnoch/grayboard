@@ -138,7 +138,8 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   const first = await s.next(boardPush);
   await closeAndSettle(s);
 
-  const s2 = client(alice, "sim");
+  // A reconnect is the same session: its key.
+  const s2 = client(alice, "sim", { key: s.key });
   await s2.connect();
   const again = await s2.next(boardPush);
   expect(again.item.post.id).toBe(first.item.post.id);
@@ -146,7 +147,7 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   expect((await s2.request({ type: "board_ack", refs })).type).toBe("ack_ok");
   await closeAndSettle(s2);
 
-  const s3 = client(alice, "sim");
+  const s3 = client(alice, "sim", { key: s.key });
   await s3.connect();
   await s3.none(boardPush);
 });
@@ -170,6 +171,8 @@ test("peer_list shows where the client says it runs; a resumed hello keeps the s
   await resumed.connect();
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
+  // A session that ends frees the alias; the next one starts its own status.
+  expect((await resumed.request({ type: "end" })).type).toBe("end_ok");
   await closeAndSettle(resumed);
   await client(alice, "be").connect();
   const fresh = await be();
@@ -195,7 +198,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   await a.call("board_post", { board: "eng", body: "standup in 5" });
   await c.none(boardPush);
   await closeAndSettle(c);
-  const c2 = client(carol, "sim");
+  const c2 = client(carol, "sim", { key: c.key });
   await c2.connect();
   const digest = await c2.next(boardPush);
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
@@ -409,12 +412,12 @@ test("claims are org-wide and atomic across users", async () => {
   expect((await b.call("claim_list")).result.map((c: any) => c.key)).toEqual(["ticket:ENG-1"]);
 });
 
-test("a live identity refuses a second connection", async () => {
+test("an alias a live session holds refuses another session's bind", async () => {
   const alice = await login("alice@example.com");
   const first = client(alice, "be");
   await first.connect();
   const second = client(alice, "be");
-  expect(await second.connect()).toMatchObject({ type: "error", code: "identity_in_use" });
+  expect(await second.connect()).toMatchObject({ type: "error", code: "alias_held", holder: `the session ${first.id}` });
   // The first connection still works.
   expect((await first.call("board_list")).type).toBe("call_ok");
 });
@@ -423,7 +426,7 @@ test("a connection that doesn't answer the probe is replaced", async () => {
   const alice = await login("alice@example.com");
   const stale = client(alice, "be", { pong: false });
   await stale.connect();
-  const fresh = client(alice, "be");
+  const fresh = client(alice, "be", { key: stale.key });
   expect((await fresh.connect()).type).toBe("hello_ok");
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
 });
@@ -432,15 +435,15 @@ test("a hello arriving while another probes the holder waits for it, so only one
   const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
   const dead = client(alice, "be", { pong: false });
   await dead.connect();
-  const n1 = client(alice, "be");
+  const n1 = client(alice, "be", { key: dead.key });
   const first = n1.connect(); // probes the dead holder (150 ms)
   await Bun.sleep(40);
   dead.close(); // the holder goes away mid-probe
   await Bun.sleep(40);
-  const n2 = client(alice, "be");
+  const n2 = client(alice, "be", { key: dead.key });
   const [r1, r2] = await Promise.all([first, n2.connect()]);
   expect(r1.type).toBe("hello_ok");
-  expect(r2).toMatchObject({ type: "error", code: "identity_in_use" });
+  expect(r2).toMatchObject({ type: "error", code: "id_collision" });
 
   const b = client(bob, "fe");
   await b.connect();
@@ -532,7 +535,7 @@ test("senders see what hasn't reached an offline peer", async () => {
     (await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.delivered);
   expect(await delivered()).toEqual([false, false]);
 
-  const b2 = client(bob, "fe");
+  const b2 = client(bob, "fe", { key: b.key });
   await b2.connect();
   const ids = [(await b2.next((m) => m.type === "push")).message.id, (await b2.next((m) => m.type === "push")).message.id];
   await b2.request({ type: "ack", message_ids: ids });
@@ -560,7 +563,7 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.body)).toEqual(["fresh"]);
 
   // Pushed but not acked: the cursor hasn't moved, but bob is live.
-  const b2 = client(bob, "fe");
+  const b2 = client(bob, "fe", { key: b.key });
   await b2.connect();
   expect((await b2.next((m) => m.type === "push")).message.body).toBe("fresh");
   await b2.none((m) => m.type === "push");
@@ -582,7 +585,7 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
   await closeAndSettle(a);
 
-  const notices: string[] = (await client(alice, "be").connect()).notices;
+  const notices: string[] = (await client(alice, "be", { key: a.key }).connect()).notices;
   expect(notices).toHaveLength(2);
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
@@ -683,7 +686,7 @@ test("a tools-only connection works beside the live owner without taking its pus
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
 const download = (token: string, identity: string, id: number) =>
-  fetch(`${srv.base}/api/attachments/${id}?identity=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
+  fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
 const audits = (action: string) =>
   (srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
@@ -851,7 +854,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
   expect((await upload(alice, "be", "d.txt", "d".repeat(20))).status).toBe(201);
 
   // A streamed body declares no length.
-  const streamed = await fetch(`${srv.base}/api/attachments?identity=be&filename=e.txt`, {
+  const streamed = await fetch(`${srv.base}/api/attachments?as=be&filename=e.txt`, {
     method: "POST",
     headers: { Authorization: `Bearer ${alice}` },
     body: new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }),

@@ -13,7 +13,7 @@ import { randomInt } from "node:crypto";
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
 import { boardNotification, dmNotification } from "../core/tools.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import type { BoardPush, CallOk, ClientMessage, HelloOk, PushMessage, SendOk, ServerMessage, ThreadOk } from "../shared/protocol.ts";
+import { PROTO, type BoardPush, type CallOk, type ClientMessage, type HelloOk, type PushMessage, type SendOk, type ServerMessage, type ThreadOk } from "../shared/protocol.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackWeb } from "../bridge/web.ts";
@@ -81,7 +81,7 @@ class HumanConn implements Conn {
     authed: AuthedUser,
     private readonly onItem: (m: PushMessage | BoardPush) => void,
   ) {
-    this.data = { authed, identityName: "", identityFull: "", ready: false, human: true };
+    this.data = { authed, primary: "", addresses: [], ready: false, human: true };
   }
 
   send(raw: string): void {
@@ -395,7 +395,7 @@ export class SlackBridge implements SlackLinker {
     });
     this.linked.set(link.user_id, { link, conn, relay });
     try {
-      await conn.request<HelloOk>({ type: "hello", identity: HUMAN_NAME });
+      await conn.request<HelloOk>({ type: "hello", proto: PROTO });
     } catch (e) {
       this.log(`${link.email}: couldn't bring the human online: ${(e as Error).message}`);
       this.detach(link.user_id);

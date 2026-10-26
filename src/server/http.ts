@@ -11,6 +11,7 @@ import { userAgent, writeAudit } from "./audit.ts";
 import { canAdmin } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
@@ -150,17 +151,34 @@ function claimList(url: URL, db: CoreDb): Response {
   return json(listClaims(db, prefix).map(({ board: _b, ...c }) => c));
 }
 
-// The caller's identity `name` as a full handle, or the refusal: the human
-// identity (`humanReason` says why), or one no session has created, so a
-// wrong name can't act as a fresh identity.
-function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: Repo, humanReason: string): string | Response {
-  if (!name) return badRequest("identity required");
-  name = name.toLowerCase();
-  if (name === HUMAN_NAME) return forbidden(humanReason);
-  if (!repo.aliases.find(`${authed.user_email}/${name}`)) {
-    return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
+// An address the caller may act as (#284 S11), in full, or the refusal: a
+// bare name means the caller's own person scope; an alias must exist, in
+// the caller's scope or a team's it belongs to, and never be a human
+// (`humanReason` says why); a session ID must be the caller's, live and no
+// viewer, so nothing acts as an ended session.
+function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: Repo, db: CoreDb, humanReason: string): string | Response {
+  if (!input) return badRequest("as required: the address to act as");
+  const p = addressParts(input);
+  if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
+  if (p.kind === "id") {
+    const row = db.prepare(`SELECT principal, ended_at, viewer FROM ids WHERE id = ?`).get(p.address) as
+      | { principal: string | null; ended_at: number | null; viewer: number }
+      | null;
+    if (!row || row.viewer || row.principal !== authed.user_email) return forbidden(`${p.address} isn't a session of yours`);
+    if (row.ended_at !== null) return forbidden(`${p.address} ended at ${new Date(row.ended_at).toISOString()}`);
+    return p.address;
   }
-  return `${authed.user_email}/${name}`;
+  const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
+  if (p.name === HUMAN_NAME) return forbidden(humanReason);
+  const owner = repo.resolver.principalOf(address);
+  const mine = owner?.kind === "user" ? owner.name === authed.user_email
+    : owner?.kind === "team" ? (() => { const t = repo.teams.findByName(owner.name); return !!t && repo.teams.isMember(t.id, authed.user_id); })()
+    : false;
+  if (!mine) return forbidden(`you can't act as "${address}": it's in neither your scope nor a team's you belong to`);
+  if (!repo.aliases.find(address)) {
+    return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
+  }
+  return address;
 }
 
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
@@ -169,7 +187,7 @@ const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void): Promise<Response> {
   const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
-  const handle = ownIdentity(body.identity, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  const handle = ownAddress(body.identity, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
   try {
     const outcome = callBoardTool(db, handle, body.tool, body.args ?? {});
@@ -214,19 +232,19 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-// The caller's identity named by ?identity=. The Slack bridge's human
-// identity stores its files in-process, not here.
-function queryIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Response {
-  return ownIdentity(url.searchParams.get("identity"), authed, repo, HUMAN_RESERVED);
+// The address named by ?as=. The Slack bridge's human stores its files
+// in-process, not here.
+function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string | Response {
+  return ownAddress(url.searchParams.get("as"), authed, repo, db, HUMAN_RESERVED);
 }
 
-// POST /api/attachments?identity=&filename=, the file's bytes as the body.
+// POST /api/attachments?as=&filename=, the file's bytes as the body.
 // The session's MCP process has already checked the path it came from; this
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
 async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate): Promise<Response> {
-  const handle = queryIdentity(url, authed, repo);
+  const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
@@ -260,10 +278,10 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
   }
 }
 
-// GET /api/attachments/<id>?identity=: the file, for an identity that can
+// GET /api/attachments/<id>?as=: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const handle = queryIdentity(url, authed, repo);
+  const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
   const row = readableAttachment(repo, db, handle, Number(idStr));
   if (!row) {
@@ -292,10 +310,10 @@ async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, r
   });
 }
 
-// DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
+// DELETE /api/attachments/<id>?as=: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
-  const handle = queryIdentity(url, authed, repo);
+  const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);

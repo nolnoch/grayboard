@@ -206,10 +206,11 @@ test("an unbound live ID subscribed to a queue is a lane by its ID, then by the 
 });
 
 test("a read-only viewer is never picked by the rotation", () => {
-  db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail', 'person', '~tail', 0, 0)`).run();
-  subscribe(db, "~tail", "work", "push");
+  const tail = "id:00000000000a1";
+  registerId(db, { id: tail, principal: null, launcher: false, viewer: true });
+  subscribe(db, tail, "work", "push");
   const r = post(db, "be", "work", "work item");
-  expect(r.wake).not.toContain("~tail");
+  expect(r.wake).not.toContain(tail);
 });
 
 test("claim_take refuses the reserved queue: keyspace", () => {

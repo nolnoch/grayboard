@@ -24,6 +24,17 @@ export function mintSessionKey(): string {
 /** A session key's shape: 64 lowercase hex characters. */
 export const SESSION_KEY = /^[0-9a-f]{64}$/;
 
+/**
+ * BUS_SESSION_KEY: an orchestrator minted this session's key, so it knows
+ * the ID before the process exists (#284 decision 2). Undefined when unset;
+ * throws on a malformed one. Both modes read it here, once.
+ */
+export function envSessionKey(env: Record<string, string | undefined> = process.env): string | undefined {
+  const key = env.BUS_SESSION_KEY;
+  if (key !== undefined && !SESSION_KEY.test(key)) throw new Error("BUS_SESSION_KEY must be 64 lowercase hex characters");
+  return key;
+}
+
 /** The session ID a key stands for: the first 64 bits of its SHA-256, as an `id:` address. */
 export function idAddress(key: string): string {
   return `id:${crockford13(createHash("sha256").update(key).digest("hex").slice(0, 16))}`;
@@ -60,11 +71,6 @@ export function dropHold(db: Database, address: string, id: string): void {
 /** The session holding `address` now, or null. */
 export function holderOf(db: Database, address: string): string | null {
   return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
-}
-
-/** At server start: no connection outlives the server, so no hold is live. */
-export function clearHolds(db: Database): void {
-  db.prepare(`DELETE FROM alias_holds`).run();
 }
 
 /** One binding_events row, or one more repeat on a refusal's row. */
@@ -133,19 +139,11 @@ export function lastWasRelease(db: Database, name: string): boolean {
   return row?.event === "released";
 }
 
-export const UNBOUND_ERROR =
-  "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
-
-/** The reads that need no name: what a server lets a read-only connection call. */
-export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
-/** What an unbound session may call: those reads, and bind (which never reaches a server as a call). */
-export const UNBOUND_TOOLS = new Set(["bind", ...UNBOUND_READS]);
-
 export const BIND_TOOL = {
   name: "bind",
   _meta: { "anthropic/alwaysLoad": true },
   description:
-    "bind(name, create?): take a bus name for this session once you know its task, or switch to another. Your claims move with you; DMs queued to the old name stay for its next holder. A name that has never existed needs create: true.",
+    "bind(name, create?): take a bus name for this session once you know its task, or switch to another. Claims stay with the name they were taken under; DMs queued to the old name stay for its next holder. A name that has never existed needs create: true.",
   inputSchema: {
     type: "object",
     properties: {
@@ -192,21 +190,11 @@ function describe(c: Candidate): string {
 }
 
 /**
- * The unbound session's instructions: one sentence, `notes` on why it has no
- * name (heldNote, restoreNote, launcherNote), and the candidates.
- */
-export function unboundInstruction(candidates: Candidate[], notes: string[] = []): string {
-  const why = notes.map((n) => ` ${n}`).join("");
-  const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
-  return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
-}
-
-/**
- * A local session with no name (#284 S13): it acts as its ID. One sentence
+ * A session with no name (#284 S13): it acts as its ID. One sentence
  * beside its bound instructions, with `notes` on why it has no name and the
  * candidates.
  */
-export function localUnboundInstruction(id: string, candidates: Candidate[], notes: string[] = []): string {
+export function unboundInstruction(id: string, candidates: Candidate[], notes: string[] = []): string {
   const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
   return `This session has no bus name yet, so it acts as its ID: peers reach it at ${id}, and it posts, sends and claims as ${id}.${why} Bind a name with bind(name) once you know your task; what the ID has stays with this session.${list}`;
@@ -254,13 +242,21 @@ export function boundInstructions(name: string, general: boolean, modeGeneral: (
 
 type TextResult = { content: { type: "text"; text: string }[]; isError?: true };
 
+/** bind's refusal in a tools-only process. */
+export const TOOLS_ONLY_BIND = "this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery";
+
+/** bind's note on the claims that stay with the name it left (#284 S6). */
+export function leftNote(previous: string, left: string[]): string[] {
+  return left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
+}
+
 /**
  * bind's checks before either mode acquires anything: the name to bind, or
  * the call's result (a refusal, or "already bound").
  */
 export function bindTarget(a: Record<string, unknown>, bound: string | null, push: boolean): { name: string } | { result: TextResult } {
   const fail = (why: string): { result: TextResult } => ({ result: { content: [{ type: "text", text: `error: ${why}` }], isError: true } });
-  if (!push) return fail("this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery");
+  if (!push) return fail(TOOLS_ONLY_BIND);
   const n = normalizeIdentityName(String(a.name));
   if (!n.ok) return fail(n.error);
   if (n.name === bound) return { result: { content: [{ type: "text", text: `already bound to "${n.name}"` }] } };
@@ -288,24 +284,15 @@ export function unboundPeer(sessionId: string, where: string | null, self: boole
  * section with it (pi, opencode), so they never parse the text.
  * `generalKnown`: an unbound session already had the general part (local).
  */
-export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = [], generalKnown = false) {
+export function bindOk(name: string, previous: string | null, instructions: (general: boolean) => string[], notes: string[] = [], generalKnown = false) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
-    ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
     ...notes,
     ...instructions(previous === null && !generalKnown),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
-}
-
-/**
- * bind's warning against a server from before #182 (its hello_ok has no
- * `moved`): it creates any name it's given and moves no claims.
- */
-export function oldServerBindNote(previous: string | null): string {
-  return `This server predates name binding: it created the name if it was new (check the spelling), ${previous ? `left your claims on "${previous}", ` : ""}and recorded nothing; ask your user to update it.`;
 }
 
 /** The notice for a bind that completed but whose result the agent never saw. */

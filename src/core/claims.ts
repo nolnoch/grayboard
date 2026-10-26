@@ -40,7 +40,7 @@ function validKey(key: string): string {
   return k;
 }
 
-type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire" | "moved";
+type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 
 // One claim_events row; callers are inside the claim's transaction.
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
@@ -182,17 +182,6 @@ export function release(
     const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
     return { wake: announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session) };
   }).immediate();
-}
-
-// A session that rebinds takes its claims to the new name (#182). Server mode
-// only: a local session keeps its claims on the address they were taken
-// under (#284 S6), and PR 3 brings the server to the same rule. Runs inside
-// the caller's transaction (the bind's), so the claims move with the name.
-// Each move is a "moved" event under the new holder, held_by naming the old one.
-export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {
-  const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
-  for (const c of moved) logEvent(db, "moved", to, c, now, from);
-  return moved;
 }
 
 // A queue post's holder replied in its thread: the work is handled. Releases

@@ -152,7 +152,7 @@ test("a run of refusals writes one row and one log line at its start and one at 
   expect(srv.app.authGate.size).toBe(0);
 });
 
-const HELLO_OK = { type: "hello_ok", identity_full: `${A}/fe`, user_email: A, teams: [] };
+const HELLO_OK = { type: "hello_ok", id: "id:aaaaaaaaaaaaa", user_email: A, teams: [] };
 
 // A stand-in server that accepts only the token `good()` names: anything
 // else gets `refuse()` on the upgrade and on /api/whoami. Records when each
@@ -189,7 +189,7 @@ test("after a confirmed 401 a running client stops retrying, and reconnects at o
   let valid = "t1";
   let token = "t1";
   const s = stub(() => valid, unauthenticated);
-  const c = new GrayboardClient(s.url, () => token, "fe", mintSessionKey(), async () => {}, async () => {}, true, undefined, { tokenPollMs: 50, signedOutRetryMs: 3000 });
+  const c = new GrayboardClient(s.url, () => token, mintSessionKey(), async () => {}, async () => {}, undefined, { tokenPollMs: 50, signedOutRetryMs: 3000 });
   cleanup.push(() => c.close());
   c.connect();
   await c.ready();
@@ -220,7 +220,7 @@ test("on a limited address the client waits at least its own backoff, keeps doub
   let open = false;
   // The server asks for only 100ms each time.
   const s = stub(() => (open ? "t" : "never"), limited(100));
-  const c = new GrayboardClient(s.url, () => "t", "fe", mintSessionKey(), async () => {}, async () => {});
+  const c = new GrayboardClient(s.url, () => "t", mintSessionKey(), async () => {}, async () => {});
   cleanup.push(() => c.close());
   c.connect();
   await until(() => c.rateLimited(), 2000);
@@ -239,7 +239,7 @@ test("on a limited address the client waits at least its own backoff, keeps doub
 test("a 429 without grayboard's code is waited out by its Retry-After, and named as such", async () => {
   let open = false;
   const s = stub(() => (open ? "t" : "never"), () => new Response("busy", { status: 429, headers: { "Retry-After": "2" } }));
-  const c = new GrayboardClient(s.url, () => "t", "fe", mintSessionKey(), async () => {}, async () => {});
+  const c = new GrayboardClient(s.url, () => "t", mintSessionKey(), async () => {}, async () => {});
   cleanup.push(() => c.close());
   c.connect();
   await until(() => c.rateLimited(), 2000);
@@ -273,7 +273,7 @@ test("a token check that never answers is abandoned at its deadline and retried"
     },
   });
   cleanup.push(() => server.stop(true));
-  const c = new GrayboardClient(`http://localhost:${server.port}`, () => "t", "fe", mintSessionKey(), async () => {}, async () => {}, true, undefined, { probeTimeoutMs: 200 });
+  const c = new GrayboardClient(`http://localhost:${server.port}`, () => "t", mintSessionKey(), async () => {}, async () => {}, undefined, { probeTimeoutMs: 200 });
   cleanup.push(() => c.close());
   c.connect();
   await c.ready();
@@ -293,7 +293,7 @@ test("at startup a limited address is waited out when the retry fits the window,
   expect((await fetch(`${fits.base}/api/whoami`, { headers: { Authorization: "Bearer bad" } })).status).toBe(401);
   expect((await fetch(`${fits.base}/api/whoami`)).status).toBe(429);
   const s = await fits.session(alice, "fe", { BUS_TEST_HELLO_MS: "300", BUS_TEST_HELLO_LIMITED_MS: "6000" });
-  expect(s.stderr()).toContain(`connection as "fe" rate limited (too many authentication failures from this address`);
+  expect(s.stderr()).toMatch(/connection as session id:\w+ rate limited \(too many authentication failures from this address/);
   expect(s.c.getInstructions()).toContain(`identity "fe"`);
 
   const stuck = new TestServer({ authFailLimit: { burst: 2, perSec: 0.1 } });

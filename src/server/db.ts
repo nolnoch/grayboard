@@ -108,6 +108,8 @@ export interface Repo {
     insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[], senderId?: string | null): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
+    // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
+    bouncesFrom(id: string): MessageRow[];
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
     history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
@@ -586,6 +588,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
+      },
+      bouncesFrom(id) {
+        return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);
       },
       history(addresses, peer, limit = 20, beforeId) {
         const set = JSON.stringify(addresses);

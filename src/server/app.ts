@@ -1,6 +1,6 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
-import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
+import { SWEEP_MS, createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { UploadGate } from "./uploads.ts";
@@ -20,7 +20,7 @@ export type StartOptions = WsOptions & {
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
-  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, sweepHellos } = createWsHandlers(repo, db, {
+  const { handlers, startPing, revalidate, disconnectUser, stopExpiry, wake, sweepHellos, sweepSessions } = createWsHandlers(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, ...opts, helloLimit: config.helloLimit,
   });
   const authGate = new AuthGate(repo, {
@@ -80,8 +80,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         const upgraded = server.upgrade(req, {
           data: {
             authed,
-            identityName: "",
-            identityFull: "",
+            primary: "",
+            addresses: [],
             ready: false,
           },
         });
@@ -114,7 +114,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopRetention: (() => void) | undefined;
   let stopped = false;
   if (opts.background !== false) {
-    timers.push(startPing(), setInterval(sweepLimits, 30_000));
+    timers.push(startPing(), setInterval(sweepLimits, 30_000), setInterval(() => sweepSessions(), SWEEP_MS));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined);
   }
 
@@ -128,6 +128,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // The heartbeat's auth re-check and limiter sweep, for tests that run without it.
     revalidate,
     sweepLimits,
+    // Ends sessions past their grace (S4), for tests that run without the interval.
+    sweepSessions,
     authGate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),

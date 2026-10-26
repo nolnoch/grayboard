@@ -133,8 +133,9 @@ export function initCoreSchema(db: Database): void {
 
     -- Claim history, since release and expiry delete the claims row. Append-
     -- only, written in the claim's own transaction; pruned with posts.
-    -- event: take, renew, refused (held_by has it), release, expire, moved
-    -- (a rebind took it to a new name; held_by has the old one).
+    -- event: take, renew, refused (held_by has it), release, expire; rows
+    -- from before 2.0 may also say moved (a rebind took it to a new name;
+    -- held_by has the old one).
     CREATE TABLE IF NOT EXISTS claim_events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       key         TEXT    NOT NULL,

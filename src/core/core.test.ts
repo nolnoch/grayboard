@@ -585,19 +585,21 @@ describe("who", () => {
     expect(() => who(db, "be", { board: "nope" }, online)).toThrow(/no such board/);
   });
 
-  test("tail viewers (~ handles) aren't peers", () => {
-    subscribe(db, "~tail-1", "e2e", "push");
-    db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail-1', 'person', '~tail-1', 0, 0)`).run();
+  const TAIL = "id:00000000000a1";
+  test("tail viewers aren't peers", () => {
+    registerId(db, { id: TAIL, principal: null, launcher: false, viewer: true });
+    subscribe(db, TAIL, "e2e", "push");
     const any = () => true;
     expect(who(db, "be", { board: "e2e" }, any).peers.map((p) => p.handle)).toEqual(["be"]);
     expect(who(db, "be", {}, any).peers.map((p) => p.handle)).toEqual(["be", "fe", "sim"]);
   });
 
   test("a post wakes tail viewers but doesn't report them as notified", () => {
-    subscribe(db, "~tail-1", "e2e", "push");
+    registerId(db, { id: TAIL, principal: null, launcher: false, viewer: true });
+    subscribe(db, TAIL, "e2e", "push");
     const out = callBoardTool(db, "fe", "board_post", { board: "e2e", body: "hi" });
-    expect(out.wake).toContain("~tail-1");
-    expect((out.result as { notified: string[] }).notified).not.toContain("~tail-1");
+    expect(out.wake).toContain(TAIL);
+    expect((out.result as { notified: string[] }).notified).not.toContain(TAIL);
   });
 
   test("the tool needs the mode's liveness check", () => {

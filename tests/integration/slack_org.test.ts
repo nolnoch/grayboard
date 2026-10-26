@@ -163,9 +163,9 @@ test("a post Slack refuses is retried and lands once", async () => {
   expect(slack.posts().filter((p) => p.markdown_text === "**be** flaky")).toHaveLength(2);
 }, 30_000);
 
-test("only the bridge may hello as human", async () => {
+test("only the bridge may hold human: no session binds it", async () => {
   const alice = await login("alice@example.com");
-  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "bad_request" });
+  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "forbidden" });
   // And not over HTTP either.
   expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
 }, 30_000);

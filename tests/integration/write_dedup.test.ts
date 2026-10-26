@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import type { Conn, WsData } from "../../src/server/ws.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
+import { PROTO } from "../../src/shared/protocol.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { localEnv } from "../support/env.ts";
 import { runCli } from "../support/cli.ts";
@@ -226,7 +227,8 @@ describe("dedup and state answers (in process)", () => {
     const sibling = await session("be", { push: false });
     expect((await sibling.request({ type: "send", recipient: "fe", body: "hello" })).replayed).toBeUndefined();
     // The same session on a new connection (a reconnect) still collides.
-    const reconnect = await session("be", { push: false, session_key: key });
+    be.close();
+    const reconnect = await session("be", { session_key: key });
     expect((await reconnect.request({ type: "send", recipient: "fe", body: "hello" })).replayed.ref.id).toBe(first.message_id);
     expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hello'")).toBe(2);
   });
@@ -295,13 +297,13 @@ describe("dedup and state answers (in process)", () => {
     const user = srv.app.repo.users.findByEmail("you@example.com")!;
     const out: Any[] = [];
     const conn: Conn = {
-      data: { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, identityId: 0, identityName: "", identityFull: "", ready: false, human: true } as WsData,
+      data: { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, primary: "", addresses: [], ready: false, human: true } as WsData,
       readyState: 1,
       send: (raw) => void out.push(JSON.parse(raw)),
       close: () => {},
     };
     const frame = (m: Record<string, unknown>) => srv.app.handlers.message(conn as never, JSON.stringify(m));
-    frame({ type: "hello", req_id: "h", identity: "human", push: false });
+    frame({ type: "hello", req_id: "h", proto: PROTO });
     await until(() => out.find((m) => m.req_id === "h"));
     frame({ type: "send", req_id: "a", recipient: "you@example.com/be", body: "yes" });
     frame({ type: "send", req_id: "b", recipient: "you@example.com/be", body: "yes" });

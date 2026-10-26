@@ -10,7 +10,7 @@ import {
 import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { SESSION_KEY, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, localUnboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { bindMissed, envSessionKey, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, leftNote, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -86,11 +86,14 @@ const PUSH = process.env.BUS_PUSH !== "off";
 // the ID before the process exists (#284 decision 2). The session is then an
 // attachment to its harness: it outlives this process, and a restart under
 // the same harness carries on as it (decision 3). Read once, here.
-const KEY = process.env.BUS_SESSION_KEY;
-if (KEY !== undefined && !SESSION_KEY.test(KEY)) {
-  console.error("[grayboard] BUS_SESSION_KEY must be 64 lowercase hex characters");
-  process.exit(1);
-}
+const KEY = (() => {
+  try {
+    return envSessionKey();
+  } catch (e) {
+    console.error(`[grayboard] ${(e as Error).message}`);
+    process.exit(1);
+  }
+})();
 const KEYED = KEY !== undefined;
 if (!KEYED && process.env.BUS_HARNESS_PID !== undefined) {
   console.error("[grayboard] BUS_HARNESS_PID names a keyed session's harness; set BUS_SESSION_KEY with it");
@@ -310,7 +313,7 @@ const mcp = new Server(
       ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
       ...(bound
         ? localBoundInstructions(bound, true)
-        : localBoundInstructions(SESSION_ID, true, [localUnboundInstruction(SESSION_ID, await candidateNames(db, SUGGESTED), unboundNotes)])),
+        : localBoundInstructions(SESSION_ID, true, [unboundInstruction(SESSION_ID, await candidateNames(db, SUGGESTED), unboundNotes)])),
     ].join(" "),
   },
 );
@@ -768,8 +771,8 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     // Claims stay with the name they were taken under (#284 S6): say which
     // ones this session no longer holds.
     const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
-    const notes = left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
-    const ok = bindOk(n.name, previous, [], (general) => localBoundInstructions(n.name, general), notes, true);
+    const notes = previous ? leftNote(previous, left) : [];
+    const ok = bindOk(n.name, previous, (general) => localBoundInstructions(n.name, general), notes, true);
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
