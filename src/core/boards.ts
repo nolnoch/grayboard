@@ -417,13 +417,16 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
-/**
- * The boards `handles` can see (#284 S14): each row acts as the first of
- * `handles` (primary first) that can see its board, so its mode and unread
- * count are that address's subscription's, as board_read and board_subscribe
- * without `as` would act.
- */
-export function listBoards(db: Database, handles: string[]): BoardSummary[] {
+// What a board call without `as` acts for (#284 S14, #366): "read"
+// (board_read, board_list's rows) and "subscribe" (board_subscribe) prefer an
+// address subscribed to the board, so a held alias's own subscription can be
+// read and changed; "read" puts one with unread posts first, so repeated
+// reads drain each subscribed address in turn. "post" (board_post) takes the
+// first that can see the board, as every use does when none is subscribed.
+export type BoardUse = "read" | "subscribe" | "post";
+
+// Each of `handles`' view of the boards it can see (of `board` alone, when given).
+function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
   const q = db.prepare(
     `SELECT b.*, s.mode AS mode,
             (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
@@ -432,14 +435,34 @@ export function listBoards(db: Database, handles: string[]): BoardSummary[] {
                 WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
        FROM boards b
        LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
+      WHERE ? IS NULL OR b.name = ?
       ORDER BY b.name`,
   );
   const a = access(db);
-  const rows = new Map<string, BoardSummary>();
-  for (const h of handles) {
-    for (const b of q.all(h, h, h) as BoardSummary[]) if (!rows.has(b.name) && a.canSee(h, b)) rows.set(b.name, b);
-  }
-  return [...rows.values()].sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+  return handles.flatMap((h) => (q.all(h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
+}
+
+// The view a use acts as, from one board's views in address order.
+function pickView<T extends { row: BoardSummary }>(views: T[], use: BoardUse): T | undefined {
+  const subscribed = views.filter((v) => v.row.mode !== null);
+  const preferred = use === "read" ? (subscribed.find((v) => v.row.unread > 0) ?? subscribed[0]) : use === "subscribe" ? subscribed[0] : undefined;
+  return preferred ?? views[0];
+}
+
+/** The first of `handles` (primary first) that `use` of `board` acts as; undefined when none can see it. */
+export function boardAddress(db: Database, board: string, handles: string[], use: BoardUse): string | undefined {
+  return pickView(boardViews(db, handles, board), use)?.handle;
+}
+
+/**
+ * The boards `handles` can see: each row is the view of the address
+ * board_read without `as` would act as (boardAddress's "read"), so its mode
+ * and unread count are that address's subscription's.
+ */
+export function listBoards(db: Database, handles: string[]): BoardSummary[] {
+  const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
+  for (const v of boardViews(db, handles, null)) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
+  return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.

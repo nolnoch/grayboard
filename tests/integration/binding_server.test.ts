@@ -1136,3 +1136,55 @@ test("#284 S1: with the server's clock frozen, the first alias bound stays the p
   expect((await s.call("whoami", {})).aliases).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
   expect(s.c.getInstructions()).toStartWith(`You are identity "zed"`);
 }, 40_000);
+
+// #366: a held alias's own subscription is the one a read, a subscribe and a
+// board_list row act on, even when the primary also sees the board; with two
+// subscribed, reads drain the one with unread first, then the other.
+test("#366: a board call without as acts as a subscribed address first, one with unread first for a read", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  const prev = srv.client(alice, "eng/x");
+  await prev.connect();
+  expect(await prev.call("board_subscribe", { board: "eng", mode: "digest" })).toMatchObject({ type: "call_ok" });
+  expect((await prev.request({ type: "end" })).type).toBe("end_ok");
+  const s = srv.client(alice, "a");
+  await s.connect();
+  // alice made the team, so a is subscribed to its board: unsubscribe it, as in the issue.
+  expect(await s.call("board_subscribe", { board: "eng", mode: "off" })).toMatchObject({ type: "call_ok" });
+  expect(await s.bind("eng/x")).toMatchObject({ type: "bind_ok", held: [`${A}/a`, "eng/x"] });
+  const bo = srv.client(bob, "bo");
+  await bo.connect();
+  const cursor = () => Object.fromEntries(rows<{ handle: string; cursor: number }>(`SELECT handle, cursor FROM subscriptions WHERE board = 'eng' AND handle IN (?, 'eng/x')`, `${A}/a`).map((r) => [r.handle, r.cursor]));
+  const postId = async (body: string) => (await bo.call("board_post", { board: "eng", body })).result.post_id as number;
+  const bodies = async () => ((await s.call("board_read", { board: "eng" })).result.posts as { body: string }[]).map((p) => p.body);
+  const row = async () => ((await s.call("board_list", {})).result as { name: string; mode: string | null; unread: number }[]).find((b) => b.name === "eng");
+
+  const p1 = await postId("p1");
+  expect(await row()).toMatchObject({ mode: "digest", unread: 1 });
+  expect(await bodies()).toEqual(["p1"]);
+  expect(cursor()).toEqual({ "eng/x": p1 });
+  expect(await row()).toMatchObject({ mode: "digest", unread: 0 });
+
+  // Both subscribed (a's taken while eng/x was unbound): a read drains the one with unread first.
+  expect(await s.request({ type: "unbind", alias: "eng/x" })).toMatchObject({ type: "unbind_ok" });
+  expect(await s.call("board_subscribe", { board: "eng", mode: "digest" })).toMatchObject({ type: "call_ok" });
+  expect(await s.bind("eng/x")).toMatchObject({ type: "bind_ok", held: [`${A}/a`, "eng/x"] });
+  const p2 = await postId("p2");
+  expect(await bodies()).toEqual(["p2"]);
+  expect(cursor()).toEqual({ [`${A}/a`]: p2, "eng/x": p1 });
+  expect(await row()).toMatchObject({ unread: 1 });
+  expect(await bodies()).toEqual(["p2"]);
+  expect(cursor()).toEqual({ [`${A}/a`]: p2, "eng/x": p2 });
+  expect(await row()).toMatchObject({ unread: 0 });
+
+  // A subscribe acts on the first subscribed; off removes one per call.
+  expect(await s.call("board_subscribe", { board: "eng", mode: "push" })).toMatchObject({ type: "call_ok" });
+  const modes = () => rows(`SELECT handle, mode FROM subscriptions WHERE board = 'eng' AND handle IN (?, 'eng/x') ORDER BY handle`, `${A}/a`);
+  expect(modes()).toEqual([{ handle: `${A}/a`, mode: "push" }, { handle: "eng/x", mode: "digest" }]);
+  expect(await s.call("board_subscribe", { board: "eng", mode: "off" })).toMatchObject({ type: "call_ok" });
+  expect(await s.call("board_subscribe", { board: "eng", mode: "off" })).toMatchObject({ type: "call_ok" });
+  expect(modes()).toEqual([]);
+  // None subscribed: the first that can see the board, the primary.
+  expect(await s.call("board_subscribe", { board: "eng", mode: "digest" })).toMatchObject({ type: "call_ok" });
+  expect(modes()).toEqual([{ handle: `${A}/a`, mode: "digest" }]);
+}, 30_000);

@@ -386,9 +386,12 @@ test("#361: a post pending for the ID and the alias is pushed once and delivered
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   const s = await session();
   const id = await sessionId(s);
-  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  // A subscribe acts on an existing subscription first (#366): subscribe fe, then the ID while fe is unbound.
   await s.call("bind", { name: "fe", create: true });
   await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("unbind", { name: "fe" });
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("bind", { name: "fe" });
   expect(rows(`SELECT handle FROM subscriptions WHERE board = 'e2e' AND handle != 'be' ORDER BY handle`)).toEqual([{ handle: "fe" }, { handle: id }]);
 
   await be.call("board_post", { board: "e2e", body: "once" });
@@ -858,7 +861,7 @@ test("#361: a post pending for two held aliases is pushed once and delivered for
   const s = await session("a");
   await s.call("board_subscribe", { board: "e2e", mode: "push" });
   await s.call("bind", { name: "b", create: true });
-  // Local picks the primary for a board tool (S14): make b the primary to subscribe it.
+  // A subscribe acts on a subscribed address first (#366): make b the only one held to subscribe it.
   await s.call("unbind", { name: "a" });
   await s.call("board_subscribe", { board: "e2e", mode: "push" });
   await s.call("bind", { name: "a" });

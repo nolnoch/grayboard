@@ -8,7 +8,7 @@ import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import { canSeeBoard, normalizeBoard, type UnboundPeer } from "./boards.ts";
+import { boardAddress, normalizeBoard, type BoardUse, type UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
@@ -121,9 +121,9 @@ export function actingAs(input: string, addresses: string[], ownScope: string | 
 /**
  * The address a board tool acts as (#284 S3, S14): `as` when given
  * (board_post, claim_take), checked against `asAddresses`; for a board read,
- * post or subscription without it, the first of `addresses` (primary first,
- * the ID last) that can see the board, else the primary, whose refusal
- * stands. Every other tool acts as the primary. Callers resolve it before
+ * post or subscription without it, the one of `addresses` (primary first, the
+ * ID last) that boardAddress picks, else the primary, whose refusal stands.
+ * Every other tool acts as the primary. Callers resolve it before
  * callBoardTool and pass the args without `as`.
  */
 export function boardActor(
@@ -134,15 +134,18 @@ export function boardActor(
 ): string {
   const primary = s.addresses[0]!;
   if (args.as !== undefined) return actingAs(String(args.as), s.asAddresses, s.ownScope);
-  if ((tool !== "board_read" && tool !== "board_post" && tool !== "board_subscribe") || typeof args.board !== "string") return primary;
+  const use = BOARD_USES[tool];
+  if (!use || typeof args.board !== "string") return primary;
   let board: string;
   try {
     board = normalizeBoard(args.board);
   } catch {
     return primary;
   }
-  return s.addresses.find((h) => canSeeBoard(db, h, board)) ?? primary;
+  return boardAddress(db, board, s.addresses, use) ?? primary;
 }
+
+const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
 
 /**
  * The address a DM reply goes out as without `as` (#284 S4): the parent's
