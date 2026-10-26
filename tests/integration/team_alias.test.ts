@@ -119,3 +119,11 @@ test("acting as a team alias over HTTP follows membership", async () => {
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
   expect(await srv.upload(bob, "eng/build", "a.txt", "x")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
 });
+
+// A team's alias follows its own team's board, not its creator's others.
+test("a lazily created team alias follows only its team's board", async () => {
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  await srv.client(bob, "eng/build").connect();
+  expect(rows(`SELECT board FROM subscriptions WHERE handle = 'eng/build'`)).toEqual([{ board: "eng" }]);
+  expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
+});

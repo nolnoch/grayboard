@@ -2,7 +2,7 @@ import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { actingIdentity } from "./claim.ts";
+import { actingIdentity, busHandle } from "./claim.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -90,6 +90,23 @@ describe("actingIdentity: --as, an explicit BUS_IDENTITY, and server mode's deri
     expect(() => actingIdentity("Gray!", {}, at("repo", "src"))).toThrow(/invalid --as "Gray!"/);
     expect(() => actingIdentity(undefined, { BUS_IDENTITY: "Gray!" }, at("repo", "src"))).toThrow(/invalid identity name/);
   });
+});
+
+// #284 S9: on a server a shell may act as a team's alias it can hold.
+test("server mode takes a scoped name, as-is; local mode refuses one", () => {
+  expect(actingIdentity("Eng/Deploy", {}, at("repo", "src"), undefined, true)).toEqual({ name: "eng/deploy", source: "--as" });
+  expect(actingIdentity(undefined, { BUS_IDENTITY: "eng/build" }, at("repo", "src"), undefined, true)).toEqual({ name: "eng/build", source: "BUS_IDENTITY" });
+  expect(() => actingIdentity("eng/deploy", {}, at("repo", "src"))).toThrow(/invalid --as "eng\/deploy"/);
+  const env = { GRAYBOARD_CREDENTIALS: join(root, "creds.json") };
+  writeFileSync(env.GRAYBOARD_CREDENTIALS, JSON.stringify({ server: "http://x", token: "t", user_email: "you@example.com" }));
+  const saved = { ...process.env };
+  Object.assign(process.env, env);
+  try {
+    expect(busHandle("eng/deploy", "server")).toBe("eng/deploy");
+    expect(busHandle("Be", "server")).toBe("you@example.com/be");
+  } finally {
+    process.env = saved;
+  }
 });
 
 describe("the local rule: the shell's bound session (#182 decision 18)", () => {

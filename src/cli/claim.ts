@@ -5,6 +5,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { ApiError, busMode, loadCredentials, makeClient, signInHint } from "./api.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
+import { addressParts, normalizeAliasName } from "../core/addresses.ts";
 import { defaultIdentity, gitLocation, isExplicitIdentity, linkedWorktreeName, pinnedIdentity, resolveIdentity } from "../shared/identity.ts";
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
@@ -63,16 +64,19 @@ export function boundSession(view: LocalView, cwd: string): { name: string; sour
  * local rows, so it keeps the derived rule: no BUS_IDENTITY, or one that
  * merely re-delivers a pin, keeps the worktree suffix, as sessions did.
  */
-export function actingIdentity(as?: string, env = process.env, cwd = process.cwd(), local?: LocalView): { name: string; source: string } {
+// server: a server-mode shell, whose explicit name may carry a scope
+// (eng/deploy, #284 S9); the server judges it.
+export function actingIdentity(as?: string, env = process.env, cwd = process.cwd(), local?: LocalView, server = false): { name: string; source: string } {
+  const normalize = server ? normalizeAliasName : normalizeIdentityName;
   if (as !== undefined) {
     // Same rule the session itself resolves by (#181): lowercased, then
     // validated — so --as Gray acts as "gray", the handle both modes agree on.
-    const n = normalizeIdentityName(as);
-    if (!n.ok) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -`);
+    const n = normalize(as);
+    if (!n.ok) throw new Error(`invalid --as "${as}": 1–32 chars, a-z 0-9 _ -${server ? ", or scope/name" : ""}`);
     return { name: n.name, source: "--as" };
   }
   if (isExplicitIdentity(env, cwd)) {
-    const n = normalizeIdentityName(env.BUS_IDENTITY!);
+    const n = normalize(env.BUS_IDENTITY!);
     if (!n.ok) throw new Error(n.error);
     return { name: n.name, source: "BUS_IDENTITY" };
   }
@@ -104,15 +108,17 @@ async function localView(): Promise<LocalView> {
 /** actingIdentity for this process, reading the local bus's sessions when the rule needs them. */
 export async function actingName(as?: string, mode = busMode()): Promise<{ name: string; source: string }> {
   const needsLocal = mode === "local" && as === undefined && !isExplicitIdentity();
-  return actingIdentity(as, process.env, process.cwd(), needsLocal ? await localView() : undefined);
+  return actingIdentity(as, process.env, process.cwd(), needsLocal ? await localView() : undefined, mode === "server");
 }
 
-/** The bus handle for `name`: as-is in local mode, `<email>/<name>` (lowercased, as the server stores it) in server mode. */
+/** The bus handle for `name`: as-is in local mode; in server mode a scoped name as-is, a bare one `<email>/<name>` (lowercased, as the server stores it). */
 export function busHandle(name: string, mode = busMode()): string {
   if (mode === "local") return name;
   const email = loadCredentials()?.user_email;
   if (!email) throw new Error("signed out; run grayboard login");
-  return `${email}/${name.toLowerCase()}`;
+  // A scoped name (eng/deploy) or a session ID is already an address.
+  const p = addressParts(name);
+  return p && p.kind !== "bare" ? p.address : `${email}/${name.toLowerCase()}`;
 }
 
 async function localCall(name: string, tool: ClaimTool, args: Record<string, unknown>): Promise<unknown> {
