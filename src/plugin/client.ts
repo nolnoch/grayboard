@@ -7,7 +7,7 @@ import { HTTP_TIMEOUT_MS, describeFetchError } from "../shared/http.ts";
 // Server tool calls are single DB transactions; one unanswered this long never will be.
 const REQUEST_TIMEOUT_MS = 30_000;
 // Once a session has had a hello_ok, its reconnects must land inside the
-// server's 30 s grace (#284 S4): the backoff stops at 8 s (12 s with jitter),
+// server's 30 s grace (#284 S4): the backoff stops at 8 s, unjittered,
 // and the pre-open token check gives up after 5 s.
 const RESUME_BACKOFF_MAX_MS = 8_000;
 const RESUME_PROBE_MS = 5_000;
