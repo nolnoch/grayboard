@@ -1,5 +1,6 @@
 import pkg from "../../package.json" with { type: "json" };
 import { PrincipalTaken, type Repo, type Team } from "./db.ts";
+import { mayActIn } from "./access.ts";
 import type { Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
@@ -171,10 +172,10 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
   if (p.name === HUMAN_NAME) return forbidden(humanReason);
   const owner = repo.resolver.principalOf(address);
-  const mine = owner?.kind === "user" ? owner.name === authed.user_email
-    : owner?.kind === "team" ? (() => { const t = repo.teams.findByName(owner.name); return !!t && repo.teams.isMember(t.id, authed.user_id); })()
-    : false;
-  if (!mine) return forbidden(`you can't act as "${address}": it's in neither your scope nor a team's you belong to`);
+  const no = owner
+    ? mayActIn(repo, { kind: "user", name: authed.user_email }, { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name })
+    : "no principal owns its scope";
+  if (no) return forbidden(`you can't act as "${address}": ${no}`);
   if (!repo.aliases.find(address)) {
     return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }

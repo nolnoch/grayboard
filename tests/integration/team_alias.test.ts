@@ -111,3 +111,11 @@ test("the plugin drops a lost team alias and says so in the next tool result", a
   );
   expect((r.structuredContent as { name: string | null }).name).toBeNull();
 }, 20_000);
+
+// HTTP's ?as= takes the same check as bind (mayActIn).
+test("acting as a team alias over HTTP follows membership", async () => {
+  await srv.client(bob, "eng/build").connect();
+  expect((await srv.upload(bob, "eng/build", "a.txt", "x")).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
+  expect(await srv.upload(bob, "eng/build", "a.txt", "x")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
+});
