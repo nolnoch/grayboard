@@ -263,7 +263,7 @@ test("#284 S1, S2: bind adds a hold; unbind releases one, its claims and mail st
 
   const result = await s.call("bind", { name: "fe2" });
   expect(result).toStartWith(`Bound to "fe2"; you hold "fe", "fe2" and send as "fe".`);
-  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe".`);
+  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe" unless a call passes as, and a reply goes as the alias its message reached.`);
   // Both names' mail reaches it: fe2's queued DM and a new one to fe.
   await until(() => contents(s).includes("queued for fe2"));
   await be.call("dm_send", { to: "fe", body: "to fe" });
@@ -436,7 +436,7 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   const texts = (r.content as { text: string }[]).map((c) => c.text);
   expect(JSON.parse(texts[0]!).you).toBe("old");
   expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe"; you hold "old", "fe" and send as "old".`);
-  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old".`]);
+  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old" unless a call passes as, and a reply goes as the alias its message reached.`]);
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 30_000);
 
@@ -634,7 +634,7 @@ test("#284 S10: a restart takes back every name in its record, in order; one hel
   const now = holderOf("zed")!;
   expect(now).not.toBe(before);
   expect(rows(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, now)).toEqual([{ address: "zed" }, { address: "alpha" }]);
-  expect(s.c.getInstructions()).toStartWith(`You are identity "zed" on the grayboard bus, which coordinates between agents. You also hold "alpha"; you send as "zed".`);
+  expect(s.c.getInstructions()).toStartWith(`You are identity "zed" on the grayboard bus, which coordinates between agents. You also hold "alpha"; you send as "zed" unless a call passes as, and a reply goes as the alias its message reached.`);
   for (const n of ["zed", "alpha"]) expect(events(n).at(-1)).toEqual({ session_id: now, event: "bound", detail: `restored: restart of session ${before}` });
   await peer.call("dm_send", { to: "alpha", body: "to alpha" });
   await until(() => contents(s).includes("to alpha"));

@@ -397,7 +397,7 @@ export function launcherNote(launcher: string): string {
 export function boundInstructions(name: string, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
   return [
     `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
-    ...(others.length ? [`You also hold ${quoted(others)}; you send as "${name}".`] : []),
+    ...(others.length ? [`You also hold ${quoted(others)}; you send as "${name}" unless a call passes as, and a reply goes as the alias its message reached.`] : []),
     ...(general
       ? [
           `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,

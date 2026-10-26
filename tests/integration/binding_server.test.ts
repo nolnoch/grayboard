@@ -156,7 +156,7 @@ test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mai
 
   const result = await s.call("bind", { name: "fe2" });
   expect(result).toStartWith(`Bound to "fe2"; you hold "fe", "fe2" and send as "fe".`);
-  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe".`);
+  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe" unless a call passes as, and a reply goes as the alias its message reached.`);
   // Both names' mail reaches it: fe2's queued DM and a new one to fe. A push
   // names the alias it reached when that isn't the primary (S4).
   await until(() => contents(s).includes("queued for fe2"));
@@ -347,7 +347,7 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   const texts = (r.content as { text: string }[]).map((c) => c.text);
   expect(JSON.parse(texts[0]!).you).toBe(`${A}/old`);
   expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe"; you hold "old", "fe" and send as "old".`);
-  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old".`]);
+  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old" unless a call passes as, and a reply goes as the alias its message reached.`]);
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 20_000);
 
