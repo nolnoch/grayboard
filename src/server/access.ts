@@ -48,6 +48,13 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
   return {
     canSee,
 
+    // An alias's labels reach only a principal that may act in its scope
+    // (#284 S13): a team's task or private board name stays inside the team.
+    seesAliasMeta(handle, scope) {
+      const p = repo.resolver.principalOf(handle);
+      return p !== null && scope.scope_ref !== null && mayActIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref }) === null;
+    },
+
     // No server #announce yet (#24): a team board named announce stays ordinary.
     announceBoard: null,
 

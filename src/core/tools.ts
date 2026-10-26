@@ -16,6 +16,7 @@ import {
   setStatus,
   subscribe,
   viewers,
+  parseMatch,
   who,
   type Pending,
   type Post,
@@ -129,12 +130,16 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "peer_list",
       description:
-        "peer_list(board?, include_offline?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own row has self: true. With board: its subscribers and their mode (a team's board is its roster).",
+        "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
       inputSchema: {
         type: "object",
         properties: {
           board: { type: "string", description: "Optional. Only this board's subscribers." },
           include_offline: { type: "boolean", description: "Also list offline handles with last_seen (default false)." },
+          match: {
+            type: "object",
+            description: "Optional. Only rows whose fields equal these (case-insensitive): id, harness, model, effort, task, owner, source_board, spec_hash, scope.",
+          },
         },
       },
     },
@@ -434,7 +439,11 @@ export function callBoardTool(
     case "peer_list": {
       if (!ctx.online) throw new CoreError("peer_list isn't available in this mode");
       const board = optStr(a, "board");
-      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online, ctx.unbound);
+      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline"), match: parseMatch(a.match) }, ctx.online, {
+        unbound: ctx.unbound,
+        addresses: ctx.addresses,
+        session: ctx.session,
+      });
       return { result: r, wake: [] };
     }
 

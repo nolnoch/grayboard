@@ -50,34 +50,41 @@ describe("launchers", () => {
     expect(isLauncher(db, "nobody")).toBe(false);
   });
 
-  // #284 audit B4: an offline alias's facts come from the session that last
-  // bound it, unless that session has moved to another name since.
-  test("an alias whose last binder moved on has none of its facts", () => {
+  // #284 S13: an offline alias's facts come from the session that last
+  // bound it once that session has ended; a live session's show only on the
+  // aliases it holds.
+  test("an alias its live binder released has none of its facts; they return when that session ends", () => {
     session("fe", true);
     const id = `id:${String(sessions).padStart(13, "0")}`;
     logBinding(db, id, "fe", "bound", null);
     dropHold(db, "fe", id);
+    logBinding(db, id, "fe", "released", "unbind");
     connected("fe2");
     holdAlias(db, "fe2", id);
-    logBinding(db, id, "fe2", "moved", "fe");
+    logBinding(db, id, "fe2", "bound", null);
     setStatus(db, "fe2", "on fe2");
     expect(isLauncher(db, "fe")).toBe(false);
     expect(isLauncher(db, "fe2")).toBe(true);
-    const peers = who(db, "me", { include_offline: true }, () => false).peers;
-    expect(peers.find((p) => p.handle === "fe")).toEqual({ handle: "fe", online: false, last_seen: expect.any(Number) });
-    expect(peers.find((p) => p.handle === "fe2")).toMatchObject({ status: "on fe2", launcher: true });
+    const peers = () => who(db, "me", { include_offline: true }, () => false).peers;
+    expect(peers().find((p) => p.handle === "fe")).toEqual({ handle: "fe", online: false, last_seen: expect.any(Number) });
+    expect(peers().find((p) => p.handle === "fe2")).toMatchObject({ id, status: "on fe2", launcher: true });
+    dropHold(db, "fe2", id);
+    db.prepare(`UPDATE ids SET ended_at = 1 WHERE id = ?`).run(id);
+    expect(peers().find((p) => p.handle === "fe")).toMatchObject({ id, launcher: true });
+    expect(peers().find((p) => p.handle === "fe")!.status).toBeUndefined();
   });
 
-  test("an offline alias keeps its last binder's launcher flag but shows no status", () => {
-    session("fe", true);
+  // #284 S13: the auto-pick sees a launcher session once, by its primary; an
+  // explicit to may name any alias it holds.
+  test("a launcher holding two aliases: launchers lists its primary, isLauncher accepts both", () => {
+    session("zed", true);
     const id = `id:${String(sessions).padStart(13, "0")}`;
-    logBinding(db, id, "fe", "bound", null);
-    setStatus(db, "fe", "busy");
-    dropHold(db, "fe", id);
-    expect(isLauncher(db, "fe")).toBe(true);
-    const fe = who(db, "me", { include_offline: true }, () => false).peers.find((p) => p.handle === "fe");
-    expect(fe).toMatchObject({ launcher: true });
-    expect(fe!.status).toBeUndefined();
+    connected("alpha");
+    holdAlias(db, "alpha", id);
+    expect(launchers(db)).toEqual(["zed"]);
+    expect(isLauncher(db, "alpha")).toBe(true);
+    expect(isLauncher(db, "zed")).toBe(true);
+    expect(resolveDelegation(db, "me", { ...args, to: "alpha" }, live).to).toBe("alpha");
   });
 });
 

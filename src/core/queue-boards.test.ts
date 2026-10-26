@@ -205,6 +205,17 @@ test("an unbound live ID subscribed to a queue is a lane by its ID, then by the 
   expect(lanes()).toEqual(["fe", "sim"]);
 });
 
+// #284 S13: a session's lane is its primary, once, however many aliases it holds.
+test("an ID-subscribed queue board counts a two-hold session once, by its primary", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  subscribe(db, ID, "work", "push");
+  for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
+  holdAlias(db, "zed", ID, 100);
+  holdAlias(db, "alpha", ID, 100);
+  expect(queueLanes(db, getBoard(db, "work")!, "be").sort()).toEqual(["fe", "sim", "zed"]);
+});
+
 test("a read-only viewer is never picked by the rotation", () => {
   const tail = "id:00000000000a1";
   registerId(db, { id: tail, principal: null, launcher: false, viewer: true });
@@ -254,6 +265,7 @@ test("a decline's redelivery skips a lane that lost access to the board", () => 
     canSee: (h, b) => b.scope === null || members.has(h),
     checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
     resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+    seesAliasMeta: () => true,
     announceBoard: null,
   });
   createBoard(db, "be", "eng", "team queue", "team:eng", { kind: "queue" });

@@ -156,6 +156,19 @@ describe("resolveMention", () => {
 });
 
 // Who may bind or write as an alias (#284 S9), keyed by principal.
+// #284 S13: peer_list's alias labels are judged for the calling session's
+// ID, whose principal is its user even when its primary is a team alias.
+test("seesAliasMeta: only a principal that may act in the alias's scope", () => {
+  const eveId = idAddress("e".repeat(64));
+  registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
+  expect(access.seesAliasMeta(WADE_ID, { scope_kind: "team", scope_ref: "eng" })).toBe(true);
+  expect(access.seesAliasMeta(WADE_ID, { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(true);
+  expect(access.seesAliasMeta(eveId, { scope_kind: "team", scope_ref: "eng" })).toBe(false);
+  expect(access.seesAliasMeta(eveId, { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(false);
+  expect(access.seesAliasMeta(WADE_ID, { scope_kind: "person", scope_ref: null })).toBe(false);
+  expect(access.seesAliasMeta(idAddress("f".repeat(64)), { scope_kind: "team", scope_ref: "eng" })).toBe(false);
+});
+
 test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", () => {
   const bob = { kind: "user" as const, name: "bob@example.com" };
   const may = (p: Parameters<typeof mayActIn>[1], kind: "person" | "team" | "service", ref: string) => mayActIn(repo, p, { scope_kind: kind, scope_ref: ref });
