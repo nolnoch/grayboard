@@ -81,7 +81,7 @@ class HumanConn implements Conn {
     authed: AuthedUser,
     private readonly onItem: (m: PushMessage | BoardPush) => void,
   ) {
-    this.data = { authed, primary: "", addresses: [], ready: false, human: true };
+    this.data = { authed, primary: "", addresses: [], holds: [], ready: false, human: true };
   }
 
   send(raw: string): void {

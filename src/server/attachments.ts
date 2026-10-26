@@ -14,7 +14,7 @@ import { addressSet } from "../core/bindings.ts";
 // null for the Slack bridge's humans, which have no session.
 export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: number, principal: string | null): AttachmentRow | undefined {
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
-  const addresses = principal === null ? [handle] : addressSet(db, handle, principal);
+  const addresses = addressSet(db, handle, principal);
   const dmVisible = (messageId: number) => participant(repo.messages.getById(messageId), addresses);
   return row && canReadAttachment(db, handle, row, dmVisible, addresses) ? row : undefined;
 }

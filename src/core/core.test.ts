@@ -125,7 +125,7 @@ describe("#announce", () => {
 test("new subscribers start at the tip", () => {
   post(db, "be", "e2e", "old news");
   subscribe(db, "sim", "e2e", "digest");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(0);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(0);
   expect(pendingFor(db, "sim")).toEqual([]);
 });
 
@@ -136,7 +136,7 @@ test("push-mode subscriber gets full post; author does not", () => {
   expect(items).toHaveLength(1);
   expect(items[0]).toMatchObject({ kind: "push", reason: "subscription" });
   expect(drain("sim")).toEqual([]);
-  expect(listBoards(db, "be")[0]!.unread).toBe(0); // push counts as read
+  expect(listBoards(db, ["be"])[0]!.unread).toBe(0); // push counts as read
 });
 
 test("digest coalesces until the reader catches up", () => {
@@ -163,7 +163,7 @@ test("posting does not mark others' unread posts as read", () => {
   post(db, "be", "e2e", "one");
   post(db, "be", "e2e", "two");
   post(db, "sim", "e2e", "reply without reading");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(2);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(2);
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 2 }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
@@ -172,7 +172,7 @@ test("a mention doesn't also count toward the mentioned subscriber's digest", ()
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "@sim look at this");
   expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention" }]);
-  expect(listBoards(db, "sim")[0]!.unread).toBe(0);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(0);
   post(db, "be", "e2e", "unrelated");
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
@@ -182,7 +182,7 @@ test("quiet subscribers are never pushed but see unread counts", () => {
   subscribe(db, "sim", "e2e", "quiet");
   const { wake } = post(db, "be", "e2e", "hi");
   expect(wake).not.toContain("sim");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(1);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(1);
 });
 
 test("mentions push to known handles even without a subscription", () => {
@@ -223,7 +223,7 @@ test("a deferred push shows as unread, and reading the board delivers it", () =>
   drain("sim");
   drain("fe");
   expect(post(db, "fe", "e2e", "answer", mid.id).deferred).toEqual(["be"]);
-  expect(listBoards(db, "be")[0]!.unread).toBe(1);
+  expect(listBoards(db, ["be"])[0]!.unread).toBe(1);
   expect(read(db, "be", "e2e").posts.map((p) => p.body)).toEqual(["answer"]);
   // Delivered by the read; the earlier pushes (be was push-subscribed) it didn't show still come.
   expect(drain("be", true).map((i) => i.kind === "push" && i.post.body)).toEqual(["question", "me too"]);
@@ -263,7 +263,7 @@ test("a muted thread stops pushing replies, but @mentions still land", () => {
   callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "push", thread: root.id });
   expect(post(db, "sim", "e2e", "routine 3", root.id).deferred).toEqual(["fe"]);
   // The board's own mode is untouched, and other threads still push.
-  expect(listBoards(db, "be").find((b) => b.name === "e2e")?.mode).toBe("push");
+  expect(listBoards(db, ["be"]).find((b) => b.name === "e2e")?.mode).toBe("push");
   expect(post(db, "sim", "e2e", "new topic").wake).toEqual(["be"]);
 });
 
@@ -625,8 +625,8 @@ describe("with a scoped access policy", () => {
   });
 
   test("non-members can't see, read, post, or subscribe", () => {
-    expect(listBoards(db, "fe").map((b) => b.name)).toEqual(["e2e"]);
-    expect(listBoards(db, "sim").map((b) => b.name)).toEqual(["e2e", "eng"]);
+    expect(listBoards(db, ["fe"]).map((b) => b.name)).toEqual(["e2e"]);
+    expect(listBoards(db, ["sim"]).map((b) => b.name)).toEqual(["e2e", "eng"]);
     expect(() => read(db, "fe", "eng")).toThrow(/no such board/);
     expect(() => post(db, "fe", "eng", "hi")).toThrow(/no such board/);
     expect(() => subscribe(db, "fe", "eng", "push")).toThrow(/no such board/);

@@ -128,7 +128,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   const { db, openEnded } = await import("../local/db.ts");
   const { isHuman, lastSeen } = await import("../core/boards.ts");
   const { callBoardTool } = await import("../core/tools.ts");
-  const { holderOf } = await import("../core/bindings.ts");
+  const { addressSet } = await import("../core/bindings.ts");
   const { deliverEnded, poke } = await import("../local/wakeup.ts");
   await deliverEnded(db, openEnded);
   // The human's handle speaks with the human's authority (#announce), which nothing an agent can run may borrow.
@@ -137,8 +137,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   // As the session holding the name: its address set, so a claim it took
   // under its ID before binding is its own here too (#284 S5). No `session`:
   // this process wrote the post, not that session.
-  const holder = holderOf(db, name);
-  const outcome = callBoardTool(db, name, tool, args, { addresses: holder ? [name, holder] : [name] });
+  const outcome = callBoardTool(db, name, tool, args, { addresses: addressSet(db, name, null) });
   // The acting session too: a wakeup re-arms its claim-expiry timer, as its own tool call would.
   await Promise.all([...new Set([...outcome.wake, name])].map((h) => poke(h)));
   return outcome.result;

@@ -82,6 +82,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
             authed,
             primary: "",
             addresses: [],
+            holds: [],
             ready: false,
           },
         });

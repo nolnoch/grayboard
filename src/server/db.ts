@@ -102,10 +102,15 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    // attachmentIds: the sender's unbound uploads, bound in the insert's
-    // transaction (a refused id throws CoreError and nothing is written).
-    // senderId: the sending session's ID (#284); null for a writer with no session.
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[], senderId?: string | null): MessageRow;
+    // attachmentIds: unbound uploads of any of `uploaders` (default
+    // [sender]; the sending session's address set, #284 PR 4 S5), bound in
+    // the insert's transaction (a refused id throws CoreError and nothing is
+    // written). senderId: the sending session's ID (#284); null for a writer
+    // with no session.
+    insert(
+      sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[],
+      senderId?: string | null, uploaders?: string[],
+    ): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
@@ -576,13 +581,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null, uploaders = [sender]) {
         return db.transaction(() => {
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
           ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
-          const attachments = bindAttachments(db, attachmentIds, [sender], { message_id: row.id }, attachmentLimits);
+          const attachments = bindAttachments(db, attachmentIds, uploaders, { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
       },

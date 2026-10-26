@@ -1,6 +1,6 @@
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import {
-  parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type BindRequest, type DelegateRequest, type DelegateResult, type SendRequest, type SendResult,
+  parseClientMessage, type ServerMessage, type HelloOk, type HelloRequest, type BindRequest, type UnbindRequest, type DelegateRequest, type DelegateResult, type SendRequest, type SendResult,
   type ErrorCode, type ErrorMessage, type WriteRef,
 } from "../shared/protocol.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
@@ -14,6 +14,7 @@ import {
   checkBody,
   lastSeen,
   normalizeBoard,
+  parseAliasMeta,
   pendingFor,
   pendingKey,
   refOf,
@@ -21,15 +22,17 @@ import {
   inheritStatus,
   registerId,
   cleanPlace,
+  setAliasMeta,
   setPlace,
   touchAlias,
   touchId,
+  type AliasMetaSet,
   type CoreDb,
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  aliasHeldText, aliasUser, aliasUses, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow, idStatuses, logBinding, unboundPeer, unendedIds,
-  unknownNameError, type AliasUse, type Continuity, type IdRow,
+  MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow, idStatuses, logBinding,
+  primaryOf, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError, type AliasUse, type Continuity, type IdRow,
 } from "../core/bindings.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -50,17 +53,21 @@ import {
 export type WsData = {
   authed: AuthedUser;
   ready: boolean;
-  // The address the connection writes as (#284 S8): its alias when bound,
-  // else its session ID; a tools-only connection's writes_as.
+  // The address the connection writes as by default (#284 S1, S8): its
+  // oldest hold, else its session ID; a tools-only connection's writes_as.
   primary: string;
-  // Every address it reads as: {bound alias?, ID}; a tools-only
-  // connection's [writes_as] (it receives nothing, so its ID isn't one).
+  // Every address it reads as: its holds, oldest first, then its ID; a
+  // tools-only connection's [writes_as] (it receives nothing, so its ID
+  // isn't one). Primary first.
   addresses: string[];
-  // The alias the session holds (one per session until PR 4).
-  bound?: string;
-  // Board items sent and not yet acked on this connection. Cleared with the
-  // connection, so a reconnect resends them (at-least-once, like DMs).
-  inflight?: Set<string>;
+  // The aliases the session holds, oldest first (PR 4 S1); set by setHolds.
+  holds: string[];
+  // Board items sent and not yet acked on this connection, each with the
+  // addresses it was pending for: one push per item across the set, and an
+  // unbind drops the released address, so the item reaches that alias's
+  // next binding. Cleared with the connection, so a reconnect resends them
+  // (at-least-once, like DMs).
+  inflight?: Map<string, Set<string>>;
   // Set while a collision probe is waiting for this connection's pong.
   onPong?: () => void;
   // The server's Slack bridge holding a user's human alias (S16): it has no
@@ -150,16 +157,44 @@ function coreRefusal(e: CoreError): { code: ErrorCode; message: string } {
 // unbound and the alias's own both deliver. all: also deferred pushes and
 // digests (at hello; see pendingFor).
 function drainBoards(ws: Ws, db: CoreDb, all = false): void {
-  const inflight = (ws.data.inflight ??= new Set());
+  const inflight = (ws.data.inflight ??= new Map());
   for (const address of ws.data.addresses) {
     for (const item of pendingFor(db, address, { all })) {
       const key = pendingKey(refOf(item));
-      if (inflight.has(key)) continue;
-      inflight.add(key);
+      const sent = inflight.get(key);
+      if (sent) {
+        sent.add(address);
+        continue;
+      }
+      inflight.set(key, new Set([address]));
       send(ws, { type: "board_push", item });
     }
   }
 }
+
+// The session's holds changed (#284 PR 4 S1, S8): its primary and address
+// set follow, and a push connection's registry entries with them. An alias
+// it no longer holds leaves the registry and its in-flight board items, so
+// they're pushed to whoever binds it next.
+function setHolds(hub: Hub, ws: Ws, holds: string[]): void {
+  const id = ws.data.sessionId!;
+  for (const a of ws.data.holds) {
+    if (holds.includes(a)) continue;
+    if (hub.registry.get(a) === ws) hub.registry.delete(a);
+    for (const [key, sent] of ws.data.inflight ?? []) {
+      sent.delete(a);
+      if (!sent.size) ws.data.inflight!.delete(key);
+    }
+  }
+  ws.data.holds = holds;
+  ws.data.primary = primaryOf(holds, id);
+  ws.data.addresses = [...holds, id];
+  if (ws.data.push) for (const a of ws.data.addresses) hub.registry.set(a, ws);
+}
+
+// What `as` may name (#284 S3): any of the session's addresses; the Slack
+// bridge's human acts only as its handle.
+const asAddresses = (ws: Ws): string[] => (ws.data.human ? [ws.data.primary] : ws.data.addresses);
 
 // Direct messages to any of `addresses` past each one's cursor (unacked ones
 // are resent).
@@ -329,6 +364,9 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
           case "bind":
             handleBind(hub, ws, msg);
             break;
+          case "unbind":
+            handleUnbind(hub, ws, msg);
+            break;
           case "end":
             handleEnd(hub, ws, msg.req_id);
             break;
@@ -406,11 +444,11 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
       if (!id || hub.holders.get(id) !== ws) return;
       detach(hub, ws);
       touchId(hub.db, id);
-      if (ws.data.bound) touchAlias(hub.db, ws.data.bound);
-      // Its holds stay: a 30 s blip must not lose the alias (S4).
+      for (const a of ws.data.holds) touchAlias(hub.db, a);
+      // Its holds stay: a 30 s blip must not lose the aliases (S4).
       const until = hub.now() + GRACE_MS;
       hub.grace.set(id, until);
-      writeAudit(hub.repo, "id.detached", ws.data.authed.user_email, id, { held: ws.data.bound ?? null, grace_until: until });
+      writeAudit(hub.repo, "id.detached", ws.data.authed.user_email, id, { held: ws.data.holds, grace_until: until });
     },
   };
 
@@ -542,13 +580,14 @@ function recheckAliases(hub: Hub, principal: string | null, by: string | null): 
 }
 
 // Takes aliases from sessions whose principals may no longer act in their
-// scopes (S9). A holder keeps its ID: its hold is released, and a live one
-// is told by an alias_lost frame and acts as its ID from here. A tools-only
+// scopes (S9). A holder keeps its ID and its other holds: only the revoked
+// hold is released, and a live one is told by an alias_lost frame and sends
+// as its primary from here. A tools-only
 // connection writes only as its writes_as, so it has nothing left to be:
 // its session ends, and its reconnect's hello is refused.
 function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[], by: string | null): void {
   if (!uses.length) return;
-  const { repo, db, registry } = hub;
+  const { repo, db } = hub;
   const ended: string[] = [];
   for (const u of uses) {
     const { reason } = u;
@@ -568,11 +607,8 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[], by: st
       logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
       writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
     });
-    if (!ws || ws.data.bound !== u.address) continue;
-    if (registry.get(u.address) === ws) registry.delete(u.address);
-    ws.data.bound = undefined;
-    ws.data.primary = u.id;
-    ws.data.addresses = [u.id];
+    if (!ws || !ws.data.holds.includes(u.address)) continue;
+    setHolds(hub, ws, ws.data.holds.filter((a) => a !== u.address));
     send(ws, { type: "alias_lost", alias: u.address, reason });
   }
   endIds(hub, ended, "revoked");
@@ -604,7 +640,7 @@ function noticesFor(hub: Hub, addresses: string[], first: string[] = []): string
 // The hello is the session (#284 S1, S3): it registers the key's ID, or
 // re-attaches a session in its grace, holds and all. Aliases come by bind.
 async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
-  const { repo, db, registry, holders } = hub;
+  const { repo, db, holders } = hub;
   const reqId = m.req_id;
   const { authed } = ws.data;
   const id = m.session_key ? idAddress(m.session_key) : null;
@@ -696,6 +732,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       if (writesAs) createLazily(hub, authed, writesAs, id);
       const reused = registerId(db, {
         id, principal: authed.user_email, place: where, launcher, keyed: m.keyed === true, ...(writesAs === undefined ? {} : { writesAs: writesAs.address }),
+        harness: m.harness, model: m.model, effort: m.effort,
       });
       // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
       if (reused) writeAudit(repo, "id.reused", authed.user_email, id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at });
@@ -716,17 +753,20 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // connection can't receive a delegation, so it's never a launcher.
   if (push) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: launcher });
 
-  const bound = toolsOnly ? undefined : holdsOf(db, id)[0];
   ws.data.sessionId = id;
   ws.data.place = where;
   ws.data.push = push;
-  ws.data.bound = bound;
-  if (toolsOnly) ws.data.toolsOnly = true;
-  ws.data.primary = writesAs?.address ?? bound ?? id;
-  ws.data.addresses = writesAs !== undefined ? [writesAs.address] : bound ? [bound, id] : [id];
   holders.set(id, ws);
-  if (push) for (const a of ws.data.addresses) registry.set(a, ws);
-  if (bound) touchAlias(db, bound);
+  if (writesAs) {
+    ws.data.toolsOnly = true;
+    ws.data.primary = writesAs.address;
+    ws.data.addresses = [writesAs.address];
+  } else {
+    // A re-attach restores every hold, in bound order (S8).
+    setHolds(hub, ws, holdsOf(db, id));
+  }
+  const bound = ws.data.holds;
+  for (const a of bound) touchAlias(db, a);
   ws.data.ready = true;
 
   const bridgeNotice = owedBridgeNotice(repo, authed.user_email);
@@ -736,7 +776,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     ...(bridgeNotice ? [bridgeNotice] : []),
   ]);
   send(ws, {
-    type: "hello_ok", req_id: reqId, id, ...(bound ? { bound } : {}), ...helloOkFields(hub, authed),
+    type: "hello_ok", req_id: reqId, id, ...(bound.length ? { bound } : {}), ...helloOkFields(hub, authed),
     ...(notices.length ? { notices } : {}),
   });
   if (!push) return;
@@ -825,17 +865,18 @@ function describeHolder(hub: Hub, id: string): string {
   return `the session ${id}${place ? `, in ${place}` : ""}${grace}`;
 }
 
-// bind (#284 S2): take an alias for this session, or move to another. A
-// bind while holding one is a rebind: the old hold is released, and claims
-// stay with the alias they were taken under (S6).
+// bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
+// already holds answers ok and applies only `meta`; the others stay held,
+// and the primary changes only when the session held nothing.
 function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
-  const { repo, db, registry } = hub;
+  const { repo, db } = hub;
   const { authed } = ws.data;
   if (ws.data.human) return err(ws, m.req_id, "bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
   if (ws.data.toolsOnly) return err(ws, m.req_id, "bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
   const id = ws.data.sessionId!;
   // Lazy creation is here, not in the limited hello: an unlimited create loop
-  // would mint aliases without bound.
+  // would mint aliases without bound. Taken before the held check, so a
+  // re-bind loop spends it too.
   const t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias });
   if (!t.ok) {
     return send(ws, { type: "error", req_id: m.req_id, code: "rate_limited", message: `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, retry_after_ms: t.retryAfterMs });
@@ -846,12 +887,27 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     return err(ws, m.req_id, target.code, target.error);
   }
   const { address, scope } = target;
-  const previous = ws.data.bound ?? null;
-  if (address === previous) return send(ws, { type: "bind_ok", req_id: m.req_id, alias: address });
   const refuse = (code: ErrorCode, message: string, detail: string, extra: Pick<ErrorMessage, "known" | "holder" | "retry_after_ms"> = {}) => {
     logBinding(db, id, address, "refused", detail);
     err(ws, m.req_id, code, message, extra);
   };
+  let meta: AliasMetaSet | undefined;
+  try {
+    meta = m.meta === undefined ? undefined : parseAliasMeta(m.meta);
+  } catch (e) {
+    if (e instanceof CoreError) return refuse("bad_request", e.message, e.message);
+    throw e;
+  }
+  const audit = serverAuditSink(repo);
+  if (ws.data.holds.includes(address)) {
+    // No binding event, and bound_at stays: the session already holds it.
+    if (meta) repo.atomic(() => setAliasMeta(db, address, meta, id, audit));
+    return send(ws, { type: "bind_ok", req_id: m.req_id, alias: address, held: ws.data.holds });
+  }
+  if (ws.data.holds.length >= MAX_HOLDS) {
+    const why = tooManyHolds(ws.data.holds);
+    return refuse("bad_request", why, why);
+  }
   // A typo would otherwise create a fresh alias, and the DMs queued for the
   // intended one would never arrive.
   if (m.create === false && !repo.aliases.find(address)) {
@@ -877,51 +933,63 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     return refuse("alias_held", aliasHeldText(address, why, "bind another name"), why);
   }
 
-  repo.atomic(() => {
+  const restored = repo.atomic(() => {
     createLazily(hub, authed, target, id);
-    const continued = continuity(hub, authed, id, address, m);
-    if (previous) {
-      dropHold(db, previous, id);
-      logBinding(db, id, previous, "released", `rebound to ${address}`);
-    }
-    holdAlias(db, address, id);
-    logBinding(db, id, address, previous ? "moved" : "bound", previous ?? continued?.detail ?? null);
+    const c = continuity(hub, authed, id, address, m);
+    holdAlias(db, address, id, hub.now());
+    logBinding(db, id, address, "bound", c?.detail ?? null);
+    if (meta) setAliasMeta(db, address, meta, id, audit);
     touchAlias(db, address);
+    return c;
   });
 
-  if (previous && registry.get(previous) === ws) registry.delete(previous);
-  if (ws.data.push) registry.set(address, ws);
-  ws.data.bound = address;
-  ws.data.primary = address;
-  ws.data.addresses = [address, id];
-  // Claims stay with the alias they were taken under (S6): say which.
-  const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
+  setHolds(hub, ws, holdsOf(db, id));
   const notices = noticesFor(hub, ws.data.addresses);
   send(ws, {
-    type: "bind_ok", req_id: m.req_id, alias: address,
-    ...(left.length ? { left } : {}), ...(notices.length ? { notices } : {}),
+    type: "bind_ok", req_id: m.req_id, alias: address, held: ws.data.holds,
+    ...(notices.length ? { notices } : {}), ...(restored ? { restored } : {}),
   });
   if (!ws.data.push) return;
   drainDirect(hub, ws, [address]);
   drainBoards(ws, db, true);
 }
 
+// unbind (#284 PR 4 S2): release one hold. Its mail queues and its claims
+// stay with the alias, for its next holder; a board item in flight for it
+// leaves this connection (setHolds), so that holder is pushed it. An alias
+// the session doesn't hold answers ok with released: false.
+function handleUnbind(hub: Hub, ws: Ws, m: UnbindRequest): void {
+  const { repo, db } = hub;
+  if (ws.data.human) return err(ws, m.req_id, "bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
+  if (ws.data.toolsOnly) return err(ws, m.req_id, "bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
+  const id = ws.data.sessionId!;
+  const p = addressParts(m.alias);
+  if (!p || p.kind === "id" || p.kind === "team") {
+    return err(ws, m.req_id, "bad_request", `"${m.alias}" isn't an alias: a name, or scope/name`);
+  }
+  const address = p.kind === "bare" ? `${ws.data.authed.user_email}/${p.name}` : p.address;
+  if (!ws.data.holds.includes(address)) {
+    return send(ws, { type: "unbind_ok", req_id: m.req_id, alias: address, released: false, held: ws.data.holds });
+  }
+  repo.atomic(() => {
+    dropHold(db, address, id);
+    logBinding(db, id, address, "released", "unbind");
+    touchAlias(db, address);
+  });
+  setHolds(hub, ws, ws.data.holds.filter((a) => a !== address));
+  const left = listClaims(db).filter((c) => c.holder === address).map((c) => c.key);
+  send(ws, { type: "unbind_ok", req_id: m.req_id, alias: address, released: true, held: ws.data.holds, ...(left.length ? { left } : {}) });
+}
+
 // A bind's claim to continue an earlier session on the alias (#211), checked
 // against the alias's history in the bind's transaction. restored_from names
-// a public ID, so it shows the history, not descent; previous_key is the
-// ended session's secret, so it proves descent after a reconnect past the
-// grace (S4). A verified one carries the status over.
+// a public ID, which any client of the principal can present, so it proves
+// nothing (PR 4 S11, #259): kept as audit, carrying no status. previous_key
+// is the ended session's secret, so it proves descent after a reconnect
+// past the grace (PR 3 S4); a verified one carries the status over.
 function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m: BindRequest): Continuity | undefined {
   const { db } = hub;
-  if (m.restored_from !== undefined) {
-    // Another principal's session's status is never carried over.
-    if (idRow(db, m.restored_from)?.principal !== authed.user_email) {
-      return { verified: false, detail: `restore not verified: ${m.restored_from} isn't a session of yours` };
-    }
-    const c = continuityOf(db, address, { restartOf: m.restored_from });
-    if (c.verified) inheritStatus(db, id, m.restored_from);
-    return c;
-  }
+  if (m.restored_from !== undefined) return { verified: false, detail: `restore claimed from ${m.restored_from}, not verified` };
   if (m.previous_key === undefined) return undefined;
   const prev = idAddress(m.previous_key);
   const row = idRow(db, prev);
@@ -938,7 +1006,7 @@ function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m
 // user's (`where` describes their machine). A hold connection isn't listed:
 // it receives nothing.
 function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
-  const mine = [...hub.holders.values()].filter((c) => c.data.authed.user_id === ws.data.authed.user_id && c.data.push && !c.data.bound);
+  const mine = [...hub.holders.values()].filter((c) => c.data.authed.user_id === ws.data.authed.user_id && c.data.push && c.data.holds.length === 0);
   const statuses = idStatuses(hub.db, mine.map((c) => c.data.sessionId!));
   const now = hub.now();
   return mine.map((c) => {
@@ -989,13 +1057,31 @@ class SendRefused extends Error {
   }
 }
 
-// A send checked and resolved, ready to write: `to` is the recipient's full
-// handle, `digests` its files' blob digests in call order.
-type PreparedSend = { to: string; body: string; parentId: number | null; pending: boolean; ids: number[]; digests: string[] };
+// A send checked and resolved, ready to write: `from` the address it goes
+// out as, `to` the recipient's full handle, `digests` its files' blob
+// digests in call order.
+type PreparedSend = { from: string; to: string; body: string; parentId: number | null; pending: boolean; ids: number[]; digests: string[] };
+
+// The address a send goes out as: `as` when given (#284 S3), else for a
+// reply the held alias its parent reached or was sent as (S4), else the
+// primary. Throws SendRefused for an `as` that isn't the session's.
+function sendAs(hub: Hub, ws: Ws, as: string | undefined, parentId: number | null): string {
+  if (as !== undefined) {
+    try {
+      return actingAs(as, asAddresses(ws), ws.data.authed.user_email);
+    } catch (e) {
+      if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
+      throw e;
+    }
+  }
+  const parent = parentId === null ? undefined : hub.repo.messages.getById(parentId);
+  return (parent && participant(parent, ws.data.addresses) ? replySender(parent, ws.data.holds) : null) ?? ws.data.primary;
+}
 
 // Checks a send and resolves its recipient, writing nothing; throws SendRefused.
+// Its uploads may be any of the session's addresses' (S5).
 function prepareSend(
-  hub: Hub, ws: Ws, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+  hub: Hub, ws: Ws, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
 ): PreparedSend {
   const { repo, db } = hub;
   let ids: number[];
@@ -1003,25 +1089,25 @@ function prepareSend(
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
-    digests = uploadDigests(db, ids, [ws.data.primary]);
+    digests = uploadDigests(db, ids, ws.data.addresses);
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
   }
 
-  const r = resolvePeerInput(repo, ws.data.primary, recipientStr);
+  const r = resolvePeerInput(repo, from, recipientStr);
   if ("error" in r) throw new SendRefused(r.code, r.error);
   const to = r.address;
   if (to.kind === "team") throw new SendRefused("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   if (to.kind === "alias" && !repo.aliases.find(to.address)) throw new SendRefused("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
-  const decision = canSend(ws.data.primary, { kind: "user", address: to.address }, { db: repo, now: hub.now(), humanReach: hub.humanReach });
+  const decision = canSend(from, { kind: "user", address: to.address }, { db: repo, now: hub.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.addresses)) {
     throw new SendRefused("not_found", `parent_id ${parentId} is not a message you sent or received`);
   }
-  return { to: to.address, body, parentId, pending, ids, digests };
+  return { from, to: to.address, body, parentId, pending, ids, digests };
 }
 
 // Writes the message and builds its result. Runs inside the caller's
@@ -1032,7 +1118,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(ws.data.primary, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.sessionId ?? null);
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.sessionId ?? null, ws.data.addresses);
   } catch (e) {
     if (e instanceof CoreError) {
       const r = coreRefusal(e);
@@ -1040,7 +1126,11 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
     }
     throw e;
   }
-  const f = { ...(p.pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
+  const f = {
+    ...(p.pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}),
+    // Named whenever it isn't the primary (S4).
+    ...(p.from !== ws.data.primary ? { sent_as: p.from } : {}),
+  };
   const seen = lastSeen(db, p.to);
   const payload: SendResult = registry.get(p.to)?.data.ready
     ? { message_id: msg.id, delivered_now: true, ...f }
@@ -1059,29 +1149,30 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
 // the push to a live recipient.
 function deliverSend(hub: Hub, ws: Ws, msg: MessageRow): void {
   for (const a of msg.attachments ?? []) {
-    writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.primary, message_id: msg.id, recipient: msg.recipient });
+    writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
   }
   const recipientWs = hub.registry.get(msg.recipient);
   if (recipientWs?.data.ready) send(recipientWs, { type: "push", message: showMessage(msg) });
 }
 
 // An append write, deduplicated (#254): an identical call by this session
-// within the window answers with the first one's result. The Slack bridge's
-// humans are exempt: a person typing a line twice sent it twice. `uploads`:
-// the call's attachment ids; a replay releases them (the retry uploaded its
-// files afresh, and nothing will bind them), audited like any release.
+// as the same `sender` within the window answers with the first one's
+// result. The Slack bridge's humans are exempt: a person typing a line twice
+// sent it twice. `uploads`: the call's attachment ids, any of the session's
+// addresses' (S5); a replay releases them (the retry uploaded its files
+// afresh, and nothing will bind them), audited like any release.
 function writeOnce<W extends Written>(
-  hub: Hub, ws: Ws, tool: DedupTool, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
+  hub: Hub, ws: Ws, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
 ): DedupOutcome<W> {
   const { repo } = hub;
   if (ws.data.human) return { fresh: repo.atomic(write) };
-  const { authed, primary: me } = ws.data;
+  const { authed } = ws.data;
   const out = dedupWrite(repo, hub.now(), {
-    tool, session: ws.data.sessionId!, sender: me, actor: authed.user_email, transport: "wss", args, resend,
+    tool, session: ws.data.sessionId!, sender, actor: authed.user_email, transport: "wss", args, resend,
   }, write, () => {
-    for (const row of dropUnsentUploads(hub.db, uploads, [me])) {
+    for (const row of dropUnsentUploads(hub.db, uploads, ws.data.addresses)) {
       writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
-        identity: me, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
+        identity: row.uploader, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
     }
   });
@@ -1092,10 +1183,11 @@ function writeOnce<W extends Written>(
 function handleSend(hub: Hub, ws: Ws, m: SendRequest): void {
   let out: DedupOutcome<Written<SendResult> & { msg: MessageRow }>;
   try {
-    const p = prepareSend(hub, ws, m.recipient, m.body, m.parent_id ?? null, m.pending === true, m.attachment_ids);
+    const parentId = m.parent_id ?? null;
+    const p = prepareSend(hub, ws, sendAs(hub, ws, m.as, parentId), m.recipient, m.body, parentId, m.pending === true, m.attachment_ids);
     // Keyed by what the server resolved, so two spellings of one call collide.
     const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
-    out = writeOnce(hub, ws, "dm_send", args, m.resend === true, p.ids, () => writeSend(hub, ws, p));
+    out = writeOnce(hub, ws, "dm_send", p.from, args, m.resend === true, p.ids, () => writeSend(hub, ws, p));
   } catch (e) {
     if (e instanceof SendRefused) return err(ws, m.req_id, e.code, e.message);
     throw e;
@@ -1142,10 +1234,10 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
   let picked: string | undefined;
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   try {
-    out = writeOnce(hub, ws, "delegate", args, m.resend === true, [], () => {
+    out = writeOnce(hub, ws, "delegate", ws.data.primary, args, m.resend === true, [], () => {
       const d = resolveDelegation(hub.db, ws.data.primary, { ...m, to }, online, humanReachable);
       picked = d.to;
-      const w = writeSend(hub, ws, prepareSend(hub, ws, d.to, d.body, null, true, undefined));
+      const w = writeSend(hub, ws, prepareSend(hub, ws, ws.data.primary, d.to, d.body, null, true, undefined));
       // The result is built by the same builder local uses (review 13): the
       // extra carries nothing delegation-specific, so the modes can't drift.
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
@@ -1220,10 +1312,19 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
     addresses: ws.data.addresses,
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, ws) } : {}),
   };
-  if (tool === "board_post") return handleBoardPost(hub, ws, reqId, args, ctx);
+  // `as`, else the first address that can see the board (#284 S3, S14).
+  let actor: string;
+  try {
+    actor = boardActor(db, tool, args, { addresses: ws.data.addresses, asAddresses: asAddresses(ws), ownScope: ws.data.authed.user_email });
+  } catch (e) {
+    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    throw e;
+  }
+  const { as: _as, ...rest } = args;
+  if (tool === "board_post") return handleBoardPost(hub, ws, reqId, actor, rest, ctx);
   let outcome;
   try {
-    outcome = callBoardTool(db, ws.data.primary, tool, args, ctx);
+    outcome = callBoardTool(db, actor, tool, rest, ctx);
   } catch (e) {
     if (e instanceof CoreError) {
       const r = coreRefusal(e);
@@ -1238,9 +1339,8 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
 
 // board_post, deduplicated (#254): a repeat replays the first post's result,
 // and a queue board gets no second work item.
-function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, unknown>, ctx: ToolContext): void {
+function handleBoardPost(hub: Hub, ws: Ws, reqId: string, me: string, args: Record<string, unknown>, ctx: ToolContext): void {
   const { db, repo } = hub;
-  const me = ws.data.primary;
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
   try {
@@ -1253,9 +1353,9 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, u
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
       parent_id: postArgs.parent_id ?? null,
-      attachments: uploadDigests(db, ids, [me]),
+      attachments: uploadDigests(db, ids, ws.data.addresses),
     };
-    out = writeOnce(hub, ws, "board_post", fp, resend === true, ids, () => {
+    out = writeOnce(hub, ws, "board_post", me, fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };

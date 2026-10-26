@@ -16,7 +16,7 @@ import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
-import { aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
+import { addressSet, aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -193,8 +193,11 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreD
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
   const handle = ownAddress(body.identity, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
+  if (body.args?.as !== undefined) return badRequest("name the address to act as in identity, not args.as");
   try {
-    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {});
+    // As the session the identity is or is held by: its claims under any of
+    // its addresses are its own here (#360).
+    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email) });
     wake(outcome.wake);
     return json(outcome.result);
   } catch (e) {

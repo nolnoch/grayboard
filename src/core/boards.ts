@@ -214,7 +214,7 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
     `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, f.model ?? null, f.effort ?? null);
+  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort));
   return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
 }
 
@@ -229,6 +229,13 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
     db.prepare(`INSERT OR REPLACE INTO pruned_ids (id, ended_at, pruned_at) SELECT id, ended_at, ? FROM ids WHERE ended_at < ? AND keyed = 1`).run(now, olderThanMs);
     return db.prepare(`DELETE FROM ids WHERE ended_at < ?`).run(olderThanMs).changes;
   }).immediate();
+}
+
+// A self-reported session fact (harness, model, effort; #284 S12) as stored:
+// one line of at most 64 characters, since peer_list puts it in other
+// agents' prompts. Empty is none.
+function cleanFact(v: string | null | undefined): string | null {
+  return v ? oneLine(v).slice(0, 64) || null : null;
 }
 
 /** A session used the bus: its last_seen moves. */
@@ -410,21 +417,29 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
-export function listBoards(db: Database, handle: string): BoardSummary[] {
-  const rows = db
-    .prepare(
-      `SELECT b.*, s.mode AS mode,
-              (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
-              CASE WHEN s.handle IS NULL THEN 0 ELSE
-                (SELECT COUNT(*) FROM posts p
-                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
-         FROM boards b
-         LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
-        ORDER BY b.name`,
-    )
-    .all(handle, handle, handle) as BoardSummary[];
+/**
+ * The boards `handles` can see (#284 S14): each row acts as the first of
+ * `handles` (primary first) that can see its board, so its mode and unread
+ * count are that address's subscription's, as board_read and board_subscribe
+ * without `as` would act.
+ */
+export function listBoards(db: Database, handles: string[]): BoardSummary[] {
+  const q = db.prepare(
+    `SELECT b.*, s.mode AS mode,
+            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+            CASE WHEN s.handle IS NULL THEN 0 ELSE
+              (SELECT COUNT(*) FROM posts p
+                WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
+       FROM boards b
+       LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
+      ORDER BY b.name`,
+  );
   const a = access(db);
-  return rows.filter((b) => a.canSee(handle, b));
+  const rows = new Map<string, BoardSummary>();
+  for (const h of handles) {
+    for (const b of q.all(h, h, h) as BoardSummary[]) if (!rows.has(b.name) && a.canSee(h, b)) rows.set(b.name, b);
+  }
+  return [...rows.values()].sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.

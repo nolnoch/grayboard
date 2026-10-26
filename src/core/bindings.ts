@@ -156,14 +156,16 @@ export function replySender(parent: { sender: string; recipient: string }, holds
 
 /**
  * The address set a caller acting as `address` reads as (#284 S8), for a
- * request that names one address (HTTP `?as=`): an ID with the aliases it
- * holds, or an alias with the ID of the session holding it when that session
- * is `principal`'s, so another principal's session ID never joins the set.
+ * request that names one address (HTTP `?as=`, `grayboard claim`): `address`
+ * first, then the rest of the address set of the session it is or that holds
+ * it, when that session is `principal`'s (null: local mode's one implicit
+ * scope), so another principal's session's addresses never join the set.
  */
-export function addressSet(db: Database, address: string, principal: string): string[] {
-  if (addressParts(address)?.kind === "id") return [address, ...holdsOf(db, address)];
-  const holder = db.prepare(`SELECT h.id, i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`).get(address) as { id: string; principal: string | null } | null;
-  return holder && holder.principal === principal ? [address, holder.id] : [address];
+export function addressSet(db: Database, address: string, principal: string | null): string[] {
+  const id = addressParts(address)?.kind === "id" ? address : holderOf(db, address);
+  const row = id === null ? undefined : idRow(db, id);
+  if (id === null || !row || row.principal !== principal) return [address];
+  return [address, ...sessionAddresses(db, id).filter((a) => a !== address)];
 }
 
 /**

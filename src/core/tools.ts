@@ -357,7 +357,8 @@ export function callBoardTool(
   if (a.as !== undefined) throw new Error(`${name}: "as" must be resolved by boardActor before callBoardTool`);
   switch (name) {
     case "board_list":
-      return { result: listBoards(db, handle), wake: [] };
+      // Each row acts as the first address that can see its board (S14).
+      return { result: listBoards(db, [handle, ...(ctx.addresses ?? []).filter((h) => h !== handle)]), wake: [] };
 
     case "board_create": {
       const team = optStr(a, "team");
