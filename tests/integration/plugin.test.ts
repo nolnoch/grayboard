@@ -425,6 +425,29 @@ test("a repeat of a lost write after the session's holds changed is refused unti
   }
 }, 20_000);
 
+test("a repeat of a lost dm_send with `as`, holds unchanged, replays the first result", async () => {
+  let lose = false;
+  const p = proxy(() => undefined, (frame) => {
+    const msg = JSON.parse(frame) as { type: string };
+    if (!lose || msg.type !== "send_ok") return frame;
+    lose = false;
+    setTimeout(() => p.drop(), 0);
+    return JSON.stringify({ ...msg, req_id: "lost" });
+  });
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    await be.call("bind", { name: "ops", create: true });
+    lose = true;
+    await expect(be.call("dm_send", { to: "be", body: "as ops", as: "ops" })).rejects.toThrow("Calling again with the same arguments within 10 minutes is safe");
+    const retry = await until(() => be.call("dm_send", { to: "be", body: "as ops", as: "ops" }).catch(() => null), 10_000, "the reconnect");
+    const rows = srv.app.db.query("SELECT id, sender FROM messages WHERE body = 'as ops'").all() as { id: number; sender: string }[];
+    expect(rows).toEqual([{ id: expect.any(Number), sender: "alice@example.com/ops" }]);
+    expect(retry).toMatchObject({ message_id: rows[0]!.id, replayed: { ref: { kind: "message", id: rows[0]!.id } } });
+  } finally {
+    p.stop(true);
+  }
+}, 30_000);
+
 test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {
   srv.stop();
   srv = new TestServer({ attachmentLimits: { file: 5, total: 10 } });

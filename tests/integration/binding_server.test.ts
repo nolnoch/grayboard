@@ -1072,3 +1072,35 @@ test("an upload made as one alias attaches to a send as another, and to a reply 
   expect(reply).toMatchObject({ type: "send_ok", attachments: [expect.objectContaining({ id: second })] });
   expect(senderOf(reply.message_id)).toBe(`${A}/b`);
 });
+
+// #259 with several aliases (spec AC 6): a stray holding b is refused a while
+// its holder lives and keeps writing as b; once the holder ends, a forged
+// restored_from gets a's mail and claims, but not the holder's status, and
+// leaves the stray's primary b.
+test("#259: a stray refused a while its holder lives takes it after the end, unverified, keeping its primary", async () => {
+  const p = srv.client(alice, "a");
+  await p.connect();
+  expect((await p.call("peer_status", { text: "p's task" })).type).toBe("call_ok");
+  expect(await p.call("claim_take", { key: "ticket:ENG-7" })).toMatchObject({ type: "call_ok", result: { claim: { holder: `${A}/a` } } });
+  const x = srv.client(alice, "b");
+  await x.connect();
+  expect(await x.bind("a", { restored_from: p.id })).toMatchObject({ type: "error", code: "alias_held" });
+  expect(await x.request({ type: "send", recipient: `${A}/a`, body: "from b" })).toMatchObject({ type: "send_ok" });
+  expect(await p.next((m) => m.type === "push" && m.message.body === "from b" && m.message.sender === `${A}/b`)).toBeDefined();
+
+  expect((await p.request({ type: "end" })).type).toBe("end_ok");
+  const peer = srv.client(bob, "fe");
+  await peer.connect();
+  expect(await peer.request({ type: "send", recipient: `${A}/a`, body: "for a" })).toMatchObject({ type: "send_ok", delivered_now: false });
+
+  expect(await x.bind("a", { restored_from: p.id })).toMatchObject({ type: "bind_ok", held: [`${A}/b`, `${A}/a`] });
+  expect(await x.next((m) => m.type === "push" && m.message.body === "for a", 3000)).toBeDefined();
+  expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([{ holder: `${A}/a` }]);
+  expect(events("a").slice(-2)).toEqual([
+    { session_id: p.id, event: "released", detail: "session_end: exit" },
+    { session_id: x.id, event: "bound", detail: `restore claimed from ${p.id}, not verified` },
+  ]);
+  expect(status(`${A}/a`)).toBeNull();
+  const sent = await x.request({ type: "send", recipient: "bob@example.com/fe", body: "who am i" });
+  expect(rows(`SELECT sender FROM messages WHERE id = ?`, sent.message_id)).toEqual([{ sender: `${A}/b` }]);
+});
