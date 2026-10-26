@@ -411,7 +411,7 @@ function serverBoundInstructions(name: string, general: boolean, named: string[]
     () => [
       ...(hello.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
       ...(hello.human?.linked ? ownHumanInstruction(hello.human.handle) : []),
-      `Handles are user@org/name; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own identity of that name if you have one, else the one person on the board with it; @user/name or @user@org/name is exact.`,
+      `Handles are scope/name (user@org/name for a person's, team/name for a team's) or id:… for a session; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own scope's name if there is one, else the one on the board with it (if several, name one); @scope/name and @id:… are exact.`,
     ],
     named,
   );
