@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 
 import { aliasScope, addressParts } from "./addresses.ts";
-import { SESSION_ID, asSessionId, crockford13, idAddress, mintSessionKey } from "./bindings.ts";
+import { asSessionId, idAddress, mintSessionKey } from "./bindings.ts";
+import { SESSION_ID, crockford13 } from "./session_id.ts";
 
 // #284 decision 2: the session ID is the same 64 bits, as 13 Crockford characters.
 test("crockford13 encodes 64 bits as 13 lowercase Crockford characters, big-endian", () => {

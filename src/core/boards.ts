@@ -4,8 +4,10 @@ import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts"
 import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
-import { aliasScope } from "./addresses.ts";
+import { addressParts, aliasScope } from "./addresses.ts";
 import { writeCoreAudit } from "./audit.ts";
+import { SESSION_ID_PATTERN } from "./session_id.ts";
+import { undeliverableId } from "./session_end.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
 export type CoreDb = Database;
@@ -21,10 +23,13 @@ export function checkBody(body: unknown): string {
   }
   return body;
 }
-// @name, @local/name, @user@org.com/name. Not preceded by a word char or @,
-// so plain email addresses in prose aren't mentions.
-const MENTION_RE =
-  /(?:^|[^\w@])@([a-z0-9._%+-]+(?:@[a-z0-9.-]+\.[a-z]{2,})?(?:\/[a-z0-9_-]{1,32})?)/gi;
+// @id:<13 Crockford> (a session, #284), @name, @local/name, @user@org.com/name.
+// Not preceded by a word char or @, so plain email addresses in prose aren't
+// mentions. A malformed @id:… is the alias "id", as before IDs.
+const MENTION_RE = new RegExp(
+  `(?:^|[^\\w@])@(${SESSION_ID_PATTERN}(?![0-9a-z])|[a-z0-9._%+-]+(?:@[a-z0-9.-]+\\.[a-z]{2,})?(?:\\/[a-z0-9_-]{1,32})?)`,
+  "gi",
+);
 
 export type SubMode = "push" | "digest" | "quiet";
 
@@ -75,7 +80,9 @@ export type Access = {
   // Returns an error message, or null if allowed.
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
-  resolveMention(token: string, author: string, board: Board): string | null;
+  // `strict`: a token that names a session that can't receive refuses the
+  // post instead of going unresolved.
+  resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
   // The board only a human handle can start posts on, or null for none.
@@ -89,7 +96,16 @@ export const openAccess = (db: Database): Access => ({
   announceBoard: ANNOUNCE_BOARD,
   canSee: () => true,
   checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
-  resolveMention: (token) => {
+  // An @id: is the session itself; one that can't receive refuses an
+  // author's post, as a direct message to it would (#284 S7, S9). A system
+  // post (a claim event quoting its key) leaves it unresolved: a key that
+  // names a since-ended ID must not refuse every later sweep and end.
+  resolveMention: (token, _author, _board, strict) => {
+    if (addressParts(token)?.kind === "id") {
+      const why = undeliverableId(db, token);
+      if (why && strict) throw new CoreError(why);
+      return why ? null : token;
+    }
     if (!BOARD_NAME_RE.test(token)) return null;
     const row = db.prepare(`SELECT address FROM aliases WHERE address = ?`).get(token) as
       | { address: string }
@@ -152,27 +168,55 @@ export type IdFacts = {
   cwd?: string | null;
   place?: string | null;
   launcher: boolean;
+  // A tools-only process (#284 S7): receives nothing, writes as this alias.
+  writesAs?: string;
+  // A `grayboard tail` (#284 S9): never listed or addressable.
+  viewer?: boolean;
+  // The ID came from a session key (#284 S10): retention leaves a tombstone for it.
+  keyed?: boolean;
 };
 
-/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
 export function idCollisionText(id: string, why: string): string {
   return `id_collision: ${id} ${why}; start with a new session key`;
 }
 
+/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
 export class IdCollision extends CoreError {
   constructor(readonly id: string, readonly endedAt: number | null) {
     super(idCollisionText(id, endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`));
   }
 }
 
-/** A new session's ids row. Throws IdCollision if the ID already has one. */
-export function registerId(db: Database, f: IdFacts, now = Date.now()): void {
+/** A keyed ID retention pruned (#284 S10), which a new session has presented again. */
+export type ReusedId = { ended_at: number; pruned_at: number };
+
+/**
+ * A new session's ids row. Throws IdCollision if the ID already has one.
+ * Returns the pruned session's tombstone when the ID is a key re-used after
+ * retention deleted its row, for the caller to audit as id.reused; null
+ * otherwise. Callers are inside a transaction.
+ */
+export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId | null {
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0);
+  return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
+}
+
+/**
+ * Retention for session IDs (#284 S10, decision 4): delete the ids rows of
+ * sessions that ended before `olderThanMs`. Nothing else names an ended ID
+ * but provenance text (binding_events, sender_id, audit rows), which stays.
+ * A keyed row leaves a pruned_ids tombstone. Returns how many it deleted.
+ */
+export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now()): number {
+  return db.transaction(() => {
+    db.prepare(`INSERT OR REPLACE INTO pruned_ids (id, ended_at, pruned_at) SELECT id, ended_at, ? FROM ids WHERE ended_at < ? AND keyed = 1`).run(now, olderThanMs);
+    return db.prepare(`DELETE FROM ids WHERE ended_at < ?`).run(olderThanMs).changes;
+  }).immediate();
 }
 
 /** The principal of session `id`'s row, or undefined when it has none. */
@@ -184,11 +228,6 @@ export function idPrincipal(db: Database, id: string): string | null | undefined
 /** A session used the bus: its last_seen moves. */
 export function touchId(db: Database, id: string, now = Date.now()): void {
   db.prepare(`UPDATE ids SET last_seen = ? WHERE id = ?`).run(now, id);
-}
-
-/** A local session ended (#284): its ID is never taken again. */
-export function endId(db: Database, id: string, now = Date.now()): void {
-  db.prepare(`UPDATE ids SET ended_at = ? WHERE id = ? AND ended_at IS NULL`).run(now, id);
 }
 
 /**
@@ -247,9 +286,9 @@ export function setStatus(db: Database, handle: string, text: string, now = Date
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
   touchAlias(db, handle, now);
-  const r = db
-    .prepare(`UPDATE ids SET status = ?, status_at = ? WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`)
-    .run(t || null, t ? now : null, handle);
+  // An ID-only session (#284 S13) sets its own row; a name, its holder's.
+  const session = addressParts(handle)?.kind === "id" ? `?3 AND ended_at IS NULL` : `(SELECT id FROM alias_holds WHERE address = ?3)`;
+  const r = db.prepare(`UPDATE ids SET status = ?1, status_at = ?2 WHERE id = ${session}`).run(t || null, t ? now : null, handle);
   if (r.changes === 0) throw new CoreError(`no live session holds "${handle}", so it has no status to set`);
 }
 
@@ -442,12 +481,13 @@ function resolveMentions(
   body: string,
   author: string,
   board: Board,
+  strict: boolean,
 ): { handles: string[]; unresolved: string[] } {
   const a = access(db);
   const handles = new Set<string>();
   const unresolved: string[] = [];
   for (const t of mentionTokens(body)) {
-    const h = a.resolveMention(t, author, board);
+    const h = a.resolveMention(t, author, board, strict);
     if (h && a.canSee(h, board)) handles.add(h);
     else unresolved.push(t);
   }
@@ -479,18 +519,27 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // sessions' instructions. attachments: the poster's unbound uploads to
 // carry, bound in the post's transaction under the mode's size caps.
 // author_id: the posting session's ID (#284), when the writer is a session.
+// addresses: the poster's address set (#284 S5), `handle` its primary; a
+// queue claim held by any of them is acked, and none of them is pushed the post.
 export type PostOpts = {
   online?: (handle: string) => boolean;
+  addresses?: string[];
   author_id?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; limits?: AttachmentLimits };
+  // An author's own words: an @id: that can't receive refuses the post.
+  // Unset (system posts), it goes unresolved.
+  strictIds?: boolean;
 };
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
 // (never-woken first, then by handle). A lane is a push subscriber who isn't
 // the poster, hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer. With `online`, live lanes come first; offline lanes are
-// the fallback in the same order, so an empty live set still delivers.
+// read-only viewer. A session's lane is the alias it holds, else its ID
+// (#284 S8; an ID can't opt out), whichever address it subscribed under: a
+// session that subscribed unbound stays in the rotation after it binds. With
+// `online`, live lanes come first; offline lanes are the fallback in the same
+// order, so an empty live set still delivers.
 export function queueLanes(
   db: Database,
   b: Board,
@@ -498,13 +547,20 @@ export function queueLanes(
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
+  const isViewer = viewers(db);
   const rows = (
     db
       .prepare(
-        `SELECT s.handle FROM subscriptions s JOIN aliases h ON h.address = s.handle
-         WHERE s.board = ? AND s.mode = 'push' AND s.handle != ? AND h.queue_off IS NULL
+        `WITH lanes AS (
+           SELECT COALESCE(ah.address, s.handle) AS lane FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle
+           WHERE s.board = ?1 AND s.mode = 'push')
+         SELECT l.lane AS handle FROM lanes l LEFT JOIN aliases h ON h.address = l.lane
+         LEFT JOIN ids i ON i.id = l.lane
+         WHERE l.lane != ?2
+           AND (h.address IS NOT NULL AND h.queue_off IS NULL OR i.id IS NOT NULL AND i.ended_at IS NULL)
+         GROUP BY l.lane
          ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                    WHERE o2.handle = s.handle AND p2.board = s.board) ASC NULLS FIRST, s.handle ASC`,
+                    WHERE o2.handle = l.lane AND p2.board = ?1) ASC NULLS FIRST, l.lane ASC`,
       )
       .all(b.name, poster) as { handle: string }[]
   )
@@ -604,6 +660,7 @@ export function post(
   }
   const files = opts.attachments ?? { ids: [] };
   if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
+  const isViewer = viewers(db);
 
   return db.transaction((): PostResult => {
     const now = Date.now();
@@ -637,7 +694,7 @@ export function post(
     const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       if (mentioned.length === 0) {
@@ -663,7 +720,7 @@ export function post(
       for (const s of subs)
         if (s.mode === "push" && !queueBoard) targets.set(s.handle, { reason: "subscription", wake: true });
       if (announcement) {
-        for (const h of rosterHandles(db)) {
+        for (const h of liveAddresses(db)) {
           if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
         }
       } else if (parentId !== null) {
@@ -682,7 +739,7 @@ export function post(
         const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
         for (const m of muted) targets.delete(m.handle);
       }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
@@ -691,9 +748,9 @@ export function post(
     // release instead of an expire (#192 review). Another lane's reply leaves
     // the holder on the hook. No redelivery: handled is handled.
     if (parentId !== null && (b.kind ?? "broadcast") === "queue") {
-      ackQueueClaim(db, handle, `queue:${board}:${threadRoot(db, parentId)}`, now);
+      ackQueueClaim(db, opts.addresses ?? [handle], `queue:${board}:${threadRoot(db, parentId)}`, now);
     }
-    targets.delete(handle);
+    for (const a of opts.addresses ?? [handle]) targets.delete(a);
 
     const ins = db.prepare(
       `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
@@ -752,16 +809,22 @@ export type Peer = {
   queue_off?: true;
   launcher?: true;
 };
-// Read-only viewers (`grayboard tail`) and unbound sessions (#182) act under
-// "~" handles, which no identity can have: locally "~<id>", on a server
-// "<email>/~<id>". They aren't agents: keep them out of the roster.
-export const isViewer = (handle: string): boolean => handle.startsWith("~") || handle.includes("/~");
+/**
+ * Which handles are read-only viewers, kept out of the roster, rotations and
+ * notified lists: a `grayboard tail` session (ids.viewer, #284 S9), and the
+ * "~" handles no identity can have: a 1.x local tail's "~tail-<pid>", and a
+ * server's "<email>/~<id>" (until PR 3). Read once per call.
+ */
+export function viewers(db: Database): (handle: string) => boolean {
+  const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
+  return (h) => h.startsWith("~") || h.includes("/~") || ids.has(h);
+}
 
-// A live session with no name yet (#182): shown so the user and other agents
-// see what's running, never messageable, so it has no handle.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; self?: true };
+// A live session with no name yet (#182), addressed by its session ID
+// (#284), with the status it set as that ID.
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true };
 
-// `you` is left out for an unbound session: its "~" handle can't be addressed.
+// `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // The session an alias's metadata comes from (#284): its holder, or once
@@ -786,6 +849,7 @@ export function who(
   online: (h: string) => boolean,
   unbound: UnboundPeer[] = [],
 ): WhoResult {
+  const isViewer = viewers(db);
   type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
   const held = `EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address AND h.id = i.id)`;
   const cols = `a.last_seen, i.cwd, i.place, CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
@@ -793,16 +857,26 @@ export function who(
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
     const acc = access(db);
-    rows = (
-      db
-        .prepare(
-          `SELECT s.handle, s.mode, ${cols} FROM subscriptions s
-             LEFT JOIN aliases a ON a.address = s.handle
-             LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
-            WHERE s.board = ? ORDER BY s.handle`,
-        )
-        .all(b.name) as typeof rows
-    ).filter((r) => acc.canSee(r.handle, b));
+    // A subscription an unbound session took as its ID is listed under the
+    // name the session now holds (as queueLanes does), or as the ID with its
+    // own session's facts; a name's own subscription wins over its ID's.
+    const idCols = `COALESCE(a.last_seen, i.last_seen) AS last_seen, i.cwd, i.place,
+      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
+      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
+    const subs = db
+      .prepare(
+        `SELECT m.handle, m.mode, m.own, ${idCols} FROM (
+             SELECT COALESCE(ah.address, s.handle) AS handle, s.mode, ah.address IS NULL AS own
+               FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle WHERE s.board = ?) m
+           LEFT JOIN aliases a ON a.address = m.handle
+           LEFT JOIN ids i ON i.id = COALESCE(${ALIAS_SESSION_SQL}, m.handle)
+          ORDER BY m.handle, m.own DESC`,
+      )
+      .all(b.name) as (Row & { own: number })[];
+    rows = subs
+      .filter((r, n) => n === 0 || subs[n - 1]!.handle !== r.handle)
+      .map(({ own: _, ...r }) => r)
+      .filter((r) => acc.canSee(r.handle, b));
   } else {
     rows = db
       .prepare(
@@ -828,7 +902,7 @@ export function who(
       ...(r.launcher ? { launcher: true as const } : {}),
     };
   });
-  // Unbound sessions subscribe to nothing, so a board's roster has none.
+  // A board's roster lists its unbound subscribers by ID among its peers.
   const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
   const you = isViewer(handle) ? {} : { you: handle };
   if (opts.include_offline) return { ...you, peers: all, ...sessions };
@@ -837,9 +911,11 @@ export function who(
   return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
-// When a handle last had a session, or null if it never connected.
+// When a handle last had a session, or null if it never connected. An ID's
+// is its own session's (#284 S8).
 export function lastSeen(db: Database, handle: string): number | null {
-  const row = db.prepare(`SELECT last_seen FROM aliases WHERE address = ?`).get(handle) as { last_seen: number | null } | undefined;
+  const sql = addressParts(handle)?.kind === "id" ? `SELECT last_seen FROM ids WHERE id = ?` : `SELECT last_seen FROM aliases WHERE address = ?`;
+  const row = db.prepare(sql).get(handle) as { last_seen: number | null } | undefined;
   return row?.last_seen ?? null;
 }
 
@@ -854,9 +930,25 @@ export function sessionsSeen(db: Database, handles: string[]): Map<string, { las
   return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
-/** Every handle in the roster, for a mode that must check liveness up front. */
+/** Every handle in the roster: the aliases that have had a session. */
 export function rosterHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE last_seen IS NOT NULL`).all() as { address: string }[]).map((r) => r.address);
+}
+
+/**
+ * Every address that may have a live session, for a mode that must check
+ * liveness up front (#284 S8): the roster, and the session IDs that haven't
+ * ended, deliver, aren't viewers and hold no alias (a bound session is
+ * reached through its alias).
+ */
+export function liveAddresses(db: Database): string[] {
+  const ids = db
+    .prepare(
+      `SELECT id FROM ids i WHERE ended_at IS NULL AND delivery = 'push' AND viewer = 0
+         AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id) ORDER BY id`,
+    )
+    .all() as { id: string }[];
+  return [...rosterHandles(db), ...ids.map((r) => r.id)];
 }
 
 // A human's announcements still inside their TTL, oldest first.

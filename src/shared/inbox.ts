@@ -2,10 +2,10 @@ import { age } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; parent_id?: number; age: string; body: string; attachments?: AttachmentInfo[] };
+export type InboxItem = { id: number; from: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
+export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
@@ -13,8 +13,9 @@ export const MAX_INBOX_DAYS = 30;
 export const PROMISE_DAYS = MAX_INBOX_DAYS;
 const SNIPPET = 300;
 
-// Candidates with no later message from `me` in the same thread.
-function lastWord<M extends Msg>(me: string, candidates: M[], threadOf: (id: number) => Msg[]): M[] {
+// Candidates with no later message from `me` (the session's address set,
+// #284 S5) in the same thread.
+function lastWord<M extends Msg>(me: string[], candidates: M[], threadOf: (id: number) => Msg[]): M[] {
   const threadById = new Map<number, Msg[]>();
   return candidates.filter((m) => {
     let t = threadById.get(m.id);
@@ -22,13 +23,14 @@ function lastWord<M extends Msg>(me: string, candidates: M[], threadOf: (id: num
       t = threadOf(m.id);
       for (const x of t) threadById.set(x.id, t);
     }
-    return !t.some((x) => x.sender === me && x.id > m.id);
+    return !t.some((x) => me.includes(x.sender) && x.id > m.id);
   });
 }
 
 function item(m: Msg, now: number) {
   return {
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
+    ...(m.kind ? { kind: m.kind } : {}),
     age: age(now - m.created_at),
     body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
     ...(m.attachments ? { attachments: m.attachments } : {}),
@@ -37,22 +39,23 @@ function item(m: Msg, now: number) {
 
 // Received messages still owed an answer: no later message from `me` in the
 // same thread. Candidates are already windowed and filtered of acks.
-export function unanswered(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
+export function unanswered(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): InboxItem[] {
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, from: m.sender, ...item(m, now) }));
 }
 
 // Messages `me` sent pending that are still its latest in their thread: a
 // follow-up it promised. Candidates are `me`'s pending sends, windowed by
 // PROMISE_DAYS and filtered of its own acks.
-export function promised(me: string, candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): PromiseItem[] {
+export function promised(me: string[], candidates: Msg[], threadOf: (id: number) => Msg[], now = Date.now()): PromiseItem[] {
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, to: m.recipient, ...item(m, now) }));
 }
 
-// pending is stored as 0/1; rows show it only when set, so history and
-// threads don't pay for it on every message.
-export function showPending<M extends { pending: number | boolean }>(m: M): Omit<M, "pending"> & { pending?: true } {
-  const { pending, ...rest } = m;
-  return pending ? { ...rest, pending: true } : rest;
+// A message as a read shows it. pending is stored as 0/1 and kind as null
+// for an ordinary message; rows show each only when set, so history and
+// threads don't pay for them on every message.
+export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null }>(m: M): Omit<M, "pending" | "kind"> & { pending?: true; kind?: "bounce" } {
+  const { pending, kind, ...rest } = m;
+  return { ...rest, ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}) };
 }
 
 // dm_history's limit, checked alike in both modes (#75).

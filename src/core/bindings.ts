@@ -6,6 +6,7 @@ import type { Database } from "bun:sqlite";
 import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
+import { SESSION_ID, crockford13 } from "./session_id.ts";
 import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -22,24 +23,6 @@ export function mintSessionKey(): string {
 
 /** A session key's shape: 64 lowercase hex characters. */
 export const SESSION_KEY = /^[0-9a-f]{64}$/;
-
-// Crockford's base32, lowercased: no i, l, o or u, so an ID reads back
-// unambiguously. IDs are only ever compared, never decoded.
-const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
-
-/** 16 hex characters (64 bits) as 13 Crockford base32 characters. */
-export function crockford13(hex16: string): string {
-  let n = BigInt(`0x${hex16}`);
-  let out = "";
-  for (let i = 0; i < 13; i++) {
-    out = CROCKFORD[Number(n & 31n)]! + out;
-    n >>= 5n;
-  }
-  return out;
-}
-
-/** A session ID's shape: `id:` and 13 Crockford characters. */
-export const SESSION_ID = /^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/;
 
 /** The session ID a key stands for: the first 64 bits of its SHA-256, as an `id:` address. */
 export function idAddress(key: string): string {
@@ -72,6 +55,11 @@ export function holdAlias(db: Database, address: string, id: string, now = Date.
 /** Session `id` no longer holds `address`; a hold another session took since stays. */
 export function dropHold(db: Database, address: string, id: string): void {
   db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);
+}
+
+/** The session holding `address` now, or null. */
+export function holderOf(db: Database, address: string): string | null {
+  return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
 }
 
 /** At server start: no connection outlives the server, so no hold is live. */
@@ -213,6 +201,17 @@ export function unboundInstruction(candidates: Candidate[], notes: string[] = []
   return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
 }
 
+/**
+ * A local session with no name (#284 S13): it acts as its ID. One sentence
+ * beside its bound instructions, with `notes` on why it has no name and the
+ * candidates.
+ */
+export function localUnboundInstruction(id: string, candidates: Candidate[], notes: string[] = []): string {
+  const why = notes.map((n) => ` ${n}`).join("");
+  const list = candidates.length ? ` Candidates (free now): ${candidates.map(describe).join("; ")}.` : "";
+  return `This session has no bus name yet, so it acts as its ID: peers reach it at ${id}, and it posts, sends and claims as ${id}.${why} Bind a name with bind(name) once you know your task; what the ID has stays with this session.${list}`;
+}
+
 /** An explicit name a live session already held at start. */
 export function heldNote(name: string, holder: string): string {
   return `BUS_IDENTITY asked for "${name}", but ${holder} holds it, so this session started without a name.`;
@@ -269,8 +268,15 @@ export function bindTarget(a: Record<string, unknown>, bound: string | null, pus
 }
 
 /** peer_list's row for a live session with no name. */
-export function unboundPeer(sessionId: string, where: string | null, self: boolean): UnboundPeer {
-  return { session_id: sessionId, unbound: true, online: true, ...(where ? { where } : {}), ...(self ? { self: true } : {}) };
+export function unboundPeer(sessionId: string, where: string | null, self: boolean, status?: { text: string; age: string }): UnboundPeer {
+  return {
+    session_id: sessionId,
+    unbound: true,
+    online: true,
+    ...(where ? { where } : {}),
+    ...(status ? { status: status.text, status_age: status.age } : {}),
+    ...(self ? { self: true } : {}),
+  };
 }
 
 /**
@@ -280,15 +286,16 @@ export function unboundPeer(sessionId: string, where: string | null, self: boole
  * a rebind, which the model already has. `structuredContent` carries the full
  * set, name and general alike, for adapters that replace their system-prompt
  * section with it (pi, opencode), so they never parse the text.
+ * `generalKnown`: an unbound session already had the general part (local).
  */
-export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
+export function bindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = [], generalKnown = false) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
     ...notes,
-    ...instructions(previous === null),
+    ...instructions(previous === null && !generalKnown),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }

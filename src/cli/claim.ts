@@ -91,10 +91,11 @@ async function localView(): Promise<LocalView> {
   const { ancestors } = await import("../shared/proc.ts");
   const { localDbPath, openLocalDb } = await import("../local/open.ts");
   if (!existsSync(localDbPath())) return { sessions: [], ancestors: ancestors() };
-  const { liveSessions } = await import("../local/binding.ts");
-  const db = openLocalDb();
+  const { deliverEnded } = await import("../local/wakeup.ts");
+  const { db, ended, live } = openLocalDb();
   try {
-    return { sessions: liveSessions(db), ancestors: ancestors() };
+    await deliverEnded(db, ended);
+    return { sessions: live, ancestors: ancestors() };
   } finally {
     db.close();
   }
@@ -118,14 +119,20 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   const { localDbPath } = await import("../local/open.ts");
   const hint = `; check which handle this shell acts as with grayboard whoami, or pass --as`;
   if (!existsSync(localDbPath())) throw new Error(`no session has used handle "${name}"${hint}`);
-  const { db } = await import("../local/db.ts");
+  const { db, openEnded } = await import("../local/db.ts");
   const { isHuman, lastSeen } = await import("../core/boards.ts");
   const { callBoardTool } = await import("../core/tools.ts");
-  const { poke } = await import("../local/wakeup.ts");
+  const { holderOf } = await import("../core/bindings.ts");
+  const { deliverEnded, poke } = await import("../local/wakeup.ts");
+  await deliverEnded(db, openEnded);
   // The human's handle speaks with the human's authority (#announce), which nothing an agent can run may borrow.
   if (isHuman(db, name)) throw new Error(`"${name}" is the human handle; claim commands can't act as it`);
   if (lastSeen(db, name) === null) throw new Error(`no session has used handle "${name}"${hint}`);
-  const outcome = callBoardTool(db, name, tool, args);
+  // As the session holding the name: its address set, so a claim it took
+  // under its ID before binding is its own here too (#284 S5). No `session`:
+  // this process wrote the post, not that session.
+  const holder = holderOf(db, name);
+  const outcome = callBoardTool(db, name, tool, args, { addresses: holder ? [name, holder] : [name] });
   // The acting session too: a wakeup re-arms its claim-expiry timer, as its own tool call would.
   await Promise.all([...new Set([...outcome.wake, name])].map((h) => poke(h)));
   return outcome.result;

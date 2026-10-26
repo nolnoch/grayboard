@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   acknowledge,
   createBoard,
+  getBoard,
+  queueLanes,
   pendingFor,
   post,
   setAccess,
@@ -115,6 +117,20 @@ test("a reply by the claim holder acks and releases the claim", () => {
   expect(claimEvents(claimKey(r.post.id)).filter((e) => e.event === "take").length).toBe(1);
 });
 
+// #284 S5: a queue post taken by a session's ID is acked by its reply as its
+// alias; the ack is logged under the holder, and the poster isn't pushed its
+// own reply under either address.
+test("a reply by any of the holder's addresses acks the claim as the holder", () => {
+  const ID = "id:0123456789abc";
+  const r = post(db, "be", "work", "work item"); // fe claims
+  db.prepare(`UPDATE claims SET holder = ? WHERE key = ?`).run(ID, claimKey(r.post.id));
+  subscribe(db, ID, "work", "push");
+  const reply = post(db, "fe", "work", "done", r.post.id, { addresses: ["fe", ID] });
+  expect(reply.wake).not.toContain(ID);
+  expect(listClaims(db).some((c) => c.key === claimKey(r.post.id))).toBe(false);
+  expect(claimEvents(claimKey(r.post.id)).at(-1)).toEqual({ event: "release", handle: ID });
+});
+
 test("a holder's reply after its claim lapsed, before the sweep, still acks; the sweep redelivers nothing (#234)", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
   db.prepare(`UPDATE claims SET expires_at = 1 WHERE key = ?`).run(claimKey(r.post.id));
@@ -166,6 +182,27 @@ test("the rotation prefers live lanes and falls back to offline ones", () => {
   const r3 = post(db, "be", "work", "third work item", null, { online: () => false });
   expect(r3.wake.length).toBe(1);
   expect(["fe", "sim"]).toContain(r3.wake[0]!);
+});
+
+// #284 S6: an unbound live session is a lane by its ID; once it holds an
+// alias the alias is the lane (audit W9: the subscription stays under the
+// ID, so the session stays in the rotation), and an ended ID is none.
+test("an unbound live ID subscribed to a queue is a lane by its ID, then by the alias it binds; ended, none", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  subscribe(db, ID, "work", "push");
+  const lanes = () => queueLanes(db, getBoard(db, "work")!, "be").sort();
+  expect(lanes()).toEqual(["fe", ID, "sim"].sort());
+  expect(post(db, "be", "work", "for the live one", null, { online: (h) => h === ID }).wake).toEqual([ID]);
+  ensureAlias(db, "qa", "test");
+  holdAlias(db, "qa", ID);
+  expect(lanes()).toEqual(["fe", "qa", "sim"]);
+  expect(post(db, "be", "work", "for the bound one", null, { online: (h) => h === "qa" }).wake).toEqual(["qa"]);
+  setQueueParticipation(db, "qa", false);
+  expect(lanes()).toEqual(["fe", "sim"]);
+  db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(ID);
+  db.prepare(`UPDATE ids SET ended_at = 1 WHERE id = ?`).run(ID);
+  expect(lanes()).toEqual(["fe", "sim"]);
 });
 
 test("a read-only viewer is never picked by the rotation", () => {

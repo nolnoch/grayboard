@@ -207,6 +207,39 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
     CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
+  // Session end and kinds (#284 PR 2). held_aliases_json: the aliases the ID
+  // held when it ended, for the id_ended hint and bounces. delivery: 'push'
+  // (default) or 'none', a tools-only process (BUS_PUSH=off) that receives
+  // nothing; writes_as: the alias such a process writes as, which a send to
+  // its ID is pointed at. viewer: a `grayboard tail` session, never listed or addressable.
+  const idCols = new Set((db.prepare(`PRAGMA table_info(ids)`).all() as { name: string }[]).map((c) => c.name));
+  if (!idCols.has("held_aliases_json")) db.exec(`ALTER TABLE ids ADD COLUMN held_aliases_json TEXT`);
+  if (!idCols.has("delivery")) db.exec(`ALTER TABLE ids ADD COLUMN delivery TEXT NOT NULL DEFAULT 'push'`);
+  if (!idCols.has("writes_as")) db.exec(`ALTER TABLE ids ADD COLUMN writes_as TEXT`);
+  if (!idCols.has("viewer")) {
+    db.exec(`ALTER TABLE ids ADD COLUMN viewer INTEGER NOT NULL DEFAULT 0`);
+    // A local tail's 1.x `~tail-<pid>` handle had its rows swept by the next
+    // tail; viewers are ids rows now, ended like any session, so the old
+    // handles' rows go once, on the open that adds the column.
+    db.exec(`DELETE FROM subscriptions WHERE handle LIKE '~tail-%'; DELETE FROM outbox WHERE handle LIKE '~tail-%';`);
+  }
+  // viewers() reads the viewer rows on every post.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_viewer ON ids(id) WHERE viewer = 1`);
+  // keyed: the ID came from a session key (#284 S10), so a later session can
+  // present it again. Retention deletes an ended ids row (pruneEndedIds); a
+  // keyed one leaves a pruned_ids row, so a key re-used after the prune is
+  // audited id.reused rather than registering silently. Unkeyed IDs are
+  // random and never come back, so they leave none.
+  if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pruned_ids (
+      id         TEXT PRIMARY KEY,
+      ended_at   INTEGER NOT NULL,
+      pruned_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ids_ended ON ids(ended_at) WHERE ended_at IS NOT NULL;
+  `);
+
   // The 1.x roster's later columns, which each mode's alias seed reads.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"], ["launcher", "INTEGER"]]) {

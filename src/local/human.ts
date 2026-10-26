@@ -1,10 +1,10 @@
 // `grayboard human`, `grayboard announce` and `grayboard board create`: the human's own commands on the
 // local bus. They run in the human's terminal (or as `! grayboard announce …`
 // inside a session), never through an agent's tools.
-import { db } from "./db.ts";
-import { poke } from "./wakeup.ts";
+import { db, openEnded } from "./db.ts";
+import { deliverEnded, poke } from "./wakeup.ts";
 import { declareLocalHuman } from "./binding.ts";
-import { ANNOUNCE_BOARD, createBoard, humanHandles, isViewer, post, rosterHandles, subscribe } from "../core/boards.ts";
+import { ANNOUNCE_BOARD, createBoard, humanHandles, liveAddresses, post, subscribe, viewers } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import { parseTtl as parseDuration } from "../shared/ttl.ts";
@@ -20,6 +20,7 @@ export function parseTtl(text: string): number {
 
 /** Show the declared human handle, or declare `handle` as it. */
 export async function runHuman(handle?: string): Promise<void> {
+  await deliverEnded(db, openEnded);
   if (handle === undefined) {
     const humans = humanHandles(db);
     console.log(humans.length ? humans.join("\n") : "No human handle declared. Declare yours: grayboard human <handle>");
@@ -40,13 +41,15 @@ export function declaredHuman(): string {
 
 /** Post an announcement as the human to every live session. */
 export async function runAnnounce(body: string, ttl?: string): Promise<void> {
+  await deliverEnded(db, openEnded);
   const human = declaredHuman();
   const ttl_ms = ttl === undefined ? undefined : parseTtl(ttl);
   // Probing a socket also wakes its session; it drains nothing until the post lands.
-  const others = rosterHandles(db).filter((h) => h !== human && !isViewer(h));
+  const isViewer = viewers(db);
+  const others = liveAddresses(db).filter((h) => h !== human && !isViewer(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
-  const r = post(db, human, ANNOUNCE_BOARD, body, null, { online: (h) => live.has(h), ttl_ms });
+  const r = post(db, human, ANNOUNCE_BOARD, body, null, { online: (h) => live.has(h), ttl_ms, strictIds: true });
   await Promise.all(r.wake.map((h) => poke(h)));
   const reached = r.wake.filter((h) => !isViewer(h));
   console.log(
@@ -59,7 +62,8 @@ export async function runAnnounce(body: string, ttl?: string): Promise<void> {
 
 /** Create a board as the human. It starts quiet for them: replies to their
  * posts and @mentions still arrive, every other post doesn't. */
-export function runBoardCreate(name: string, purpose: string): void {
+export async function runBoardCreate(name: string, purpose: string): Promise<void> {
+  await deliverEnded(db, openEnded);
   const human = declaredHuman();
   const b = createBoard(db, human, name, purpose);
   subscribe(db, human, b.name, "quiet");

@@ -152,6 +152,7 @@ describe("type detection and names", () => {
     const msg = { id: 7, sender: "be", body: "hi", parent_id: null, created_at: 1 };
     const file = { id: 12, filename: "a.png", type: "image/png", size: 3, sha256: "a".repeat(64) };
     expect(dmNotification(msg).meta).toEqual({ message_id: "7", from: "be", created_at: "1" });
+    expect(dmNotification({ ...msg, kind: "bounce" }).meta).toEqual({ message_id: "7", from: "be", created_at: "1", kind: "bounce" });
     expect(dmNotification({ ...msg, attachments: [file] }).meta).toMatchObject({
       attachments: formatAttachmentsMeta([file]),
       files_tool: expect.stringMatching(/^attachment_get\(id/),

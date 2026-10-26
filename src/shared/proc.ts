@@ -169,3 +169,12 @@ export function launcherName(pid: number): string | null {
     : (ps("args", [pid])?.get(pid) ?? "");
   return LAUNCHERS.exec(args)?.[1] ?? null;
 }
+
+/**
+ * The harness this process runs under: its first ancestor that isn't a
+ * launcher (launcherName), or null when every ancestor is one. Its parent
+ * alone may be a shell or package runner that exits with it.
+ */
+export function harnessAncestor(pid = process.pid): number | null {
+  return ancestors(pid).find((p) => launcherName(p) === null) ?? null;
+}

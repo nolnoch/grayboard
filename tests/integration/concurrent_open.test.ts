@@ -47,7 +47,7 @@ const dropped: Record<Kind, [string, string][]> = {
   server: [["messages", "pending"], ["posts", "expires_at"], ["outbox", "wake"]],
 };
 const create: Record<Kind, (path: string) => void> = {
-  local: (p) => openLocalDb(p).close(),
+  local: (p) => openLocalDb(p).db.close(),
   bridge: (p) => new Store(p).db.close(),
   server: (p) => openDatabase(p, { blobDir: join(dir, "blobs") }).db.close(),
 };

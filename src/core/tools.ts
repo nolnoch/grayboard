@@ -7,7 +7,6 @@ import {
   canSeeBoard,
   createBoard,
   getBoard,
-  isViewer,
   listBoards,
   muteThread,
   normalizeBoard,
@@ -16,12 +15,14 @@ import {
   setQueueParticipation,
   setStatus,
   subscribe,
+  viewers,
   who,
   type Pending,
   type Post,
   type SubMode,
   type UnboundPeer,
 } from "./boards.ts";
+import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds } from "./attachments.ts";
@@ -222,12 +223,13 @@ const MAX_CLAIM_NOTE_CHARS = 150;
 // come first, with notes; others' are keys only (claim_list has holder and
 // expiry), since every session pays for this text on every call. Keys still
 // show signals nobody would claim_take, like "dev:freeze". A cut is counted.
-export function claimsInstruction(claims: Claim[], self: string): string[] {
+// `self` is the session's address set (#284 S5).
+export function claimsInstruction(claims: Claim[], self: string[]): string[] {
   if (claims.length === 0) return [];
   const until = (c: Claim) => `${new Date(c.expires_at).toISOString().slice(0, 16)}Z`;
   const note = (n: string) => (n.length > MAX_CLAIM_NOTE_CHARS ? `${n.slice(0, MAX_CLAIM_NOTE_CHARS)}…` : n);
-  const mine = claims.filter((c) => c.holder === self).map((c) => `${c.key} (until ${until(c)}${c.note ? `: ${note(c.note)}` : ""})`);
-  const others = claims.filter((c) => c.holder !== self).map((c) => c.key);
+  const mine = claims.filter((c) => self.includes(c.holder)).map((c) => `${c.key} (until ${until(c)}${c.note ? `: ${note(c.note)}` : ""})`);
+  const others = claims.filter((c) => !self.includes(c.holder)).map((c) => c.key);
   const all = [...mine, ...others];
   let shown = 0;
   for (let room = MAX_CLAIMS_CHARS; shown < all.length && (room -= all[shown]!.length + 2) >= 0; shown++);
@@ -322,7 +324,16 @@ export type BoardPostResult = {
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
 // `session`: the calling session's ID, recorded on its posts (#284).
-export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[]; human?: boolean; session?: string };
+// `addresses`: the caller's address set, `handle` its primary (#284 S5);
+// claims held by any of them are the caller's. Default [handle].
+export type ToolContext = {
+  online?: (handle: string) => boolean;
+  attachmentLimits?: AttachmentLimits;
+  unbound?: UnboundPeer[];
+  human?: boolean;
+  session?: string;
+  addresses?: string[];
+};
 
 export function callBoardTool(
   db: Database,
@@ -366,8 +377,9 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
+        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits }, strictIds: true },
       );
+      const isViewer = viewers(db);
       const result: BoardPostResult = {
         post_id: p.id,
         board: p.board,
@@ -394,6 +406,10 @@ export function callBoardTool(
       const queue = optStr(a, "queue");
       if (queue !== undefined && queue !== "on" && queue !== "off") {
         throw new CoreError(`queue must be "on" or "off"`);
+      }
+      // The opt-out is a name's flag; an ID is always in its queues' rotation.
+      if (queue !== undefined && addressParts(handle)?.kind === "id") {
+        throw new CoreError(`queue opt-out is a name's; bind(name) first, or leave queue unset`);
       }
       setStatus(db, handle, str(a, "text"));
       if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");
@@ -428,6 +444,8 @@ export function callBoardTool(
         until: optStr(a, "until"),
         note: optStr(a, "note"),
         board: optStr(a, "board"),
+        addresses: ctx.addresses,
+        session: ctx.session,
       });
       const { wake, ...rest } = r;
       return { result: rest, wake };
@@ -435,12 +453,12 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"));
+      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
       return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake };
     }
 
     case "claim_watch":
-      return { result: watch(db, handle, str(a, "key"), optBool(a, "off")), wake: [] };
+      return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses), wake: [] };
 
     case "claim_list":
       return { result: listClaims(db, optStr(a, "prefix"), handle), wake: [] };
@@ -458,9 +476,10 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 }
 
 // The channel notification for a direct message. Same shape in every mode.
-export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
+  if (msg.kind) meta.kind = msg.kind;
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }

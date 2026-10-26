@@ -49,9 +49,13 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
-function announce(db: Database, handle: string, board: string | null, text: string): string[] {
+// The calling session (#284): `addresses` is its address set, the primary
+// first; `session` its ID, recorded on the posts it makes (S8).
+export type ClaimCtx = { addresses?: string[]; session?: string };
+
+function announce(db: Database, handle: string, board: string | null, text: string, session?: string): string[] {
   if (!board) return [];
-  return post(db, handle, board, text).wake;
+  return post(db, handle, board, text, null, { author_id: session }).wake;
 }
 
 // The claim's watchers as @mentions for a post about it. An end post takes
@@ -67,11 +71,14 @@ function watchersCc(db: Database, key: string, take: boolean): string {
 // renewal without a ttl or stop time never shortens the claim, and one that
 // changes the note announces it to the board and the watchers.
 // IMMEDIATE takes the write lock up front so two processes can't both win.
+// `addresses` is the caller's address set (#284 S5), `handle` its primary: a
+// claim held by any of them is the caller's, and a renewal keeps the address
+// it was taken under; a new claim is taken as `handle`.
 export function claim(
   db: Database,
   handle: string,
   keyInput: string,
-  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } = {},
+  opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } & ClaimCtx = {},
 ): ClaimResult {
   const key = validKey(keyInput);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
@@ -85,6 +92,7 @@ export function claim(
     );
   expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
   const board = opts.board ? normalizeBoard(opts.board) : null;
+  const addresses = opts.addresses ?? [handle];
 
   return db.transaction((): ClaimResult => {
     const now = Date.now();
@@ -92,11 +100,12 @@ export function claim(
     // Announce a lapsed claim before anyone takes it over.
     const lapsed = sweepIn(db, now);
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
-    if (cur && cur.expires_at > now && cur.holder !== handle) {
+    const renewed = !!cur && cur.expires_at > now && addresses.includes(cur.holder);
+    if (cur && cur.expires_at > now && !renewed) {
       logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
       return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, wake: lapsed };
     }
-    const renewed = !!cur && cur.expires_at > now && cur.holder === handle;
+    const as = renewed ? cur.holder : handle;
     if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
     const row = db
       .prepare(
@@ -111,45 +120,54 @@ export function claim(
            expires_at = excluded.expires_at
          RETURNING *`,
       )
-      .get(key, handle, opts.note ?? null, board, now, expires, now) as Claim;
-    logEvent(db, renewed ? "renew" : "take", handle, row, now);
+      .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
+    logEvent(db, renewed ? "renew" : "take", as, row, now);
     const wake = !renewed
-      ? announce(db, handle, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`)
-      : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, handle, row.board)
-        ? announce(db, handle, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`)
+      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts.session)
+      : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
+        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts.session)
         : [];
     return { ok: true, claim: row, renewed, wake: [...new Set([...lapsed, ...wake])] };
   }).immediate();
 }
 
-// When `handle` released `key`, if nothing has happened to the key since: its
-// release is the key's latest event, or on a queue: key the one its own
-// redelivery directly followed. Otherwise undefined.
-function releasedBy(db: Database, key: string, handle: string): number | undefined {
+// When one of `addresses` released `key`, if nothing has happened to the key
+// since: its release is the key's latest event, or on a queue: key the one
+// its own redelivery directly followed. Otherwise undefined.
+function releasedBy(db: Database, key: string, addresses: string[]): number | undefined {
   const [last, prev] = db.prepare(`SELECT handle, event, note, at FROM claim_events WHERE key = ? ORDER BY id DESC LIMIT 2`).all(key) as
     { handle: string; event: ClaimEvent; note: string | null; at: number }[];
-  if (last?.event === "release" && last.handle === handle) return last.at;
+  if (last?.event === "release" && addresses.includes(last.handle)) return last.at;
   const redelivered = key.startsWith("queue:") && last?.event === "take" && last.note === REDELIVERED_NOTE;
-  if (redelivered && prev?.event === "release" && prev.handle === handle) return prev.at;
+  if (redelivered && prev?.event === "release" && addresses.includes(prev.handle)) return prev.at;
   return undefined;
 }
 
-// releasedAt: this handle had already released the claim, at that time, and
+// releasedAt: this caller had already released the claim, at that time, and
 // nothing has happened to it since: a repeat whose first answer was lost
-// (#254) succeeds without a second release event or redelivery.
-export function release(db: Database, handle: string, keyInput: string, note?: string): { wake: string[]; releasedAt?: number } {
+// (#254) succeeds without a second release event or redelivery. A claim held
+// by any of `addresses` is released as its holder (#284 S5).
+export function release(
+  db: Database,
+  handle: string,
+  keyInput: string,
+  note?: string,
+  ctx: ClaimCtx = {},
+): { wake: string[]; releasedAt?: number } {
   const key = validKey(keyInput);
+  const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
     const active = !!cur && cur.expires_at > Date.now();
-    if (!active || cur.holder !== handle) {
-      const releasedAt = releasedBy(db, key, handle);
+    if (!active || !addresses.includes(cur.holder)) {
+      const releasedAt = releasedBy(db, key, addresses);
       if (releasedAt !== undefined) return { wake: [], releasedAt };
       if (!active) throw new CoreError(`no active claim on "${key}"`);
       throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
     }
+    const as = cur.holder;
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
-    logEvent(db, "release", handle, { ...cur, note: note ?? null }, Date.now());
+    logEvent(db, "release", as, { ...cur, note: note ?? null }, Date.now());
     if (key.startsWith("queue:")) {
       // A declined queue post goes to the next lane with the original post;
       // the decline post would itself rotate as a new work item, so it isn't
@@ -161,16 +179,16 @@ export function release(db: Database, handle: string, keyInput: string, note?: s
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
-    const board = cur.board && canSeeBoard(db, handle, cur.board) ? cur.board : null;
-    return { wake: announce(db, handle, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`) };
+    const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
+    return { wake: announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session) };
   }).immediate();
 }
 
-// A session that rebinds takes its claims to the new name (#182): renew and
-// release compare the holder, so claims left on the old name could be neither
-// renewed nor released by the session doing the work. Runs inside the
-// caller's transaction (the bind's), so the claims move with the name. Each
-// move is a "moved" event under the new holder, held_by naming the old one.
+// A session that rebinds takes its claims to the new name (#182). Server mode
+// only: a local session keeps its claims on the address they were taken
+// under (#284 S6), and PR 3 brings the server to the same rule. Runs inside
+// the caller's transaction (the bind's), so the claims move with the name.
+// Each move is a "moved" event under the new holder, held_by naming the old one.
 export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {
   const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
   for (const c of moved) logEvent(db, "moved", to, c, now, from);
@@ -180,22 +198,23 @@ export function moveClaims(db: Database, from: string, to: string, now = Date.no
 // A queue post's holder replied in its thread: the work is handled. Releases
 // the claim with an ack note - no redelivery (handled is handled), no board
 // post. A decline, by contrast, is claim_release, which redelivers. Runs
-// inside the caller's transaction; returns whether `handle` held it.
-export function ackQueueClaim(db: Database, handle: string, key: string, now = Date.now()): boolean {
+// inside the caller's transaction; returns whether one of `addresses` held it.
+export function ackQueueClaim(db: Database, addresses: string[], key: string, now = Date.now()): boolean {
   const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
   // A lapsed row the sweep hasn't reached is still the holder's: the reply
   // handled the post, so redelivering it would duplicate the work (#234).
-  if (!cur || cur.holder !== handle) return false;
+  if (!cur || !addresses.includes(cur.holder)) return false;
   db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
   watchersCc(db, key, true);
-  logEvent(db, "release", handle, { ...cur, note: cur.expires_at <= now ? "ack (late)" : "ack" }, now);
+  logEvent(db, "release", cur.holder, { ...cur, note: cur.expires_at <= now ? "ack (late)" : "ack" }, now);
   return true;
 }
 
 // Be told when someone else's claim is updated or ends, whatever your mode on
 // its board: the update, release or expiry post @mentions you. Needs a claim with a board, which
-// is where that post goes. off: stop watching.
-export function watch(db: Database, handle: string, keyInput: string, off = false): string {
+// is where that post goes. off: stop watching. A claim held by any of
+// `addresses` is yours.
+export function watch(db: Database, handle: string, keyInput: string, off = false, addresses: string[] = [handle]): string {
   const key = validKey(keyInput);
   if (off) {
     db.prepare(`DELETE FROM claim_watches WHERE key = ? AND handle = ?`).run(key, handle);
@@ -203,7 +222,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
   }
   const cur = db.prepare(`SELECT * FROM claims WHERE key = ? AND expires_at > ?`).get(key, Date.now()) as Claim | undefined;
   if (!cur) throw new CoreError(`no active claim on "${key}"; claim_take it instead`);
-  if (cur.holder === handle) throw new CoreError(`you hold "${key}"`);
+  if (addresses.includes(cur.holder)) throw new CoreError(`you hold "${key}"`);
   if (!cur.board || !canSeeBoard(db, handle, cur.board)) {
     throw new CoreError(
       `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${cur.holder} to renew it with board=`,
@@ -229,7 +248,7 @@ export function listClaims(db: Database, prefix?: string, viewer?: string): Clai
 // the work was done, so the post says to check with them. Runs inside the
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
-function sweepIn(db: Database, now: number): string[] {
+export function sweepIn(db: Database, now: number): string[] {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
   const wake = new Set<string>();
   for (const c of gone) {

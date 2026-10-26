@@ -3,7 +3,7 @@
 // run, so the sessions sharing a bus prune it at most once a day between them.
 import type { Database } from "bun:sqlite";
 
-import { DEFAULT_RETENTION_DAYS, parseRetentionDays, prunePosts } from "../core/boards.ts";
+import { DEFAULT_RETENTION_DAYS, parseRetentionDays, pruneEndedIds, prunePosts } from "../core/boards.ts";
 import { dropAttachments, pruneUnbound, sweepBlobs, type BlobStore } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 
@@ -38,7 +38,7 @@ function claimRun(db: Database, now: number): boolean {
   }).immediate();
 }
 
-// Messages and posts older than `days`, uploads left unbound, then the bytes
+// Messages, posts and ended sessions older than `days`, uploads left unbound, then the bytes
 // nothing names any more. Returns false without pruning if the bus was pruned
 // within the last day.
 export async function runLocalRetention(db: Database, blobs: BlobStore, days: number, now = Date.now()): Promise<boolean> {
@@ -47,6 +47,7 @@ export async function runLocalRetention(db: Database, blobs: BlobStore, days: nu
     pruneMessages(db, now - days * DAY_MS);
     prunePosts(db, now - days * DAY_MS);
     db.prepare(`DELETE FROM audit_log WHERE at < ?`).run(now - days * DAY_MS);
+    pruneEndedIds(db, now - days * DAY_MS, now);
     pruneUnbound(db, now - UNBOUND_TTL_MS);
   } catch (e) {
     console.error("[grayboard] retention failed:", e);

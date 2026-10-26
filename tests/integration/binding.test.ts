@@ -11,8 +11,9 @@ import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
-import { crockford13 } from "../../src/core/bindings.ts";
+import { crockford13 } from "../../src/core/session_id.ts";
 
 let dir: string;
 
@@ -84,7 +85,7 @@ function spawnCli(args: string[], extra: Record<string, string>) {
 const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
 const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
 
-test("1, 3, 14, 18: an unbound session reads without a trace, offers its default with its mail, and binds", async () => {
+test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
   const repo = join(dir, "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
   // "api" existed once and has 3 DMs queued, with no live holder.
@@ -95,18 +96,18 @@ test("1, 3, 14, 18: an unbound session reads without a trace, offers its default
   await be.call("board_post", { board: "e2e", body: "hello" });
 
   const s = await session(undefined, { cwd: repo });
-  expect(s.c.getInstructions()).toStartWith("This session has no bus name yet.");
-  expect(s.c.getInstructions()).toContain("Candidates (free now): api (this checkout's default: 3 queued DMs, 0 claims");
   const id = await sessionId(s);
   expect(id).toMatch(/^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/);
+  // #284 S13: it acts as its ID, told so in one line beside the usual text.
+  expect(s.c.getInstructions()).toStartWith(`You are identity "${id}" on the grayboard bus`);
+  expect(s.c.getInstructions()).toContain(`This session has no bus name yet, so it acts as its ID: peers reach it at ${id}`);
+  expect(s.c.getInstructions()).toContain("Candidates (free now): api (this checkout's default: 3 queued DMs, 0 claims");
 
-  // Reads work; nothing else does, and nothing records the session.
+  // Reads work as before, and nothing is recorded under a "~" handle.
   expect((await s.call("board_read", { board: "e2e" })).posts.map((p: any) => p.body)).toEqual(["hello"]);
   expect((await s.call("board_list", {})).map((b: any) => b.name)).toContain("e2e");
   expect(await s.call("claim_list", {})).toEqual([]);
-  for (const [tool, args] of [["board_post", { board: "e2e", body: "x" }], ["dm_send", { to: "be", body: "x" }], ["claim_take", { key: "k" }], ["dm_inbox", {}]] as const) {
-    expect(await refusal(s, tool, args)).toContain("no bus name yet. Call bind(name)");
-  }
+  expect(await s.call("dm_inbox", {})).toEqual({ unanswered: [] });
   expect(cellsEqual(`~${id}`)).toEqual([]);
 
   // 14: peers see it by session ID, unbound.
@@ -217,7 +218,7 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   // s starts first: its startup reaps dead rows, and the row must still be there at its bind.
   const s = await session();
   await session("fe");
-  process.kill(pidOf("fe"), "SIGKILL");
+  await sigkill(pidOf("fe"));
   await localSession(dir, "fe", { bin: rel.cli });
   expect(holderOf("fe")).toBeDefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
@@ -230,7 +231,7 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   // The wakeup socket can't be renamed onto a non-empty directory.
   mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
   const err = await refusal(s, "bind", { name: "fe2", create: true });
-  expect(err).toContain('bound "fe2" (was "fe"); claims moved: ticket:ENG-142, but setting it up failed');
+  expect(err).toContain('bound "fe2" (was "fe"), but setting it up failed');
   expect(rows(`SELECT address FROM alias_holds WHERE address LIKE 'fe%'`)).toEqual([{ address: "fe2" }]);
   expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
   // fe is free: no listener left on it, and another session takes it.
@@ -240,7 +241,7 @@ test("8: a bind whose setup fails after the acquire leaves the session on the ne
   expect(readdirSync(dir).filter((f) => f.startsWith(".w"))).toEqual([]);
 }, 30_000);
 
-test("8, 13: a rebind moves claims, frees the old name, and delivers the new name's mail", async () => {
+test("8, 13: a rebind leaves claims on the old name, frees it, and delivers the new name's mail", async () => {
   const s = await session("fe");
   const be = await session("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
@@ -252,12 +253,12 @@ test("8, 13: a rebind moves claims, frees the old name, and delivers the new nam
 
   const result = await s.call("bind", { name: "fe2" });
   expect(result).toContain(`Bound to "fe2" (was "fe")`);
-  expect(result).toContain(`Your claims moved from "fe" to "fe2": ticket:ENG-142.`);
+  // #284 S6: claims stay with the address they were taken under.
+  expect(result).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
   await until(() => contents(s).includes("queued for fe2"));
-  expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual(["fe2"]);
-  expect(rows(`SELECT handle, event FROM claim_events WHERE key = 'ticket:ENG-142' AND event = 'moved'`)).toEqual([{ handle: "fe2", event: "moved" }]);
-  expect(await s.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
-  expect(await s.call("claim_list", {})).toEqual([]);
+  expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual(["fe"]);
+  expect(rows(`SELECT COUNT(*) AS n FROM claim_events WHERE event = 'moved'`)).toEqual([{ n: 0 }]);
+  expect(await refusal(s, "claim_release", { key: "ticket:ENG-142" })).toContain('"ticket:ENG-142" is held by fe, not you');
 
   expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "moved"]);
   expect(events("fe2").at(-1)!.detail).toBe("fe");
@@ -266,6 +267,7 @@ test("8, 13: a rebind moves claims, frees the old name, and delivers the new nam
   const other = await session();
   await other.call("bind", { name: "fe" });
   expect((await other.call("peer_list", {})).you).toBe("fe");
+  expect(await other.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
 }, 30_000);
 
 test("9: a DM sent mid-swap is never consumed under the new name", async () => {
@@ -356,7 +358,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect(existsSync(record)).toBe(false);
 
   await session("fe");
-  process.kill(pidOf("fe"), "SIGKILL");
+  await sigkill(pidOf("fe"));
   await until(() => {
     try {
       process.kill(pidOf("fe"), 0);
@@ -371,7 +373,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   expect((await next.call("peer_list", {})).you).toBe("fe");
   const ev = events("fe");
   expect(ev.map((e) => e.event)).toEqual(["bound", "released", "bound"]);
-  expect(ev[1]!.detail).toMatch(/^reaped: pid \d+ is gone$/);
+  expect(ev[1]!.detail).toMatch(/^session_end: reaped: pid \d+ is gone$/);
   // A clean exit logs its release, and keeps its name record for a restart under its harness.
   await stop(next.c);
   expect(events("fe").at(-1)!.event).toBe("released");
@@ -390,6 +392,24 @@ test("#211: a name record whose session the name's history doesn't show restores
   s = await s.restart("crash");
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
+  expect(statusOf("api")).toBeNull();
+}, 30_000);
+
+// #259, local half: a session ID is public, but locally the proof of descent
+// is the name record under the same harness, which a stray never has.
+test("#259: a stray refused while the holder lived binds the name after its death as a fresh session: no restore, no status", async () => {
+  const holder = await session("api");
+  await holder.call("peer_status", { text: "mid-task" });
+  const prior = holderOf("api")!;
+  const stray = await session("api");
+  expect((await stray.call("peer_list", {})).you).toMatch(/^id:/);
+  await sigkill(pidOf("api"));
+  await stray.call("bind", { name: "api" });
+  expect((await stray.call("peer_list", {})).you).toBe("api");
+  expect(holderOf("api")).not.toBe(prior);
+  const bound = events("api").filter((e) => e.event === "bound").at(-1)!;
+  expect(bound.session_id).toBe(holderOf("api")!);
+  expect(bound.detail ?? "").not.toContain("restored");
   expect(statusOf("api")).toBeNull();
 }, 30_000);
 
@@ -462,7 +482,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   // A new harness process is a new session: unbound, with "api" free to bind.
   await stop(s.c);
   const fresh = await session();
-  expect(fresh.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(fresh.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 
   // A launcher between harness and grayboard is a new parent on each restart,
@@ -473,7 +493,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(l.c.getInstructions()).toContain(launcherNote);
   await l.call("bind", { name: "web", create: true });
   l = await l.restart("reconnect");
-  expect(l.c.getInstructions()).toStartWith("This session has no bus name yet.");
+  expect(l.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(l.c.getInstructions()).toContain(launcherNote);
 }, 60_000);
 
@@ -491,12 +511,17 @@ test("13 (decision 13): `grayboard tools` prints what the session serves; bind's
   expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
   const { instructions } = r.structuredContent as { instructions: string[] };
   expect(instructions[0]).toStartWith(`You are identity "api"`);
-  expect((r.content as { text: string }[])[0]!.text).toEndWith(instructions.join(" "));
+  // The unbound session already had the general text (#284 S13): the result
+  // repeats only what's about the name.
+  const text = (r.content as { text: string }[])[0]!.text;
+  expect(text).toEndWith(instructions[0]!);
+  expect(s.c.getInstructions()).toContain(instructions[1]!);
+  expect(text).not.toContain(instructions[1]!);
 }, 20_000);
 
 // #284 audit B1/W1: a write carries the writing session's ID; a tools-only
 // process registers no session, so its writes carry none.
-test("#284: messages and posts carry the owner session's ID; a tools-only process's carry null", async () => {
+test("#284 S7: a tools-only process is its own session: its writes carry its ID, it can't be sent to, it isn't listed, it ends on exit", async () => {
   const owner = await session("be");
   await owner.call("board_create", { name: "e2e", purpose: "test" });
   const tools = await session("be", { extra: { BUS_PUSH: "off" } });
@@ -505,7 +530,18 @@ test("#284: messages and posts carry the owner session's ID; a tools-only proces
     await s.call("board_post", { board: "e2e", body: `post ${tag}` });
   }
   const id = holderOf("be")!;
+  const toolsId = rows<{ id: string }>(`SELECT id FROM ids WHERE delivery = 'none'`)[0]!.id;
   expect(id).toMatch(/^id:[0-9a-z]{13}$/);
-  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: null }]);
-  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: null }]);
+  expect(toolsId).toMatch(/^id:[0-9a-z]{13}$/);
+  expect(toolsId).not.toBe(id);
+  expect(rows(`SELECT writes_as, ended_at FROM ids WHERE id = ?`, toolsId)).toEqual([{ writes_as: "be", ended_at: null }]);
+  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: toolsId }]);
+  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: toolsId }]);
+  // Mail it could never read is refused now, pointed at the alias it writes as.
+  expect(await refusal(owner, "dm_send", { to: toolsId, body: "hi" })).toBe(`error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to be`);
+  const other = await session();
+  expect(((await other.call("peer_list", {})).unbound_sessions as { session_id: string }[]).map((u) => u.session_id)).toEqual([await sessionId(other)]);
+  await stop(tools.c);
+  await until(() => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, toolsId)[0]!.ended_at !== null);
+  expect(holderOf("be")).toBe(id);
 }, 20_000);

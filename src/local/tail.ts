@@ -1,17 +1,19 @@
 // `grayboard tail <board>`: a read-only human view of a local board.
 //
-// Event-driven like any agent: tail holds a push subscription under a
-// per-process handle and listens on its own wakeup socket, so posters poke it.
-// It never posts, never becomes an alias (so it can't be @mentioned),
-// and only moves its own cursor.
-import { db } from "./db.ts";
-import { listenForWakeup, poke } from "./wakeup.ts";
+// Event-driven like any agent: tail is a viewer session (#284 S9), its own
+// ID with ids.viewer set, holding a push subscription and listening on its
+// ID's wakeup socket, so posters poke it. It never posts, never becomes an
+// alias, isn't listed or addressable, and only moves its own cursor. A tail
+// killed hard is ended, subscription and all, by the next process to open
+// the bus.
+import { db, openEnded } from "./db.ts";
+import { endLocalSession, registerSession, thisSession } from "./binding.ts";
+import { deliverEnded, listenForWakeup } from "./wakeup.ts";
+import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { normalizeBoard, subscribe, type Post } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { withAttachments } from "../core/attachments.ts";
 import { formatAttachmentsMeta } from "../shared/attachments.ts";
-
-const PREFIX = "~tail-";
 
 function fmt(p: Post): string {
   const t = new Date(p.created_at).toTimeString().slice(0, 8);
@@ -21,29 +23,20 @@ function fmt(p: Post): string {
   return `${t} [${p.id}${reply}] ${p.author}: ${body}${files}`;
 }
 
-// A tail that was killed hard leaves a subscription nobody answers. Clear any
-// whose socket is dead so outbox rows don't pile up for them.
-async function sweepStale(): Promise<void> {
-  const rows = db
-    .prepare(`SELECT DISTINCT handle FROM subscriptions WHERE handle LIKE ?`)
-    .all(`${PREFIX}%`) as { handle: string }[];
-  for (const { handle } of rows) {
-    if (await poke(handle)) continue;
-    db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
-    db.prepare(`DELETE FROM outbox WHERE handle = ?`).run(handle);
-  }
-}
-
 export async function runTail(boardInput: string, backlog: number): Promise<void> {
+  await deliverEnded(db, openEnded);
   const board = normalizeBoard(boardInput);
-  const handle = `${PREFIX}${process.pid}`;
-  await sweepStale();
+  const handle = idAddress(mintSessionKey());
+  registerSession(db, thisSession(handle), { viewer: true });
+  // Ending it drops its subscription and pushes with every other trace.
+  const end = () => deliverEnded(db, endLocalSession(db, handle));
 
   try {
     subscribe(db, handle, board, "push");
   } catch (e) {
     if (e instanceof CoreError) {
       console.error(e.message);
+      await end();
       process.exit(1);
     }
     throw e;
@@ -74,12 +67,11 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
   console.error(`-- tailing #${board} (ctrl-c to stop)`);
   drain(); // anything posted between the backlog query and the listener
 
-  const shutdown = () => {
+  const shutdown = async () => {
     stopListening();
-    db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(handle);
-    db.prepare(`DELETE FROM outbox WHERE handle = ?`).run(handle);
+    await end();
     process.exit(0);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 }

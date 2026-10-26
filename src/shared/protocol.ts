@@ -1,7 +1,8 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
-import { SESSION_ID, SESSION_KEY, asSessionId, type Candidate } from "../core/bindings.ts";
+import { SESSION_KEY, asSessionId, type Candidate } from "../core/bindings.ts";
+import { SESSION_ID } from "../core/session_id.ts";
 
 export type Message = {
   id: number;
@@ -15,6 +16,8 @@ export type Message = {
   pending?: true;
   // Only when it carries files.
   attachments?: AttachmentInfo[];
+  // Only when set: "bounce", returned by a session that ended before reading it (#284 S12).
+  kind?: "bounce";
 };
 
 // Client -> Server

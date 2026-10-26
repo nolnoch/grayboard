@@ -43,7 +43,7 @@ import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
 import {
-  PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction,
+  PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction,
 } from "../shared/inbox.ts";
 
 export type WsData = {
@@ -535,7 +535,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // hello and updated by the rest (a reconnect, a rebind), and its hold.
     // The Slack bridge's humans have no ID.
     if (!ws.data.human) {
-      if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true });
+      if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true, keyed: m.session_key !== undefined });
       else {
         setPlace(db, sessionId, m.where ?? null);
         touchId(db, sessionId);
@@ -611,7 +611,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // Before the claims: drained once, so a cut must not take it.
     ...(bridgeNotice ? [bridgeNotice] : []),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
-    ...claimsInstruction(listClaims(db, undefined, full), full),
+    ...claimsInstruction(listClaims(db, undefined, full), [full]),
   ];
   if (notices.length) helloOk.notices = notices;
   send(ws, helloOk);
@@ -620,7 +620,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // Direct messages since the cursor (unacked ones are resent), then boards.
   const since = repo.cursors.get(full, "direct", full);
   for (const message of repo.messages.unreadSince([{ type: "direct", ref: full, since }])) {
-    send(ws, { type: "push", message: showPending(message) });
+    send(ws, { type: "push", message: showMessage(message) });
   }
   drainBoards(ws, db, true);
 }
@@ -804,7 +804,7 @@ function deliverSend(hub: Hub, ws: Ws, msg: MessageRow): void {
     writeAudit(hub.repo, "attachment.bound", ws.data.authed.user_email, `attachment:${a.id}`, { identity: ws.data.identityFull, message_id: msg.id, recipient: msg.recipient });
   }
   const recipientWs = hub.registry.get(msg.recipient);
-  if (recipientWs?.data.ready) send(recipientWs, { type: "push", message: showPending(msg) });
+  if (recipientWs?.data.ready) send(recipientWs, { type: "push", message: showMessage(msg) });
 }
 
 // An append write, deduplicated (#254): an identical call by this session
@@ -1041,7 +1041,7 @@ function handleHistory(
   const messages = repo.messages.history(me, peerFull, lim, beforeId).reverse().map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
-  send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showPending) });
+  send(ws, { type: "history_ok", req_id: reqId, messages: messages.map(showMessage) });
 }
 
 function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined): void {
@@ -1053,8 +1053,8 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
-  const owed = unanswered(me, repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
-  const promises = promised(me, repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
+  const owed = unanswered([me], repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
+  const promises = promised([me], repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(me).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
@@ -1075,7 +1075,7 @@ function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): voi
     return;
   }
   const messages = repo.messages.thread(messageId).filter((m) => participant(m, me));
-  send(ws, { type: "thread_ok", req_id: reqId, messages: messages.map(showPending) });
+  send(ws, { type: "thread_ok", req_id: reqId, messages: messages.map(showMessage) });
 }
 
 function handleAck(ws: Ws, reqId: string, messageIds: number[], repo: Repo): void {
