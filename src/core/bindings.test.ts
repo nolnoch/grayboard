@@ -94,3 +94,14 @@ test("actingAs resolves a bare name in the caller's scope and refuses an address
   expect(actingAs("a", ["a", id], null)).toBe("a");
   expect(() => actingAs("you@example.com/a", ["a", id], null)).toThrow(CoreError);
 });
+
+// #284 S12; AC 6: an alias carries labels, never a task reference.
+test("the schema has the ID and alias metadata columns and no task_ref", () => {
+  const db = new Database(":memory:");
+  initCoreSchema(db);
+  initCoreSchema(db);
+  const cols = (t: string) => (db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]).map((c) => c.name);
+  expect(cols("ids")).toEqual(expect.arrayContaining(["harness", "model", "effort"]));
+  expect(cols("aliases")).toEqual(expect.arrayContaining(["task", "owner", "source_board", "spec_hash", "description", "last_bound_at"]));
+  expect(cols("aliases")).not.toContain("task_ref");
+});
