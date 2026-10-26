@@ -116,6 +116,43 @@ test("a closed session keeps its holds through the grace: a reconnect re-attache
   expect((await srv.client(alice, "be").connect()).bind_ok.alias).toBe(`${A}/be`);
 });
 
+// Audit F1/A1 (#345): one end that throws is audited and retried a grace
+// later; the other sessions in the same sweep still end, and the sweep
+// itself doesn't throw (an uncaught throw in its interval exits the server).
+test("a session whose end fails is audited and retried a grace later; the others in the sweep still end", async () => {
+  const alice = await srv.login(A);
+  const bad = srv.client(alice, "be");
+  const good = srv.client(alice, "fe");
+  await bad.connect();
+  await good.connect();
+  await inGrace(alice, bad, "be");
+  await inGrace(alice, good, "fe");
+  const mail = srv.app.repo.mail;
+  const unread = mail.unread.bind(mail);
+  mail.unread = (id) => {
+    if (id === bad.id) throw new Error("disk on fire");
+    return unread(id);
+  };
+
+  clock += GRACE_MS;
+  expect(() => srv.app.sweepSessions()).not.toThrow();
+  expect(row(good.id)!.ended_at).toBe(clock);
+  // The failed end rolled back whole: the ID and its hold are as they were.
+  expect(row(bad.id)!.ended_at).toBeNull();
+  expect(holder(`${A}/be`)).toBe(bad.id);
+  const failed = srv.app.db.prepare(`SELECT actor, detail FROM access_log WHERE action = 'id.end_failed' AND target = ?`).all(bad.id) as { actor: string | null; detail: string }[];
+  expect(failed.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: null, why: "grace", error: "Error: disk on fire", retry_at: clock + GRACE_MS }]);
+
+  // Not retried before its retry time; ended by the sweep after it.
+  mail.unread = unread;
+  srv.app.sweepSessions(clock + GRACE_MS - 1);
+  expect(row(bad.id)!.ended_at).toBeNull();
+  clock += GRACE_MS;
+  srv.app.sweepSessions();
+  expect(row(bad.id)!.ended_at).toBe(clock);
+  expect(holder(`${A}/be`)).toBeNull();
+});
+
 test("a restarted server gives every unended session a fresh grace: one that comes back keeps its alias, one that doesn't ends", async () => {
   srv.stop();
   srv = start(join(dbDir, "bus.db"));

@@ -9,7 +9,9 @@ import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
+import { PROTO } from "../../src/shared/protocol.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 import type { Any, WsClient, WsClientOptions } from "../support/ws_client.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
@@ -422,13 +424,57 @@ test("an alias a live session holds refuses another session's bind", async () =>
   expect((await first.call("board_list")).type).toBe("call_ok");
 });
 
-test("a connection that doesn't answer the probe is replaced", async () => {
+test("a connection that doesn't answer the probe is replaced, audited id.superseded with both places", async () => {
   const alice = await login("alice@example.com");
-  const stale = client(alice, "be", { pong: false });
+  const stale = client(alice, "be", { pong: false, hello: { where: "old box" } });
   await stale.connect();
-  const fresh = client(alice, "be", { key: stale.key });
+  // A place is cleaned once, before any audit carries it (audit S6).
+  const fresh = client(alice, "be", { key: stale.key, hello: { where: "  new\n box " } });
   expect((await fresh.connect()).type).toBe("hello_ok");
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
+  const rows = srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'id.superseded'`).all() as { actor: string; target: string; detail: string }[];
+  expect(rows.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([
+    { actor: "alice@example.com", target: stale.id, detail: { old_place: "old box", place: "new box" } },
+  ]);
+});
+
+// Audit S2 (#345): a hello awaits the probe; a second hello on the same
+// connection meanwhile is refused and closes it, and the first never
+// supersedes the holder from a closed socket.
+test("a second hello while the first is probing is refused and closes the connection", async () => {
+  const alice = await login("alice@example.com");
+  const dead = client(alice, "be", { pong: false });
+  await dead.connect();
+  const twice = client(alice, "be", { key: dead.key });
+  const first = twice.connect(); // probes the dead holder (150 ms)
+  await until(() => twice.ws.readyState === 1);
+  twice.ws.send(JSON.stringify({ type: "hello", req_id: "h2", proto: PROTO, session_key: dead.key }));
+  expect(await twice.next((m) => m.req_id === "h2")).toMatchObject({ type: "error", code: "bad_request", message: "a hello is already in flight on this connection" });
+  await expect(first).rejects.toThrow("socket closed");
+  await dead.none((m: Any) => m.type === "error", 300);
+});
+
+// Audit S1 (#345): a re-attach is the session its row registered: a
+// tools-only hello on a push session's key, or a push hello on a tools-only
+// session's, is id_collision, refused before the probe, so it never
+// supersedes the holder.
+test("a re-attach whose writes_as differs from the session's row is id_collision and supersedes nothing", async () => {
+  const alice = await login("alice@example.com");
+  const holder = client(alice, "be", { pong: false });
+  await holder.connect();
+  const sidecar = client(alice, "be", { key: holder.key, push: false });
+  expect(await sidecar.connect()).toMatchObject({
+    type: "error", code: "id_collision", message: expect.stringContaining(`registered writing as its own addresses, and this hello writes as "alice@example.com/be"`),
+  });
+  await holder.none((m: Any) => m.type === "error", 300);
+
+  const writer = client(alice, "fe", { push: false });
+  await writer.connect();
+  writer.close();
+  const pushed = client(alice, "fe", { key: writer.key });
+  expect(await pushed.connect()).toMatchObject({ type: "error", code: "id_collision", message: expect.stringContaining(`registered writing as "alice@example.com/fe"`) });
+  const audited = srv.app.db.prepare(`SELECT target FROM access_log WHERE action = 'id.collision' ORDER BY id`).all();
+  expect(audited).toEqual([{ target: holder.id }, { target: writer.id }]);
 });
 
 test("a hello arriving while another probes the holder waits for it, so only one wins", async () => {
@@ -590,6 +636,32 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
   expect((await client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
+});
+
+// Audit F2 (#345): bind_ok's notices cover the session's whole address set,
+// so a claim taken as the ID before the bind is still listed as its own.
+test("bind_ok's notices list the claims the session took as its ID before the bind", async () => {
+  const alice = await login("alice@example.com");
+  const a = srv.client(alice, null);
+  await a.connect();
+  await a.call("claim_take", { key: "ticket:ENG-3", note: "as the ID" });
+  const b = await a.bind("be");
+  expect(b.notices.at(-1)).toMatch(/Yours: ticket:ENG-3 \(until [^)]*: as the ID\)\./);
+});
+
+// Audit W2 (#345): deleting an identity would drop its holds under a live
+// holder, and a second session could then bind it: refused while in use.
+test("an identity a session holds or writes as can't be deleted until those sessions end", async () => {
+  const alice = await login("alice@example.com");
+  const a = client(alice, "be");
+  await a.connect();
+  const sidecar = client(alice, "be", { push: false });
+  await sidecar.connect();
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by session") } });
+  expect(await a.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(sidecar.id) } });
+  expect(await sidecar.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 200, body: { ok: true } });
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {

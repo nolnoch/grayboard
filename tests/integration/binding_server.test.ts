@@ -540,6 +540,20 @@ test("#211: a restored_from the name's history doesn't show is logged unverified
   expect(status(`${A}/api`)).toBeNull();
 });
 
+// Audit S5 (#345): a team alias's history shows every member's sessions,
+// but a restore never carries another principal's session's status over.
+test("#211: a restored_from naming another principal's session is unverified, even when the alias's history shows it", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  const theirs = srv.client(bob, "eng/api");
+  expect((await theirs.connect()).bind_ok.alias).toBe("eng/api");
+  await theirs.call("peer_status", { text: "bob's task" });
+  expect((await theirs.request({ type: "end" })).type).toBe("end_ok");
+  const mine = srv.client(alice, "eng/api", { bind: { restored_from: theirs.id } });
+  expect((await mine.connect()).bind_ok.restored).toEqual({ verified: false, detail: `restore not verified: ${theirs.id} isn't a session of yours` });
+  expect(status("eng/api")).toBeNull();
+});
+
 test("#284: a 1.x client's 16-hex restored_from is the same session ID: its restore verifies", async () => {
   const key = "d5".repeat(32);
   const ws = srv.client(alice, "api", { key });

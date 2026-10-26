@@ -45,7 +45,7 @@ test("unread mail to an ended ID bounces to its senders; nothing else does", () 
   send(db, OTHER, ID, "from a dead ID");
 
   const r = end(db);
-  expect(r).toEqual({ held: ["fe"], wake: ["be"] });
+  expect(r).toEqual({ ended: true, held: ["fe"], wake: ["be"] });
   expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 1, unbounced: 1 });
   expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
     { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `${ID} ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
@@ -77,7 +77,7 @@ test("the end leaves no row for the ID and releases its aliases", async () => {
   expect(db.prepare(`SELECT name, event, detail FROM binding_events WHERE session_id = ?`).all(ID)).toEqual([{ name: "fe", event: "released", detail: "session_end" }]);
   expect(db.prepare(`SELECT action, target FROM audit_log WHERE action = 'id.ended'`).all()).toEqual([{ action: "id.ended", target: ID }]);
   // Ending it again changes nothing.
-  expect(end(db, ID, 20_000)).toEqual({ held: [], wake: [] });
+  expect(end(db, ID, 20_000)).toEqual({ ended: false, held: [], wake: [] });
 });
 
 // #284 decision 4: claims held by the ID are released through release(), so

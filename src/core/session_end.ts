@@ -29,13 +29,15 @@ export interface MailPort {
 }
 
 export type EndedSession = {
+  /** False when the session had already ended: this call changed nothing. */
+  ended: boolean;
   /** The aliases it held, now released. */
   held: string[];
   /** Addresses to poke once the transaction commits: bounce recipients, release and redelivery wakes. */
   wake: string[];
 };
 
-const NOT_ENDED: EndedSession = { held: [], wake: [] };
+const NOT_ENDED: EndedSession = { ended: false, held: [], wake: [] };
 
 /**
  * End session `id`. Callers are inside a BEGIN IMMEDIATE transaction and
@@ -112,7 +114,7 @@ export function endSession(
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
   });
   wake.delete(id);
-  return { held, wake: [...wake] };
+  return { ended: true, held, wake: [...wake] };
 }
 
 function isEndedId(db: Database, address: string): boolean {

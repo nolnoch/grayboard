@@ -59,7 +59,7 @@ describe("a lost answer over WSS, then the same call (server process)", () => {
   async function lostThenRepeated(identity: string, frame: Record<string, unknown>): Promise<{ again: WsClient; retry: Any }> {
     const session_key = mintSessionKey();
     rmSync(go(), { force: true });
-    const first = client(alice, identity, { session_key });
+    const first = client(alice, identity, { session_key }, false);
     expect((await first.connect()).type).toBe("hello_ok");
     const before = hits("hit");
     first.ws.send(JSON.stringify({ ...frame, req_id: "lost" }));
@@ -68,9 +68,10 @@ describe("a lost answer over WSS, then the same call (server process)", () => {
     const released = hits("released");
     writeFileSync(go(), "");
     await until(() => hits("released") > released, 10_000, "the pause's release");
-    // Tools-only, so the reconnect needn't wait out the old holder's probe; the session is the same.
+    // Tools-only on both sides (a re-attach is the kind its row registered, S1),
+    // so the reconnect needn't wait out the old holder's probe.
     const again = client(alice, identity, { session_key, resume: true }, false);
-    expect((await again.connect()).type).toBe("hello_ok");
+    expect(await again.connect()).toMatchObject({ type: "hello_ok" });
     const retry = await again.request(frame);
     expect(retry.req_id).toBe("r1");
     return { again, retry };

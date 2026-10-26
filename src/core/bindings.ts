@@ -73,6 +73,22 @@ export function holderOf(db: Database, address: string): string | null {
   return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
 }
 
+/**
+ * A session acting as `address`, live or in its grace: holding it, or a
+ * tools-only session writing as it; with `exceptPrincipal`, only another
+ * principal's. An alias in use is exclusive across principals (#284 S8,
+ * decided): their binds, writes_as and `?as=` are refused alias_held while
+ * it is, and no one deletes it.
+ */
+export function aliasUser(db: Database, address: string, exceptPrincipal: string | null = null): string | null {
+  return (db.prepare(
+    `SELECT i.id FROM ids i
+      WHERE i.ended_at IS NULL AND (?2 IS NULL OR i.principal IS NOT ?2)
+        AND (i.id IN (SELECT id FROM alias_holds WHERE address = ?1) OR i.writes_as = ?1)
+      LIMIT 1`,
+  ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
+}
+
 /** One binding_events row, or one more repeat on a refusal's row. */
 export function logBinding(db: Database, sessionId: string, name: string, event: BindingEvent, detail: string | null = null, at = Date.now()): void {
   // A retry loop refused for the same reason is one row with a count, not a

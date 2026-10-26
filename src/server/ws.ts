@@ -19,6 +19,7 @@ import {
   idCollisionText,
   inheritStatus,
   registerId,
+  cleanPlace,
   setPlace,
   touchAlias,
   touchId,
@@ -27,7 +28,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  closestNames, continuityOf, dropHold, holdAlias, holderOf, idAddress, logBinding, unboundPeer, unknownNameError, type Continuity,
+  aliasUser, closestNames, continuityOf, dropHold, holdAlias, holderOf, idAddress, logBinding, unboundPeer, unknownNameError, type Continuity,
 } from "../core/bindings.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -77,6 +78,8 @@ export type WsData = {
   toolsOnly?: true;
   // Its session ended by its `end` (S4): any later frame is refused.
   ended?: true;
+  // Its hello is in flight: a second one is refused.
+  helloing?: true;
 };
 
 // What the hub needs of a connection: a client's WebSocket, or an in-process
@@ -299,6 +302,13 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
           ws.close();
           return;
         }
+        // A hello awaits a probe; a second one meanwhile would race it for the session.
+        if (ws.data.helloing) {
+          err(ws, msg.req_id, "bad_request", "a hello is already in flight on this connection");
+          ws.close();
+          return;
+        }
+        ws.data.helloing = true;
         (ws.data.human ? Promise.resolve(helloHuman(hub, ws, msg)) : handleHello(hub, ws, msg)).catch((e) => {
           console.error("[grayboard] hello failed:", e);
           err(ws, msg.req_id, "internal", "hello failed");
@@ -464,13 +474,27 @@ function sweepSessions(hub: Hub, now: number): void {
 
 // Ends sessions, each in its own transaction (bounces, claim releases, holds
 // released), then wakes what that changed and sweeps the freed upload bytes.
+// One end that throws is logged and audited id.end_failed and leaves the
+// others ended; its ID goes (back) into the grace, so a sweep retries it
+// rather than the sweep's interval dying with it.
 function endIds(hub: Hub, ids: string[], why: string): void {
   if (!ids.length) return;
   const { repo, db } = hub;
   const woken = new Set<string>();
   for (const id of ids) {
+    let ended;
+    try {
+      ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: hub.now(), audit: serverAuditSink(repo) }));
+    } catch (e) {
+      const retryAt = hub.now() + GRACE_MS;
+      if (!hub.holders.has(id)) hub.grace.set(id, retryAt);
+      console.error(`[grayboard] ending session ${id} (${why}) failed; retrying after ${new Date(retryAt).toISOString()}:`, e);
+      writeAudit(repo, "id.end_failed", null, id, { why, error: String(e), retry_at: retryAt });
+      continue;
+    }
     hub.grace.delete(id);
-    const ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: hub.now(), audit: serverAuditSink(repo) }));
+    // An end that found the session already ended sends nothing again.
+    if (!ended.ended) continue;
     for (const h of ended.wake) woken.add(h);
     // A bounce goes to a live sender now, as a send does; a drain would
     // resend that connection's unacked messages too.
@@ -570,10 +594,10 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void 
 
 const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: authed.user_email });
 
-type IdRow = { principal: string | null; ended_at: number | null; place: string | null };
+type IdRow = { principal: string | null; ended_at: number | null; place: string | null; writes_as: string | null };
 
 function idRow(db: CoreDb, id: string): IdRow | undefined {
-  return (db.prepare(`SELECT principal, ended_at, place FROM ids WHERE id = ?`).get(id) as IdRow | null) ?? undefined;
+  return (db.prepare(`SELECT principal, ended_at, place, writes_as FROM ids WHERE id = ?`).get(id) as IdRow | null) ?? undefined;
 }
 
 // The alias session `id` holds, if any (one per session until PR 4).
@@ -609,8 +633,10 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const reqId = m.req_id;
   const { authed } = ws.data;
   const id = m.session_key ? idAddress(m.session_key) : null;
+  // Client text: cleaned once, before any audit or log carries it.
+  const where = cleanPlace(m.where ?? null);
   // First, before anything reads or writes the database.
-  const t = hub.helloLimiter.take(authed.user_email, { session_id: id, place: m.where ?? null });
+  const t = hub.helloLimiter.take(authed.user_email, { session_id: id, place: where });
   if (!t.ok) {
     send(ws, { type: "error", req_id: reqId, code: "rate_limited", message: `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, retry_after_ms: t.retryAfterMs });
     ws.close();
@@ -631,10 +657,16 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       if (target.address) logBinding(db, id, target.address, "refused", target.error);
       return refuse(target.code, target.error);
     }
+    const other = aliasUser(db, target.address, authed.user_email);
+    if (other) {
+      const why = `"${target.address}" is in use by another user's session ${other}`;
+      logBinding(db, id, target.address, "refused", why);
+      return refuse("alias_held", `${why}; write as another name`);
+    }
     writesAs = target;
   }
   const collide = (why: string) => {
-    writeAudit(repo, "id.collision", authed.user_email, id, { why, place: m.where ?? null });
+    writeAudit(repo, "id.collision", authed.user_email, id, { why, place: where });
     refuse("id_collision", idCollisionText(id, why));
   };
   // Never probe or supersede another principal's connection: its row is
@@ -642,6 +674,12 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   const row = idRow(db, id);
   if (row && row.principal !== authed.user_email) return collide("is another principal's session");
   if (row?.ended_at != null) return collide(`ended at ${new Date(row.ended_at).toISOString()}`);
+  // A re-attach is the session it registered as: a tools-only session
+  // writes as the same alias, and a push or hold one writes as nobody else.
+  // Checked before the probe, so a mismatched hello never supersedes.
+  const sameShape = (r: IdRow) => r.writes_as === (writesAs?.address ?? null);
+  const shapeWhy = (r: IdRow) => `registered writing as ${r.writes_as ? `"${r.writes_as}"` : "its own addresses"}, and this hello writes as ${writesAs ? `"${writesAs.address}"` : "its own"}`;
+  if (row && !sameShape(row)) return collide(shapeWhy(row));
 
   // One live connection per session. A connection on this ID that still
   // answers is a second process on one key: refused. One that doesn't is
@@ -668,6 +706,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       // Detached first, so its close finds another connection holding the
       // ID and records no grace (S3).
       detach(hub, holder);
+      writeAudit(repo, "id.superseded", authed.user_email, id, { old_place: holder.data.place ?? null, place: where });
       err(holder, undefined, "superseded", "a newer connection took over this session");
       holder.close();
     }
@@ -675,8 +714,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // The row again: the session may have ended during an await.
   const now = idRow(db, id);
   if (now?.ended_at != null) return collide(`ended at ${new Date(now.ended_at).toISOString()}`);
-
-  const where = m.where ?? null;
+  if (now && !sameShape(now)) return collide(shapeWhy(now));
   const launcher = push && m.launcher === true;
   if (!now) {
     repo.atomic(() => {
@@ -857,6 +895,13 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     const wait = until === undefined ? {} : { retry_after_ms: Math.max(0, until - hub.now()) + SWEEP_MS };
     return refuse("alias_held", `"${address}" is held by ${who}; bind another name`, who, { holder: who, ...wait });
   }
+  // Another user's tools-only session writing as it holds nothing, but the
+  // alias is in use, so it's exclusive all the same (S8, decided).
+  const writer = aliasUser(db, address, authed.user_email);
+  if (writer !== null) {
+    const why = `"${address}" is in use by another user's session ${writer}`;
+    return refuse("alias_held", `${why}; bind another name`, why);
+  }
 
   const restored = repo.atomic((): Continuity | undefined => {
     createLazily(hub, authed, target, id);
@@ -878,7 +923,7 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
   ws.data.addresses = [address, id];
   // Claims stay with the alias they were taken under (S6): say which.
   const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
-  const notices = noticesFor(hub, [address]);
+  const notices = noticesFor(hub, ws.data.addresses);
   send(ws, {
     type: "bind_ok", req_id: m.req_id, alias: address,
     ...(restored ? { restored } : {}), ...(left.length ? { left } : {}), ...(notices.length ? { notices } : {}),
@@ -896,6 +941,10 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
 function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m: BindRequest): Continuity | undefined {
   const { db } = hub;
   if (m.restored_from !== undefined) {
+    // Another principal's session's status is never carried over.
+    if (idRow(db, m.restored_from)?.principal !== authed.user_email) {
+      return { verified: false, detail: `restore not verified: ${m.restored_from} isn't a session of yours` };
+    }
     const c = continuityOf(db, address, { restartOf: m.restored_from });
     if (c.verified) inheritStatus(db, id, m.restored_from);
     return c;

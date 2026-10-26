@@ -30,6 +30,7 @@ export type AuditAction =
   | "id.collision"
   | "id.detached"
   | "id.end_failed"
+  | "id.superseded"
   | "id.ended"
   | "id.reattached"
   | "id.registered"

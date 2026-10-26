@@ -270,7 +270,7 @@ export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-const cleanPlace = (place: string | null): string | null => place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
+export const cleanPlace = (place: string | null): string | null => place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
 
 // Server mode: where the session runs, as its client described it.
 export function setPlace(db: Database, id: string, place: string | null): void {

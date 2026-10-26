@@ -16,6 +16,7 @@ import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
+import { aliasUser } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -179,6 +180,10 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   if (!repo.aliases.find(address)) {
     return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
+  // An alias in use by another user's session is exclusive (#284 S8, decided);
+  // the caller's own sessions' uses aren't refused (a tools-only sidecar, #182).
+  const other = aliasUser(db, address, authed.user_email);
+  if (other) return jsonErr("alias_held", `"${address}" is in use by another user's session ${other}; act as another name`, 409);
   return address;
 }
 
@@ -225,6 +230,10 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   const existing = repo.aliases.find(`${authed.user_email}/${name}`);
   if (!existing) return notFound();
+  // Its holds and writers would outlive it: a second session could then bind
+  // the name while the first still acts as it.
+  const user = aliasUser(db, existing.address);
+  if (user) return jsonErr("alias_held", `"${existing.address}" is in use by session ${user}; end it, or bind it elsewhere, first`, 409);
   repo.aliases.remove(existing.address);
   forgetHandle(db, existing.address);
   writeAudit(repo, "alias.deleted", authed.user_email, existing.address);

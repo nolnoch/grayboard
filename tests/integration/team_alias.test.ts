@@ -127,3 +127,34 @@ test("a lazily created team alias follows only its team's board", async () => {
   expect(rows(`SELECT board FROM subscriptions WHERE handle = 'eng/build'`)).toEqual([{ board: "eng" }]);
   expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
 });
+
+// #284 S8 (decided): an alias in use is exclusive across principals. While
+// bob's session holds eng/build, alice can't write as it (tools-only
+// writes_as, ?as=) or bind it; while alice's tools-only session writes as
+// eng/deploy, bob can't bind it. A principal's own sessions share freely.
+test("a team alias in use by one member's session refuses another member's writes_as, ?as= and bind", async () => {
+  const build = srv.client(bob, "eng/build");
+  expect((await build.connect()).bind_ok.alias).toBe("eng/build");
+  // bob's own tools-only sidecar and ?as= stay allowed (#182).
+  const own = srv.client(bob, "eng/build", { push: false });
+  expect(await own.connect()).toMatchObject({ type: "hello_ok" });
+  expect((await srv.upload(bob, "eng/build", "a.txt", "x")).status).toBe(201);
+
+  const writer = srv.client(alice, "eng/build", { push: false });
+  expect(await writer.connect()).toMatchObject({ type: "error", code: "alias_held", message: expect.stringContaining(`another user's session ${build.id}`) });
+  expect(lastEvent("eng/build")).toMatchObject({ event: "refused", detail: `"eng/build" is in use by another user's session ${build.id}` });
+  const up = await srv.upload(alice, "eng/build", "a.txt", "x");
+  expect(up).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(build.id) } });
+
+  const sidecar = srv.client(alice, "eng/deploy", { push: false });
+  expect(await sidecar.connect()).toMatchObject({ type: "hello_ok" });
+  const bind = await srv.client(bob, "eng/deploy").connect();
+  expect(bind).toMatchObject({ type: "error", code: "alias_held", message: expect.stringContaining(`another user's session ${sidecar.id}`) });
+  expect(holder("eng/deploy")).toEqual([]);
+
+  // Once bob's sessions using it end, the alias is free to alice.
+  expect(await build.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect((await srv.upload(alice, "eng/build", "a.txt", "x")).status).toBe(409);
+  expect(await own.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect((await srv.upload(alice, "eng/build", "a.txt", "x")).status).toBe(201);
+});
