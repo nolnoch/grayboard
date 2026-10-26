@@ -299,3 +299,41 @@ test("a hold session registers delivery push: a send to its ID is accepted and w
   await held.none(push);
   expect(await held.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok", unanswered: [expect.objectContaining({ body: "for later", from: `${A}/be` })] });
 });
+
+// #284 PR 4: a session's holds are a set; a resume inside the grace and a
+// server restart's re-attach both bring every hold back, each delivered.
+test("a two-hold session keeps both holds through a resume and a server restart, and each is delivered", async () => {
+  srv.stop();
+  srv = start(join(dbDir, "bus.db"));
+  let alice = await srv.login(A);
+  const s = srv.client(alice, "be");
+  await s.connect();
+  expect(await s.bind("be2", { create: true })).toMatchObject({ type: "bind_ok", held: [`${A}/be`, `${A}/be2`] });
+  const peer = srv.client(alice, "fe");
+  await peer.connect();
+  const reaches = async (c: WsClient, alias: string, body: string) => {
+    expect(await peer.request({ type: "send", recipient: alias, body })).toMatchObject({ type: "send_ok" });
+    return c.next((m) => push(m) && m.message.body === body, 3000);
+  };
+
+  // A resume inside the grace.
+  await inGrace(alice, s, "be2");
+  const resumed = srv.client(alice, "be", { key: s.key, hello: { resume: true } });
+  expect(await resumed.connect()).toMatchObject({ type: "hello_ok", id: s.id, bound: [`${A}/be`, `${A}/be2`] });
+  for (const alias of ["be", "be2"]) expect(await reaches(resumed, alias, `resumed to ${alias}`)).toBeDefined();
+
+  // A server restart: the re-attach registers both.
+  srv.stop();
+  clock += 60_000;
+  srv = start(join(dbDir, "bus.db"));
+  alice = await srv.login(A);
+  expect(holder(`${A}/be2`)).toBe(s.id);
+  const back = srv.client(alice, "be", { key: s.key, hello: { resume: true } });
+  expect(await back.connect()).toMatchObject({ type: "hello_ok", id: s.id, bound: [`${A}/be`, `${A}/be2`] });
+  const peer2 = srv.client(alice, "fe");
+  await peer2.connect();
+  for (const alias of ["be", "be2"]) {
+    expect(await peer2.request({ type: "send", recipient: alias, body: `restarted to ${alias}` })).toMatchObject({ type: "send_ok" });
+    expect(await back.next((m) => push(m) && m.message.body === `restarted to ${alias}`, 3000)).toBeDefined();
+  }
+});
