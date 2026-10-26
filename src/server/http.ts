@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import type { Repo, Team } from "./db.ts";
+import { PrincipalTaken, type Repo, type Team } from "./db.ts";
 import type { Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
@@ -16,7 +16,7 @@ import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
-import { ensureTeamBoard, onIdentityCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
+import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -43,11 +43,10 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 }
 
 function makePrincipal(authed: AuthedUser): SendPrincipal {
-  // Used only for canAdmin — identity_id can be 0 since admin doesn't need it
+  // Used only for canAdmin, which needs no identity.
   return {
     user_id:       authed.user_id,
     user_email:    authed.user_email,
-    identity_id:   0,
     identity_name: "",
     identity_full: "",
   };
@@ -147,7 +146,7 @@ function authLogout(authed: AuthedUser, repo: Repo): Response {
 }
 
 function whoami(authed: AuthedUser, repo: Repo): Response {
-  const identities = repo.identities.listForUser(authed.user_id).map(i => i.name);
+  const identities = repo.aliases.listFor(authed.user_email).map(i => i.name);
   const teams      = repo.teams.listForUser(authed.user_id).map(t => t.name);
   return json({ email: authed.user_email, identities, teams });
 }
@@ -168,7 +167,7 @@ function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: 
   if (!name) return badRequest("identity required");
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return forbidden(humanReason);
-  if (!repo.identities.findByUserAndName(authed.user_id, name)) {
+  if (!repo.aliases.find(authed.user_email, name)) {
     return jsonErr("unknown_identity", `no session has used identity "${name}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
   return `${authed.user_email}/${name}`;
@@ -195,7 +194,7 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreD
 // ── identities ────────────────────────────────────────────────────────────────
 
 function identityList(authed: AuthedUser, repo: Repo): Response {
-  return json(repo.identities.listForUser(authed.user_id).map(i => ({ name: i.name, created_at: i.created_at })));
+  return json(repo.aliases.listFor(authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
 async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
@@ -204,22 +203,22 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid identity name");
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
-  const existing = repo.identities.findByUserAndName(authed.user_id, name);
+  const existing = repo.aliases.find(authed.user_email, name);
   if (existing) return conflict(`identity "${name}" already exists`);
-  const identity = repo.identities.create(authed.user_id, name);
-  writeAudit(repo, "identity.created", authed.user_email, name);
-  onIdentityCreated(db, repo, authed.user_id, `${authed.user_email}/${name}`);
+  const identity = repo.aliases.create(authed.user_email, name);
+  writeAudit(repo, "alias.created", authed.user_email, identity.address);
+  onAliasCreated(db, repo, authed.user_id, identity.address);
   return json({ name: identity.name, created_at: identity.created_at }, 201);
 }
 
 function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
-  const existing = repo.identities.findByUserAndName(authed.user_id, name);
+  const existing = repo.aliases.find(authed.user_email, name);
   if (!existing) return notFound();
-  repo.identities.remove(authed.user_id, name);
-  forgetHandle(db, `${authed.user_email}/${name}`);
-  writeAudit(repo, "identity.deleted", authed.user_email, name);
+  repo.aliases.remove(authed.user_email, name);
+  forgetHandle(db, existing.address);
+  writeAudit(repo, "alias.deleted", authed.user_email, existing.address);
   return json({ ok: true });
 }
 
@@ -327,10 +326,16 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
   if (repo.teams.findByName(name)) return conflict(`team "${name}" already exists`);
   // The team's board shares its name, so the name must be free as a board too.
   if (getBoard(db, name)) return conflict(`a board named "#${name}" already exists`);
-  const team = repo.teams.create(name, authed.user_id);
+  let team: Team;
+  try {
+    team = repo.teams.create(name, authed.user_id);
+  } catch (e) {
+    if (e instanceof PrincipalTaken) return conflict(e.message);
+    throw e;
+  }
   repo.teams.addMember(team.id, authed.user_id);
   ensureTeamBoard(db, team, authed.user_email);
-  onTeamJoined(db, repo, team, authed.user_id, authed.user_email);
+  onTeamJoined(db, repo, team, authed.user_email);
   writeAudit(repo, "team.created", authed.user_email, name);
   writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email });
   return json({ name: team.name, created_at: team.created_at }, 201);
@@ -361,7 +366,7 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb)
   const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
   repo.teams.removeMember(team.id, authed.user_id);
-  onTeamLeft(db, repo, team, authed.user_id, authed.user_email);
+  onTeamLeft(db, repo, team, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
   return json({ ok: true });
 }
@@ -376,7 +381,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   const user  = repo.users.findByEmail(email);
   if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
   repo.teams.addMember(team.id, user.id);
-  onTeamJoined(db, repo, team, user.id, email);
+  onTeamJoined(db, repo, team, email);
   writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
 }
@@ -393,7 +398,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
     return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
   }
   repo.teams.removeMember(team.id, user.id);
-  onTeamLeft(db, repo, team, user.id, email);
+  onTeamLeft(db, repo, team, email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
 }

@@ -40,8 +40,7 @@ test("a hello over the user's bucket is refused with a wait, writes nothing abou
   expect(r.retry_after_ms).toBeLessThanOrEqual(250);
   expect(r.message).toMatch(/too many connections for this user; retry in \ds/);
   expect(count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ?`, `${A}/fe`)).toBe(0);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM identities WHERE name = 'fe'`)).toBe(0);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM handles WHERE name = ?`, `${A}/fe`)).toBe(0);
+  expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/fe`)).toBe(0);
 
   // Another user's bucket is their own.
   expect((await srv.client(bob, "be").connect()).type).toBe("hello_ok");

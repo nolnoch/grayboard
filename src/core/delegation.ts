@@ -16,25 +16,29 @@
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
-import { humanHandles, lastSeen, rosterHandles } from "./boards.ts";
+import { ALIAS_SESSION_SQL, humanHandles, lastSeen, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 
-// The launchers on the roster: handles whose live session opted in
-// (BUS_LAUNCHER=1, or the hello's launcher flag). Humans can't spawn — a
-// bridge holds their identity — and viewers have no handles row.
+// The launchers on the roster: aliases whose session opted in (BUS_LAUNCHER=1,
+// or the hello's launcher flag); offline ones by the session that last held
+// them, as peer_list shows. Humans can't spawn — a bridge holds their
+// identity — and viewers have no aliases row.
+const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
+  WHERE i.launcher = 1 AND (a.human IS NULL OR a.human = 0)`;
+
 export function launchers(db: Database): string[] {
-  return (db.prepare(`SELECT name FROM handles WHERE launcher = 1 AND (human IS NULL OR human = 0) ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+  return (db.prepare(`${LAUNCHER_SQL} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-// One session row notes the capability; the next session on the handle
-// rewrites it (the row describes the live session, as cwd and status do).
-export function setLauncher(db: Database, handle: string, on: boolean): void {
-  db.prepare(`UPDATE handles SET launcher = ? WHERE name = ?`).run(on ? 1 : 0, handle);
+// The session's capability, rewritten by each of its owner hellos on a server
+// (local mode records it when the session registers).
+export function setLauncher(db: Database, id: string, on: boolean): void {
+  db.prepare(`UPDATE ids SET launcher = ? WHERE id = ?`).run(on ? 1 : 0, id);
 }
 
 export function isLauncher(db: Database, handle: string): boolean {
-  return !!db.prepare(`SELECT launcher FROM handles WHERE name = ? AND launcher = 1 AND (human IS NULL OR human = 0)`).get(handle);
+  return !!db.prepare(`${LAUNCHER_SQL} AND a.address = ?`).get(handle);
 }
 
 // Server handles are `email/name` (local handles are bare names, one user per

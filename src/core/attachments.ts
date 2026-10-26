@@ -51,10 +51,11 @@ async function withBlob<T>(sha256: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-// A server user's caps, over the uploads of every handle under `prefix` (the
-// user's "email/"): `unsent` bytes not yet on a message or post, and `stored`
-// bytes in all, sent or not.
-export type UploadQuota = { prefix: string; unsent: number; stored: number };
+// A principal's caps (#284 decision 13), over every upload that counts
+// against it, whatever address uploaded it: `unsent` bytes not yet on a
+// message or post, and `stored` bytes in all, sent or not. `principal` is a
+// server user's email; it's recorded on the upload as uploader_principal.
+export type UploadQuota = { principal: string; unsent: number; stored: number };
 
 // Stores one checked file as an unbound upload of `uploader`'s. Identical
 // bytes share one blob. Also prunes uploads left unbound past their TTL, then
@@ -77,19 +78,21 @@ export async function storeAttachment(
       const row = db.transaction(() => {
         unnamed = pruneUnbound(db, now - UNBOUND_TTL_MS) > 0;
         const q = opts.quota;
-        if (q && uploadedBytes(db, q.prefix, true) + file.data.length > q.unsent) {
+        // Bytes the principal already has under this blob add nothing.
+        const adds = (unbound: boolean) => (q && heldBlob(db, q.principal, sha256, unbound) ? 0 : file.data.length);
+        if (q && uploadedBytes(db, q.principal, true) + adds(true) > q.unsent) {
           throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.unsent)}; send or wait for them to expire`);
         }
-        if (q && uploadedBytes(db, q.prefix, false) + file.data.length > q.stored) {
+        if (q && uploadedBytes(db, q.principal, false) + adds(false) > q.stored) {
           throw new TooLargeError(`your stored attachments would exceed ${formatSize(q.stored)}; they're freed as their messages and posts age out`);
         }
         db.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(sha256, file.data.length, now);
         return db
           .prepare(
-            `INSERT INTO attachments (sha256, filename, type, size, uploader, created_at)
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+            `INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           )
-          .get(sha256, file.filename, file.type, file.data.length, uploader, now) as AttachmentRow;
+          .get(sha256, file.filename, file.type, file.data.length, uploader, q?.principal ?? null, now) as AttachmentRow;
       }).immediate();
       try {
         // Put even when the catalog knew this sha256: it heals bytes a crash lost.
@@ -222,19 +225,26 @@ export function dropAttachments(db: Database, kind: "message" | "post", ownersSq
   return db.prepare(`DELETE FROM attachments WHERE ${col} IN (${ownersSql})`).run(...params).changes;
 }
 
-// Bytes uploaded by the handles under `prefix` (a server user's "email/"),
-// only the unbound ones if `unbound`, for the per-user quotas. The range on
-// uploader uses its index: every handle under the prefix sorts below the
-// prefix with its last character incremented.
-export function uploadedBytes(db: Database, prefix: string, unbound: boolean): number {
-  const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+// Bytes stored against `principal`, only the unbound uploads if `unbound`,
+// for the per-principal quotas. Each distinct blob counts once (#284
+// decision 13): the same file sent twice is stored once.
+export function uploadedBytes(db: Database, principal: string, unbound: boolean): number {
   const row = db
     .prepare(
-      `SELECT COALESCE(SUM(size), 0) AS n FROM attachments
-        WHERE uploader >= ? AND uploader < ?${unbound ? " AND message_id IS NULL AND post_id IS NULL" : ""}`,
+      `SELECT COALESCE(SUM(size), 0) AS n FROM (
+         SELECT MAX(size) AS size FROM attachments
+          WHERE uploader_principal = ?${unbound ? " AND message_id IS NULL AND post_id IS NULL" : ""}
+          GROUP BY sha256)`,
     )
-    .get(prefix, end) as { n: number };
+    .get(principal) as { n: number };
   return row.n;
+}
+
+// Whether `principal` already stores blob `sha256` (only unbound uploads, if `unbound`).
+function heldBlob(db: Database, principal: string, sha256: string, unbound: boolean): boolean {
+  return !!db
+    .prepare(`SELECT 1 FROM attachments WHERE uploader_principal = ? AND sha256 = ?${unbound ? " AND message_id IS NULL AND post_id IS NULL" : ""}`)
+    .get(principal, sha256);
 }
 
 // Drops one of `uploader`'s unsent uploads, for a send that failed after

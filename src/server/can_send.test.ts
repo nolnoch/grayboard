@@ -4,7 +4,6 @@ import { canSend, canAdmin, type SendPrincipal, type SendTarget, type SendContex
 const principal: SendPrincipal = {
   user_id:       1,
   user_email:    "wade@example.com",
-  identity_id:   1,
   identity_name: "fe",
   identity_full: "wade@example.com/fe",
 };

@@ -2,14 +2,68 @@ import type { Database } from "bun:sqlite";
 
 // Board + claim tables, shared by local and distributed modes. Kept separate
 // from each mode's direct-message tables so neither needs a migration.
-// (handles.launcher: the session's harness can spawn subagents, #184.)
 export function initCoreSchema(db: Database): void {
   db.exec(`
+    -- The 1.x roster, replaced by aliases and ids (#284). Nothing reads or
+    -- writes it after each mode's open seeds aliases from it; it stays
+    -- because schema changes are additive.
     CREATE TABLE IF NOT EXISTS handles (
       name        TEXT PRIMARY KEY,
       first_seen  INTEGER NOT NULL,
       last_seen   INTEGER NOT NULL
     );
+
+    -- One row per session (#284): the session ID as an address, and the
+    -- facts that describe a running session. principal: the session's
+    -- signed-in user (its email) on a server, null in local mode's one
+    -- implicit person scope. cwd (local) or place (server, as the client
+    -- described it) says where it runs; status is its peer_status line;
+    -- launcher: its harness can spawn subagents (#184). ended_at: local
+    -- mode's session ended (a clean exit, or reaped once its process was
+    -- gone), so its ID is never taken again.
+    CREATE TABLE IF NOT EXISTS ids (
+      id          TEXT PRIMARY KEY,
+      principal   TEXT,
+      harness     TEXT,
+      cwd         TEXT,
+      place       TEXT,
+      status      TEXT,
+      status_at   INTEGER,
+      launcher    INTEGER,
+      started_at  INTEGER NOT NULL,
+      last_seen   INTEGER NOT NULL,
+      ended_at    INTEGER
+    );
+
+    -- Durable names (#284): every 1.x handle, as a person-scope alias.
+    -- address is the handle as written (local: the bare name; server:
+    -- email/name). scope_ref: the person's email, null for local mode's
+    -- implicit scope. human: the declared human's alias. queue_off: opted
+    -- out of queue boards' rotation, until it opts back in. last_seen: when
+    -- a session last used it, null until one has.
+    CREATE TABLE IF NOT EXISTS aliases (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      address               TEXT    NOT NULL UNIQUE,
+      scope_kind            TEXT    NOT NULL CHECK (scope_kind IN ('person','team','service')),
+      scope_ref             TEXT,
+      name                  TEXT    NOT NULL,
+      human                 INTEGER,
+      queue_off             INTEGER,
+      created_by_principal  TEXT,
+      created_at            INTEGER NOT NULL,
+      last_seen             INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_aliases_scope ON aliases(scope_ref, name);
+    CREATE INDEX IF NOT EXISTS idx_aliases_name ON aliases(name);
+
+    -- Which session holds each alias now: the address is the key, so a
+    -- name has one holder (src/core/bindings.ts holdAlias).
+    CREATE TABLE IF NOT EXISTS alias_holds (
+      address   TEXT    PRIMARY KEY,
+      id        TEXT    NOT NULL,
+      bound_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alias_holds_id ON alias_holds(id);
 
     CREATE TABLE IF NOT EXISTS boards (
       name        TEXT PRIMARY KEY,
@@ -153,10 +207,7 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
     CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
-  // Session context, added after the roster: where the session runs (cwd in
-  // local mode; place, as the client described it, in server mode) and a
-  // free-text status it set, both reset when a session starts; and whether the
-  // handle is a declared human's (`grayboard human`), which persists.
+  // The 1.x roster's later columns, which each mode's alias seed reads.
   const handleCols = new Set((db.prepare(`PRAGMA table_info(handles)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["cwd", "TEXT"], ["place", "TEXT"], ["status", "TEXT"], ["status_at", "INTEGER"], ["human", "INTEGER"], ["queue_off", "INTEGER"], ["launcher", "INTEGER"]]) {
     if (!handleCols.has(col!)) db.exec(`ALTER TABLE handles ADD COLUMN ${col} ${type}`);
@@ -165,6 +216,18 @@ export function initCoreSchema(db: Database): void {
   // An announcement's TTL (`grayboard announce --ttl`); null for other posts.
   const postCols = db.prepare(`PRAGMA table_info(posts)`).all() as { name: string }[];
   if (!postCols.some((c) => c.name === "expires_at")) db.exec(`ALTER TABLE posts ADD COLUMN expires_at INTEGER`);
+  // The session that wrote the post (#284), beside the address it posted as;
+  // null for posts from before it, and for writers with no session.
+  if (!postCols.some((c) => c.name === "author_id")) db.exec(`ALTER TABLE posts ADD COLUMN author_id TEXT`);
+
+  // The principal an upload counts against (#284 decision 13): a server
+  // user's email, null in local mode. Backfilled from the uploader's "email/"
+  // prefix, which is what the quota ranged over before, on every open: rows
+  // a 1.x server wrote after a downgrade count too.
+  const attachmentCols = db.prepare(`PRAGMA table_info(attachments)`).all() as { name: string }[];
+  if (!attachmentCols.some((c) => c.name === "uploader_principal")) db.exec(`ALTER TABLE attachments ADD COLUMN uploader_principal TEXT`);
+  db.exec(`UPDATE attachments SET uploader_principal = substr(uploader, 1, instr(uploader, '/') - 1) WHERE uploader_principal IS NULL AND instr(uploader, '/') > 0`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_attachments_principal ON attachments(uploader_principal, sha256) WHERE uploader_principal IS NOT NULL`);
 
   // Whether a push wakes its recipient (1), or waits to ride along with the
   // next push that does (0): a thread reply to a bystander.

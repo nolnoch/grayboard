@@ -9,7 +9,7 @@ import { runCli } from "../support/cli.ts";
 import { serverEnv } from "../support/env.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
-import { sessionIdOf, unboundInstruction } from "../../src/core/bindings.ts";
+import { idAddress, unboundInstruction } from "../../src/core/bindings.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -37,6 +37,8 @@ function rows<T>(sql: string, ...args: (string | number)[]): T[] {
 }
 
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, `${A}/${name}`);
+// The status of the session holding `address` (#284: status is the session's).
+const status = (address: string) => rows<{ status: string | null }>(`SELECT i.status FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`, address)[0]!.status;
 const contents = (s: Session) => s.pushes.map((p) => p.content);
 // An unbound session's own row in peer_list's unbound_sessions.
 const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
@@ -152,7 +154,7 @@ test("4, 13: a never-seen name needs create; the refusal lists the closest names
   expect(err).toContain(`no name "fee" has ever been used; closest: fe.`);
   expect(events("fee")).toEqual([{ session_id: await sessionId(s), event: "refused", detail: expect.stringContaining("closest: fe") }]);
   // The refusal created nothing; create: true does.
-  expect(rows(`SELECT 1 FROM identities WHERE name = 'fee'`)).toEqual([]);
+  expect(rows(`SELECT 1 FROM aliases WHERE name = 'fee'`)).toEqual([]);
   await s.call("bind", { name: "fee", create: true });
   expect((await s.call("peer_list", {})).you).toBe(`${A}/fee`);
 }, 20_000);
@@ -250,7 +252,7 @@ test("audit 2: a channels-off session holds its name: probed, never online, and 
 
 test("audit 3, 4: a rebind's from is checked against the record, a late resume is refused, and a session key can't be borrowed", async () => {
   const key = "a1".repeat(32);
-  const sid = sessionIdOf(key);
+  const sid = idAddress(key);
   const fe = srv.client(alice, "fe", { hello: { session_key: key } });
   expect((await fe.connect()).type).toBe("hello_ok");
   await fe.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
@@ -276,7 +278,7 @@ test("audit 3, 4: a rebind's from is checked against the record, a late resume i
   const ok = await other.connect();
   expect(ok.type).toBe("hello_ok");
   expect(ok).toMatchObject({ moved: [], not_moved: `claims not moved: this session doesn't hold "fe2"` });
-  expect(events("x")).toEqual([{ session_id: sessionIdOf("b2".repeat(32)), event: "bound", detail: `claims not moved: this session doesn't hold "fe2"` }]);
+  expect(events("x")).toEqual([{ session_id: idAddress("b2".repeat(32)), event: "bound", detail: `claims not moved: this session doesn't hold "fe2"` }]);
   expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe2` }]);
   expect(events("fe2").map((e) => e.event)).toEqual(["moved"]);
 }, 20_000);
@@ -429,11 +431,11 @@ test("16, 18: raw hellos: create: false, lazy create, and a read-only connection
   // 16: create: false refuses an unknown name with the closest known ones.
   const refused = await srv.client(alice, "bee", { hello: { create: false } }).connect();
   expect(refused).toMatchObject({ type: "error", code: "identity_unknown", known: ["be"] });
-  expect(rows(`SELECT 1 FROM identities WHERE name = 'bee'`)).toEqual([]);
+  expect(rows(`SELECT 1 FROM aliases WHERE name = 'bee'`)).toEqual([]);
   // An old client's hello (no create) still creates the name.
   const lazy = srv.client(alice, "lazy");
   expect((await lazy.connect()).type).toBe("hello_ok");
-  expect(rows(`SELECT 1 FROM identities WHERE name = 'lazy'`)).toHaveLength(1);
+  expect(rows(`SELECT 1 FROM aliases WHERE name = 'lazy'`)).toHaveLength(1);
   // Candidates leave out live names.
   expect((await srv.client(alice, null).connect()).candidates).toEqual([]);
   lazy.close();
@@ -443,7 +445,7 @@ test("16, 18: raw hellos: create: false, lazy create, and a read-only connection
 
   // 18: a read-only connection: open boards and its user's team boards.
   const key = "0123456789abcdef".repeat(4);
-  const id = sessionIdOf(key);
+  const id = idAddress(key);
   let ro = srv.client(alice, null, { hello: { session_key: key } });
   // Once lazy's close lands, it's a candidate.
   await until(async () => {
@@ -467,7 +469,7 @@ test("16, 18: raw hellos: create: false, lazy create, and a read-only connection
   ]) expect(r).toMatchObject({ type: "error", code: "unbound" });
   expect(cellsContaining(`~${id}`)).toEqual([]);
   // A hello with no session_key (an old client) gets a session ID minted.
-  expect((await srv.client(alice, null).connect()).identity_full).toMatch(new RegExp(`^${A}/~[0-9a-f]{16}$`));
+  expect((await srv.client(alice, null).connect()).identity_full).toMatch(new RegExp(`^${A}/~id:[0-9a-z]{13}$`));
 }, 20_000);
 
 let rel: ReleaseBinaries;
@@ -530,17 +532,34 @@ test("#211: a restored_from the name's history doesn't show is logged unverified
   const prior = events("api").at(-1)!.session_id;
   await stop(s.c);
   const { WsClient } = await import("../support/ws_client.ts");
-  const stranger = "0123456789abcdef";
+  const stranger = "id:0123456789abc";
   const ws = new WsClient(srv.base, alice, "api", { hello: { restored_from: stranger } });
   expect((await ws.connect()).type).toBe("hello_ok");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
-  expect(rows<{ status: string | null }>("SELECT status FROM handles WHERE name = ?", `${A}/api`)[0]!.status).toBeNull();
+  expect(status(`${A}/api`)).toBeNull();
+  ws.close();
+});
+
+test("#284: a 1.x client's 16-hex restored_from is the same session ID: its restore verifies", async () => {
+  const { WsClient } = await import("../support/ws_client.ts");
+  const key = "d5".repeat(32);
+  let ws = new WsClient(srv.base, alice, "api", { hello: { session_key: key } });
+  expect((await ws.connect()).type).toBe("hello_ok");
+  await ws.call("peer_status", { text: "mid-task" });
+  ws.close();
+  await until(() => events("api").at(-1)!.event === "released");
+  // What a 1.x client's name record holds: the key's SHA-256, first 16 hex.
+  const hex = new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 16);
+  ws = new WsClient(srv.base, alice, "api", { hello: { session_key: "e6".repeat(32), restored_from: hex } });
+  expect((await ws.connect()).type).toBe("hello_ok");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored: restart of session ${idAddress(key)}` });
+  expect(status(`${A}/api`)).toBe("mid-task");
   ws.close();
 });
 
 test("#211: a resume keeps its status only when its own session last bound the name; a rebind ignores restored_from", async () => {
   const { WsClient } = await import("../support/ws_client.ts");
-  const status = () => rows<{ status: string | null }>("SELECT status FROM handles WHERE name = ?", `${A}/api`)[0]!.status;
+  const apiStatus = () => status(`${A}/api`);
   const [mine, theirs] = ["a1".repeat(32), "b1".repeat(32)];
   const connect = async (key: string, hello: Record<string, unknown>) => {
     const ws = new WsClient(srv.base, alice, "api", { hello: { session_key: key, ...hello } });
@@ -553,25 +572,58 @@ test("#211: a resume keeps its status only when its own session last bound the n
   await until(() => events("api").at(-1)!.event === "released");
   // A reconnect of the session that last bound it: verified, status kept.
   ws = await connect(mine, { resume: true });
-  expect(events("api").at(-1)).toMatchObject({ session_id: sessionIdOf(mine), event: "bound", detail: "reconnect" });
-  expect(status()).toBe("mid-task");
+  expect(events("api").at(-1)).toMatchObject({ session_id: idAddress(mine), event: "bound", detail: "reconnect" });
+  expect(apiStatus()).toBe("mid-task");
   ws.close();
   await until(() => events("api").at(-1)!.event === "released");
   // Another session's resume: unverified, fresh status.
   ws = await connect(theirs, { resume: true });
-  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `reconnect not verified: latest bound by ${sessionIdOf(mine)}` });
-  expect(status()).toBeNull();
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `reconnect not verified: latest bound by ${idAddress(mine)}` });
+  expect(apiStatus()).toBeNull();
   await ws.call("peer_status", { text: "theirs" });
   ws.close();
   await until(() => events("api").at(-1)!.event === "released");
-  // A rebind naming a restored_from that would verify still starts fresh, and logs only the move.
+  // A rebind naming a restored_from logs only the move; the status is the
+  // rebinding session's own (#284: session facts move with the session).
   const other = await connect(mine, { identity: "fe" });
   other.close();
   await until(() => events("fe").at(-1)!.event === "released");
-  ws = await connect(mine, { from: "fe", restored_from: sessionIdOf(theirs) });
+  ws = await connect(mine, { from: "fe", restored_from: idAddress(theirs) });
   expect(events("api").at(-1)).toMatchObject({ event: "moved", detail: `${A}/fe` });
-  expect(status()).toBeNull();
+  expect(apiStatus()).toBe("mid-task");
   ws.close();
+});
+
+// #284: a session's ID is one principal's. Another user presenting the same
+// key is refused, never attached to the session's row; the owner's own
+// further hellos (a reconnect, a rebind) are the same session.
+test("#284: a key whose ID is another principal's session is refused with id_collision, and audited", async () => {
+  const { WsClient } = await import("../support/ws_client.ts");
+  const key = "c4".repeat(32);
+  const mine = new WsClient(srv.base, alice, "api", { hello: { session_key: key, where: "laptop" } });
+  expect((await mine.connect()).type).toBe("hello_ok");
+  expect(rows(`SELECT id, principal, place FROM ids`)).toEqual([{ id: idAddress(key), principal: A, place: "laptop" }]);
+  expect(rows(`SELECT address, id FROM alias_holds`)).toEqual([{ address: `${A}/api`, id: idAddress(key) }]);
+  const theirs = new WsClient(srv.base, bob, "api", { hello: { session_key: key } });
+  expect(await theirs.connect()).toMatchObject({ type: "error", code: "id_collision", message: expect.stringContaining(idAddress(key)) });
+  expect(rows(`SELECT actor, action, target FROM access_log WHERE action = 'id.collision'`)).toEqual([{ actor: "bob@example.com", action: "id.collision", target: idAddress(key) }]);
+  expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/api` }]);
+  // The owner's rebind is the same session: one ids row, the hold moves.
+  const again = new WsClient(srv.base, alice, "web", { hello: { session_key: key, from: "api" } });
+  expect((await again.connect()).type).toBe("hello_ok");
+  expect(rows(`SELECT id FROM ids`)).toEqual([{ id: idAddress(key) }]);
+  expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/web` }]);
+  mine.close();
+  again.close();
+  await until(() => rows(`SELECT 1 FROM alias_holds`).length === 0);
+});
+
+// #284 decision 5: teams and service principals share one namespace.
+test("#284: creating a team refuses a name another principal holds", async () => {
+  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  const r = await srv.api(alice, "POST", "/api/teams", { name: "ingest" });
+  expect(r.status).toBe(409);
+  expect(r.body.message).toContain(`"ingest" belongs to another team or service principal`);
 });
 
 test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
@@ -590,6 +642,34 @@ test("audit 19: a hello refused for an invalid or reserved name is logged as ref
   expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "bad_request" });
   // A tools-only connection doesn't hold the name, so it doesn't log.
   expect(await srv.client(alice, "human", { push: false }).connect()).toMatchObject({ type: "error", code: "bad_request" });
-  expect(events(long.slice(0, 32))).toEqual([{ session_id: expect.stringMatching(/^[0-9a-f]{16}$/), event: "refused", detail: "invalid name" }]);
-  expect(events("human")).toEqual([{ session_id: expect.stringMatching(/^[0-9a-f]{16}$/), event: "refused", detail: expect.stringContaining("human") }]);
+  expect(events(long.slice(0, 32))).toEqual([{ session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: "invalid name" }]);
+  expect(events("human")).toEqual([{ session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: expect.stringContaining("human") }]);
 });
+
+// #284 audit B1/W1: a write carries the writing session's ID; a tools-only
+// connection holds no session row, so its writes carry none.
+test("#284: messages and posts carry the owner session's ID; a tools-only connection's carry null", async () => {
+  const owner = await session("be");
+  await owner.call("board_create", { name: "e2e", purpose: "test" });
+  const tools = await session("be", { extra: { BUS_PUSH: "off" } });
+  for (const [s, tag] of [[owner, "owner"], [tools, "tools"]] as const) {
+    await s.call("dm_send", { to: `${A}/be`, body: `dm ${tag}` });
+    await s.call("board_post", { board: "e2e", body: `post ${tag}` });
+  }
+  const id = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/be`)[0]!.id;
+  expect(id).toMatch(/^id:[0-9a-z]{13}$/);
+  expect(rows(`SELECT body, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender_id: id }, { body: "dm tools", sender_id: null }]);
+  expect(rows(`SELECT body, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author_id: id }, { body: "post tools", author_id: null }]);
+}, 20_000);
+
+// #284 audit B12/W5: the lazy alias.created and handle.launcher_set rows name
+// the session; the first hello's launcher flag is written once, by registerId.
+test("#284: alias.created and handle.launcher_set name the session; the flag is on its ids row", async () => {
+  await session("be", { extra: { BUS_LAUNCHER: "1" } });
+  const id = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/be`)[0]!.id;
+  expect(rows(`SELECT action, actor, target, detail FROM access_log WHERE action IN ('alias.created', 'handle.launcher_set') AND target = ? ORDER BY id`, `${A}/be`)).toEqual([
+    { action: "alias.created", actor: A, target: `${A}/be`, detail: JSON.stringify({ lazy: true, session: id }) },
+    { action: "handle.launcher_set", actor: A, target: `${A}/be`, detail: JSON.stringify({ on: true, session: id }) },
+  ]);
+  expect(rows(`SELECT launcher FROM ids WHERE id = ?`, id)).toEqual([{ launcher: 1 }]);
+}, 20_000);

@@ -23,22 +23,30 @@ import {
   read,
   refOf,
   setAccess,
-  startSession,
+  ensureAlias,
+  registerId,
   subscribe,
-  touchHandle,
+  touchAlias,
   who,
   type Access,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
+import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 
 let db: Database;
+
+// A name a session has used: an alias with a last_seen, so it's on the roster.
+const seen = (h: string) => {
+  ensureAlias(db, h, "test");
+  touchAlias(db, h);
+};
 
 beforeEach(() => {
   db = new Database(":memory:");
   initCoreSchema(db);
-  for (const h of ["be", "sim", "fe"]) touchHandle(db, h);
+  for (const h of ["be", "sim", "fe"]) seen(h);
   createBoard(db, "be", "#e2e", "End-to-end fixtures and runs");
 });
 
@@ -60,7 +68,7 @@ test("a declared human handle persists across sessions; declaring another moves 
   const r = who(db, "be", { include_offline: true }, () => true);
   expect(r.peers.find((p) => p.handle === "alex")?.human).toBe(true);
   expect(r.peers.find((p) => p.handle === "sim")?.human).toBeUndefined();
-  startSession(db, "alex", null);
+  seen("alex");
   expect(humanHandles(db)).toEqual(["alex"]);
   declareHuman(db, "sam");
   expect(humanHandles(db)).toEqual(["sam"]);
@@ -545,7 +553,7 @@ describe("who", () => {
 
   test("tail viewers (~ handles) aren't peers", () => {
     subscribe(db, "~tail-1", "e2e", "push");
-    db.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('~tail-1', 0, 0)`).run();
+    db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail-1', 'person', '~tail-1', 0, 0)`).run();
     const any = () => true;
     expect(who(db, "be", { board: "e2e" }, any).peers.map((p) => p.handle)).toEqual(["be"]);
     expect(who(db, "be", {}, any).peers.map((p) => p.handle)).toEqual(["be", "fe", "sim"]);
@@ -655,7 +663,15 @@ test("board_create exposes kind, and a queue board created through the tool rout
   expect(getBoard(db, "plain")!.kind).toBe("broadcast");
 });
 
+// A session holding `name` (#284): its ids row and its hold.
+const hold = (name: string, id: string, facts: { cwd?: string; launcher?: boolean } = {}) => {
+  registerId(db, { id, principal: null, cwd: facts.cwd ?? null, launcher: facts.launcher ?? false });
+  holdAlias(db, name, id);
+  logBinding(db, id, name, "bound");
+};
+
 test("peer_status queue param is the explicit rotation opt-out; status text never is", () => {
+  hold("fe", "id:00000000000fe");
   callBoardTool(db, "be", "board_create", { name: "lanes", purpose: "work rotation", kind: "queue" });
   callBoardTool(db, "sim", "board_subscribe", { board: "lanes", mode: "push" });
   callBoardTool(db, "fe", "board_subscribe", { board: "lanes", mode: "push" });
@@ -666,6 +682,24 @@ test("peer_status queue param is the explicit rotation opt-out; status text neve
   callBoardTool(db, "fe", "peer_status", { text: "", queue: "on" });
   expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBeUndefined();
   expect(() => callBoardTool(db, "fe", "peer_status", { text: "", queue: "busy" })).toThrow(/queue/);
+});
+
+// #284 decision 11: a session's facts sit on its ID, an alias's on the alias.
+test("peer_list shows the session's facts through its alias; on a rebind they move and the alias's stay", () => {
+  hold("fe", "id:0000000000001", { cwd: "/tmp/checkout", launcher: true });
+  callBoardTool(db, "fe", "peer_status", { text: "on ENG-142", queue: "off" });
+  const peer = (h: string) => who(db, "be", { include_offline: true }, () => true).peers.find((p) => p.handle === h);
+  expect(peer("fe")).toMatchObject({ status: "on ENG-142", queue_off: true, launcher: true, where: expect.any(String) });
+  // The session rebinds to fe2: its status and launcher flag go with it, fe keeps its queue opt-out.
+  seen("fe2");
+  dropHold(db, "fe", "id:0000000000001");
+  holdAlias(db, "fe2", "id:0000000000001");
+  logBinding(db, "id:0000000000001", "fe2", "moved", "fe");
+  expect(peer("fe2")).toMatchObject({ status: "on ENG-142", launcher: true });
+  expect(peer("fe2")?.queue_off).toBeUndefined();
+  expect(peer("fe")?.queue_off).toBe(true);
+  // A name no session holds has no session to set a status on.
+  expect(() => callBoardTool(db, "sim", "peer_status", { text: "x" })).toThrow(/no live session holds "sim"/);
 });
 
 // #254: a repeat whose first answer was lost is answered from state.

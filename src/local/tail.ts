@@ -2,7 +2,7 @@
 //
 // Event-driven like any agent: tail holds a push subscription under a
 // per-process handle and listens on its own wakeup socket, so posters poke it.
-// It never posts, never registers in `handles` (so it can't be @mentioned),
+// It never posts, never becomes an alias (so it can't be @mentioned),
 // and only moves its own cursor.
 import { db } from "./db.ts";
 import { listenForWakeup, poke } from "./wakeup.ts";

@@ -1,14 +1,15 @@
-// Local name binding (#182). Every grayboard mcp process that owns delivery
-// writes a bindings row at start, keyed by its session ID, with name NULL
-// while unbound. A name is acquired by setting the row's name inside one
-// BEGIN IMMEDIATE transaction, so two starters can't both win and a live
-// holder whose event loop is busy can't lose its name to a socket probe
-// (#80). The wakeup socket follows the row: only the row's owner listens.
+// Local name binding (#182, #284). Every grayboard mcp process that owns
+// delivery writes a bindings row at start, keyed by its session ID: its
+// liveness (pid, start time, harness pid). Its facts are its ids row. A name
+// is acquired by writing its alias_holds row inside one BEGIN IMMEDIATE
+// transaction, so two starters can't both win and a live holder whose event
+// loop is busy can't lose its name to a socket probe (#80). The wakeup socket
+// follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { declareHuman, humanHandles, isHuman, isViewer } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, endId, ensureAlias, humanHandles, isHuman, isViewer, registerId } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { continuityOf, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims, moveClaims, type Claim } from "../core/claims.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -16,6 +17,9 @@ import { testPause } from "../shared/testpause.ts";
 import { aliveRows, commandName, isAlive, procStart } from "../shared/proc.ts";
 import { poke } from "./wakeup.ts";
 
+// A session as binding reads it: its bindings row (liveness), its ids row's
+// harness and cwd, and the name it holds, if any: its hold, or for a 1.x
+// process sharing the file, its bindings row's name.
 export type SessionRow = {
   session_id: string;
   name: string | null;
@@ -25,8 +29,10 @@ export type SessionRow = {
   harness_pid: number | null;
   cwd: string | null;
   started_at: number;
-  bound_at: number | null;
 };
+
+const SESSION_SQL = `SELECT b.session_id, COALESCE(h.address, b.name) AS name, b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at
+  FROM bindings b LEFT JOIN ids i ON i.id = b.session_id LEFT JOIN alias_holds h ON h.id = b.session_id`;
 
 /** This process as a session row, unbound. */
 export function thisSession(sessionId: string, cwd = process.cwd()): SessionRow {
@@ -42,16 +48,21 @@ export function thisSession(sessionId: string, cwd = process.cwd()): SessionRow 
     harness_pid: process.ppid,
     cwd,
     started_at: Date.now(),
-    bound_at: null,
   };
 }
 
-/** Write this session's row, unbound: its presence until it binds. */
-export function registerSession(db: Database, s: SessionRow): void {
-  db.prepare(
-    `INSERT INTO bindings (session_id, name, pid, proc_start, harness, harness_pid, cwd, started_at, bound_at)
-     VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NULL)`,
-  ).run(s.session_id, s.pid, s.proc_start, s.harness, s.harness_pid, s.cwd, s.started_at);
+/**
+ * Write this session's rows, unbound: its liveness and its ids row, which
+ * are its presence until it binds. Throws IdCollision when the ID already
+ * has a row: an ID is never reused.
+ */
+export function registerSession(db: Database, s: SessionRow, launcher: boolean): void {
+  db.transaction(() => {
+    registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher }, s.started_at);
+    db.prepare(
+      `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at) VALUES (?, ?, ?, ?, ?)`,
+    ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at);
+  }).immediate();
 }
 
 /** How a holder reads in a refusal: "pid 4242 (claude, in grayboard on main)". */
@@ -61,31 +72,58 @@ export function describeHolder(r: SessionRow): string {
   return `the live session ${r.session_id} (pid ${r.pid}${what ? `, ${what}` : ""})`;
 }
 
-// A live socket with no live row: a session from before #182, or one that
-// has just rebound off the name and hasn't closed its socket yet. That one
-// left no row (dead or alive) on the name, and its release is the name's last
-// event. `deadRow`: a dead holder's row was found, so it isn't that.
+// A live socket with no live session holding the name: a session from
+// before #182, or one that has just rebound off the name and hasn't closed
+// its socket yet. That one left no hold (dead or alive) on the name, and its
+// release is the name's last event. `deadRow`: a dead holder's row was found,
+// so it isn't that.
 function noRowHolder(db: Database, name: string, deadRow: boolean): string {
   return !deadRow && lastWasRelease(db, name)
     ? "a session that has just rebound off it (its wakeup socket still answers); try again in a moment"
-    : "a live session from an older grayboard (its wakeup socket answers; no live bindings row holds the name)";
+    : "a live session from an older grayboard (its wakeup socket answers; no live session holds the name)";
+}
+
+// The session ends: its liveness row and its holds go, each release is
+// logged, and its ID is marked ended. A 1.x process's name is its bindings
+// row's. Callers are inside a transaction. Returns the names it held.
+function end(db: Database, sessionId: string, why: string | null, now: number): string[] {
+  const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
+  const holds = (db.prepare(`DELETE FROM alias_holds WHERE id = ? RETURNING address`).all(sessionId) as { address: string }[]).map((r) => r.address);
+  const held = [...new Set([...holds, ...(row?.name ? [row.name] : [])])];
+  for (const name of held) logBinding(db, sessionId, name, "released", why, now);
+  endId(db, sessionId, now);
+  return held;
+}
+
+// Holds whose session has no bindings row: a 1.x process reaped it, which
+// deletes only the row. Their sessions are over. Call inside a transaction.
+function sweepOrphanHolds(db: Database, now: number): void {
+  const gone = db.prepare(`DELETE FROM alias_holds WHERE id NOT IN (SELECT session_id FROM bindings) RETURNING id`).all() as { id: string }[];
+  for (const { id } of gone) endId(db, id, now);
 }
 
 // Reap rows whose process is gone. Callers are inside a transaction. The
 // rows were read before it, so another process may have reaped one already:
-// only the process whose delete removed the row logs its release.
+// only the process whose delete removed the row ends the session.
 export function reap(db: Database, rows: SessionRow[], now: number): void {
   for (const r of rows) {
-    const gone = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(r.session_id) as { name: string | null } | null;
-    if (gone?.name) logBinding(db, r.session_id, gone.name, "released", `reaped: pid ${r.pid} is gone`, now);
+    if (!db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(r.session_id)) continue;
+    end(db, r.session_id, `reaped: pid ${r.pid} is gone`, now);
   }
 }
 
 /** Every live session row, reaping the dead ones. */
 export function liveSessions(db: Database): SessionRow[] {
-  const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
+  const rows = db.prepare(SESSION_SQL).all() as SessionRow[];
   const { alive, dead } = aliveRows(rows);
-  if (dead.length) db.transaction(() => reap(db, dead, Date.now())).immediate();
+  const orphans = !!db.prepare(`SELECT 1 FROM alias_holds WHERE id NOT IN (SELECT session_id FROM bindings) LIMIT 1`).get();
+  if (dead.length || orphans) {
+    db.transaction(() => {
+      const now = Date.now();
+      reap(db, dead, now);
+      sweepOrphanHolds(db, now);
+    }).immediate();
+  }
   return alive;
 }
 
@@ -99,11 +137,17 @@ function agentName(db: Database): (name: string) => boolean {
   return (n) => !isViewer(n) && !humans.has(n) && n !== HUMAN_NAME;
 }
 
-// Names that exist: the roster's agent names.
+// Names that exist: the aliases that are agents'.
 function knownNames(db: Database): string[] {
-  return (db.prepare(`SELECT name FROM handles ORDER BY last_seen DESC`).all() as { name: string }[])
-    .map((r) => r.name)
+  return (db.prepare(`SELECT address FROM aliases ORDER BY last_seen DESC`).all() as { address: string }[])
+    .map((r) => r.address)
     .filter(agentName(db));
+}
+
+// The session holding `name`, other than `sessionId`: by its hold, or a
+// 1.x process by its bindings row's name.
+function holdingSession(db: Database, name: string, sessionId: string | null = null): SessionRow | null {
+  return db.prepare(`${SESSION_SQL} WHERE (h.address = ?1 OR b.name = ?1) AND b.session_id IS NOT ?2`).get(name, sessionId) as SessionRow | null;
 }
 
 /**
@@ -114,9 +158,9 @@ function knownNames(db: Database): string[] {
  * against the name's history in the transaction that logs the bind (#211),
  * and `restored` says whether it held. Refusals are logged.
  *
- * The socket probe for a pre-upgrade holder (no live row, live socket) runs
+ * The socket probe for a pre-upgrade holder (no live hold, live socket) runs
  * before the lock and is re-checked against the rows inside it, so the write
- * lock is never held across a probe. A dead row doesn't skip it: a settled
+ * lock is never held across a probe. A dead holder doesn't skip it: a settled
  * pre-upgrade session can listen on a name whose new-code holder was killed.
  */
 export async function acquireName(
@@ -125,8 +169,7 @@ export async function acquireName(
   name: string,
   opts: { create: boolean; previous: string | null; allowHuman?: boolean; restartOf?: string },
 ): Promise<AcquireResult> {
-  const rowHolder = () => db.prepare(`SELECT * FROM bindings WHERE name = ? AND session_id != ?`).get(name, sessionId) as SessionRow | null;
-  const before = rowHolder();
+  const before = holdingSession(db, name, sessionId);
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
   testPause("bind:before-txn");
@@ -140,11 +183,11 @@ export async function acquireName(
     if (!opts.allowHuman && (name === HUMAN_NAME || isHuman(db, name))) {
       return refuse(`"${name}" is your user's handle; an agent session can't bind it`);
     }
-    if (!opts.create && !db.prepare(`SELECT 1 FROM handles WHERE name = ?`).get(name)) {
+    if (!opts.create && !db.prepare(`SELECT 1 FROM aliases WHERE address = ?`).get(name)) {
       const known = closestNames(name, knownNames(db));
       return refuse(unknownNameError(name, known), { known });
     }
-    const holder = rowHolder();
+    const holder = holdingSession(db, name, sessionId);
     if (holder && isAlive(holder.pid, holder.proc_start)) {
       const who = describeHolder(holder);
       return refuse(`"${name}" is held by ${who}`, { holder: who });
@@ -155,8 +198,13 @@ export async function acquireName(
       return refuse(`"${name}" is held by ${who}`, { holder: who });
     }
 
+    // bindings.name too: a 1.x process sharing the file sees the holder there
+    // (its UNIQUE and its holder check), not in alias_holds.
     const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
     if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
+    ensureAlias(db, name, sessionId, now);
+    if (opts.previous) dropHold(db, opts.previous, sessionId);
+    holdAlias(db, name, sessionId, now);
     const restart = opts.restartOf === undefined ? null : continuityOf(db, name, { restartOf: opts.restartOf });
     const moved = opts.previous ? moveClaims(db, opts.previous, name, now) : [];
     if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
@@ -173,7 +221,7 @@ export async function acquireName(
 export async function siblingGone(db: Database, name: string, harnessPid: number, ms = 5000): Promise<boolean> {
   const deadline = Date.now() + ms;
   for (;;) {
-    const row = db.prepare(`SELECT * FROM bindings WHERE name = ?`).get(name) as SessionRow | null;
+    const row = holdingSession(db, name);
     if (!row || row.harness_pid !== harnessPid || !isAlive(row.pid, row.proc_start)) return true;
     if (Date.now() >= deadline) return false;
     await Bun.sleep(50);
@@ -181,15 +229,12 @@ export async function siblingGone(db: Database, name: string, harnessPid: number
 }
 
 /**
- * The session ends: delete its row and log the release. Returns the name it
- * still held, if any, so the caller removes that name's socket.
+ * The session ends: its rows go, its ID is marked ended, and each release is
+ * logged. Returns the name it still held, if any, so the caller removes that
+ * name's socket.
  */
 export function endSession(db: Database, sessionId: string): string | null {
-  return db.transaction(() => {
-    const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
-    if (row?.name) logBinding(db, sessionId, row.name, "released");
-    return row?.name ?? null;
-  }).immediate();
+  return db.transaction(() => end(db, sessionId, null, Date.now())[0] ?? null).immediate();
 }
 
 /**
@@ -198,7 +243,7 @@ export function endSession(db: Database, sessionId: string): string | null {
  * probe, taken before its transaction. Call inside that transaction.
  */
 export function nameHolder(db: Database, name: string, sockLive: boolean): string | null {
-  const row = db.prepare(`SELECT * FROM bindings WHERE name = ?`).get(name) as SessionRow | null;
+  const row = holdingSession(db, name);
   if (row && isAlive(row.pid, row.proc_start)) return describeHolder(row);
   return sockLive ? noRowHolder(db, name, row !== null) : null;
 }
@@ -242,7 +287,10 @@ export async function candidateNames(db: Database, suggested: string | null): Pr
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const agent = agentName(db);
   const ok = (n: string) => !live.has(n) && agent(n);
-  const rows = (db.prepare(`SELECT name, last_seen, cwd FROM handles`).all() as { name: string; last_seen: number; cwd: string | null }[]).filter((r) => ok(r.name));
+  const rows = (
+    db.prepare(`SELECT a.address AS name, a.last_seen, i.cwd FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL} WHERE a.last_seen IS NOT NULL`).all() as
+      { name: string; last_seen: number; cwd: string | null }[]
+  ).filter((r) => ok(r.name));
   const queued = new Map((db.prepare(QUEUED_FOR_SQL).all(JSON.stringify(rows.map((r) => r.name))) as { name: string; n: number }[]).map((r) => [r.name, r.n]));
   const pool = orderCandidates(
     rows.map((r) => ({

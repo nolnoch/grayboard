@@ -10,18 +10,8 @@ import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
-/** 16 random hex characters, minted once per process and never reused. Not an address. */
-export function mintSessionId(): string {
-  const b = new Uint8Array(8);
-  crypto.getRandomValues(b);
-  return Buffer.from(b).toString("hex");
-}
-
-/** A session ID's shape: 16 lowercase hex characters. */
-export const SESSION_ID = /^[0-9a-f]{16}$/;
-
 /**
- * A server-mode session's secret (#182 audit 4): 32 random bytes, hex. Its
+ * A session's secret (#182 audit 4): 32 random bytes, hex. A server-mode
  * hello carries the key, never the ID, and the server derives the ID from
  * it, so a session ID seen in peer_list or a refusal can't be presented by
  * another connection.
@@ -33,9 +23,60 @@ export function mintSessionKey(): string {
 /** A session key's shape: 64 lowercase hex characters. */
 export const SESSION_KEY = /^[0-9a-f]{64}$/;
 
-/** The session ID a key stands for: the first 16 hex characters of its SHA-256. */
-export function sessionIdOf(key: string): string {
-  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+// Crockford's base32, lowercased: no i, l, o or u, so an ID reads back
+// unambiguously. IDs are only ever compared, never decoded.
+const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+
+/** 16 hex characters (64 bits) as 13 Crockford base32 characters. */
+export function crockford13(hex16: string): string {
+  let n = BigInt(`0x${hex16}`);
+  let out = "";
+  for (let i = 0; i < 13; i++) {
+    out = CROCKFORD[Number(n & 31n)]! + out;
+    n >>= 5n;
+  }
+  return out;
+}
+
+/** A session ID's shape: `id:` and 13 Crockford characters. */
+export const SESSION_ID = /^id:[0-9abcdefghjkmnpqrstvwxyz]{13}$/;
+
+/** The session ID a key stands for: the first 64 bits of its SHA-256, as an `id:` address. */
+export function idAddress(key: string): string {
+  return `id:${crockford13(createHash("sha256").update(key).digest("hex").slice(0, 16))}`;
+}
+
+// A 1.x session ID: the same 64 bits as 16 hex characters. Binding history
+// and name records written before #284 keep it; it is re-encoded on read,
+// never rewritten.
+const HEX_SESSION_ID = /^[0-9a-f]{16}$/;
+
+/** A session ID in the `id:` form, re-encoding a 1.x one. */
+export function asSessionId(s: string): string {
+  return HEX_SESSION_ID.test(s) ? `id:${crockford13(s)}` : s;
+}
+
+// alias_holds (#284): which session holds each name now, one row per name.
+// Local mode takes a hold inside acquire's BEGIN IMMEDIATE, after checking
+// the current holder; the server takes one when its hub has settled the
+// name's connection, so a hold here replaces whatever row was left.
+
+/** Session `id` holds `address` from `now`. */
+export function holdAlias(db: Database, address: string, id: string, now = Date.now()): void {
+  db.prepare(
+    `INSERT INTO alias_holds (address, id, bound_at) VALUES (?, ?, ?)
+     ON CONFLICT(address) DO UPDATE SET id = excluded.id, bound_at = excluded.bound_at`,
+  ).run(address, id, now);
+}
+
+/** Session `id` no longer holds `address`; a hold another session took since stays. */
+export function dropHold(db: Database, address: string, id: string): void {
+  db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);
+}
+
+/** At server start: no connection outlives the server, so no hold is live. */
+export function clearHolds(db: Database): void {
+  db.prepare(`DELETE FROM alias_holds`).run();
 }
 
 /** One binding_events row, or one more repeat on a refusal's row. */
@@ -62,7 +103,7 @@ function latestBinder(db: Database, name: string): string | null {
   const row = db.prepare(
     `SELECT session_id FROM binding_events WHERE name = ? AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1`,
   ).get(name) as { session_id: string } | null;
-  return row?.session_id ?? null;
+  return row ? asSessionId(row.session_id) : null;
 }
 
 /**

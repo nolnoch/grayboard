@@ -198,18 +198,16 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   );
 }, 20_000);
 
-test("identities from before the handles roster are backfilled", async () => {
+// #284: every 1.x handle is an alias, with its durable facts; viewers aren't.
+test("a 1.x roster's handles become aliases on open", async () => {
   const { Database } = await import("bun:sqlite");
   const old = new Database(join(dir, "bus.db"));
-  old.exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL,
-              body TEXT NOT NULL, parent_id INTEGER, created_at INTEGER NOT NULL);
-            CREATE TABLE cursors (reader TEXT PRIMARY KEY, last_seen_id INTEGER NOT NULL);
-            INSERT INTO messages (sender, recipient, body, created_at) VALUES ('fe', 'be', 'hi', 1), ('be', 'typo', 'x', 2);
-            INSERT INTO cursors VALUES ('docs', 1);`);
+  old.exec(`CREATE TABLE handles (name TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, queue_off INTEGER);
+            INSERT INTO handles VALUES ('fe', 1, 2, 1), ('docs', 1, 3, NULL), ('~tail-9', 1, 4, NULL);`);
   old.close();
   const be = await start("be");
   const all = await call(be, "peer_list", { include_offline: true });
-  expect(all.peers.map((p: any) => p.handle)).toEqual(["be", "docs", "fe"]);
+  expect(all.peers.map((p: any) => [p.handle, p.queue_off ?? false])).toEqual([["be", false], ["docs", false], ["fe", true]]);
   expect((await call(be, "dm_send", { to: "fe", body: "still there?" })).delivered_now).toBe(false);
   await expect(call(be, "dm_send", { to: "typo", body: "x" })).rejects.toThrow(/peer_list/);
 }, 20_000);
@@ -297,7 +295,7 @@ test("a send to a long-idle handle says so; dm_retract withdraws it until it's d
   expect(first.note).toMatch(/^Recipient offline/);
   const { Database } = await import("bun:sqlite");
   const db = new Database(join(dir, "bus.db"));
-  db.exec(`UPDATE handles SET last_seen = last_seen - 22 * 3600000 WHERE name = 'fe'`);
+  db.exec(`UPDATE aliases SET last_seen = last_seen - 22 * 3600000 WHERE address = 'fe'`);
   db.close();
   const wrong = await call(be, "dm_send", { to: "fe", body: "meant for sim" });
   expect(wrong.note).toMatch(/^Queued: fe last seen 22h ago\. .*dm_retract/);

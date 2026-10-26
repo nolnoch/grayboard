@@ -321,7 +321,8 @@ export type BoardPostResult = {
 // unbound: the live sessions with no name yet, for peer_list (#182).
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
-export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[]; human?: boolean };
+// `session`: the calling session's ID, recorded on its posts (#284).
+export type ToolContext = { online?: (handle: string) => boolean; attachmentLimits?: AttachmentLimits; unbound?: UnboundPeer[]; human?: boolean; session?: string };
 
 export function callBoardTool(
   db: Database,
@@ -365,7 +366,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
+        { online: ctx.online, author_id: ctx.session, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits } },
       );
       const result: BoardPostResult = {
         post_id: p.id,

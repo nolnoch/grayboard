@@ -11,11 +11,14 @@
 import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { procStart, procStarts } from "./proc.ts";
+import { asSessionId } from "../core/bindings.ts";
 
 export type NameRecord = {
   // The bound name, or null while the session is unbound.
   name: string | null;
-  // The process that wrote it, for the binding history.
+  // The session that wrote it, for the binding history: an `id:` address. A
+  // 1.x record's 16-hex ID is re-encoded on read (the same 64 bits), so a
+  // restart across the upgrade still matches its history.
   session_id: string;
   harness_pid: number;
   // The harness's start time (procStart): a reused pid doesn't match.
@@ -82,7 +85,7 @@ export function freshRecord(dir: string, harnessPid: number, bus: string): NameR
     rm(path);
     return null;
   }
-  return r.bus === bus ? r : null;
+  return r.bus === bus ? { ...r, session_id: asSessionId(r.session_id) } : null;
 }
 
 /**

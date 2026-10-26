@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { openDatabase, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
 // ── repository isolation ───────────────────────────────────────────────────────
 
@@ -71,14 +71,19 @@ describe("Repo", () => {
     expect(repo.sessions.findByTokenHash("hash123")).toBeUndefined();
   });
 
-  test("identities: create, list, remove", () => {
-    const u  = repo.users.upsertByEmail("wade@example.com", null);
-    repo.identities.create(u.id, "fe");
-    repo.identities.create(u.id, "be");
-    expect(repo.identities.listForUser(u.id)).toHaveLength(2);
-    repo.identities.remove(u.id, "fe");
-    expect(repo.identities.listForUser(u.id)).toHaveLength(1);
+  test("aliases: create, list, remove", () => {
+    repo.users.upsertByEmail("you@example.com", null);
+    expect(repo.aliases.create("you@example.com", "fe").address).toBe("you@example.com/fe");
+    repo.aliases.create("you@example.com", "be");
+    expect(repo.aliases.listFor("you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
+    repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 7);
+    repo.aliases.remove("you@example.com", "fe");
+    expect(repo.aliases.listFor("you@example.com")).toHaveLength(1);
+    // Its read point goes with it: a new alias of the name starts from scratch.
+    expect(repo.cursors.directFor("you@example.com/fe")).toBe(0);
   });
+
+
 
   test("teams: create, join, leave, list members", () => {
     const u1 = repo.users.upsertByEmail("a@example.com", null);
@@ -102,13 +107,11 @@ describe("Repo", () => {
   });
 
   test("cursors: advance is idempotent and takes MAX", () => {
-    const u = repo.users.upsertByEmail("wade@example.com", null);
-    const i = repo.identities.create(u.id, "fe");
-    repo.cursors.advance(i.id, "direct", "wade@example.com/fe", 10);
-    repo.cursors.advance(i.id, "direct", "wade@example.com/fe", 5);  // lower — should not regress
-    expect(repo.cursors.get(i.id, "direct", "wade@example.com/fe")).toBe(10);
-    repo.cursors.advance(i.id, "direct", "wade@example.com/fe", 20);
-    expect(repo.cursors.get(i.id, "direct", "wade@example.com/fe")).toBe(20);
+    repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 10);
+    repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 5);  // lower — should not regress
+    expect(repo.cursors.get("you@example.com/fe", "direct", "you@example.com/fe")).toBe(10);
+    repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 20);
+    expect(repo.cursors.directFor("you@example.com/fe")).toBe(20);
   });
 
   test("unreadSince returns only messages after cursor", () => {
@@ -127,19 +130,55 @@ describe("Repo", () => {
   });
 });
 
+// #284 decision 5: users, teams and service principals share one namespace.
+test("principals: a sign-in and a team create insert one; a team can't take another principal's name", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const u = repo.users.upsertByEmail("a@example.com", null);
+  repo.users.upsertByEmail("a@example.com", "A");
+  const eng = repo.teams.create("eng", u.id);
+  // Service principals arrive with #270; the namespace guard is here now.
+  db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  expect(() => repo.teams.create("ingest", u.id)).toThrow(PrincipalTaken);
+  expect(repo.teams.findByName("ingest")).toBeUndefined();
+  expect(db.prepare(`SELECT kind, name, user_id, team_id FROM principals ORDER BY id`).all()).toEqual([
+    { kind: "user", name: "a@example.com", user_id: u.id, team_id: null },
+    { kind: "team", name: "eng", user_id: null, team_id: eng.id },
+    { kind: "service", name: "ingest", user_id: null, team_id: null },
+  ]);
+});
+
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────
 
-test("undeliveredFrom uses the stream index, never a cursors scan", () => {
+test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {
   const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const sender = repo.users.upsertByEmail("a@example.com", null);
-  repo.identities.create(sender.id, "fe");
-  const recip = repo.users.upsertByEmail("b@example.com", null);
-  const ri = repo.identities.create(recip.id, "be");
+  repo.users.upsertByEmail("a@example.com", null);
+  repo.aliases.create("a@example.com", "fe");
+  repo.users.upsertByEmail("b@example.com", null);
+  repo.aliases.create("b@example.com", "be");
   repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
-  repo.cursors.advance(ri.id, "direct", "b@example.com/be", 1);
+  repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
   const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
     .all("a@example.com/fe", Number.MAX_SAFE_INTEGER) as { detail: string }[];
   const detail = plan.map(p => p.detail).join(" ");
-  expect(detail).toContain("USING INDEX idx_cursors_stream");
-  expect(detail).not.toContain("SCAN cursors");
+  expect(detail).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
+  expect(detail).not.toContain("SCAN c");
+});
+
+// #284 audit: queuedTo and retract read the read point by its key too.
+test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  repo.users.upsertByEmail("a@example.com", null);
+  repo.aliases.create("a@example.com", "fe");
+  repo.users.upsertByEmail("b@example.com", null);
+  repo.aliases.create("b@example.com", "be");
+  repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+  repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
+  const detail = (sql: string, ...args: (string | number)[]) =>
+    (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
+  const queued = detail(QUEUED_TO_SQL, JSON.stringify(["b@example.com/be"]));
+  expect(queued).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
+  expect(queued).not.toContain("SCAN c");
+  const retract = detail(RETRACTABLE_SQL, 1, "a@example.com/fe");
+  expect(retract).toContain("SEARCH mailbox_cursors USING INDEX sqlite_autoindex_mailbox_cursors_1");
+  expect(retract).not.toContain("SCAN mailbox_cursors");
 });

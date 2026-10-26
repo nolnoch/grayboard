@@ -8,10 +8,13 @@ import {
   post,
   setAccess,
   setQueueParticipation,
+  ensureAlias,
+  registerId,
   setStatus,
   subscribe,
-  touchHandle,
+  touchAlias,
 } from "./boards.ts";
+import { holdAlias } from "./bindings.ts";
 import { claim, release, sweepExpired, listClaims } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -20,7 +23,10 @@ let db: Database;
 beforeEach(() => {
   db = new Database(":memory:");
   initCoreSchema(db);
-  for (const h of ["be", "sim", "fe"]) touchHandle(db, h);
+  for (const h of ["be", "sim", "fe"]) {
+    ensureAlias(db, h, "test");
+    touchAlias(db, h);
+  }
   createBoard(db, "be", "work", "the work queue", null, { kind: "queue" });
   subscribe(db, "sim", "work", "push");
   subscribe(db, "fe", "work", "push");
@@ -135,6 +141,8 @@ test("a resolved @mention is direct addressing and bypasses the rotation", () =>
 });
 
 test("status text is not a busy flag; only the explicit opt-out skips a lane", () => {
+  registerId(db, { id: "id:00000000000fe", principal: null, launcher: false });
+  holdAlias(db, "fe", "id:00000000000fe");
   setStatus(db, "fe", "heads-down on another task");
   const r = post(db, "be", "work", "work item");
   expect(r.wake).toEqual(["fe"]); // status is free text; fe is still eligible
@@ -142,7 +150,7 @@ test("status text is not a busy flag; only the explicit opt-out skips a lane", (
   const r2 = post(db, "be", "work", "second work item");
   expect(r2.wake).toEqual(["sim"]);
   // The opt-out persists until the lane opts back in.
-  expect(db.prepare(`SELECT queue_off FROM handles WHERE name = 'fe'`).get()).toEqual({ queue_off: 1 });
+  expect(db.prepare(`SELECT queue_off FROM aliases WHERE address = 'fe'`).get()).toEqual({ queue_off: 1 });
   setQueueParticipation(db, "fe", true);
   const r3 = post(db, "be", "work", "third work item");
   expect(r3.wake).toEqual(["fe"]);
@@ -161,7 +169,7 @@ test("the rotation prefers live lanes and falls back to offline ones", () => {
 });
 
 test("a read-only viewer is never picked by the rotation", () => {
-  touchHandle(db, "~tail");
+  db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail', 'person', '~tail', 0, 0)`).run();
   subscribe(db, "~tail", "work", "push");
   const r = post(db, "be", "work", "work item");
   expect(r.wake).not.toContain("~tail");

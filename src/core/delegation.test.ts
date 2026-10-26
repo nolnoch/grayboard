@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { declareHuman, startSession, touchHandle } from "./boards.ts";
-import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, setLauncher, DELEGATE_TOOL } from "./delegation.ts";
+import { declareHuman, ensureAlias, registerId, setStatus, touchAlias, who } from "./boards.ts";
+import { dropHold, holdAlias, logBinding } from "./bindings.ts";
+import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, DELEGATE_TOOL } from "./delegation.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
 
@@ -13,13 +14,20 @@ beforeEach(() => {
   initCoreSchema(db);
 });
 
-// A session on the roster, its launcher flag per the test's need. The row
-// describes the live session, so startSession then setLauncher is the order
-// both modes use.
-function session(name: string, launcher = false, seen = true): void {
-  if (seen) startSession(db, name, null);
-  else touchHandle(db, name);
-  setLauncher(db, name, launcher);
+// A name that has connected: an alias on the roster.
+function connected(name: string): void {
+  ensureAlias(db, name, "test");
+  touchAlias(db, name);
+}
+
+// A session holding `name`, its launcher flag per the test's need: the flag
+// is the session's (#284), on its ids row.
+let sessions = 0;
+function session(name: string, launcher = false): void {
+  connected(name);
+  const id = `id:${String(++sessions).padStart(13, "0")}`;
+  registerId(db, { id, principal: null, launcher });
+  holdAlias(db, name, id);
 }
 
 const live = (h: string) => h !== "dead";
@@ -29,9 +37,8 @@ describe("launchers", () => {
   test("lists only opted-in, non-human handles", () => {
     session("a", true);
     session("b", false);
-    startSession(db, "human", null);
-    db.prepare(`UPDATE handles SET human = 1 WHERE name = 'human'`).run();
-    setLauncher(db, "human", true);
+    session("human", true);
+    db.prepare(`UPDATE aliases SET human = 1 WHERE address = 'human'`).run();
     expect(launchers(db)).toEqual(["a"]);
   });
 
@@ -41,6 +48,36 @@ describe("launchers", () => {
     expect(isLauncher(db, "a")).toBe(true);
     expect(isLauncher(db, "b")).toBe(false);
     expect(isLauncher(db, "nobody")).toBe(false);
+  });
+
+  // #284 audit B4: an offline alias's facts come from the session that last
+  // bound it, unless that session has moved to another name since.
+  test("an alias whose last binder moved on has none of its facts", () => {
+    session("fe", true);
+    const id = `id:${String(sessions).padStart(13, "0")}`;
+    logBinding(db, id, "fe", "bound", null);
+    dropHold(db, "fe", id);
+    connected("fe2");
+    holdAlias(db, "fe2", id);
+    logBinding(db, id, "fe2", "moved", "fe");
+    setStatus(db, "fe2", "on fe2");
+    expect(isLauncher(db, "fe")).toBe(false);
+    expect(isLauncher(db, "fe2")).toBe(true);
+    const peers = who(db, "me", { include_offline: true }, () => false).peers;
+    expect(peers.find((p) => p.handle === "fe")).toEqual({ handle: "fe", online: false, last_seen: expect.any(Number) });
+    expect(peers.find((p) => p.handle === "fe2")).toMatchObject({ status: "on fe2", launcher: true });
+  });
+
+  test("an offline alias keeps its last binder's launcher flag but shows no status", () => {
+    session("fe", true);
+    const id = `id:${String(sessions).padStart(13, "0")}`;
+    logBinding(db, id, "fe", "bound", null);
+    setStatus(db, "fe", "busy");
+    dropHold(db, "fe", id);
+    expect(isLauncher(db, "fe")).toBe(true);
+    const fe = who(db, "me", { include_offline: true }, () => false).peers.find((p) => p.handle === "fe");
+    expect(fe).toMatchObject({ launcher: true });
+    expect(fe!.status).toBeUndefined();
   });
 });
 
@@ -90,7 +127,7 @@ describe("resolveDelegation", () => {
 
   test("no live launcher: falls back to a human that has connected", () => {
     declareHuman(db, "human");
-    startSession(db, "human", null);
+    connected("human");
     const d = resolveDelegation(db, "me", args, online);
     expect(d.to).toBe("human");
     expect(d.humanFallback).toBe(true);
@@ -100,7 +137,7 @@ describe("resolveDelegation", () => {
   test("server-style caller with no human row: refused (their user's human is the only fallback)", () => {
     // Another user's human connected, but the fallback is the caller's own
     // user's human, which has no row (their Slack was never linked).
-    startSession(db, "other@example.com/human", null);
+    connected("other@example.com/human");
     expect(() => resolveDelegation(db, "you@example.com/me", args, online)).toThrow(/no live launcher session/);
   });
 
@@ -121,8 +158,8 @@ describe("resolveDelegation", () => {
   test("server-style human fallback: the caller's own user's human handle", () => {
     // Server handles are user@org/name; the fallback is the caller's user's
     // human, not another user's.
-    startSession(db, "you@example.com/human", null);
-    startSession(db, "other@example.com/human", null);
+    connected("you@example.com/human");
+    connected("other@example.com/human");
     const d = resolveDelegation(db, "you@example.com/me", args, online);
     expect(d.to).toBe("you@example.com/human");
     expect(d.humanFallback).toBe(true);
@@ -189,7 +226,7 @@ describe("own-user scope (#246 review 1-2)", () => {
 
   test("auto-pick with only another user's launcher live: the human fallback fires, not the stranger", () => {
     session("alice@example.com/be", true);
-    startSession(db, "bob@b.com/human", null);
+    connected("bob@b.com/human");
     const d = resolveDelegation(db, "bob@b.com/me", args, live);
     expect(d.to).toBe("bob@b.com/human");
     expect(d.humanFallback).toBe(true);
@@ -209,7 +246,7 @@ describe("own-user scope (#246 review 1-2)", () => {
 
 describe("human fallback reachability (#246 review 10)", () => {
   test("a server fallback checks real reachability, not just a connected row", () => {
-    startSession(db, "you@example.com/human", null);
+    connected("you@example.com/human");
     // The mode reports the human unreachable (Slack unlinked / bridge down):
     // refuse with the undo rather than queue into the void.
     expect(() => resolveDelegation(db, "you@example.com/me", args, live, () => false)).toThrow(/no live launcher session/);
@@ -220,7 +257,7 @@ describe("human fallback reachability (#246 review 10)", () => {
 
   test("without the predicate (local mode), connected counts as reachable", () => {
     declareHuman(db, "human");
-    startSession(db, "human", null);
+    connected("human");
     const d = resolveDelegation(db, "me", args, live);
     expect(d.humanFallback).toBe(true);
   });

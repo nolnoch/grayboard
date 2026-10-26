@@ -7,10 +7,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { activeAnnouncements, checkBody, age, humanHandles, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, startSession, touchHandle, type UnboundPeer } from "../core/boards.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, lastWasRelease, launcherNote, mintSessionId, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
+import { UNBOUND_ERROR, UNBOUND_TOOLS, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, mintSessionKey, restoreNote, unboundInstruction, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -75,8 +75,8 @@ import {
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
-// This process, for run metadata and binding history (#182). Not an address.
-const SESSION_ID = mintSessionId();
+// This process's session ID (#284), derived from a key minted at start.
+const SESSION_ID = idAddress(mintSessionKey());
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
 // This bus's subdirectory of the default save directory.
@@ -90,6 +90,9 @@ if (RETENTION_DAYS === null) {
 // BUS_PUSH=off: tools only, for a harness that drops MCP notifications and
 // has no adapter. Draining here would consume messages into a void.
 const PUSH = process.env.BUS_PUSH !== "off";
+// The session ID this process's writes carry: a tools-only process registers
+// no session (#284 PR 2 gives it one), so its writes carry none.
+const WRITER_ID = PUSH ? SESSION_ID : null;
 // BUS_HUMAN=1: a human holds this identity through a bridge (`grayboard bridge
 // slack`). It grants nothing: the handle must already be the declared human
 // (`grayboard human`), whose messages and posts reach agents marked
@@ -151,6 +154,8 @@ const unboundNotes: string[] = [];
 // The name came back from the name record and the name's history shows the
 // recorded session (#211): the same harness session, so its peer status stays.
 let restored = false;
+// The session a verified restore continues (#211): its status carries over.
+let restoredFrom: string | null = null;
 // The name record (#182 decision 14), written by the session that owns
 // delivery whenever its name changes. The Slack bridge's child keeps none:
 // its name is fixed, and a restart that can't have it must fail loudly.
@@ -165,12 +170,23 @@ const writeName = (name: string | null) => {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
 };
-if (!PUSH) bound = SUGGESTED;
-else {
-  // The session that owns delivery owns the name: it writes the bindings row,
-  // its presence while unbound, and acquires through it. Channels-off
-  // sessions too: they own the session, they just don't listen.
-  registerSession(db, thisSession(SESSION_ID));
+if (!PUSH) {
+  bound = SUGGESTED;
+  ensureAlias(db, bound!, bound!);
+} else {
+  // The session that owns delivery owns the name: it writes the session's
+  // rows, its presence while unbound, and acquires through them.
+  // Channels-off sessions too: they own the session, they just don't listen.
+  try {
+    registerSession(db, thisSession(SESSION_ID), EFFECTIVE_LAUNCHER);
+  } catch (e) {
+    if (!(e instanceof IdCollision)) throw e;
+    writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid });
+    console.error(`[grayboard] ${e.message}`);
+    process.exit(1);
+  }
+  // The flag is the session's (ids.launcher), so it's audited once, here.
+  writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   if (RECORDS) sweepRecords(RECORD_DIR);
   // A restart under the same harness takes back its predecessor's name, ahead
   // of BUS_IDENTITY: it's the same session, mid-task.
@@ -185,6 +201,7 @@ else {
     if (r.ok) {
       bound = r.name;
       restored = r.restored;
+      if (restored) restoredFrom = rec.session_id;
     } else unboundNotes.push(restoreNote(rec.name, r.error));
   } else if (EXPLICIT) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
@@ -286,8 +303,8 @@ const late = new LateCancels();
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   const run = async () => {
-    // An unbound session writes no handles row: it would join dm_send's roster.
-    if (bound) touchHandle(db, bound);
+    if (bound) touchAlias(db, bound);
+    if (PUSH) touchId(db, SESSION_ID);
     return call(name, args, signal);
   };
   const r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown } =
@@ -357,7 +374,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     checkBody(d.body);
     // The message id tracks the pick that owns the work: a re-pick replaces
     // both (review 16).
-    let msgId = (await insertMessage(IDENTITY, d.to, d.body, null, true, [])).id;
+    let msgId = (await insertMessage(IDENTITY, WRITER_ID, d.to, d.body, null, true, [])).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
@@ -371,7 +388,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       try {
         const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
-          const id2 = (await insertMessage(IDENTITY, d2.to, d2.body, null, true, [])).id;
+          const id2 = (await insertMessage(IDENTITY, WRITER_ID, d2.to, d2.body, null, true, [])).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
           d = d2;
           msgId = id2;
@@ -417,7 +434,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, recipient, body, parent_id ?? null, pending === true, ids));
+    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, WRITER_ID, recipient, body, parent_id ?? null, pending === true, ids));
     const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
@@ -509,6 +526,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       ...(name === "peer_list" ? { unbound: unboundPeers() } : {}),
       attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
       human: HUMAN,
+      ...(WRITER_ID ? { session: WRITER_ID } : {}),
     };
     const { attachments: paths, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
@@ -631,12 +649,8 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
         stopListening = () => {};
         stopListening = listenForWakeup(n.name, onWake);
       }
-      if (previous) touchHandle(db, previous);
-      startSession(db, n.name, process.cwd());
-      if (PUSH) {
-        setLauncher(db, n.name, EFFECTIVE_LAUNCHER);
-        writeCoreAudit(db, "handle.launcher_set", n.name, n.name, { on: EFFECTIVE_LAUNCHER });
-      }
+      if (previous) touchAlias(db, previous);
+      touchAlias(db, n.name);
     } catch (e) {
       const moved = r.moved.length ? `; claims moved: ${r.moved.map((c) => c.key).join(", ")}` : "";
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
@@ -660,14 +674,10 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
 // Startup: the name (if any) is already acquired. Connect MCP so
 // notifications are accepted, listen on the name's wakeup socket, and replay
 // what arrived while offline.
-// A tools-only server runs beside the session that owns the identity, and a
-// restored name is the same session restarted: leave their status alone.
-if (bound && PUSH && !restored) startSession(db, bound, process.cwd());
-else if (bound) touchHandle(db, bound);
-if (bound && PUSH) {
-  setLauncher(db, bound, EFFECTIVE_LAUNCHER);
-  writeCoreAudit(db, "handle.launcher_set", bound, bound, { on: EFFECTIVE_LAUNCHER });
-}
+// A restored name is the same harness session restarted: its status carries
+// over to this session's ID.
+if (restoredFrom) inheritStatus(db, SESSION_ID, restoredFrom);
+if (bound) touchAlias(db, bound);
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
 late.watch(transport);
@@ -676,7 +686,7 @@ startLocalRetention(db, blobs, RETENTION_DAYS);
 
 const shutdown = () => {
   try {
-    if (bound) touchHandle(db, bound);
+    if (bound) touchAlias(db, bound);
   } catch {
     // The bus may already be closed at shutdown; exiting matters more.
   }

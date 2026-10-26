@@ -3,6 +3,7 @@
 // TestServer. The launcher opt-in (BUS_LAUNCHER=1), the delegate tool's
 // resolution rules, the payload's harness-neutrality, the human fallback,
 // and result-return through the pending/promise machinery.
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -251,6 +252,19 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   // The positive control proves both observables: a push launcher's
   // instructions do carry the sentence (review 6: the gate, both modes).
   expect(be.c.getInstructions()).toContain("You're a launcher session");
+
+  // The flag is the session's: audited once per session that owns delivery,
+  // under its ID, and never by a tools-only process (#284 audit W5).
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try {
+    const idOf = (name: string) => (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(name) as { id: string }).id;
+    expect(db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'handle.launcher_set' ORDER BY rowid`).all()).toEqual([
+      { actor: idOf("be"), target: idOf("be"), detail: JSON.stringify({ on: true }) },
+      { actor: idOf("sim"), target: idOf("sim"), detail: JSON.stringify({ on: false }) },
+    ]);
+  } finally {
+    db.close();
+  }
 }, 30_000);
 
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
@@ -367,10 +381,10 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     expect(JSON.parse(requested[0]!.detail).via).toBe("human_fallback");
     expect(requested[0]!.target).toBe("alice@example.com/human");
 
-    // A refusal never masquerades as a request: with the human's identity
+    // A refusal never masquerades as a request: with the human's alias
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
-    srv.app.db.exec(`DELETE FROM identities WHERE name = 'human'`);
+    srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`);
     await expect(call(sim.c, "delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
     const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);
