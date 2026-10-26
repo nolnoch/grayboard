@@ -157,6 +157,14 @@ test("2: a Slack-bridge child on a held human name still exits", async () => {
   expect(r.err).toContain(`"alex" is in use by the live session`);
 }, 20_000);
 
+test("#363: the human's session binds nothing", async () => {
+  expect((await runCli(["human", "alex"], { cwd: dir, env: localEnv(dir) })).code).toBe(0);
+  const h = await session("alex", { extra: { BUS_HUMAN: "1" } });
+  expect(await refusal(h, "bind", { name: "fe", create: true })).toBe(`error: this is the human's session ("alex", BUS_HUMAN=1); it binds nothing`);
+  expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: "alex" }]);
+  expect(rows(`SELECT 1 FROM aliases WHERE address = 'fe'`)).toEqual([]);
+}, 20_000);
+
 test("4: a never-seen name needs create; the refusal lists the closest names", async () => {
   await stop((await session("fe")).c);
   const s = await session();
@@ -271,6 +279,26 @@ test("8, 13: a rebind leaves claims on the old name, frees it, and delivers the 
   await other.call("bind", { name: "fe" });
   expect((await other.call("peer_list", {})).you).toBe("fe");
   expect(await other.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
+}, 30_000);
+
+test("#361: a post pending for the ID and the alias is pushed once and delivered for both", async () => {
+  const be = await session("be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  await s.call("bind", { name: "fe", create: true });
+  await s.call("board_subscribe", { board: "e2e", mode: "push" });
+  expect(rows(`SELECT handle FROM subscriptions WHERE board = 'e2e' AND handle != 'be' ORDER BY handle`)).toEqual([{ handle: "fe" }, { handle: id }]);
+
+  await be.call("board_post", { board: "e2e", body: "once" });
+  const delivered = () => rows<{ handle: string }>(`SELECT o.handle FROM outbox o JOIN posts p ON p.id = o.post_id WHERE p.body = 'once' AND o.delivered_at IS NOT NULL ORDER BY o.handle`);
+  await until(() => delivered().length === 2);
+  expect(delivered()).toEqual([{ handle: "fe" }, { handle: id }]);
+  // Barrier: a DM drained after the post's push.
+  await be.call("dm_send", { to: "fe", body: "probe" });
+  await until(() => contents(s).includes("probe"));
+  expect(contents(s).filter((c) => c === "once")).toHaveLength(1);
 }, 30_000);
 
 test("9: a DM sent mid-swap is never consumed under the new name", async () => {

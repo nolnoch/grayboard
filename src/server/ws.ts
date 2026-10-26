@@ -15,6 +15,7 @@ import {
   lastSeen,
   normalizeBoard,
   pendingFor,
+  pendingKey,
   refOf,
   idCollisionText,
   inheritStatus,
@@ -24,7 +25,6 @@ import {
   touchAlias,
   touchId,
   type CoreDb,
-  type PendingRef,
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
@@ -145,11 +145,6 @@ function coreRefusal(e: CoreError): { code: ErrorCode; message: string } {
   return e instanceof Undeliverable ? { code: e.code, message: e.detail } : { code: "bad_request", message: e.message };
 }
 
-function refKey(r: PendingRef): string {
-  // Digests are keyed by board: until one is acked, newer posts don't send another.
-  return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
-}
-
 // Send this connection everything pending on boards, for any of its
 // addresses, that it hasn't been sent: a subscription taken as the ID while
 // unbound and the alias's own both deliver. all: also deferred pushes and
@@ -158,7 +153,7 @@ function drainBoards(ws: Ws, db: CoreDb, all = false): void {
   const inflight = (ws.data.inflight ??= new Set());
   for (const address of ws.data.addresses) {
     for (const item of pendingFor(db, address, { all })) {
-      const key = refKey(refOf(item));
+      const key = pendingKey(refOf(item));
       if (inflight.has(key)) continue;
       inflight.add(key);
       send(ws, { type: "board_push", item });
@@ -385,7 +380,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
             // with no such row, so each address acks it.
             for (const r of msg.refs) {
               for (const a of ws.data.addresses) acknowledge(db, a, r);
-              ws.data.inflight?.delete(refKey(r));
+              ws.data.inflight?.delete(pendingKey(r));
             }
             send(ws, { type: "ack_ok", req_id: msg.req_id });
             break;

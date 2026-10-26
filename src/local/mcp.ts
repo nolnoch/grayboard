@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { TOOLS_ONLY_BIND, bindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, leftNote, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
@@ -691,10 +691,7 @@ async function drainLoop(): Promise<void> {
     let any = false;
     for (const reader of readers) {
       const batch = unreadFor(reader);
-      // A human's session has no tokens to save; a DM is already waking the agent.
-      const boardItems = pendingFor(db, reader, { all: first || HUMAN || batch.length > 0 });
-      if (batch.length === 0 && boardItems.length === 0) continue;
-      any = true;
+      if (batch.length > 0) any = true;
       for (const msg of batch) {
         if (shuttingDown) return;
         const params = dmNotification(msg);
@@ -703,17 +700,31 @@ async function drainLoop(): Promise<void> {
         if (sessionEnded) return;
         setCursor(reader, msg.id);
       }
-      for (const item of boardItems) {
-        if (shuttingDown) return;
-        const params = boardNotification(item);
-        if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params,
-        });
-        if (sessionEnded) return;
-        markDelivered(db, reader, item);
+    }
+    // A post pending for several addresses (an ID and an alias subscription)
+    // is pushed once and marked delivered for each (#361), as the server's
+    // drain and board_ack do. A human's session has no tokens to save; a DM
+    // is already waking the agent.
+    const boardItems = new Map<string, { item: Pending; readers: string[] }>();
+    for (const reader of readers) {
+      for (const item of pendingFor(db, reader, { all: first || HUMAN || any })) {
+        const key = pendingKey(refOf(item));
+        const seen = boardItems.get(key);
+        if (seen) seen.readers.push(reader);
+        else boardItems.set(key, { item, readers: [reader] });
       }
+    }
+    if (boardItems.size > 0) any = true;
+    for (const { item, readers: pendingTo } of boardItems.values()) {
+      if (shuttingDown) return;
+      const params = boardNotification(item);
+      if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params,
+      });
+      if (sessionEnded) return;
+      for (const reader of pendingTo) markDelivered(db, reader, item);
     }
     if (!any) break;
   }
@@ -741,6 +752,8 @@ let stopIdListening = () => {};
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail(TOOLS_ONLY_BIND);
+  // The human's handle is a declaration, fixed for its bridge's session (#363), as the server's HumanConn.
+  if (HUMAN) return fail(`this is the human's session ("${bound}", BUS_HUMAN=1); it binds nothing`);
   const raw = String(a.name);
   // A server alias's scope ("eng/x", "you@example.com/x") means nothing here.
   if (raw.includes("/")) return fail(`local mode has one scope; bind a bare name, not "${raw}"`);

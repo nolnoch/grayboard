@@ -1097,6 +1097,15 @@ export function refOf(item: Pending): PendingRef {
     : { kind: "digest", board: item.board, latest_id: item.latest.id };
 }
 
+/**
+ * One key per pending item a session is sent once, whichever of its
+ * addresses it is pending for (#361): a push by post; a digest by board, so
+ * until one is acked newer posts don't send another.
+ */
+export function pendingKey(r: PendingRef): string {
+  return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
+}
+
 export function markDelivered(db: Database, handle: string, item: Pending): void {
   acknowledge(db, handle, refOf(item));
 }
