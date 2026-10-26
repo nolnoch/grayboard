@@ -442,12 +442,12 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     for (const id of new Set(conns().map((ws) => ws.data.authed.user_id))) {
       if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
     }
-    recheckAliases(hub, null);
+    recheckAliases(hub, null, null);
   };
   // What a principal may act in changed (S9): a team leave or removal now,
   // #270's grants later. Its sessions stop acting as aliases it lost now,
   // not when they next bind.
-  const accessChanged = (principal: string) => recheckAliases(hub, principal);
+  const accessChanged = (principal: string, by: string) => recheckAliases(hub, principal, by);
 
   // Heartbeat: keeps idle connections open through proxies.
   const startPing = () =>
@@ -533,15 +533,17 @@ function detach(hub: Hub, ws: Ws): void {
 
 // Re-checks the aliases that sessions act as (S9) against mayActIn, for one
 // principal's sessions or (null) every session's, and revokes the ones it
-// now refuses.
-function recheckAliases(hub: Hub, principal: string | null): void {
+// now refuses. by: the user whose act changed the access (an admin's team
+// removal, the principal's own leave), or null for the server's own sweep;
+// the revocations' audit actor.
+function recheckAliases(hub: Hub, principal: string | null, by: string | null): void {
   const revoked: (AliasUse & { reason: string })[] = [];
   for (const u of aliasUses(hub.db, principal)) {
     const p = hub.repo.principals.findByName(u.principal);
     const reason = p ? mayActIn(hub.repo, p, u) : `principal ${u.principal} no longer exists`;
     if (reason) revoked.push({ ...u, reason });
   }
-  revokeAliases(hub, revoked);
+  revokeAliases(hub, revoked, by);
 }
 
 // Takes aliases from sessions whose principals may no longer act in their
@@ -549,7 +551,7 @@ function recheckAliases(hub: Hub, principal: string | null): void {
 // is told by an alias_lost frame and acts as its ID from here. A tools-only
 // connection writes only as its writes_as, so it has nothing left to be:
 // its session ends, and its reconnect's hello is refused.
-function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void {
+function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[], by: string | null): void {
   if (!uses.length) return;
   const { repo, db, registry } = hub;
   const ended: string[] = [];
@@ -557,7 +559,7 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void 
     const { reason } = u;
     const ws = hub.holders.get(u.id);
     if (!u.held) {
-      writeAudit(repo, "alias.revoked", u.principal, u.address, { session: u.id, writes_as: true, reason });
+      writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
       if (ws) {
         detach(hub, ws);
         err(ws, undefined, "forbidden", `this connection wrote as "${u.address}", and ${reason}`);
@@ -569,7 +571,7 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void 
     repo.atomic(() => {
       dropHold(db, u.address, u.id);
       logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
-      writeAudit(repo, "alias.revoked", u.principal, u.address, { session: u.id, reason });
+      writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
     });
     if (!ws || ws.data.bound !== u.address) continue;
     if (registry.get(u.address) === ws) registry.delete(u.address);

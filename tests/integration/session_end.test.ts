@@ -67,7 +67,7 @@ test("an end frame ends the session at once: holds and claims released, unread m
   expect(holder(`${A}/be`)).toBeNull();
   expect(lastEvent(`${A}/be`)).toEqual({ session_id: a.id, event: "released", detail: "session_end: exit" });
   expect((await b.call("claim_list")).result.map((c: any) => [c.key, c.holder])).toEqual([["ticket:ENG-142", `${A}/be`]]);
-  expect(ended(a.id)).toEqual([{ held: [`${A}/be`], why: "exit", bounced: 1 }]);
+  expect(ended(a.id)).toEqual([{ principal: A, held: [`${A}/be`], why: "exit", bounced: 1 }]);
 
   const bounce = await b.next(push);
   expect(bounce.message).toMatchObject({ sender: a.id, parent_id: sent.message_id });

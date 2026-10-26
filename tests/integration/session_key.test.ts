@@ -160,7 +160,7 @@ test("a tools-only process sharing a live session's key is refused: it never att
   const owner = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key } });
   const err = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } }).then(() => "started", (e: Error) => e.message);
   expect(err).toContain(`id_collision: ${id} is a live session's; start with a new session key`);
-  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ ended_at: null, tools_only: true })]);
+  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ why: "is a live session's", delivery: "none", ended_at: null })]);
   expect(binding(id)).toMatchObject({ pid: owner.harnessPid, detached_at: null });
   expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "push", ended_at: null }]);
 }, 30_000);
@@ -170,7 +170,7 @@ test("a keyed tools-only process alone registers its key's ID as keyed, so reten
   const id = idAddress(key);
   const s = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } });
   expect(rows(`SELECT delivery, keyed FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "none", keyed: 1 }]);
-  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ tools_only: true, keyed: true })]);
+  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ delivery: "none", keyed: true })]);
   await stop(s.c);
 }, 30_000);
 

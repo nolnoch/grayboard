@@ -53,7 +53,7 @@ export function endSession(
   opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
-  const row = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null } | null;
+  const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
   if (row?.ended_at != null) return NOT_ENDED;
   const holds = (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
   const held = [...new Set([...holds, ...(opts.legacyNames ?? [])])];
@@ -107,6 +107,7 @@ export function endSession(
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
   (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
+    principal: row?.principal ?? null,
     held,
     why: opts.why ?? null,
     bounced,

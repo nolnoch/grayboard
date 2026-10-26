@@ -205,7 +205,7 @@ if (!PUSH) {
     registerSession(db, thisSession(SESSION_ID), { writesAs: bound!, keyed: KEYED });
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
-    writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid, tools_only: true });
+    writeCoreAudit(db, "id.collision", e.id, e.id, { why: e.why, delivery: "none", ended_at: e.endedAt, pid: process.pid });
     console.error(`[grayboard] ${e.message}`);
     process.exit(1);
   }
@@ -232,7 +232,7 @@ if (!PUSH) {
       attached = true;
       bound = r.held;
     } else {
-      writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid });
+      writeCoreAudit(db, "id.collision", e.id, e.id, { why: e.why, ended_at: e.endedAt, pid: process.pid });
       console.error(`[grayboard] ${e.message}`);
       process.exit(1);
     }

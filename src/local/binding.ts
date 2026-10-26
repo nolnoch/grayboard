@@ -123,7 +123,7 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
       `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
     writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
-      ...(writesAs === undefined ? {} : { tools_only: true, writes_as: writesAs }),
+      delivery: writesAs === undefined ? "push" : "none", ...(writesAs === undefined ? {} : { writes_as: writesAs }),
       ...(viewer ? { viewer: true } : {}),
       keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     });
@@ -161,7 +161,7 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     const b = db.prepare(`SELECT pid, proc_start, harness_rule, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
       Pick<SessionRow, "pid" | "proc_start" | "harness_rule" | "attached_pid" | "attached_start"> | null;
     const refuse = (why: string, detail: Record<string, unknown> = {}): AttachResult => {
-      writeCoreAudit(db, "id.collision", s.session_id, s.session_id, { pid: process.pid, reason: why, ...detail });
+      writeCoreAudit(db, "id.collision", s.session_id, s.session_id, { why, pid: process.pid, ...detail });
       return { ok: false, error: idCollisionText(s.session_id, why) };
     };
     if (!id) return refuse("has no session row");
@@ -420,7 +420,7 @@ export async function siblingGone(db: Database, name: string, harnessPid: number
 export function endLocalSession(db: Database, sessionId: string): Ended {
   return db.transaction(() => {
     const out: Ended = { ended: [], wake: [] };
-    merge(out, sessionId, end(db, sessionId, null, Date.now()));
+    merge(out, sessionId, end(db, sessionId, "exit", Date.now()));
     return out;
   }).immediate();
 }

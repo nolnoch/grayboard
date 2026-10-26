@@ -69,9 +69,10 @@ test("a removed member's sessions lose the team's aliases: a holder keeps its ID
   const audited = revoked();
   expect(audited).toHaveLength(3);
   expect(audited).toEqual(expect.arrayContaining([
-    { actor: B, target: "eng/build", detail: { session: build.id, reason: REASON } },
-    { actor: B, target: "eng/build", detail: { session: writer.id, writes_as: true, reason: REASON } },
-    { actor: B, target: "eng/deploy", detail: { session: deploy.id, reason: REASON } },
+    // The actor is the admin who removed B; the principal is B.
+    { actor: "alice@example.com", target: "eng/build", detail: { session: build.id, principal: B, reason: REASON } },
+    { actor: "alice@example.com", target: "eng/build", detail: { session: writer.id, principal: B, writes_as: true, reason: REASON } },
+    { actor: "alice@example.com", target: "eng/deploy", detail: { session: deploy.id, principal: B, reason: REASON } },
   ]));
   // A member can take the freed alias.
   expect((await srv.client(alice, "eng/build").connect()).bind_ok.alias).toBe("eng/build");
