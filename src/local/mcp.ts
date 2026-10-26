@@ -772,7 +772,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     // ones this session no longer holds.
     const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
     const notes = previous ? leftNote(previous, left) : [];
-    const ok = bindOk(n.name, previous, (general) => localBoundInstructions(n.name, general), notes, true);
+    const ok = bindOk(n.name, previous, (general) => localBoundInstructions(n.name, general), notes);
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);

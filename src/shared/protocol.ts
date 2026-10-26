@@ -97,13 +97,11 @@ export type HelloOk     = {
   // This server's attachment size caps, for the client's checks before upload.
   attachment_limits: AttachmentLimits;
 };
-// alias: the full address bound. restored: a restore's or a reconnect-after-
-// end's continuity, checked against the alias's history. left: the claims
-// that stay with the alias this session left (#284 S6). notices: as
-// hello_ok's, for the alias now held.
+// alias: the full address bound. left: the claims that stay with the alias
+// this session left (#284 S6). notices: as hello_ok's, for the alias now
+// held. A restore's continuity is in the alias's binding_events row.
 export type BindOk      = {
-  type: "bind_ok"; req_id: string; alias: string; restored?: { verified: boolean; detail: string };
-  left?: string[]; notices?: string[];
+  type: "bind_ok"; req_id: string; alias: string; left?: string[]; notices?: string[];
 };
 export type EndOk       = { type: "end_ok"; req_id: string };
 // The server released an alias this session held (#284 S9: its user left the

@@ -611,7 +611,7 @@ test("#211: a restored_from the name's history doesn't show is logged unverified
   // One of alice's own sessions (a stranger's fails the principal check first).
   const stranger = await sessionId(await session(null));
   const ws = srv.client(alice, "api", { bind: { restored_from: stranger } });
-  expect((await ws.connect()).bind_ok.restored).toEqual({ verified: false, detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
+  expect((await ws.connect()).bind_ok.alias).toBe(`${A}/api`);
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(status(`${A}/api`)).toBeNull();
 });
@@ -626,7 +626,8 @@ test("#211: a restored_from naming another principal's session is unverified, ev
   await theirs.call("peer_status", { text: "bob's task" });
   expect((await theirs.request({ type: "end" })).type).toBe("end_ok");
   const mine = srv.client(alice, "eng/api", { bind: { restored_from: theirs.id } });
-  expect((await mine.connect()).bind_ok.restored).toEqual({ verified: false, detail: `restore not verified: ${theirs.id} isn't a session of yours` });
+  expect((await mine.connect()).bind_ok.alias).toBe("eng/api");
+  expect(rows(`SELECT detail FROM binding_events WHERE name = 'eng/api' ORDER BY id DESC LIMIT 1`)).toEqual([{ detail: `restore not verified: ${theirs.id} isn't a session of yours` }]);
   expect(status("eng/api")).toBeNull();
 });
 
@@ -663,7 +664,9 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
 
   // A stray naming a key that isn't an ended session of the alias's: unverified, fresh status.
   ws = srv.client(alice, "api", { bind: { previous_key: theirs } });
-  expect((await ws.connect()).bind_ok.restored).toEqual({ verified: false, detail: `restore after end not verified: ${idAddress(theirs)} isn't an ended session of yours` });
+  await ws.connect();
+  const stray = ws.id;
+  expect(events("api").at(-1)!.detail).toBe(`restore after end not verified: ${idAddress(theirs)} isn't an ended session of yours`);
   expect(apiStatus()).toBeNull();
   expect((await ws.request({ type: "end" })).type).toBe("end_ok");
   ws.close();
@@ -671,7 +674,8 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
   // The ended session's own key, after a stray held the name since: not the latest binder.
   const third = "c1".repeat(32);
   ws = srv.client(alice, "api", { key: third, bind: { previous_key: mine } });
-  expect((await ws.connect()).bind_ok.restored.verified).toBe(false);
+  await ws.connect();
+  expect(events("api").at(-1)!.detail).toBe(`restored_from ${idAddress(mine)} not verified: latest bound by ${stray}`);
   expect(apiStatus()).toBeNull();
   await ws.call("peer_status", { text: "resumable" });
   expect((await ws.request({ type: "end" })).type).toBe("end_ok");
@@ -679,7 +683,8 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
 
   // The latest binder's key: verified, status inherited.
   ws = srv.client(alice, "api", { bind: { previous_key: third } });
-  expect((await ws.connect()).bind_ok.restored).toEqual({ verified: true, detail: `restored after end of session ${idAddress(third)}` });
+  await ws.connect();
+  expect(events("api").at(-1)!.detail).toBe(`restored after end of session ${idAddress(third)}`);
   expect(apiStatus()).toBe("resumable");
 }, 20_000);
 

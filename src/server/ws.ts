@@ -881,7 +881,7 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     return refuse("alias_held", `${why}; bind another name`, why);
   }
 
-  const restored = repo.atomic((): Continuity | undefined => {
+  repo.atomic(() => {
     createLazily(hub, authed, target, id);
     const continued = continuity(hub, authed, id, address, m);
     if (previous) {
@@ -891,7 +891,6 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     holdAlias(db, address, id);
     logBinding(db, id, address, previous ? "moved" : "bound", previous ?? continued?.detail ?? null);
     touchAlias(db, address);
-    return continued;
   });
 
   if (previous && registry.get(previous) === ws) registry.delete(previous);
@@ -904,7 +903,7 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
   const notices = noticesFor(hub, ws.data.addresses);
   send(ws, {
     type: "bind_ok", req_id: m.req_id, alias: address,
-    ...(restored ? { restored } : {}), ...(left.length ? { left } : {}), ...(notices.length ? { notices } : {}),
+    ...(left.length ? { left } : {}), ...(notices.length ? { notices } : {}),
   });
   if (!ws.data.push) return;
   drainDirect(hub, ws, [address]);

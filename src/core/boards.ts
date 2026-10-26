@@ -219,12 +219,6 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
   }).immediate();
 }
 
-/** The principal of session `id`'s row, or undefined when it has none. */
-export function idPrincipal(db: Database, id: string): string | null | undefined {
-  const row = db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(id) as { principal: string | null } | null;
-  return row ? row.principal : undefined;
-}
-
 /** A session used the bus: its last_seen moves. */
 export function touchId(db: Database, id: string, now = Date.now()): void {
   db.prepare(`UPDATE ids SET last_seen = ? WHERE id = ?`).run(now, id);
@@ -916,17 +910,6 @@ export function lastSeen(db: Database, handle: string): number | null {
   const sql = addressParts(handle)?.kind === "id" ? `SELECT last_seen FROM ids WHERE id = ?` : `SELECT last_seen FROM aliases WHERE address = ?`;
   const row = db.prepare(sql).get(handle) as { last_seen: number | null } | undefined;
   return row?.last_seen ?? null;
-}
-
-/** When and where each of `handles` last had a session; those that never connected are absent. */
-export function sessionsSeen(db: Database, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
-  const rows = db
-    .prepare(
-      `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
-        WHERE a.address IN (SELECT value FROM json_each(?)) AND a.last_seen IS NOT NULL`,
-    )
-    .all(JSON.stringify(handles)) as { address: string; last_seen: number; cwd: string | null; place: string | null }[];
-  return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
 /** Every handle in the roster: the aliases that have had a session. */

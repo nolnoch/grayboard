@@ -348,19 +348,19 @@ export function unboundPeer(sessionId: string, where: string | null, self: boole
 /**
  * bind's result: what changed, then the startup text for the name
  * (instructions are fixed at initialize, so bind's result carries them).
- * `instructions(general)` builds it; the text leaves out the general part on
- * a rebind, which the model already has. `structuredContent` carries the full
- * set, name and general alike, for adapters that replace their system-prompt
- * section with it (pi, opencode), so they never parse the text.
- * `generalKnown`: an unbound session already had the general part (local).
+ * `instructions(general)` builds it; the text leaves out the general part,
+ * which the model already has (an unbound session's instructions carry it).
+ * `structuredContent` carries the full set, name and general alike, for
+ * adapters that replace their system-prompt section with it (pi, opencode),
+ * so they never parse the text.
  */
-export function bindOk(name: string, previous: string | null, instructions: (general: boolean) => string[], notes: string[] = [], generalKnown = false) {
+export function bindOk(name: string, previous: string | null, instructions: (general: boolean) => string[], notes: string[] = []) {
   const text = [
     previous
       ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...notes,
-    ...instructions(previous === null && !generalKnown),
+    ...instructions(false),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }

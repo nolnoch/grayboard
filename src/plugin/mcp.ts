@@ -736,7 +736,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   console.error(`[grayboard] session ${client.id} bound "${ok.alias}"${previous ? ` (was "${previous}")` : ""}`);
   const notes = previous ? leftNote(short(previous), ok.left ?? []) : [];
   // An unbound session already had the general part, acting as its ID.
-  const r = bindOk(name, previous ? short(previous) : null, (general) => serverBoundInstructions(name, general, boundNotices), notes, true);
+  const r = bindOk(name, previous ? short(previous) : null, (general) => serverBoundInstructions(name, general, boundNotices), notes);
   // A cancelled call's result is dropped (pi and opencode cancel on abort).
   if (signal.aborted) {
     missedBindNotice = bindMissed(name, "it was cancelled", r.content[0]!.text);
