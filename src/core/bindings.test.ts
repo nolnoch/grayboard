@@ -102,6 +102,6 @@ test("the schema has the ID and alias metadata columns and no task_ref", () => {
   initCoreSchema(db);
   const cols = (t: string) => (db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]).map((c) => c.name);
   expect(cols("ids")).toEqual(expect.arrayContaining(["harness", "model", "effort"]));
-  expect(cols("aliases")).toEqual(expect.arrayContaining(["task", "owner", "source_board", "spec_hash", "description", "last_bound_at"]));
+  expect(cols("aliases")).toEqual(expect.arrayContaining(["task", "owner", "source_board", "spec_hash", "description"]));
   expect(cols("aliases")).not.toContain("task_ref");
 });

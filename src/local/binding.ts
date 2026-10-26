@@ -421,7 +421,7 @@ export async function acquireName(
     ensureAlias(db, name, sessionId, now);
     holdAlias(db, name, sessionId, now);
     if (opts.meta) setAliasMeta(db, name, opts.meta, sessionId, coreAuditSink(db));
-    const restart = opts.restartOf === undefined ? null : continuityOf(db, name, { restartOf: opts.restartOf });
+    const restart = opts.restartOf === undefined ? null : continuityOf(db, name, opts.restartOf);
     logBinding(db, sessionId, name, "bound", restart?.detail ?? null, now);
     return { ok: true, name, restored: restart?.verified ?? false, ended };
   }).immediate();

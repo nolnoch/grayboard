@@ -996,7 +996,7 @@ function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m
   if (!row || row.principal !== authed.user_email || row.ended_at === null) {
     return { verified: false, detail: `restore after end not verified: ${prev} isn't an ended session of yours` };
   }
-  const c = continuityOf(db, address, { restartOf: prev });
+  const c = continuityOf(db, address, prev);
   if (!c.verified) return c;
   inheritStatus(db, id, prev);
   return { verified: true, detail: `restored after end of session ${prev}` };

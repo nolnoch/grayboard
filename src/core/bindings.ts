@@ -59,9 +59,9 @@ export function asSessionId(s: string): string {
 /**
  * Session `id` holds `address` from `now`, or from just after its newest
  * other hold when that is later (#284 S1): two binds in one millisecond keep
- * the order they were made in, so the primary is the one bound first. The
- * alias's last_bound_at moves (S12). Call inside the bind's write
- * transaction, for a new hold only: a re-bind of a held alias changes neither.
+ * the order they were made in, so the primary is the one bound first. Call
+ * inside the bind's write transaction, for a new hold only: a re-bind of a
+ * held alias leaves its bound_at.
  */
 export function holdAlias(db: Database, address: string, id: string, now = Date.now()): void {
   db.prepare(
@@ -69,7 +69,6 @@ export function holdAlias(db: Database, address: string, id: string, now = Date.
        VALUES (?1, ?2, MAX(?3, COALESCE((SELECT MAX(bound_at) + 1 FROM alias_holds WHERE id = ?2 AND address != ?1), ?3)))
      ON CONFLICT(address) DO UPDATE SET id = excluded.id, bound_at = excluded.bound_at`,
   ).run(address, id, now);
-  db.prepare(`UPDATE aliases SET last_bound_at = ? WHERE address = ?`).run(now, address);
 }
 
 /** How many aliases one session may hold at once (#284 S1): each is a socket, a registry entry and a drain stream. */
@@ -269,22 +268,18 @@ function latestBinder(db: Database, name: string): string | null {
 export type Continuity = { verified: boolean; detail: string };
 
 /**
- * A hello's claim to continue `session` on `name` (#211): a reconnect of the
- * session itself, or a restart of an earlier one. Honoured only when the
- * name's latest bound or moved event is that session's, so the binding
- * history never records a continuation the bus didn't see. A restart names
- * a public ID, so on the server this shows the history, not descent (#259).
- * An unverified claim's detail names the latest binder, so the row explains
- * its refusal. Call it in the transaction that logs the bind.
+ * A bind's claim that it restarts `session`, an earlier session, on `name`
+ * (#211). Honoured only when the name's latest bound or moved event is that
+ * session's, so the binding history never records a continuation the bus
+ * didn't see. The claim names a public ID, so on the server this shows the
+ * history, not descent (#259). An unverified claim's detail names the latest
+ * binder, so the row explains its refusal. Call it in the transaction that
+ * logs the bind.
  */
-export function continuityOf(db: Database, name: string, claim: { reconnect: string } | { restartOf: string }): Continuity {
-  const session = "reconnect" in claim ? claim.reconnect : claim.restartOf;
+export function continuityOf(db: Database, name: string, session: string): Continuity {
   const latest = latestBinder(db, name);
-  if (latest === session) {
-    return { verified: true, detail: "reconnect" in claim ? "reconnect" : `restored: restart of session ${session}` };
-  }
-  const what = "reconnect" in claim ? "reconnect" : `restored_from ${session}`;
-  return { verified: false, detail: `${what} not verified: latest bound by ${latest ?? "nobody"}` };
+  if (latest === session) return { verified: true, detail: `restored: restart of session ${session}` };
+  return { verified: false, detail: `restored_from ${session} not verified: latest bound by ${latest ?? "nobody"}` };
 }
 
 /** Whether the name's latest bound, moved or released event is a release. */

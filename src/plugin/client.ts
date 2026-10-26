@@ -302,7 +302,7 @@ export class GrayboardClient {
         }
         // A resume refused because the session ended during the outage (its
         // grace ran out): an unkeyed session carries on under a new key at
-        // once, and re-binds its alias with the old key as proof (#284 S4).
+        // once, and re-binds its aliases with the old key as proof (#284 S4).
         if (msg.code === "id_collision" && !this.helloData && msg.req_id === this.helloId && this.wasReady && !this.opts.keyed && this.rekeyedFrom === null) {
           console.error(`[grayboard] session ${this.id} was refused on reconnect (${msg.message}); starting a new session`);
           this.rekeyedFrom = this.key;

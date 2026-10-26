@@ -573,7 +573,7 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // sessions' instructions. attachments: the poster's unbound uploads to
 // carry, bound in the post's transaction under the mode's size caps.
 // author_id: the posting session's ID (#284), when the writer is a session.
-// addresses: the poster's address set (#284 S5), `handle` its primary; a
+// addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
 // queue claim held by any of them is acked, and none of them is pushed the post.
 export type PostOpts = {
   online?: (handle: string) => boolean;

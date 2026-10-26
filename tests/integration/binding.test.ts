@@ -335,7 +335,7 @@ test("#284 S2: unbind is refused for a scoped name, a tools-only process and the
 }, 30_000);
 
 // The alias's labels and its meta audit rows.
-const labels = (name: string) => rows<Record<string, string | null>>(`SELECT task, owner, source_board, spec_hash, description, last_bound_at FROM aliases WHERE address = ?`, name)[0]!;
+const labels = (name: string) => rows<Record<string, string | null>>(`SELECT task, owner, source_board, spec_hash, description FROM aliases WHERE address = ?`, name)[0]!;
 const metaAudits = (name: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY rowid`, name).map((r) => JSON.parse(r.detail));
 
 test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes only its labels", async () => {
@@ -344,7 +344,6 @@ test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes 
   await s.call("bind", { name: "fe", create: true, meta: { task: "  idle\tanim ", source_board: "#E2E" } });
   const first = labels("fe");
   expect(first).toMatchObject({ task: "idle anim", source_board: "e2e", owner: null });
-  expect(first.last_bound_at).toBeNumber();
   expect(metaAudits("fe")).toEqual([{ address: "fe", fields: { task: "idle anim", source_board: "e2e" }, session: id }]);
   const boundAt = rows<{ bound_at: number }>(`SELECT bound_at FROM alias_holds WHERE address = 'fe'`)[0]!.bound_at;
 
@@ -352,7 +351,7 @@ test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes 
   expect(await s.call("bind", { name: "fe", meta: { task: "idle anim" } })).toBe(`already bound to "fe"`);
   expect(metaAudits("fe")).toHaveLength(1);
   expect(await s.call("bind", { name: "fe", meta: { task: "", owner: "be" } })).toBe(`already bound to "fe"`);
-  expect(labels("fe")).toMatchObject({ task: null, owner: "be", source_board: "e2e", last_bound_at: first.last_bound_at });
+  expect(labels("fe")).toMatchObject({ task: null, owner: "be", source_board: "e2e" });
   expect(metaAudits("fe").at(-1)).toEqual({ address: "fe", fields: { task: null, owner: "be" }, session: id });
   expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
   expect(rows<{ bound_at: number }>(`SELECT bound_at FROM alias_holds WHERE address = 'fe'`)[0]!.bound_at).toBe(boundAt);

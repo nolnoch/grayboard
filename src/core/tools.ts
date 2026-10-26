@@ -334,7 +334,7 @@ export type BoardPostResult = {
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
 // `session`: the calling session's ID, recorded on its posts (#284).
-// `addresses`: the caller's address set, `handle` its primary (#284 S5);
+// `addresses`: the caller's address set, `handle` the one it acts as (#284 S5);
 // claims held by any of them are the caller's. Default [handle].
 export type ToolContext = {
   online?: (handle: string) => boolean;

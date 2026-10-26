@@ -137,8 +137,9 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
   if (lastSeen(db, name) === null) throw new Error(`no session has used handle "${name}"${hint}`);
   // As the session holding the name: its address set, so a claim it took
   // under its ID before binding is its own here too (#284 S5). No `session`:
-  // this process wrote the post, not that session.
-  const outcome = callBoardTool(db, name, tool, args, { addresses: addressSet(db, name, null) });
+  // this process wrote the post, not that session. One transaction, so a
+  // bind or unbind can't change the set between its read and the write.
+  const outcome = db.transaction(() => callBoardTool(db, name, tool, args, { addresses: addressSet(db, name, null) })).immediate();
   // The acting session too: a wakeup re-arms its claim-expiry timer, as its own tool call would.
   await Promise.all([...new Set([...outcome.wake, name])].map((h) => poke(h)));
   return outcome.result;

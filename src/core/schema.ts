@@ -236,12 +236,13 @@ export function initCoreSchema(db: Database): void {
   // reported (BUS_MODEL, BUS_EFFORT; the WSS hello), display facts that end
   // with the session. An alias's task, owner, source_board, spec_hash and
   // description are one-line labels its binder sets (`bind(…, meta)`), never
-  // a reference or task state (decision 12); last_bound_at is its latest bind.
+  // a reference or task state (decision 12). When it was bound is
+  // binding_events' record, not a column.
   for (const col of ["model", "effort"]) {
     if (!idCols.has(col)) db.exec(`ALTER TABLE ids ADD COLUMN ${col} TEXT`);
   }
   const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
-  for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"], ["last_bound_at", "INTEGER"]]) {
+  for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
     if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);
   }
   db.exec(`

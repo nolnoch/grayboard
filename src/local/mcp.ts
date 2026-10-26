@@ -457,8 +457,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // requester settles the thread (#184). Same result fields as dm_send, via
     // the shared builder, so the modes can't drift.
     const live = await liveHandles(ADDRS);
-    // A launcher inside its bind swap still answers under its old name: filter
-    // it like dm_send does (a released name's socket isn't the session).
+    // A name just released (an unbind, or a 1.x rebind sharing the file) can
+    // still answer on its socket: filter it like dm_send does (a released
+    // name's socket isn't the session).
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
     let d;
     try {
