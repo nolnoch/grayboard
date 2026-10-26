@@ -207,3 +207,31 @@ test("retention prunes ended sessions; a keyed one's key coming back is audited 
   expect(audits("id.reused")).toHaveLength(1);
   expect(audits("id.registered").filter((a) => a.target === plain.id)).toHaveLength(1);
 });
+
+// #284 S18: a send or mention naming an ID that can't receive is refused
+// with that ID's own code, not bad_request, and the same text local mode shows.
+test("a send or @id: mention to an ID that can't receive carries its code: not_found, id_ended, no_delivery", async () => {
+  const alice = await srv.login(A);
+  const a = srv.client(alice, "be");
+  await a.connect();
+  const gone = srv.client(alice, null);
+  await gone.connect();
+  expect(await gone.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  const tools = srv.client(alice, "be", { push: false });
+  await tools.connect();
+  await a.call("board_create", { name: "e2e", purpose: "test" });
+
+  const at = new Date(clock).toISOString();
+  expect(await a.request({ type: "send", recipient: "id:0123456789abz", body: "hi" })).toMatchObject({ type: "error", code: "not_found", message: "no session id:0123456789abz" });
+  expect(await a.request({ type: "send", recipient: gone.id, body: "hi" })).toMatchObject({ type: "error", code: "id_ended", message: `${gone.id} ended at ${at}; it held no alias` });
+  expect(await a.request({ type: "send", recipient: tools.id, body: "hi" })).toMatchObject({
+    type: "error",
+    code: "no_delivery",
+    message: `${tools.id} is a tools-only session and receives nothing; send to ${A}/be`,
+  });
+  expect(await a.call("board_post", { board: "e2e", body: `@${gone.id} hi` })).toMatchObject({ type: "error", code: "id_ended", message: `${gone.id} ended at ${at}; it held no alias` });
+  expect(await a.call("board_post", { board: "e2e", body: `@${tools.id} hi` })).toMatchObject({ type: "error", code: "no_delivery" });
+  // Nothing was written.
+  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM messages`).get()).toEqual({ n: 0 });
+  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM posts`).get()).toEqual({ n: 0 });
+});

@@ -103,7 +103,7 @@ export const openAccess = (db: Database): Access => ({
   resolveMention: (token, _author, _board, strict) => {
     if (addressParts(token)?.kind === "id") {
       const why = undeliverableId(db, token);
-      if (why && strict) throw new CoreError(why);
+      if (why && strict) throw why;
       return why ? null : token;
     }
     if (!BOARD_NAME_RE.test(token)) return null;

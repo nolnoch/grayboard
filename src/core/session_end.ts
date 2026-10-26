@@ -138,21 +138,35 @@ export function bounceBody(id: string, endedAt: number, held: string[]): string 
  */
 export function assertDeliverableId(db: Database, id: string): void {
   const why = undeliverableId(db, id);
-  if (why) throw new CoreError(why);
+  if (why) throw why;
+}
+
+/**
+ * assertDeliverableId's refusal. Its message reads `<code>: <detail>`, the
+ * text a local tool error shows; the server sends `code` as the error
+ * frame's code and `detail` as its message, so both modes read the same.
+ */
+export class Undeliverable extends CoreError {
+  constructor(
+    readonly code: "not_found" | "id_ended" | "no_delivery",
+    readonly detail: string,
+  ) {
+    super(`${code}: ${detail}`);
+  }
 }
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
-export function undeliverableId(db: Database, id: string): string | null {
+export function undeliverableId(db: Database, id: string): Undeliverable | null {
   const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
     | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
     | null;
-  if (!r || r.viewer) return `not_found: no session ${id}`;
+  if (!r || r.viewer) return new Undeliverable("not_found", `no session ${id}`);
   if (r.ended_at != null) {
     const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-    return `id_ended: ${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`;
+    return new Undeliverable("id_ended", `${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
   }
   if (r.delivery === "none") {
-    return `no_delivery: ${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`;
+    return new Undeliverable("no_delivery", `${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
   }
   return null;
 }

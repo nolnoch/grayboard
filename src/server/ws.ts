@@ -32,7 +32,7 @@ import {
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
-import { assertDeliverableId, endSession } from "../core/session_end.ts";
+import { assertDeliverableId, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests } from "../core/attachments.ts";
@@ -133,6 +133,12 @@ function send(ws: Ws, msg: ServerMessage): void {
 
 function err(ws: Ws, reqId: string | undefined, code: ErrorCode, message: string, extra: Pick<ErrorMessage, "known" | "holder" | "retry_after_ms"> = {}): void {
   send(ws, { type: "error", req_id: reqId, code, message, ...extra });
+}
+
+// A refused call's code and message: an ID that can't receive names its own
+// code (#284 S18); any other CoreError is a bad request.
+function coreRefusal(e: CoreError): { code: ErrorCode; message: string } {
+  return e instanceof Undeliverable ? { code: e.code, message: e.detail } : { code: "bad_request", message: e.message };
 }
 
 function refKey(r: PendingRef): string {
@@ -1010,7 +1016,10 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
     msg = repo.messages.insert(ws.data.primary, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.sessionId ?? null);
   } catch (e) {
-    if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
+    if (e instanceof CoreError) {
+      const r = coreRefusal(e);
+      throw new SendRefused(r.code, r.message);
+    }
     throw e;
   }
   const f = { ...(p.pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
@@ -1133,7 +1142,8 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
     // Written after the rollback, so the refusal's row stays.
     if (e instanceof CoreError) {
       writeAudit(repo, "delegation.refused", authed.user_email, ws.data.primary, { reason: e.message, to: m.to });
-      return err(ws, reqId, "bad_request", e.message);
+      const r = coreRefusal(e);
+      return err(ws, reqId, r.code, r.message);
     }
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
@@ -1197,7 +1207,10 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   try {
     outcome = callBoardTool(db, ws.data.primary, tool, args, ctx);
   } catch (e) {
-    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    if (e instanceof CoreError) {
+      const r = coreRefusal(e);
+      return err(ws, reqId, r.code, r.message);
+    }
     console.error(`[grayboard] ${tool} failed:`, e);
     return err(ws, reqId, "internal", `${tool} failed`);
   }
@@ -1230,7 +1243,10 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, args: Record<string, u
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };
     });
   } catch (e) {
-    if (e instanceof CoreError) return err(ws, reqId, "bad_request", e.message);
+    if (e instanceof CoreError) {
+      const r = coreRefusal(e);
+      return err(ws, reqId, r.code, r.message);
+    }
     console.error("[grayboard] board_post failed:", e);
     return err(ws, reqId, "internal", "board_post failed");
   }

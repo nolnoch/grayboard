@@ -71,7 +71,7 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       if (!t || t.kind === "team") return null;
       if (t.kind === "id") {
         const why = undeliverableId(db, t.address);
-        if (why && strict) throw new CoreError(why);
+        if (why && strict) throw why;
         return why ? null : t.address;
       }
       const reach = (h: string) => canSee(h, board) && reachesHuman(repo, humanReach, author, h);

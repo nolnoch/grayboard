@@ -665,6 +665,8 @@ test("#284: messages and posts carry the writing session's ID, a tools-only conn
   expect(toolsId).not.toBe(id);
   expect(rows(`SELECT body, sender, sender_id FROM messages ORDER BY id`)).toEqual([{ body: "dm owner", sender: `${A}/be`, sender_id: id }, { body: "dm tools", sender: `${A}/be`, sender_id: toolsId }]);
   expect(rows(`SELECT body, author, author_id FROM posts ORDER BY id`)).toEqual([{ body: "post owner", author: `${A}/be`, author_id: id }, { body: "post tools", author: `${A}/be`, author_id: toolsId }]);
+  // Mail it could never read is refused with its code, in local mode's words (#284 S18).
+  expect(await refusal(owner, "dm_send", { to: toolsId, body: "hi" })).toBe(`error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to ${A}/be`);
 }, 20_000);
 
 // #284 audit B12/W5: the lazy alias.created row names the session that

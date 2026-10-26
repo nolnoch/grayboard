@@ -166,9 +166,9 @@ export type ErrorCode =
   // hello refused: the session key's ID is another principal's session, has
   // ended, or is live on another connection (#284)
   | "id_collision"
-  // the session has ended (#284 S4), or a send named an ended ID
+  // the session has ended (#284 S4), or a send or mention named an ended ID
   | "id_ended"
-  // a send named an ID that receives nothing (a hold or tools-only session)
+  // a send or mention named an ID that receives nothing (a tools-only session)
   | "no_delivery";
 
 /** The protocol version a hello must carry (#284 S15). */
