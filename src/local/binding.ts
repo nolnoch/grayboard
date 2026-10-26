@@ -29,7 +29,10 @@ import { deliverEnded, poke } from "./wakeup.ts";
 // process sharing the file, its bindings row's name.
 export type SessionRow = {
   session_id: string;
+  // The primary (its oldest hold, #284 S1) and every hold oldest first; a
+  // 1.x process's one name is its bindings row's.
   name: string | null;
+  names: string[];
   pid: number;
   proc_start: string | null;
   harness: string | null;
@@ -49,9 +52,19 @@ export type HarnessRule = "env" | "ancestor";
 /** A keyed session's harness: the process whose exit ends it. */
 export type Harness = { pid: number; proc_start: string | null; rule: HarnessRule };
 
-const SESSION_SQL = `SELECT b.session_id, COALESCE(h.address, b.name) AS name, b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at,
-    b.harness_rule, b.attached_pid, b.attached_start
-  FROM bindings b LEFT JOIN ids i ON i.id = b.session_id LEFT JOIN alias_holds h ON h.id = b.session_id`;
+// One row per session, however many aliases it holds (#284 S7).
+const SESSION_SQL = `SELECT b.session_id, b.name AS legacy_name,
+    (SELECT json_group_array(address ORDER BY bound_at, address) FROM alias_holds WHERE id = b.session_id) AS names_json,
+    b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at, b.harness_rule, b.attached_pid, b.attached_start
+  FROM bindings b LEFT JOIN ids i ON i.id = b.session_id`;
+
+type RawSessionRow = Omit<SessionRow, "name" | "names"> & { legacy_name: string | null; names_json: string };
+
+function sessionRow({ legacy_name, names_json, ...r }: RawSessionRow): SessionRow {
+  const held = JSON.parse(names_json) as string[];
+  const names = held.length ? held : legacy_name ? [legacy_name] : [];
+  return { ...r, name: names[0] ?? null, names };
+}
 
 /**
  * This process as a session row, unbound. A keyed session's row lives by its
@@ -65,6 +78,7 @@ export function thisSession(sessionId: string, harness: Harness | null = null, c
   return {
     session_id: sessionId,
     name: null,
+    names: [],
     pid: harness?.pid ?? process.pid,
     proc_start: harness ? harness.proc_start : proc_start,
     harness: commandName(harnessPid),
@@ -272,7 +286,7 @@ const ORPHAN_SQL = `SELECT id FROM ids WHERE ended_at IS NULL AND id NOT IN (SEL
  * candidate is re-checked inside it.
  */
 export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
-  const rows = db.prepare(SESSION_SQL).all() as SessionRow[];
+  const rows = (db.prepare(SESSION_SQL).all() as RawSessionRow[]).map(sessionRow);
   const { alive: live, dead } = aliveRows(rows);
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
@@ -335,7 +349,10 @@ function knownNames(db: Database): string[] {
 // The session holding `name`, other than `sessionId`: by its hold, or a
 // 1.x process by its bindings row's name.
 function holdingSession(db: Database, name: string, sessionId: string | null = null): SessionRow | null {
-  return db.prepare(`${SESSION_SQL} WHERE (h.address = ?1 OR b.name = ?1) AND b.session_id IS NOT ?2`).get(name, sessionId) as SessionRow | null;
+  const row = db.prepare(
+    `${SESSION_SQL} WHERE (EXISTS (SELECT 1 FROM alias_holds WHERE id = b.session_id AND address = ?1) OR b.name = ?1) AND b.session_id IS NOT ?2`,
+  ).get(name, sessionId) as RawSessionRow | null;
+  return row ? sessionRow(row) : null;
 }
 
 /**
@@ -473,7 +490,7 @@ export async function candidateNames(db: Database, suggested: string | null): Pr
   const sessions = liveSessions(db);
   // The sessions this check found dead were ended: their bounces and releases wake now.
   await deliverEnded(db, sessions);
-  const live = new Set(sessions.alive.map((r) => r.name).filter((n): n is string => n !== null));
+  const live = new Set(sessions.alive.flatMap((r) => r.names));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const agent = agentName(db);

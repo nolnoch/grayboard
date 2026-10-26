@@ -7,6 +7,7 @@ import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
+import { CoreError } from "./errors.ts";
 import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -55,10 +56,16 @@ export function asSessionId(s: string): string {
 // the current holder; the server takes one when its hub has settled the
 // name's connection, so a hold here replaces whatever row was left.
 
-/** Session `id` holds `address` from `now`. */
+/**
+ * Session `id` holds `address` from `now`, or from just after its newest
+ * other hold when that is later (#284 S1): two binds in one millisecond keep
+ * the order they were made in, so the primary is the one bound first. Call
+ * inside the bind's write transaction.
+ */
 export function holdAlias(db: Database, address: string, id: string, now = Date.now()): void {
   db.prepare(
-    `INSERT INTO alias_holds (address, id, bound_at) VALUES (?, ?, ?)
+    `INSERT INTO alias_holds (address, id, bound_at)
+       VALUES (?1, ?2, MAX(?3, COALESCE((SELECT MAX(bound_at) + 1 FROM alias_holds WHERE id = ?2 AND address != ?1), ?3)))
      ON CONFLICT(address) DO UPDATE SET id = excluded.id, bound_at = excluded.bound_at`,
   ).run(address, id, now);
 }
@@ -76,6 +83,29 @@ export function holderOf(db: Database, address: string): string | null {
 /** The aliases session `id` holds, oldest hold first. */
 export function holdsOf(db: Database, id: string): string[] {
   return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+}
+
+/** Session `id`'s address set (#284 S1): the aliases it holds, oldest first, then its ID. */
+export function sessionAddresses(db: Database, id: string): string[] {
+  return [...holdsOf(db, id), id];
+}
+
+/** The address a session sends as by default (#284 S1): its oldest hold, else its ID. */
+export function primaryOf(holds: string[], id: string): string {
+  return holds[0] ?? id;
+}
+
+/**
+ * The address a write names with `as` (#284 S3), checked against the
+ * caller's `addresses`: a bare name in the caller's own scope (`ownScope`,
+ * the server's `email`; null in local mode, whose aliases are bare), or a
+ * scope/name or ID as given.
+ */
+export function actingAs(input: string, addresses: string[], ownScope: string | null): string {
+  const p = addressParts(input);
+  const address = p?.kind === "bare" && ownScope !== null ? `${ownScope}/${p.name}` : p?.address;
+  if (address !== undefined && p?.kind !== "team" && addresses.includes(address)) return address;
+  throw new CoreError(`"${input}" isn't one of this session's addresses: ${addresses.join(", ")}`);
 }
 
 /**

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { acquireName, attachSession, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { acquireName, attachSession, candidateNames, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -15,7 +15,7 @@ import { openLocalDb } from "./open.ts";
 test("a dead row reaped twice logs one release", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const id = "id:0123456789abc";
-  registerSession(db, { session_id: id, name: null, pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null });
+  registerSession(db, { session_id: id, name: null, names: [], pid: 999999, proc_start: null, harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null });
   holdAlias(db, "fe", id);
   const rows = db.prepare(`SELECT * FROM bindings`).all() as SessionRow[];
   db.transaction(() => reap(db, rows, 2)).immediate();
@@ -24,6 +24,24 @@ test("a dead row reaped twice logs one release", () => {
   // The reap ends the session (#284): its hold goes and its ID is never taken again.
   expect(db.prepare(`SELECT * FROM alias_holds`).all()).toEqual([]);
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
+});
+
+// #284 S7: a session holding two aliases is one live row, its primary the
+// one it bound first, and a bind of either by another session is refused.
+test("a session with two holds is one live row; neither name is offered or free", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const me = "id:0123456789abf";
+  registerSession(db, { ...thisSession(me), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  // One millisecond, bound zed then alpha: bind order, not the address, picks the primary.
+  holdAlias(db, "zed", me, 7);
+  holdAlias(db, "alpha", me, 7);
+  expect(liveSessions(db).alive).toEqual([expect.objectContaining({ session_id: me, name: "zed", names: ["zed", "alpha"] })]);
+  expect((await candidateNames(db, "alpha")).map((c) => c.name)).not.toContain("alpha");
+  const other = "id:0123456789abg";
+  registerSession(db, { ...thisSession(other), pid: 999999, proc_start: null });
+  for (const name of ["zed", "alpha"]) {
+    expect(await acquireName(db, other, name, { create: true, previous: null })).toMatchObject({ ok: false, error: expect.stringContaining(me) });
+  }
 });
 
 // #284 decision 2: an ID with any ids row, live or ended, is never registered again.
