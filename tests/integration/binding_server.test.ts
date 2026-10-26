@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
-import { serverEnv } from "../support/env.ts";
+import { cleanEnv, serverEnv } from "../support/env.ts";
 import { PROTO_REFUSAL } from "../../src/shared/protocol.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
@@ -834,3 +834,109 @@ test("#284: alias.created names the session; handle.launcher_set targets it; the
   ]);
   expect(rows(`SELECT launcher FROM ids WHERE id = ?`, id)).toEqual([{ launcher: 1 }]);
 }, 20_000);
+
+const senderOf = (id: number) => rows<{ sender: string }>(`SELECT sender FROM messages WHERE id = ?`, id)[0]!.sender;
+
+test("#284 S3: as on dm_send names one of the session's addresses; another's is refused with the list", async () => {
+  await session("peer");
+  const s = await session(null);
+  const id = await sessionId(s);
+  await s.call("bind", { name: "a", create: true });
+  await s.call("bind", { name: "b", create: true });
+  await session("c");
+  const plain = await s.call("dm_send", { to: "peer", body: "1" });
+  expect([senderOf(plain.message_id as number), plain.sent_as]).toEqual([`${A}/a`, undefined]);
+  const asB = await s.call("dm_send", { to: "peer", body: "2", as: "b" });
+  expect([senderOf(asB.message_id as number), asB.sent_as]).toEqual([`${A}/b`, `${A}/b`]);
+  const asId = await s.call("dm_send", { to: "peer", body: "3", as: id });
+  expect(senderOf(asId.message_id as number)).toBe(id);
+  for (const other of ["zzz", "c"]) {
+    expect(await refusal(s, "dm_send", { to: "peer", body: "x", as: other })).toContain(`isn't one of this session's addresses: ${A}/a, ${A}/b, ${id}`);
+  }
+}, 30_000);
+
+test("#284 S4: a reply goes as the held alias its parent reached or was sent as; else the primary", async () => {
+  const peer = await session("peer");
+  const s = await session(null);
+  const id = await sessionId(s);
+  // Mail to the ID before any bind is answered as the alias bound since.
+  const toId = await peer.call("dm_send", { to: id, body: "to the id" });
+  await s.call("bind", { name: "a", create: true });
+  await s.call("bind", { name: "b", create: true });
+  expect(senderOf((await s.call("dm_send", { to: "peer", body: "r0", parent_id: toId.message_id })).message_id as number)).toBe(`${A}/a`);
+
+  const toB = await peer.call("dm_send", { to: "b", body: "to b" });
+  await until(() => contents(s).includes("to b"));
+  const r1 = await s.call("dm_send", { to: "peer", body: "r1", parent_id: toB.message_id });
+  expect([senderOf(r1.message_id as number), r1.sent_as]).toEqual([`${A}/b`, `${A}/b`]);
+  const r2 = await s.call("dm_send", { to: "peer", body: "r2", parent_id: toB.message_id, as: "a" });
+  expect(senderOf(r2.message_id as number)).toBe(`${A}/a`);
+  // Its own thread, as its sender.
+  expect(senderOf((await s.call("dm_send", { to: "peer", body: "r3", parent_id: r1.message_id })).message_id as number)).toBe(`${A}/b`);
+
+  // b unbound and taken by t: a reply to mail that reached b is refused, not sent as a.
+  const toB2 = await peer.call("dm_send", { to: "b", body: "to b again" });
+  await until(() => contents(s).includes("to b again"));
+  await s.call("unbind", { name: "b" });
+  const t = await session(null);
+  await t.call("bind", { name: "b" });
+  expect(await refusal(s, "dm_send", { to: "peer", body: "x", parent_id: toB2.message_id })).toContain(`parent_id ${toB2.message_id} is not a message you sent or received`);
+}, 40_000);
+
+// S14: a team alias sees only its team's boards, while a person alias sees
+// every team its user is in. So with eng/x primary, a board of ops (which
+// alice is in, eng isn't) acts as the person alias, and its subscription,
+// cursor and unread count are that alias's.
+test("#284 S14: a board call without as acts as the first address that can see the board", async () => {
+  for (const name of ["eng", "ops"]) expect((await srv.api(alice, "POST", "/api/teams", { name })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/ops/add", { email: "bob@example.com" })).status).toBe(200);
+  const s = await session(null);
+  await s.call("bind", { name: "eng/x", create: true });
+  await s.call("bind", { name: "a", create: true });
+  expect((await s.call("whoami", {})).primary).toBe("eng/x");
+  const sub = (handle: string) => rows<{ mode: string; cursor: number }>(`SELECT mode, cursor FROM subscriptions WHERE board = 'ops' AND handle = ?`, handle);
+
+  await s.call("board_subscribe", { board: "ops", mode: "digest" });
+  expect(sub(`${A}/a`)).toMatchObject([{ mode: "digest" }]);
+  expect(sub("eng/x")).toEqual([]);
+  const bo = await session("bo", { token: bob });
+  const posted = await bo.call("board_post", { board: "ops", body: "for ops" });
+  const opsRow = async () => ((await s.call("board_list", {})) as { name: string; mode: string | null; unread: number }[]).find((b) => b.name === "ops");
+  expect(await opsRow()).toMatchObject({ mode: "digest", unread: 1 });
+  expect((await s.call("board_read", { board: "ops" })).posts.map((p: any) => p.body)).toEqual(["for ops"]);
+  expect(sub(`${A}/a`)).toMatchObject([{ cursor: posted.post_id }]);
+  expect(await opsRow()).toMatchObject({ unread: 0 });
+  const reply = await s.call("board_post", { board: "ops", body: "ops reply" });
+  expect(rows(`SELECT author FROM posts WHERE id = ?`, reply.post_id)).toEqual([{ author: `${A}/a` }]);
+  // eng's board the primary can see: it acts as eng/x.
+  const own = await s.call("board_post", { board: "eng", body: "eng post" });
+  expect(rows(`SELECT author FROM posts WHERE id = ?`, own.post_id)).toEqual([{ author: "eng/x" }]);
+}, 30_000);
+
+// #360: `grayboard claim` from a shell acts as an alias over HTTP with the
+// session's address set, so it releases what the session took under its ID.
+// Another principal's ?as= of a held team alias is refused outright (S8), so
+// the set never reaches across principals.
+test("#284 #360: grayboard claim release as an alias releases its session's ID-held claim; another member's as is refused", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  const dir = mkdtempSync(join(srv.dir, "grayboard-claim-"));
+  const gb = async (token: string, email: string, identity: string, ...args: string[]) => {
+    const creds = join(dir, `creds-${email}`);
+    writeFileSync(creds, JSON.stringify({ session_token: token, server: srv.base, user_email: email }));
+    return runCli(args, { cwd: dir, env: cleanEnv({ HOME: dir, GRAYBOARD_CREDENTIALS: creds, BUS_IDENTITY: identity }) });
+  };
+  const s = await session(null, { token: bob });
+  const id = await sessionId(s);
+  await s.call("bind", { name: "eng/x", create: true });
+  expect((await s.call("claim_take", { key: "ticket:ENG-7", as: id })).claim).toMatchObject({ holder: id });
+
+  const theirs = await gb(alice, A, "eng/x", "claim", "release", "ticket:ENG-7");
+  expect(theirs.code).toBe(1);
+  expect(theirs.err).toContain(`"eng/x" is in use by`);
+  expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([{ holder: id }]);
+
+  const mine = await gb(bob, "bob@example.com", "eng/x", "claim", "release", "ticket:ENG-7");
+  expect(mine.code, mine.err).toBe(0);
+  expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([]);
+}, 30_000);
