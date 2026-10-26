@@ -343,6 +343,18 @@ function adopt(ok: BindOk): void {
 }
 
 const sameList = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+// A no-op bind or unbind answer still carries the server's hold list: adopt
+// it, so a mirror that drifted (a lost answer, a missed alias_lost) heals on
+// the next call instead of staying wrong.
+function syncHeld(now: string[]): void {
+  if (sameList(held, now)) return;
+  console.error(`[grayboard] session ${client.id} holds "${now.join('", "')}" (was "${held.join('", "')}")`);
+  held = now;
+  if (!held.length) boundNotices = [];
+  writeNames();
+  instructionsStale = true;
+}
 const quotedShort = (names: string[]) => names.map((n) => `"${short(n)}"`).join(", ");
 
 // A reconnect's hello_ok. A resume re-attaches the session with its holds,
@@ -794,7 +806,10 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   } catch (e) {
     return fail(lostBind(e as Error, "bind"));
   }
-  if (held.includes(ok.alias)) return text(`already bound to "${short(ok.alias)}"`);
+  if (held.includes(ok.alias)) {
+    syncHeld(ok.held);
+    return text(`already bound to "${short(ok.alias)}"`);
+  }
   testPause("bind:after-acquire");
   adopt(ok);
   nameNotice = null;
@@ -824,7 +839,10 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
   }
   // The agent's choice ends a restore still waiting on a grace.
   restoring.delete(ok.alias);
-  if (!ok.released) return text(notHolding(short(ok.alias)));
+  if (!ok.released) {
+    syncHeld(ok.held);
+    return text(notHolding(short(ok.alias)));
+  }
   held = ok.held;
   if (!held.length) boundNotices = [];
   writeNames();

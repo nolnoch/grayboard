@@ -1188,3 +1188,13 @@ test("#366: a board call without as acts as a subscribed address first, one with
   expect(await s.call("board_subscribe", { board: "eng", mode: "digest" })).toMatchObject({ type: "call_ok" });
   expect(modes()).toEqual([{ handle: `${A}/a`, mode: "digest" }]);
 }, 30_000);
+
+test("audit F8: a raw call's as is honoured only by the tools whose schema takes it", async () => {
+  const s = srv.client(alice, "fe");
+  await s.connect();
+  expect(await s.bind("fe2", { create: true })).toMatchObject({ type: "bind_ok" });
+  expect(await s.call("board_create", { name: "eng", purpose: "fixtures" })).toMatchObject({ type: "call_ok" });
+  expect(await s.call("board_read", { board: "eng", as: "fe2" })).toMatchObject({ type: "error", code: "bad_request", message: `board_read takes no "as": it acts as your primary` });
+  expect(await s.call("board_post", { board: "eng", body: "hi", as: "fe2" })).toMatchObject({ type: "call_ok" });
+  expect(rows(`SELECT author FROM posts`)).toEqual([{ author: `${A}/fe2` }]);
+}, 20_000);

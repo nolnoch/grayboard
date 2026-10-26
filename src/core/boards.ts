@@ -583,7 +583,8 @@ export type PostOpts = {
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
 // (never-woken first, then by handle). A lane is a push subscriber who isn't
-// the poster, hasn't opted out (peer_status queue:"off"), and isn't a
+// one of the poster's addresses (its address set: a session's own lane never
+// takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), and isn't a
 // read-only viewer. A session's lane is its primary, the oldest alias it
 // holds, else its ID (#284 S8, S13; an ID can't opt out), whichever address
 // it subscribed under: a session that subscribed unbound stays in the
@@ -593,7 +594,7 @@ export type PostOpts = {
 export function queueLanes(
   db: Database,
   b: Board,
-  poster: string,
+  poster: string[],
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
@@ -606,13 +607,13 @@ export function queueLanes(
            WHERE s.board = ?1 AND s.mode = 'push')
          SELECT l.lane AS handle FROM lanes l LEFT JOIN aliases h ON h.address = l.lane
          LEFT JOIN ids i ON i.id = l.lane
-         WHERE l.lane != ?2
+         WHERE l.lane NOT IN (SELECT value FROM json_each(?2))
            AND (h.address IS NOT NULL AND h.queue_off IS NULL OR i.id IS NOT NULL AND i.ended_at IS NULL)
          GROUP BY l.lane
          ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
                     WHERE o2.handle = l.lane AND p2.board = ?1) ASC NULLS FIRST, l.lane ASC`,
       )
-      .all(b.name, poster) as { handle: string }[]
+      .all(b.name, JSON.stringify(poster)) as { handle: string }[]
   )
     .map((r) => r.handle)
     .filter((h) => !isViewer(h) && a.canSee(h, b));
@@ -653,6 +654,16 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
 // decline's own redelivery from a later claim (#254).
 export const REDELIVERED_NOTE = "queue post (redelivered)";
 
+// A post's author's address set as of now: the author, and its writing
+// session's ID and the aliases that session holds (#284 S5).
+function postAddresses(db: Database, postId: number): string[] {
+  return (db.prepare(
+    `SELECT p.author AS a FROM posts p WHERE p.id = ?1
+     UNION SELECT p.author_id FROM posts p WHERE p.id = ?1 AND p.author_id IS NOT NULL
+     UNION SELECT h.address FROM posts p JOIN alias_holds h ON h.id = p.author_id WHERE p.id = ?1`,
+  ).all(postId) as { a: string }[]).map((r) => r.a);
+}
+
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
 // offer the original post to the next eligible lane. The previous holder is
 // excluded - it held the post for a full TTL, or declined. With no other
@@ -667,7 +678,7 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   const b = getBoard(db, m[1]!);
   const p = getPost(db, Number(m[2]));
   if (!b || !p || p.board !== b.name) return null;
-  const lane = queueLanes(db, b, p.author).find((h) => h !== prevHolder);
+  const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => h !== prevHolder);
   if (!lane) return null;
   claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
   return lane;
@@ -751,7 +762,7 @@ export function post(
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
         // live lanes idle (#192 review).
-        const picked = queueLanes(db, b, handle, { online: opts.online })[0];
+        const picked = queueLanes(db, b, opts.addresses ?? [handle], { online: opts.online })[0];
         if (picked) {
           targets.set(picked, { reason: "subscription", wake: true });
           claimQueuePost(db, board, p, picked, now);

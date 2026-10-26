@@ -191,7 +191,7 @@ test("an unbound live ID subscribed to a queue is a lane by its ID, then by the 
   const ID = "id:0123456789abc";
   registerId(db, { id: ID, principal: null, launcher: false });
   subscribe(db, ID, "work", "push");
-  const lanes = () => queueLanes(db, getBoard(db, "work")!, "be").sort();
+  const lanes = () => queueLanes(db, getBoard(db, "work")!, ["be"]).sort();
   expect(lanes()).toEqual(["fe", ID, "sim"].sort());
   expect(post(db, "be", "work", "for the live one", null, { online: (h) => h === ID }).wake).toEqual([ID]);
   ensureAlias(db, "qa", "test");
@@ -213,7 +213,26 @@ test("an ID-subscribed queue board counts a two-hold session once, by its primar
   for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
   holdAlias(db, "zed", ID, 100);
   holdAlias(db, "alpha", ID, 100);
-  expect(queueLanes(db, getBoard(db, "work")!, "be").sort()).toEqual(["fe", "sim", "zed"]);
+  expect(queueLanes(db, getBoard(db, "work")!, ["be"]).sort()).toEqual(["fe", "sim", "zed"]);
+});
+
+// #284 S5: a session posting as any of its aliases is never its own lane,
+// on the first delivery or a decline's redelivery.
+test("a session posting as its second alias never claims its own queue post", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  subscribe(db, ID, "work", "push");
+  for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
+  holdAlias(db, "zed", ID, 100);
+  holdAlias(db, "alpha", ID, 101);
+  const as = { addresses: ["alpha", "zed", ID], author_id: ID };
+  const posts = [1, 2, 3].map((n) => post(db, "alpha", "work", `item ${n}`, null, as));
+  expect(posts.map((r) => r.wake)).toEqual([["be"], ["fe"], ["sim"]]);
+  // be declines item 1: zed is the least-recently-woken other lane, but it
+  // is the author's session, so fe takes it.
+  release(db, "be", claimKey(posts[0]!.post.id), "not my lane");
+  expect(listClaims(db).filter((c) => c.holder === "zed")).toEqual([]);
+  expect(listClaims(db).find((c) => c.key === claimKey(posts[0]!.post.id))?.holder).toBe("fe");
 });
 
 test("a read-only viewer is never picked by the rotation", () => {

@@ -4,7 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
-import { BOARD_INSTRUCTIONS } from "./tools.ts";
+import { BOARD_INSTRUCTIONS, boardTools } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
@@ -123,8 +123,9 @@ export function actingAs(input: string, addresses: string[], ownScope: string | 
  * (board_post, claim_take), checked against `asAddresses`; for a board read,
  * post or subscription without it, the one of `addresses` (primary first, the
  * ID last) that boardAddress picks, else the primary, whose refusal stands.
- * Every other tool acts as the primary. Callers resolve it before
- * callBoardTool and pass the args without `as`.
+ * Every other tool acts as the primary, and refuses `as` (a raw server
+ * call skips the MCP schema check). Callers resolve it before callBoardTool
+ * and pass the args without `as`.
  */
 export function boardActor(
   db: Database,
@@ -133,7 +134,10 @@ export function boardActor(
   s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
 ): string {
   const primary = s.addresses[0]!;
-  if (args.as !== undefined) return actingAs(String(args.as), s.asAddresses, s.ownScope);
+  if (args.as !== undefined) {
+    if (!AS_TOOLS.has(tool)) throw new CoreError(`${tool} takes no "as": it acts as your primary`);
+    return actingAs(String(args.as), s.asAddresses, s.ownScope);
+  }
   const use = BOARD_USES[tool];
   if (!use || typeof args.board !== "string") return primary;
   let board: string;
@@ -144,6 +148,9 @@ export function boardActor(
   }
   return boardAddress(db, board, s.addresses, use) ?? primary;
 }
+
+// The board tools whose schema takes `as`.
+const AS_TOOLS = new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name));
 
 const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
 
