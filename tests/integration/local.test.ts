@@ -358,6 +358,8 @@ test("grayboard claim take/release acts as the shell's bound session; held exits
   expect(unbound.code).toBe(1);
   expect(unbound.err).toContain("hasn't bound a name yet");
   await call(api, "bind", { name: "api", create: true });
+  // A second hold doesn't change what the shell acts as: the primary (#284 S1).
+  await call(api, "bind", { name: "api-b", create: true });
   // A tools-only process beside it in the checkout (#284 S7) owns no shell:
   // the bound session is still the only candidate.
   await localSession(dir, "api", { cwd: repo, extra: { BUS_PUSH: "off" } });

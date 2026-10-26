@@ -23,6 +23,7 @@ export type AuditAction =
   | "bridge.notified"
   | "bridge.stopped"
   | "alias.created"
+  | "alias.meta_set"
   | "alias.revoked"
   | "alias.deleted"
   | "hello.rate_limit_ended"

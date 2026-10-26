@@ -251,7 +251,7 @@ const RECORD_DIR = sockDir();
 function writeName(name: string | null): void {
   if (!RECORDS) return;
   try {
-    writeRecord(RECORD_DIR, { name, session_id: client.id, harness_pid: process.ppid, bus: serverUrl });
+    writeRecord(RECORD_DIR, { names: name ? [name] : [], session_id: client.id, harness_pid: process.ppid, bus: serverUrl });
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
@@ -361,13 +361,15 @@ hello = await helloWithin(client, STARTUP_LIMITED_BY).catch(fatal);
 const unboundNotes: string[] = [];
 if (RECORDS) sweepRecords(RECORD_DIR);
 const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, serverUrl) : null;
+// The server path holds one name until #284 steps 6/7: it restores the primary.
+const restoreName = rec?.names[0];
 if (hello.bound) {
   // A keyed session restarted within its grace: it still holds its alias.
   bound = hello.bound;
   boundNotices = hello.notices ?? [];
 } else if (!PUSH) {
   bound = SUGGESTED;
-} else if (rec?.name) {
+} else if (rec && restoreName) {
   // A restart under the same harness takes back its predecessor's name,
   // ahead of BUS_IDENTITY: it's the same session, mid-task. The process it
   // replaces may still hold it for a moment, before its end lands.
@@ -375,21 +377,21 @@ if (hello.bound) {
   testPause("restore:before-bind");
   for (;;) {
     try {
-      adopt(await startupBind(rec.name, { create: false, restored_from: rec.session_id }));
+      adopt(await startupBind(restoreName, { create: false, restored_from: rec.session_id }));
       break;
     } catch (e) {
       if (!(e instanceof ServerRefused)) fatal(e as Error);
       const held = e as ServerRefused;
       if (held.code === "alias_held" && held.retryAfterMs !== undefined) {
-        restoreLater(rec.name, rec.session_id, held.retryAfterMs);
-        unboundNotes.push(`This grayboard process restarted; the one before it held "${short(rec.name)}" and is in its reconnect grace, so this session is restoring it: it binds "${short(rec.name)}" by itself within ${Math.ceil(held.retryAfterMs / 1000)}s, and a tool result says when.`);
+        restoreLater(restoreName, rec.session_id, held.retryAfterMs);
+        unboundNotes.push(`This grayboard process restarted; the one before it held "${short(restoreName)}" and is in its reconnect grace, so this session is restoring it: it binds "${short(restoreName)}" by itself within ${Math.ceil(held.retryAfterMs / 1000)}s, and a tool result says when.`);
         break;
       }
       if (held.code === "alias_held" && Date.now() < until) {
         await Bun.sleep(500);
         continue;
       }
-      unboundNotes.push(restoreNote(short(rec.name), reason(held)));
+      unboundNotes.push(restoreNote(short(restoreName), reason(held)));
       break;
     }
   }
@@ -709,6 +711,14 @@ class SendLanded extends Error {
   }
 }
 
+// The server still moves a session from one alias to the next until it
+// holds several (#284 PR 4 steps 6/7): a bind while bound released the old
+// name, which bindOk's several-holds wording doesn't say.
+function rebindOk(name: string, previous: string, instructions: (general: boolean) => string[], notes: string[]) {
+  const text = [`Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`, ...notes, ...instructions(false)].join(" ");
+  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
+}
+
 // bind(name, create?): take an alias, or move to another (#284 S2). The
 // server checks the name (a bare name in your own scope, or scope/name) and
 // switches what this session's connection acts as in one step; claims stay
@@ -736,7 +746,9 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   console.error(`[grayboard] session ${client.id} bound "${ok.alias}"${previous ? ` (was "${previous}")` : ""}`);
   const notes = previous ? leftNote(short(previous), ok.left ?? []) : [];
   // An unbound session already had the general part, acting as its ID.
-  const r = bindOk(name, previous ? short(previous) : null, (general) => serverBoundInstructions(name, general, boundNotices), notes);
+  const r = previous
+    ? rebindOk(name, short(previous), (general) => serverBoundInstructions(name, general, boundNotices), notes)
+    : bindOk(name, [name], (general) => serverBoundInstructions(name, general, boundNotices), notes);
   // A cancelled call's result is dropped (pi and opencode cancel on abort).
   if (signal.aborted) {
     missedBindNotice = bindMissed(name, "it was cancelled", r.content[0]!.text);

@@ -59,8 +59,9 @@ export function asSessionId(s: string): string {
 /**
  * Session `id` holds `address` from `now`, or from just after its newest
  * other hold when that is later (#284 S1): two binds in one millisecond keep
- * the order they were made in, so the primary is the one bound first. Call
- * inside the bind's write transaction.
+ * the order they were made in, so the primary is the one bound first. The
+ * alias's last_bound_at moves (S12). Call inside the bind's write
+ * transaction, for a new hold only: a re-bind of a held alias changes neither.
  */
 export function holdAlias(db: Database, address: string, id: string, now = Date.now()): void {
   db.prepare(
@@ -68,6 +69,15 @@ export function holdAlias(db: Database, address: string, id: string, now = Date.
        VALUES (?1, ?2, MAX(?3, COALESCE((SELECT MAX(bound_at) + 1 FROM alias_holds WHERE id = ?2 AND address != ?1), ?3)))
      ON CONFLICT(address) DO UPDATE SET id = excluded.id, bound_at = excluded.bound_at`,
   ).run(address, id, now);
+  db.prepare(`UPDATE aliases SET last_bound_at = ? WHERE address = ?`).run(now, address);
+}
+
+/** How many aliases one session may hold at once (#284 S1): each is a socket, a registry entry and a drain stream. */
+export const MAX_HOLDS = 8;
+
+/** The refusal for a bind past MAX_HOLDS. */
+export function tooManyHolds(held: string[]): string {
+  return `this session already holds ${held.length} names (${held.join(", ")}); unbind one first`;
 }
 
 /** Session `id` no longer holds `address`; a hold another session took since stays. */
@@ -250,12 +260,25 @@ export const BIND_TOOL = {
   name: "bind",
   _meta: { "anthropic/alwaysLoad": true },
   description:
-    "bind(name, create?): take a bus name for this session once you know its task, or switch to another. Claims stay with the name they were taken under; DMs queued to the old name stay for its next holder. A name that has never existed needs create: true.",
+    "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another; you send as the first you bound, and unbind releases one you're done with. A name that has never existed needs create: true.",
   inputSchema: {
     type: "object",
     properties: {
       name: { type: "string", description: "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe)." },
       create: { type: "boolean", description: "Optional. true to create a name that has never existed (a guard against typos)." },
+      meta: { type: "object", description: 'Optional. One-line labels peers see in peer_list: task, owner, source_board, spec_hash, description; "" clears one.' },
+    },
+    required: ["name"],
+  },
+};
+
+export const UNBIND_TOOL = {
+  name: "unbind",
+  description: "unbind(name): release one of your aliases; its mail and claims stay with it for its next holder.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "A name this session holds." },
     },
     required: ["name"],
   },
@@ -312,9 +335,12 @@ export function heldNote(name: string, holder: string): string {
   return `BUS_IDENTITY asked for "${name}", but ${holder} holds it, so this session started without a name.`;
 }
 
-/** A name record (decision 14) this restart couldn't take back. */
-export function restoreNote(name: string, why: string): string {
-  return `This grayboard process restarted; the one before it held "${name}", but ${why}, so this one started without a name.`;
+/**
+ * A name record (decision 14) this restart couldn't take back. `holdsOthers`:
+ * it took back another name from the record (#284 S10).
+ */
+export function restoreNote(name: string, why: string, holdsOthers = false): string {
+  return `This grayboard process restarted; the one before it held "${name}", but ${why}, so ${holdsOthers ? "this session doesn't hold it" : "this one started without a name"}.`;
 }
 
 /**
@@ -326,14 +352,17 @@ export function launcherNote(launcher: string): string {
 }
 
 /**
- * What a session bound to `name` is told: at start, or in bind's result.
- * `general` is everything not about the name, which a rebind already has;
- * `modeGeneral` adds a mode's own general sentences. `named` goes last:
- * variable length, so a client cut loses it, not the fixed text.
+ * What a session whose primary is `name` is told: at start, or in a bind or
+ * unbind result. `general` is everything not about the name, which a session
+ * that has bound already has; `modeGeneral` adds a mode's own general
+ * sentences. `others` are the session's other holds (#284 S16): one sentence,
+ * only when there are any. `named` goes last: variable length, so a client
+ * cut loses it, not the fixed text.
  */
-export function boundInstructions(name: string, general: boolean, modeGeneral: () => string[], named: string[]): string[] {
+export function boundInstructions(name: string, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
   return [
     `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
+    ...(others.length ? [`You also hold ${quoted(others)}; you send as "${name}".`] : []),
     ...(general
       ? [
           `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
@@ -350,9 +379,14 @@ export function boundInstructions(name: string, general: boolean, modeGeneral: (
 /** bind's refusal in a tools-only process. */
 export const TOOLS_ONLY_BIND = "this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery";
 
-/** bind's note on the claims that stay with the name it left (#284 S6). */
-export function leftNote(previous: string, left: string[]): string[] {
-  return left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
+/** unbind's note on the claims that stay with the name it released (#284 S6, S2). */
+export function leftNote(released: string, left: string[]): string[] {
+  return left.length ? [`Claims stay with the name they were taken under; these are now "${released}"'s next holder's: ${left.join(", ")}.`] : [];
+}
+
+// "a", "b" for a sentence.
+function quoted(names: string[]): string {
+  return names.map((n) => `"${n}"`).join(", ");
 }
 
 /** peer_list's row for a live session with no name. */
@@ -368,18 +402,19 @@ export function unboundPeer(sessionId: string, where: string | null, self: boole
 }
 
 /**
- * bind's result: what changed, then the startup text for the name
- * (instructions are fixed at initialize, so bind's result carries them).
+ * bind's result: what changed, then the startup text for the session's
+ * primary (instructions are fixed at initialize, so bind's result carries
+ * them). `held` is every hold after the bind, oldest first.
  * `instructions(general)` builds it; the text leaves out the general part,
  * which the model already has (an unbound session's instructions carry it).
  * `structuredContent` carries the full set, name and general alike, for
  * adapters that replace their system-prompt section with it (pi, opencode),
- * so they never parse the text.
+ * so they never parse the text; its `name` is the name bound.
  */
-export function bindOk(name: string, previous: string | null, instructions: (general: boolean) => string[], notes: string[] = []) {
+export function bindOk(name: string, held: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
   const text = [
-    previous
-      ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
+    held.length > 1
+      ? `Bound to "${name}"; you hold ${quoted(held)} and send as "${held[0]}".`
       : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
     ...notes,
     ...instructions(false),
@@ -387,9 +422,35 @@ export function bindOk(name: string, previous: string | null, instructions: (gen
   return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }
 
+/**
+ * unbind's result (#284 S2), built like bindOk's: the release, the claims
+ * that stay with the alias, the new primary when it changed, then the
+ * instructions for the session as it is now (its new primary's, or its ID's
+ * with the unbound line). `structuredContent.name` is the primary now.
+ */
+export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string, left: string[], instructions: (general: boolean) => string[]) {
+  const text = [
+    `Released "${alias}"; mail to it queues for its next holder.`,
+    ...leftNote(alias, left),
+    ...(primaryAfter !== primaryBefore ? [`You now send as "${primaryAfter}".`] : []),
+    ...instructions(false),
+  ].join(" ");
+  return { content: [{ type: "text" as const, text }], structuredContent: { name: primaryAfter, instructions: instructions(true) } };
+}
+
+/** unbind's answer for a name this session doesn't hold: already released. */
+export function notHolding(name: string): string {
+  return `not holding "${name}"`;
+}
+
 /** The notice for a bind that completed but whose result the agent never saw. */
 export function bindMissed(name: string, why: string, result: string): string {
   return `bind("${name}") completed after ${why}. ${result}`;
+}
+
+/** The notice for an unbind that completed but whose result the agent never saw. */
+export function unbindMissed(name: string, why: string, result: string): string {
+  return `unbind("${name}") completed after ${why}. ${result}`;
 }
 
 /** The refusal for a name that has never existed, without create: true. */

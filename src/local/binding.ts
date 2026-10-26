@@ -11,10 +11,10 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, viewers } from "../core/boards.ts";
-import { writeCoreAudit } from "../core/audit.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, viewers, type AliasMetaSet } from "../core/boards.ts";
+import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
-import { aliasHeldText, continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { aliasHeldText, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, MAX_CANDIDATES, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
 import { listClaims } from "../core/claims.ts";
 import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -116,7 +116,8 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
 }
 
 /** What kind of session a registration is, beyond its row: see IdFacts. */
-export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean };
+// model, effort: what the session reports running on (BUS_MODEL, BUS_EFFORT; #284 S12).
+export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean; model?: string; effort?: string };
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
@@ -128,9 +129,9 @@ export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: bool
  */
 export function registerSession(db: Database, s: SessionRow, kind: SessionKind = {}): void {
   // A keyed tools-only process has no harness row: its key is passed explicitly.
-  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null } = kind;
+  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null, model, effort } = kind;
   db.transaction(() => {
-    const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed }, s.started_at);
+    const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed, model, effort }, s.started_at);
     // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
     if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });
     db.prepare(
@@ -144,7 +145,7 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
   }).immediate();
 }
 
-export type AttachResult = { ok: true; held: string | null } | { ok: false; error: string };
+export type AttachResult = { ok: true; held: string[] } | { ok: false; error: string };
 
 // How long a restart waits for the child it replaces to exit.
 const ATTACH_WAIT_MS = 5000;
@@ -156,7 +157,7 @@ const ATTACH_WAIT_MS = 5000;
  * predecessor may not have exited yet, so this waits up to `ms` for it,
  * outside the lock, then re-reads the row inside one. Refused, and audited as
  * id.collision, when the session has ended, another live child is attached,
- * or the row isn't this harness's. `held` is the name the session holds.
+ * or the row isn't this harness's. `held` is every name the session holds, oldest first.
  */
 export async function attachSession(db: Database, s: SessionRow, human: boolean, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
   // Only a child of this harness is worth waiting for; any other refuses.
@@ -187,16 +188,18 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     if (b.attached_pid !== null && isAlive(b.attached_pid, b.attached_start)) {
       return refuse(`is served by the live process ${b.attached_pid}`, { attached_pid: b.attached_pid });
     }
-    const hold = db.prepare(`SELECT address FROM alias_holds WHERE id = ?`).get(s.session_id) as { address: string } | null;
+    const held = holdsOf(db, s.session_id);
     // The human's handle carries its authority (#announce): a restart takes
     // it back only as the human's bridge, and the bridge only the human's.
-    if (hold && isHuman(db, hold.address) !== human) {
-      return refuse(human ? `holds "${hold.address}", which isn't the declared human handle` : `holds the human handle "${hold.address}", and this process isn't BUS_HUMAN=1`);
+    for (const hold of held) {
+      if (isHuman(db, hold) !== human) {
+        return refuse(human ? `holds "${hold}", which isn't the declared human handle` : `holds the human handle "${hold}", and this process isn't BUS_HUMAN=1`);
+      }
     }
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
     writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
-    return { ok: true, held: hold?.address ?? null };
+    return { ok: true, held };
   }).immediate();
 }
 
@@ -356,9 +359,10 @@ function holdingSession(db: Database, name: string, sessionId: string | null = n
 }
 
 /**
- * Bind session `sessionId` to `name`, moving it off `previous` (a rebind).
- * Claims stay with the name they were taken under (#284 S6). `create` allows a name that has never existed (startup
+ * Session `sessionId` takes a hold on `name`, beside any it has (#284 S1):
+ * at most MAX_HOLDS. `create` allows a name that has never existed (startup
  * passes it for an explicit BUS_IDENTITY, as startup always created one).
+ * `meta` labels the alias in the same transaction (S12).
  * `restartOf` is the session a restart takes the name back from: verified
  * against the name's history in the transaction that logs the bind (#211),
  * and `restored` says whether it held. Refusals are logged.
@@ -372,7 +376,7 @@ export async function acquireName(
   db: Database,
   sessionId: string,
   name: string,
-  opts: { create: boolean; previous: string | null; allowHuman?: boolean; restartOf?: string },
+  opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet },
 ): Promise<AcquireResult> {
   const before = holdingSession(db, name, sessionId);
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
@@ -389,6 +393,8 @@ export async function acquireName(
     if (!opts.allowHuman && (name === HUMAN_NAME || isHuman(db, name))) {
       return refuse(`"${name}" is your user's handle; an agent session can't bind it`);
     }
+    const held = holdsOf(db, sessionId);
+    if (held.length >= MAX_HOLDS) return refuse(tooManyHolds(held));
     if (!opts.create && !db.prepare(`SELECT 1 FROM aliases WHERE address = ?`).get(name)) {
       const known = closestNames(name, knownNames(db));
       return refuse(unknownNameError(name, known), { known });
@@ -404,17 +410,48 @@ export async function acquireName(
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
 
-    // bindings.name too: a 1.x process sharing the file sees the holder there
-    // (its UNIQUE and its holder check), not in alias_holds.
-    const r = db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ?`).run(name, now, sessionId);
-    if (r.changes !== 1) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
+    // bindings.name mirrors the primary for a 1.x process sharing the file
+    // (its UNIQUE and its holder check), so only the first hold sets it.
+    if (!db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(sessionId)) throw new Error(`grayboard: session ${sessionId} has no bindings row`);
+    db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ? AND name IS NULL`).run(name, now, sessionId);
     ensureAlias(db, name, sessionId, now);
-    if (opts.previous) dropHold(db, opts.previous, sessionId);
     holdAlias(db, name, sessionId, now);
+    if (opts.meta) setAliasMeta(db, name, opts.meta, sessionId, coreAuditSink(db));
     const restart = opts.restartOf === undefined ? null : continuityOf(db, name, { restartOf: opts.restartOf });
-    if (opts.previous) logBinding(db, sessionId, opts.previous, "released", `rebound to ${name}`, now);
-    logBinding(db, sessionId, name, opts.previous ? "moved" : "bound", opts.previous ?? restart?.detail ?? null, now);
+    logBinding(db, sessionId, name, "bound", restart?.detail ?? null, now);
     return { ok: true, name, restored: restart?.verified ?? false, ended };
+  }).immediate();
+}
+
+/**
+ * Session `sessionId` releases its hold on `name` (#284 S2), in one
+ * transaction: the hold goes, the bindings.name mirror moves to the next
+ * oldest hold (or NULL), and the release is logged. False when it didn't
+ * hold `name`. The caller has already stopped the name's wakeup socket.
+ */
+export function releaseName(db: Database, sessionId: string, name: string): boolean {
+  return db.transaction((): boolean => {
+    if (!holdsOf(db, sessionId).includes(name)) return false;
+    const now = Date.now();
+    dropHold(db, name, sessionId);
+    const rest = holdsOf(db, sessionId);
+    db.prepare(`UPDATE bindings SET name = ? WHERE session_id = ? AND name = ?`).run(rest.length ? primaryOf(rest, sessionId) : null, sessionId, name);
+    logBinding(db, sessionId, name, "released", "unbind", now);
+    touchAlias(db, name, now);
+    return true;
+  }).immediate();
+}
+
+/**
+ * A re-bind of a name `sessionId` already holds, with labels (#284 S1, S12):
+ * only the labels change, with no binding event and the hold's times left
+ * alone. False when the session no longer holds it.
+ */
+export function setHeldMeta(db: Database, sessionId: string, name: string, meta: AliasMetaSet): boolean {
+  return db.transaction((): boolean => {
+    if (!holdsOf(db, sessionId).includes(name)) return false;
+    setAliasMeta(db, name, meta, sessionId, coreAuditSink(db));
+    return true;
   }).immediate();
 }
 

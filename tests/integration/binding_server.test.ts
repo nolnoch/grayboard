@@ -115,7 +115,7 @@ test("15: an unbound exit removes its name record, a bound exit keeps it", async
   const b = await session("api");
   await stop(b.c);
   // Server mode records the full address the bind returned.
-  expect(JSON.parse(readFileSync(join(records, `bind.${b.harnessPid}`), "utf8")).name).toBe(`${A}/api`);
+  expect(JSON.parse(readFileSync(join(records, `bind.${b.harnessPid}`), "utf8")).names).toEqual([`${A}/api`]);
 }, 30_000);
 
 test("2, 13: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {

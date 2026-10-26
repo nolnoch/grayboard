@@ -236,49 +236,149 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   expect(holderOf("fe")).toBeUndefined();
 }, 30_000);
 
-test("8: a bind whose setup fails after the acquire leaves the session on the new name, and says so", async () => {
+test("8: a bind whose setup fails after the acquire leaves the session holding the new name, and says so", async () => {
   const s = await session("fe");
-  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
   // The wakeup socket can't be renamed onto a non-empty directory.
   mkdirSync(join(dir, "sock.fe2", "x"), { recursive: true });
   const err = await refusal(s, "bind", { name: "fe2", create: true });
-  expect(err).toContain('bound "fe2" (was "fe"), but setting it up failed');
-  expect(rows(`SELECT address FROM alias_holds WHERE address LIKE 'fe%'`)).toEqual([{ address: "fe2" }]);
+  expect(err).toContain('bound "fe2", but setting it up failed');
+  expect(rows(`SELECT address FROM alias_holds WHERE address LIKE 'fe%' ORDER BY bound_at`)).toEqual([{ address: "fe" }, { address: "fe2" }]);
   expect(await s.call("bind", { name: "fe2" })).toContain('already bound to "fe2"');
-  // fe is free: no listener left on it, and another session takes it.
-  expect(existsSync(join(dir, "sock.fe"))).toBe(false);
-  const other = await session();
-  expect(await other.call("bind", { name: "fe" })).toContain('Bound to "fe"');
+  // fe's socket is untouched: the failure was fe2's alone.
+  expect(existsSync(join(dir, "sock.fe"))).toBe(true);
   expect(readdirSync(dir).filter((f) => f.startsWith(".w"))).toEqual([]);
 }, 30_000);
 
-test("8, 13: a rebind leaves claims on the old name, frees it, and delivers the new name's mail", async () => {
+// The session's own rows in peer_list, as [handle, online].
+const ownRows = async (s: Session) =>
+  ((await s.call("peer_list", {})).peers as { handle: string; online: boolean; self?: true }[]).filter((p) => p.self).map((p) => [p.handle, p.online]).sort();
+
+test("#284 S1, S2: bind adds a hold; unbind releases one, its claims and mail staying with it", async () => {
   const s = await session("fe");
   const be = await session("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
-  await be.call("dm_send", { to: "fe", body: "warmup" });
-  await until(() => contents(s).length === 1);
   // fe2 exists (it was used once), with a DM queued before the bind.
   await stop((await session("fe2")).c);
   await be.call("dm_send", { to: "fe2", body: "queued for fe2" });
 
   const result = await s.call("bind", { name: "fe2" });
-  expect(result).toContain(`Bound to "fe2" (was "fe")`);
-  // #284 S6: claims stay with the address they were taken under.
-  expect(result).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
+  expect(result).toStartWith(`Bound to "fe2"; you hold "fe", "fe2" and send as "fe".`);
+  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe".`);
+  // Both names' mail reaches it: fe2's queued DM and a new one to fe.
   await until(() => contents(s).includes("queued for fe2"));
+  await be.call("dm_send", { to: "fe", body: "to fe" });
+  await until(() => contents(s).includes("to fe"));
+  const id = holderOf("fe")!;
+  expect(rows(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, id)).toEqual([{ address: "fe" }, { address: "fe2" }]);
+  expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
+  expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "bound"]);
+  expect(rows(`SELECT COUNT(*) AS n FROM binding_events WHERE event = 'moved'`)).toEqual([{ n: 0 }]);
+  // The 1.x mirror holds the primary only.
+  expect(rows(`SELECT name FROM bindings WHERE session_id = ?`, id)).toEqual([{ name: "fe" }]);
+  const peers = await s.call("peer_list", {});
+  expect(peers.you).toBe("fe");
+  expect(await ownRows(s)).toEqual([["fe", true], ["fe2", true]]);
+
+  // Unbinding the primary promotes the next oldest hold.
+  const u = await s.call("unbind", { name: "fe" });
+  expect(u).toStartWith(`Released "fe"; mail to it queues for its next holder.`);
+  // #284 S6: claims stay with the address they were taken under.
+  expect(u).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
+  expect(u).toContain(`You now send as "fe2".`);
+  expect(events("fe").at(-1)).toMatchObject({ session_id: id, event: "released", detail: "unbind" });
+  expect(rows(`SELECT address FROM alias_holds WHERE id = ?`, id)).toEqual([{ address: "fe2" }]);
+  expect(rows(`SELECT name FROM bindings WHERE session_id = ?`, id)).toEqual([{ name: "fe2" }]);
+  expect(existsSync(join(dir, "sock.fe"))).toBe(false);
+  expect((await s.call("peer_list", {})).you).toBe("fe2");
   expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual(["fe"]);
-  expect(rows(`SELECT COUNT(*) AS n FROM claim_events WHERE event = 'moved'`)).toEqual([{ n: 0 }]);
   expect(await refusal(s, "claim_release", { key: "ticket:ENG-142" })).toContain('"ticket:ENG-142" is held by fe, not you');
+  expect(await be.call("dm_send", { to: "fe", body: "after unbind" })).toMatchObject({ delivered_now: false });
+  // Idempotent: a name it doesn't hold is already released.
+  expect(await s.call("unbind", { name: "fe" })).toBe(`not holding "fe"`);
+  expect(events("fe").filter((e) => e.event === "released")).toHaveLength(1);
 
-  expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "moved"]);
-  expect(events("fe2").at(-1)!.detail).toBe("fe");
-  expect(events("fe").at(-1)).toMatchObject({ event: "released", detail: "rebound to fe2" });
-
+  // fe's next holder gets its mail and its claim.
   const other = await session();
   await other.call("bind", { name: "fe" });
-  expect((await other.call("peer_list", {})).you).toBe("fe");
+  await until(() => contents(other).includes("after unbind"));
+  expect(contents(s)).not.toContain("after unbind");
   expect(await other.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
+
+  // Unbinding the last hold leaves the session acting as its ID.
+  const last = await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
+  expect((last.content as { text: string }[])[0]!.text).toContain(`You now send as "${id}".`);
+  expect((last.structuredContent as { name: string; instructions: string[] })).toEqual({ name: id, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
+  expect((await s.call("peer_list", {})).you).toBe(id);
+  expect(rows(`SELECT name FROM bindings WHERE session_id = ?`, id)).toEqual([{ name: null }]);
+  expect(JSON.parse(readFileSync(join(dir, `bind.${s.harnessPid}`), "utf8")).names).toEqual([]);
+}, 40_000);
+
+test("#284 S1: the primary is the oldest hold; a ninth hold is refused", async () => {
+  const s = await session();
+  for (const n of ["zed", "alpha", "c", "d", "e", "f", "g", "h"]) await s.call("bind", { name: n, create: true });
+  expect((await s.call("peer_list", {})).you).toBe("zed");
+  const err = await refusal(s, "bind", { name: "i", create: true });
+  expect(err).toBe(`error: this session already holds 8 names (zed, alpha, c, d, e, f, g, h); unbind one first`);
+  expect(rows(`SELECT 1 FROM alias_holds WHERE address = 'i'`)).toEqual([]);
+}, 40_000);
+
+test("#284 S2: unbind is refused for a scoped name, a tools-only process and the human", async () => {
+  const s = await session("fe");
+  expect(await refusal(s, "unbind", { name: "eng/x" })).toContain(`local mode has one scope; unbind a bare name, not "eng/x"`);
+  const tools = await session("fe", { extra: { BUS_PUSH: "off" } });
+  expect(await refusal(tools, "unbind", { name: "fe" })).toContain("this grayboard process is tools-only (BUS_PUSH=off)");
+  expect((await runCli(["human", "alex"], { cwd: dir, env: localEnv(dir) })).code).toBe(0);
+  const h = await session("alex", { extra: { BUS_HUMAN: "1" } });
+  expect(await refusal(h, "unbind", { name: "alex" })).toBe(`error: this is the human's session ("alex", BUS_HUMAN=1); it unbinds nothing`);
+  expect(holderOf("fe")).toBeDefined();
+  expect(holderOf("alex")).toBeDefined();
+}, 30_000);
+
+// The alias's labels and its meta audit rows.
+const labels = (name: string) => rows<Record<string, string | null>>(`SELECT task, owner, source_board, spec_hash, description, last_bound_at FROM aliases WHERE address = ?`, name)[0]!;
+const metaAudits = (name: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY rowid`, name).map((r) => JSON.parse(r.detail));
+
+test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes only its labels", async () => {
+  const s = await session();
+  const id = await sessionId(s);
+  await s.call("bind", { name: "fe", create: true, meta: { task: "  idle\tanim ", source_board: "#E2E" } });
+  const first = labels("fe");
+  expect(first).toMatchObject({ task: "idle anim", source_board: "e2e", owner: null });
+  expect(first.last_bound_at).toBeNumber();
+  expect(metaAudits("fe")).toEqual([{ address: "fe", fields: { task: "idle anim", source_board: "e2e" }, session: id }]);
+  const boundAt = rows<{ bound_at: number }>(`SELECT bound_at FROM alias_holds WHERE address = 'fe'`)[0]!.bound_at;
+
+  // Held already: no bind event, the hold's times stand, and only a change is audited.
+  expect(await s.call("bind", { name: "fe", meta: { task: "idle anim" } })).toBe(`already bound to "fe"`);
+  expect(metaAudits("fe")).toHaveLength(1);
+  expect(await s.call("bind", { name: "fe", meta: { task: "", owner: "be" } })).toBe(`already bound to "fe"`);
+  expect(labels("fe")).toMatchObject({ task: null, owner: "be", source_board: "e2e", last_bound_at: first.last_bound_at });
+  expect(metaAudits("fe").at(-1)).toEqual({ address: "fe", fields: { task: null, owner: "be" }, session: id });
+  expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
+  expect(rows<{ bound_at: number }>(`SELECT bound_at FROM alias_holds WHERE address = 'fe'`)[0]!.bound_at).toBe(boundAt);
+
+  // Refusals change nothing.
+  expect(await refusal(s, "bind", { name: "fe", meta: { task: "x".repeat(201) } })).toContain("meta.task must be at most 200 chars");
+  expect(await refusal(s, "bind", { name: "fe", meta: { source_board: "not a board" } })).toContain(`invalid board name "not a board"`);
+  expect(await refusal(s, "bind", { name: "fe", meta: { colour: "red" } })).toContain(`unknown meta key "colour"; known: task, owner, source_board, spec_hash, description`);
+  expect(await refusal(s, "bind", { name: "fe", meta: { task: 7 } })).toContain("meta.task must be a string");
+  expect(await refusal(s, "bind", { name: "fe2", create: true, meta: { task: "x".repeat(201) } })).toContain("meta.task must be at most 200 chars");
+  expect(holderOf("fe2")).toBeUndefined();
+  expect(labels("fe")).toMatchObject({ task: null, owner: "be" });
+}, 30_000);
+
+test("#284 AC 8: the session's model shows on the alias it holds; the alias's task stays with the alias", async () => {
+  const s = await session(undefined, { extra: { BUS_MODEL: "m", BUS_EFFORT: "high" } });
+  const id = await sessionId(s);
+  await s.call("bind", { name: "a", create: true, meta: { task: "t" } });
+  await s.call("unbind", { name: "a" });
+  await s.call("bind", { name: "b", create: true });
+  // A is released, so offline: listed only with include_offline.
+  const peers = (await s.call("peer_list", { include_offline: true })).peers as Record<string, unknown>[];
+  expect(peers.find((p) => p.handle === "b")).toMatchObject({ id, model: "m", effort: "high" });
+  const a = peers.find((p) => p.handle === "a")!;
+  expect(a).toMatchObject({ task: "t" });
+  expect(a.model).toBeUndefined();
 }, 30_000);
 
 test("#361: a post pending for the ID and the alias is pushed once and delivered for both", async () => {
@@ -301,34 +401,26 @@ test("#361: a post pending for the ID and the alias is pushed once and delivered
   expect(contents(s).filter((c) => c === "once")).toHaveLength(1);
 }, 30_000);
 
-test("9: a DM sent mid-swap is never consumed under the new name", async () => {
-  const s = await session("fe", { extra: pauseEnv("bind:after-acquire") });
+test("9: a DM sent mid-unbind is queued for the name's next holder, never consumed here", async () => {
+  const s = await session("fe", { extra: pauseEnv("unbind:before-txn") });
+  await s.call("bind", { name: "fe2", create: true });
   const be = await session("be");
-  const binding = s.c.callTool({ name: "bind", arguments: { name: "fe2", create: true } });
-  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
-  // fe's socket still answers, but fe is released: the sender is told it's queued (audit 29).
-  expect(await be.call("dm_send", { to: "fe", body: "mid-swap" })).toMatchObject({ delivered_now: false });
-  // A bind of fe in the window is refused as a rebind in progress, not an older grayboard.
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  // fe2's socket closed before its hold drops: the sender is told it's queued.
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(false);
+  expect(await be.call("dm_send", { to: "fe2", body: "mid-unbind" })).toMatchObject({ delivered_now: false });
+  // The hold stands until the release commits: nobody takes the name meanwhile.
   const third = await session();
-  const refused = await third.c.callTool({ name: "bind", arguments: { name: "fe" } });
-  expect((refused.content as { text: string }[])[0]!.text).toContain(`"fe" is in use by a session that has just rebound off it`);
-  await stop(third.c);
-  release("bind:after-acquire");
-  expect((await binding).isError).toBeFalsy();
-  // Barrier: fe2's first drain runs after every drain under fe, so mid-swap,
-  // if it was ever going to reach this session, is in before the probe.
-  await be.call("dm_send", { to: "fe2", body: "probe" });
+  expect(await refusal(third, "bind", { name: "fe2" })).toContain(`"fe2" is in use by the live session`);
+  release("unbind:before-txn");
+  expect((await unbinding).isError).toBeFalsy();
+  // Barrier: a DM to fe drains after anything under fe2.
+  await be.call("dm_send", { to: "fe", body: "probe" });
   await until(() => contents(s).includes("probe"));
-  // Delivered as fe before the swap, or left for fe; never read as fe2.
-  const asFe = contents(s).includes("mid-swap");
-  const [{ id }] = rows<{ id: number }>(`SELECT id FROM messages WHERE body = 'mid-swap'`);
-  const feCursor = rows<{ last_seen_id: number }>(`SELECT last_seen_id FROM cursors WHERE reader = 'fe'`)[0]?.last_seen_id ?? 0;
-  expect(feCursor >= id).toBe(asFe);
-  if (!asFe) {
-    const next = await session();
-    await next.call("bind", { name: "fe" });
-    await until(() => contents(next).includes("mid-swap"));
-  }
+  expect(contents(s)).not.toContain("mid-unbind");
+  await third.call("bind", { name: "fe2" });
+  await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
@@ -342,9 +434,9 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   release("bind:after-acquire");
   const r = await s.c.callTool({ name: "peer_list", arguments: {} });
   const texts = (r.content as { text: string }[]).map((c) => c.text);
-  expect(JSON.parse(texts[0]!).you).toBe("fe");
-  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe" (was "old")`);
-  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
+  expect(JSON.parse(texts[0]!).you).toBe("old");
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe"; you hold "old", "fe" and send as "old".`);
+  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old".`]);
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 30_000);
 
@@ -409,7 +501,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
   await stop(next.c);
   expect(events("fe").at(-1)!.event).toBe("released");
   expect(existsSync(join(dir, "sock.fe"))).toBe(false);
-  expect(JSON.parse(readFileSync(join(dir, `bind.${next.harnessPid}`), "utf8")).name).toBe("fe");
+  expect(JSON.parse(readFileSync(join(dir, `bind.${next.harnessPid}`), "utf8")).names).toEqual(["fe"]);
 }, 30_000);
 
 test("#211: a name record whose session the name's history doesn't show restores the name unverified, with a fresh status", async () => {
@@ -490,6 +582,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
   let s = await session("be");
   await s.call("bind", { name: "api", create: true });
+  await s.call("unbind", { name: "be" });
   await s.call("peer_status", { text: "mid-task" });
   const peer = await session("fe");
   for (const how of ["reconnect", "crash"] as const) {
@@ -509,6 +602,7 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   }
   // "be" was never taken back: the restart restored "api", not BUS_IDENTITY.
   expect(events("be").map((e) => e.event)).toEqual(["bound", "released"]);
+  expect(events("be")[1]!.detail).toBe("unbind");
 
   // A new harness process is a new session: unbound, with "api" free to bind.
   await stop(s.c);
@@ -527,6 +621,50 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(l.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(l.c.getInstructions()).toContain(launcherNote);
 }, 60_000);
+
+test("#284 S10: a restart takes back every name in its record, in order; one held by another is named in a note", async () => {
+  let s = await session();
+  await s.call("bind", { name: "zed", create: true });
+  await s.call("bind", { name: "alpha", create: true });
+  const before = holderOf("zed")!;
+  const path = join(dir, `bind.${s.harnessPid}`);
+  expect(JSON.parse(readFileSync(path, "utf8")).names).toEqual(["zed", "alpha"]);
+  const peer = await session("be");
+  s = await s.restart("crash");
+  const now = holderOf("zed")!;
+  expect(now).not.toBe(before);
+  expect(rows(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, now)).toEqual([{ address: "zed" }, { address: "alpha" }]);
+  expect(s.c.getInstructions()).toStartWith(`You are identity "zed" on the grayboard bus, which coordinates between agents. You also hold "alpha"; you send as "zed".`);
+  for (const n of ["zed", "alpha"]) expect(events(n).at(-1)).toEqual({ session_id: now, event: "bound", detail: `restored: restart of session ${before}` });
+  await peer.call("dm_send", { to: "alpha", body: "to alpha" });
+  await until(() => contents(s).includes("to alpha"));
+
+  // alpha taken by another session while this one is down: zed comes back alone.
+  const rec = JSON.parse(readFileSync(path, "utf8"));
+  await s.call("unbind", { name: "alpha" });
+  const t = await session();
+  const tid = await sessionId(t);
+  await t.call("bind", { name: "alpha" });
+  writeFileSync(path, JSON.stringify(rec));
+  s = await s.restart("crash");
+  expect((await s.call("peer_list", {})).you).toBe("zed");
+  expect(holderOf("alpha")).toBe(tid);
+  expect(s.c.getInstructions()).toContain(`This grayboard process restarted; the one before it held "alpha", but "alpha" is in use by the live session`);
+  expect(s.c.getInstructions()).toContain("so this session doesn't hold it.");
+}, 40_000);
+
+test("#284 S10: a name record from before several aliases (one `name`) still restores", async () => {
+  let s = await session();
+  await s.call("bind", { name: "api", create: true });
+  const path = join(dir, `bind.${s.harnessPid}`);
+  const { names, ...rec } = JSON.parse(readFileSync(path, "utf8"));
+  expect(names).toEqual(["api"]);
+  writeFileSync(path, JSON.stringify({ ...rec, name: "api" }));
+  const before = holderOf("api")!;
+  s = await s.restart("crash");
+  expect((await s.call("peer_list", {})).you).toBe("api");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored: restart of session ${before}` });
+}, 30_000);
 
 test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
   const s = await session();

@@ -5,7 +5,7 @@ import { bindAttachments, dropAttachments, withAttachments } from "./attachments
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
-import { writeCoreAudit } from "./audit.ts";
+import { writeCoreAudit, type AuditSink } from "./audit.ts";
 import { SESSION_ID_PATTERN } from "./session_id.ts";
 import { undeliverableId } from "./session_end.ts";
 
@@ -285,11 +285,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
+/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+export function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+}
+
 // One line saying what the session holding `handle` is doing; empty clears
 // it. Status is the session's (#284), so it goes to the alias's holder: a
 // tools-only process sets its owner's.
 export function setStatus(db: Database, handle: string, text: string, now = Date.now()): void {
-  const t = text.replace(/\s+/g, " ").trim();
+  const t = oneLine(text);
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
   touchAlias(db, handle, now);
   // An ID-only session (#284 S13) sets its own row; a name, its holder's.
@@ -806,6 +811,48 @@ function threadRoot(db: Database, postId: number): number {
 // An alias's owner-set labels (#284 S12): one line each, set by its binder.
 export const ALIAS_META_KEYS = ["task", "owner", "source_board", "spec_hash", "description"] as const;
 export type AliasMeta = { [K in (typeof ALIAS_META_KEYS)[number]]?: string };
+// bind's `meta` once checked: a key present with null clears that label.
+export type AliasMetaSet = { [K in (typeof ALIAS_META_KEYS)[number]]?: string | null };
+
+const MAX_LABEL = 200;
+
+/**
+ * bind's `meta` argument, checked (#284 S12): an object of known keys, each a
+ * one-line string of at most 200 characters ("" clears it); `source_board`
+ * must be a board name (it may name a board since deleted).
+ */
+export function parseAliasMeta(v: unknown): AliasMetaSet {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new CoreError("meta must be an object of labels");
+  const out: AliasMetaSet = {};
+  for (const [k, raw] of Object.entries(v)) {
+    if (!(ALIAS_META_KEYS as readonly string[]).includes(k)) throw new CoreError(`unknown meta key "${k}"; known: ${ALIAS_META_KEYS.join(", ")}`);
+    if (typeof raw !== "string") throw new CoreError(`meta.${k} must be a string`);
+    const t = oneLine(raw);
+    if (t.length > MAX_LABEL) throw new CoreError(`meta.${k} must be at most ${MAX_LABEL} chars`);
+    out[k as keyof AliasMetaSet] = t === "" ? null : k === "source_board" ? normalizeBoard(t) : t;
+  }
+  return out;
+}
+
+/**
+ * Set an alias's labels from a parsed `meta`, as `session` binding it.
+ * Only the fields whose value changes are written, and audited as one
+ * alias.meta_set; those fields are returned (empty: nothing changed). Call
+ * inside the bind's write transaction.
+ */
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink): AliasMetaSet {
+  const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
+  if (!keys.length) return {};
+  const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
+  if (!cur) throw new Error(`grayboard: no alias "${address}" to label`);
+  const fields: AliasMetaSet = {};
+  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) fields[k] = meta[k] ?? null;
+  const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
+  if (!changed.length) return {};
+  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
+  audit("alias.meta_set", session, address, { address, fields, session });
+  return fields;
+}
 
 // A session's self-reported facts (#284 S12), shown on its rows.
 type SessionFacts = { harness?: string; model?: string; effort?: string };

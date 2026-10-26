@@ -78,6 +78,22 @@ test("a SIGKILLed child restarted under its live harness re-attaches: same ID, n
   expect(peer.pushes.filter((p) => p.meta.kind === "bounce")).toEqual([]);
 }, 30_000);
 
+test("#284 S7: a keyed restart keeps every hold, oldest first, and both names' mail arrives", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  let s = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key } });
+  const peer = await localSession(dir, "fe");
+  await s.call("bind", { name: "api", create: true });
+  await s.call("bind", { name: "web", create: true });
+  s = await s.restart("crash");
+  expect(s.c.getInstructions()).toStartWith(`You are identity "api" on the grayboard bus, which coordinates between agents. You also hold "web"; you send as "api".`);
+  expect(rows<{ address: string }>(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, id)).toEqual([{ address: "api" }, { address: "web" }]);
+  for (const to of ["api", "web"]) {
+    await peer.call("dm_send", { to, body: `to ${to}` });
+    await until(() => s.pushes.some((p) => p.content === `to ${to}`));
+  }
+}, 30_000);
+
 test("a clean exit under a live harness detaches; the harness's exit ends the session at the next open, and the key is refused", async () => {
   const key = mintSessionKey();
   const id = idAddress(key);

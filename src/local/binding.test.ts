@@ -40,7 +40,7 @@ test("a session with two holds is one live row; neither name is offered or free"
   const other = "id:0123456789abg";
   registerSession(db, { ...thisSession(other), pid: 999999, proc_start: null });
   for (const name of ["zed", "alpha"]) {
-    expect(await acquireName(db, other, name, { create: true, previous: null })).toMatchObject({ ok: false, error: expect.stringContaining(me) });
+    expect(await acquireName(db, other, name, { create: true })).toMatchObject({ ok: false, error: expect.stringContaining(me) });
   }
 });
 
@@ -65,11 +65,11 @@ test("a live 1.x holder blocks a HEAD acquire; a HEAD hold mirrors into bindings
     .run(name, process.pid, procStart(process.pid) ?? null);
   const me = "id:0123456789abd";
   registerSession(db, { ...thisSession(me), pid: 999999, proc_start: null });
-  const r = await acquireName(db, me, name, { create: true, previous: null });
+  const r = await acquireName(db, me, name, { create: true });
   expect(r).toMatchObject({ ok: false, error: expect.stringContaining("0123456789abcdef") });
   // The 1.x process exits uncleanly: its row is dead, reaped, its release logged.
   db.prepare(`UPDATE bindings SET pid = 999998, proc_start = NULL WHERE session_id = '0123456789abcdef'`).run();
-  expect(await acquireName(db, me, name, { create: true, previous: null })).toMatchObject({ ok: true });
+  expect(await acquireName(db, me, name, { create: true })).toMatchObject({ ok: true });
   expect(db.prepare(`SELECT session_id, event FROM binding_events WHERE name = ? AND event != 'refused' ORDER BY id`).all(name)).toEqual([
     { session_id: "0123456789abcdef", event: "released" },
     { session_id: me, event: "bound" },
@@ -121,7 +121,7 @@ test("a keyed attach is refused when the held handle and BUS_HUMAN disagree", as
   db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
 
   expect(await attachSession(db, self, false)).toMatchObject({ ok: false, error: expect.stringContaining(`holds the human handle "boss", and this process isn't BUS_HUMAN=1`) });
-  expect(await attachSession(db, self, true)).toEqual({ ok: true, held: "boss" });
+  expect(await attachSession(db, self, true)).toEqual({ ok: true, held: ["boss"] });
   db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
   holdAlias(db, "fe", id);
   db.prepare(`DELETE FROM alias_holds WHERE address = 'boss'`).run();
