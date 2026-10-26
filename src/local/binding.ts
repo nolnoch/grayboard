@@ -52,16 +52,20 @@ export type HarnessRule = "env" | "ancestor";
 /** A keyed session's harness: the process whose exit ends it. */
 export type Harness = { pid: number; proc_start: string | null; rule: HarnessRule };
 
-// One row per session, however many aliases it holds (#284 S7).
+// One row per session, however many aliases it holds (#284 S7). The holds
+// are sorted in JS, holdsOf's order: an aggregate ORDER BY needs SQLite 3.44,
+// newer than some macOS system libraries Bun links against.
 const SESSION_SQL = `SELECT b.session_id, b.name AS legacy_name,
-    (SELECT json_group_array(address ORDER BY bound_at, address) FROM alias_holds WHERE id = b.session_id) AS names_json,
+    (SELECT json_group_array(json_array(bound_at, address)) FROM alias_holds WHERE id = b.session_id) AS names_json,
     b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at, b.harness_rule, b.attached_pid, b.attached_start
   FROM bindings b LEFT JOIN ids i ON i.id = b.session_id`;
 
 type RawSessionRow = Omit<SessionRow, "name" | "names"> & { legacy_name: string | null; names_json: string };
 
 function sessionRow({ legacy_name, names_json, ...r }: RawSessionRow): SessionRow {
-  const held = JSON.parse(names_json) as string[];
+  const held = (JSON.parse(names_json) as [number, string][])
+    .sort(([at, a], [bt, b]) => at - bt || (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, address]) => address);
   const names = held.length ? held : legacy_name ? [legacy_name] : [];
   return { ...r, name: names[0] ?? null, names };
 }
