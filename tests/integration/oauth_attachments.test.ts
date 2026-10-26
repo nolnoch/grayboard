@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { reprDigest, sha256Hex } from "../../src/shared/attachments.ts";
+import { reprDigest } from "../../src/shared/attachments.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 
@@ -17,7 +20,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 const bytes = new TextEncoder().encode("private report\n");
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-http-oauth-attachments-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", background: false });
+  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
@@ -48,7 +51,7 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
   const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
-  app.repo.identities.create(outsider.authed.user_id, "be");
+  app.repo.aliases.create(outsider.authed.user_email, "be");
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
@@ -111,8 +114,8 @@ test("private board visibility is checked again after reading the blob", async (
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
   const alice = issue();
-  app.repo.identities.create(alice.authed.user_id, "be");
-  const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) });
+  app.repo.aliases.create(alice.authed.user_email, "be");
+  const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
   const oldUpload = await fetch(`${base}/api/attachments?identity=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
   expect(oldUpload.status).toBe(201);
