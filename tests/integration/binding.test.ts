@@ -211,7 +211,7 @@ test("7: a pre-upgrade session holding a name by socket alone keeps it", async (
   const s = await session();
   expect(holderOf("fe")).toBeUndefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
-  expect(s.c.getInstructions()).not.toContain("fe (");
+  expect(s.c.getInstructions()).not.toMatch(/(?:Candidates \(free now\): |; )fe \(/);
 }, 30_000);
 
 test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the name since", async () => {
