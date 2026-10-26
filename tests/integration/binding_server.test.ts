@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { serverEnv } from "../support/env.ts";
+import { PROTO_REFUSAL } from "../../src/shared/protocol.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { idAddress } from "../../src/core/bindings.ts";
@@ -500,6 +501,15 @@ test("18: against a 1.x server, a 2.x session fails at start with the server's r
     await old.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+}, 60_000);
+
+test("S15: a 1.x CLI against this server fails at start with the update hint", async () => {
+  for (const identity of [null, "fe"]) {
+    const start = mcpSession({ env: serverEnv(srv.dir, srv.base, alice, identity), cwd: srv.dir, args: ["mcp", "--mode", "server"], bin: rel.cli });
+    await expect(start).rejects.toThrow(PROTO_REFUSAL);
+  }
+  // Refused by the parser, before the limiter and the DB.
+  expect(rows(`SELECT id FROM ids`)).toEqual([]);
 }, 60_000);
 
 test("11: a restart under the same harness takes its name back, or restores it once a crashed predecessor's grace ends; a fresh harness starts unbound", async () => {

@@ -79,6 +79,21 @@ test("the Slack bridge's human connection is exempt", async () => {
   await until(() => count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ? AND event = 'bound'`, `${A}/human`) === 1);
 });
 
+test("a bind spends the user's hello bucket: binds and hellos drain one bucket", async () => {
+  const srv = serve({ helloLimit: { burst: 3, perSec: 0.01 } });
+  const alice = await srv.login(A);
+  const a = srv.client(alice, null);
+  expect((await a.connect()).type).toBe("hello_ok");
+  expect((await a.bind("be")).type).toBe("bind_ok");
+  expect((await a.bind("fe")).type).toBe("bind_ok");
+  // Three tokens spent, one by the hello and two by binds: the next of either is refused.
+  const bind = await a.bind("ops");
+  expect(bind).toMatchObject({ type: "error", code: "rate_limited", message: expect.stringMatching(/too many binds for this user; retry in \d+s/) });
+  expect(bind.retry_after_ms).toBeGreaterThan(0);
+  expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/ops`)).toBe(0);
+  expect((await srv.client(alice, null).connect()).code).toBe("rate_limited");
+});
+
 test("a session started while its user is rate-limited waits and binds", async () => {
   const srv = serve({ helloLimit: { burst: 1, perSec: 1 } });
   const alice = await srv.login(A);

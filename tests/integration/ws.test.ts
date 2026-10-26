@@ -951,6 +951,7 @@ test("the server reports its version: /healthz and --version", async () => {
 // it replies in a thread it received as the ID, and downloads a file DM'd to
 // the ID with ?as= its alias. Another user's session's ID never joins the
 // set: bob acting as his own alias can't read alice's ID's file.
+// Once the session ends, ?as= its ID is refused.
 test("after a bind, a session replies to a thread and reads a file it received as its ID", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -969,6 +970,10 @@ test("after a bind, a session replies to a thread and reads a file it received a
   const other = client(bob, "ops");
   await other.connect();
   expect((await download(bob, "bob@example.com/ops", up.body.id)).status).toBe(404);
+  // Nothing acts as an ended session, even its own user (S11).
+  expect(await a.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  const gone = await download(alice, a.id, up.body.id);
+  expect({ status: gone.status, body: await gone.json() }).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
 });
 
 // Audit A7 (#345): a frame still in flight on a connection that left the hub

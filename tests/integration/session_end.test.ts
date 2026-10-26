@@ -70,7 +70,7 @@ test("an end frame ends the session at once: holds and claims released, unread m
   expect(ended(a.id)).toEqual([{ principal: A, held: [`${A}/be`], why: "exit", bounced: 1 }]);
 
   const bounce = await b.next(push);
-  expect(bounce.message).toMatchObject({ sender: a.id, parent_id: sent.message_id });
+  expect(bounce.message).toMatchObject({ sender: a.id, parent_id: sent.message_id, kind: "bounce" });
   expect(bounce.message.body).toBe(`${a.id} ended at ${new Date(clock).toISOString()} before reading this; it held \`${A}/be\`.`);
 
   // The ended connection answers nothing more, and its key can't come back.
@@ -93,10 +93,19 @@ test("a closed session keeps its holds through the grace: a reconnect re-attache
   const detached = srv.app.db.prepare(`SELECT actor, detail FROM access_log WHERE action = 'id.detached' AND target = ?`).all(a.id) as { actor: string; detail: string }[];
   expect(detached.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: A, held: `${A}/be`, grace_until: clock + GRACE_MS }]);
 
-  // The same key re-attaches, holding the alias already.
+  // Mail sent in the gap, to the alias and to the ID, waits for the session.
+  const b = srv.client(await srv.login("bob@example.com"), "ops");
+  await b.connect();
+  for (const recipient of [`${A}/be`, a.id]) {
+    expect(await b.request({ type: "send", recipient, body: `gap: ${recipient}` })).toMatchObject({ type: "send_ok", delivered_now: false });
+  }
+
+  // The same key re-attaches, holding the alias already, and drains the gap's mail.
   const back = srv.client(alice, "be", { key: a.key });
   expect(await back.connect()).toMatchObject({ type: "hello_ok", id: a.id, bound: `${A}/be` });
   expect(back.inbox.filter((m) => m.type === "bind_ok")).toEqual([]);
+  const drained = [(await back.next(push)).message, (await back.next(push)).message];
+  expect(drained.map((m: Any) => m.body).sort()).toEqual([`gap: ${A}/be`, `gap: ${a.id}`].sort());
   const reattached = srv.app.db.prepare(`SELECT detail FROM access_log WHERE action = 'id.reattached' AND target = ?`).get(a.id) as { detail: string };
   expect(JSON.parse(reattached.detail)).toMatchObject({ in_grace: true });
 
