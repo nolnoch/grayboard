@@ -67,7 +67,7 @@ export class WsClient {
     const ok = await this.next((m) => m.type === "hello_ok" || (m.type === "error" && m.req_id === "h"));
     if (ok.type !== "hello_ok") return ok;
     this.id = ok.id;
-    if (this.identity === null || this.toolsOnly || ok.bound === this.qualified(ok)) return ok;
+    if (this.identity === null || this.toolsOnly || ok.bound?.includes(this.qualified(ok))) return ok;
     const b = await this.bind(this.identity, this.opts.bind);
     return b.type === "bind_ok" ? { ...ok, bind_ok: b } : b;
   }

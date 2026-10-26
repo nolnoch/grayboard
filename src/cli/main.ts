@@ -266,11 +266,13 @@ program
     const { actingName, busHandle } = await import("./claim.ts");
     let acting;
     try {
-      const { name, source } = await actingName(globalAs());
-      acting = { handle: busHandle(name), source };
+      const { name, source, held } = await actingName(globalAs());
+      // A session holding several aliases acts as the first (#284 S6).
+      acting = { handle: busHandle(name), source, ...(held && held.length > 1 ? { held } : {}) };
     } catch (e) { console.error(`[grayboard] whoami: ${(e as Error).message}`); process.exit(1); }
     if (busMode() === "local") {
-      output(globalJson() ? acting : `${acting.handle} (from ${acting.source})`, globalJson());
+      const also = acting.held ? `; that session also holds ${acting.held.slice(1).join(", ")}` : "";
+      output(globalJson() ? acting : `${acting.handle} (from ${acting.source}${also})`, globalJson());
       return;
     }
     try {

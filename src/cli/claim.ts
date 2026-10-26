@@ -10,8 +10,8 @@ import { defaultIdentity, gitLocation, isExplicitIdentity, linkedWorktreeName, p
 
 export type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
 
-/** A live local session, as its bindings row records it (src/local/binding.ts). */
-export type LiveSession = { name: string | null; harness_pid: number | null; cwd: string | null };
+/** A live local session, as its bindings row records it (src/local/binding.ts): `name` its primary, `names` every hold, oldest first. */
+export type LiveSession = { name: string | null; names: string[]; harness_pid: number | null; cwd: string | null };
 
 /** The local sessions alive now and this process's ancestors: what decides a local shell's name. */
 export type LocalView = { sessions: LiveSession[]; ancestors: number[] };
@@ -35,7 +35,7 @@ function checkoutOf(cwd: string): string {
  * narrows those. None, several, or an unbound one refuses, pointing at --as:
  * a claim on a guessed name would land on the wrong handle silently.
  */
-export function boundSession(view: LocalView, cwd: string): { name: string; source: string } {
+export function boundSession(view: LocalView, cwd: string): { name: string; source: string; held: string[] } {
   const here = checkoutOf(cwd);
   const inHere = (r: LiveSession) => r.cwd !== null && checkoutOf(r.cwd) === here;
   const mine = new Set(view.ancestors);
@@ -50,9 +50,9 @@ export function boundSession(view: LocalView, cwd: string): { name: string; sour
     const names = pick.map((r) => r.name ?? "an unbound session").join(", ");
     throw new Error(`${pick.length} live sessions could own this shell (${names}); pass --as <name>`);
   }
-  const name = pick[0]!.name;
+  const { name, names } = pick[0]!;
   if (!name) throw new Error(`${source} hasn't bound a name yet; bind one there, or pass --as <name>`);
-  return { name, source };
+  return { name, source, held: names };
 }
 
 /**
@@ -66,7 +66,8 @@ export function boundSession(view: LocalView, cwd: string): { name: string; sour
  */
 // server: a server-mode shell, whose explicit name may carry a scope
 // (eng/deploy, #284 S9); the server judges it.
-export function actingIdentity(as?: string, env = process.env, cwd = process.cwd(), local?: LocalView, server = false): { name: string; source: string } {
+// held: with a local session, every alias it holds (it acts as the first).
+export function actingIdentity(as?: string, env = process.env, cwd = process.cwd(), local?: LocalView, server = false): { name: string; source: string; held?: string[] } {
   const normalize = server ? normalizeAliasName : normalizeIdentityName;
   if (as !== undefined) {
     // Same rule the session itself resolves by (#181): lowercased, then
@@ -106,7 +107,7 @@ async function localView(): Promise<LocalView> {
 }
 
 /** actingIdentity for this process, reading the local bus's sessions when the rule needs them. */
-export async function actingName(as?: string, mode = busMode()): Promise<{ name: string; source: string }> {
+export async function actingName(as?: string, mode = busMode()): Promise<{ name: string; source: string; held?: string[] }> {
   const needsLocal = mode === "local" && as === undefined && !isExplicitIdentity();
   return actingIdentity(as, process.env, process.cwd(), needsLocal ? await localView() : undefined, mode === "server");
 }

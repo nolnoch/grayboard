@@ -146,62 +146,103 @@ test("4, 13: a never-seen name needs create; the refusal lists the closest names
   expect((await s.call("peer_list", {})).you).toBe(`${A}/fee`);
 }, 20_000);
 
-test("8, 13: a rebind leaves its claims with the old name, frees it, and delivers the new name's mail", async () => {
+test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mail staying with it", async () => {
   const s = await session("fe");
   const be = await session("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
-  await be.call("dm_send", { to: "fe", body: "warmup" });
-  await until(() => contents(s).length === 1);
   // fe2 exists (it was used once), with a DM queued before the bind.
   await stop((await session("fe2")).c);
   await be.call("dm_send", { to: "fe2", body: "queued for fe2" });
 
-  // #284 S6: claims stay with the name they were taken under.
   const result = await s.call("bind", { name: "fe2" });
-  expect(result).toContain(`Bound to "fe2" (was "fe")`);
-  expect(result).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
+  expect(result).toStartWith(`Bound to "fe2"; you hold "fe", "fe2" and send as "fe".`);
+  expect(result).toContain(`You are identity "fe" on the grayboard bus, which coordinates between agents. You also hold "fe2"; you send as "fe".`);
+  // Both names' mail reaches it: fe2's queued DM and a new one to fe. A push
+  // names the alias it reached when that isn't the primary (S4).
   await until(() => contents(s).includes("queued for fe2"));
+  await be.call("dm_send", { to: "fe", body: "to fe" });
+  await until(() => contents(s).includes("to fe"));
+  expect(s.pushes.find((p) => p.content === "queued for fe2")!.meta.to).toBe(`${A}/fe2`);
+  expect(s.pushes.find((p) => p.content === "to fe")!.meta.to).toBeUndefined();
+  const sid = events("fe")[0]!.session_id;
+  expect(rows(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, sid)).toEqual([{ address: `${A}/fe` }, { address: `${A}/fe2` }]);
+  expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
+  expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "bound"]);
+  expect(rows(`SELECT COUNT(*) AS n FROM binding_events WHERE event = 'moved'`)).toEqual([{ n: 0 }]);
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
+  expect(await s.call("whoami", {})).toEqual({ id: sid, primary: `${A}/fe`, aliases: [`${A}/fe`, `${A}/fe2`], principal: A });
+
+  // Unbinding the primary promotes the next oldest hold.
+  const u = await s.call("unbind", { name: "fe" });
+  expect(u).toStartWith(`Released "fe"; mail to it queues for its next holder.`);
+  // #284 S6: claims stay with the address they were taken under.
+  expect(u).toContain(`Claims stay with the name they were taken under; these are now "fe"'s next holder's: ticket:ENG-142.`);
+  expect(u).toContain(`You now send as "fe2".`);
+  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: "unbind" });
+  expect(rows(`SELECT address FROM alias_holds WHERE id = ?`, sid)).toEqual([{ address: `${A}/fe2` }]);
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/fe2`);
+  expect(await s.call("whoami", {})).toEqual({ id: sid, primary: `${A}/fe2`, aliases: [`${A}/fe2`], principal: A });
   expect((await s.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
   expect(rows(`SELECT 1 FROM claim_events WHERE key = 'ticket:ENG-142' AND event = 'moved'`)).toEqual([]);
   expect(await refusal(s, "claim_release", { key: "ticket:ENG-142" })).toContain(`${A}/fe`);
+  expect(await be.call("dm_send", { to: "fe", body: "after unbind" })).toMatchObject({ delivered_now: false });
+  // Idempotent: a name it doesn't hold is already released.
+  expect(await s.call("unbind", { name: "fe" })).toBe(`not holding "fe"`);
+  expect(events("fe").filter((e) => e.event === "released")).toHaveLength(1);
 
-  const sid = events("fe")[0]!.session_id;
-  expect(events("fe")).toEqual([
-    { session_id: sid, event: "bound", detail: null },
-    { session_id: sid, event: "released", detail: `rebound to ${A}/fe2` },
-  ]);
-  expect(events("fe2").map((e) => e.event)).toEqual(["bound", "released", "moved"]);
-  expect(events("fe2").at(-1)).toEqual({ session_id: sid, event: "moved", detail: `${A}/fe` });
-
-  // fe's next holder has its claim.
+  // fe's next holder gets its mail and its claim.
   const other = await session(null);
   await other.call("bind", { name: "fe" });
-  expect((await other.call("peer_list", {})).you).toBe(`${A}/fe`);
+  await until(() => contents(other).includes("after unbind"));
+  expect(contents(s)).not.toContain("after unbind");
   expect(await other.call("claim_release", { key: "ticket:ENG-142" })).toBe("released ticket:ENG-142");
-  // A clean exit logs its release once.
-  await stop(other.c);
-  await until(() => events("fe").at(-1)!.event === "released");
-  expect(events("fe").filter((e) => e.event === "released")).toHaveLength(2);
+
+  // Unbinding the last hold leaves the session acting as its ID.
+  const last = await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
+  expect((last.content as { text: string }[])[0]!.text).toContain(`You now send as "${sid}".`);
+  expect((last.structuredContent as { name: string; instructions: string[] })).toEqual({ name: sid, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
+  expect((await s.call("peer_list", {})).you).toBe(sid);
+  expect(JSON.parse(readFileSync(join(srv.dir, "home", ".claude-bus", `bind.${s.harnessPid}`), "utf8")).names).toEqual([]);
+}, 40_000);
+
+test("#284 S1: the primary is the oldest hold; a ninth hold is refused", async () => {
+  const s = await session(null);
+  for (const n of ["zed", "alpha", "c", "d", "e", "f", "g", "h"]) await s.call("bind", { name: n, create: true });
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/zed`);
+  expect(await refusal(s, "bind", { name: "i", create: true })).toContain(`this session already holds 8 names`);
+  expect(rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/i`)).toEqual([]);
+}, 40_000);
+
+test("#284 S2, S6: unbind is refused for a tools-only process, whose whoami names what it writes as", async () => {
+  const s = await session("fe");
+  const tools = await session("fe", { extra: { BUS_PUSH: "off" } });
+  expect(await refusal(tools, "unbind", { name: "fe" })).toContain("this grayboard process is tools-only (BUS_PUSH=off)");
+  expect(await tools.call("whoami", {})).toMatchObject({ aliases: [], primary: `${A}/fe`, writes_as: `${A}/fe` });
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
 }, 30_000);
 
-test("9: a DM sent mid-swap is never consumed under the new name", async () => {
-  const s = await session("fe", { extra: pauseEnv("bind:after-acquire") });
+test("#284 S2: a DM pushed for an alias and unacked at its unbind reaches its next holder; a board item pushed before is pushed again on a re-bind", async () => {
+  const s = srv.client(alice, "fe");
+  await s.connect();
+  expect(await s.bind("fe2", { create: true })).toMatchObject({ type: "bind_ok", held: [`${A}/fe`, `${A}/fe2`] });
   const be = await session("be");
-  const binding = s.c.callTool({ name: "bind", arguments: { name: "fe2", create: true } });
-  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
-  // The server has moved the hold: fe has no holder now.
-  await be.call("dm_send", { to: "fe", body: "mid-swap" });
-  release("bind:after-acquire");
-  expect((await binding).isError).toBeFalsy();
-  const fe = (await be.call("peer_list", { include_offline: true })).peers.find((p: any) => p.handle === `${A}/fe`);
-  expect(fe.online).toBe(false);
-  // Left for fe; never read as fe2.
-  await be.call("dm_send", { to: "fe2", body: "barrier" });
-  await until(() => contents(s).includes("barrier"));
-  expect(contents(s)).not.toContain("mid-swap");
-  const next = await session(null);
-  await next.call("bind", { name: "fe" });
-  await until(() => contents(next).includes("mid-swap"));
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await be.call("board_post", { board: "e2e", body: "@fe2 look" });
+  const post = await s.next((m) => m.type === "board_push" && m.item.post?.body === "@fe2 look");
+  await be.call("dm_send", { to: "fe2", body: "unacked" });
+  const dm = await s.next((m) => m.type === "push" && m.message.body === "unacked");
+  // Neither is acked; the unbind leaves both for fe2.
+  expect(await s.request({ type: "unbind", alias: "fe2" })).toMatchObject({ type: "unbind_ok", alias: `${A}/fe2`, released: true, held: [`${A}/fe`] });
+  expect(await s.request({ type: "unbind", alias: "fe2" })).toMatchObject({ type: "unbind_ok", released: false });
+  // Re-bound on the same connection, the board item goes out again.
+  expect(await s.bind("fe2")).toMatchObject({ type: "bind_ok" });
+  expect(await s.next((m) => m.type === "board_push" && m.item.post?.id === post.item.post.id)).toBeDefined();
+  expect(await s.next((m) => m.type === "push" && m.message.id === dm.message.id)).toBeDefined();
+  expect(await s.request({ type: "unbind", alias: "fe2" })).toMatchObject({ released: true });
+  // Another session's bind of fe2 gets the DM still unacked.
+  const t = await session(null);
+  await t.call("bind", { name: "fe2" });
+  await until(() => contents(t).includes("unacked"));
 }, 30_000);
 
 
@@ -217,7 +258,7 @@ async function channelsOffSession(identity: string | null): Promise<Session> {
   return s;
 }
 
-test("audit 2: a channels-off session holds its name: never online, and its rebind leaves its claims", async () => {
+test("audit 2: a channels-off session holds its names: never online, and an unbind leaves its claims", async () => {
   const s = await channelsOffSession("fe");
   const be = await session("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
@@ -227,13 +268,14 @@ test("audit 2: a channels-off session holds its name: never online, and its rebi
   const fe = () => be.call("peer_list", { include_offline: true }).then((r) => r.peers.find((p: any) => p.handle === `${A}/fe`));
   expect((await fe()).online).toBe(false);
 
-  const result = await s.call("bind", { name: "fe2", create: true });
+  await s.call("bind", { name: "fe2", create: true });
+  const result = await s.call("unbind", { name: "fe" });
   expect(result).toContain(`these are now "fe"'s next holder's: ticket:ENG-142.`);
   expect((await be.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
   const sid = events("fe")[0]!.session_id;
   expect(events("fe").map((e) => e.event)).toEqual(["bound", "refused", "refused", "released"]);
-  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: `rebound to ${A}/fe2` });
-  expect(events("fe2")).toEqual([{ session_id: sid, event: "moved", detail: `${A}/fe` }]);
+  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: "unbind" });
+  expect(events("fe2")).toEqual([{ session_id: sid, event: "bound", detail: null }]);
   // fe is free now.
   const other = await session(null);
   await other.call("bind", { name: "fe" });
@@ -264,7 +306,7 @@ test("audit 3, 4: a reconnect on the session's key keeps its hold; another sessi
   // The same key re-attaches: the hold and the claim are its, and nothing is rebound.
   const back = srv.client(alice, "fe", { key, hello: { resume: true } });
   const ok = await back.connect();
-  expect(ok).toMatchObject({ type: "hello_ok", id: sid, bound: `${A}/fe` });
+  expect(ok).toMatchObject({ type: "hello_ok", id: sid, bound: [`${A}/fe`] });
   expect(ok.bind_ok).toBeUndefined();
   expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe` }]);
   // One refusal row per reason: held live, then held in the grace.
@@ -279,8 +321,8 @@ test("audit 5: a bind whose answer was lost is settled by calling it again: the 
   expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
 }, 20_000);
 
-test("audit 11: a call issued during a bind waits for it, and runs as the new name", async () => {
-  const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
+test("audit 11: a call issued during a bind waits for it, and runs as the name it bound", async () => {
+  const s = await session(null, { extra: pauseEnv("bind:after-acquire") });
   const order: string[] = [];
   const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }).then((r) => (order.push("bind"), r));
   await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
@@ -303,9 +345,9 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   release("bind:after-acquire");
   const r = await s.c.callTool({ name: "peer_list", arguments: {} });
   const texts = (r.content as { text: string }[]).map((c) => c.text);
-  expect(JSON.parse(texts[0]!).you).toBe(`${A}/fe`);
-  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe" (was "old")`);
-  expect((r.structuredContent as any).instructions[0]).toBe(`You are identity "fe" on the grayboard bus, which coordinates between agents.`);
+  expect(JSON.parse(texts[0]!).you).toBe(`${A}/old`);
+  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe"; you hold "old", "fe" and send as "old".`);
+  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old".`]);
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 20_000);
 
@@ -512,8 +554,9 @@ test("S15: a 1.x CLI against this server fails at start with the update hint", a
   expect(rows(`SELECT id FROM ids`)).toEqual([]);
 }, 60_000);
 
-test("11: a restart under the same harness takes its name back, or restores it once a crashed predecessor's grace ends; a fresh harness starts unbound", async () => {
+test("11: a restart under the same harness takes its names back, or restores them once a crashed predecessor's grace ends; a fresh harness starts unbound", async () => {
   // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
+  // It takes back every name it held, in order (S10); restored_from proves nothing, so its status stays behind (S11).
   let s = await session("be");
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
@@ -521,12 +564,16 @@ test("11: a restart under the same harness takes its name back, or restores it o
   // A clean restart (/mcp reconnect): the old session ended, so the name is free.
   const before = events("api").at(-1)!.session_id;
   s = await s.restart("reconnect");
-  expect(s.c.getInstructions()).toStartWith(`You are identity "api"`);
-  expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
-  const last = events("api").at(-1)!;
-  expect(last).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restored: restart of session ${before}` });
-  // The same session to its peers: its status stays, and its mail arrives.
-  expect((await peer.call("peer_list", {})).peers).toContainEqual(expect.objectContaining({ handle: `${A}/api`, status: "mid-task" }));
+  expect(s.c.getInstructions()).toStartWith(`You are identity "be"`);
+  expect(s.c.getInstructions()).toContain(`You also hold "api"`);
+  expect(s.c.getInstructions()).toContain(`The server couldn't verify that this session continues the one that held "be", "api" (restore claimed from ${before}, not verified), so that session's status wasn't carried over: peer_status to set yours.`);
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
+  for (const name of ["be", "api"]) {
+    expect(events(name).at(-1)).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restore claimed from ${before}, not verified` });
+  }
+  // Its mail arrives; its status didn't carry over.
+  expect((await peer.call("peer_list", {})).peers).toContainEqual(expect.objectContaining({ handle: `${A}/api` }));
+  expect((await peer.call("peer_list", {})).peers).not.toContainEqual(expect.objectContaining({ status: "mid-task" }));
   await peer.call("dm_send", { to: "api", body: "after restart" });
   await until(() => contents(s).includes("after restart"));
 
@@ -571,7 +618,7 @@ test("11: a restore waiting out a crashed predecessor's grace binds once the swe
   expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, before)).toEqual([{ ended_at: clock }]);
   await until(() => rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`).length > 0, SWEEP_MS + 5000, "the restore's bind");
   expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: after }]);
-  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restored: restart of session ${before}` });
+  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restore claimed from ${before}, not verified` });
   expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
 }, 30_000);
 
@@ -609,26 +656,27 @@ test("11: a restore refused by the bind limit retries after the wait it was give
   clock += 2000;
   await until(() => rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`).length > 0, 5000, "the retried restore");
   expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: after }]);
-  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restored: restart of session ${before}` });
+  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restore claimed from ${before}, not verified` });
   expect(s.stderr()).not.toContain(`didn't restore`);
 }, 30_000);
 
-test("#211: a restored_from the name's history doesn't show is logged unverified and starts a fresh status", async () => {
+// S11: restored_from proves nothing on a server; every one is logged as a
+// claim and starts a fresh status.
+test("S11: a restored_from naming another of the user's sessions is logged unverified and starts a fresh status", async () => {
   const s = await session("api");
   await s.call("peer_status", { text: "mid-task" });
-  const prior = events("api").at(-1)!.session_id;
   await stop(s.c);
   // One of alice's own sessions (a stranger's fails the principal check first).
   const stranger = await sessionId(await session(null));
   const ws = srv.client(alice, "api", { bind: { restored_from: stranger } });
   expect((await ws.connect()).bind_ok.alias).toBe(`${A}/api`);
-  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restore claimed from ${stranger}, not verified` });
   expect(status(`${A}/api`)).toBeNull();
 });
 
 // Audit S5 (#345): a team alias's history shows every member's sessions,
 // but a restore never carries another principal's session's status over.
-test("#211: a restored_from naming another principal's session is unverified, even when the alias's history shows it", async () => {
+test("S11: a restored_from naming another principal's session is unverified, even when the alias's history shows it", async () => {
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const theirs = srv.client(bob, "eng/api");
@@ -637,11 +685,11 @@ test("#211: a restored_from naming another principal's session is unverified, ev
   expect((await theirs.request({ type: "end" })).type).toBe("end_ok");
   const mine = srv.client(alice, "eng/api", { bind: { restored_from: theirs.id } });
   expect((await mine.connect()).bind_ok.alias).toBe("eng/api");
-  expect(rows(`SELECT detail FROM binding_events WHERE name = 'eng/api' ORDER BY id DESC LIMIT 1`)).toEqual([{ detail: `restore not verified: ${theirs.id} isn't a session of yours` }]);
+  expect(rows(`SELECT detail FROM binding_events WHERE name = 'eng/api' ORDER BY id DESC LIMIT 1`)).toEqual([{ detail: `restore claimed from ${theirs.id}, not verified` }]);
   expect(status("eng/api")).toBeNull();
 });
 
-test("#284: a 1.x client's 16-hex restored_from is the same session ID: its restore verifies", async () => {
+test("#284: a 1.x client's 16-hex restored_from is logged as the same session ID, unverified (S11)", async () => {
   const key = "d5".repeat(32);
   const ws = srv.client(alice, "api", { key });
   expect((await ws.connect()).type).toBe("hello_ok");
@@ -652,8 +700,8 @@ test("#284: a 1.x client's 16-hex restored_from is the same session ID: its rest
   const hex = new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 16);
   const next = srv.client(alice, "api", { bind: { restored_from: hex } });
   expect((await next.connect()).type).toBe("hello_ok");
-  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored: restart of session ${idAddress(key)}` });
-  expect(status(`${A}/api`)).toBe("mid-task");
+  expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restore claimed from ${idAddress(key)}, not verified` });
+  expect(status(`${A}/api`)).toBeNull();
 });
 
 test("#211, S4: a reconnect inside the grace is the same session; past its end, previous_key proves descent and a stray's doesn't", async () => {
@@ -665,7 +713,7 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
   ws.close();
   // A reconnect on its key re-attaches: same ID, still bound, status kept, no rebind.
   ws = srv.client(alice, "api", { key: mine, hello: { resume: true } });
-  expect(await ws.connect()).toMatchObject({ type: "hello_ok", id: idAddress(mine), bound: `${A}/api` });
+  expect(await ws.connect()).toMatchObject({ type: "hello_ok", id: idAddress(mine), bound: [`${A}/api`] });
   expect(apiStatus()).toBe("mid-task");
   expect(events("api").map((e) => e.event)).toEqual(["bound"]);
   // The session ends (as the grace would end it).
@@ -701,7 +749,7 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
 
 // #284: a session's ID is one principal's. Another user presenting the same
 // key is refused, never attached to the session's row; the owner's own
-// further hellos (a reconnect, a rebind) are the same session.
+// further hellos and binds are the same session.
 test("#284: a key whose ID is another principal's session is refused with id_collision, and audited", async () => {
   const key = "c4".repeat(32);
   const mine = srv.client(alice, "api", { key, hello: { where: "laptop" } });
@@ -712,10 +760,10 @@ test("#284: a key whose ID is another principal's session is refused with id_col
   expect(await theirs.connect()).toMatchObject({ type: "error", code: "id_collision", message: expect.stringContaining(idAddress(key)) });
   expect(rows(`SELECT actor, action, target FROM access_log WHERE action = 'id.collision'`)).toEqual([{ actor: "bob@example.com", action: "id.collision", target: idAddress(key) }]);
   expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/api` }]);
-  // The owner's rebind is the same session: one ids row, the hold moves.
+  // The owner's next bind is the same session: one ids row, a second hold.
   expect(await mine.bind("web")).toMatchObject({ type: "bind_ok", alias: `${A}/web` });
   expect(rows(`SELECT id FROM ids`)).toEqual([{ id: idAddress(key) }]);
-  expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/web` }]);
+  expect(rows(`SELECT address, id FROM alias_holds ORDER BY address`)).toEqual([{ address: `${A}/api`, id: idAddress(key) }, { address: `${A}/web`, id: idAddress(key) }]);
   expect((await mine.request({ type: "end" })).type).toBe("end_ok");
   expect(rows(`SELECT 1 FROM alias_holds`)).toEqual([]);
 });

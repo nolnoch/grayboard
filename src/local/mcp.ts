@@ -435,6 +435,8 @@ async function call(name: string, args: Record<string, unknown>, signal: AbortSi
 async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
+  // Local mode has one implicit scope: no principal (#284 S6).
+  if (name === "whoami") return text({ id: SESSION_ID, primary: primary(), aliases: held, principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}) });
   // With no name, the session acts as its ID (#284 S13).
   const IDENTITY = primary();
   // What this session reads mail, claims and uploads as; IDENTITY is the

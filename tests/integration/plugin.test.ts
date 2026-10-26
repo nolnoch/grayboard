@@ -395,7 +395,7 @@ test("a lost answer says a retry is safe, and the retry replays the first result
   }
 }, 30_000);
 
-test("a repeat of a lost write after the session's name changed is refused until resend: the server can't match it (A2)", async () => {
+test("a repeat of a lost write after the session's holds changed is refused until resend: the server can't match it (A2)", async () => {
   let lose = false;
   const p = proxy(() => undefined, (frame) => {
     const msg = JSON.parse(frame) as { type: string };
@@ -409,9 +409,10 @@ test("a repeat of a lost write after the session's name changed is refused until
     lose = true;
     await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow("Calling again with the same arguments within 10 minutes is safe");
     await until(() => be.call("peer_list", {}).catch(() => null), 10_000, "the reconnect");
-    // The dedup key holds the sender: as "ops", the repeat would write again.
+    // The dedup key holds the sender, which the holds can change (a reply
+    // default, #284 S4): after a bind the plugin can't match the repeat.
     await be.call("bind", { name: "ops", create: true });
-    const refused = "this repeats a dm_send whose answer was lost as alice@example.com/be; this session has changed since, so the server can't match the repeat to it, and the first may have landed.";
+    const refused = `this repeats a dm_send whose answer was lost while this session held "be"; this session has changed since, so the server can't match the repeat to it, and the first may have landed.`;
     await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
     await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
     expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 1 });

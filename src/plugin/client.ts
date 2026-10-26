@@ -49,6 +49,10 @@ export type ClientOptions = {
   // land here (#184). Sent on every hello; the server records it on the
   // session's row and peer_list shows it.
   launcher?: boolean;
+  // What the session runs on (#284 S12): the harness's command name,
+  // BUS_MODEL, BUS_EFFORT. Sent on every hello; the server records them when
+  // the hello registers the session.
+  facts?: { harness?: string; model?: string; effort?: string };
   onReady?: ReadyCallback;
   // The server released an alias this session held (#284 S9).
   onAliasLost?: (m: AliasLost) => void;
@@ -183,12 +187,13 @@ export class GrayboardClient {
       // Read each time, so a reconnect picks up a branch switch.
       const where = describeLocation(process.cwd());
       this.helloId = this.nextId();
-      const { push = true, hold, writesAs, keyed, launcher } = this.opts;
+      const { push = true, hold, writesAs, keyed, launcher, facts } = this.opts;
       this.send({
         type: "hello", req_id: this.helloId, proto: PROTO, session_key: this.key,
         ...(keyed ? { keyed: true } : {}),
         ...(push ? {} : hold ? { push: false, hold: true } : { push: false, writes_as: writesAs }),
         ...(launcher ? { launcher: true } : {}),
+        ...facts,
         ...(where ? { where } : {}),
         // A new key's hello starts a session; it resumes nothing.
         ...(this.wasReady && this.rekeyedFrom === null ? { resume: true } : {}),

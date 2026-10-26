@@ -110,11 +110,11 @@ test("server mode takes a scoped name, as-is; local mode refuses one", () => {
 });
 
 describe("the local rule: the shell's bound session (#182 decision 18)", () => {
-  const row = (name: string | null, harness_pid: number | null, ...cwd: string[]) => ({ name, harness_pid, cwd: at(...cwd) });
+  const row = (name: string | null, harness_pid: number | null, ...cwd: string[]) => ({ name, names: name ? [name] : [], harness_pid, cwd: at(...cwd) });
 
   test("the session whose harness is an ancestor, wherever it runs", () => {
     const view = { sessions: [row("eng-142", 40, "repo"), row("other", 50, "repo", "src")], ancestors: [99, 40, 7] };
-    expect(actingIdentity(undefined, {}, at("repo", "src"), view)).toEqual({ name: "eng-142", source: "the session this shell runs under" });
+    expect(actingIdentity(undefined, {}, at("repo", "src"), view)).toEqual({ name: "eng-142", source: "the session this shell runs under", held: ["eng-142"] });
   });
 
   test("several under one harness: the checkout narrows them; a linked worktree is its own checkout", () => {
@@ -125,7 +125,7 @@ describe("the local rule: the shell's bound session (#182 decision 18)", () => {
 
   test("no ancestor match: the one session in this checkout", () => {
     const view = { sessions: [row("main", 40, "repo", "src"), row("stream", 41, "repo", ".wt", "stream")], ancestors: [99] };
-    expect(actingIdentity(undefined, {}, at("repo"), view)).toEqual({ name: "main", source: "the session in this checkout" });
+    expect(actingIdentity(undefined, {}, at("repo"), view)).toEqual({ name: "main", source: "the session in this checkout", held: ["main"] });
   });
 
   test("none, several, or an unbound one refuses and points at --as", () => {
@@ -137,6 +137,11 @@ describe("the local rule: the shell's bound session (#182 decision 18)", () => {
     // Several under this shell's harness, none in this checkout: says so (#182 audit 29).
     const elsewhere = { sessions: [row("main", 40, "repo"), row("stream", 40, "repo", ".wt", "stream")], ancestors: [40] };
     expect(() => actingIdentity(undefined, {}, root, elsewhere)).toThrow(/2 live sessions run this shell \(main, stream\), none in this checkout; pass --as/);
+  });
+
+  test("a session holding several aliases acts as its primary and reports them all (#284 S6)", () => {
+    const view = { sessions: [{ ...row("zed", 40, "repo"), names: ["zed", "alpha"] }], ancestors: [40] };
+    expect(actingIdentity(undefined, {}, at("repo"), view)).toEqual({ name: "zed", source: "the session this shell runs under", held: ["zed", "alpha"] });
   });
 
   test("--as and an explicit BUS_IDENTITY still win", () => {

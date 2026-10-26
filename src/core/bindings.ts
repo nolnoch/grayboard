@@ -322,6 +322,12 @@ export const UNBIND_TOOL = {
   },
 };
 
+export const WHOAMI_TOOL = {
+  name: "whoami",
+  description: "whoami(): your session ID, the aliases you hold (oldest first; you send as the first) and your principal.",
+  inputSchema: { type: "object", properties: {} },
+};
+
 // `fresh`: the name has never existed, so binding it needs create: true.
 export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true };
 

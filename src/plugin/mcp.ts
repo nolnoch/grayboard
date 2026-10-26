@@ -9,16 +9,17 @@ import { join } from "node:path";
 import { GrayboardClient, ServerRefused, retryWait } from "./client.ts";
 import { ApiClient, ApiError, loadCredentials as savedCredentials, signInHint } from "../cli/api.ts";
 import { isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
-import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk, BindOk, BindRequest } from "../shared/protocol.ts";
+import type { AckOk, Message, SendOk, DelegateOk, HistoryOk, ThreadOk, CallOk, InboxOk, HelloOk, BindOk, BindRequest, UnbindOk } from "../shared/protocol.ts";
 import { canonicalJson, WRITE_DEDUP_WINDOW_MS, WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
 import {
-  TOOLS_ONLY_BIND, bindMissed, bindOk, boundInstructions, envSessionKey, heldNote, idAddress, launcherNote, leftNote, mintSessionKey, restoreNote, unboundInstruction,
+  TOOLS_ONLY_BIND, bindMissed, bindOk, boundInstructions, envSessionKey, heldNote, idAddress, launcherNote, mintSessionKey, notHolding, restoreNote, unbindMissed,
+  unbindOk, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
-import { launcherName } from "../shared/proc.ts";
+import { commandName, launcherName } from "../shared/proc.ts";
 import { SERVER_TOOLS } from "./tools.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -104,6 +105,8 @@ const ROOTS = attachRoots();
 const PUSH = process.env.BUS_PUSH !== "off";
 if (!resolved.ok && (EXPLICIT || !PUSH)) fatal(new Error(resolved.error));
 const SUGGESTED = resolved.ok ? resolved.name : null;
+// What a tools-only process writes as; it holds nothing.
+const WRITES_AS = PUSH ? null : SUGGESTED!;
 // Claude Code started without a channels flag drops pushes silently; say so.
 const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
 if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
@@ -135,12 +138,16 @@ const notify = async (params: { content: string; meta: Record<string, string> })
 const envToken = !!process.env.GRAYBOARD_TOKEN;
 const currentToken = () => process.env.GRAYBOARD_TOKEN ?? savedCredentials()?.session_token ?? creds.session_token;
 
-// The alias this session holds (its full address), or null while it acts as
-// its ID. A tools-only process writes as SUGGESTED and holds nothing.
-let bound: string | null = null;
+// The aliases this session holds (full addresses), oldest first (#284 S1):
+// it sends as the first, its primary, and as its ID while it holds none.
+// The server's hello_ok, bind_ok, unbind_ok and alias_lost keep it in step.
+let held: string[] = [];
+// A tools-only process's name is bare until the server qualifies it, as a
+// bind does: your own scope.
+const primary = (): string => (WRITES_AS ? (WRITES_AS.includes("/") ? WRITES_AS : `${hello.user_email}/${WRITES_AS}`) : held[0] ?? client.id);
 // The latest hello_ok: a reconnect's replaces it.
 let hello!: HelloOk;
-// The notices for the alias bound: its bind_ok's, or at start the hello_ok's.
+// The notices for the set held: the latest bind_ok's, or at start the hello_ok's.
 let boundNotices: string[] = [];
 // What happened to this session's name without a bind result saying so (a
 // lost name, a restore's end, a new ID), for the next tool result.
@@ -157,6 +164,8 @@ const gate = new BindGate();
 // Set once startup has bound what it binds; a hello_ok before then is startup's.
 let started = false;
 
+// The harness this process runs under, for its hello.
+const harness = commandName(process.ppid);
 // One connection for the session's life (#284 S11): it holds the session's
 // ID, and binding an alias changes what it acts as, not the connection.
 const client: GrayboardClient = new GrayboardClient(
@@ -164,7 +173,7 @@ const client: GrayboardClient = new GrayboardClient(
   currentToken,
   KEY ?? mintSessionKey(),
   async (msg: Message) => {
-    const params = dmNotification(msg);
+    const params = dmNotification(msg, primary());
     if (fromOwnHuman(msg.sender)) params.meta.human = "true";
     return notify(params);
   },
@@ -180,17 +189,26 @@ const client: GrayboardClient = new GrayboardClient(
     ...(PUSH ? {} : { writesAs: SUGGESTED! }),
     keyed: KEYED,
     launcher: process.env.BUS_LAUNCHER === "1",
+    // What the session runs on, self-reported (#284 S12).
+    facts: {
+      ...(harness ? { harness } : {}),
+      ...(process.env.BUS_MODEL ? { model: process.env.BUS_MODEL } : {}),
+      ...(process.env.BUS_EFFORT ? { effort: process.env.BUS_EFFORT } : {}),
+    },
     onReady: (h, rekeyedFrom) => {
       hello = h;
       if (started) reattached(h, rekeyedFrom);
     },
-    // Its user left the alias's team: the session carries on as its ID.
+    // Its user left the alias's team: the session keeps its other holds.
     onAliasLost: (m) => {
-      if (bound !== m.alias) return;
-      bound = null;
-      boundNotices = [];
-      writeName(null);
-      nameNotice = `This session lost its bus name "${short(m.alias)}": ${m.reason}. It acts as its ID (${client.id}) now: bind(name) to take another.`;
+      if (!held.includes(m.alias)) return;
+      const before = primary();
+      held = held.filter((h) => h !== m.alias);
+      if (!held.length) boundNotices = [];
+      writeNames();
+      nameNotice = `This session lost its bus name "${short(m.alias)}": ${m.reason}. ` + (held.length
+        ? before === primary() ? `It still sends as "${short(primary())}".` : `It sends as "${short(primary())}" now.`
+        : `It acts as its ID (${client.id}) now: bind(name) to take another.`);
       instructionsStale = true;
       console.error(`[grayboard] session ${client.id} lost "${m.alias}": ${m.reason}`);
     },
@@ -244,14 +262,14 @@ const helloWithin = (c: GrayboardClient, limitedBy: number): Promise<HelloOk> =>
 };
 
 // The name record (#182 decision 14), written by the session that owns
-// delivery whenever its name changes, so a restart under the same harness
-// takes the name back.
+// delivery whenever its holds change, so a restart under the same harness
+// takes them back (#284 S10).
 const RECORD_DIR = sockDir();
-// A failed write costs only the restore after a restart; the bind itself stands.
-function writeName(name: string | null): void {
+// A failed write costs only the restore after a restart; the binds stand.
+function writeNames(): void {
   if (!RECORDS) return;
   try {
-    writeRecord(RECORD_DIR, { names: name ? [name] : [], session_id: client.id, harness_pid: process.ppid, bus: serverUrl });
+    writeRecord(RECORD_DIR, { names: held, session_id: client.id, harness_pid: process.ppid, bus: serverUrl });
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
@@ -271,23 +289,35 @@ async function startupBind(alias: string, extra: Omit<BindRequest, "type" | "req
   }
 }
 
-// The alias a restart is taking back while its predecessor's session is in
-// its grace (S11); any bind the agent makes cancels it.
-let restoring: string | null = null;
+// What restores' bind_oks say about their continuity (#284 PR 4 S11): a
+// restored_from proves nothing, so the session before's status stays behind.
+// One sentence for every unverified restore, which all name the same session.
+function restoredNote(oks: BindOk[]): string[] {
+  const unverified = oks.filter((ok) => ok.restored && !ok.restored.verified);
+  if (!unverified.length) return [];
+  return [`The server couldn't verify that this session continues the one that held ${quotedShort(unverified.map((ok) => ok.alias))} (${unverified[0]!.restored!.detail}), so that session's status wasn't carried over: peer_status to set yours.`];
+}
+
+// The aliases a restart is taking back while its predecessor's session is in
+// its grace (S11). The agent's own bind or unbind of one settles it.
+const restoring = new Set<string>();
 
 // Retries a restore after `ms`, until the holder's grace ends and the alias
 // is free, or the holder comes back (an alias_held with no wait).
 function restoreLater(alias: string, restoredFrom: string, ms: number): void {
-  restoring = alias;
+  restoring.add(alias);
   setTimeout(() => {
-    if (restoring !== alias) return;
+    if (!restoring.has(alias)) return;
     void gate.bind(async () => {
-      if (restoring !== alias) return;
+      if (!restoring.has(alias)) return;
       try {
         const ok = await client.request<BindOk>({ type: "bind", alias, create: false, restored_from: restoredFrom });
-        restoring = null;
+        restoring.delete(alias);
         adopt(ok);
-        nameNotice = `This session took back "${short(ok.alias)}", which the grayboard process before it held; it acts as "${short(ok.alias)}" now.`;
+        nameNotice = [
+          `This session took back "${short(ok.alias)}", which the grayboard process before it held; it sends as "${short(primary())}".`,
+          ...restoredNote([ok]),
+        ].join(" ");
         instructionsStale = true;
         console.error(`[grayboard] session ${client.id} restored "${ok.alias}"`);
       } catch (e) {
@@ -296,60 +326,73 @@ function restoreLater(alias: string, restoredFrom: string, ms: number): void {
           console.error(`[grayboard] session ${client.id} restoring "${alias}" retries in ${e.retryAfterMs}ms: ${e.code}`);
           return restoreLater(alias, restoredFrom, e.retryAfterMs);
         }
-        restoring = null;
-        nameNotice = restoreNote(short(alias), reason(e as Error));
+        restoring.delete(alias);
+        nameNotice = restoreNote(short(alias), reason(e as Error), held.length > 0);
         console.error(`[grayboard] session ${client.id} didn't restore "${alias}": ${(e as Error).message}`);
       }
     });
   }, ms);
 }
 
-// A bind accepted: this session acts as its alias from here.
+// A bind accepted: the server's held list is this session's from here.
 function adopt(ok: BindOk): void {
-  bound = ok.alias;
+  held = ok.held;
   boundNotices = ok.notices ?? [];
-  writeName(bound);
+  restoring.delete(ok.alias);
+  writeNames();
 }
 
-// A reconnect's hello_ok. A resume re-attaches the session with its hold, so
-// nothing is bound again (S11); a new ID (the old one ended during the
-// outage, S4) re-binds the alias, proving descent with the old key.
+const sameList = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+const quotedShort = (names: string[]) => names.map((n) => `"${short(n)}"`).join(", ");
+
+// A reconnect's hello_ok. A resume re-attaches the session with its holds,
+// so nothing is bound again (S11); a new ID (the old one ended during the
+// outage, S4) re-binds each alias in order, proving descent with the old key.
 function reattached(h: HelloOk, rekeyedFrom: string | null): void {
   if (rekeyedFrom === null) {
-    if (!PUSH || (h.bound ?? null) === bound) return;
-    nameNotice = bound
-      ? `This session reconnected without its bus name "${short(bound)}"${h.bound ? `; it holds "${short(h.bound)}" now` : ", and acts as its ID now: bind(name) to take a name again"}.`
-      : `This session reconnected holding "${short(h.bound!)}".`;
-    bound = h.bound ?? null;
+    const now = h.bound ?? [];
+    if (!PUSH || sameList(now, held)) return;
+    const lost = held.filter((a) => !now.includes(a));
+    nameNotice = lost.length
+      ? `This session reconnected without ${quotedShort(lost)}; ` + (now.length ? `it holds ${quotedShort(now)} and sends as "${short(now[0]!)}".` : `it acts as its ID now: bind(name) to take a name again.`)
+      : `This session reconnected holding ${quotedShort(now)}.`;
+    held = now;
     boundNotices = h.notices ?? [];
     instructionsStale = true;
-    writeName(bound);
+    writeNames();
     return;
   }
   const changed = `This session's ID changed from ${idAddress(rekeyedFrom)} to ${h.id}: it was disconnected past the server's grace, so the old session ended and DMs sent to the old ID bounce.`;
   instructionsStale = true;
-  // A tools-only session binds nothing: its new hello wrote as its writes_as
-  // again, so it still writes as `bound`.
+  // A tools-only session binds nothing: its new hello wrote as its writes_as again.
   if (!PUSH) {
     nameNotice = changed;
     return;
   }
-  const alias = bound;
-  if (alias === null) {
+  const aliases = held;
+  held = [];
+  boundNotices = [];
+  if (!aliases.length) {
     nameNotice = changed;
-    writeName(null);
+    writeNames();
     return;
   }
   void gate.bind(async () => {
-    try {
-      adopt(await client.request<BindOk>({ type: "bind", alias, previous_key: rekeyedFrom }));
-      nameNotice = `${changed} It took back "${short(alias)}".`;
-    } catch (e) {
-      bound = null;
-      writeName(null);
-      nameNotice = `${changed} It couldn't take back "${short(alias)}" (${reason(e as Error)}), so it acts as its ID now: bind(name) to take a name again.`;
+    const missed: string[] = [];
+    for (const alias of aliases) {
+      try {
+        adopt(await client.request<BindOk>({ type: "bind", alias, previous_key: rekeyedFrom }));
+      } catch (e) {
+        missed.push(`"${short(alias)}" (${reason(e as Error)})`);
+      }
     }
-    console.error(`[grayboard] session ${idAddress(rekeyedFrom)} ended during an outage; now ${h.id}${bound ? `, bound "${bound}"` : ""}`);
+    writeNames();
+    nameNotice = [
+      changed,
+      ...(held.length ? [`It took back ${quotedShort(held)}${held.length > 1 ? ` and sends as "${short(primary())}"` : ""}.`] : []),
+      ...(missed.length ? [`It couldn't take back ${missed.join(", ")}${held.length ? "" : ", so it acts as its ID now: bind(name) to take a name again"}.`] : []),
+    ].join(" ");
+    console.error(`[grayboard] session ${idAddress(rekeyedFrom)} ended during an outage; now ${h.id}${held.length ? `, holding "${held.join('", "')}"` : ""}`);
   });
 }
 
@@ -357,66 +400,73 @@ function reattached(h: HelloOk, rekeyedFrom: string | null): void {
 // so a refused session or an unreachable server shows as a failed server in
 // the client, and so the instructions say what was bound.
 hello = await helloWithin(client, STARTUP_LIMITED_BY).catch(fatal);
-// Why this session started unbound, for its instructions.
-const unboundNotes: string[] = [];
+// Why this session started as it did, for its instructions.
+const startNotes: string[] = [];
 if (RECORDS) sweepRecords(RECORD_DIR);
 const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, serverUrl) : null;
-// The server path holds one name until #284 steps 6/7: it restores the primary.
-const restoreName = rec?.names[0];
-if (hello.bound) {
-  // A keyed session restarted within its grace: it still holds its alias.
-  bound = hello.bound;
+if (hello.bound?.length) {
+  // A keyed session restarted within its grace: it still holds its aliases.
+  held = hello.bound;
   boundNotices = hello.notices ?? [];
-} else if (!PUSH) {
-  bound = SUGGESTED;
-} else if (rec && restoreName) {
-  // A restart under the same harness takes back its predecessor's name,
-  // ahead of BUS_IDENTITY: it's the same session, mid-task. The process it
-  // replaces may still hold it for a moment, before its end lands.
+} else if (PUSH && rec?.names.length) {
+  // A restart under the same harness takes back its predecessor's names, in
+  // their order, ahead of BUS_IDENTITY: it's the same session, mid-task
+  // (#284 S10). Each is judged on its own; the first taken is the primary.
+  // The process it replaces may still hold them for a moment, before its end lands.
   const until = Date.now() + 6000;
   testPause("restore:before-bind");
-  for (;;) {
-    try {
-      adopt(await startupBind(restoreName, { create: false, restored_from: rec.session_id }));
-      break;
-    } catch (e) {
-      if (!(e instanceof ServerRefused)) fatal(e as Error);
-      const held = e as ServerRefused;
-      if (held.code === "alias_held" && held.retryAfterMs !== undefined) {
-        restoreLater(restoreName, rec.session_id, held.retryAfterMs);
-        unboundNotes.push(`This grayboard process restarted; the one before it held "${short(restoreName)}" and is in its reconnect grace, so this session is restoring it: it binds "${short(restoreName)}" by itself within ${Math.ceil(held.retryAfterMs / 1000)}s, and a tool result says when.`);
+  const missed: { name: string; why: string }[] = [];
+  const restored: BindOk[] = [];
+  for (const name of rec.names) {
+    for (;;) {
+      try {
+        const ok = await startupBind(name, { create: false, restored_from: rec.session_id });
+        adopt(ok);
+        restored.push(ok);
+        break;
+      } catch (e) {
+        if (!(e instanceof ServerRefused)) fatal(e as Error);
+        const refused = e as ServerRefused;
+        if (refused.code === "alias_held" && refused.retryAfterMs !== undefined) {
+          restoreLater(name, rec.session_id, refused.retryAfterMs);
+          startNotes.push(`This grayboard process restarted; the one before it held "${short(name)}" and is in its reconnect grace, so this session is restoring it: it binds "${short(name)}" by itself within ${Math.ceil(refused.retryAfterMs / 1000)}s, and a tool result says when.`);
+          break;
+        }
+        if (refused.code === "alias_held" && Date.now() < until) {
+          await Bun.sleep(500);
+          continue;
+        }
+        missed.push({ name, why: reason(refused) });
         break;
       }
-      if (held.code === "alias_held" && Date.now() < until) {
-        await Bun.sleep(500);
-        continue;
-      }
-      unboundNotes.push(restoreNote(short(restoreName), reason(held)));
-      break;
     }
   }
-} else if (EXPLICIT) {
+  startNotes.push(...restoredNote(restored));
+  // Once the loop is done, so each says whether the session holds others.
+  for (const m of missed) startNotes.push(restoreNote(short(m.name), m.why, held.length > 0));
+} else if (PUSH && EXPLICIT) {
   try {
     adopt(await startupBind(SUGGESTED!, { create: true }));
   } catch (e) {
     // A held explicit name starts the session unbound, naming the holder:
     // exiting would show the agent nothing it can act on.
     if (!(e instanceof ServerRefused && e.code === "alias_held")) fatal(e as Error);
-    unboundNotes.push(heldNote(SUGGESTED!, (e as ServerRefused).holder ?? reason(e as Error)));
+    startNotes.push(heldNote(SUGGESTED!, (e as ServerRefused).holder ?? reason(e as Error)));
   }
 }
-if (!bound && RECORDS) {
+if (!held.length && RECORDS) {
   const launcher = launcherName(process.ppid);
-  if (launcher) unboundNotes.push(launcherNote(launcher));
+  if (launcher) startNotes.push(launcherNote(launcher));
 }
-if (bound) boundNotices = [...(hello.notices ?? []), ...boundNotices.filter((n) => !hello.notices?.includes(n))];
-writeName(bound);
+if (WRITES_AS || held.length) boundNotices = [...(hello.notices ?? []), ...boundNotices.filter((n) => !hello.notices?.includes(n))];
+writeNames();
 started = true;
-console.error(`[grayboard] server mode (${serverUrl}), session ${client.id}${KEYED ? " (keyed)" : ""}, ${bound ? `identity "${bound}"` : "unbound"}`);
+console.error(`[grayboard] server mode (${serverUrl}), session ${client.id}${KEYED ? " (keyed)" : ""}, ${held.length ? `identity "${held.join('", "')}"` : WRITES_AS ? `writing as "${WRITES_AS}"` : "unbound"}`);
 
 // What a session acting as `name` is told (core's boundInstructions), with
-// server mode's team, human and handle sentences, then `named`.
-function serverBoundInstructions(name: string, general: boolean, named: string[]): string[] {
+// server mode's team, human and handle sentences, then `named`. `others`:
+// the session's other holds.
+function serverBoundInstructions(name: string, general: boolean, named: string[], others: string[] = []): string[] {
   return boundInstructions(
     name,
     general,
@@ -426,15 +476,18 @@ function serverBoundInstructions(name: string, general: boolean, named: string[]
       `Handles are scope/name (user@org/name for a person's, team/name for a team's) or id:… for a session; dm_send also takes a bare name, resolved the same way as @name. In a post, @name means your own scope's name if there is one, else the one on the board with it (if several, name one); @scope/name and @id:… are exact.`,
     ],
     named,
+    others,
   );
 }
 
-// The full instructions for what this session acts as now. Unbound, it acts
-// as its ID (#284 S13), with a sentence on binding a name.
-const currentInstructions = (notes: string[] = []): string[] =>
-  bound
-    ? serverBoundInstructions(short(bound), true, boundNotices)
-    : serverBoundInstructions(client.id, true, [unboundInstruction(client.id, [], notes), ...(hello.notices ?? [])]);
+// The instructions for what this session acts as now: its primary, with its
+// other holds. Unbound, it acts as its ID (#284 S13), with a sentence on
+// binding a name. `notes`: why it started as it did.
+const instructionsNow = (general: boolean, notes: string[] = []): string[] =>
+  WRITES_AS || held.length
+    ? serverBoundInstructions(short(primary()), general, [...notes, ...boundNotices], held.slice(1).map(short))
+    : serverBoundInstructions(client.id, general, [unboundInstruction(client.id, [], notes), ...(hello.notices ?? [])]);
+const currentInstructions = (notes: string[] = []): string[] => instructionsNow(true, notes);
 
 // Built after hello_ok; notify waits for `initialized`, which needs it.
 const server = new Server(
@@ -444,7 +497,7 @@ const server = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: [...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []), ...currentInstructions(unboundNotes)].join(" "),
+    instructions: [...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []), ...currentInstructions(startNotes)].join(" "),
   },
 );
 
@@ -482,17 +535,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId 
   const { name, arguments: args = {} } = req.params;
   const run = () => call(name, args as Record<string, unknown>, signal);
   const r: { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: unknown } =
-    await (name === "bind" ? gate.bind(run) : gate.call(run));
+    // bind and unbind change the address set: no call overlaps either.
+    await (name === "bind" || name === "unbind" ? gate.bind(run) : gate.call(run));
   // A cancelled call's result is dropped: its notices wait for the next one.
   if (signal.aborted) return r;
   const extra = notices();
   let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text" as const, text }))] } : r;
   if (instructionsStale && !out.structuredContent) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: bound ? short(bound) : null, instructions: currentInstructions() } };
+    out = { ...out, structuredContent: { name: WRITES_AS || held.length ? short(primary()) : null, instructions: currentInstructions() } };
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String((args as Record<string, unknown>).name), "it was cancelled", r.content[0]!.text));
     requeued.push(...extra);
     if (out.structuredContent) instructionsStale = true;
   });
@@ -503,11 +558,14 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
   const bad = checkArgs(SERVER_TOOLS, name, a);
   if (bad) return { ...text(`error: ${bad}`), isError: true };
   if (name === "bind") return bind(a, signal);
+  if (name === "unbind") return unbind(a, signal);
+  if (name === "whoami") return text(whoami());
   const repeat = APPEND_WRITES.has(name) ? unmatchedRetry(name, a) : null;
   if (repeat) return { ...text(`error: ${repeat}`), isError: true };
   try {
-    // What uploads and downloads act as: what the connection acts as.
-    const me = bound ?? client.id;
+    // What uploads act as: the call's `as`, else the primary (#284 S5).
+    // The server binds them over the sending session's whole address set.
+    const me = a.as !== undefined ? String(a.as) : primary();
     if (isBoardTool(name)) {
       const { attachments: paths, ...args } = a;
       if (paths !== undefined && name === "board_post") checkBody(args.body);
@@ -527,6 +585,7 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
           ...(a.pending === true ? { pending: true } : {}),
           ...(ids.length ? { attachment_ids: ids } : {}),
           ...(a.resend === true ? { resend: true } : {}),
+          ...(a.as !== undefined ? { as: a.as } : {}),
         }),
       );
       return text(rest);
@@ -597,7 +656,7 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
   } catch (e) {
     if (e instanceof SendLanded) return text({ sent: true, attachment_ids: e.attachments, note: e.message });
     if (APPEND_WRITES.has(name) && isLostAnswer(e as Error)) {
-      lostWrites.set(writeKey(name, a), { session: client.id, sender: bound ?? client.id, at: Date.now() });
+      lostWrites.set(writeKey(name, a), { session: client.id, holds: held, at: Date.now() });
       return { ...text(`error: ${lostAnswer((e as Error).message, a.resend === true)}`), isError: true };
     }
     // The HTTP API (attachments) refused the token, as a WS hello would have.
@@ -622,17 +681,20 @@ const lostAnswer = (why: string, resend: boolean) =>
     : `Calling again with the same arguments within ${WRITE_DEDUP_WINDOW_TEXT} is safe: the server returns the first result instead of sending twice.`);
 
 // Append writes whose answer was lost, by tool and arguments, with the
-// session and sender they went out as: the server's dedup key
-// (src/server/write_dedup.ts) holds both. The lost request was rejected when
-// its connection closed, before any reconnect could rekey the session.
-const lostWrites = new Map<string, { session: string; sender: string; at: number }>();
+// session and the holds it had: the server's dedup key
+// (src/server/write_dedup.ts) holds the session and the sender, and the
+// server resolves the sender from the arguments, the parent and the holds
+// (#284 S3, S4), so unchanged holds mean an unchanged key. The lost request
+// was rejected when its connection closed, before any reconnect could rekey
+// the session.
+const lostWrites = new Map<string, { session: string; holds: string[]; at: number }>();
 const writeKey = (name: string, a: Record<string, unknown>) => {
   const { resend: _resend, ...args } = a;
   return canonicalJson({ tool: name, args });
 };
 
 // A repeat of a lost write after the session's ID changed (a rekey past the
-// grace) or its name did (a bind or restore) reaches the server under another
+// grace) or its holds did (a bind, unbind or restore) may reach the server under another
 // key, so it would write twice: refused, unless the call forces a resend.
 // A repeat under the same key goes out; the server replays the first result.
 function unmatchedRetry(name: string, a: Record<string, unknown>): string | null {
@@ -642,11 +704,11 @@ function unmatchedRetry(name: string, a: Record<string, unknown>): string | null
   const lost = lostWrites.get(key);
   if (!lost) return null;
   // Either answer settles it: the server's, or the agent's resend.
-  if (a.resend === true || (lost.session === client.id && lost.sender === (bound ?? client.id))) {
+  if (a.resend === true || (lost.session === client.id && sameList(lost.holds, held))) {
     lostWrites.delete(key);
     return null;
   }
-  const was = lost.session === client.id ? `as ${lost.sender}` : `from session ${lost.session}`;
+  const was = lost.session === client.id ? `while this session held ${lost.holds.length ? quotedShort(lost.holds) : "no name"}` : `from session ${lost.session}`;
   return `this repeats a ${name} whose answer was lost ${was}; this session has changed since, so the server can't match the repeat to it, and the first may have landed. Check dm_history, board_read or dm_inbox's promised list; to send it anyway, call again with resend: true.`;
 }
 
@@ -711,50 +773,82 @@ class SendLanded extends Error {
   }
 }
 
-// The server still moves a session from one alias to the next until it
-// holds several (#284 PR 4 steps 6/7): a bind while bound released the old
-// name, which bindOk's several-holds wording doesn't say.
-function rebindOk(name: string, previous: string, instructions: (general: boolean) => string[], notes: string[]) {
-  const text = [`Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`, ...notes, ...instructions(false)].join(" ");
-  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
-}
+// The text a bind or unbind refusal carries: a lost answer may have landed.
+const lostBind = (e: Error, verb: "bind" | "unbind") =>
+  isLostAnswer(e) ? `${e.message}; the ${verb} may have completed: call ${verb} again with the same name, which is safe, to find out` : e.message;
 
-// bind(name, create?): take an alias, or move to another (#284 S2). The
-// server checks the name (a bare name in your own scope, or scope/name) and
-// switches what this session's connection acts as in one step; claims stay
-// with the alias they were taken under (S6). It runs behind the gate, so no
-// tool call overlaps it. A bind with the same name again is harmless, so an
-// answer lost to a disconnect or a timeout is settled by calling it again.
+// bind(name, create?, meta?): add an alias to this session's holds (#284
+// S1). The server checks the name (a bare name in your own scope, or
+// scope/name) and adds it to what this session's connection receives and may
+// act as; it never drops another hold. It runs behind the gate, so no tool
+// call overlaps it. A bind of a name already held only applies its labels,
+// so an answer lost to a disconnect or a timeout is settled by calling again.
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail(TOOLS_ONLY_BIND);
-  // The agent's choice replaces a restore still waiting on a grace.
-  restoring = null;
-  const previous = bound;
   let ok: BindOk;
   try {
-    ok = await client.request<BindOk>({ type: "bind", alias: String(a.name), create: a.create === true });
+    ok = await client.request<BindOk>({
+      type: "bind", alias: String(a.name), create: a.create === true, ...(a.meta !== undefined ? { meta: a.meta as Record<string, unknown> } : {}),
+    });
   } catch (e) {
-    const why = (e as Error).message;
-    return fail(isLostAnswer(e as Error) ? `${why}; the bind may have completed: call bind again with the same name, which is safe, to find out` : why);
+    return fail(lostBind(e as Error, "bind"));
   }
-  if (ok.alias === previous) return text(`already bound to "${short(ok.alias)}"`);
+  if (held.includes(ok.alias)) return text(`already bound to "${short(ok.alias)}"`);
   testPause("bind:after-acquire");
   adopt(ok);
   nameNotice = null;
   const name = short(ok.alias);
-  console.error(`[grayboard] session ${client.id} bound "${ok.alias}"${previous ? ` (was "${previous}")` : ""}`);
-  const notes = previous ? leftNote(short(previous), ok.left ?? []) : [];
-  // An unbound session already had the general part, acting as its ID.
-  const r = previous
-    ? rebindOk(name, short(previous), (general) => serverBoundInstructions(name, general, boundNotices), notes)
-    : bindOk(name, [name], (general) => serverBoundInstructions(name, general, boundNotices), notes);
+  console.error(`[grayboard] session ${client.id} bound "${ok.alias}"; holds "${held.join('", "')}"`);
+  const r = bindOk(name, held.map(short), instructionsNow);
   // A cancelled call's result is dropped (pi and opencode cancel on abort).
   if (signal.aborted) {
     missedBindNotice = bindMissed(name, "it was cancelled", r.content[0]!.text);
     instructionsStale = true;
   }
   return r;
+}
+
+// unbind(name): release one of this session's holds (#284 S2). Its mail and
+// claims stay with the alias for its next holder; the server stops pushing
+// it here before it answers.
+async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
+  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  if (!PUSH) return fail(TOOLS_ONLY_BIND);
+  const before = primary();
+  let ok: UnbindOk;
+  try {
+    ok = await client.request<UnbindOk>({ type: "unbind", alias: String(a.name) });
+  } catch (e) {
+    return fail(lostBind(e as Error, "unbind"));
+  }
+  // The agent's choice ends a restore still waiting on a grace.
+  restoring.delete(ok.alias);
+  if (!ok.released) return text(notHolding(short(ok.alias)));
+  held = ok.held;
+  if (!held.length) boundNotices = [];
+  writeNames();
+  nameNotice = null;
+  const name = short(ok.alias);
+  console.error(`[grayboard] session ${client.id} released "${ok.alias}"; ${held.length ? `holds "${held.join('", "')}"` : "unbound"}`);
+  const r = unbindOk(name, short(before), short(primary()), ok.left ?? [], instructionsNow);
+  if (signal.aborted) {
+    missedBindNotice = unbindMissed(name, "it was cancelled", r.content[0]!.text);
+    instructionsStale = true;
+  }
+  return r;
+}
+
+// whoami (#284 S6), from this process's own state, which hello_ok, bind_ok,
+// unbind_ok and alias_lost keep in step with the server's.
+function whoami() {
+  return {
+    id: client.id,
+    primary: primary(),
+    aliases: held,
+    principal: hello.user_email,
+    ...(WRITES_AS ? { writes_as: primary() } : {}),
+  };
 }
 
 // ── start stdio transport ─────────────────────────────────────────────────────
@@ -770,7 +864,7 @@ const shutdown = async () => {
   if (stopping) return;
   stopping = true;
   await client.end(2000);
-  if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, client.id);
+  if (RECORDS && !held.length) dropUnboundRecord(RECORD_DIR, process.ppid, client.id);
   process.exit(0);
 };
 process.on("SIGINT",  shutdown);

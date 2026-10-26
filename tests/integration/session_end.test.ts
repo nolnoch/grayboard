@@ -91,7 +91,7 @@ test("a closed session keeps its holds through the grace: a reconnect re-attache
   expect(held).toMatchObject({ type: "error", code: "alias_held", retry_after_ms: GRACE_MS + SWEEP_MS });
   expect(held.holder).toContain(`ends by ${new Date(clock + GRACE_MS).toISOString()}`);
   const detached = srv.app.db.prepare(`SELECT actor, detail FROM access_log WHERE action = 'id.detached' AND target = ?`).all(a.id) as { actor: string; detail: string }[];
-  expect(detached.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: A, held: `${A}/be`, grace_until: clock + GRACE_MS }]);
+  expect(detached.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: A, held: [`${A}/be`], grace_until: clock + GRACE_MS }]);
 
   // Mail sent in the gap, to the alias and to the ID, waits for the session.
   const b = srv.client(await srv.login("bob@example.com"), "ops");
@@ -102,7 +102,7 @@ test("a closed session keeps its holds through the grace: a reconnect re-attache
 
   // The same key re-attaches, holding the alias already, and drains the gap's mail.
   const back = srv.client(alice, "be", { key: a.key });
-  expect(await back.connect()).toMatchObject({ type: "hello_ok", id: a.id, bound: `${A}/be` });
+  expect(await back.connect()).toMatchObject({ type: "hello_ok", id: a.id, bound: [`${A}/be`] });
   expect(back.inbox.filter((m) => m.type === "bind_ok")).toEqual([]);
   const drained = [(await back.next(push)).message, (await back.next(push)).message];
   expect(drained.map((m: Any) => m.body).sort()).toEqual([`gap: ${A}/be`, `gap: ${a.id}`].sort());
@@ -178,7 +178,7 @@ test("a restarted server gives every unended session a fresh grace: one that com
   // The holds survived the restart.
   expect(holder(`${A}/fe`)).toBe(gone.id);
   expect(await srv.client(alice2, "fe").connect()).toMatchObject({ code: "alias_held", retry_after_ms: GRACE_MS + SWEEP_MS });
-  expect(await srv.client(alice2, "be", { key: back.key }).connect()).toMatchObject({ type: "hello_ok", bound: `${A}/be` });
+  expect(await srv.client(alice2, "be", { key: back.key }).connect()).toMatchObject({ type: "hello_ok", bound: [`${A}/be`] });
 
   clock += GRACE_MS;
   srv.app.sweepSessions();
