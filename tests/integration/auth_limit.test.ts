@@ -106,7 +106,7 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
   const logins = audit(srv, "auth.login").map((r) => JSON.parse(r.detail).ip);
   expect(logins.slice(-3)).toEqual([X, X, X]);
 
-  const off = serve({ devAuth: false, googleClientSecret: "s" });
+  const off = serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
   const r = (from: string) => fetch(`${off.srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: "{}" });
   for (let i = 0; i < 5; i++) expect((await r(X)).status).toBe(404);
   expect(off.srv.app.authGate.size).toBe(0);

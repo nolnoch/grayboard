@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -17,7 +19,7 @@ const clients: Client[] = [];
 beforeEach(() => {
   clock = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-streams-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock } });
+  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

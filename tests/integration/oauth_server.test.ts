@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { auth, Client, StreamableHTTPClientTransport, type OAuthClientProvider, type OAuthDiscoveryState, type StoredOAuthTokens } from "@modelcontextprotocol/client";
 import { randomBytes } from "node:crypto";
@@ -19,7 +21,7 @@ beforeEach(() => {
   exchanges = 0;
   app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
-    messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [],
+    messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     oauthClients: [{ clientId: OPENCODE_CLIENT, name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
   }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async input => {
     exchanges++;

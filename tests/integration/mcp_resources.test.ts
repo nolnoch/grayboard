@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -18,7 +20,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 beforeEach(() => {
   clock = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resources-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] }, { hostname: "127.0.0.1", background: false, helloLimit: { burst: 1000, perSec: 1000 }, oauth: { now: () => clock } });
+  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, helloLimit: { burst: 1000, perSec: 1000 }, oauth: { now: () => clock } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
@@ -303,7 +305,7 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
 
 test("explicit open conflicts with an existing live WS-style owner; native and subscriber reads do not", async () => {
   const grant = issue();
-  const login = await fetch(base + "/api/auth/dev-login", { method: "POST", body: JSON.stringify({ email: "alice@example.com" }) });
+  const login = await fetch(base + "/api/auth/dev-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const { session_token } = await login.json() as { session_token: string };
   const ws = new WebSocket(base.replace("http:", "ws:"), { headers: { Authorization: `Bearer ${session_token}` } });
   const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
