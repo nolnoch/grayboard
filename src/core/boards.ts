@@ -1314,7 +1314,7 @@ export function prunePosts(db: Database, olderThanMs: number): void {
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
     // Each name's latest bound or moved event outlives retention: who holds a
-    // name by the record (lastBoundBy, continuityOf) is read from it (#211).
+    // name by the record (latestBinder, continuityOf) is read from it (#211).
     db.prepare(
       `DELETE FROM binding_events WHERE COALESCE(last_at, at) < ? AND id NOT IN
          (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`,

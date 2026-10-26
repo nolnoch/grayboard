@@ -255,15 +255,6 @@ function latestBinder(db: Database, name: string): string | null {
   return row ? asSessionId(row.session_id) : null;
 }
 
-/**
- * Whether `sessionId` holds `name` by the record: the latest bound or moved
- * event for the name is its own. A rebind moves claims from the name it
- * leaves only then (#182 audit 3).
- */
-export function lastBoundBy(db: Database, name: string, sessionId: string): boolean {
-  return latestBinder(db, name) === sessionId;
-}
-
 /** A bind's claim to continue a session on its name, checked against the history. */
 export type Continuity = { verified: boolean; detail: string };
 

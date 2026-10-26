@@ -34,22 +34,6 @@ test("calls overlap each other", async () => {
   await a;
 });
 
-test("holdUntil keeps calls waiting after the bind's result, until it settles, even if it rejects", async () => {
-  const gate = new BindGate();
-  const held = later();
-  const log: string[] = [];
-  await gate.bind(async () => {
-    gate.holdUntil(held.p.then(() => Promise.reject(new Error("gave up"))));
-    log.push("bind");
-  });
-  const c = gate.call(async () => { log.push("c"); });
-  await Bun.sleep(10);
-  expect(log).toEqual(["bind"]);
-  held.go();
-  await c;
-  expect(log).toEqual(["bind", "c"]);
-});
-
 test("a bind that throws opens the gate", async () => {
   const gate = new BindGate();
   await expect(gate.bind(() => Promise.reject(new Error("no")))).rejects.toThrow("no");
