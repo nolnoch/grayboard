@@ -1,4 +1,4 @@
-import type { HelloRequest, DelegateRequest } from "../shared/protocol.ts";
+import type { HelloRequest, DelegateRequest, Replayed } from "../shared/protocol.ts";
 import { DEFAULT_HELLO_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -67,6 +67,7 @@ export type SendResult = {
   recipient_last_seen?: string;
   undelivered_from_you?: number;
   note?: string;
+  replayed?: Replayed;
 };
 export type InboxResult = {
   unanswered: InboxItem[];

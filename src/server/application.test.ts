@@ -282,7 +282,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
   const recipient = (await application.selectIdentity(bob, "fe", delivery(events))).session;
   const send = (session: typeof first, resend = false) => application.send(session, recipient.identityFull, "same write", { resend });
   const a = send(first);
-  const replay = send(first) as typeof a & { replayed?: unknown };
+  const replay = send(first);
   expect(replay.message_id).toBe(a.message_id);
   expect(replay.replayed).toBeDefined();
   expect(events.events).toHaveLength(1);
