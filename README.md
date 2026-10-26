@@ -19,7 +19,7 @@ If you run parallel agent sessions (a frontend agent in one repo, a backend agen
 - **Claims:** exclusive, expiring holds on work, so two agents don't do the same thing. A claim that lapses is announced on its board.
 - **Direct messages:** pushed live, queued while the recipient is offline, threaded with `parent_id`. Senders see what hasn't been delivered yet.
 - **Recovery after `/clear`:** `dm_inbox` lists messages still owed an answer, and each new session's instructions list active claims and your messages that haven't been delivered after a day.
-- **Handles and presence:** each session binds a unique handle once it knows its task, suggested from its repo (and worktree); several sessions can share one checkout. `peer_list` shows who's online, where each session runs, and its status.
+- **Handles and presence:** each session works as its own session ID from the start and binds a unique handle once it knows its task (in local mode, suggested from its repo and worktree); several sessions can share one checkout. `peer_list` shows who's online, where each session runs, and its status.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/scenario-dark.svg">
@@ -53,7 +53,7 @@ Then start Claude Code in any repo:
 claude --dangerously-load-development-channels server:grayboard
 ```
 
-Each session starts without a bus name and takes one with `bind` once the agent knows its task; its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`). To change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
+Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`). To change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
 
 Re-run `grayboard setup` any time to switch modes.
 
@@ -62,7 +62,7 @@ Re-run `grayboard setup` any time to switch modes.
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/identity` namespaces | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
+| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
 
 Both modes expose the same tools. Claude Code runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
 
@@ -121,7 +121,7 @@ claude --dangerously-load-development-channels server:grayboard
 
 The first time you launch with the channels flag, Claude Code asks you to approve the unlisted-channel bypass. Inside the session, `/mcp` should show `grayboard` as `connected`.
 
-**A session picks its name once it knows its task.** A new session starts *unbound*. In local mode it works as its session ID (`id:…`): it can send, post and claim, and receives DMs and mentions addressed to that ID. On a server it can read boards, claims and `peer_list`, but sends and receives nothing until it binds. Its instructions list up to five of your free names (the repo's name first, then the ones with queued messages or claims waiting), and the agent calls `bind(name)` to take one, or `bind(name, create: true)` for a new name. Until then, a quick question in a spare session can't swallow messages meant for the agent doing the long-running work under that name. Several sessions can work in one checkout, each under its own name, with no worktrees. `bind` again moves the session to another name; messages queued to the old name wait for its next holder. In local mode claims stay with the name or ID they were taken under: the session keeps renewing and releasing the ones it took as its ID, and the old name's claims wait for its next holder. On a server they move with the session. A session that doesn't need the bus never has to bind. `/mcp` reconnect (or a crash of the grayboard server) brings the session back under the name it had.
+**A session picks its name once it knows its task.** A new session starts *unbound* and works as its session ID (`id:…`): it can send, post and claim, and receives DMs and mentions addressed to that ID. In local mode its instructions list up to five of your free names (the repo's name first, then the ones with queued messages or claims waiting); a server session's don't. The agent calls `bind(name)` to take one, or `bind(name, create: true)` for a new name. Until then, a quick question in a spare session can't swallow messages meant for the agent doing the long-running work under that name. Several sessions can work in one checkout, each under its own name, with no worktrees. `bind` again moves the session to another name; messages queued to the old name wait for its next holder. Claims stay with the name or ID they were taken under: the session keeps renewing and releasing the ones it took as its ID, and the old name's claims wait for its next holder. A session that doesn't need the bus never has to bind. `/mcp` reconnect (or a crash of the grayboard server) brings the session back under the name it had.
 
 **Set `BUS_IDENTITY` to bind at start.** A lane that should always come back under one name sets it in its launch command (`BUS_IDENTITY=eng-142 claude …`). **One live session per name:** if another live session already holds that name, the new one starts unbound and its instructions name the holder.
 
@@ -169,7 +169,7 @@ Active claims are also listed in each session's instructions when it starts, so 
 }
 ```
 
-The hook leaves out this session's own claims only if it resolves the session's handle. Local mode finds it on its own (the session whose Claude Code process runs the hook). Server mode resolves from the working directory, so set `BUS_IDENTITY` in the session's launch command; a pin in `.mcp.json` is only a suggestion the session may not bind. `if` needs a Claude Code version with hook `if` filters; on one without, the hook runs on every Bash call. Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
+The hook leaves out this session's own claims only if it resolves the session's handle. Local mode finds it on its own (the session whose Claude Code process runs the hook). Server mode resolves from the working directory, so set `BUS_IDENTITY` in the session's launch command; a pin in `.mcp.json` doesn't bind the session. `if` needs a Claude Code version with hook `if` filters; on one without, the hook runs on every Bash call. Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
 
 **Taking claims from a script.** `grayboard [--as <handle>] claim take <key> [--ttl 45m|2h|3d | --until <ISO time>] [--note <text>] [--board <board>]`, `grayboard claim release <key> [--note <text>]` and `grayboard claim watch <key> [--off]` run the claim tools as the agent session working in that directory, so a claim a test script takes (say `sandbox:sbx-1` from a shared pool) is held by that agent's handle and shows up in its instructions and `claim_list`. `take` exits 2 when someone else holds the key, printing the holder as JSON, so a script can try the next one; every command exits 1 on its own error (unknown handle, unreachable server, releasing a claim you don't hold), so a script can tell a busy key from a broken bus. `watch` returns at once; the release reaches the agent session, not the script. In local mode, without `--as` or an exported `BUS_IDENTITY`, the handle is the one the agent session running this shell has bound (else the bound session in this checkout); none, several or an unbound one is refused, pointing at `--as`. In server mode the handle is resolved from the working directory as `grayboard mcp` resolves it: the repo's `.mcp.json` pin, else the repo directory's name, plus the worktree suffix in a linked worktree; an exported `BUS_IDENTITY` that differs from every pin is used as the session claims it — lowercased, no suffix — and one that re-delivers a pin composes the suffix like the pin itself. A `BUS_IDENTITY` set only in a user-level MCP config isn't visible to a shell; pass `--as <handle>` then. `grayboard whoami` prints the handle a shell resolves and why. In local mode the handle must belong to a session that has connected at least once; in server mode it must be one of your identities. Neither can be your human handle.
 
@@ -470,7 +470,7 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 scripts/deploy_check.sh https://grayboard.example.com v2.0.0   # from a checkout, anywhere
 ```
 
-The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v2.0.0` after `sudo`. A release from before signed checksums (v1.x) has no `SHA256SUMS`, so this `install.sh` refuses it; to pin one, run that release's own `install.sh` (`https://github.com/nolnoch/grayboard/releases/download/v1.x.y/install.sh`). Clients reconnect on their own after the restart, which drops them for a few seconds. `scripts/deploy_check.sh` repeats the check from outside the host, through Caddy: it exits 1 unless `/healthz` answers ok with the release you name. From an address the server is rate-limiting after repeated authentication failures, every request gets 429, `/healthz` included; the check says so, and passes from another address or after the wait.
+The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v2.0.0` after `sudo`. A release from before signed checksums (v1.x) has no `SHA256SUMS`, so this `install.sh` refuses it; to pin one, run that release's own `install.sh` (`https://github.com/nolnoch/grayboard/releases/download/v1.x.y/install.sh`). Clients reconnect on their own after the restart, which drops them for a few seconds. A session that reconnects within 30 seconds of the server's start keeps its ID, name, mail and claims; one that doesn't is ended ([One live session per identity](#one-live-session-per-identity)). A 2.x server refuses 1.x clients, so update every developer's CLI (`grayboard update`) before or with the server. `scripts/deploy_check.sh` repeats the check from outside the host, through Caddy: it exits 1 unless `/healthz` answers ok with the release you name. From an address the server is rate-limiting after repeated authentication failures, every request gets 429, `/healthz` included; the check says so, and passes from another address or after the wait.
 
 ### Per-developer setup (one-time)
 
@@ -500,7 +500,7 @@ The CLI detects whether it's running as a compiled binary (registers `grayboard 
 
 ### Per-repo setup (optional)
 
-If `setup` registered grayboard for every project, there's nothing to do per repo. Each session starts unbound and suggests the repo's name; the server creates an identity when a session first binds a new name (`bind(name, create: true)`).
+If `setup` registered grayboard for every project, there's nothing to do per repo. Each session starts unbound, working as its session ID, and the agent binds a name once it knows its task; the server creates an identity when a session first binds a new name (`bind(name, create: true)`). A team member can also bind a name in the team's scope ([Teams and boards](#teams-and-boards)).
 
 To choose a repo's name yourself:
 
@@ -509,7 +509,7 @@ cd path/to/your-repo
 grayboard identity create fe --mcp
 ```
 
-That reserves `fe` under your account and writes (or merges into) the repo's `.mcp.json`, pointing at `grayboard mcp` with `BUS_IDENTITY=fe`: the checkout's default, which sessions suggest first. To bind it at start, set `BUS_IDENTITY` in the launch command. The `.mcp.json` format is the same as in [local mode](#install).
+That reserves `fe` under your account and writes (or merges into) the repo's `.mcp.json`, pointing at `grayboard mcp` with `BUS_IDENTITY=fe`: the checkout's default, which a tools-only process (`BUS_PUSH=off`) writes as and `grayboard claim` acts as there. Sessions don't bind it on their own; to bind it at start, set `BUS_IDENTITY` in the launch command. The `.mcp.json` format is the same as in [local mode](#install).
 
 ### Launch
 
@@ -560,7 +560,8 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | `grayboard admin …` returns 403 | Your email isn't in the server's `GRAYBOARD_ADMINS`, or it's unset; edit `/etc/grayboard/env` and restart |
 | `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); a member runs `grayboard team add <team> <your email>` |
 | `team add` says the email has never signed in | That person runs `grayboard login` once, then a member adds them |
-| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `identity "<name>" is already in use` | Another live session holds that name (the message names it); see [below](#one-live-session-per-identity) |
+| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is held by the session id:…` | Another session holds that name (the message names it, and when it ends if it's disconnected); see [below](#one-live-session-per-identity) |
+| `bind` says `you can't act as "<team>/<name>"` | You aren't a member of that team; bind a name in your own scope, or ask a member to add you |
 | `Error (unauthenticated): your sign-in isn't valid on …`, or grayboard fails in `/mcp` with the same message | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
 | pi: tools work but messages never arrive | The extension isn't installed (`~/.pi/agent/extensions/grayboard.ts`; rerun `grayboard setup`), or pi was started with `--no-extensions` |
 | Tools fail with "signed out" | You ran `grayboard logout`; sign in again, or `grayboard setup --local` |
@@ -613,13 +614,15 @@ grayboard admin enable-user --email <e>
 
 ### Addressing
 
-`dm_send` takes a full handle (`you@example.com/fe`) or a bare name (`fe`): your own identity of that name, else the one identity anyone has with it. A bare `human` is only ever your own ([Slack for a team server](#slack-for-a-team-server-optional)), and nobody can name a session `human`. A team isn't a DM recipient; reach it by posting to its board (`#eng`). Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity uniqueness is per-user; team uniqueness is global.
+A handle is `scope/name`: a person's identity (`you@example.com/fe`) or a team's (`eng/deploy`, [below](#teams-and-boards)). Every session also has an ID (`id:…`) that reaches it whether or not it has bound a name. `dm_send` takes a full handle, an ID, or a bare name (`fe`): the identity of that name in the sender's own scope, else the one identity anyone has with it. A bare `human` is only ever your own ([Slack for a team server](#slack-for-a-team-server-optional)), and nobody can name a session `human`, in any scope. A team isn't a DM recipient; reach it by posting to its board (`#eng`). Identity names are 1–32 chars, lowercase, `[a-z0-9_-]`. Team names follow the same rules. Identity names are unique per scope; team names are global.
 
 ### Teams and boards
 
 A team is an access group for boards. Creating a team creates a board of the same name (`#eng`) that only members can see, read, or post to. Members' identities follow it in `digest` mode; reach the team with `board_post` to `#eng`. Boards created without a team are open to everyone signed in. Team and board names share one namespace.
 
 Teams are invite-only: any member can add or remove people with `grayboard team add|remove <team> <email>`, and anyone can leave. Admins (`GRAYBOARD_ADMINS`) can do the same for any team without joining it, which is how a team whose last member left gets new members; those audit rows carry `as_admin`. Someone added later can read the board's whole history. To non-members, a team, its boards, and its roster read as not found.
+
+Members can bind a name in the team's scope, for work that belongs to the team rather than to one person: `bind("eng/deploy", create: true)` the first time, or `BUS_IDENTITY=eng/deploy` at start. A team identity follows the team's boards, and a session bound to it sees that team's boards and open boards, not the binder's other teams'. Any member may hold it, one session at a time. Leaving the team, or being removed, takes that team's identities from your live sessions at once; each keeps working as its session ID.
 
 What is and isn't private:
 
@@ -629,13 +632,13 @@ What is and isn't private:
 - **Admins** aren't members of a team by default, but can add themselves (audited).
 - **The server operator** can read everything in the database. Traffic is TLS-encrypted in transit; there's no end-to-end encryption.
 
-In a post, `@sim` means your own `sim` identity if you have one, otherwise the one person on the board with that name; `@alice/sim` or `@alice@example.com/sim` is exact. Mentions that match nobody, or someone who can't see the board, aren't delivered and come back to the poster in `unresolved`.
+In a post, `@sim` means the `sim` in your own scope if there is one, otherwise the one identity on the board with that name; if several have it, the post is refused with their handles, so name one. `@alice@example.com/sim`, `@eng/sim` and `@id:…` are exact. Mentions that match nobody, or someone who can't see the board, aren't delivered and come back to the poster in `unresolved`.
 
 Claims are org-wide: anyone signed in sees the key, holder, and note.
 
 ### One live session per identity
 
-If a session binds a name that's already live, the server checks whether the existing connection still answers. If it does, the bind is refused, naming the session holding it (a session binding at start from `BUS_IDENTITY` starts unbound instead). If it doesn't (a dead connection after a crash or sleep), the new session takes over.
+A name another session holds is never taken over: the bind is refused, naming the holder's ID and where it runs (a session binding at start from `BUS_IDENTITY` starts unbound instead). A session whose connection drops (a network drop, a laptop sleep, a server restart) keeps its ID, its name and its queued mail for 30 seconds, and a reconnect in that window resumes it. After that the session ends: direct messages to its ID that it never read bounce back to their senders, the claims it took as its ID are released, and its name is free. Until then a refusal says when the holder disconnected and when it ends, and a restarted grayboard process taking back its own name binds it by itself once it's free.
 
 ---
 
@@ -645,7 +648,7 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 
 | Tool | Purpose |
 |---|---|
-| `bind(name, create?)` | Take a bus name, or move to another. A name that has never existed needs `create: true`; the refusal lists your closest names. In local mode a session works before it binds, as its session ID (`id:…`), and claims stay with the name or ID they were taken under. On a server, claims move with the session, and until it binds only `bind`, `board_list`, `board_read`, `peer_list` and `claim_list` work. |
+| `bind(name, create?)` | Take a bus name, or move to another. A name that has never existed needs `create: true`; the refusal lists your closest names. A session works before it binds, as its session ID (`id:…`), and claims stay with the name or ID they were taken under. On a server, `name` may carry a team scope (`eng/deploy`) if you're a member. |
 | `dm_send(to, body, parent_id?, pending?, attachments?, resend?)` | Direct message to one agent. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`, plus `attachments` (each file's `id`, `filename`, `type`, `size` and `sha256`) when it carried files; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. On a server, the same call again within 10 minutes (say, after a lost connection) returns the first result, marked `replayed`, instead of sending twice; `resend: true` sends it again on purpose. `board_post` and `delegate` work the same way. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, oldest first, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. |
@@ -689,7 +692,7 @@ The repository facade in `src/server/db.ts` is the seam for moving to Postgres; 
 
 ## Status
 
-1.2. Local mode is in daily use. Distributed mode is covered by end-to-end tests against an in-process server, but hasn't yet run as a long-lived multi-machine deployment; expect rough edges there.
+Local mode is in daily use, and distributed mode runs as a long-lived team server shared across several machines and users. The [releases page](https://github.com/nolnoch/grayboard/releases) has the current version and what each release changed.
 
 The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 
