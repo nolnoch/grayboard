@@ -159,3 +159,98 @@ test("a team alias in use by one member's session refuses another member's write
   expect(await own.request({ type: "end" })).toMatchObject({ type: "end_ok" });
   expect((await srv.upload(alice, "eng/build", "a.txt", "x")).status).toBe(201);
 });
+
+// #284 PR 4: a revocation takes only the alias it revokes. A session holding
+// two team aliases keeps the other, and the oldest hold left is its primary.
+test("losing one of two team aliases keeps the other, which becomes the primary", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/ops/add", { email: B })).status).toBe(200);
+  const s = srv.client(bob, "eng/build");
+  await s.connect();
+  expect(await s.bind("ops/run", { create: true })).toMatchObject({ type: "bind_ok", held: ["eng/build", "ops/run"] });
+  const peer = srv.client(alice, "fe");
+  await peer.connect();
+  const senderOf = async (c: typeof s) => {
+    const sent = await c.request({ type: "send", recipient: "alice@example.com/fe", body: "who" });
+    expect(sent).toMatchObject({ type: "send_ok" });
+    return rows(`SELECT sender FROM messages WHERE id = ?`, String(sent.message_id))[0];
+  };
+  expect(await senderOf(s)).toEqual({ sender: "eng/build" });
+
+  expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
+  expect(await s.next((m: Any) => m.type === "alias_lost")).toEqual({ type: "alias_lost", alias: "eng/build", reason: REASON });
+  expect(holder("eng/build")).toEqual([]);
+  expect(holder("ops/run")).toEqual([s.id]);
+  expect(await senderOf(s)).toEqual({ sender: "ops/run" });
+  // Mail to the kept alias still reaches it.
+  expect(await peer.request({ type: "send", recipient: "ops/run", body: "still yours" })).toMatchObject({ type: "send_ok" });
+  expect(await s.next((m: Any) => m.type === "push" && m.message.body === "still yours")).toBeDefined();
+  expect(revoked()).toEqual([{ actor: "alice@example.com", target: "eng/build", detail: { session: s.id, principal: B, reason: REASON } }]);
+});
+
+const labels = (address: string) => rows(`SELECT task, source_board FROM aliases WHERE address = ?`, address)[0];
+const metaSets = (address: string) => rows(`SELECT actor, detail FROM access_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY id`, address).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
+const peerRow = async (c: { call: (t: string, a?: Record<string, unknown>) => Promise<Any> }, match?: Record<string, string>) =>
+  ((await c.call("peer_list", { include_offline: true, ...(match ? { match } : {}) })).result.peers as Any[]).find((p) => p.handle === "eng/build");
+
+// #284 S12, S13 over the server: bind's meta labels a team alias; a re-bind of
+// a held alias changes only labels that differ; the labels reach only members.
+test("bind's meta over WSS: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no labels", async () => {
+  const build = srv.client(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142", source_board: "#E2E" } }, hello: { model: "opus" } });
+  expect((await build.connect()).bind_ok).toMatchObject({ alias: "eng/build" });
+  expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
+  expect(metaSets("eng/build")).toEqual([{ actor: build.id, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
+  const boundAt = () => rows(`SELECT bound_at FROM alias_holds WHERE address = 'eng/build'`);
+  const at = boundAt();
+  const bound = () => rows(`SELECT event FROM binding_events WHERE name = 'eng/build'`).length;
+  const events = bound();
+
+  // Held already: the same labels write nothing; a change is audited; neither is a bind.
+  expect(await build.bind("eng/build", { meta: { task: "ENG-142" } })).toMatchObject({ type: "bind_ok", held: ["eng/build"] });
+  expect(metaSets("eng/build")).toHaveLength(1);
+  expect(await build.bind("eng/build", { meta: { task: "" } })).toMatchObject({ type: "bind_ok" });
+  expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
+  expect(metaSets("eng/build").at(-1)!.detail).toEqual({ address: "eng/build", fields: { task: null }, session: build.id });
+  expect(boundAt()).toEqual(at);
+  expect(bound()).toBe(events);
+
+  // Refusals change nothing.
+  expect(await build.bind("eng/build", { meta: { task: "x".repeat(201) } })).toMatchObject({ type: "error", code: "bad_request", message: "meta.task must be at most 200 chars" });
+  expect(await build.bind("eng/build", { meta: { source_board: "not a board" } })).toMatchObject({ type: "error", code: "bad_request", message: expect.stringContaining(`invalid board name "not a board"`) });
+  expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
+  expect(await build.bind("eng/build", { meta: { task: "ENG-142" } })).toMatchObject({ type: "bind_ok" });
+
+  // A non-member can't bind it, so can't label it.
+  const carol = await srv.login("carol@example.com");
+  const outsider = srv.client(carol, null);
+  await outsider.connect();
+  expect(await outsider.bind("eng/build", { meta: { task: "mine" } })).toMatchObject({ type: "error", code: "forbidden" });
+  expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
+
+  // The labels reach a member; a non-member's row has only the session's facts, and match can't probe them.
+  const member = srv.client(alice, "fe");
+  await member.connect();
+  expect(await peerRow(member)).toMatchObject({ task: "ENG-142", source_board: "e2e", model: "opus" });
+  expect(await peerRow(member, { task: "eng-142" })).toBeDefined();
+  const seen = (await peerRow(outsider))!;
+  expect(seen).toMatchObject({ handle: "eng/build", model: "opus" });
+  expect(seen.task).toBeUndefined();
+  expect(seen.source_board).toBeUndefined();
+  expect(await peerRow(outsider, { task: "ENG-142" })).toBeUndefined();
+});
+
+// #284 S13: peer_list's match through the tool, each key ANDed and case-insensitive.
+test("peer_list's match over WSS: model, task, id and scope; an unknown key is refused", async () => {
+  const build = srv.client(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142" } }, hello: { model: "opus" } });
+  await build.connect();
+  const member = srv.client(alice, "fe", { hello: { model: "sonnet" } });
+  await member.connect();
+  const handles = async (match: Record<string, string>) => ((await member.call("peer_list", { match })).result.peers as Any[]).map((p) => p.handle);
+  expect(await handles({ model: "OPUS" })).toEqual(["eng/build"]);
+  expect(await handles({ task: "eng-142", model: "opus" })).toEqual(["eng/build"]);
+  expect(await handles({ task: "eng-142", model: "sonnet" })).toEqual([]);
+  expect(await handles({ id: build.id })).toEqual(["eng/build"]);
+  expect(await handles({ scope: "eng" })).toEqual(["eng/build"]);
+  expect(await handles({ scope: "alice@example.com" })).toEqual(["alice@example.com/fe"]);
+  expect(await member.call("peer_list", { match: { colour: "red" } })).toMatchObject({ type: "error", message: expect.stringContaining(`match has no key "colour"`) });
+});

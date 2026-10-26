@@ -940,3 +940,38 @@ test("#284 #360: grayboard claim release as an alias releases its session's ID-h
   expect(mine.code, mine.err).toBe(0);
   expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([]);
 }, 30_000);
+
+// #284 S10 on the server: a restart takes back what it can of its record; a
+// name another live session holds is named in a note, and the rest still bind.
+test("#284 S10: a restart takes back its names but one held by another, which a note names", async () => {
+  let s = await session("be");
+  await s.call("bind", { name: "api", create: true });
+  const path = join(srv.dir, "home", ".claude-bus", `bind.${s.harnessPid}`);
+  const rec = JSON.parse(readFileSync(path, "utf8"));
+  expect(rec.names).toEqual([`${A}/be`, `${A}/api`]);
+  await s.call("unbind", { name: "api" });
+  const t = await session(null);
+  const tid = await sessionId(t);
+  await t.call("bind", { name: "api" });
+  writeFileSync(path, JSON.stringify(rec));
+  s = await s.restart("reconnect");
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
+  expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: tid }]);
+  expect(s.c.getInstructions()).toContain(`This grayboard process restarted; the one before it held "api", but`);
+  expect(s.c.getInstructions()).toContain("so this session doesn't hold it.");
+  expect(s.c.getInstructions()).not.toContain(`You also hold "api"`);
+}, 40_000);
+
+// A record written before several aliases carries one `name`; client files
+// can't be migrated, so it still restores.
+test("#284 S10: a name record from before several aliases (one `name`) still restores on the server", async () => {
+  let s = await session("api");
+  const path = join(srv.dir, "home", ".claude-bus", `bind.${s.harnessPid}`);
+  const { names, ...rec } = JSON.parse(readFileSync(path, "utf8"));
+  expect(names).toEqual([`${A}/api`]);
+  writeFileSync(path, JSON.stringify({ ...rec, name: `${A}/api` }));
+  const before = events("api").at(-1)!.session_id;
+  s = await s.restart("reconnect");
+  expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
+  expect(events("api").at(-1)).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restore claimed from ${before}, not verified` });
+}, 30_000);
