@@ -687,7 +687,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
       if (reused) writeAudit(repo, "id.reused", authed.user_email, id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at });
       writeAudit(repo, "id.registered", authed.user_email, id, {
-        delivery: push ? "push" : "none", ...(m.hold ? { hold: true } : {}), ...(writesAs === undefined ? {} : { writes_as: writesAs.address }), keyed: m.keyed === true, place: where,
+        delivery: writesAs === undefined ? "push" : "none", ...(m.hold ? { hold: true } : {}), ...(writesAs === undefined ? {} : { writes_as: writesAs.address }), keyed: m.keyed === true, place: where,
       });
     });
   } else {

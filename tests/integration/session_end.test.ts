@@ -235,3 +235,21 @@ test("a send or @id: mention to an ID that can't receive carries its code: not_f
   expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM messages`).get()).toEqual({ n: 0 });
   expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM posts`).get()).toEqual({ n: 0 });
 });
+
+// #284 S7: a hold session takes mail like local channels-off (#71): it gets
+// no pushes, and what's sent to it waits for dm_inbox. Its row and its
+// id.registered audit both say delivery 'push'; only tools-only is 'none'.
+test("a hold session registers delivery push: a send to its ID is accepted and waits", async () => {
+  const alice = await srv.login(A);
+  const a = srv.client(alice, "be");
+  await a.connect();
+  const held = srv.client(alice, "fe", { push: false, hold: true });
+  await held.connect();
+  const registered = srv.app.db.prepare(`SELECT detail FROM access_log WHERE action = 'id.registered' AND target = ?`).get(held.id) as { detail: string };
+  expect(JSON.parse(registered.detail)).toMatchObject({ delivery: "push", hold: true });
+  expect(srv.app.db.prepare(`SELECT delivery FROM ids WHERE id = ?`).get(held.id)).toEqual({ delivery: "push" });
+
+  expect(await a.request({ type: "send", recipient: held.id, body: "for later" })).toMatchObject({ type: "send_ok", delivered_now: false });
+  await held.none(push);
+  expect(await held.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok", unanswered: [expect.objectContaining({ body: "for later", from: `${A}/be` })] });
+});
