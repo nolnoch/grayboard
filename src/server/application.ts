@@ -1,20 +1,22 @@
 import type { HelloRequest, DelegateRequest } from "../shared/protocol.ts";
-import { DEFAULT_HELLO_LIMIT, HelloLimiter, type HelloLimit } from "./hello_limit.ts";
+import { DEFAULT_HELLO_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
+import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
+import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
-import { MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, mintSessionId, orderCandidates, continuityOf, sessionIdOf, unboundPeer, unknownNameError, type Candidate } from "../core/bindings.ts";
-import { participant, type MessageRow, type Repo } from "./db.ts";
+import { MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, closestNames, lastBoundBy, lastWasRelease, logBinding, clearHolds, dropHold, holdAlias, idAddress, mintSessionKey, orderCandidates, continuityOf, unboundPeer, unknownNameError, type Candidate } from "../core/bindings.ts";
+import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address } from "../shared/addressing.ts";
 import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, startSession, touchHandle, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
+import { acknowledge, age, checkBody, lastSeen, pendingFor, refOf, sessionsSeen, setPlace, touchAlias, touchId, registerId, idPrincipal, idCollisionText, inheritStatus, normalizeBoard, type CoreDb, type Pending, type PendingRef, type UnboundPeer } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { callBoardTool, claimsInstruction, isBoardTool } from "../core/tools.ts";
-import { attachmentIds, sweepBlobs } from "../core/attachments.ts";
+import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
+import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs } from "../core/attachments.ts";
 import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
-import { onIdentityCreated } from "./teams.ts";
-import { PROMISE_DAYS, STALE_UNDELIVERED_MS, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showPending, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
+import { onAliasCreated } from "./teams.ts";
+import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 
 export type ApplicationCode =
   | "unauthenticated"
@@ -26,14 +28,15 @@ export type ApplicationCode =
   | "identity_in_use"
   | "identity_unknown"
   | "unbound"
-  | "rate_limited";
+  | "rate_limited"
+  | "id_collision";
 
 export class ApplicationError extends Error {
   constructor(readonly code: ApplicationCode, message: string, readonly extra: { known?: string[]; holder?: string; retry_after_ms?: number } = {}) {
     super(message);
   }
 }
-export type DirectMessage = ReturnType<typeof showPending<MessageRow>>;
+export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
   | { kind: "direct"; message: DirectMessage }
@@ -54,6 +57,7 @@ export type IdentityInfo = {
   notices?: string[];
   human: { handle: string; linked: boolean };
   attachment_limits: AttachmentLimits;
+  write_dedup?: true;
 };
 export type SendResult = {
   message_id: number;
@@ -73,10 +77,12 @@ export type ApplicationOptions = {
   probeMs?: number;
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
-  helloLimit?: HelloLimit;
+  helloLimit?: RateLimit;
+  now?: () => number;
 };
 export type IdentityOptions = Omit<HelloRequest, "type" | "req_id" | "identity"> & {
   alive?: () => boolean;
+  transport?: "wss" | "hosted";
 };
 
 // Only sessions registered by this application may execute operations.
@@ -87,7 +93,8 @@ export class ApplicationSession {
   place: string | null = null;
   readOnly = false;
   owner = false;
-  identityId = 0;
+  writerId?: string;
+  transport: "wss" | "hosted" = "wss";
   identityName = "";
   identityFull = "";
   constructor(
@@ -116,6 +123,7 @@ type Hub = {
   probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
+  now: () => number;
 };
 function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void {
   for (const item of pendingFor(db, session.identityFull, { all })) {
@@ -162,17 +170,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     probeMs: opts.probeMs ?? 2000,
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
+    now: opts.now ?? Date.now,
   };
-  const helloLimiter = new HelloLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
-    start: (_id, email, ctx, retryAfterMs) => {
+  const helloLimiter = new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
+    start: (email, ctx, retryAfterMs) => {
       console.error(`[grayboard] rate-limiting hellos from ${email}`);
       writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
     },
-    end: (_id, email, refused) => {
+    end: (email, refused) => {
       console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
       writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
     },
-  });
+  }, opts.now);
+  clearHolds(db);
   const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
   const revoked = new Map<number, number>();
   function release(session: ApplicationSession, why: string) {
@@ -186,8 +196,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (hub.registry.get(session.identityFull) === session) hub.registry.delete(session.identityFull);
     if (hub.holders.get(session.identityFull) === session) {
       hub.holders.delete(session.identityFull);
-      touchHandle(db, session.identityFull);
+      if (!session.human) dropHold(db, session.identityFull, session.sessionId);
+      touchAlias(db, session.identityFull);
     }
+    if (session.writerId) touchId(db, session.writerId);
     release(session, why);
   }
   function terminate(session: ApplicationSession, error: ApplicationError, why = error.message) {
@@ -206,8 +218,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const { holders, registry } = hub;
     // Before database work; trusted bridge attachments are the server's own.
     if (!human) {
-      const t = helloLimiter.take(authed.user_id, authed.user_email, {
-        session_id: m.session_key ? sessionIdOf(m.session_key) : null,
+      const t = helloLimiter.take(authed.user_email, {
+        session_id: m.session_key ? idAddress(m.session_key) : null,
         ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
         place: m.where ?? null,
       });
@@ -218,9 +230,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     const push = m.push !== false;
     const owns = push || m.hold === true;
-    const sessionId = m.session_key ? sessionIdOf(m.session_key) : mintSessionId();
+    const sessionId = idAddress(m.session_key ?? mintSessionKey());
     const session = new ApplicationSession(authed, sink, human, push);
     session.sessionId = sessionId;
+    session.transport = m.transport ?? "wss";
     session.place = m.where ?? null;
     const epoch = revoked.get(authed.user_id);
     const alive = () => session.active && (m.alive?.() ?? true) && (human || revoked.get(authed.user_id) === epoch);
@@ -257,8 +270,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
     // A typo would otherwise create a fresh name, and the DMs queued for the
     // intended one would never arrive.
-    if (m.create === false && !repo.identities.findByUserAndName(authed.user_id, name)) {
-      const known = closestNames(name, repo.identities.listForUser(authed.user_id).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
+    if (m.create === false && !repo.aliases.find(authed.user_email, name)) {
+      const known = closestNames(name, repo.aliases.listFor(authed.user_email).map((i) => i.name).filter((n) => n !== HUMAN_NAME));
       const message = unknownNameError(name, known);
       return refuse("identity_unknown", message, message, { known });
     }
@@ -295,6 +308,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
     }
 
+    // A session's ID is one principal's (#284): a key whose ID is another
+    // user's session is refused, never attached to that session's row. From
+    // here to registry.set nothing awaits, so the row read here stands.
+    const prior = owns && !human ? idPrincipal(db, sessionId) : undefined;
+    if (prior !== undefined && prior !== authed.user_email) {
+      writeAudit(repo, "id.collision", authed.user_email, sessionId, { name: full });
+      return refuse("id_collision", idCollisionText(sessionId, "is another principal's session"), "id_collision");
+    }
+
     // A rebind names the name it leaves (#182 audit 3). Its claims move only
     // if this session holds that name by the record and no other connection
     // holds it live; that holds whether or not the old connection is open. A
@@ -317,33 +339,48 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
 
     if (!alive() || repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "an admin signed this user out");
-    let identity = repo.identities.findByUserAndName(authed.user_id, name);
-    if (!identity) {
-      identity = repo.identities.create(authed.user_id, name);
-      writeAudit(repo, "identity.created", authed.user_email, name, { lazy: true });
-      onIdentityCreated(db, repo, authed.user_id, full);
+    if (!repo.aliases.find(authed.user_email, name)) {
+      repo.aliases.create(authed.user_email, name);
+      writeAudit(repo, "alias.created", authed.user_email, full, { lazy: true, ...(session.human ? {} : { session: sessionId }) });
+      onAliasCreated(db, repo, authed.user_id, full);
     }
 
-    session.identityId = identity.id;
-    session.identityName = name;
-    session.identityFull = full;
     hub.sessions.add(session);
     let moved: string[] | undefined;
     if (owns) {
       moved = [];
       holders.set(full, session);
       if (push) registry.set(full, session);
-      // Preserve status only when the name's binding history verifies continuity.
+      // The session's rows (#284): its ids row, written by its first owner
+      // hello and updated by the rest (a reconnect, a rebind), and its hold.
+      // The Slack bridge's humans have no ID.
+      if (!session.human) {
+        if (prior === undefined) registerId(db, { id: sessionId, principal: authed.user_email, place: m.where ?? null, launcher: push && m.launcher === true, keyed: m.session_key !== undefined });
+        else {
+          setPlace(db, sessionId, m.where ?? null);
+          touchId(db, sessionId);
+        }
+        holdAlias(db, full, sessionId);
+        session.writerId = sessionId;
+      }
+      // A reconnect, or a restart taking its name back, is the same session, so
+      // its status stays, once the name's history shows it (#211). The session
+      // ID comes from the client's secret, so a reconnect proves itself; a
+      // restore names a public ID. A rebind is neither: it logs `moved`.
       const continued = m.from !== undefined ? null
         : m.resume ? continuityOf(db, full, { reconnect: sessionId })
         : m.restored_from !== undefined ? continuityOf(db, full, { restartOf: m.restored_from })
         : null;
-      if (continued?.verified) touchHandle(db, full);
-      else startSession(db, full, null);
-      setPlace(db, full, m.where ?? null);
+      // A verified restore is the same harness session: its status carries over.
+      if (continued?.verified && m.restored_from !== undefined && !session.human) inheritStatus(db, sessionId, m.restored_from);
+      touchAlias(db, full);
+      // Only a push-mode owner advertises the capability (a hold or tools-only
+      // connection can't receive a delegation, so it must not be one). Every
+      // owner hello rewrites the flag and audits it, changed or not (#184 review 4/6).
       if (push) {
-        setLauncher(db, full, m.launcher === true);
-        writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true });
+        // registerId wrote the flag for a new row; a later hello rewrites it.
+        if (!session.human && prior !== undefined) setLauncher(db, sessionId, m.launcher === true);
+        writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: m.launcher === true, ...(session.human ? {} : { session: sessionId }) });
       }
       session.owner = true;
       if (from) {
@@ -352,7 +389,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         if (prev) {
           holders.delete(from);
           if (registry.get(from) === prev) registry.delete(from);
-          touchHandle(db, from);
+          dropHold(db, from, sessionId);
+          touchAlias(db, from);
         }
         moved = db.transaction(() => moveClaims(db, from, full))().map((c) => c.key);
         if (prev?.owner) release(prev, `rebound to ${full}`);
@@ -362,10 +400,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         logBinding(db, sessionId, full, "bound", [continued?.detail ?? null, notMoved].filter((d) => d !== null).join("; ") || null);
       }
     } else {
-      touchHandle(db, full);
-    }
 
-    const info: IdentityInfo = { ...infoFor(full), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
+      touchAlias(db, full);
+    }
+    session.identityName = name;
+    session.identityFull = full;
+
+    const info: IdentityInfo = { ...infoFor(full), ...(m.session_key ? { write_dedup: true as const } : {}), ...(moved ? { moved } : {}), ...(notMoved ? { not_moved: notMoved } : {}) };
     // Tools-only requests and the bridge's human attachment cannot consume the owner's notice.
     const bridgeNotice = owns && !human ? owedBridgeNotice(repo, authed.user_email) : undefined;
     const notices = [
@@ -373,7 +414,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       ...undeliveredInstruction(repo.messages.undeliveredFrom(full, Date.now() - STALE_UNDELIVERED_MS), h => lastSeen(db, h)),
       ...(bridgeNotice ? [bridgeNotice] : []),
       // Last: claims are the longest notice, so a client cut must lose them first.
-      ...claimsInstruction(listClaims(db, undefined, full), full),
+      ...claimsInstruction(listClaims(db, undefined, full), [full]),
     ];
     if (notices.length) info.notices = notices;
     return { session, info };
@@ -386,9 +427,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     replay(session: ApplicationSession) {
       valid(session, true);
       if (session.readOnly || !session.push || hub.registry.get(session.identityFull) !== session) return;
-      const since = repo.cursors.get(session.identityId, "direct", session.identityFull);
+      const since = repo.cursors.get(session.identityFull, "direct", session.identityFull);
       for (const message of repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])) {
-        session.sink.deliver({ kind: "direct", message: showPending(message) });
+        session.sink.deliver({ kind: "direct", message: showMessage(message) });
       }
       drainBoards(session, db, true);
     },
@@ -396,10 +437,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       session: ApplicationSession,
       recipient: string,
       body: string,
-      options: { parent_id?: number; pending?: boolean; attachment_ids?: number[] } = {},
+      options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean } = {},
     ) {
       valid(session);
-      return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids);
+      return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true);
     },
     delegate(session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       valid(session);
@@ -436,7 +477,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     retract(session: ApplicationSession, id: number) {
       valid(session);
-      handleRetract(hub, session, id);
+      return handleRetract(hub, session, id);
     },
     call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
@@ -465,6 +506,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       helloLimiter.sweep();
       for (const s of hub.sessions) s.sink.keepAlive?.();
     },
+    sweepHellos: () => helloLimiter.sweep(),
     stopExpiry: expiry.stop,
   };
   return application;
@@ -479,7 +521,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
   const { repo, db, holders } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
   const free = (n: string) => n !== HUMAN_NAME && !holders.has(full(n));
-  const names = repo.identities.listForUser(authed.user_id).map((i) => i.name).filter(free);
+  const names = repo.aliases.listFor(authed.user_email).map((i) => i.name).filter(free);
   const queued = repo.messages.queuedTo(names.map(full));
   const seen = sessionsSeen(db, names.map(full));
   const claims = new Map<string, number>();
@@ -506,13 +548,13 @@ function resolvePeer(repo: Repo, session: ApplicationSession, input: string): Ad
   const { authed } = session;
   if (isValidIdentityName(input)) {
     const name = input.toLowerCase();
-    if (repo.identities.findByUserAndName(authed.user_id, name)) {
+    if (repo.aliases.find(authed.user_email, name)) {
       input = formatDirectAddress(authed.user_email, name);
     } else if (name === HUMAN_NAME) {
       // Every linked user has one; listing them would only leak who linked.
       fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
     } else {
-      const all = repo.identities.findAllByName(name);
+      const all = repo.aliases.findAllByName(name);
       if (all.length !== 1) {
         const which = all.length ? `several identities are named "${name}": ${all.map(i => formatDirectAddress(i.email, i.name)).sort().join(", ")}` : `no identity is named "${name}"`;
         fail("not_found", `${which}; peer_list shows exact handles`);
@@ -527,108 +569,144 @@ function resolvePeer(repo: Repo, session: ApplicationSession, input: string): Ad
   }
 }
 
-function handleSend(
-  hub: Hub,
-  session: ApplicationSession,
-  recipientStr: string,
-  body: string,
-  parentId: number | null,
-  pending: boolean,
-  attachmentIdsRaw: unknown,
-): SendResult {
-  const { repo, db, registry } = hub;
+type PreparedSend = { to: string; body: string; parentId: number | null; pending: boolean; ids: number[]; digests: string[] };
+
+// Checks a send and resolves its recipient, writing nothing; throws ApplicationError.
+function prepareSend(
+  hub: Hub, session: ApplicationSession, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+): PreparedSend {
+  const { repo, db } = hub;
+  const { authed } = session;
   let ids: number[];
+  let digests: string[];
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
+    digests = uploadDigests(db, ids, session.identityFull);
   } catch (e) {
-    return fail("bad_request", (e as Error).message);
+    if (e instanceof CoreError) throw new ApplicationError("bad_request", e.message);
+    throw e;
   }
 
-  const { authed } = session;
   const parsed = resolvePeer(repo, session, recipientStr);
 
   const principal: SendPrincipal = {
     user_id:       authed.user_id,
     user_email:    authed.user_email,
-    identity_id:   session.identityId,
     identity_name: session.identityName,
     identity_full: session.identityFull,
   };
 
-  if (parsed.kind === "team") {
-    fail("bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
-  }
+  if (parsed.kind === "team") throw new ApplicationError("bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
 
   const recipientUser = repo.users.findByEmail(parsed.email);
-  if (!recipientUser) {
-    fail("not_found", `user "${parsed.email}" not found`);
-  }
-  const recipientIdentity = repo.identities.findByUserAndName(recipientUser.id, parsed.name);
-  if (!recipientIdentity) {
-    fail("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
-  }
+  if (!recipientUser) throw new ApplicationError("not_found", `user "${parsed.email}" not found`);
+  if (!repo.aliases.find(recipientUser.email, parsed.name)) throw new ApplicationError("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
   const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
-  if (!decision.allow) {
-    fail(decision.code, decision.reason);
-  }
+  if (!decision.allow) throw new ApplicationError(decision.code, decision.reason);
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), session.identityFull)) {
-    fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
+    throw new ApplicationError("not_found", `parent_id ${parentId} is not a message you sent or received`);
   }
+  return { to: parsed.full, body, parentId, pending, ids, digests };
+}
 
+// Writes the message and builds its result. Runs inside the caller's
+// transaction; whether the recipient is live is read here, with nothing
+// awaited before deliverSend pushes, so the result says what happens.
+function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Written<SendResult> & { msg: MessageRow } {
+  const { repo, db, registry } = hub;
   let msg: MessageRow;
   try {
-    msg = repo.messages.insert(session.identityFull, "user", parsed.full, body, parentId, pending, ids);
+    msg = repo.messages.insert(session.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null);
   } catch (e) {
-    if (e instanceof CoreError) return fail("bad_request", e.message);
+    if (e instanceof CoreError) throw new ApplicationError("bad_request", e.message);
     throw e;
   }
+  const f = { ...(p.pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
+  const seen = lastSeen(db, p.to);
+  const payload: SendResult = registry.get(p.to)?.active
+    ? { message_id: msg.id, delivered_now: true, ...f }
+    : {
+        message_id: msg.id,
+        delivered_now: false,
+        ...f,
+        ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+        undelivered_from_you: repo.messages.undeliveredFrom(session.identityFull).find((u) => u.recipient === p.to)?.n ?? 1,
+        note: queuedNote(p.to, seen),
+      };
+  return { payload, ref: { kind: "message", id: msg.id }, msg };
+}
+
+// After a fresh send's commit (never a replay's): its files' audit rows and
+// the push to a live recipient.
+function deliverSend(hub: Hub, session: ApplicationSession, msg: MessageRow): void {
   for (const a of msg.attachments ?? []) {
-    writeAudit(repo, "attachment.bound", authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, message_id: msg.id, recipient: parsed.full });
+    writeAudit(hub.repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, message_id: msg.id, recipient: msg.recipient });
   }
-  const p = { ...(pending ? { pending: true as const } : {}), ...(msg.attachments ? { attachments: msg.attachments } : {}) };
+  const recipientWs = hub.registry.get(msg.recipient);
+  if (recipientWs?.active) recipientWs.sink.deliver({ kind: "direct", message: showMessage(msg) });
+}
 
-  let deliveredNow = false;
-  const recipientSession = registry.get(parsed.full);
-  if (recipientSession?.active) {
-    recipientSession.sink.deliver({ kind: "direct", message: showPending(msg) });
-    deliveredNow = true;
-  }
+// An append write, deduplicated (#254): an identical call by this session
+// within the window answers with the first one's result. The Slack bridge's
+// humans are exempt: a person typing a line twice sent it twice. `uploads`:
+// the call's attachment ids; a replay releases them (the retry uploaded its
+// files afresh, and nothing will bind them), audited like any release.
+function writeOnce<W extends Written>(
+  hub: Hub, session: ApplicationSession, tool: DedupTool, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
+): DedupOutcome<W> {
+  const { repo } = hub;
+  if (session.human) return { fresh: repo.atomic(write) };
+  const { authed, identityFull: me } = session;
+  const out = dedupWrite(repo, hub.now(), {
+    tool, session: session.sessionId!, sender: me, actor: authed.user_email, transport: session.transport, args, resend,
+  }, write, () => {
+    for (const row of dropUnsentUploads(hub.db, uploads, me)) {
+      writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
+        identity: me, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
+      });
+    }
+  });
+  if ("replay" in out && uploads.length > 0) void sweepBlobs(hub.db, repo.blobs);
+  return out;
+}
 
-  if (deliveredNow) {
-    return { message_id: msg.id, delivered_now: true, ...p };
-  }
-  const seen = lastSeen(db, parsed.full);
-  return {
-    message_id: msg.id,
-    delivered_now: false,
-    ...p,
-    ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
-    undelivered_from_you: repo.messages.undeliveredFrom(session.identityFull).find((u) => u.recipient === parsed.full)?.n ?? 1,
-    note: queuedNote(parsed.full, seen),
-  };
+function handleSend(hub: Hub, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean): SendResult {
+  const p = prepareSend(hub, session, recipient, body, parentId, pending, ids);
+  const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
+  const out = writeOnce(hub, session, "dm_send", args, resend, p.ids, () => writeSend(hub, session, p));
+  if ("replay" in out) return out.replay;
+  testPause("write:after-commit");
+  deliverSend(hub, session, out.fresh.msg);
+  return out.fresh.payload;
 }
 
 function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">) {
   const { repo, db } = hub;
   const { authed } = session;
-  let to: string | undefined;
   let resolvedTo = m.to;
   try {
-    if (m.to !== undefined) to = resolvePeer(repo, session, m.to).full;
-    const d = resolveDelegation(db, session.identityFull, { ...m, to },
-      h => hub.registry.get(h)?.active === true,
-      () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id));
-    resolvedTo = d.to;
-    const sent = handleSend(hub, session, d.to, d.body, null, true, undefined);
-    const result = delegateOkFields(d, sent);
-    writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
-      requester: session.identityFull,
-      via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
-      message_id: result.message_id,
+    const to = m.to === undefined ? undefined : resolvePeer(repo, session, m.to).full;
+    const args = { to: to ?? null, persona: m.persona, task: m.task, context: m.context ?? null };
+    const out = writeOnce(hub, session, "delegate", args, m.resend === true, [], () => {
+      const d = resolveDelegation(db, session.identityFull, { ...m, to },
+        h => hub.registry.get(h)?.active === true,
+        () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id));
+      resolvedTo = d.to;
+      const w = writeSend(hub, session, prepareSend(hub, session, d.to, d.body, null, true, undefined));
+      const payload = { ...w.payload, ...delegateOkFields(d, w.payload) };
+      writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+        requester: session.identityFull,
+        via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
+        message_id: w.msg.id,
+      });
+      return { payload, ref: w.ref, msg: w.msg };
     });
-    return result;
+    if ("replay" in out) return out.replay;
+    testPause("write:after-commit");
+    deliverSend(hub, session, out.fresh.msg);
+    return out.fresh.payload;
   } catch (e) {
     if (e instanceof CoreError || e instanceof ApplicationError) {
       writeAudit(repo, "delegation.refused", authed.user_email, session.identityFull, { reason: e.message, to: resolvedTo });
@@ -638,49 +716,78 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   }
 }
 
-// The cursor moves only when the recipient acks, so a live recipient may hold
-// a pushed message past it: liveness counts as reached too.
-function handleRetract(hub: Hub, session: ApplicationSession, id: number): void {
+function handleRetract(hub: Hub, session: ApplicationSession, id: number): { note?: string } {
   const { repo, registry } = hub;
+  const me = session.identityFull;
   const m = repo.messages.getById(id);
-  if (!m || m.recipient_type !== "user" || m.sender !== session.identityFull) {
-    return fail("not_found", retractRefusal.notYours(id));
+  if (!m) {
+    const done = repo.audit.last("message.retracted", `message:${id}`);
+    const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
+    if (done && by === me) return { note: alreadyRetracted(done.at) };
   }
-  if (registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) {
-    return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  }
-  if (!repo.messages.retract(session.identityFull, id)) return fail("bad_request", retractRefusal.replied(id));
-
+  if (!m || m.recipient_type !== "user" || m.sender !== me) return fail("not_found", retractRefusal.notYours(id));
+  if (registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
+  const retracted = repo.atomic(() => {
+    if (!repo.messages.retract(me, id)) return false;
+    writeAudit(repo, "message.retracted", session.authed.user_email, `message:${id}`, { message_id: id, sender: me, recipient: m.recipient });
+    return true;
+  });
+  if (!retracted) return fail("bad_request", retractRefusal.replied(id));
   void sweepBlobs(hub.db, repo.blobs);
+  return {};
 }
 
 function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
   const { db } = hub;
-  if (!isBoardTool(tool)) {
-    fail("bad_request", `unknown tool: ${tool}`);
-  }
+  if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
+  const ctx: ToolContext = {
+    online: h => hub.registry.get(h)?.active === true,
+    attachmentLimits: hub.repo.attachmentLimits,
+    human: session.human,
+    ...(session.writerId ? { session: session.writerId } : {}),
+    ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),
+  };
+  if (tool === "board_post") return handleBoardPost(hub, session, args, ctx, publish);
   let outcome;
-  try {
-    outcome = callBoardTool(db, session.identityFull, tool, args, {
-      online: (h) => hub.registry.get(h)?.active === true,
-      attachmentLimits: hub.repo.attachmentLimits,
-      ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),
-    });
-  } catch (e) {
+  try { outcome = callBoardTool(db, session.identityFull, tool, args, ctx); }
+  catch (e) {
     if (e instanceof CoreError) return fail("bad_request", e.message);
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
-  if (tool === "board_post") {
-    const r = outcome.result as { post_id: number; board: string; attachments?: AttachmentInfo[] };
-    for (const a of r.attachments ?? []) {
-      writeAudit(hub.repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, post_id: r.post_id, board: r.board });
-    }
-  }
-  // The transitional adapter publishes its answer before the resulting deliveries.
   publish?.(outcome.result);
   wake(hub, outcome.wake);
   return outcome.result;
+}
+
+function handleBoardPost(hub: Hub, session: ApplicationSession, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void): unknown {
+  const { db, repo } = hub;
+  const me = session.identityFull;
+  const { resend, ...postArgs } = args;
+  let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
+  try {
+    if (resend !== undefined && typeof resend !== "boolean") throw new CoreError("resend must be boolean");
+    if (typeof postArgs.board !== "string") throw new CoreError("board must be a string");
+    if (typeof postArgs.body !== "string") throw new CoreError("body must be a string");
+    const ids = attachmentIds(postArgs.attachment_ids);
+    const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: postArgs.parent_id ?? null, attachments: uploadDigests(db, ids, me) };
+    out = writeOnce(hub, session, "board_post", fp, resend === true, ids, () => {
+      const o = callBoardTool(db, me, "board_post", postArgs, ctx);
+      const r = o.result as BoardPostResult;
+      return { payload: r, ref: { kind: "post", id: r.post_id }, wake: o.wake };
+    });
+  } catch (e) {
+    if (e instanceof CoreError) return fail("bad_request", e.message);
+    console.error("[grayboard] board_post failed:", e);
+    return fail("internal", "board_post failed");
+  }
+  if ("replay" in out) { publish?.(out.replay); return out.replay; }
+  testPause("write:after-commit");
+  const r = out.fresh.payload;
+  for (const a of r.attachments ?? []) writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
+  publish?.(r);
+  wake(hub, out.fresh.wake);
+  return r;
 }
 
 function handleHistory(
@@ -711,7 +818,7 @@ function handleHistory(
   const messages = repo.messages.history(me, peerFull, lim, beforeId).reverse().map((m) =>
     m.sender === me && m.recipient_type === "user" && m.recipient !== me ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
   );
-  return messages.map(showPending);
+  return messages.map(showMessage);
 }
 
 function handleInbox(hub: Hub, session: ApplicationSession, days: number | undefined): InboxResult {
@@ -723,8 +830,8 @@ function handleInbox(hub: Hub, session: ApplicationSession, days: number | undef
   } catch (e) {
     return fail("bad_request", (e as Error).message);
   }
-  const owed = unanswered(me, repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
-  const promises = promised(me, repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
+  const owed = unanswered([me], repo.messages.receivedUnacked(me, since), (id) => repo.messages.thread(id));
+  const promises = promised([me], repo.messages.sentPending(me, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(me).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
@@ -742,7 +849,7 @@ function handleThread(session: ApplicationSession, messageId: number, repo: Repo
     fail("not_found", `message ${messageId} not found`);
   }
   const messages = repo.messages.thread(messageId).filter((m) => participant(m, me));
-  return messages.map(showPending);
+  return messages.map(showMessage);
 }
 
 function handleAck(session: ApplicationSession, messageIds: number[], repo: Repo): void {
@@ -750,6 +857,6 @@ function handleAck(session: ApplicationSession, messageIds: number[], repo: Repo
     const msg = repo.messages.getById(msgId);
     // Only your own direct messages move your cursor.
     if (!msg || msg.recipient_type !== "user" || msg.recipient !== session.identityFull) continue;
-    repo.cursors.advance(session.identityId, "direct", session.identityFull, msgId);
+    repo.cursors.advance(session.identityFull, "direct", session.identityFull, msgId);
   }
 }

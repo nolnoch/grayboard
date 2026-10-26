@@ -14,7 +14,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   try {
     const token = await srv.login("alice@example.com");
     const user = srv.app.repo.users.findByEmail("alice@example.com")!;
-    srv.app.repo.identities.create(user.id, "be");
+    srv.app.repo.aliases.create(user.email, "be");
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
       fetch: async (input, init) => {
@@ -56,6 +56,29 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(srv.app.mcp.activeContexts).toBe(0);
   } finally {
     await client.close();
+    await srv.stop();
+  }
+});
+
+test("native HTTP charges only presented invalid tokens in the shared address gate", async () => {
+  let now = 0;
+  const srv = new TestServer({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
+  try {
+    const token = await srv.login("alice@example.com");
+    now = 10_000;
+    for (let n = 0; n < 3; n++) expect((await fetch(`${srv.base}/mcp`)).status).toBe(401);
+    for (let n = 0; n < 2; n++) {
+      const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: "Bearer not-a-token" } });
+      expect(response.status).toBe(401);
+      expect(await response.text()).not.toContain("not-a-token");
+    }
+    const blocked = await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } });
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'auth.rate_limited'").all()).toHaveLength(1);
+    now += 2000;
+    expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(200);
+  } finally {
     await srv.stop();
   }
 });

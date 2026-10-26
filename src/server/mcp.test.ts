@@ -23,7 +23,7 @@ beforeEach(() => {
   touches = createTouchQueue();
   hosted = createHostedMcp(application, store.repo, { trustedOrigin: "https://grayboard.example.com:443", touches });
   const u = store.repo.users.upsertByEmail("alice@example.com", null);
-  store.repo.identities.create(u.id, "be");
+  store.repo.aliases.create(u.email, "be");
   token = mintToken();
   const session = store.repo.sessions.create(u.id, hashToken(token), "test");
   user = { user_id: u.id, user_email: u.email, session_id: session.id };
@@ -42,7 +42,7 @@ test("unknown HTTP names fail with closest names without creating a context or i
   const response = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee" } }));
   expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ code: "identity_unknown", known: ["be"] });
-  expect(store.repo.identities.findByUserAndName(user.user_id, "bee")).toBeUndefined();
+  expect(store.repo.aliases.find(user.user_email, "bee")).toBeUndefined();
   expect(hosted.activeContexts).toBe(0);
 });
 
@@ -104,7 +104,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
     }
   }
   expect(selections).toBe(0);
-  expect(store.repo.identities.findByUserAndName(user.user_id, "refused")).toBeUndefined();
+  expect(store.repo.aliases.find(user.user_email, "refused")).toBeUndefined();
   expect(hosted.activeContexts).toBe(0);
 });
 

@@ -4,7 +4,6 @@ import { ApplicationError, type Application, type ApplicationOptions, type Appli
 
 export type WsData = {
   authed: AuthedUser;
-  identityId: number;
   identityName: string;
   identityFull: string;
   ready: boolean;
@@ -91,10 +90,10 @@ export function createWsHandlers(application: Application) {
         };
         application.selectIdentity(ws.data.authed, msg.identity, sink, {
           ...msg,
+          transport: "wss",
           alive: () => ws.readyState === 1,
         }).then(({ session, info }) => {
           ws.data.session = session;
-          ws.data.identityId = session.identityId;
           ws.data.identityName = session.identityName;
           ws.data.identityFull = session.identityFull;
           ws.data.ready = true;
@@ -144,8 +143,7 @@ export function createWsHandlers(application: Application) {
             send(ws, { type: "ack_ok", req_id: msg.req_id });
             break;
           case "dm_retract":
-            application.retract(session, msg.message_id);
-            send(ws, { type: "ack_ok", req_id: msg.req_id });
+            send(ws, { type: "ack_ok", req_id: msg.req_id, ...application.retract(session, msg.message_id) });
             break;
         }
       } catch (e) {

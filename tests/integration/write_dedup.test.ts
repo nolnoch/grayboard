@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { mintSessionKey } from "../../src/core/bindings.ts";
-import type { Conn, WsData } from "../../src/server/ws.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { localEnv } from "../support/env.ts";
@@ -293,30 +292,20 @@ describe("dedup and state answers (in process)", () => {
   test("the Slack bridge's human is exempt: a line typed twice is sent twice", async () => {
     await offline("be");
     const user = srv.app.repo.users.findByEmail("you@example.com")!;
-    const out: Any[] = [];
-    const conn: Conn = {
-      data: { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, identityId: 0, identityName: "", identityFull: "", ready: false, human: true } as WsData,
-      readyState: 1,
-      send: (raw) => void out.push(JSON.parse(raw)),
-      close: () => {},
-    };
-    const frame = (m: Record<string, unknown>) => srv.app.handlers.message(conn as never, JSON.stringify(m));
-    frame({ type: "hello", req_id: "h", identity: "human", push: false });
-    await until(() => out.find((m) => m.req_id === "h"));
-    frame({ type: "send", req_id: "a", recipient: "you@example.com/be", body: "yes" });
-    frame({ type: "send", req_id: "b", recipient: "you@example.com/be", body: "yes" });
-    const [a, b] = ["a", "b"].map((id) => out.find((m) => m.req_id === id)!);
-    expect(a!.type).toBe("send_ok");
-    expect(b!.replayed).toBeUndefined();
-    expect(b!.message_id).not.toBe(a!.message_id);
+    const { session } = await srv.app.application.attachHuman(
+      { user_id: user.id, user_email: user.email, session_id: 0 },
+      { deliver() {}, probe: async () => true, closed() {} },
+    );
+    const a = srv.app.application.send(session, "you@example.com/be", "yes");
+    const b = srv.app.application.send(session, "you@example.com/be", "yes");
+    expect(a.message_id).toBeGreaterThan(0);
+    expect((b as Any).replayed).toBeUndefined();
+    expect(b.message_id).not.toBe(a.message_id);
     expect(n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
-    // Its relay treats a successful board_create as a fresh create, so a
-    // repeat keeps answering "already exists".
-    frame({ type: "call", req_id: "c1", tool: "board_create", args: { name: "slack-made", purpose: "fixtures" } });
-    frame({ type: "call", req_id: "c2", tool: "board_create", args: { name: "slack-made", purpose: "fixtures" } });
-    await until(() => out.find((m) => m.req_id === "c2"));
-    expect(out.find((m) => m.req_id === "c1")!.type).toBe("call_ok");
-    expect(out.find((m) => m.req_id === "c2")).toMatchObject({ type: "error", message: expect.stringContaining("already exists") });
+    const args = { name: "slack-made", purpose: "fixtures" };
+    expect(srv.app.application.call(session, "board_create", args)).toHaveProperty("name", "slack-made");
+    expect(() => srv.app.application.call(session, "board_create", args)).toThrow("already exists");
+    srv.app.application.close(session);
   });
 });
 

@@ -6,6 +6,7 @@ import { createApplication, type DeliveryEvent, type DeliverySink } from "./appl
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
+import { createWsHandlers, type Conn } from "./ws.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -114,7 +115,7 @@ test("application selection shares the per-user hello budget across tools-only a
   application = createApplication(store.repo, store.db, { helloLimit: { burst: 1, perSec: 0.01 } });
   await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true });
   await expect(application.selectIdentity(alice, "refused", delivery(sink()), { push: false })).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
-  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  expect(store.repo.aliases.listFor(alice.user_email)).toEqual([]);
   expect(store.db.query("SELECT * FROM binding_events").all()).toEqual([]);
   expect(store.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
   expect((await application.attachHuman(alice, delivery(sink()))).session.human).toBe(true);
@@ -189,9 +190,9 @@ test("hosted Slack has no dependency on the transitional wire adapter", async ()
 
 test("unbound application sessions cannot use named operations or persist synthetic handles", async () => {
   const { session, info } = await application.selectIdentity(alice, undefined, delivery(sink()), { read_only: true, session_key: "unbound-secret", suggested: "fresh" });
-  expect(session.identityId).toBe(0);
+  expect(session.writerId).toBeUndefined();
   expect(info.candidates).toMatchObject([{ name: "fresh", fresh: true }]);
-  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  expect(store.repo.aliases.listFor(alice.user_email)).toEqual([]);
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
   const operations = [
     () => application.send(session, "be", "no"),
@@ -243,7 +244,7 @@ test("hold owners block binding and candidates without push or online presence; 
 
 test("unknown and reserved names are audited without creation; trusted human gets binding attribution", async () => {
   await expect(application.selectIdentity(alice, "typo", delivery(sink()), { create: false, session_key: "typo-secret" })).rejects.toMatchObject({ code: "identity_unknown", extra: { known: [] } });
-  expect(store.repo.identities.listForUser(alice.user_id)).toEqual([]);
+  expect(store.repo.aliases.listFor(alice.user_email)).toEqual([]);
   await expect(application.selectIdentity(alice, "human", delivery(sink()), { session_key: "human-secret" })).rejects.toMatchObject({ code: "bad_request" });
   const human = (await application.attachHuman(alice, delivery(sink()))).session;
   expect(human.sessionId).not.toBe("");
@@ -272,4 +273,53 @@ test("rebind acquires target before releasing source, moves claims not DMs, and 
   application.close(old);
   expect(store.db.query("SELECT * FROM binding_events WHERE name = ? AND event = 'released'").all(old.identityFull)).toHaveLength(1);
   application.close(blocker);
+});
+
+test("shared writes retain calling-session dedup, ID provenance and replay audit ownership", async () => {
+  const first = (await application.selectIdentity(alice, "be", delivery(sink()), { session_key: "first-session" })).session;
+  const sibling = (await application.selectIdentity(alice, "be", delivery(sink()), { push: false, session_key: "sibling-session" })).session;
+  const events = sink();
+  const recipient = (await application.selectIdentity(bob, "fe", delivery(events))).session;
+  const send = (session: typeof first, resend = false) => application.send(session, recipient.identityFull, "same write", { resend });
+  const a = send(first);
+  const replay = send(first) as typeof a & { replayed?: unknown };
+  expect(replay.message_id).toBe(a.message_id);
+  expect(replay.replayed).toBeDefined();
+  expect(events.events).toHaveLength(1);
+  const deliberate = send(first, true);
+  const other = send(sibling);
+  expect(new Set([a.message_id, deliberate.message_id, other.message_id]).size).toBe(3);
+  expect(events.events).toHaveLength(3);
+  expect(store.db.query("SELECT sender_id FROM messages WHERE id = ?").get(a.message_id)).toEqual({ sender_id: first.sessionId });
+  expect(store.db.query("SELECT sender_id FROM messages WHERE id = ?").get(other.message_id)).toEqual({ sender_id: null });
+  expect(first.sessionId).toMatch(/^id:[0-9a-hjkmnp-tv-z]{13}$/);
+  expect(store.db.query("SELECT principal, keyed FROM ids WHERE id = ?").get(first.sessionId)).toEqual({ principal: alice.user_email, keyed: 1 });
+  expect(store.db.query("SELECT id FROM alias_holds WHERE address = ?").get(first.identityFull)).toEqual({ id: first.sessionId });
+  expect(store.db.query("SELECT id FROM ids WHERE id = ?").get(sibling.sessionId)).toBeNull();
+  const audits = store.db.query("SELECT action, detail FROM access_log WHERE action IN ('request.replayed', 'request.resent') ORDER BY id").all() as { action: string; detail: string }[];
+  expect(audits.map(a => a.action)).toEqual(["request.replayed", "request.resent"]);
+  expect(JSON.parse(audits[0]!.detail)).toMatchObject({ session: first.sessionId, transport: "wss", tool: "dm_send" });
+  application.close(first);
+  expect(store.db.query("SELECT id FROM alias_holds WHERE address = ?").get(first.identityFull)).toBeNull();
+  await expect(application.selectIdentity(bob, "other", delivery(sink()), { session_key: "first-session" })).rejects.toMatchObject({ code: "id_collision" });
+  expect(store.repo.aliases.find(bob.user_email, "other")).toBeUndefined();
+});
+
+test("WSS transport attribution is server-owned even if hello carries an extra field", async () => {
+  const frames: Record<string, unknown>[] = [];
+  const conn: Conn = {
+    data: { authed: alice, identityName: "", identityFull: "", ready: false },
+    readyState: 1,
+    send: raw => { frames.push(JSON.parse(raw)); },
+    close() {},
+  };
+  const { handlers } = createWsHandlers(application);
+  handlers.message(conn, JSON.stringify({ type: "hello", req_id: "h", identity: "be", session_key: "f".repeat(64), transport: "hosted" }));
+  await Promise.resolve();
+  expect(frames[0]?.type).toBe("hello_ok");
+  for (const req_id of ["a", "b"]) handlers.message(conn, JSON.stringify({ type: "send", req_id, recipient: "be", body: "same write" }));
+  const replay = store.db.query("SELECT detail FROM access_log WHERE action = 'request.replayed'").get() as { detail: string };
+  expect(JSON.parse(replay.detail)).toMatchObject({ transport: "wss", tool: "dm_send" });
+  expect(frames.find(f => f.req_id === "b")).toMatchObject({ type: "send_ok", replayed: { ref: { kind: "message" } } });
+  handlers.close(conn);
 });

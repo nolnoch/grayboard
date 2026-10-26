@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { writeAudit } from "../../src/server/audit.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { WsClient } from "../support/ws_client.ts";
 
 let app: ReturnType<typeof startServer>;
@@ -17,7 +19,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-http-mcp-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"] }, { background: false });
+  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { background: false });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
@@ -28,11 +30,11 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 async function login(email = "alice@example.com") {
-  const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", body: JSON.stringify({ email }) });
+  const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   const token = (await res.json() as { session_token: string }).session_token;
   const user = app.repo.users.findByEmail(email)!;
   for (const name of ["be", "allowed"]) {
-    if (!app.repo.identities.findByUserAndName(user.id, name)) app.repo.identities.create(user.id, name);
+    if (!app.repo.aliases.find(user.email, name)) app.repo.aliases.create(user.email, name);
   }
   return token;
 }
@@ -121,7 +123,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP r
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {
   const token = await login();
   await expect(connect(token, "refused", version, "https://foreign.example.com")).rejects.toThrow();
-  expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "refused")).toBeUndefined();
+  expect(app.repo.aliases.find("alice@example.com", "refused")).toBeUndefined();
   let origin = trustedOrigin;
   let identity = "allowed";
   const client = new Client({ name: "origin-test", version: "1" }, {
@@ -152,7 +154,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
       });
       expect(res.status).toBe(403);
     }
-    expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, identity)).toBeUndefined();
+    expect(app.repo.aliases.find("alice@example.com", identity)).toBeUndefined();
     expect(app.mcp.activeContexts).toBe(0);
   }
   origin = trustedOrigin;
@@ -172,7 +174,7 @@ test("all HTTP methods require a valid token and explicit own agent name", async
       expect(res.status).toBe(400);
     }
   }
-  expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "human")).toBeUndefined();
+  expect(app.repo.aliases.find("alice@example.com", "human")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(0);
 });
 

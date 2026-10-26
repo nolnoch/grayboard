@@ -46,7 +46,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
     const { session, info } = await application.selectIdentity(
       authed, requestInfo.headers.get("X-Grayboard-Identity")!,
       { deliver() {}, probe: async () => false, closed() {} },
-      { push: false, create: false, where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
+      { push: false, create: false, transport: "hosted", where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
     ).catch((e: unknown) => {
       // The SDK redacts factory errors; retain only this expected admission refusal.
       const exchange = admission.getStore();
@@ -147,8 +147,8 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
         return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
       }
-      if (!repo.identities.findByUserAndName(authed.user_id, name.toLowerCase())) {
-        const known = closestNames(name.toLowerCase(), repo.identities.listForUser(authed.user_id).map(i => i.name).filter(n => n !== HUMAN_NAME));
+      if (!repo.aliases.find(authed.user_email, name.toLowerCase())) {
+        const known = closestNames(name.toLowerCase(), repo.aliases.listFor(authed.user_email).map(i => i.name).filter(n => n !== HUMAN_NAME));
         return Response.json({ code: "identity_unknown", message: unknownNameError(name.toLowerCase(), known), known }, { status: 400 });
       }
       return admission.run({}, async () => {
