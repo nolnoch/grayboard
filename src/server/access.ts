@@ -1,33 +1,38 @@
-// Board access for the distributed server. Handles are "email/name".
-// Open boards (scope null) are visible to everyone signed in; "team:<name>"
-// boards only to that team's members. Installed on the database by
-// openDatabase, so every core call is checked.
-import type { Access, Board } from "../core/boards.ts";
+// Board access for the distributed server, evaluated for the acting address
+// through the Resolver (#284 S12). Open boards (scope null) are visible to
+// any address with a principal; "team:<name>" boards to that team's own
+// aliases and to its members' addresses. A session bound to `eng/x` acts as
+// eng: it sees eng's boards, not its binder's other teams'. Installed on the
+// database by openDatabase, so every core call is checked.
+import { addressParts } from "../core/addresses.ts";
+import type { Access, Board, CoreDb } from "../core/boards.ts";
+import { CoreError } from "../core/errors.ts";
+import { ownScope, type Principal } from "../core/resolver.ts";
+import { undeliverableId } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { reachesHuman, type HumanReach } from "./can_send.ts";
 import type { Repo } from "./db.ts";
-
-function emailOf(handle: string): string | null {
-  const slash = handle.lastIndexOf("/");
-  return slash > 0 ? handle.slice(0, slash) : null;
-}
 
 function teamOf(scope: string | null): string | null {
   return scope?.startsWith("team:") ? scope.slice(5) : null;
 }
 
-export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Access {
-  const isMember = (handle: string, teamName: string): boolean => {
-    const email = emailOf(handle);
-    const user = email ? repo.users.findByEmail(email) : undefined;
+export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "team"): Access {
+  // Whether p acts inside team `teamName`: the team itself, or a member.
+  const inTeam = (p: Principal, teamName: string): boolean => {
+    if (p.kind === "team") return p.name === teamName;
+    if (p.kind !== "user") return false;
+    const user = repo.users.findByEmail(p.name);
     const team = repo.teams.findByName(teamName);
     return !!user && !!team && repo.teams.isMember(team.id, user.id);
   };
 
   const canSee = (handle: string, board: Board): boolean => {
-    if (board.scope === null) return emailOf(handle) !== null;
+    const p = repo.resolver.principalOf(handle);
+    if (!p) return false;
+    if (board.scope === null) return true;
     const team = teamOf(board.scope);
-    return team !== null && isMember(handle, team);
+    return team !== null && inTeam(p, team);
   };
 
   return {
@@ -41,34 +46,37 @@ export function serverAccess(repo: Repo, humanReach: HumanReach = "team"): Acces
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
       if (!repo.teams.findByName(team)) return `no such team "${team}"`;
-      return isMember(handle, team) ? null : `you're not a member of team "${team}"`;
+      const p = repo.resolver.principalOf(handle);
+      return p && inTeam(p, team) ? null : `you're not a member of team "${team}"`;
     },
 
-    // @email/name exactly; @local/name by email local part; @name means the
-    // author's own identity first, then a unique match among board viewers.
-    resolveMention(token, author, board) {
-      const slash = token.lastIndexOf("/");
-      const name = slash >= 0 ? token.slice(slash + 1) : token;
-      const prefix = slash >= 0 ? token.slice(0, slash) : null;
-      const candidates = repo.aliases
-        .findAllByName(name)
-        .map((i) => i.address)
-        .filter((h) => {
-          if (prefix === null) return true;
-          const email = emailOf(h)!;
-          return prefix.includes("@") ? email === prefix : email.split("@")[0] === prefix;
-        });
-      if (prefix === null) {
-        const own = `${emailOf(author)}/${name}`;
-        if (candidates.includes(own)) return own;
-        // A bare @human is only ever your own.
-        if (name === HUMAN_NAME) return null;
+    // The grammar of #284 decision 16 (S13): @id:… is the session itself (a
+    // strict post refuses one that can't receive); @scope/name is that alias
+    // exactly; a bare @name is the author's own scope's first, then the one
+    // alias of that name on the board's roster. A strict post refuses an
+    // ambiguous bare name, naming the candidates; a system post leaves it
+    // unresolved. A bare @human is only ever your own.
+    resolveMention(token, author, board, strict) {
+      const t = addressParts(token);
+      if (!t || t.kind === "team") return null;
+      if (t.kind === "id") {
+        const why = undeliverableId(db, t.address);
+        if (why && strict) throw new CoreError(why);
+        return why ? null : t.address;
       }
-      const visible = candidates.filter((h) => canSee(h, board) && reachesHuman(repo, humanReach, emailOf(author)!, h));
-      return visible.length === 1 ? visible[0]! : null;
+      const reach = (h: string) => canSee(h, board) && reachesHuman(repo, humanReach, author, h);
+      if (t.kind === "alias") return repo.aliases.find(t.address) && reach(t.address) ? t.address : null;
+      const scope = ownScope(repo.resolver, author);
+      const own = scope ? `${scope}/${t.name}` : null;
+      if (own && repo.aliases.find(own)) return own;
+      if (t.name === HUMAN_NAME) return null;
+      const roster = repo.aliases.findAllByName(t.name).map((i) => i.address).filter(reach);
+      if (roster.length === 1) return roster[0]!;
+      if (roster.length > 1 && strict) throw new CoreError(`@${t.name} matches ${roster.join(", ")}; name one`);
+      return null;
     },
 
     // A thread reply reaches a human only as far as a DM could.
-    mayReach: (from, to) => reachesHuman(repo, humanReach, emailOf(from) ?? "", to),
+    mayReach: (from, to) => reachesHuman(repo, humanReach, from, to),
   };
 }

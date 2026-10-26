@@ -23,7 +23,7 @@ export function checkBody(body: unknown): string {
   }
   return body;
 }
-// @id:<13 Crockford> (a session, #284), @name, @local/name, @user@org.com/name.
+// @id:<13 Crockford> (a session, #284), @name, @scope/name, @user@org.com/name.
 // Not preceded by a word char or @, so plain email addresses in prose aren't
 // mentions. A malformed @id:… is the alias "id", as before IDs.
 const MENTION_RE = new RegExp(

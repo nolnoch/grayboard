@@ -1,4 +1,5 @@
 // The authorization seam. All message sends route through here.
+import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Repo } from "./db.ts";
 
@@ -12,54 +13,57 @@ export type SendContext = {
   humanReach: HumanReach;
 };
 
-export type SendPrincipal = {
-  user_id: number;
-  user_email: string;
-  identity_name: string;
-  identity_full: string;
-};
-
 export type SendTarget = { kind: "user"; address: string };
 
 export type SendDecision =
   | { allow: true }
   | { allow: false; code: "forbidden" | "not_found"; reason: string };
 
+// `from`: the sending address (an alias or an ID).
 export function canSend(
-  sender: SendPrincipal,
+  from: string,
   target: SendTarget,
   ctx: SendContext,
 ): SendDecision {
   // Future policy lives here. Do not add caller-side bypasses.
-  if (!reachesHuman(ctx.db, ctx.humanReach, sender.user_email, target.address)) {
+  if (!reachesHuman(ctx.db, ctx.humanReach, from, target.address)) {
     return { allow: false, code: "forbidden", reason: `${target.address} is a person's phone, reachable only by their teammates' agents` };
   }
   return { allow: true };
 }
 
-// Whether a handle owned by fromEmail may wake `to` when `to` is a human. Your
-// own human is always reachable. Board mentions and thread replies go through
-// this too (access.ts), so a post can't reach a phone a DM can't.
-export function reachesHuman(repo: Repo, reach: HumanReach, fromEmail: string, to: string): boolean {
-  const slash = to.lastIndexOf("/");
-  if (to.slice(slash + 1) !== HUMAN_NAME) return true;
-  const toEmail = to.slice(0, slash);
-  if (reach === "all" || toEmail === fromEmail) return true;
-  const a = repo.users.findByEmail(fromEmail);
-  const b = repo.users.findByEmail(toEmail);
-  if (!a || !b) return false;
-  const theirs = new Set(repo.teams.listForUser(b.id).map((t) => t.id));
-  return repo.teams.listForUser(a.id).some((t) => theirs.has(t.id));
+// Whether the address `from` may wake `to` when `to` is a human
+// (`<email>/human`). A person reaches their own human, and a teammate's
+// (reach "team"); a team alias reaches a member's (#284 S12), the analogue
+// of sharing a team. Board mentions and thread replies go through this too
+// (access.ts), so a post can't reach a phone a DM can't.
+export function reachesHuman(repo: Repo, reach: HumanReach, from: string, to: string): boolean {
+  const t = addressParts(to);
+  if (t?.kind !== "alias" || t.name !== HUMAN_NAME) return true;
+  if (reach === "all") return true;
+  const f = repo.resolver.principalOf(from);
+  const them = t.scopeKind === "person" ? repo.users.findByEmail(t.scope) : undefined;
+  if (!f || !them) return false;
+  if (f.kind === "team") {
+    const team = repo.teams.findByName(f.name);
+    return !!team && repo.teams.isMember(team.id, them.id);
+  }
+  if (f.kind !== "user") return false;
+  if (f.name === them.email) return true;
+  const me = repo.users.findByEmail(f.name);
+  if (!me) return false;
+  const theirs = new Set(repo.teams.listForUser(them.id).map((x) => x.id));
+  return repo.teams.listForUser(me.id).some((x) => theirs.has(x.id));
 }
 
 // Admins are the emails in GRAYBOARD_ADMINS. All admin actions are audited.
-export function canAdmin(principal: SendPrincipal, admins: readonly string[]): SendDecision {
-  if (admins.includes(principal.user_email.toLowerCase())) return { allow: true };
+export function canAdmin(email: string, admins: readonly string[]): SendDecision {
+  if (admins.includes(email.toLowerCase())) return { allow: true };
   return {
     allow: false,
     code: "forbidden",
     reason: admins.length === 0
       ? "no admins are configured on this server (GRAYBOARD_ADMINS)"
-      : `${principal.user_email} is not an admin`,
+      : `${email} is not an admin`,
   };
 }

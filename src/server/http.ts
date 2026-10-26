@@ -8,7 +8,7 @@ import {
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
-import { canAdmin, type SendPrincipal } from "./can_send.ts";
+import { canAdmin } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
@@ -40,16 +40,6 @@ function requireAuth(req: Request, repo: Repo, touches: TouchQueue): AuthedUser 
 
 async function parseBody<T>(req: Request): Promise<T | null> {
   try { return (await req.json()) as T; } catch { return null; }
-}
-
-function makePrincipal(authed: AuthedUser): SendPrincipal {
-  // Used only for canAdmin, which needs no identity.
-  return {
-    user_id:       authed.user_id,
-    user_email:    authed.user_email,
-    identity_name: "",
-    identity_full: "",
-  };
 }
 
 // ── route handlers ────────────────────────────────────────────────────────────
@@ -357,7 +347,7 @@ function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | nu
 function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
   const team = memberTeam(teamName, authed, repo);
   if (team) return { team, audit: {} };
-  if (!canAdmin(makePrincipal(authed), config.admins).allow) return null;
+  if (!canAdmin(authed.user_email, config.admins).allow) return null;
   const any = repo.teams.findByName(teamName.toLowerCase());
   return any ? { team: any, audit: { as_admin: true } } : null;
 }
@@ -515,7 +505,7 @@ export async function handleHttp(
   }
 
   if (path.startsWith("/api/admin/")) {
-    const decision = canAdmin(makePrincipal(authed), config.admins);
+    const decision = canAdmin(authed.user_email, config.admins);
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, disconnectUser);

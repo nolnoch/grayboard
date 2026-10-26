@@ -40,11 +40,22 @@ test("addressParts: IDs, team broadcasts, person and principal aliases, bare nam
   expect(addressParts("be")).toEqual({ kind: "bare", address: "be", name: "be" });
   // A scope is one segment: the split is at the first "/", so the name can't hold another.
   expect(addressParts("eng/x/y")).toBeNull();
-  for (const bad of ["", "/be", "you@example.com/", "team:", "id:short", "~tail-1", "not@an-email/be"]) expect(addressParts(bad)).toBeNull();
+  expect(addressParts("a@mail.co.uk/my_identity-1")?.kind).toBe("alias");
+  expect(addressParts(`b@example.com/${"a".repeat(32)}`)?.kind).toBe("alias");
+  for (const bad of [
+    "", "/be", "you@example.com/", "team:", "team:my team", "id:short", "~tail-1", "not@an-email/be", "a@localhost/fe",
+    "alice@example.com", "channel:foo", `a@example.com/${"x".repeat(33)}`,
+  ]) expect(addressParts(bad)).toBeNull();
 });
 
-test("aliasScope: a person's alias, or local mode's bare name; nothing else names one", () => {
+test("aliasScope: a person's alias, local mode's bare name, or a principal's scope by its kind", () => {
   expect(aliasScope("you@example.com/be")).toEqual({ scope_kind: "person", scope_ref: "you@example.com", name: "be" });
   expect(aliasScope("be")).toEqual({ scope_kind: "person", scope_ref: null, name: "be" });
-  for (const bad of ["eng/x", "team:eng", idAddress("e".repeat(64)), "~tail-1"]) expect(() => aliasScope(bad)).toThrow(/isn't a person's alias/);
+  const kinds = (n: string) => (n === "eng" ? "team" : n === "ci" ? "service" : null);
+  expect(aliasScope("eng/x", kinds)).toEqual({ scope_kind: "team", scope_ref: "eng", name: "x" });
+  expect(aliasScope("ci/x", kinds)).toEqual({ scope_kind: "service", scope_ref: "ci", name: "x" });
+  // A principal scope needs the lookup, and a principal that owns it.
+  expect(() => aliasScope("eng/x")).toThrow(/no team or service is named "eng"/);
+  expect(() => aliasScope("ops/x", kinds)).toThrow(/no team or service is named "ops"/);
+  for (const bad of ["team:eng", idAddress("e".repeat(64)), "~tail-1"]) expect(() => aliasScope(bad, kinds)).toThrow(/isn't an alias/);
 });

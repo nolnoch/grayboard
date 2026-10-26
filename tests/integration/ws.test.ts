@@ -225,7 +225,7 @@ test("leaving a team drops its board and pending pushes", async () => {
   await a.connect();
   // carol is offline when mentioned, then leaves before connecting.
   await api(carol, "POST", "/api/identities", { name: "sim" });
-  await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
+  await a.call("board_post", { board: "eng", body: "@carol@example.com/sim are you there" });
   await api(carol, "POST", "/api/teams/eng/leave");
 
   const c = client(carol, "sim");
@@ -242,7 +242,7 @@ test("removing a member drops their board and pending pushes", async () => {
   const a = client(alice, "be");
   await a.connect();
   await api(carol, "POST", "/api/identities", { name: "sim" });
-  await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
+  await a.call("board_post", { board: "eng", body: "@carol@example.com/sim are you there" });
   expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "carol@example.com" })).status).toBe(200);
 
   const c = client(carol, "sim");

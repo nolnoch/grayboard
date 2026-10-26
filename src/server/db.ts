@@ -4,6 +4,8 @@ import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
+import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import type { MailPort } from "../core/session_end.ts";
 import { openSqlite } from "../core/sqlite.ts";
@@ -17,10 +19,9 @@ export type User     = { id: number; email: string; display_name: string | null;
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
-export type AliasScopeKind = "person" | "team" | "service";
-export type Alias = { id: number; address: string; scope_kind: AliasScopeKind; scope_ref: string; name: string; created_at: number };
+export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_ref: string; name: string; created_at: number };
 // A scope owner (#284 decision 5): a user (name = email), a team or a service principal.
-export type Principal = { id: number; kind: "user" | "team" | "service"; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
+export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
@@ -72,14 +73,17 @@ export interface Repo {
     touch(sessionId: number, now: number): void;
   };
   principals: {
-    findByName(name: string): Principal | undefined;
+    findByName(name: string): PrincipalRow | undefined;
   };
+  // Who an address acts for (#284 S12): an ID's registering user, an
+  // alias's scope owner, a team broadcast's team.
+  resolver: Resolver;
   // Names in scopes, keyed by address.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
-    create(scope: { scope_kind: AliasScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
+    create(scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
     find(address: string): Alias | undefined;
-    listForScope(kind: AliasScopeKind, ref: string): Alias[];
+    listForScope(kind: ScopeKind, ref: string): Alias[];
     // Every scope's alias of this name.
     findAllByName(name: string): Alias[];
     // Also deletes the alias's read points.
@@ -218,7 +222,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     seedSchema(d, first);
   });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
-  setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
+  setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
 }
 
@@ -415,6 +419,8 @@ export class PrincipalTaken extends Error {
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  const principalByName = (name: string): PrincipalRow | undefined =>
+    db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   return {
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
@@ -476,8 +482,21 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     principals: {
-      findByName(name) {
-        return db.query<Principal, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
+      findByName: principalByName,
+    },
+
+    resolver: {
+      principalOf(address) {
+        const p = addressParts(address);
+        if (!p || p.kind === "bare") return null;
+        const name = p.kind === "id"
+          ? db.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
+          : p.kind === "alias" ? p.scope : p.name;
+        const row = name ? principalByName(name) : undefined;
+        // team:x names a team, never a service; a person scope (an email) is only a user's.
+        if (!row || (p.kind === "team" && row.kind !== "team")) return null;
+        if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
+        return { kind: row.kind, name: row.name };
       },
     },
 

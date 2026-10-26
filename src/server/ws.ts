@@ -4,9 +4,9 @@ import {
   type WriteRef,
 } from "../shared/protocol.ts";
 import {
-  HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName, parseAddress, type Address,
+  HUMAN_NAME, HUMAN_RESERVED, MAX_IDENTITY_LENGTH, formatDirectAddress, formatTeamAddress, isValidIdentityName,
 } from "../shared/addressing.ts";
-import { canSend, type HumanReach, type SendPrincipal } from "./can_send.ts";
+import { canSend, type HumanReach } from "./can_send.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
@@ -34,7 +34,10 @@ import {
   MAX_CANDIDATES, UNBOUND_ERROR, UNBOUND_READS, clearHolds, closestNames, dropHold, holdAlias, idAddress, lastBoundBy, lastWasRelease, logBinding, mintSessionKey,
   orderCandidates, continuityOf, unboundPeer, unknownNameError, type Candidate,
 } from "../core/bindings.ts";
+import { addressParts, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
+import { ownScope } from "../core/resolver.ts";
+import { assertDeliverableId } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
 import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests } from "../core/attachments.ts";
@@ -678,38 +681,32 @@ function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
     .map((c) => unboundPeer(c.data.sessionId!, c.data.place ?? null, c.data.sessionId === ws.data.sessionId));
 }
 
-// A bare name means your own identity of that name, else the one identity
-// anyone has with it (as @name does in a post). The pure core of resolvePeer,
-// shared with delegate's `to` resolution (#184 review 7): both take bare and
-// mixed-case names through the same path.
-function resolvePeerInput(repo: Repo, email: string, input: string): { address: Address } | { error: string; code: "not_found" | "bad_request" } {
-  if (isValidIdentityName(input)) {
-    const name = input.toLowerCase();
-    if (repo.aliases.find(formatDirectAddress(email, name))) {
-      input = formatDirectAddress(email, name);
-    } else if (name === HUMAN_NAME) {
-      // Every linked user has one; listing them would only leak who linked.
-      return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
-    } else {
-      const all = repo.aliases.findAllByName(name);
-      if (all.length !== 1) {
-        const which = all.length ? `several identities are named "${name}": ${all.map(i => i.address).sort().join(", ")}` : `no identity is named "${name}"`;
-        return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
-      }
-      input = all[0]!.address;
-    }
+// A bare name means the one of that name in the acting address's own scope,
+// else the one alias anyone has with it (as @name does in a post). The pure
+// core of resolvePeer, shared with delegate's `to` resolution (#184 review
+// 7): both take bare and mixed-case names through the same path.
+type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
+function resolvePeerInput(repo: Repo, from: string, input: string): { address: Peer } | { error: string; code: "not_found" | "bad_request" } {
+  const p = addressParts(input);
+  if (!p) return { error: `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`, code: "bad_request" };
+  if (p.kind !== "bare") return { address: p };
+  const scope = ownScope(repo.resolver, from);
+  const own = scope ? addressParts(`${scope}/${p.name}`) : null;
+  if (own?.kind === "alias" && repo.aliases.find(own.address)) return { address: own };
+  if (p.name === HUMAN_NAME) {
+    // Every linked user has one; listing them would only leak who linked.
+    return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
   }
-  try {
-    return { address: parseAddress(input) };
-  } catch (e) {
-    return { error: String(e), code: "bad_request" };
-  }
+  const all = repo.aliases.findAllByName(p.name);
+  const only = all.length === 1 ? addressParts(all[0]!.address) : null;
+  if (only && only.kind !== "bare") return { address: only };
+  const which = all.length ? `several identities are named "${p.name}": ${all.map(i => i.address).sort().join(", ")}` : `no identity is named "${p.name}"`;
+  return { error: `${which}; peer_list shows exact handles`, code: "not_found" };
 }
 
 // Null once it has answered the request with why not.
-function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Address | null {
-  const { authed } = ws.data;
-  const r = resolvePeerInput(repo, authed.user_email, input);
+function resolvePeer(repo: Repo, ws: Ws, reqId: string, input: string): Peer | null {
+  const r = resolvePeerInput(repo, ws.data.identityFull, input);
   if ("error" in r) {
     err(ws, reqId, r.code, r.error);
     return null;
@@ -733,7 +730,6 @@ function prepareSend(
   hub: Hub, ws: Ws, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
 ): PreparedSend {
   const { repo, db } = hub;
-  const { authed } = ws.data;
   let ids: number[];
   let digests: string[];
   try {
@@ -745,29 +741,19 @@ function prepareSend(
     throw e;
   }
 
-  const parsedR = resolvePeerInput(repo, authed.user_email, recipientStr);
-  if ("error" in parsedR) throw new SendRefused(parsedR.code, parsedR.error);
-  const parsed = parsedR.address;
-
-  const principal: SendPrincipal = {
-    user_id:       authed.user_id,
-    user_email:    authed.user_email,
-    identity_name: ws.data.identityName,
-    identity_full: ws.data.identityFull,
-  };
-
-  if (parsed.kind === "team") throw new SendRefused("bad_request", `${parsed.full} isn't a person; to reach a team, board_post to its board #${parsed.name}`);
-
-  const recipientUser = repo.users.findByEmail(parsed.email);
-  if (!recipientUser) throw new SendRefused("not_found", `user "${parsed.email}" not found`);
-  if (!repo.aliases.find(formatDirectAddress(recipientUser.email, parsed.name))) throw new SendRefused("not_found", `identity "${parsed.full}" not found; peer_list shows exact handles`);
-  const decision = canSend(principal, { kind: "user", address: parsed.full }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
+  const r = resolvePeerInput(repo, ws.data.identityFull, recipientStr);
+  if ("error" in r) throw new SendRefused(r.code, r.error);
+  const to = r.address;
+  if (to.kind === "team") throw new SendRefused("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
+  // An ID's deliverability is checked in the write's transaction (writeSend).
+  if (to.kind === "alias" && !repo.aliases.find(to.address)) throw new SendRefused("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
+  const decision = canSend(ws.data.identityFull, { kind: "user", address: to.address }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.identityFull)) {
     throw new SendRefused("not_found", `parent_id ${parentId} is not a message you sent or received`);
   }
-  return { to: parsed.full, body, parentId, pending, ids, digests };
+  return { to: to.address, body, parentId, pending, ids, digests };
 }
 
 // Writes the message and builds its result. Runs inside the caller's
@@ -777,6 +763,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
   const { repo, db, registry } = hub;
   let msg: MessageRow;
   try {
+    if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
     msg = repo.messages.insert(ws.data.identityFull, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.writerId ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
@@ -866,13 +853,13 @@ function handleDelegate(hub: Hub, ws: Ws, reqId: string, m: DelegateRequest): vo
   const { authed } = ws.data;
   let to: string | undefined;
   if (m.to !== undefined) {
-    const r = resolvePeerInput(repo, authed.user_email, m.to);
+    const r = resolvePeerInput(repo, ws.data.identityFull, m.to);
     if ("error" in r) {
       // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
       writeAudit(repo, "delegation.refused", authed.user_email, ws.data.identityFull, { reason: r.error, to: m.to });
       return err(ws, reqId, r.code, r.error);
     }
-    to = r.address.full;
+    to = r.address.address;
   }
   const online = (h: string) => hub.registry.get(h)?.data.ready === true;
   // The human fallback's reachability is the server's own knowledge: the
@@ -1029,7 +1016,7 @@ function handleHistory(
   if (peer) {
     const parsed = resolvePeer(repo, ws, reqId, peer);
     if (!parsed) return;
-    peerFull = parsed.full;
+    peerFull = parsed.address;
   }
   const me = ws.data.identityFull;
   const cursors = new Map<string, number>();
