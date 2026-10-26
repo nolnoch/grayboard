@@ -1,6 +1,7 @@
 import { McpServer, ProtocolError, ProtocolErrorCode, ResourceNotFoundError, type ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { CoreError } from "../core/errors.ts";
+import { SESSION_ID } from "../core/session_id.ts";
 import { ApplicationError, type ApplicationSession } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { Delivery } from "./delivery.ts";
@@ -126,7 +127,7 @@ export function registerHostedResources(server: McpServer, context: {
   }, (args, ctx) => run(ctx, () => hosted.register(context.current().principal, context.current().sessionContext, args.child, args.via)));
   server.registerTool("session_end", {
     description: "End this ownership, or remove one registered child without ending its root.",
-    inputSchema: z.strictObject({ session: z.string().regex(/^[a-f0-9]{16}$/).optional() }),
+    inputSchema: z.strictObject({ session: z.string().regex(SESSION_ID).optional() }),
   }, (args, ctx) => run(ctx, () => hosted.end(context.current().principal, context.current().sessionContext, args.session)));
   server.registerTool("delivery_open", {
     description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items.", inputSchema: z.strictObject({}),
