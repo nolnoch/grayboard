@@ -7,6 +7,7 @@ import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
+import { addressParts } from "./addresses.ts";
 import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -71,6 +72,23 @@ export function dropHold(db: Database, address: string, id: string): void {
 /** The session holding `address` now, or null. */
 export function holderOf(db: Database, address: string): string | null {
   return (db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
+}
+
+/** The aliases session `id` holds, oldest hold first. */
+export function holdsOf(db: Database, id: string): string[] {
+  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+}
+
+/**
+ * The address set a caller acting as `address` reads as (#284 S8), for a
+ * request that names one address (HTTP `?as=`): an ID with the aliases it
+ * holds, or an alias with the ID of the session holding it when that session
+ * is `principal`'s, so another principal's session ID never joins the set.
+ */
+export function addressSet(db: Database, address: string, principal: string): string[] {
+  if (addressParts(address)?.kind === "id") return [address, ...holdsOf(db, address)];
+  const holder = db.prepare(`SELECT h.id, i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`).get(address) as { id: string; principal: string | null } | null;
+  return holder && holder.principal === principal ? [address, holder.id] : [address];
 }
 
 /**

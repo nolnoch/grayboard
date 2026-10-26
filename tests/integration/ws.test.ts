@@ -946,3 +946,49 @@ test("the server reports its version: /healthz and --version", async () => {
   expect(p.exitCode).toBe(0);
   expect(p.stdout.toString().trim()).toBe(pkg.version);
 });
+
+// Audits W1, W4 (#345): after a bind, the session still reads as its ID:
+// it replies in a thread it received as the ID, and downloads a file DM'd to
+// the ID with ?as= its alias. Another user's session's ID never joins the
+// set: bob acting as his own alias can't read alice's ID's file.
+test("after a bind, a session replies to a thread and reads a file it received as its ID", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = srv.client(alice, null);
+  await a.connect();
+  const b = client(bob, "fe");
+  await b.connect();
+  const up = await upload(bob, "fe", "shot.png", PNG);
+  const sent = await b.request({ type: "send", recipient: a.id, body: "for your ID", attachment_ids: [up.body.id] });
+  expect(sent.type).toBe("send_ok");
+  expect((await a.bind("be")).type).toBe("bind_ok");
+
+  expect(await a.request({ type: "send", recipient: "bob@example.com/fe", body: "got it", parent_id: sent.message_id })).toMatchObject({ type: "send_ok" });
+  expect((await download(alice, "alice@example.com/be", up.body.id)).status).toBe(200);
+  expect((await download(alice, a.id, up.body.id)).status).toBe(200);
+  const other = client(bob, "ops");
+  await other.connect();
+  expect((await download(bob, "bob@example.com/ops", up.body.id)).status).toBe(404);
+});
+
+// Audit A7 (#345): a frame still in flight on a connection that left the hub
+// (superseded, revoked) is refused, so it can't act for the session's
+// successor: an `end` there would end the live session.
+test("a frame on a connection that no longer holds its session is refused and acts on nothing", async () => {
+  const alice = await login("alice@example.com");
+  const live = client(alice, "be");
+  await live.connect();
+  const out: Any[] = [];
+  let closed = false;
+  const stale = {
+    data: { authed: { user_id: 0, session_id: 0, user_email: "alice@example.com" }, ready: true, sessionId: live.id, primary: "alice@example.com/be", addresses: ["alice@example.com/be", live.id], push: true },
+    readyState: 1,
+    send: (d: string) => out.push(JSON.parse(d)),
+    close: () => { closed = true; },
+  };
+  srv.app.handlers.message(stale as any, JSON.stringify({ type: "end", req_id: "e" }));
+  expect(out).toEqual([{ type: "error", req_id: "e", code: "superseded", message: "this connection no longer holds its session" }]);
+  expect(closed).toBe(true);
+  expect(srv.app.db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(live.id)).toEqual({ ended_at: null });
+  expect((await live.call("board_list")).type).toBe("call_ok");
+});

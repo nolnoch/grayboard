@@ -28,9 +28,9 @@ export type Team     = { id: number; name: string; created_by: number; policy: s
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; kind: "bounce" | null; attachments?: AttachmentInfo[] };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
-// doesn't leak.
-export function participant(m: MessageRow | undefined, me: string): m is MessageRow {
-  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
+// doesn't leak. `me`: every address the caller reads as (#284 S8).
+export function participant(m: MessageRow | undefined, me: string[]): m is MessageRow {
+  return !!m && m.recipient_type === "user" && (me.includes(m.sender) || me.includes(m.recipient));
 }
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };

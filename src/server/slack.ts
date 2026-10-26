@@ -347,7 +347,7 @@ export class SlackBridge implements SlackLinker {
       // In process: the read check the download route makes, and the store an
       // upload makes, audited the same way.
       async attachment(id) {
-        const row = readableAttachment(repo, db, handle, id);
+        const row = readableAttachment(repo, db, handle, id, null);
         if (!row) {
           writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
           throw new Error(`no attachment ${id} on a message or post you can read`);

@@ -317,6 +317,14 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
         return;
       }
 
+      // A connection superseded, revoked or ended has left the hub; a frame
+      // already in flight on it must not act for the session (its successor's).
+      if (!ws.data.human && hub.holders.get(ws.data.sessionId!) !== ws) {
+        err(ws, msg.req_id, "superseded", "this connection no longer holds its session");
+        ws.close();
+        return;
+      }
+
       // The handlers are synchronous: a throw (a bug, or a row deleted under
       // the connection) answers the call instead of leaving it to time out.
       try {
@@ -1049,7 +1057,7 @@ function prepareSend(
   const decision = canSend(ws.data.primary, { kind: "user", address: to.address }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
-  if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.primary)) {
+  if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.addresses)) {
     throw new SendRefused("not_found", `parent_id ${parentId} is not a message you sent or received`);
   }
   return { to: to.address, body, parentId, pending, ids, digests };
@@ -1367,7 +1375,7 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
 }
 
 function handleThread(ws: Ws, reqId: string, messageId: number, repo: Repo): void {
-  const mine = (m: MessageRow | undefined): m is MessageRow => ws.data.addresses.some((a) => participant(m, a));
+  const mine = (m: MessageRow | undefined): m is MessageRow => participant(m, ws.data.addresses);
   if (!mine(repo.messages.getById(messageId))) {
     err(ws, reqId, "not_found", `message ${messageId} not found`);
     return;
