@@ -4,7 +4,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
-import { normalizeIdentityName } from "../shared/addressing.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
@@ -318,27 +317,12 @@ export function boundInstructions(name: string, general: boolean, modeGeneral: (
   ];
 }
 
-type TextResult = { content: { type: "text"; text: string }[]; isError?: true };
-
 /** bind's refusal in a tools-only process. */
 export const TOOLS_ONLY_BIND = "this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery";
 
 /** bind's note on the claims that stay with the name it left (#284 S6). */
 export function leftNote(previous: string, left: string[]): string[] {
   return left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
-}
-
-/**
- * bind's checks before either mode acquires anything: the name to bind, or
- * the call's result (a refusal, or "already bound").
- */
-export function bindTarget(a: Record<string, unknown>, bound: string | null, push: boolean): { name: string } | { result: TextResult } {
-  const fail = (why: string): { result: TextResult } => ({ result: { content: [{ type: "text", text: `error: ${why}` }], isError: true } });
-  if (!push) return fail(TOOLS_ONLY_BIND);
-  const n = normalizeIdentityName(String(a.name));
-  if (!n.ok) return fail(n.error);
-  if (n.name === bound) return { result: { content: [{ type: "text", text: `already bound to "${n.name}"` }] } };
-  return { name: n.name };
 }
 
 /** peer_list's row for a live session with no name. */

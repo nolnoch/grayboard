@@ -600,7 +600,7 @@ function helloOkFields(hub: Hub, authed: AuthedUser): Pick<HelloOk, "user_email"
 function noticesFor(hub: Hub, addresses: string[], first: string[] = []): string[] {
   return [
     ...first,
-    ...undeliveredInstruction(hub.repo.messages.undeliveredFrom(addresses, Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.db, h)),
+    ...undeliveredInstruction(hub.repo.messages.undeliveredFrom(addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.db, h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(hub.db), addresses),
   ];
@@ -836,9 +836,8 @@ function describeHolder(hub: Hub, id: string): string {
 function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
   const { repo, db, registry } = hub;
   const { authed } = ws.data;
-  if (ws.data.human || ws.data.toolsOnly) {
-    return err(ws, m.req_id, "bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
-  }
+  if (ws.data.human) return err(ws, m.req_id, "bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
+  if (ws.data.toolsOnly) return err(ws, m.req_id, "bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
   const id = ws.data.sessionId!;
   // Lazy creation is here, not in the limited hello: an unlimited create loop
   // would mint aliases without bound.
@@ -946,7 +945,7 @@ function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m
 function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
   const mine = [...hub.holders.values()].filter((c) => c.data.authed.user_id === ws.data.authed.user_id && c.data.push && !c.data.bound);
   const statuses = idStatuses(hub.db, mine.map((c) => c.data.sessionId!));
-  const now = Date.now();
+  const now = hub.now();
   return mine.map((c) => {
     const s = statuses.get(c.data.sessionId!);
     return unboundPeer(c.data.sessionId!, c.data.place ?? null, c === ws, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
@@ -966,7 +965,9 @@ function resolvePeerInput(repo: Repo, from: string, input: string): { address: P
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
   if (own?.kind === "alias" && repo.aliases.find(own.address)) return { address: own };
   if (p.name === HUMAN_NAME) {
-    // Every linked user has one; listing them would only leak who linked.
+    // A bare "human" is always your own (addressing.ts HUMAN_NAME), never the
+    // one alias anyone has with the name: another user's is reached by its
+    // full handle, as peer_list shows it.
     return { error: `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`, code: "not_found" };
   }
   const all = repo.aliases.findAllByName(p.name);
@@ -1019,7 +1020,7 @@ function prepareSend(
   if (to.kind === "team") throw new SendRefused("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   if (to.kind === "alias" && !repo.aliases.find(to.address)) throw new SendRefused("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
-  const decision = canSend(ws.data.primary, { kind: "user", address: to.address }, { db: repo, now: Date.now(), humanReach: hub.humanReach });
+  const decision = canSend(ws.data.primary, { kind: "user", address: to.address }, { db: repo, now: hub.now(), humanReach: hub.humanReach });
   if (!decision.allow) throw new SendRefused(decision.code, decision.reason);
 
   if (parentId !== null && !participant(repo.messages.getById(parentId), ws.data.addresses)) {
@@ -1052,7 +1053,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
         message_id: msg.id,
         delivered_now: false,
         ...f,
-        ...(seen ? { recipient_last_seen: `${age(Date.now() - seen)} ago` } : {}),
+        ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
         undelivered_from_you: repo.messages.undeliveredFrom(ws.data.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
       };
@@ -1320,15 +1321,15 @@ function handleInbox(hub: Hub, ws: Ws, reqId: string, days: number | undefined):
   const mine = ws.data.addresses;
   let since: number;
   try {
-    since = Date.now() - inboxDays(days) * 86_400_000;
+    since = hub.now() - inboxDays(days) * 86_400_000;
   } catch (e) {
     return err(ws, reqId, "bad_request", (e as Error).message);
   }
   const owed = unanswered(mine, repo.messages.receivedUnacked(mine, since), (id) => repo.messages.thread(id));
-  const promises = promised(mine, repo.messages.sentPending(mine, Date.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
+  const promises = promised(mine, repo.messages.sentPending(mine, hub.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
   const queued = repo.messages.undeliveredFrom(mine).map((u) => {
     const seen = lastSeen(db, u.recipient);
-    return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(Date.now() - seen)} ago` } : {}) };
+    return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
   send(ws, {
     type: "inbox_ok",

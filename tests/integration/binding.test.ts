@@ -165,6 +165,13 @@ test("4: a never-seen name needs create; the refusal lists the closest names", a
   expect(events("fee")).toEqual([{ session_id: await sessionId(s), event: "refused", detail: expect.stringContaining("closest: fe") }]);
 }, 20_000);
 
+test("audit 20: a scoped name is refused locally: local mode has one scope", async () => {
+  const s = await session();
+  for (const name of ["eng/x", "you@example.com/x"]) {
+    expect(await refusal(s, "bind", { name, create: true })).toContain(`local mode has one scope; bind a bare name, not "${name}"`);
+  }
+}, 20_000);
+
 test("5, 13: of N concurrent binders exactly one wins; the losers name it and leave its socket alone (#80)", async () => {
   const n = 6;
   const all = await Promise.all(Array.from({ length: n }, () => session()));

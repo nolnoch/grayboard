@@ -10,7 +10,7 @@ import {
 import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { bindMissed, envSessionKey, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, leftNote, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { TOOLS_ONLY_BIND, bindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, leftNote, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -740,8 +740,13 @@ let stopIdListening = () => {};
 // It runs behind the gate, so no tool call overlaps it (#182 audit 11).
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-  const n = bindTarget(a, bound, PUSH);
-  if ("result" in n) return n.result;
+  if (!PUSH) return fail(TOOLS_ONLY_BIND);
+  const raw = String(a.name);
+  // A server alias's scope ("eng/x", "you@example.com/x") means nothing here.
+  if (raw.includes("/")) return fail(`local mode has one scope; bind a bare name, not "${raw}"`);
+  const n = normalizeIdentityName(raw);
+  if (!n.ok) return fail(n.error);
+  if (n.name === bound) return text(`already bound to "${n.name}"`);
   swapping = true;
   try {
     await inflight;
