@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv, serverEnv } from "../support/env.ts";
-import { PROTO_REFUSAL } from "../../src/shared/protocol.ts";
+import { PROTO, PROTO_REFUSAL } from "../../src/shared/protocol.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { idAddress } from "../../src/core/bindings.ts";
@@ -975,3 +975,100 @@ test("#284 S10: a name record from before several aliases (one `name`) still res
   expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
   expect(events("api").at(-1)).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restore claimed from ${before}, not verified` });
 }, 30_000);
+
+// #284 S16: the Slack bridge's human is its user's `human` and nothing else.
+// A connection shaped as the bridge's (in-process, `human: true`) binds,
+// unbinds and ends nothing, and keeps its hold.
+test("the bridge's human connection binds, unbinds and ends nothing", async () => {
+  const user = srv.app.repo.users.findByEmail(A)!;
+  const frames: Record<string, any>[] = [];
+  const conn = {
+    readyState: 1,
+    data: { authed: { user_id: user.id, user_email: A, session_id: 0 }, primary: "", addresses: [], holds: [], ready: false, human: true },
+    send: (raw: string) => frames.push(JSON.parse(raw)),
+    close() {},
+  };
+  const ask = async (frame: Record<string, unknown>) => {
+    const req_id = `h${frames.length}-${frame.type}`;
+    srv.app.handlers.message(conn as never, JSON.stringify({ ...frame, req_id }));
+    return until(() => frames.find((f) => f.req_id === req_id));
+  };
+  expect(await ask({ type: "hello", proto: PROTO })).toMatchObject({ type: "hello_ok", id: "human" });
+  const human = `${A}/human`;
+  expect(await ask({ type: "unbind", alias: human })).toEqual({ type: "error", req_id: expect.any(String), code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it unbinds nothing` });
+  expect(await ask({ type: "bind", alias: "fe", create: true })).toMatchObject({ type: "error", code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it binds nothing` });
+  expect(await ask({ type: "end" })).toMatchObject({ type: "error", code: "bad_request", message: "the Slack bridge's humans have no session to end" });
+  // Still the human: a DM to it is pushed to this connection.
+  const be = srv.client(alice, "be");
+  await be.connect();
+  expect(await be.request({ type: "send", recipient: "human", body: "still you" })).toMatchObject({ type: "send_ok" });
+  await until(() => frames.some((f) => f.type === "push" && f.message.body === "still you"));
+});
+
+// #284 S5, decision 20: claims are the session's across its address set; a
+// claim stays under the address that took it.
+test("claims across a session's aliases: release under another primary, renew under the taker, a queue reply-ack by a non-primary lane", async () => {
+  const s = srv.client(alice, "b");
+  await s.connect();
+  expect(await s.bind("a", { create: true })).toMatchObject({ type: "bind_ok", held: [`${A}/b`, `${A}/a`] });
+  const claimRow = (key: string) => rows<{ holder: string }>(`SELECT holder FROM claims WHERE key = ?`, key);
+
+  // Taken as a, released with no `as` while the primary is b.
+  expect(await s.call("claim_take", { key: "ticket:ENG-1", as: "a" })).toMatchObject({ type: "call_ok", result: { claim: { holder: `${A}/a` } } });
+  expect(await s.call("claim_release", { key: "ticket:ENG-1" })).toMatchObject({ type: "call_ok" });
+  expect(claimRow("ticket:ENG-1")).toEqual([]);
+
+  // Taken as a, taken again as b: renewed, still a's.
+  expect(await s.call("claim_take", { key: "ticket:ENG-2", as: "a" })).toMatchObject({ type: "call_ok" });
+  expect(await s.call("claim_take", { key: "ticket:ENG-2", as: "b" })).toMatchObject({ type: "call_ok", result: { claim: { holder: `${A}/a` } } });
+  expect(claimRow("ticket:ENG-2")).toEqual([{ holder: `${A}/a` }]);
+
+  // A queue lane subscribed as b, whose primary is now a, acks a post by replying.
+  const lane = srv.client(alice, "lane-b");
+  await lane.connect();
+  expect(await lane.call("board_create", { name: "lanes", purpose: "rotation", kind: "queue" })).toMatchObject({ type: "call_ok" });
+  expect(await lane.bind("lane-a", { create: true })).toMatchObject({ type: "bind_ok" });
+  expect(await lane.request({ type: "unbind", alias: `${A}/lane-b` })).toMatchObject({ type: "unbind_ok" });
+  expect(await lane.bind("lane-b")).toMatchObject({ type: "bind_ok", held: [`${A}/lane-a`, `${A}/lane-b`] });
+  expect(rows(`SELECT handle FROM subscriptions WHERE board = 'lanes'`)).toEqual([{ handle: `${A}/lane-b` }]);
+  const poster = srv.client(bob, "fe");
+  await poster.connect();
+  const posted = await poster.call("board_post", { board: "lanes", body: "work item" });
+  expect(posted).toMatchObject({ type: "call_ok" });
+  const key = `queue:lanes:${posted.result.post_id}`;
+  expect(claimRow(key)).toEqual([{ holder: `${A}/lane-b` }]);
+  expect(await lane.next((m) => m.type === "board_push" && m.item.post?.body === "work item", 3000)).toBeDefined();
+  const reply = await lane.call("board_post", { board: "lanes", body: "done", parent_id: posted.result.post_id });
+  expect(reply).toMatchObject({ type: "call_ok" });
+  expect(rows(`SELECT author FROM posts WHERE id = ?`, reply.result.post_id)).toEqual([{ author: `${A}/lane-a` }]);
+  expect(claimRow(key)).toEqual([]);
+});
+
+// #284 PR 4: an upload is the session's across its address set. One made as
+// a rides a send as b, and a reply that defaults to b.
+test("an upload made as one alias attaches to a send as another, and to a reply defaulting to it", async () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
+  const s = srv.client(alice, "a");
+  await s.connect();
+  expect(await s.bind("b", { create: true })).toMatchObject({ type: "bind_ok" });
+  const peer = srv.client(bob, "fe");
+  await peer.connect();
+  const up = async () => {
+    const r = await srv.upload(alice, "a", "shot.png", PNG);
+    expect(r.status).toBe(201);
+    return r.body.id as number;
+  };
+  const senderOf = (id: number) => rows<{ sender: string }>(`SELECT sender FROM messages WHERE id = ?`, id)[0]!.sender;
+
+  const first = await up();
+  const sent = await s.request({ type: "send", recipient: "bob@example.com/fe", body: "as b", as: "b", attachment_ids: [first] });
+  expect(sent).toMatchObject({ type: "send_ok", attachments: [expect.objectContaining({ id: first })] });
+  expect(senderOf(sent.message_id)).toBe(`${A}/b`);
+
+  const ask = await peer.request({ type: "send", recipient: `${A}/b`, body: "to b" });
+  await s.next((m) => m.type === "push" && m.message.body === "to b", 3000);
+  const second = await up();
+  const reply = await s.request({ type: "send", recipient: "bob@example.com/fe", body: "reply", parent_id: ask.message_id, attachment_ids: [second] });
+  expect(reply).toMatchObject({ type: "send_ok", attachments: [expect.objectContaining({ id: second })] });
+  expect(senderOf(reply.message_id)).toBe(`${A}/b`);
+});
