@@ -327,7 +327,7 @@ test("audit 15: a holder that can't answer keeps its name: another session's bin
   const holder = events("fe")[0]!.session_id;
   await whileStopped(s, async () => {
     const t = await session(null);
-    expect(await refusal(t, "bind", { name: "fe" })).toContain(`alias_held: "${A}/fe" is held by the session ${holder}`);
+    expect(await refusal(t, "bind", { name: "fe" })).toContain(`alias_held: "${A}/fe" is in use by the session ${holder}`);
   });
   expect((await s.call("peer_list", {})).you).toBe(`${A}/fe`);
   expect(s.stderr()).not.toContain("superseded");
@@ -352,7 +352,7 @@ test("audit 15: a holder whose server restarts re-attaches within the grace and 
       // The restarted server seeds the grace for every unended session.
       const t = await session(null);
       const why = await refusal(t, "bind", { name: "fe" });
-      expect(why).toContain(`alias_held: "${A}/fe" is held by the session ${holder}`);
+      expect(why).toContain(`alias_held: "${A}/fe" is in use by the session ${holder}`);
       expect(why).toContain("ends by");
     });
     // Tool calls fail while it reconnects; then it acts as fe again.

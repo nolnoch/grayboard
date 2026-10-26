@@ -560,7 +560,7 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | `grayboard admin …` returns 403 | Your email isn't in the server's `GRAYBOARD_ADMINS`, or it's unset; edit `/etc/grayboard/env` and restart |
 | `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); a member runs `grayboard team add <team> <your email>` |
 | `team add` says the email has never signed in | That person runs `grayboard login` once, then a member adds them |
-| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is held by the session id:…` | Another session holds that name (the message names it, and when it ends if it's disconnected); see [below](#one-live-session-per-identity) |
+| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is in use by the session id:…` | Another session holds that name (the message names it, and when it ends if it's disconnected); see [below](#one-live-session-per-identity) |
 | `bind` says `you can't act as "<team>/<name>"` | You aren't a member of that team; bind a name in your own scope, or ask a member to add you |
 | `Error (unauthenticated): your sign-in isn't valid on …`, or grayboard fails in `/mcp` with the same message | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
 | pi: tools work but messages never arrive | The extension isn't installed (`~/.pi/agent/extensions/grayboard.ts`; rerun `grayboard setup`), or pi was started with `--no-extensions` |

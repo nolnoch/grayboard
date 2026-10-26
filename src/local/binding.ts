@@ -14,7 +14,7 @@ import type { Database } from "bun:sqlite";
 import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, viewers } from "../core/boards.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
-import { continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
+import { aliasHeldText, continuityOf, dropHold, holdAlias, lastWasRelease, logBinding, closestNames, orderCandidates, unknownNameError, MAX_CANDIDATES, type Candidate } from "../core/bindings.ts";
 import { listClaims } from "../core/claims.ts";
 import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -379,12 +379,12 @@ export async function acquireName(
     const holder = holdingSession(db, name, sessionId);
     if (holder && isAlive(holder.pid, holder.proc_start)) {
       const who = describeHolder(holder);
-      return refuse(`"${name}" is held by ${who}`, { holder: who });
+      return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
     if (holder) ended = reap(db, [holder], now);
     if (sockLive) {
       const who = noRowHolder(db, name, before !== null || holder !== null);
-      return refuse(`"${name}" is held by ${who}`, { holder: who });
+      return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
 
     // bindings.name too: a 1.x process sharing the file sees the holder there

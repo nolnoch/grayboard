@@ -143,7 +143,7 @@ test("a team alias in use by one member's session refuses another member's write
 
   const writer = srv.client(alice, "eng/build", { push: false });
   expect(await writer.connect()).toMatchObject({ type: "error", code: "alias_held", message: expect.stringContaining(`another user's session ${build.id}`) });
-  expect(lastEvent("eng/build")).toMatchObject({ event: "refused", detail: `"eng/build" is in use by another user's session ${build.id}` });
+  expect(lastEvent("eng/build")).toMatchObject({ event: "refused", detail: `another user's session ${build.id}` });
   const up = await srv.upload(alice, "eng/build", "a.txt", "x");
   expect(up).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(build.id) } });
 

@@ -107,6 +107,14 @@ export function aliasUser(db: Database, address: string, exceptPrincipal: string
   ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
 }
 
+/**
+ * The one alias_held refusal text, wherever an alias in use is refused (a
+ * bind, writes_as, `?as=`, a delete): who uses it, then what to do instead.
+ */
+export function aliasHeldText(address: string, who: string, instead: string): string {
+  return `"${address}" is in use by ${who}; ${instead}`;
+}
+
 /** A session's `ids` row, as the server checks it. */
 export type IdRow = { principal: string | null; ended_at: number | null; place: string | null; writes_as: string | null; viewer: boolean };
 

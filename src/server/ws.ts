@@ -28,7 +28,7 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  aliasUser, aliasUses, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow, idStatuses, logBinding, unboundPeer, unendedIds,
+  aliasHeldText, aliasUser, aliasUses, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow, idStatuses, logBinding, unboundPeer, unendedIds,
   unknownNameError, type AliasUse, type Continuity, type IdRow,
 } from "../core/bindings.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
@@ -639,9 +639,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     }
     const other = aliasUser(db, target.address, authed.user_email);
     if (other) {
-      const why = `"${target.address}" is in use by another user's session ${other}`;
+      const why = `another user's session ${other}`;
       logBinding(db, id, target.address, "refused", why);
-      return refuse("alias_held", `${why}; write as another name`);
+      return refuse("alias_held", aliasHeldText(target.address, why, "write as another name"));
     }
     writesAs = target;
   }
@@ -873,14 +873,14 @@ function handleBind(hub: Hub, ws: Ws, m: BindRequest): void {
     // unless it comes back: a restore retries then (S11).
     const until = hub.grace.get(holder);
     const wait = until === undefined ? {} : { retry_after_ms: Math.max(0, until - hub.now()) + SWEEP_MS };
-    return refuse("alias_held", `"${address}" is held by ${who}; bind another name`, who, { holder: who, ...wait });
+    return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who, ...wait });
   }
   // Another user's tools-only session writing as it holds nothing, but the
   // alias is in use, so it's exclusive all the same (S8, decided).
   const writer = aliasUser(db, address, authed.user_email);
   if (writer !== null) {
-    const why = `"${address}" is in use by another user's session ${writer}`;
-    return refuse("alias_held", `${why}; bind another name`, why);
+    const why = `another user's session ${writer}`;
+    return refuse("alias_held", aliasHeldText(address, why, "bind another name"), why);
   }
 
   repo.atomic(() => {

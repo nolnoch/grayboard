@@ -657,7 +657,7 @@ test("an identity a session holds or writes as can't be deleted until those sess
   await a.connect();
   const sidecar = client(alice, "be", { push: false });
   await sidecar.connect();
-  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by session") } });
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by the session") } });
   expect(await a.request({ type: "end" })).toMatchObject({ type: "end_ok" });
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(sidecar.id) } });
   expect(await sidecar.request({ type: "end" })).toMatchObject({ type: "end_ok" });

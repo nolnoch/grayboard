@@ -154,7 +154,7 @@ test("2: a Slack-bridge child on a held human name still exits", async () => {
   await session("alex", { extra: { BUS_HUMAN: "1" } });
   const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, "alex", { BUS_HUMAN: "1" }), holdStdin: true, timeoutMs: 5000 });
   expect(r.code).toBe(1);
-  expect(r.err).toContain(`"alex" is held by the live session`);
+  expect(r.err).toContain(`"alex" is in use by the live session`);
 }, 20_000);
 
 test("4: a never-seen name needs create; the refusal lists the closest names", async () => {
@@ -173,7 +173,7 @@ test("5, 13: of N concurrent binders exactly one wins; the losers name it and le
   expect(winners).toHaveLength(1);
   const winnerId = holderOf("fe")!;
   for (const r of results.filter((r) => r.isError)) {
-    expect((r.content as { text: string }[])[0]!.text).toContain(`"fe" is held by the live session ${winnerId}`);
+    expect((r.content as { text: string }[])[0]!.text).toContain(`"fe" is in use by the live session ${winnerId}`);
   }
   expect(existsSync(join(dir, "sock.fe"))).toBe(true);
   const be = await session("be");
@@ -191,7 +191,7 @@ test("6: a holder whose event loop is stopped keeps its name", async () => {
   process.kill(pid, "SIGSTOP");
   try {
     const s = await session();
-    expect(await refusal(s, "bind", { name: "fe" })).toContain(`"fe" is held by the live session`);
+    expect(await refusal(s, "bind", { name: "fe" })).toContain(`"fe" is in use by the live session`);
   } finally {
     process.kill(pid, "SIGCONT");
   }
@@ -276,7 +276,7 @@ test("9: a DM sent mid-swap is never consumed under the new name", async () => {
   // A bind of fe in the window is refused as a rebind in progress, not an older grayboard.
   const third = await session();
   const refused = await third.c.callTool({ name: "bind", arguments: { name: "fe" } });
-  expect((refused.content as { text: string }[])[0]!.text).toContain(`"fe" is held by a session that has just rebound off it`);
+  expect((refused.content as { text: string }[])[0]!.text).toContain(`"fe" is in use by a session that has just rebound off it`);
   await stop(third.c);
   release("bind:after-acquire");
   expect((await binding).isError).toBeFalsy();
