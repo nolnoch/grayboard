@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -220,13 +222,13 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   const config: Config = {
     dbPath: ":memory:", blobDir: dir, httpPort: 0,
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
-    messageRetentionDays: 90, auditRetentionDays: 90, admins: [], orgDomain: "example.com",
+    messageRetentionDays: 90, auditRetentionDays: 90, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
   };
   const uploads = new UploadGate(4 * store.repo.attachmentLimits.total, store.repo.attachmentLimits.total);
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, application.disconnectUser, application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, application.disconnectUser, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {

@@ -125,7 +125,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
     expect(fresh.name).toBe(change === "convert" ? null : "be");
-    expect(database.repo.identities.findByUserAndName(p.authed.user_id, "new")).toBeUndefined();
+    expect(database.repo.aliases.find(p.authed.user_email, "new")).toBeUndefined();
     expect(database.repo.hosted.all().some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
   });
@@ -207,7 +207,7 @@ for (const child of [false, true]) test(`external rebind during native dispatch 
   }), async () => { expect(external({ operation: "bind", principal, name: "be" }).ok).toBe(true); });
   await expect(call).rejects.toHaveProperty("code", "unbound");
   expect(dispatched).toBe(false);
-  expect(database.db.query<{ status: string | null }, []>("SELECT status FROM handles WHERE name='you@example.com/fe'").get()?.status).not.toBe("stale write");
+  expect(database.db.query<{ status: string | null }, [string]>("SELECT status FROM ids WHERE id=?").get((context(principal, child ? "child" : "root") as { id: string }).id)?.status).not.toBe("stale write");
 });
 
 test("two restarts retain ownership and deadline; expiry rebuild releases exactly once", async () => {
@@ -218,6 +218,7 @@ test("two restarts retain ownership and deadline; expiry rebuild releases exactl
   const lease = await delivery.open(principal, context(principal));
   close(); now += 5_000; open();
   expect(await hosted.whoami(principal, context(principal))).toMatchObject(before);
+  expect(database.db.query("SELECT address, id FROM alias_holds").all()).toEqual([{ address: "you@example.com/fe", id: (context(principal) as { id: string }).id }]);
   const reopened = await delivery.open(principal, context(principal));
   expect(reopened.ownership).toBe(lease.ownership);
   expect(reopened.capability).not.toBe(lease.capability);
@@ -266,11 +267,11 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
   const first = issue();
-  database.repo.identities.create(first.authed.user_id, "fe");
+  database.repo.aliases.create(first.authed.user_email, "fe");
   const message = database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   close(); open();
-  expect(database.repo.identities.listForUser(first.authed.user_id).map(row => row.name)).toEqual(["fe"]);
+  expect(database.repo.aliases.listFor(first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
   expect(database.repo.oauth.isGrantActive(first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(database.repo.hosted.all()).toEqual([]);

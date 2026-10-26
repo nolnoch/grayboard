@@ -501,9 +501,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       session.readOnly = name === null;
       session.identityName = name ?? `~${id}`;
       session.identityFull = `${authed.user_email}/${session.identityName}`;
-      session.identityId = name ? repo.identities.findByUserAndName(authed.user_id, name)?.id ?? 0 : 0;
+      if (name && idPrincipal(db, id) === authed.user_email) session.writerId = id;
       hub.sessions.add(session);
-      if (hold && name) hub.holders.set(session.identityFull, session);
+      if (hold && name) {
+        holdAlias(db, session.identityFull, id);
+        hub.holders.set(session.identityFull, session);
+      }
       if (push && name) hub.registry.set(session.identityFull, session);
       const info: IdentityInfo = {
         identity_full: session.identityFull, user_email: authed.user_email,
@@ -514,19 +517,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       };
       return { session, info };
     },
+    hostedRegister(authed: AuthedUser, id: string) {
+      const prior = idPrincipal(db, id);
+      if (prior !== undefined && prior !== authed.user_email) throw new ApplicationError("id_collision", idCollisionText(id, "is another principal's session"));
+      if (prior === undefined) registerId(db, { id, principal: authed.user_email, harness: "opencode", launcher: false });
+      else touchId(db, id);
+    },
     hostedBind(authed: AuthedUser, id: string, name: string, previous: string | null, place: string | null, create: boolean) {
       const full = `${authed.user_email}/${name}`;
-      let identity = repo.identities.findByUserAndName(authed.user_id, name);
+      let identity = repo.aliases.find(authed.user_email, name);
       if (!identity && !create) {
-        const known = closestNames(name, repo.identities.listForUser(authed.user_id).map(i => i.name).filter(n => n !== HUMAN_NAME));
+        const known = closestNames(name, repo.aliases.listFor(authed.user_email).map(i => i.name).filter(n => n !== HUMAN_NAME));
         const message = unknownNameError(name, known);
         logBinding(db, id, full, "refused", message);
         throw new ApplicationError("identity_unknown", message, { known });
       }
       if (!identity) {
-        identity = repo.identities.create(authed.user_id, name);
-        writeAudit(repo, "identity.created", authed.user_email, name);
-        onIdentityCreated(db, repo, authed.user_id, full);
+        identity = repo.aliases.create(authed.user_email, name);
+        writeAudit(repo, "alias.created", authed.user_email, full, { session: id });
+        onAliasCreated(db, repo, authed.user_id, full);
       }
       let moved: string[] = [];
       let notMoved: string | undefined;
@@ -537,14 +546,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         logBinding(db, id, from, "released", `rebound to ${full}`);
         logBinding(db, id, full, "moved", [from, notMoved].filter(Boolean).join("; "));
       } else logBinding(db, id, full, "bound");
-      if (previous === null) startSession(db, full, null);
-      else {
-        touchHandle(db, full);
-        db.prepare("UPDATE handles SET (status, status_at, queue_off) = (SELECT status, status_at, queue_off FROM handles WHERE name = ?) WHERE name = ?")
-          .run(`${authed.user_email}/${previous}`, full);
-      }
-      setPlace(db, full, place);
-      setLauncher(db, full, false);
+      if (previous !== null) dropHold(db, `${authed.user_email}/${previous}`, id);
+      touchAlias(db, full);
+      holdAlias(db, full, id);
+      setPlace(db, id, place);
+      setLauncher(db, id, false);
       writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: false });
       return { moved, notMoved };
     },
@@ -596,9 +602,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     pending(session: ApplicationSession, limit = 100): DeliveryEvent[] {
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
-      const since = repo.cursors.get(session.identityId, "direct", session.identityFull);
+      const since = repo.cursors.get(session.identityFull, "direct", session.identityFull);
       const direct: DeliveryEvent[] = repo.messages.unreadSince([{ type: "direct", ref: session.identityFull, since }])
-        .slice(0, limit).map(message => ({ kind: "direct", message: showPending(message) }));
+        .slice(0, limit).map(message => ({ kind: "direct", message: showMessage(message) }));
       const boards = pendingFor(db, session.identityFull, { all: true });
       return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
     },
@@ -810,15 +816,14 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
         undelivered_from_you: repo.messages.undeliveredFrom(session.identityFull).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
       };
+  for (const a of msg.attachments ?? []) {
+    writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, message_id: msg.id, recipient: msg.recipient });
+  }
   return { payload, ref: { kind: "message", id: msg.id }, msg };
 }
 
-// After a fresh send's commit (never a replay's): its files' audit rows and
-// the push to a live recipient.
+// Only after the outermost commit, never on a replay.
 function deliverSend(hub: Hub, session: ApplicationSession, msg: MessageRow): void {
-  for (const a of msg.attachments ?? []) {
-    writeAudit(hub.repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: session.identityFull, message_id: msg.id, recipient: msg.recipient });
-  }
   const recipientWs = hub.registry.get(msg.recipient);
   if (recipientWs?.active) recipientWs.sink.deliver({ kind: "direct", message: showMessage(msg) });
 }
@@ -852,8 +857,10 @@ function handleSend(hub: Hub, session: ApplicationSession, recipient: string, bo
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
   const out = writeOnce(hub, session, "dm_send", args, resend, p.ids, () => writeSend(hub, session, p));
   if ("replay" in out) return out.replay;
-  testPause("write:after-commit");
-  deliverSend(hub, session, out.fresh.msg);
+  afterCommit(hub.db, () => {
+    testPause("write:after-commit");
+    deliverSend(hub, session, out.fresh.msg);
+  });
   return out.fresh.payload;
 }
 
@@ -879,8 +886,10 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       return { payload, ref: w.ref, msg: w.msg };
     });
     if ("replay" in out) return out.replay;
-    testPause("write:after-commit");
-    deliverSend(hub, session, out.fresh.msg);
+    afterCommit(db, () => {
+      testPause("write:after-commit");
+      deliverSend(hub, session, out.fresh.msg);
+    });
     return out.fresh.payload;
   } catch (e) {
     if (e instanceof CoreError || e instanceof ApplicationError) {
@@ -951,6 +960,7 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, args: Record<str
     out = writeOnce(hub, session, "board_post", fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
+      for (const a of r.attachments ?? []) writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
       return { payload: r, ref: { kind: "post", id: r.post_id }, wake: o.wake };
     });
   } catch (e) {
@@ -958,11 +968,14 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, args: Record<str
     console.error("[grayboard] board_post failed:", e);
     return fail("internal", "board_post failed");
   }
-  if ("replay" in out) { publish?.(out.replay); return out.replay; }
-  testPause("write:after-commit");
+  if ("replay" in out) {
+    if (publish) afterCommit(db, () => publish(out.replay));
+    return out.replay;
+  }
   const r = out.fresh.payload;
-  for (const a of r.attachments ?? []) writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
-  publish?.(r);
+  afterCommit(db, () => testPause("write:after-commit"));
+  hub.boardChanged(r.board);
+  if (publish) afterCommit(db, () => publish(r));
   wake(hub, out.fresh.wake);
   return r;
 }

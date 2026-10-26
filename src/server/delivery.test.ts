@@ -50,7 +50,7 @@ test("canceling duplicate open preserves accepted lease, children, receipts and 
   expect(delivery.activeLeaseCount).toBe(1);
   expect(store.repo.hosted.all()).toHaveLength(2);
   expect(originalHints).toBe(1);
-  send();
+  send("next message");
   expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);
   await delivery.receipt(bob, context(bob), first.capability, [items[0]!.id]);
   await delivery.renew(bob, context(bob), first.capability);

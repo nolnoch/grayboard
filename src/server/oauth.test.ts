@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { auth, Client, StreamableHTTPClientTransport, type OAuthClientProvider, type OAuthDiscoveryState, type StoredOAuthTokens } from "@modelcontextprotocol/client";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
@@ -51,7 +53,7 @@ beforeEach(() => {
   } });
   base = `http://127.0.0.1:${server.port}`;
   config = { dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "fake-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: base,
-    devAuth: true, admins: [], messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations };
+    devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations };
   service = makeService();
   mcp = createMcpHandler(({ requestInfo }) => {
     const principal = service.authenticate(requestInfo!);

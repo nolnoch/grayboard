@@ -93,38 +93,40 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   }
 });
 
-for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native identity preflight spends once before alias reads`, async () => {
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted preflight spends once before candidate reads`, async () => {
   let now = 0;
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
-    const token = await srv.login("alice@example.com");
+    const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     srv.app.repo.aliases.create("alice@example.com", "be");
     const aliases = srv.app.repo.aliases;
     const find = aliases.find.bind(aliases), listFor = aliases.listFor.bind(aliases);
     let finds = 0, lists = 0;
     aliases.find = (...args) => { finds++; return find(...args); };
     aliases.listFor = (...args) => { lists++; return listFor(...args); };
+    let legacySession: string | null = null;
     const call = async (name: string, id: number, extra: Record<string, string> = {}) => {
       const response = await fetch(`${srv.base}/mcp`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": name, "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/list" } : {}), "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra },
-        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/list", ...(version === "2026-07-28" ? { params: { _meta: { [PROTOCOL_VERSION_META_KEY]: version, [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } } } : {}) }),
+        headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": name, "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession } : {}), ...(version === "2026-07-28" ? { "Mcp-Method": "tools/list" } : {}), "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: version !== "2026-07-28" && !legacySession ? "initialize" : "tools/list", ...(version === "2026-07-28" ? { params: { _meta: { [PROTOCOL_VERSION_META_KEY]: version, [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } } } : !legacySession ? { params: { protocolVersion: version, clientInfo: { name: "fixture", version: "1" }, capabilities: {} } } : {}) }),
       });
+      legacySession ??= response.headers.get("Mcp-Session-Id");
       return { response, text: await response.text() };
     };
     expect((await call("bee", 1, { Origin: "https://foreign.example.com" })).response.status).toBe(403);
-    expect((await call("human", 1)).response.status).toBe(400);
     expect((await call("bee", 1, { Authorization: "" })).response.status).toBe(401);
     expect([finds, lists]).toEqual([0, 0]);
-    const unknown = await call("bee", 1);
-    expect(unknown.response.status).toBe(400);
-    expect(JSON.parse(unknown.text)).toMatchObject({ code: "identity_unknown", known: ["be"] });
-    expect([finds, lists]).toEqual([1, 1]);
-    const known = await call("be", 2);
-    expect(known.response.status).toBe(200);
-    expect(known.text).toContain('"tools"');
+    const first = await call("human", 1);
+    expect(first.response.status).toBe(200);
+    const second = await call("bee", 2);
+    expect(second.response.status).toBe(200);
+    expect(second.text).toContain('"tools"');
+    expect(srv.app.repo.hosted.all()).toEqual([]);
+    expect(srv.app.repo.aliases.listFor("alice@example.com").map(alias => alias.name)).toEqual(["be"]);
     const before = [finds, lists];
-    expect(finds).toBeGreaterThan(1);
+    expect(finds).toBe(0);
+    expect(lists).toBeGreaterThan(1);
     for (const [name, id] of [["be", 3], ["bee", 4]] as const) {
       const blocked = await call(name, id);
       expect(blocked.response.status).toBe(429);
@@ -133,7 +135,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native identity p
       expect([finds, lists]).toEqual(before);
     }
     for (const method of ["GET", "DELETE", "OPTIONS", "HEAD"]) {
-      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee", "MCP-Protocol-Version": version } });
+      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee", "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession } : {}) } });
       expect(blocked.status).toBe(429);
       expect(blocked.headers.get("Retry-After")).toBe("1");
       await blocked.text();

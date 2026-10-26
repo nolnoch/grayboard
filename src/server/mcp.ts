@@ -112,6 +112,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           error: { code: -32000, message: "too many connections; retry after the indicated delay", data: { code: "rate_limited", retry_after_ms: retryAfterMs } },
         }, { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } });
       }
+      if (error instanceof ApplicationError && error.code === "rate_limited" && !exchange?.refusal) throw new ApplicationError("internal", "internal error");
       if (!closed && !request.signal.aborted && error instanceof ApplicationError && error.code === "unauthenticated") {
         const refusal = oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
@@ -401,7 +402,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus() });
                 live = makeLive(context, authorized, ownHandler);
                 response = await ownHandler.fetch(req, { parsedBody: body.parsedBody });
-              } else response = await modern.fetch(req, { parsedBody: body.parsedBody });
+              } else {
+                exchange.context = await select(req);
+                response = await modern.fetch(req, { parsedBody: body.parsedBody });
+              }
             } else {
               const sid = req.headers.get("Mcp-Session-Id");
               let legacy = sid ? legacySessions.get(sid) : undefined;

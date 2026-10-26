@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,7 +34,7 @@ beforeEach(async () => {
   database = openDatabase(path, { blobDir: join(dir, "blobs") });
   const issued = issueOAuth(database.repo, `${origin}/mcp`, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   token = issued.token;
-  oauth = createOAuthServer(database.repo, { dbPath: path, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: origin, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] });
+  oauth = createOAuthServer(database.repo, { dbPath: path, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: origin, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   application = createApplication(database.repo, database.db);
   mcp = createHostedMcp(application, oauth, { trustedOrigin: origin });
   const authenticated = oauth.authenticate(new Request(`${origin}/mcp`, { headers: { Authorization: `Bearer ${token}` } }), ["grayboard:tools"]);
@@ -57,6 +59,8 @@ for (const tool of ["dm_send", "delegate"]) test(`${tool}: late hosted audit rol
   await expect(mcp.sessions.run(principal, context(), tool, session => tool === "delegate" ? delegate(session) : application.send(session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
   expect(application.history(recipient.session)).toEqual([]);
   expect(events).toEqual([]);
+  expect(database.db.query("SELECT * FROM write_receipts").all()).toEqual([]);
+  expect(database.db.query("SELECT action FROM access_log WHERE action IN ('request.replayed', 'request.resent', 'delegation.requested')").all()).toEqual([]);
 });
 
 test("actual HTTP delegation audit rollback cannot publish a launcher request", async () => {

@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -28,7 +30,7 @@ beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
   application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] });
+  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
@@ -53,10 +55,13 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 
-test("unknown HTTP names fail with closest names without creating a context or identity", async () => {
-  const response = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee" } }));
-  expect(response.status).toBe(400);
-  expect(await response.json()).toMatchObject({ code: "identity_unknown", known: ["be"] });
+test("legacy identity headers cannot select or create names; explicit bind retains closest-name refusal", async () => {
+  const client = await connect("2026-07-28", undefined, new Headers({ "X-Grayboard-Identity": "bee" }));
+  const identity = await client.callTool({ name: "whoami", arguments: {} });
+  expect(identity.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"name":\s*"be"/) })]);
+  const refused = await client.callTool({ name: "bind", arguments: { name: "bee" } });
+  expect(refused.isError).toBe(true);
+  expect(refused.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"known":\s*\[\s*"be"\s*\]/) })]);
   expect(store.repo.aliases.find(user.user_email, "bee")).toBeUndefined();
   expect(hosted.activeContexts).toBe(0);
 });
@@ -262,7 +267,8 @@ test("hosted bind does not inherit a previous WS launcher's opt-in", async () =>
   application.close(prior.session);
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
-  expect(store.db.query("SELECT launcher FROM handles WHERE name = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
+  expect(store.db.query("SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
+  expect(store.db.query("SELECT launcher FROM ids WHERE id = ?").get(prior.session.sessionId)).toEqual({ launcher: 1 });
   expect(store.db.query("SELECT detail FROM access_log WHERE action = 'handle.launcher_set' AND target = ? ORDER BY rowid DESC LIMIT 1").get("alice@example.com/launcher")).toEqual({ detail: '{"on":false}' });
 });
 
@@ -700,7 +706,7 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
     const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
-    expect(store.repo.identities.findByUserAndName(user.user_id, "unselected")).toBeUndefined();
+    expect(store.repo.aliases.find(user.user_email, "unselected")).toBeUndefined();
   } finally { store.repo.oauth.findActiveAccess = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });

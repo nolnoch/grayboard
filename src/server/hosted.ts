@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
-import { bindOk, boundInstructions, UNBOUND_READS, unboundInstruction } from "../core/bindings.ts";
+import { asSessionId, bindOk, boundInstructions, UNBOUND_READS, unboundInstruction } from "../core/bindings.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
@@ -19,7 +19,7 @@ export function hostedSessionId(user: number, client: string, raw: string): stri
     length.writeUInt32BE(bytes.length);
     hash.update(length).update(bytes);
   }
-  return hash.digest("hex").slice(0, 16);
+  return asSessionId(hash.digest("hex").slice(0, 16));
 }
 export function sessionContext(principal: OAuthPrincipal, meta: unknown): SessionContext {
   if (principal.clientId !== OPENCODE_CLIENT) return { missing: "the client has no mapped source" };
@@ -68,6 +68,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, name: null, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
+      application.hostedRegister(p.authed, row.session_id);
       store.insert(row);
     }
     return row;
@@ -309,6 +310,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           touch(attached);
           if (existing?.root_session_id === root.session_id) return { message: "already registered" };
           if (existing) store.end(existing.session_id, "closed", now());
+          application.hostedRegister(p.authed, childId);
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, name: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });

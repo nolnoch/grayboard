@@ -1166,6 +1166,7 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
       if (row.name) {
         const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(row.user_id)!;
+        db.run("DELETE FROM alias_holds WHERE address = ? AND id = ?", [`${user.email}/${row.name}`, session]);
         db.run("INSERT INTO binding_events(session_id, name, event, at, detail) VALUES (?, ?, 'released', ?, ?)", [session, `${user.email}/${row.name}`, now, reason]);
       }
       for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);

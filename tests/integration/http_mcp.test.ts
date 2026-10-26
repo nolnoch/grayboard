@@ -279,7 +279,7 @@ test("OAuth challenges and actual scope precede identity validation on every met
       expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${error}"`);
     }
   }
-  expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "unselected")).toBeUndefined();
+  expect(app.repo.aliases.find("alice@example.com", "unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -385,7 +385,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
       await response.arrayBuffer();
     }
     expect(checks).toBe(2);
-    expect(app.repo.identities.findByUserAndName(issued.authed.user_id, "unselected")).toBeUndefined();
+    expect(app.repo.aliases.find(issued.authed.user_email, "unselected")).toBeUndefined();
     expect(app.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   } finally { app.oauth.authenticate = original; }
@@ -401,6 +401,6 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
   } finally { app.repo.oauth.findActiveAccess = original; }
-  expect(app.repo.identities.findByUserAndName(app.repo.users.findByEmail("alice@example.com")!.id, "unselected")).toBeUndefined();
+  expect(app.repo.aliases.find("alice@example.com", "unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });

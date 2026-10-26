@@ -30,6 +30,23 @@ beforeEach(() => {
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
+test("hosted source IDs attribute child writes and release only the root alias hold", async () => {
+  const root = context("root"), child = context("child");
+  if (!("id" in root) || !("id" in child)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  await hosted.register(principal, root, "child");
+  for (const id of [root.id, child.id]) {
+    expect(id).toMatch(/^id:[0-9a-hjkmnp-tv-z]{13}$/);
+    expect(database.db.query("SELECT principal, keyed, launcher FROM ids WHERE id=?").get(id)).toEqual({ principal: "you@example.com", keyed: 0, launcher: 0 });
+  }
+  expect(database.db.query("SELECT address, id FROM alias_holds").all()).toEqual([{ address: "you@example.com/be", id: root.id }]);
+  await hosted.run(principal, child, "dm_send", session => application.send(session, "be", "child attribution"));
+  expect(database.db.query("SELECT sender_id FROM messages WHERE body='child attribution'").get()).toEqual({ sender_id: child.id });
+  await hosted.end(principal, root);
+  expect(database.db.query("SELECT * FROM alias_holds").all()).toEqual([]);
+  expect(database.db.query("SELECT id FROM ids WHERE id IN (?, ?)").all(root.id, child.id)).toHaveLength(2);
+});
+
 test("unbound row quota survives service restart, idle cleanup frees rows and gates", async () => {
   for (let i = 0; i < hosted.limits.user; i++) await hosted.whoami(principal, context(`unbound-${i}`));
   expect(database.repo.hosted.all()).toHaveLength(hosted.limits.user);
@@ -109,7 +126,7 @@ test("unbound context cannot write or implicitly create names", async () => {
   await expect(hosted.run(principal, context("one"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   await expect(hosted.bind(principal, context("one"), { name: "fe" })).rejects.toHaveProperty("code", "identity_unknown");
   await expect(hosted.bind(principal, { missing: "metadata missing" }, { name: "fe", create: true })).rejects.toHaveProperty("code", "unbound");
-  expect(database.repo.identities.listForUser(principal.authed.user_id)).toEqual([]);
+  expect(database.repo.aliases.listFor(principal.authed.user_email)).toEqual([]);
 });
 
 test("two contexts execute tools under distinct bound identities", async () => {
@@ -125,9 +142,14 @@ test("rebind retains ownership and children but fences old delivery", async () =
   const before = await hosted.whoami(principal, context("root"));
   const lease = await delivery.open(principal, context("root"));
   claim(database.db, "you@example.com/fe", "ticket:ENG-142");
-  database.db.prepare("UPDATE handles SET status = ?, status_at = ?, queue_off = 1 WHERE name = ?").run("reviewing", now, "you@example.com/fe");
+  const root = context("root");
+  if (!("id" in root)) throw new Error("fixture has no mapped source");
+  database.db.prepare("UPDATE ids SET status = ?, status_at = ? WHERE id = ?").run("reviewing", now, root.id);
+  database.db.prepare("UPDATE aliases SET queue_off = 1 WHERE address = ?").run("you@example.com/fe");
   await hosted.bind(principal, context("root"), { name: "be", create: true });
-  expect(database.db.prepare("SELECT status, status_at, queue_off FROM handles WHERE name = ?").get("you@example.com/be")).toEqual({ status: "reviewing", status_at: now, queue_off: 1 });
+  expect(database.db.prepare("SELECT status, status_at FROM ids WHERE id = ?").get(root.id)).toEqual({ status: "reviewing", status_at: now });
+  expect(database.db.prepare("SELECT queue_off FROM aliases WHERE address = ?").get("you@example.com/fe")).toEqual({ queue_off: 1 });
+  expect(database.db.prepare("SELECT queue_off FROM aliases WHERE address = ?").get("you@example.com/be")).toEqual({ queue_off: null });
   expect(listClaims(database.db)).toMatchObject([{ key: "ticket:ENG-142", holder: "you@example.com/be" }]);
   expect(await hosted.whoami(principal, context("child"))).toMatchObject({ name: "be", ownership: before.ownership, child: true });
   await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");

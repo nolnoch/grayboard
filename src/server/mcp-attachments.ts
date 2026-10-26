@@ -71,8 +71,8 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
           const current = oauth.authenticate(req, ["grayboard:tools"]);
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard();
-          const identity = repo.identities.findByUserAndName(principal.authed.user_id, session.identityName);
-          if (!identity || identity.id !== session.identityId) throw new Refusal(error("not_found", "identity not found", 404));
+          const alias = repo.aliases.find(principal.authed.user_email, session.identityName);
+          if (!alias || alias.address !== session.identityFull) throw new Refusal(error("not_found", "identity not found", 404));
         };
         guard();
         const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)

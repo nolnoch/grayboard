@@ -1,3 +1,5 @@
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +14,7 @@ const hostname = "127.0.0.1";
 
 for (const expired of [false, true]) test(`actual server restart restores or expires live graph, expired=${expired}`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-restart-"));
-  const config = { dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [] };
+  const config = { dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES };
   let app: ReturnType<typeof startServer> | undefined;
   try {
     app = startServer(config, { hostname, background: false });
@@ -68,7 +70,7 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
     app = startServer({
       dbPath: ":memory:", blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl,
-      messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [],
+      messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     }, { hostname, background: false });
     expect(app.server.hostname).toBe(hostname);
     const response = await fetch(`http://${hostname}:${app.server.port}/.well-known/oauth-authorization-server`);
