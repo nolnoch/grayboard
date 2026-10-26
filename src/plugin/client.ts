@@ -1,4 +1,4 @@
-import { PROTO, type ServerMessage, type ClientMessage, type AliasLost, type ErrorMessage, type HelloOk, type Message } from "../shared/protocol.ts";
+import { PROTO, type ServerMessage, type ClientMessage, type AliasLost, type ErrorMessage, type HelloOk, type Message, type AckRequest, type BoardAckRequest } from "../shared/protocol.ts";
 import { refOf, type Pending } from "../core/boards.ts";
 import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -67,6 +67,8 @@ export type ClientOptions = {
 /** Why the server is refusing this client for now: what it limits, its
  *  message, and when the client tries again. */
 export type RateLimited = { what: string; message: string; retryAt: number };
+// An ack waiting for a ready socket; its req_id is minted when it goes out.
+type UnsentAck = Omit<AckRequest, "req_id"> | Omit<BoardAckRequest, "req_id">;
 
 // What a token check found: go ahead, sign in again, wait, or no answer.
 type Probe =
@@ -85,6 +87,7 @@ export class GrayboardClient {
   private dead      = false; // set on superseded, refusal or close; do not reconnect
 
   private helloData: HelloOk | null = null;
+  private unsentAcks: UnsentAck[] = [];
   private refused: string | null = null; // set while the server refuses our token
   // Set while the server rate-limits this client, its user's hellos (#210)
   // or its address after auth failures (#240), until a hello is accepted:
@@ -242,6 +245,7 @@ export class GrayboardClient {
         // Reset on an accepted hello, not on open: a server that closes
         // after every hello would otherwise be retried each second.
         this.backoffMs = 1000;
+        for (const ack of this.unsentAcks.splice(0)) this.send({ ...ack, req_id: this.nextId() });
         const resolvers = this.readyResolvers.splice(0);
         for (const r of resolvers) r();
         const rekeyedFrom = this.rekeyedFrom;
@@ -252,11 +256,7 @@ export class GrayboardClient {
       case "push": {
         const id = msg.message.id;
         this.onPush(msg.message).then(
-          () => {
-            if (this.ws?.readyState === WebSocket.OPEN) {
-              this.send({ type: "ack", req_id: this.nextId(), message_ids: [id] });
-            }
-          },
+          () => this.ackWhenReady({ type: "ack", message_ids: [id] }),
           (e) => console.error("[grayboard] message delivery failed:", e),
         );
         break;
@@ -265,11 +265,7 @@ export class GrayboardClient {
       case "board_push": {
         const ref = refOf(msg.item);
         this.onBoardPush(msg.item).then(
-          () => {
-            if (this.ws?.readyState === WebSocket.OPEN) {
-              this.send({ type: "board_ack", req_id: this.nextId(), refs: [ref] });
-            }
-          },
+          () => this.ackWhenReady({ type: "board_ack", refs: [ref] }),
           (e) => console.error("[grayboard] board delivery failed:", e),
         );
         break;
@@ -423,6 +419,15 @@ export class GrayboardClient {
 
   private send(msg: ClientMessage): void {
     this.ws?.send(JSON.stringify(msg));
+  }
+
+  // A delivery can finish after its socket closed, or on a new socket before
+  // its hello_ok, where the server would close it for a frame before the
+  // hello (A4). Its ack then goes out after the next hello_ok: the session
+  // re-attached acks it; any other ignores ids it can't read.
+  private ackWhenReady(ack: UnsentAck): void {
+    if (this.ws?.readyState === WebSocket.OPEN && this.helloData) this.send({ ...ack, req_id: this.nextId() });
+    else this.unsentAcks.push(ack);
   }
 
   private nextId(): string {

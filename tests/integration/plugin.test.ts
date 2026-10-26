@@ -128,6 +128,35 @@ test("the client reports where it runs, and a dropped connection resumes without
   expect(me).toMatchObject({ online: true, where: describeLocation(process.cwd()), status: "soaking" });
 }, 20_000);
 
+// Audit A4 (#345): a delivery that finishes while the socket is down (or on
+// a new one before its hello_ok) acks after the next hello_ok, not before it.
+test("an ack whose socket is gone goes out after the next hello_ok", async () => {
+  const alice = await login("alice@example.com");
+  const noop = async () => {};
+  // The first delivery finishes when the test says; later ones never do, so
+  // only the first one's ack can move the cursor.
+  let finish!: () => void;
+  const first = new Promise<void>((r) => (finish = r));
+  let delivered = 0;
+  const onPush = () => (++delivered === 1 ? first : new Promise<void>(() => {}));
+  const be = new GrayboardClient(srv.base, () => alice, mintSessionKey(), onPush, noop);
+  be.connect();
+  await be.ready();
+  await be.request({ type: "bind", alias: "be" });
+  const fe = await session(await login("bob@example.com"), "fe");
+  const { message_id } = await fe.call("dm_send", { to: "alice@example.com/be", body: "hi" });
+  await until(() => delivered === 1, 5000, "the push");
+  (be as any).ws.close();
+  await until(() => (be as any).ws === null, 5000, "the close");
+  finish();
+  await be.ready();
+  const cursor = () => srv.app.db.query(`SELECT last_seen_id FROM mailbox_cursors WHERE address = 'alice@example.com/be' AND stream_type = 'direct'`).get();
+  await until(() => cursor(), 5000, "the ack");
+  expect(cursor()).toEqual({ last_seen_id: message_id });
+  expect(await be.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok" });
+  be.close();
+}, 20_000);
+
 test("a refused token says to sign in again: at startup, in a running session's tools, and in the CLI", async () => {
   const noop = async () => {};
   const msg = (running: boolean) => (running ? "sign in; reconnecting" : "sign in");
