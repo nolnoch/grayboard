@@ -6,8 +6,11 @@ import { OpenCode } from "@opencode/sdk";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
+import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
 
@@ -20,7 +23,7 @@ const installed = readFileSync(join(root, "installed.txt"), "utf8").trim();
 const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
-const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], ...(process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? {} : { helloLimit: { burst: 10000, perSec: 10000 } }) };
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HELLO_LIMIT : { burst: 10000, perSec: 10000 } };
 const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
@@ -265,6 +268,8 @@ try {
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await invoke(grandchild.id, "dm_send", { to: "fe", body: "Nested child inherits A" });
   assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); assert.equal(row(child.id), null, "via ancestry is not registration authority");
+  assert.match(row(a.id)!.session_id, SESSION_ID); assert.match(row(grandchild.id)!.session_id, SESSION_ID);
+  assert.equal((app.db.prepare("SELECT sender_id FROM messages WHERE body = ?").get("Nested child inherits A") as { sender_id: string }).sender_id, row(grandchild.id)!.session_id);
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
   await invoke(grandchild.id, "bind", { name: "child-control", create: true }); assert.equal(row(grandchild.id)?.name, null); assert.equal(app.mcp.activeLeases, 2);
   const attachmentGrant = await ctx.integration.connection.resolve(selected); assert(attachmentGrant?.type === "oauth");
@@ -344,7 +349,7 @@ try {
   await wait(() => app.mcp.activeLeases, n => n === 1, "server restart after sticky expiry"); assert.notEqual(row(a.id)!.ownership_id, timelyOwnership);
   console.log("REAL_SERVER_RESTART_DEADLINES_OK", { before: timelyOwnership, after: row(a.id)!.ownership_id });
   await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
-  assert.equal(app.repo.identities.listForUser(app.repo.users.findByEmail("you@example.com")!.id).some(i => i.name === "does-not-exist"), false);
+  assert.equal(app.repo.aliases.listFor("you@example.com").some(i => i.name === "does-not-exist"), false);
   await rpc.enroll({ sessionID: a.id, name: "r4" }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit reapproval existing name");
   const drift = await ctx.mcp.transform(e => { const old = e.get("grayboard"); assert(old?.type === "remote"); e.set("grayboard", { ...old, headers: { "X-Fixture-Drift": "away" } }); }); await ctx.mcp.reload();
   await wait(() => rpc.status({}, { location }), s => s.state === "paused", "real config drift"); await drift.dispose(); await ctx.mcp.reload(); assert.equal((await rpc.status({}, { location })).state, "paused");
