@@ -16,7 +16,7 @@ import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { listClaims } from "../core/claims.ts";
-import { aliasUser } from "../core/bindings.ts";
+import { aliasUser, idRow } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -163,9 +163,7 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
   if (p.kind === "id") {
-    const row = db.prepare(`SELECT principal, ended_at, viewer FROM ids WHERE id = ?`).get(p.address) as
-      | { principal: string | null; ended_at: number | null; viewer: number }
-      | null;
+    const row = idRow(db, p.address);
     if (!row || row.viewer || row.principal !== authed.user_email) return forbidden(`${p.address} isn't a session of yours`);
     if (row.ended_at !== null) return forbidden(`${p.address} ended at ${new Date(row.ended_at).toISOString()}`);
     return p.address;

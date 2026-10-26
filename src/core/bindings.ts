@@ -7,7 +7,7 @@ import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { BOARD_INSTRUCTIONS } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
-import { addressParts } from "./addresses.ts";
+import { addressParts, type ScopeKind } from "./addresses.ts";
 import type { UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
@@ -105,6 +105,42 @@ export function aliasUser(db: Database, address: string, exceptPrincipal: string
         AND (i.id IN (SELECT id FROM alias_holds WHERE address = ?1) OR i.writes_as = ?1)
       LIMIT 1`,
   ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
+}
+
+/** A session's `ids` row, as the server checks it. */
+export type IdRow = { principal: string | null; ended_at: number | null; place: string | null; writes_as: string | null; viewer: boolean };
+
+export function idRow(db: Database, id: string): IdRow | undefined {
+  const r = db.prepare(`SELECT principal, ended_at, place, writes_as, viewer FROM ids WHERE id = ?`).get(id) as (Omit<IdRow, "viewer"> & { viewer: number }) | null;
+  return r ? { ...r, viewer: r.viewer === 1 } : undefined;
+}
+
+/** The sessions not yet ended (viewers aside), every principal's or one's. */
+export function unendedIds(db: Database, principal: string | null = null): string[] {
+  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND (?1 IS NULL OR principal = ?1)`).all(principal) as { id: string }[]).map((r) => r.id);
+}
+
+/** The statuses set on these sessions, by ID. */
+export function idStatuses(db: Database, ids: string[]): Map<string, { status: string; status_at: number | null }> {
+  const rows = db.prepare(`SELECT id, status, status_at FROM ids WHERE status IS NOT NULL AND id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(ids)) as { id: string; status: string; status_at: number | null }[];
+  return new Map(rows.map(({ id, ...s }) => [id, s]));
+}
+
+/** A session acting as an alias: holding it, or a tools-only session writing as it. principal: the session's. */
+export type AliasUse = { id: string; principal: string; address: string; scope_kind: ScopeKind; scope_ref: string; held: boolean };
+
+/** The aliases unended sessions act as, every principal's or one's. */
+export function aliasUses(db: Database, principal: string | null): AliasUse[] {
+  return (db.prepare(
+    `SELECT * FROM (
+       SELECT h.id, i.principal, a.address, a.scope_kind, a.scope_ref, 1 AS held FROM alias_holds h
+         JOIN ids i ON i.id = h.id JOIN aliases a ON a.address = h.address
+        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL
+       UNION ALL
+       SELECT i.id, i.principal, a.address, a.scope_kind, a.scope_ref, 0 FROM ids i JOIN aliases a ON a.address = i.writes_as
+        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL)
+     WHERE ?1 IS NULL OR principal = ?1`,
+  ).all(principal) as (Omit<AliasUse, "held"> & { held: number })[]).map((r) => ({ ...r, held: r.held === 1 }));
 }
 
 /** One binding_events row, or one more repeat on a refusal's row. */

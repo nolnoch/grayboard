@@ -28,7 +28,8 @@ import {
   type UnboundPeer,
 } from "../core/boards.ts";
 import {
-  aliasUser, closestNames, continuityOf, dropHold, holdAlias, holderOf, idAddress, logBinding, unboundPeer, unknownNameError, type Continuity,
+  aliasUser, aliasUses, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow, idStatuses, logBinding, unboundPeer, unendedIds,
+  unknownNameError, type AliasUse, type Continuity, type IdRow,
 } from "../core/bindings.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress, type ScopeKind } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -255,9 +256,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
   // (S4): every one a previous run left gets a grace from now, so a deploy
   // ends only the sessions that don't come back, through endSession.
   const startedAt = hub.now();
-  for (const { id } of db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0`).all() as { id: string }[]) {
-    hub.grace.set(id, startedAt + GRACE_MS);
-  }
+  for (const id of unendedIds(db)) hub.grace.set(id, startedAt + GRACE_MS);
 
   const handlers = {
     open(_ws: Ws) {
@@ -434,8 +433,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     }
     const email = repo.users.findById(userId)?.email;
     if (!email) return;
-    const ids = db.prepare(`SELECT id FROM ids WHERE principal = ? AND ended_at IS NULL AND viewer = 0`).all(email) as { id: string }[];
-    endIds(hub, ids.map((r) => r.id), "revoked");
+    endIds(hub, unendedIds(db, email), "revoked");
   };
   // Catches a user disabled while one of their hellos was in flight, and an
   // alias its session's principal may no longer act as (S9's backstop to
@@ -533,29 +531,12 @@ function detach(hub: Hub, ws: Ws): void {
   for (const a of ws.data.addresses) if (hub.registry.get(a) === ws) hub.registry.delete(a);
 }
 
-// A session acting as an alias: holding it, or a tools-only connection
-// writing as it. Live or in its grace. principal: the session's principal.
-type AliasUse = { id: string; principal: string; address: string; scope_kind: ScopeKind; scope_ref: string; held: boolean };
-
-function aliasUses(hub: Hub, principal: string | null): AliasUse[] {
-  return hub.db.prepare(
-    `SELECT * FROM (
-       SELECT h.id, i.principal, a.address, a.scope_kind, a.scope_ref, 1 AS held FROM alias_holds h
-         JOIN ids i ON i.id = h.id JOIN aliases a ON a.address = h.address
-        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL
-       UNION ALL
-       SELECT i.id, i.principal, a.address, a.scope_kind, a.scope_ref, 0 FROM ids i JOIN aliases a ON a.address = i.writes_as
-        WHERE i.ended_at IS NULL AND i.principal IS NOT NULL)
-     WHERE ?1 IS NULL OR principal = ?1`,
-  ).all(principal).map((r: any) => ({ ...r, held: r.held === 1 })) as AliasUse[];
-}
-
 // Re-checks the aliases that sessions act as (S9) against mayActIn, for one
 // principal's sessions or (null) every session's, and revokes the ones it
 // now refuses.
 function recheckAliases(hub: Hub, principal: string | null): void {
   const revoked: (AliasUse & { reason: string })[] = [];
-  for (const u of aliasUses(hub, principal)) {
+  for (const u of aliasUses(hub.db, principal)) {
     const p = hub.repo.principals.findByName(u.principal);
     const reason = p ? mayActIn(hub.repo, p, u) : `principal ${u.principal} no longer exists`;
     if (reason) revoked.push({ ...u, reason });
@@ -601,17 +582,6 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[]): void 
 }
 
 const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: authed.user_email });
-
-type IdRow = { principal: string | null; ended_at: number | null; place: string | null; writes_as: string | null };
-
-function idRow(db: CoreDb, id: string): IdRow | undefined {
-  return (db.prepare(`SELECT principal, ended_at, place, writes_as FROM ids WHERE id = ?`).get(id) as IdRow | null) ?? undefined;
-}
-
-// The alias session `id` holds, if any (one per session until PR 4).
-function heldBy(db: CoreDb, id: string): string | undefined {
-  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at LIMIT 1`).get(id) as { address: string } | null)?.address;
-}
 
 function helloOkFields(hub: Hub, authed: AuthedUser): Pick<HelloOk, "user_email" | "teams" | "human" | "attachment_limits"> {
   const { repo } = hub;
@@ -749,7 +719,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
   // connection can't receive a delegation, so it's never a launcher.
   if (push) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: launcher });
 
-  const bound = toolsOnly ? undefined : heldBy(db, id);
+  const bound = toolsOnly ? undefined : holdsOf(db, id)[0];
   ws.data.sessionId = id;
   ws.data.place = where;
   ws.data.push = push;
@@ -974,13 +944,7 @@ function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m
 // it receives nothing.
 function unboundPeers(hub: Hub, ws: Ws): UnboundPeer[] {
   const mine = [...hub.holders.values()].filter((c) => c.data.authed.user_id === ws.data.authed.user_id && c.data.push && !c.data.bound);
-  const statuses = new Map(
-    (
-      hub.db
-        .prepare(`SELECT id, status, status_at FROM ids WHERE status IS NOT NULL AND id IN (SELECT value FROM json_each(?))`)
-        .all(JSON.stringify(mine.map((c) => c.data.sessionId))) as { id: string; status: string; status_at: number | null }[]
-    ).map((r) => [r.id, r]),
-  );
+  const statuses = idStatuses(hub.db, mine.map((c) => c.data.sessionId!));
   const now = Date.now();
   return mine.map((c) => {
     const s = statuses.get(c.data.sessionId!);
