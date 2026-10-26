@@ -37,22 +37,18 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   let closed = false;
   const sessions = new Map<ApplicationSession, McpServer>();
   // SDK legacy routing clones Requests; scope refusals to the serving exchange.
-  const admission = new AsyncLocalStorage<{ retryAfterMs?: number }>();
+  const admission = new AsyncLocalStorage<{ select?: ReturnType<Application["admitIdentity"]>; refusal?: ApplicationError }>();
+  const isRefusal = (e: unknown): e is ApplicationError => e instanceof ApplicationError && e.code === "rate_limited" && typeof e.extra.retry_after_ms === "number" && Number.isFinite(e.extra.retry_after_ms) && e.extra.retry_after_ms > 0;
   const handler = createMcpHandler(async ({ requestInfo }) => {
     if (!requestInfo || closed) throw new Error("MCP endpoint is closed");
     const raw = extractBearer(requestInfo);
     const authed = raw && verifySessionToken(raw, repo, opts.touches);
     if (!authed) throw new Error("unauthenticated");
-    const { session, info } = await application.selectIdentity(
-      authed, requestInfo.headers.get("X-Grayboard-Identity")!,
-      { deliver() {}, probe: async () => false, closed() {} },
-      { push: false, create: false, transport: "hosted", where: requestInfo.headers.get("X-Grayboard-Where") ?? undefined, alive: () => !closed && !requestInfo.signal.aborted },
-    ).catch((e: unknown) => {
-      // The SDK redacts factory errors; retain only this expected admission refusal.
-      const exchange = admission.getStore();
-      if (exchange && e instanceof ApplicationError && e.code === "rate_limited" && typeof e.extra.retry_after_ms === "number" && Number.isFinite(e.extra.retry_after_ms) && e.extra.retry_after_ms > 0) {
-        exchange.retryAfterMs = e.extra.retry_after_ms;
-      }
+    const exchange = admission.getStore();
+    if (exchange?.refusal) throw exchange.refusal;
+    if (!exchange?.select) throw new Error("MCP identity admission is missing");
+    const { session, info } = await exchange.select({ deliver() {}, probe: async () => false, closed() {} }).catch((e: unknown) => {
+      if (isRefusal(e)) exchange.refusal = e;
       throw e;
     });
     if (closed || requestInfo.signal.aborted) {
@@ -147,16 +143,27 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       if (!name || !isValidIdentityName(name.toLowerCase()) || name.toLowerCase() === HUMAN_NAME) {
         return Response.json({ code: "bad_request", message: "X-Grayboard-Identity must name your agent identity, not a full handle or human" }, { status: 400 });
       }
-      if (!repo.aliases.find(authed.user_email, name.toLowerCase())) {
+      const exchange: NonNullable<ReturnType<typeof admission.getStore>> = {};
+      try {
+        exchange.select = application.admitIdentity(authed, name, {
+          push: false, create: false, transport: "hosted", where: req.headers.get("X-Grayboard-Where") ?? undefined,
+          alive: () => !closed && !req.signal.aborted,
+        });
+      } catch (e) {
+        if (!isRefusal(e)) return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
+        exchange.refusal = e;
+      }
+      if (!exchange.refusal && !repo.aliases.find(authed.user_email, name.toLowerCase())) {
         const known = closestNames(name.toLowerCase(), repo.aliases.listFor(authed.user_email).map(i => i.name).filter(n => n !== HUMAN_NAME));
         return Response.json({ code: "identity_unknown", message: unknownNameError(name.toLowerCase(), known), known }, { status: 400 });
       }
-      return admission.run({}, async () => {
+      return admission.run(exchange, async () => {
         try {
           const response = await handler.fetch(req);
-          const retryAfterMs = admission.getStore()!.retryAfterMs;
-          if (retryAfterMs !== undefined) {
-            const { id = null } = await response.json() as { id?: string | number | null };
+          const retryAfterMs = exchange.refusal?.extra.retry_after_ms;
+          if (typeof retryAfterMs === "number") {
+            const { id = null } = response.headers.get("Content-Type")?.includes("application/json")
+              ? await response.json().catch(() => ({})) as { id?: string | number | null } : {};
             return Response.json({
               jsonrpc: "2.0", id,
               error: { code: -32000, message: "too many connections; retry after the indicated delay", data: { code: "rate_limited", retry_after_ms: retryAfterMs } },

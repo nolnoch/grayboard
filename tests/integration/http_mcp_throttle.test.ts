@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { Client, StreamableHTTPClientTransport, PROTOCOL_VERSION_META_KEY, CLIENT_INFO_META_KEY, CLIENT_CAPABILITIES_META_KEY } from "@modelcontextprotocol/client";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
@@ -56,6 +56,64 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(srv.app.mcp.activeContexts).toBe(0);
   } finally {
     await client.close();
+    await srv.stop();
+  }
+});
+
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native identity preflight spends once before alias reads`, async () => {
+  let now = 0;
+  const srv = new TestServer({}, { helloLimit: { burst: 2, perSec: 1 }, now: () => now });
+  try {
+    const token = await srv.login("alice@example.com");
+    srv.app.repo.aliases.create("alice@example.com", "be");
+    const aliases = srv.app.repo.aliases;
+    const find = aliases.find.bind(aliases), listFor = aliases.listFor.bind(aliases);
+    let finds = 0, lists = 0;
+    aliases.find = (...args) => { finds++; return find(...args); };
+    aliases.listFor = (...args) => { lists++; return listFor(...args); };
+    const call = async (name: string, id: number, extra: Record<string, string> = {}) => {
+      const response = await fetch(`${srv.base}/mcp`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": name, "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/list" } : {}), "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/list", ...(version === "2026-07-28" ? { params: { _meta: { [PROTOCOL_VERSION_META_KEY]: version, [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } } } : {}) }),
+      });
+      return { response, text: await response.text() };
+    };
+    expect((await call("bee", 1, { Origin: "https://foreign.example.com" })).response.status).toBe(403);
+    expect((await call("human", 1)).response.status).toBe(400);
+    expect((await call("bee", 1, { Authorization: "" })).response.status).toBe(401);
+    expect([finds, lists]).toEqual([0, 0]);
+    const unknown = await call("bee", 1);
+    expect(unknown.response.status).toBe(400);
+    expect(JSON.parse(unknown.text)).toMatchObject({ code: "identity_unknown", known: ["be"] });
+    expect([finds, lists]).toEqual([1, 1]);
+    const known = await call("be", 2);
+    expect(known.response.status).toBe(200);
+    expect(known.text).toContain('"tools"');
+    const before = [finds, lists];
+    expect(finds).toBeGreaterThan(1);
+    for (const [name, id] of [["be", 3], ["bee", 4]] as const) {
+      const blocked = await call(name, id);
+      expect(blocked.response.status).toBe(429);
+      expect(blocked.response.headers.get("Retry-After")).toBe("1");
+      expect(JSON.parse(blocked.text)).toMatchObject({ jsonrpc: "2.0", id, error: { code: -32000, data: { code: "rate_limited", retry_after_ms: 1000 } } });
+      expect([finds, lists]).toEqual(before);
+    }
+    for (const method of ["GET", "DELETE", "OPTIONS", "HEAD"]) {
+      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "bee", "MCP-Protocol-Version": version } });
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers.get("Retry-After")).toBe("1");
+      await blocked.text();
+      expect([finds, lists]).toEqual(before);
+    }
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+    now += 1000;
+    expect((await call("be", 5)).response.status).toBe(200);
+    const after = [finds, lists];
+    expect((await call("be", 6)).response.status).toBe(429);
+    expect([finds, lists]).toEqual(after);
+    expect(srv.app.mcp.activeContexts).toBe(0);
+  } finally {
     await srv.stop();
   }
 });

@@ -48,6 +48,15 @@ afterEach(() => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 
+test("preflight admission is a single-use server capability", async () => {
+  store.repo.aliases.create(alice.user_email, "be");
+  const admitted = application.admitIdentity(alice, "be", { push: false, create: false, transport: "hosted" });
+  const selected = await admitted(delivery(sink()));
+  expect(selected.session.identityFull).toBe("alice@example.com/be");
+  expect(() => admitted(delivery(sink()))).toThrow("identity admission already consumed");
+  application.close(selected.session);
+});
+
 test("typed operations and delivery need no frames; receipts alone move the delivery cursor", async () => {
   const a = (await application.selectIdentity(alice, "BE", delivery(sink()))).session;
   const out = sink();

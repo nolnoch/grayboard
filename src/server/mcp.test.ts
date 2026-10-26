@@ -80,8 +80,8 @@ for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: tools-only
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
   let selections = 0;
-  const select = application.selectIdentity;
-  application.selectIdentity = async (...args) => { selections++; return select(...args); };
+  const admit = application.admitIdentity;
+  application.admitIdentity = (...args) => { selections++; return admit(...args); };
   const forbidden = [
     "https://foreign.example.com", "http://grayboard.example.com", "null", "", "not an origin",
     "https://grayboard.example.com/", "https://grayboard.example.com/path", "https://grayboard.example.com?query",
@@ -138,16 +138,19 @@ test("shutdown closes outstanding legacy SSE products and refuses new contexts",
 });
 
 test("shutdown racing the factory cannot leave a selected context behind", async () => {
-  const select = application.selectIdentity;
+  const admit = application.admitIdentity;
   let selected!: () => void;
   let release!: () => void;
   const ready = new Promise<void>(resolve => { selected = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
-  application.selectIdentity = async (...args) => {
-    const result = await select(...args);
-    selected();
-    await gate;
-    return result;
+  application.admitIdentity = (...args) => {
+    const select = admit(...args);
+    return async sink => {
+      const result = await select(sink);
+      selected();
+      await gate;
+      return result;
+    };
   };
   const pending = connect();
   await ready;
@@ -162,38 +165,46 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const client = await connect(version, async response => {
     last = { status: response.status, retryAfter: response.headers.get("Retry-After"), body: await response.clone().text() };
   });
-  const select = application.selectIdentity;
+  const admit = application.admitIdentity;
   const secret = "SELECT token FROM /private/database.sqlite alice@example.com";
-  for (const error of [new Error(secret), new ApplicationError("internal", secret), { code: "rate_limited", message: secret, extra: { retry_after_ms: 1250 } }]) {
-    application.selectIdentity = async () => { throw error; };
-    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
-    expect(last.status).toBe(500);
-    expect(last.retryAfter).toBeNull();
-    expect(last.body).not.toContain(secret);
-    expect(last.body).not.toContain("retry_after_ms");
+  for (const error of [new Error(secret), new ApplicationError("internal", secret), { code: "rate_limited", message: secret, extra: { retry_after_ms: 1250 } }, ...[0, -1, NaN, Infinity].map(retry_after_ms => new ApplicationError("rate_limited", secret, { retry_after_ms }))]) {
+    for (const preflight of [true, false]) {
+      application.admitIdentity = () => {
+        if (preflight) throw error;
+        return async () => { throw error; };
+      };
+      await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+      expect(last.status).toBe(500);
+      expect(last.retryAfter).toBeNull();
+      expect(last.body).not.toContain(secret);
+      expect(last.body).not.toContain("retry_after_ms");
+    }
   }
-  application.selectIdentity = async () => { throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 }); };
+  application.admitIdentity = () => { throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 }); };
   await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
   expect(last.status).toBe(429);
   expect(last.retryAfter).toBe("2");
   expect(JSON.parse(last.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32000, data: { code: "rate_limited", retry_after_ms: 1250 } } });
   expect(last.body).not.toContain(secret);
-  application.selectIdentity = select;
+  application.admitIdentity = admit;
   expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
   expect(last.status).toBe(200);
   expect(last.retryAfter).toBeNull();
   let selections = 0;
-  application.selectIdentity = async (...args) => {
-    const n = ++selections;
-    await Promise.resolve();
-    if (n === 1) throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 });
-    return select(...args);
+  application.admitIdentity = (...args) => {
+    const select = admit(...args);
+    return async sink => {
+      const n = ++selections;
+      await Promise.resolve();
+      if (n === 1) throw new ApplicationError("rate_limited", secret, { retry_after_ms: 1250 });
+      return select(sink);
+    };
   };
   const results = await Promise.allSettled([client.callTool({ name: "board_list", arguments: {} }), client.callTool({ name: "board_list", arguments: {} })]);
   expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
   expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
   expect(selections).toBe(2);
-  application.selectIdentity = select;
+  application.admitIdentity = admit;
   expect(hosted.activeContexts).toBe(0);
 });
 

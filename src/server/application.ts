@@ -215,20 +215,21 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
-  async function select(authed: AuthedUser, nameInput: string | undefined, sink: DeliverySink, m: IdentityOptions, human: boolean) {
+  function admit(authed: AuthedUser, nameInput: string | undefined, m: IdentityOptions) {
+    const t = helloLimiter.take(authed.user_email, {
+      session_id: m.session_key ? idAddress(m.session_key) : null,
+      ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
+      place: m.where ?? null,
+    });
+    if (!t.ok) {
+      const secs = Math.ceil(t.retryAfterMs / 1000);
+      throw new ApplicationError("rate_limited", `too many connections for this user; retry in ${secs}s`, { retry_after_ms: t.retryAfterMs });
+    }
+  }
+  async function select(authed: AuthedUser, nameInput: string | undefined, sink: DeliverySink, m: IdentityOptions, human: boolean, admitted = false) {
     const { holders, registry } = hub;
     // Before database work; trusted bridge attachments are the server's own.
-    if (!human) {
-      const t = helloLimiter.take(authed.user_email, {
-        session_id: m.session_key ? idAddress(m.session_key) : null,
-        ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
-        place: m.where ?? null,
-      });
-      if (!t.ok) {
-        const secs = Math.ceil(t.retryAfterMs / 1000);
-        throw new ApplicationError("rate_limited", `too many connections for this user; retry in ${secs}s`, { retry_after_ms: t.retryAfterMs });
-      }
-    }
+    if (!human && !admitted) admit(authed, nameInput, m);
     const push = m.push !== false;
     const owns = push || m.hold === true;
     const sessionId = idAddress(m.session_key ?? mintSessionKey());
@@ -421,6 +422,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     return { session, info };
   }
   const application = {
+    // Single-use server capability for admission before a transport's identity preflight.
+    admitIdentity(authed: AuthedUser, name: string, options: IdentityOptions = {}) {
+      const m = { ...options };
+      admit(authed, name, m);
+      let used = false;
+      return (sink: DeliverySink) => {
+        if (used) throw new ApplicationError("internal", "identity admission already consumed");
+        used = true;
+        return select(authed, name, sink, m, false, true);
+      };
+    },
     selectIdentity: (authed: AuthedUser, name: string | undefined, sink: DeliverySink, options: IdentityOptions = {}) => select(authed, name, sink, options, false),
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman: (authed: AuthedUser, sink: DeliverySink) => select(authed, HUMAN_NAME, sink, {}, true),
