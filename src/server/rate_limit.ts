@@ -98,8 +98,8 @@ export class RateLimiter {
       if (b.tokens < this.limit.burst) continue;
       try {
         this.endStreak(key, b);
-      } catch (e) {
-        console.error(`[grayboard] rate limiter: ending the run of refusals for ${key} failed: ${(e as Error).message}`);
+      } catch {
+        hostedFailure("rate_limit.end");
         continue;
       }
       this.buckets.delete(key);
@@ -133,3 +133,4 @@ export class RateLimiter {
     this.hooks.full?.(this.buckets.size, n);
   }
 }
+import { hostedFailure } from "./hosted-diagnostics.ts";

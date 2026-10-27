@@ -70,6 +70,37 @@ afterEach(async () => {
   await Promise.all(liveClients.splice(0).map(c => c.close()));
   await mcp.close(); service.close(); await server.stop(true); storage.db.close(); rmSync(dir, { recursive: true, force: true });
 });
+for (const kind of ["multiline", "getter", "proxy"] as const) test(`OAuth limiter sweep safely retries failed end audit: ${kind}`, async () => {
+  service.close(); config.oauthLimit = { burst: 1, perSec: 1 };
+  const callbacks: (() => void)[] = [], interval = globalThis.setInterval;
+  const timers = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
+    if (ms === 60000) callbacks.push(fn);
+    return interval(fn, ms, ...args);
+  }) as typeof setInterval);
+  try { service = makeService(); } finally { timers.mockRestore(); }
+  const request = new Request(base + "/oauth/unknown");
+  const key = "PRIVATE-ADDRESS";
+  expect((await service.fetch(request, { key }))!.status).toBe(405);
+  expect((await service.fetch(request, { key }))!.status).toBe(429);
+  clock += 2000;
+  let reads = 0;
+  const fault = kind === "multiline" ? new Error("Bearer PRIVATE\n at f (/private/refresh-token.ts:1:1)", { cause: "PRIVATE-CODE" }) : kind === "getter" ? Object.defineProperty(new Error(), "message", { get() { reads++; throw new Error("PRIVATE"); } }) : new Proxy({}, { get() { reads++; throw new Error("PRIVATE"); } });
+  const write = storage.repo.audit.write;
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    storage.repo.audit.write = () => { throw fault; };
+    expect(callbacks.at(-1)!).not.toThrow();
+    expect(reads).toBe(0);
+    expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"rate_limit.end","category":"failure","level":"error"}`]]);
+    storage.repo.audit.write = write;
+    callbacks.at(-1)!(); callbacks.at(-1)!();
+    const ended = storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='oauth.rate_limit_ended'").all();
+    expect(ended).toHaveLength(1);
+    expect(JSON.parse(ended[0]!.detail)).toMatchObject({ refused: 1 });
+    expect(log.mock.calls).toHaveLength(1);
+  } finally { storage.repo.audit.write = write; log.mockRestore(); }
+});
+
 test("CIMD automatic registration uses one native grant and omitted resource stays bound through exchange/refresh/revocation", async () => {
   service.close(); config = { ...config, oauthClients: [] };
   const clientId = "https://opencode.ai/oauth/opencode/client.json";

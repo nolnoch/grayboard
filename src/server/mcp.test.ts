@@ -2,6 +2,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -552,6 +553,45 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
     expect(await first).toBeInstanceOf(Error);
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { releases.forEach(release => release()); hosted.sessions.snapshot = select; }
+});
+
+for (const failure of ["storage", "revoke"] as const) test(`legacy timer contains storage and close failures while healthy users retain capacity: ${failure}`, async () => {
+  await hosted.close();
+  const callbacks: (() => void)[] = [], interval = globalThis.setInterval;
+  const timers = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
+    if (ms === 1000) callbacks.push(fn);
+    return interval(fn, ms, ...args);
+  }) as typeof setInterval);
+  try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, limits: fairLimits }); }
+  finally { timers.mockRestore(); }
+  await connect("2025-11-25");
+  const healthy = await otherClient("2025-11-25");
+  const find = store.repo.oauth.findActiveAccess;
+  let reads = 0;
+  const hostile = new Proxy({}, { get() { reads++; throw new Error("Bearer PRIVATE"); } });
+  if (failure === "revoke") store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, Date.now());
+  store.repo.oauth.findActiveAccess = (...args) => { if (failure === "storage" && args[0] === hashToken(token)) throw hostile; return find(...args); };
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  const serverFault = spyOn(McpServer.prototype, "close").mockImplementation(() => { throw hostile; });
+  const transportFault = spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close").mockImplementation(async () => { throw hostile; });
+  try {
+    expect(callbacks.at(-1)!).not.toThrow();
+    expect(hosted.activeLegacySessions).toBe(1);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(reads).toBe(0);
+    expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"mcp.legacy","category":"failure","level":"error"}`]]);
+    serverFault.mockRestore(); transportFault.mockRestore();
+    expect(callbacks.at(-1)!).not.toThrow();
+    await healthy.listResources();
+    store.repo.oauth.findActiveAccess = find;
+    if (failure === "revoke") token = issuedOAuth(store.repo, oauth.resource).token;
+    await connect("2025-11-25");
+    expect(hosted.activeLegacySessions).toBe(2);
+    await expect(connect("2025-11-25")).rejects.toThrow();
+    expect(hosted.activeLegacySessions).toBe(2);
+  } finally {
+    store.repo.oauth.findActiveAccess = find; serverFault.mockRestore(); transportFault.mockRestore(); log.mockRestore();
+  }
 });
 
 async function fairCapacity(limits: McpLimits) {

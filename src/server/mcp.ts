@@ -109,6 +109,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   function current(ctx?: ServerContext): Context {
     const exchange = exchanges.getStore();
     if (!exchange?.context || ctx && ctx.http?.req !== exchange.request) throw new Error("missing current MCP exchange");
+    if (exchange.legacy?.stopped) throw new ApplicationError("unauthenticated", "MCP session is closed");
     if (ctx?.mcpReq.signal.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     return exchange.context;
   }
@@ -336,21 +337,29 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return makeServer(context);
   };
   const modern = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000 });
-  function retire(legacy: Legacy) {
+  function retire(legacy: Legacy, failed = false) {
     if (legacy.stopped) return;
+    let reported = false;
+    const report = () => { if (!reported) { reported = true; hostedFailure("mcp.legacy"); } };
+    if (failed) report();
     legacy.stopped = true;
     legacy.release();
     legacyAll.delete(legacy);
     for (const [id, value] of legacySessions) if (value === legacy) legacySessions.delete(id);
-    legacy.stream?.stop();
+    if (legacy.stream?.stream) streamContexts.delete(legacy.stream.stream);
+    try { legacy.stream?.stop(); } catch { report(); }
     legacy.subscriptions.clear();
-    track(legacy.server.close());
-    track(legacy.transport.close());
+    track(Promise.resolve().then(() => legacy.server.close()).catch(report));
+    track(Promise.resolve().then(() => legacy.transport.close()).catch(report));
   }
   const timer = setInterval(() => {
+    for (const legacy of [...legacyAll]) {
+      try {
+        if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
+      } catch { retire(legacy, true); }
+    }
     for (const live of [...lives]) { try { valid(live); } catch { hostedFailure("mcp.stream"); live.stop(); } }
     for (const [stream, context] of streamContexts) { try { authorize(context); } catch { hostedFailure("mcp.stream"); track(stream.stop()); } }
-    for (const legacy of [...legacyAll]) if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
