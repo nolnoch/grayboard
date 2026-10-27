@@ -545,7 +545,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, ADDRS));
+    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }));
     // The result names the sender whenever it isn't the primary.
     const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
@@ -624,7 +624,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const id = checkAttachmentId(a.id);
     const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
     const row = getAttachment(db, id);
-    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)), ADDRS)) {
+    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)), { addresses: ADDRS, principal: null })) {
       return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
     }
     const path = await saveAttachment(row, await blobs.get(row.sha256), target);

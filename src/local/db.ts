@@ -1,6 +1,6 @@
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
-import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments } from "../core/attachments.ts";
+import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
 import { addressParts } from "../core/addresses.ts";
@@ -21,7 +21,7 @@ export async function withUploads<T>(uploader: string, files: AttachmentFile[], 
     for (const f of files) ids.push((await storeAttachment(db, blobs, uploader, f)).id);
     return send(ids);
   } catch (e) {
-    for (const id of ids) await releaseUpload(db, blobs, id, uploader);
+    for (const id of ids) await releaseUpload(db, blobs, id, { addresses: [uploader], principal: null });
     throw e;
   }
 }
@@ -46,9 +46,11 @@ const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending, k
 const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
 
 // Stores the message from session `senderId` and binds the uploads `ids` of
-// any of `uploaders` (the session's addresses, #284 S5) to it, in one transaction. A session ID recipient is checked in that
-// transaction, so the send can't race the session's end (#284 S8): it's
-// refused once the end has the lock, and bounced by it if it landed first.
+// `uploader` (the session's addresses, #284 S5; local mode has one user, so
+// its principal is null) to it, in one transaction. A session ID recipient is
+// checked in that transaction, so the send can't race the session's end (#284
+// S8): it's refused once the end has the lock, and bounced by it if it landed
+// first.
 export function insertMessage(
   sender: string,
   senderId: string,
@@ -57,7 +59,7 @@ export function insertMessage(
   parent_id: number | null,
   pending = false,
   ids: number[] = [],
-  uploaders: string[] = [sender],
+  uploader: Uploader = { addresses: [sender], principal: null },
 ): { id: number; attachments: AttachmentInfo[] } {
   testPause("send:before-txn");
   return db.transaction(() => {
@@ -70,7 +72,7 @@ export function insertMessage(
       )
       .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
-    return { id, attachments: bindAttachments(db, ids, { addresses: uploaders, principal: null }, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
+    return { id, attachments: bindAttachments(db, ids, uploader, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
 }
 

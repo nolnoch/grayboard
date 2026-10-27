@@ -425,9 +425,9 @@ describe("storage", () => {
     const mine = await store("be", file("a"));
     const bound = await store("be", file("b"));
     bindAttachments(db, [bound.id], as("be"), { message_id: msg() }, LIMITS);
-    expect(await releaseUpload(db, blobs, mine.id, "fe")).toBeNull();
-    expect(await releaseUpload(db, blobs, bound.id, "be")).toBeNull();
-    expect((await releaseUpload(db, blobs, mine.id, "be"))?.id).toBe(mine.id);
+    expect(await releaseUpload(db, blobs, mine.id, as("fe"))).toBeNull();
+    expect(await releaseUpload(db, blobs, bound.id, as("be"))).toBeNull();
+    expect((await releaseUpload(db, blobs, mine.id, as("be")))?.id).toBe(mine.id);
     expect(getAttachment(db, mine.id)).toBeUndefined();
     expect([blobCount(db), byteCount(db)]).toEqual([1, 1]);
   });
@@ -441,7 +441,7 @@ describe("storage", () => {
 
   test("bytes are deleted before their catalog entry, so a failed delete is retried by the next sweep", async () => {
     const a = await store("be", file("gone"));
-    await releaseUpload(db, { put: (s, d) => blobs.put(s, d), get: (s) => blobs.get(s), delete: async () => { throw new Error("EIO"); } }, a.id, "be");
+    await releaseUpload(db, { put: (s, d) => blobs.put(s, d), get: (s) => blobs.get(s), delete: async () => { throw new Error("EIO"); } }, a.id, as("be"));
     expect([blobCount(db), byteCount(db)]).toEqual([1, 1]);
     expect(await sweepBlobs(db, blobs)).toBe(1);
     expect([blobCount(db), byteCount(db)]).toEqual([0, 0]);
@@ -467,14 +467,21 @@ describe("storage", () => {
   });
 
   // #367: an address can pass to another user (a team alias rebound); its
-  // unsent uploads stay with the user who made them.
-  test("binding takes only uploads its user made, whichever of its addresses made them", async () => {
+  // unsent uploads stay with the user who made them: they don't send, read or
+  // release for the next holder.
+  test("an unsent upload binds, reads and releases only for the user who made it, whichever address made it", async () => {
     const quota = { principal: "a@example.com", unsent: 1000, stored: 1000 };
-    const up = await store("team:ops/lead", file("x"), { quota });
-    const lead = (principal: string): Uploader => ({ addresses: ["team:ops/lead"], principal });
+    const up = await store("ops/lead", file("x"), { quota });
+    const lead = (principal: string): Uploader => ({ addresses: ["ops/lead"], principal });
+    const row = getAttachment(db, up.id)!;
+    const nobody = () => false;
     expect(() => uploadDigests(db, [up.id], lead("b@example.com"))).toThrow(`attachment ${up.id} isn't an unsent upload of yours`);
     expect(() => bindAttachments(db, [up.id], lead("b@example.com"), { message_id: msg() }, LIMITS)).toThrow(`attachment ${up.id} isn't an unsent upload of yours`);
     expect(dropUnsentUploads(db, [up.id], lead("b@example.com"))).toEqual([]);
+    expect(canReadAttachment(db, "ops/lead", row, nobody, lead("b@example.com"))).toBe(false);
+    expect(await releaseUpload(db, blobs, up.id, lead("b@example.com"))).toBeNull();
+    // The refused release left it in place for its user.
+    expect(canReadAttachment(db, "ops/lead", row, nobody, lead("a@example.com"))).toBe(true);
     expect(bindAttachments(db, [up.id], lead("a@example.com"), { message_id: msg() }, LIMITS).map((r) => r.id)).toEqual([up.id]);
   });
 

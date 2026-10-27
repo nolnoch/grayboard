@@ -1309,7 +1309,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   }
   const ctx: ToolContext = {
     online: (h: string) => hub.registry.get(h)?.data.ready === true,
-    files: { limits: hub.repo.attachmentLimits, principal: ws.data.authed.user_email },
+    files: { limits: hub.repo.attachmentLimits, principal: uploaderOf(ws).principal },
     human: ws.data.human,
     ...(ws.data.sessionId ? { session: ws.data.sessionId } : {}),
     addresses: ws.data.addresses,

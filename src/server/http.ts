@@ -294,7 +294,7 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
 async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
-  const row = readableAttachment(repo, db, handle, Number(idStr), authed.user_email);
+  const row = readableAttachment(repo, db, handle, Number(idStr), authed.user_email, authed.user_email);
   if (!row) {
     writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
     return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);

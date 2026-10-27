@@ -11,12 +11,14 @@ import { addressSet } from "../core/bindings.ts";
 // on a direct message it sent or received, or its own unsent upload. A
 // session's files are its whole address set's (#284 S8): `principal` names
 // the caller, whose session holding `handle` (or held by it) joins the set;
-// null for the Slack bridge's humans, which have no session.
-export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: number, principal: string | null): AttachmentRow | undefined {
+// null for the Slack bridge's humans, which have no session. `user` is the
+// reading user's email, always set on a server: an unsent upload is readable
+// only by the user who made it, not by whoever holds its address next (#367).
+export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: number, principal: string | null, user: string): AttachmentRow | undefined {
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
   const addresses = addressSet(db, handle, principal);
   const dmVisible = (messageId: number) => participant(repo.messages.getById(messageId), addresses);
-  return row && canReadAttachment(db, handle, row, dmVisible, addresses) ? row : undefined;
+  return row && canReadAttachment(db, handle, row, dmVisible, { addresses, principal: user }) ? row : undefined;
 }
 
 // Stores a checked file as an unsent upload of `handle`'s, within the quotas
@@ -49,7 +51,7 @@ export async function releaseStored(
   id: number,
   detail: Record<string, unknown> = {},
 ): Promise<AttachmentRow | null> {
-  const row = await releaseUpload(db, repo.blobs, id, handle);
+  const row = await releaseUpload(db, repo.blobs, id, { addresses: [handle], principal: email });
   if (row) {
     writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,

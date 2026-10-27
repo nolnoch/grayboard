@@ -104,8 +104,9 @@ export interface Repo {
   messages: {
     // attachmentIds: unbound uploads of `uploader` (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
-    // transaction (a refused id throws CoreError and nothing is written). senderId: the sending session's ID (#284); null for a writer
-    // with no session.
+    // transaction (a refused id throws CoreError and nothing is written).
+    // senderId: the sending session's ID (#284); null for a writer with no
+    // session.
     insert(
       sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[],
       senderId?: string | null, uploader?: Uploader,
