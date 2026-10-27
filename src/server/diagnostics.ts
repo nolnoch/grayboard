@@ -1,19 +1,19 @@
-// Error messages and properties can contain SQL values, credentials or tool input.
-// Keep only source locations, including those of chained causes.
-export function failureLocations(error: unknown): string[] {
-  const locations: string[] = [];
-  const seen = new Set<unknown>();
-  while (error instanceof Error && !seen.has(error) && seen.size < 4) {
-    seen.add(error);
-    for (const line of (error.stack ?? "").split("\n").slice(1)) {
-      if (/https?:\/\//i.test(line)) continue;
-      const match = line.match(/[/\\]([\w.-]+\.[cm]?[jt]s):([0-9]+):([0-9]+)\)?$/);
-      if (match) locations.push(`${match[1]}:${match[2]}:${match[3]}`);
-      if (locations.length >= 12) return locations;
-    }
-    error = error.cause;
-  }
-  return locations;
+const failureSources = {
+  "hosted-tool": { source: "src/server/mcp.ts", operation: "tool" },
+  "hosted-factory": { source: "src/server/mcp.ts", operation: "factory" },
+  "hosted-admission": { source: "src/server/mcp.ts", operation: "admission" },
+  "hosted-fetch": { source: "src/server/mcp.ts", operation: "fetch" },
+  "hosted-sdk": { source: "src/server/mcp.ts", operation: "sdk" },
+  "slack-bus": { source: "src/server/slack.ts", operation: "bus.call" },
+} as const;
+export type FailureSource = keyof typeof failureSources;
+
+// Stack text includes multiline messages and can be forged, even for real filenames.
+// Derive provenance from the catch site only; never inspect errors or their causes.
+export function failureDiagnostic(source: FailureSource) {
+  const context = typeof source === "string" && Object.hasOwn(failureSources, source)
+    ? failureSources[source] : { source: "server", operation: "unknown" };
+  return { ...context, category: "unexpected" };
 }
 
 export function diagnosticOrigin(value: string | null): string | null {

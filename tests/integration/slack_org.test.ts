@@ -181,15 +181,29 @@ test("unexpected bridge bus failures log once and reply generically; expected re
   const original = srv.app.application.send;
   const logs = spyOn(console, "error").mockImplementation(() => {});
   const secret = `Bearer ${alice} client_secret=hidden https://user:password@example.com/?token=hidden`;
+  const multiline = new Error(`${secret}\n    at send (/private/server/${alice}.ts:12:34)\n    at send (/private/server/slack.ts:12:34)`);
+  const forged = new Error(secret);
+  forged.stack = `Error: failure\n    at send (/private/server/${alice}.js:12:34)`;
+  forged.cause = forged;
+  const getters = new Error("untrusted properties");
+  let reads = 0;
+  for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
   try {
-    srv.app.application.send = () => { throw new Error(secret, { cause: new Error(secret) }); };
-    const failed = slack.say("private body", { thread_ts: tsOf(top) });
-    const reply = await until(() => slack.posts().find(p => p.thread_ts === tsOf(top) && p.markdown_text?.includes("internal error")));
-    await until(() => slack.acks.includes(failed.envelope));
-    expect(logs).toHaveBeenCalledTimes(1);
-    const text = JSON.stringify([reply, logs.mock.calls]);
-    expect(text).toContain("dm_send");
-    for (const hidden of [alice, "password", "hidden", "private body", "client_secret"]) expect(text).not.toContain(hidden);
+    for (const error of [multiline, forged, getters]) {
+      logs.mockClear();
+      srv.app.application.send = () => { throw error; };
+      const before = slack.posts().length;
+      const failed = slack.say("private body", { thread_ts: tsOf(top) });
+      const reply = await until(() => slack.posts().slice(before).find(p => p.thread_ts === tsOf(top) && p.markdown_text?.includes("internal error")));
+      await until(() => slack.acks.includes(failed.envelope));
+      expect(logs).toHaveBeenCalledTimes(1);
+      const text = JSON.stringify([reply, logs.mock.calls]);
+      expect(text).toContain("dm_send");
+      expect(text).toContain('\\"source\\":\\"src/server/slack.ts\\",\\"operation\\":\\"bus.call\\",\\"category\\":\\"unexpected\\"');
+      expect(text.length).toBeLessThan(2048);
+      for (const hidden of [alice, "password", "hidden", "private body", "client_secret", "12:34"]) expect(text).not.toContain(hidden);
+    }
+    expect(reads).toBe(0);
     logs.mockClear();
     srv.app.application.send = () => { throw new ApplicationError("forbidden", "safe expected refusal"); };
     const refused = slack.say("second reply", { thread_ts: tsOf(top) });

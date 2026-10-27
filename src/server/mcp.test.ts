@@ -224,16 +224,32 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const logs = spyOn(console, "error").mockImplementation(() => {});
   const original = store.repo.messages.insert;
   const secret = `Bearer ${token} client_secret=hidden https://user:password@example.com/auth?code=hidden`;
-  store.repo.messages.insert = () => { throw new Error(secret, { cause: new Error(secret) }); };
+  const multiline = new Error(`${secret}\n    at query (/private/server/${token}.ts:12:34)\n    at query (/private/server/mcp.ts:12:34)`);
+  const forged = new Error(secret, { cause: new Error(secret) });
+  forged.stack = `Error: failure\n    at query (/private/server/${token}.js:12:34)\n    at query (/private/server/mcp.ts:12:34)\n    at auth (https://example.com/${token}.ts?token=${token}:12:34)`;
+  (forged.cause as Error).stack = `Error: cause\n    at query (/private/server/${token}.ts:12:34)`;
+  const cycle = new Error(secret);
+  cycle.cause = cycle;
+  const getters = new Error("untrusted properties");
+  let reads = 0;
+  for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
   try {
-    const result = await client.callTool({ name: "dm_send", arguments: { to: "be", body: "private tool body" } });
-    expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: internal error" }] });
-    expect(logs).toHaveBeenCalledTimes(1);
-    const line = String(logs.mock.calls[0]![0]);
-    expect(line).toContain('"tool":"dm_send"');
-    expect(line).toContain('"principal":');
-    expect(line).toContain('"session":');
-    for (const hidden of [token, "hidden", "password", "private tool body", "client_secret", "/auth?"]) expect(line).not.toContain(hidden);
+    for (const error of [multiline, forged, cycle, getters]) {
+      logs.mockClear();
+      store.repo.messages.insert = () => { throw error; };
+      const result = await client.callTool({ name: "dm_send", arguments: { to: "be", body: "private tool body" } });
+      expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: internal error" }] });
+      expect(logs).toHaveBeenCalledTimes(1);
+      const line = String(logs.mock.calls[0]![0]);
+      expect(line).toContain('"tool":"dm_send"');
+      expect(line).toContain('"principal":');
+      expect(line).toContain('"session":');
+      expect(line).toContain('"source":"src/server/mcp.ts","operation":"tool","category":"unexpected"');
+      expect(line.length).toBeLessThan(1024);
+      for (const hidden of [token, "hidden", "password", "private tool body", "client_secret", "/auth?", "12:34"]) expect(line).not.toContain(hidden);
+      expect(hosted.activeContexts).toBe(0);
+    }
+    expect(reads).toBe(0);
   } finally { store.repo.messages.insert = original; logs.mockRestore(); }
 });
 

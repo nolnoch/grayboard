@@ -11,7 +11,7 @@ import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
 import { extractBearer, verifySessionToken, type TouchQueue } from "./auth.ts";
 import type { Repo } from "./db.ts";
-import { diagnosticOrigin, failureLocations } from "./diagnostics.ts";
+import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
 import { RateLimiter } from "./rate_limit.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -42,10 +42,10 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
   type Exchange = { select?: ReturnType<Application["admitIdentity"]>; refusal?: ApplicationError; failure?: ApplicationError; logged?: boolean; principal?: number; identity?: string; session?: string; tool?: string; protocol?: string; request?: Request; address?: string };
   const admission = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, opts.now, 4096);
-  const report = (e: unknown, exchange = admission.getStore()) => {
+  const report = (e: unknown, exchange = admission.getStore(), source: FailureSource = "hosted-sdk") => {
     if (e instanceof ApplicationError || e instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
-    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, locations: failureLocations(e) })}`);
+    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source) })}`);
   };
   const refuse = (reason: string, req: Request, address: string, exchange?: Exchange) => {
     refusalLogs.sweep();
@@ -92,7 +92,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
         if (!verifySessionToken(raw, repo, opts.touches)) return { ...text("error: unauthenticated"), isError: true };
         return text(call() ?? "ok");
       } catch (e) {
-        report(e, exchange);
+        report(e, exchange, "hosted-tool");
         const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
         return { ...text(`error: ${message}`), isError: true };
       }
@@ -156,7 +156,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
       const exchange = admission.getStore();
       if (e instanceof ApplicationError && exchange) exchange.failure = e;
       if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code) && exchange?.request) refuse(e.code, exchange.request, exchange.address ?? "unknown", exchange);
-      report(e, exchange);
+      report(e, exchange, "hosted-factory");
       throw new Error("internal error");
     }
   }, { legacy: "stateless", onerror: e => report(e) });
@@ -187,7 +187,7 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
           });
         } catch (e) {
           if (!isRefusal(e)) {
-            report(e, exchange);
+            report(e, exchange, "hosted-admission");
             return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
           }
           exchange.refusal = e;
@@ -212,12 +212,12 @@ export function createHostedMcp(application: Application, repo: Repo, opts: { tr
             }
             return response;
           } catch (e) {
-            report(e, exchange);
+            report(e, exchange, "hosted-fetch");
             return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
           }
         });
       } catch (e) {
-        report(e, exchange);
+        report(e, exchange, "hosted-fetch");
         return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
       }
     },

@@ -22,7 +22,7 @@ import type { Repo, SlackLink } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
-import { failureLocations } from "./diagnostics.ts";
+import { failureDiagnostic } from "./diagnostics.ts";
 
 const CODE_TTL_MS = 10 * 60_000;
 // Wrong codes a Slack account may send per CODE_TTL_MS; 8 chars from 31 make
@@ -288,7 +288,7 @@ export class SlackBridge implements SlackLinker {
           return { ok: true, value: application.call(session, name, args) };
         } catch (e) {
           if (e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError) return { ok: false, error: e.message };
-          console.error(`[grayboard slack] bus call failed: ${JSON.stringify({ principal: link.user_id, identity: handle, session: session.sessionId, tool: name, protocol: "slack", locations: failureLocations(e) })}`);
+          console.error(`[grayboard slack] bus call failed: ${JSON.stringify({ principal: link.user_id, identity: handle, session: session.sessionId, tool: name, protocol: "slack", ...failureDiagnostic("slack-bus") })}`);
           return { ok: false, error: "internal error" };
         }
       },
