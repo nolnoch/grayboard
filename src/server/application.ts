@@ -1,5 +1,5 @@
 import type { HelloRequest, DelegateRequest, Replayed } from "../shared/protocol.ts";
-import { DEFAULT_HELLO_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, type RateLimit } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
@@ -79,6 +79,7 @@ export type ApplicationOptions = {
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
+  hostedRequestLimit?: RateLimit;
   now?: () => number;
 };
 export type IdentityOptions = Omit<HelloRequest, "type" | "req_id" | "identity"> & {
@@ -183,6 +184,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
     },
   }, opts.now);
+  const hostedRequestLimiter = new RateLimiter(opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT, {
+    start: (email, _ctx, retryAfterMs) => {
+      console.error(`[grayboard] rate-limiting hosted requests from ${email}`);
+      writeAudit(repo, "hosted.rate_limited", email, null, { retry_after_ms: retryAfterMs });
+    },
+    end: (email, refused) => {
+      console.error(`[grayboard] hosted requests from ${email} no longer rate-limited; ${refused} refused`);
+      writeAudit(repo, "hosted.rate_limit_ended", email, null, { refused });
+    },
+  }, opts.now);
   clearHolds(db);
   const expiry = claimExpiryTimer(db, handles => wake(hub, handles));
   const revoked = new Map<number, number>();
@@ -216,7 +227,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
   function admit(authed: AuthedUser, nameInput: string | undefined, m: IdentityOptions) {
-    const t = helloLimiter.take(authed.user_email, {
+    const limiter = m.transport === "hosted" ? hostedRequestLimiter : helloLimiter;
+    const t = limiter.take(authed.user_email, {
       session_id: m.session_key ? idAddress(m.session_key) : null,
       ...(m.read_only ? { read_only: true } : { name: nameInput ?? null }),
       place: m.where ?? null,
@@ -519,7 +531,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       helloLimiter.sweep();
       for (const s of hub.sessions) s.sink.keepAlive?.();
     },
-    sweepHellos: () => helloLimiter.sweep(),
+    sweepHellos: () => { helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
     stopExpiry: expiry.stop,
   };
   return application;

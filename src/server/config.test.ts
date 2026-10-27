@@ -6,7 +6,8 @@ const KEYS = [
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
-  "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
+   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
+   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
 ];
 
@@ -36,6 +37,20 @@ describe("loadConfig", () => {
   test("dev auth starts without Google credentials", () => {
     process.env.GRAYBOARD_DEV_AUTH = "1";
     expect(loadConfig().devAuth).toBe(true);
+  });
+
+  test("hosted request limits are independently configured and validated", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().hostedRequestLimit).toEqual({ burst: 120, perSec: 20 });
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "240";
+    process.env.GRAYBOARD_HOSTED_REQUEST_PER_SEC = "40";
+    expect(loadConfig().hostedRequestLimit).toEqual({ burst: 240, perSec: 40 });
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_REQUEST_BURST/);
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "120";
+    process.env.GRAYBOARD_HOSTED_REQUEST_PER_SEC = "0";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_REQUEST_PER_SEC/);
   });
 
   test("GRAYBOARD_ADMINS is a trimmed, lowercased email list; unset means none", () => {

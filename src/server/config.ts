@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 
 import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
@@ -28,6 +28,7 @@ export type Config = {
   attachmentUserQuota?: number;
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
+  hostedRequestLimit?: RateLimit;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
@@ -67,6 +68,7 @@ export function loadConfig(): Config {
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
+    hostedRequestLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, "requests"),
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),

@@ -4,8 +4,38 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
+test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaustion is isolated", async () => {
+  let now = 0;
+  const srv = new TestServer({}, { now: () => now });
+  const client = new Client({ name: "load", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  try {
+    const token = await srv.login("alice@example.com");
+    const other = await srv.login("bob@example.com");
+    srv.app.repo.aliases.create("alice@example.com", "be");
+    srv.app.repo.aliases.create("bob@example.com", "be");
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } } }));
+    // Real HTTP dispatches; virtual admission time makes the >1/s drain deterministic.
+    for (let n = 0; n < 600; n++) {
+      now += 200;
+      expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+    }
+    expect((await srv.client(token, null).connect()).type).toBe("hello_ok");
+    let refused = false;
+    for (let n = 0; n < 121; n++) {
+      try { await client.callTool({ name: "board_list", arguments: {} }); }
+      catch { refused = true; break; }
+    }
+    expect(refused).toBe(true);
+    expect((await srv.client(token, null).connect()).type).toBe("hello_ok");
+    const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${other}`, "X-Grayboard-Identity": "be" } });
+    expect(response.status).toBe(405);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
+  } finally { await client.close(); await srv.stop(); }
+});
+
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission exposes throttling and recovers without dispatching refused tools`, async () => {
-  const srv = new TestServer({}, { helloLimit: { burst: 10, perSec: 1 } });
+  const srv = new TestServer({}, { hostedRequestLimit: { burst: 10, perSec: 1 } });
   const client = new Client({ name: "throttle-test", version: "1" }, {
     supportedProtocolVersions: [version],
     versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
@@ -45,11 +75,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(last!.status).toBe(429);
     expect(srv.app.db.query("SELECT * FROM boards").all()).toEqual(before);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'binding.bound'").all()).toEqual([]);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
     await until(async () => {
       try { return await client.callTool({ name: "board_list", arguments: {} }); }
       catch { expect(last!.status).toBe(429); return false; }
-    }, 3000, "shared admission bucket to refill");
+    }, 3000, "hosted request bucket to refill");
     expect(last!.status).toBe(200);
     expect(last!.retryAfter).toBeNull();
     expect(srv.app.db.query("SELECT * FROM boards").all()).toEqual(before);
@@ -62,7 +92,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native identity preflight spends once before alias reads`, async () => {
   let now = 0;
-  const srv = new TestServer({}, { helloLimit: { burst: 2, perSec: 1 }, now: () => now });
+  const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
     const token = await srv.login("alice@example.com");
     srv.app.repo.aliases.create("alice@example.com", "be");
@@ -106,7 +136,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native identity p
       await blocked.text();
       expect([finds, lists]).toEqual(before);
     }
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
     now += 1000;
     expect((await call("be", 5)).response.status).toBe(200);
     const after = [finds, lists];
