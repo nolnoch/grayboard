@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { OpenCode } from "@opencode/sdk";
+import { createFixtureHost } from "./effect-host.js";
+import { fromPromise } from "@opencode/plugin/promise/adapter";
+import { instrument, type NativeInput, type NativeAdmission } from "./effect-instrument.js";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
@@ -32,7 +34,7 @@ const start = () => startServer(config, { hostname: "127.0.0.1", background: fal
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
-const admissions: Parameters<Context["session"]["synthetic"]>[0][] = [];
+const admissions: NativeInput[] = [];
 const admitted: typeof admissions = [];
 const suspendedModel = { target: "", entered: barrier(), released: barrier() };
 let pendingAdmissions = 0;
@@ -91,22 +93,19 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   });
   await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
 } });
-const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({ ...c, session: new Proxy(c.session, { get(s, k) {
-  if (k === "synthetic") return async (input: Parameters<Context["session"]["synthetic"]>[0]) => {
+const instrumented = instrument(plugin, async (input, forward) => {
     admissions.push(structuredClone(input)); raceGate.inputs.push(structuredClone(input));
     if (held) { entered?.(); await new Promise<void>(r => { release = r; }); }
     if (raceGate.holding && raceGate.boundary === "before") { raceGate.entered(); await raceGate.released; }
     pendingAdmissions++;
-    let value: Awaited<ReturnType<typeof s.synthetic>>;
-    try { value = await s.synthetic(input); admitted.push(structuredClone(input)); raceGate.accepted.push(value); }
+    let value: NativeAdmission;
+    try { value = await forward(input); admitted.push(structuredClone(input)); raceGate.accepted.push(value); }
     finally { pendingAdmissions--; }
     if (raceGate.holding && raceGate.boundary === "after") { raceGate.entered(); await raceGate.released; }
     if (process.env.GRAYBOARD_TEST_REAL_RACE === "expiry") expiryContinuation.returned();
     return value;
-  };
-  return Reflect.get(s, k);
-} }) }); } });
-const createHost = () => OpenCode.create({ plugins: [fixture, instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
+});
+const createHost = () => createFixtureHost({ plugins: [fromPromise(fixture), instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
 let host: Awaited<ReturnType<typeof createHost>> | undefined;
 const location = { directory: join(root, "project") };
 async function wait<T>(read: () => Promise<T> | T, predicate: (v: T) => boolean, label: string, timeout = 20_000) {
@@ -373,7 +372,7 @@ try {
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === lost.id, "restored lease replay receipt");
   await host.session.wait({ sessionID: a.id });
-  const replay = [...admissions, ...childReload.inputs as Parameters<Context["session"]["synthetic"]>[0][]].filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
+  const replay = [...admissions, ...childReload.inputs as NativeInput[]].filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
   assert.equal((await host.session.context({ sessionID: a.id })).filter((m: { id?: string; type?: string }) => m.id === replay[0]!.id).length, 1);
   console.log("REAL_HOST_RELOAD_STABLE_ID_OK", { replay: replay.length, cursor: lost.id });
 

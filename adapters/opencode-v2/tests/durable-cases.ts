@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import type { OpenCode } from "@opencode/sdk";
+import type { FixtureHost } from "./effect-host.js";
+import { Integration } from "@opencode/sdk/effect";
+import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import { afterProducers } from "./causal.ts";
 import type { SubscriberWork } from "./subscriber-work.ts";
 import { bounded, drainSessions } from "./reload-state.ts";
 
-type Host = Awaited<ReturnType<typeof OpenCode.create>>;
-type Input = Parameters<Context["session"]["synthetic"]>[0];
-type Admission = Awaited<ReturnType<Context["session"]["synthetic"]>>;
+type Host = FixtureHost;
+type Input = NativeInput;
+type Admission = NativeAdmission;
 export type Batch = { id: string; actionable: boolean; event: { text: string }; ownership: number; bind_gen: number; name: string };
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 export class DurableFixture {
@@ -127,7 +129,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
       const integrationID = (await ctx.mcp.list()).data.find(m => m.name === "grayboard")!.integrationID!;
       const old = (await host.credential.list()).find((c: { id: string; integrationID: string; active: boolean }) => c.integrationID === integrationID && c.active); assert(old);
       const method = (await ctx.integration.get({ integrationID })).data!.methods.find(m => m.type === "oauth")!;
-      await host.credential.create({ integrationID, label: "Fixture other account", activate: true, value: { type: "oauth", methodID: method.id, access: "fixture-other-access", refresh: "fixture-other-refresh", expires: Date.now() + 3_600_000, metadata: { serverUrl: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", scope: "grayboard:delivery grayboard:tools", client: { client_id: "fixture-native-client" } } } });
+      await host.credential.create({ integrationID: Integration.ID.make(integrationID), label: "Fixture other account", activate: true, value: { type: "oauth", methodID: Integration.MethodID.make(method.id), access: "fixture-other-access", refresh: "fixture-other-refresh", expires: Date.now() + 3_600_000, metadata: { serverUrl: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", scope: "grayboard:delivery grayboard:tools", client: { client_id: "fixture-native-client" } } } });
       if (f.scenario === "account-away-back") await host.credential.activate({ credentialID: old.id });
       break;
     }

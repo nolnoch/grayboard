@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { OpenCode } from "@opencode/sdk";
+import { createFixtureHost } from "./effect-host.js";
+import { fromPromise } from "@opencode/plugin/promise/adapter";
+import { instrument } from "./effect-instrument.js";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { durableCases, DurableFixture } from "./durable-cases.ts";
@@ -33,12 +35,7 @@ if (durable?.phase === "reload") {
   for (const [id, items] of replay.batches) durable.batches.set(id, items.map((item: import("./durable-cases.ts").Batch) => ({ ...item, event: { text: "ALTERED REPLAY MUST NOT REPLACE ORIGINAL" } })));
   durable.holding = false;
 }
-const instrumented = durable ? Plugin.define({ ...installed, setup(c) {
-  return installed.setup({ ...c, session: new Proxy(c.session, { get(session, key) {
-    if (key === "synthetic") return (input: Parameters<Context["session"]["synthetic"]>[0]) => durable.synthetic(input, value => session.synthetic(value));
-    return Reflect.get(session, key);
-  } }) });
-} }) : installed;
+const instrumented = durable ? instrument(installed, (input, forward) => durable.synthetic(input, forward)) : installed;
 const state = (id: string) => { if (!sessions.has(id)) sessions.set(id, { name: null, ownership: null, gen: 0 }); return sessions.get(id)!; };
 const fetch0 = globalThis.fetch;
 const json = (id: unknown, result: unknown) => Response.json({ jsonrpc: "2.0", id, result });
@@ -154,9 +151,9 @@ async function wait<T>(read: () => Promise<T>, predicate: (v: T) => boolean, lab
   for (let i = 0; i < 240; i++) { const v = await read(); if (predicate(v)) return v; await Bun.sleep(50); }
   throw new Error("Wait expired: " + label);
 }
-let host: Awaited<ReturnType<typeof OpenCode.create>> | undefined;
+let host: Awaited<ReturnType<typeof createFixtureHost>> | undefined;
 try {
-  host = await OpenCode.create({ plugins: mode === "disabled" ? [fixture] : [fixture, instrumented], database: { path: join(root, "native-host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "native-config"), project: false, claude: false }, fs: { filewatcher: false } });
+  host = await createFixtureHost({ plugins: mode === "disabled" ? [fromPromise(fixture)] : [fromPromise(fixture), instrumented], database: { path: join(root, "native-host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "native-config"), project: false, claude: false }, fs: { filewatcher: false } });
   const location = { directory: join(root, "project") };
   await host.agent.list({ location });
   const rpc = host.rpc(Grayboard);

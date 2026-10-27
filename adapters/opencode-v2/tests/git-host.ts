@@ -59,6 +59,7 @@ try {
   const tui = await Host.load(entries.tui!) as typeof import("../src/tui.js");
   const rpc = await Host.load(entries.rpc!) as typeof import("../src/rpc.js");
   assert.equal(server.default.id, "grayboard");
+  assert.equal(typeof server.default.effect, "function");
   assert.equal(tui.default.id, "grayboard.tui");
   assert(rpc.Grayboard);
   assert.equal((await host.rpc(server.Grayboard).status({}, { location })).state, "unenrolled");

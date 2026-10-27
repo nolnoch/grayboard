@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { OpenCode } from "@opencode/sdk";
+import { createFixtureHost } from "./effect-host.js";
+import { fromPromise } from "@opencode/plugin/promise/adapter";
+import { instrument, type NativeInput } from "./effect-instrument.js";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { assertStable, barrier, bounded, drainSessions } from "./reload-state.ts";
@@ -16,7 +18,7 @@ const saved = await Bun.file(join(root, suspendedResume ? "real-suspended.json" 
 assert.notEqual(process.pid, saved.pid, "Reload must cross an OS-process boundary");
 const installed = (await Bun.file(join(root, "installed.txt")).text()).trim();
 const { default: plugin } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
-const inputs: Parameters<Context["session"]["synthetic"]>[0][] = [], models: string[] = [];
+const inputs: NativeInput[] = [], models: string[] = [];
 const replayEntered = barrier(), replayReleased = barrier(), replayReturned = barrier(), modelEntered = barrier(), modelReleased = barrier();
 let replayForwarded = false;
 const receiptCommits = new Set<string>();
@@ -61,22 +63,19 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
     }
   });
 } });
-const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({ ...c, session: new Proxy(c.session, { get(s, k) {
-  if (k === "synthetic") return async (input: Parameters<Context["session"]["synthetic"]>[0]) => {
+const instrumented = instrument(plugin, async (input, forward) => {
     inputs.push(structuredClone(input));
     if (mode === "hold-before") await hold();
     if (suspendedResume && input.id === saved.input.id) {
       replayEntered.release(); await replayReleased.promise; replayForwarded = true;
     }
-    const value = await s.synthetic(input);
+    const value = await forward(input);
     if (suspendedResume && input.id === saved.input.id) replayReturned.release();
     if (mode === "hold-after") await hold();
     forwarded.add(input.id!);
     return value;
-  };
-  return Reflect.get(s, k);
-} }) }); } });
-const host = await OpenCode.create({ plugins: [fixture, instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
+});
+const host = await createFixtureHost({ plugins: [fromPromise(fixture), instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
 const settleReplay = (check: () => void) => bounded(afterProducers(async () => {
   await receiptsCommitted.promise;
   assert(forwarded.has(saved.input.id), "Action replay forwarding returned before its committed receipt");

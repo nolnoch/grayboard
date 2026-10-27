@@ -4,15 +4,16 @@ import { join } from "node:path";
 import type { SubscriberWork } from "./subscriber-work.ts";
 import { bounded, drainSessions } from "./reload-state.ts";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import type { OpenCode } from "@opencode/sdk";
+import type { FixtureHost } from "./effect-host.js";
+import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import type { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 
-type Input = Parameters<Context["session"]["synthetic"]>[0];
+type Input = NativeInput;
 export type AdmissionGate = {
   holding: boolean; boundary: "before" | "after"; inputs: Input[];
-  accepted: Awaited<ReturnType<Context["session"]["synthetic"]>>[];
+  accepted: NativeAdmission[];
   models: string[]; entered(): void; released: Promise<void>;
 };
 async function until(read: () => boolean | Promise<boolean>, label: string) {
@@ -20,7 +21,7 @@ async function until(read: () => boolean | Promise<boolean>, label: string) {
   throw new Error("Real race wait expired: " + label);
 }
 export async function realRace(f: {
-  scenario: string; gate: AdmissionGate; host: Awaited<ReturnType<typeof OpenCode.create>>;
+  scenario: string; gate: AdmissionGate; host: FixtureHost;
   ctx: Context; app: ReturnType<typeof startServer>; location: { directory: string };
   subscriberWork: SubscriberWork;
   expiryContinuation: FailedContinuation;
