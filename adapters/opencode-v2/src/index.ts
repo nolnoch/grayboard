@@ -2,6 +2,7 @@ import { Plugin } from "@opencode/plugin";
 import { Controller, type Options } from "./controller.js";
 import { Grayboard } from "./rpc.js";
 import { Refusal } from "./model.js";
+import { observeEvents } from "./events.js";
 export { Grayboard } from "./rpc.js";
 export default Plugin.define({ id: "grayboard", async setup(ctx) {
   const options: Options = {
@@ -23,10 +24,12 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
   const before = await ctx.tool.hook("execute.before", event => controller.before(event));
   const after = await ctx.tool.hook("execute.after", event => controller.after(event).catch(() => {}));
   const events = new AbortController();
-  const listening = (async () => {
-    try { for await (const event of ctx.event.subscribe({ signal: events.signal })) await controller.observe(event.type, event.data); }
-    catch { if (!events.signal.aborted) await controller.pause().catch(() => {}); }
-  })();
+  const listening = observeEvents(
+    () => ctx.event.subscribe({ signal: events.signal }),
+    event => controller.observe(event.type, event.data),
+    operation => controller.backgroundFailure(operation),
+    events.signal,
+  );
   restoring = (async () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     for (let attempt = 0; attempt < 50 && !events.signal.aborted; attempt++) {
@@ -36,7 +39,7 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
-    await controller.restore().catch(error => events.signal.aborted ? undefined : controller.pause(error instanceof Refusal ? error.message : "Saved enrollment unavailable; explicitly enroll again")).catch(() => {});
+    await controller.restore().catch(() => { if (!events.signal.aborted) controller.backgroundFailure("restore"); });
   })();
   return async () => {
     events.abort();

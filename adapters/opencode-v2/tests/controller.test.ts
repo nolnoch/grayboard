@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
+import { observeEvents } from "../src/events.js";
 import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
 import type { Enrollment, Item } from "../src/model.js";
 import { fixture } from "./binding.test.js";
@@ -70,6 +71,76 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
   return { ctx, controller, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
+test.each(["edited", "prepare"])("restore isolates a %s root without releasing a healthy root or persisting human pause", async mode => {
+  const r = runtime(); let restored: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    await r.controller.close();
+    if (mode === "edited") r.storage.set("enrollmentHash:R", "edited");
+    restored = r.restart();
+    if (mode === "prepare") {
+      const check = restored.binding.check.bind(restored.binding);
+      restored.binding.check = async e => { if ((e as Enrollment).sessionID === "R") throw new Error("temporary timeout secret"); await check(e); };
+    }
+    const start = r.calls.length;
+    await restored.restore();
+    await until(() => r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "B"));
+    expect(r.calls.slice(start).some(c => ["session_end", "delivery_release"].includes(c.name))).toBe(false);
+    expect(r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "R")).toBe(false);
+    expect(r.storage.get("paused:R")).toBe(false);
+    expect(r.storage.get("paused:B")).toBe(false);
+    expect(r.rows.get("B")?.name).toBe("fe");
+  } finally { await restored?.close(); await r.controller.close(); }
+});
+
+test("one event failure cannot lose later credential latching; stream retries are bounded", async () => {
+  const r = runtime({ name: "be" }), abort = new AbortController(), failures: string[] = [], waits: number[] = [];
+  try {
+    r.bind("R", "be"); await r.controller.enroll("R");
+    let subscriptions = 0, returned = 0;
+    const subscribe = async function* () {
+      subscriptions++;
+      try {
+        if (subscriptions === 1) {
+          yield { type: "session.created", data: { sessionID: "missing" } };
+          yield { type: "credential.switched", data: { integrationID: "native-integration" } };
+        }
+        throw new Error("stream token secret");
+      } finally { returned++; }
+    };
+    await observeEvents(subscribe, event => r.controller.observe(event.type, event.data), kind => failures.push(kind), abort.signal, async ms => { waits.push(ms); });
+    expect(failures.filter(k => k === "event")).toHaveLength(1);
+    expect(failures.filter(k => k === "stream")).toHaveLength(8);
+    expect(subscriptions).toBe(8); expect(returned).toBe(8);
+    expect(waits).toEqual([250, 500, 1000, 2000, 4000, 8000, 8000]);
+    expect(r.controller.status().state).toBe("paused");
+    expect(r.calls.some(c => c.name === "delivery_release" || c.name === "session_end")).toBe(false);
+  } finally { abort.abort(); await r.controller.close(); }
+});
+
+test("expired capture deleting an unenrolled child does not terminate later credential events", async () => {
+  const r = runtime(), abort = new AbortController(), failures: string[] = [];
+  try {
+    r.bind("B", "fe"); await r.controller.enroll("B");
+    await r.before("G"); r.f.expire();
+    await observeEvents(async function* () {
+      yield { type: "session.deleted", data: { sessionID: "C" } };
+      yield { type: "credential.switched", data: { integrationID: "native-integration" } };
+      abort.abort();
+    }, event => r.controller.observe(event.type, event.data), kind => failures.push(kind), abort.signal);
+    expect(failures).toEqual(["event"]);
+    expect(r.controller.status().state).toBe("paused");
+    expect(r.calls.some(c => c.name === "session_end" || c.name === "delivery_release")).toBe(false);
+  } finally { abort.abort(); await r.controller.close(); }
+});
+
+test("event resubscription cancellation ends backoff without another subscriber", async () => {
+  const abort = new AbortController(); let attempts = 0;
+  await observeEvents(async function* () { attempts++; throw new Error("closed"); }, async () => {}, () => {}, abort.signal, async () => { abort.abort(); });
+  expect(attempts).toBe(1);
+});
+
 test("capacity recovery rebinds without creation and receipts the reissued item under new ownership", async () => {
   const r = runtime({}, async () => {});
   try {

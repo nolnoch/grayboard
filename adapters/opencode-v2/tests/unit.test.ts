@@ -80,7 +80,12 @@ test("enrollment fingerprint pins all logical fields independently of key order"
 test("edited root metadata cannot manufacture restored approval", async () => {
   const stored: Record<string, unknown> = { rootSessionIDs: [enrollment.sessionID], [`enrollmentHash:${enrollment.sessionID}`]: enrollmentHash(enrollment) };
   const ctx = { storage: { get: async (key: string) => stored[key] }, session: { get: async () => ({ id: enrollment.sessionID, time: {}, metadata: { [METADATA]: { enabled: true, enrollment: { ...enrollment, connectionID: "forged" } } } }) } } as unknown as Context;
-  await expect(new Controller(ctx, { mcpName: "grayboard" }).restore()).rejects.toThrow("Saved enrollment was edited");
+  const controller = new Controller(ctx, { mcpName: "grayboard" });
+  let checked = false;
+  controller.binding.check = async () => { checked = true; };
+  await controller.restore();
+  expect(checked).toBe(false);
+  expect(controller.status()).toMatchObject({ state: "paused", sessionID: enrollment.sessionID, message: "Saved enrollment invalid; explicitly enroll again" });
 });
 export const items = [{ id: "direct:1", actionable: true, event: { body: "untrusted" }, ownership: 1, bind_gen: 1, name: "be" }, { id: "direct:2", actionable: false, event: {}, ownership: 1, bind_gen: 1, name: "be" }];
 test("stable admission IDs pin principal/name/root but survive new capability/generation", () => {

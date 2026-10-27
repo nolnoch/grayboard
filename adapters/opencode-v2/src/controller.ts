@@ -250,20 +250,29 @@ export class Controller {
     if (!Array.isArray(ids)) return;
     for (const id of ids) {
       if (typeof id !== "string" || this.stopped) continue;
-      let session: Awaited<ReturnType<Context["session"]["get"]>>;
-      try { session = await this.activeRoot(id); }
-      catch { continue; }
-      const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
-      const e = saved?.enrollment;
-      if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
-      const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true;
-      const r: Root = { e, epoch: 0, paused, status: this.state };
-      this.roots.set(id, r);
-      if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
-      await this.binding.check(e);
-      this.watches.set(id, await this.binding.watch(e));
-      await this.prepare(r, true);
+      try {
+        let session: Awaited<ReturnType<Context["session"]["get"]>>;
+        try { session = await this.activeRoot(id); }
+        catch { continue; }
+        const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
+        const e = saved?.enrollment;
+        if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
+        const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true;
+        const r: Root = { e, epoch: 0, paused, status: this.state };
+        this.roots.set(id, r);
+        if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
+        await this.binding.check(e);
+        this.watches.set(id, await this.binding.watch(e));
+        await this.prepare(r, true);
+      } catch {
+        const r = this.roots.get(id);
+        if (r) { r.paused = true; await this.stop(r); this.set(r, "paused", "Saved root unavailable; approval retained, explicitly enroll to retry"); }
+        else this.state = { state: "paused", sessionID: id, message: "Saved enrollment invalid; explicitly enroll again" };
+      }
     }
+  }
+  backgroundFailure(operation: "event" | "stream" | "restore") {
+    this.state = { state: "degraded", message: `Background ${operation} failed; existing root ownerships retained` };
   }
   private async native(tool: string) {
     const namespace = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_");
