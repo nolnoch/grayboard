@@ -245,6 +245,7 @@ describe("dedup and state answers (in process)", () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
     expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
     expect(await be.call("board_post", { board: "e2e", body: [[1]] })).toMatchObject({ type: "error", code: "bad_request", message: "body must be a string" });
+    expect(await be.call("board_post", { board: "e2e", body: "reply", parent_id: "1" })).toMatchObject({ type: "error", code: "bad_request", message: "parent_id must be a number" });
   });
 
   // #296: the access checks run before the receipt lookup, so a repeat from a

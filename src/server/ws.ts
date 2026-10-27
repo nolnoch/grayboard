@@ -1353,12 +1353,15 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, me: string, args: Reco
     // Checked before it's fingerprinted: a non-string body is a bad request, not a canonicalJson failure.
     if (typeof postArgs.body !== "string") throw new CoreError("body must be a string");
     const ids = attachmentIds(postArgs.attachment_ids);
+    // The same reading core's optNum gives it, so the access check and the write agree on whether this is a reply.
+    const parentId = postArgs.parent_id ?? null;
+    if (parentId !== null && typeof parentId !== "number") throw new CoreError("parent_id must be a number");
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
-    checkPostAccess(db, me, postArgs.board, typeof postArgs.parent_id === "number" ? postArgs.parent_id : null);
+    checkPostAccess(db, me, postArgs.board, parentId);
     const fp = {
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
-      parent_id: postArgs.parent_id ?? null,
+      parent_id: parentId,
       attachments: uploadDigests(db, ids, uploaderOf(ws)),
     };
     out = writeOnce(hub, ws, "board_post", me, fp, resend === true, ids, () => {
