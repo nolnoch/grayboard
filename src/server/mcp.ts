@@ -16,6 +16,8 @@ import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -100,7 +102,19 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, isAuthorized: principal => oauth.isAuthorized(principal) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
-  const exchanges = new AsyncLocalStorage<{ request: Request; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy }>();
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
+  const exchanges = new AsyncLocalStorage<Exchange>();
+  const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
+  const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
+    if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
+    if (exchange) exchange.logged = true;
+    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source) })}`);
+  };
+  const logRefusal = (reason: string, exchange: Exchange) => {
+    refusalLogs.sweep();
+    if (refusalLogs.size >= 4096 || !refusalLogs.take(exchange.address).ok) return;
+    console.error(`[grayboard] hosted MCP refused: ${JSON.stringify({ reason, address: exchange.address, origin: diagnosticOrigin(exchange.request.headers.get("Origin")), public_origin: trustedOrigin, principal: exchange.principal, identity: exchange.identity, protocol: exchange.protocol })}`);
+  };
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
     if (exchange) exchange.refusal = response;
@@ -144,7 +158,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       if (!closed && !request.signal.aborted && error instanceof ApplicationError && error.code === "unauthenticated") {
         const refusal = oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
+        refuse(Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 }));
       }
+      report(error, "hosted-admission");
       throw error;
     }
     const context: Context = { request, principal, sessionContext: routing, role, ...selected, finish() {
@@ -154,6 +170,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     } };
     contexts.add(context);
     principals.set(context.session, principal);
+    const exchange = exchanges.getStore();
+    if (exchange) { exchange.principal = principal.authed.user_id; exchange.identity = context.session.identityName; exchange.session = context.session.sessionId; }
     try {
       if (closed || request.signal.aborted) throw new Error("MCP request is closed");
       if (!oauth.isAuthorized(principal)) {
@@ -269,6 +287,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
       ].join(" "),
     });
+    server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });
     registerHostedResources(server, {
       role, current, issuer: oauth.issuer, resource: oauth.resource, resources, delivery, hosted, leaseHooks,
@@ -323,10 +342,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => control(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => control(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
   }
   const modernFactory = async () => {
+    try {
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
       if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
@@ -335,8 +355,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     const context = exchange.context ??= await select(exchange.request);
     return makeServer(context);
+    } catch (error) {
+      const exchange = exchanges.getStore();
+      if (error instanceof ApplicationError && exchange) exchange.failure = error;
+      report(error, "hosted-factory");
+      throw new Error("internal error");
+    }
   };
-  const modern = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000 });
+  const modern = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, onerror: error => report(error) });
   function retire(legacy: Legacy, failed = false) {
     if (legacy.stopped) return;
     let reported = false;
@@ -391,9 +417,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     get activeInboxListeners() { return [...lives].filter(l => l.uris.has("grayboard://inbox")).length; },
     get activeLegacySessions() { return legacyAll.size; },
     get activePosts() { return posts; },
-    async fetch(original: Request): Promise<Response> {
+    async fetch(original: Request, address = "unknown"): Promise<Response> {
+      const boundary: Exchange = { request: original, address, protocol: MCP_PROTOCOL_VERSIONS.includes(original.headers.get("Mcp-Protocol-Version") ?? "") ? original.headers.get("Mcp-Protocol-Version")! : "unspecified" };
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
-      if (!permitsOrigin(original.headers.get("Origin"))) return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 });
+      if (!permitsOrigin(original.headers.get("Origin"))) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
       let role: HostedRole;
       try { role = hostedRole(original); } catch { return Response.json({ code: "bad_request", message: "unknown X-Grayboard-Client role" }, { status: 400 }); }
       const post = original.method === "POST";
@@ -403,8 +430,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         const authenticated = oauth.authenticate(original, roleScopes(role));
         if (authenticated instanceof Response) return authenticated;
         principal = authenticated;
+        boundary.principal = principal.authed.user_id;
         postReservation = post ? reserve("post", principal) : undefined;
-      } catch { return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
+      } catch (error) { report(error, "hosted-fetch", boundary); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
       if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 });
       let released = false, legacyPost: Legacy | undefined;
       const releasePost = () => {
@@ -421,7 +449,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
         const parsed = body.parsedBody as { id?: string | number | null; params?: { _meta?: unknown } } | undefined;
-        return await exchanges.run({ request: req, meta: parsed?.params?._meta, id: parsed?.id }, async () => {
+        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
@@ -442,7 +470,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
                 if (uris.length > 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
-                ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus() });
+                ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);
                 response = await ownHandler.fetch(req, { parsedBody: body.parsedBody });
               } else {
@@ -496,6 +524,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             const done = () => { releaseListen?.(); releasePost(); };
             return wrap(response, exchange.context, live, done);
           } catch (error) {
+            report(error, "hosted-fetch");
             if (newLegacy) retire(newLegacy);
             live?.stop();
             if (ownHandler) await ownHandler.close();
@@ -510,7 +539,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             return Response.json({ code: "internal", message: "internal error" }, { status: 500 });
           }
         });
-      } catch { releasePost(); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
+      } catch (error) { report(error, "hosted-fetch", boundary); releasePost(); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
       finally { pendingRequests.delete(pendingRequest); finishRequest(); }
     },
     async close() {
@@ -529,13 +558,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
 }
 
-function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context) {
+function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     try {
       const context = current(ctx);
       return text(await hosted.run(context.principal, context.sessionContext, tool, call) ?? "ok");
     }
     catch (e) {
+      report(e, tool);
       const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
       return { ...text(`error: ${message}`), isError: true };
     }
@@ -546,7 +576,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   server.registerTool("bind", { description: "Take or change this session's name; unknown names require create:true.", inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args); }
-    catch (e) { return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
+    catch (e) { report(e, "bind"); if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code)) refuse(e.code); return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
   });
   for (const tool of boardTools({ teams: true })) {
     const properties = { ...tool.inputSchema.properties };

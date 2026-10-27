@@ -31,7 +31,7 @@ const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
-  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 } });
+  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = issuedOAuth(store.repo, oauth.resource);
@@ -325,37 +325,57 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
       expect(line).toContain('"source":"src/server/mcp.ts","operation":"tool","category":"unexpected"');
       expect(line.length).toBeLessThan(1024);
       for (const hidden of [token, "hidden", "password", "private tool body", "client_secret", "/auth?", "12:34"]) expect(line).not.toContain(hidden);
-      expect(hosted.activeContexts).toBe(0);
+      expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     }
     expect(reads).toBe(0);
+    await client.close();
+    expect(hosted.activeContexts).toBe(0);
   } finally { store.repo.messages.insert = original; logs.mockRestore(); }
 });
 
-for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: factory errors log once, expected refusals do not log, and lost authentication returns 401`, async () => {
+for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: factory construction failures are generic and release the stable context`, async () => {
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  let reads = 0;
+  const hostile = new Error("opaque");
+  for (const key of ["message", "stack", "cause"]) Object.defineProperty(hostile, key, { get() { reads++; throw new Error(token); } });
+  const fault = spyOn(McpServer.prototype, "registerTool").mockImplementation(() => { throw hostile; });
+  try {
+    await expect(connect(version)).rejects.toThrow();
+    const failures = logs.mock.calls.filter(call => String(call[0]).startsWith("[grayboard] hosted MCP failed:"));
+    expect(failures).toHaveLength(1);
+    expect(String(failures[0]![0])).toContain(`"operation":"${version === "2026-07-28" ? "factory" : "fetch"}"`);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(token);
+    expect(reads).toBe(0);
+    expect(hosted.activeContexts).toBe(0);
+  } finally { fault.mockRestore(); logs.mockRestore(); }
+});
+
+for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: selection errors log once, expected refusals do not log, and lost authentication returns 401`, async () => {
   let last!: Response;
   const client = await connect(version, async response => { last = response.clone(); });
   const logs = spyOn(console, "error").mockImplementation(() => {});
-  const original = application.admitIdentity;
+  const original = hosted.sessions.snapshot;
   try {
-    application.admitIdentity = () => async () => { throw new Error(`token=${token}`); };
+    hosted.sessions.snapshot = async () => { throw new Error(`token=${token}`); };
     await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
     expect(last.status).toBe(500);
     expect(logs).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(logs.mock.calls)).not.toContain(token);
     logs.mockClear();
-    application.admitIdentity = () => async () => { throw new ApplicationError("unauthenticated", `revoked ${token}`); };
+    hosted.sessions.snapshot = async () => { throw new ApplicationError("unauthenticated", `revoked ${token}`); };
     await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
     expect(last.status).toBe(401);
     expect(await last.text()).not.toContain(token);
     expect(logs).not.toHaveBeenCalled();
-    application.admitIdentity = () => async () => { throw new ApplicationError("rate_limited", "retry", { retry_after_ms: 1000 }); };
+    hosted.sessions.snapshot = async () => { throw new ApplicationError("rate_limited", "retry", { retry_after_ms: 1000 }); };
     await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
     expect(last.status).toBe(429);
     expect(logs).not.toHaveBeenCalled();
-  } finally { application.admitIdentity = original; logs.mockRestore(); }
+  } finally { hosted.sessions.snapshot = original; logs.mockRestore(); }
 });
 
 test("Origin and identity diagnostics are address-limited and omit URL secrets", async () => {
+  const client = await connect();
   const logs = spyOn(console, "error").mockImplementation(() => {});
   try {
     for (let n = 0; n < 5; n++) {
@@ -363,8 +383,8 @@ test("Origin and identity diagnostics are address-limited and omit URL secrets",
       expect(response.status).toBe(403);
     }
     expect(logs).toHaveBeenCalledTimes(1);
-    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "human" } }), "192.0.2.2");
-    expect(response.status).toBe(400);
+    const response = await client.callTool({ name: "bind", arguments: { name: "human" } });
+    expect(response.isError).toBe(true);
     expect(logs).toHaveBeenCalledTimes(2);
     const text = JSON.stringify(logs.mock.calls);
     expect(text).toContain("https://foreign.example.com");
@@ -376,23 +396,21 @@ test("Origin and identity diagnostics are address-limited and omit URL secrets",
 for (const revoked of [false, true]) test(`authentication lost between HTTP preflight and factory (${revoked ? "revoked" : "disabled"}) returns 401 without an unexpected log`, async () => {
   let last!: Response;
   const client = await connect("2026-07-28", async response => { last = response.clone(); });
-  const original = application.admitIdentity;
+  const original = application.admitHosted;
   const logs = spyOn(console, "error").mockImplementation(() => {});
-  application.admitIdentity = (...args) => {
-    const select = original(...args);
-    if (revoked) store.repo.sessions.revoke(user.session_id);
-    return async sink => {
-      store.repo.users.setDisabled(user.user_id, true);
-      return select(sink);
-    };
+  application.admitHosted = (...args) => {
+    original(...args);
+    if (revoked) store.repo.sessions.revokeAllForUser(user.user_id);
+    else store.repo.users.setDisabled(user.user_id, true);
   };
   try {
     await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
     expect(last.status).toBe(401);
-    expect(await last.json()).toMatchObject({ code: "unauthenticated" });
+    expect(last.headers.get("WWW-Authenticate")).toContain('error="invalid_token"');
+    expect(await last.json()).toMatchObject({ error: "invalid_token" });
     expect(logs).not.toHaveBeenCalled();
     expect(hosted.activeContexts).toBe(0);
-  } finally { application.admitIdentity = original; logs.mockRestore(); }
+  } finally { application.admitHosted = original; logs.mockRestore(); }
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {

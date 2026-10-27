@@ -493,7 +493,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     repo,
     hostedHolder(full: string) { return hub.holders.get(full); },
-    admitHosted(authed: AuthedUser, sessionId: string | null) { admit(authed, undefined, { read_only: true }, sessionId); },
+    admitHosted(authed: AuthedUser, sessionId: string | null) { admit(authed, undefined, { read_only: true, transport: "hosted" }, sessionId); },
     hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
     hostedSession(authed: AuthedUser, id: string, name: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
       const session = new ApplicationSession(authed, sink, false, push);

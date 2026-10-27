@@ -4,6 +4,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { OPENCODE_CLIENT } from "../../src/server/hosted.ts";
 
 test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaustion is isolated", async () => {
   let now = 0;
@@ -12,9 +13,23 @@ test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaust
   try {
     const token = await srv.login("alice@example.com");
     const other = await srv.login("bob@example.com");
+    const hostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
+    const otherHostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com").token;
     srv.app.repo.aliases.create("alice@example.com", "be");
     srv.app.repo.aliases.create("bob@example.com", "be");
-    await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } } }));
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${hostedToken}` } },
+      fetch: async (input, init) => {
+        let request = new Request(input, init);
+        if (request.method === "POST" && request.body) {
+          const body = await request.json();
+          body.params = { ...body.params, _meta: { ...body.params?._meta, "ai.opencode/sessionID": "throttle-root" } };
+          request = new Request(request, { body: JSON.stringify(body) });
+        }
+        return fetch(request);
+      },
+    }));
+    expect((await client.callTool({ name: "bind", arguments: { name: "be" } })).isError).not.toBe(true);
     // Real HTTP dispatches; virtual admission time makes the >1/s drain deterministic.
     for (let n = 0; n < 600; n++) {
       now += 200;
@@ -28,7 +43,7 @@ test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaust
     }
     expect(refused).toBe(true);
     expect((await srv.client(token, null).connect()).type).toBe("hello_ok");
-    const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${other}`, "X-Grayboard-Identity": "be" } });
+    const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
@@ -71,7 +86,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(error).toMatchObject({ code: -32000, data: { code: "rate_limited" } });
     expect(last!.body).not.toContain(user.email);
     expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
-    await expect(srv.app.application.selectIdentity(authed, undefined, { deliver() {}, probe: async () => false, closed() {} }, { read_only: true, push: false })).rejects.toMatchObject({ code: "rate_limited" });
+    expect(() => srv.app.application.admitHosted(authed, null)).toThrow(expect.objectContaining({ code: "rate_limited" }));
     expect(srv.app.repo.hosted.all()).toEqual([]);
     const before = srv.app.db.query("SELECT * FROM boards").all();
     await expect(client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "must not dispatch" } })).rejects.toThrow();
