@@ -1,8 +1,18 @@
 import { expect, test } from "bun:test";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
-import { Wire, SubscriberError, LeaseUnavailable } from "../src/wire.js";
+import { Wire, SubscriberError, LeaseUnavailable, subscriberError } from "../src/wire.js";
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
+test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
+  expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
+  for (const known of [["secret\nstack"], ["https://token.example.com"], Array(33).fill("be"), [42], "secret"]) {
+    const error = subscriberError({ code: "identity_unknown", known }, false);
+    expect(error.known).toBeUndefined();
+    expect(error.message).toBe("Subscriber refused (identity_unknown)");
+  }
+  expect(subscriberError({ code: "bad_request", known: ["be"] }, false).known).toBeUndefined();
+  expect(subscriberError({ code: "receipt_capacity" }, true).code).toBe("receipt_capacity");
+});
 export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", name: "be" };
 export const identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };
 async function retryWire(mode: "success" | "guard" | "abort" | "untyped") {

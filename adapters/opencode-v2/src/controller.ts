@@ -209,7 +209,16 @@ export class Controller {
           r.lease = undefined;
           if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
         } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code)) throw error;
-        else failures++;
+        else {
+          failures++;
+          if (error instanceof SubscriberError && error.code === "receipt_capacity") {
+            await this.guard(r, epoch, signal);
+            if (!wire || !r.lease) throw new Refusal("paused", "Capacity recovery requires the current lease");
+            await wire.call("delivery_release");
+            r.lease = undefined;
+            await this.guard(r, epoch, signal);
+          }
+        }
         this.set(r, "retrying", `Revalidating the approved root before reopening delivery: ${error instanceof Error ? error.message : "transport failure"}`);
         if (wire?.admissionRetryAfterMs) {
           if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");

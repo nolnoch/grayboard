@@ -14,6 +14,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const batches = new Map<string, Item[]>();
   let holdRegister: (() => Promise<void>) | undefined, admit: (() => Promise<void>) | undefined, holdReceipt = false, refuseBind = false;
   let ownership = 0, throttledReads = 0;
+  let readFailure: (() => void) | undefined;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
@@ -48,6 +49,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
       return { ok: true };
     }
     async read() {
+      readFailure?.();
       if (throttledReads > 0) { throttledReads--; this.admissionRetryAfterMs = 100; throw new Error("typed HTTP429"); }
       return { items: batches.get(this.sessionID) ?? [] };
     }
@@ -66,8 +68,48 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { ctx, controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
+test("capacity recovery rebinds without creation and receipts the reissued item under new ownership", async () => {
+  const r = runtime({}, async () => {});
+  try {
+    r.bind("R", "be");
+    let reads = 0;
+    r.readFailure(() => {
+      if (++reads === 1) throw new SubscriberError("receipt_capacity");
+      const row = r.rows.get("R")!;
+      r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: row.ownership, bind_gen: row.generation, name: "be" }]);
+    });
+    await r.controller.enroll("R");
+    await until(() => r.calls.some(c => c.name === "delivery_receipt"));
+    expect(r.rows.get("R")?.ownership).toBe(2);
+    expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(1);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "be", create: false, where: "/worktree" }]);
+    expect(r.admissions).toHaveLength(1);
+    expect(r.batches.get("R")).toEqual([]);
+    expect(r.nodes.get("R")?.metadata).toMatchObject({ "grayboard.enrollment": { enabled: true } });
+  } finally { await r.controller.close(); }
+});
+
+test.each(["receipt_capacity", "bad_request"])("only typed %s controls bounded capacity recovery", async code => {
+  const r = runtime({}, async () => {});
+  try {
+    r.bind("R", "be");
+    r.readFailure(() => { throw new SubscriberError(code); });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "paused");
+    expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(8);
+    const releases = r.calls.filter(c => c.name === "delivery_release");
+    expect(releases).toHaveLength(code === "receipt_capacity" ? 8 : 0);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual(code === "receipt_capacity" ? Array.from({ length: 7 }, () => ({ name: "be", create: false, where: "/worktree" })) : []);
+    if (code === "receipt_capacity") {
+      const first = r.calls.findIndex(c => c.name === "delivery_release");
+      expect(r.calls.slice(first, first + 4).map(c => c.name)).toEqual(["delivery_release", "whoami", "bind", "delivery_open"]);
+    }
+  } finally { await r.controller.close(); }
+});
+
 test("a poison item exhausts eight attempts despite successful same-lease opens, without receipts or skipping", async () => {
   const waits: number[] = [];
   const r = runtime({}, async ms => { waits.push(ms); });

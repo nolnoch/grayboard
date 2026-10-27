@@ -3,16 +3,18 @@ import type { Configuration } from "./model.js";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export class SubscriberError extends Error {
-  constructor(readonly code: string) { super(`Subscriber refused (${code})`); }
+  constructor(readonly code: string, readonly known?: string[]) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}`); }
 }
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
-const domainCodes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited"]);
+const domainCodes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
 export function subscriberError(value: unknown, leaseOperation: boolean): SubscriberError {
   const code = (value as { code?: unknown } | undefined)?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
-  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain);
+  const suggestions = (value as { known?: unknown } | undefined)?.known;
+  const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 32 && suggestions.every(name => typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,31}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known);
 }
 
 export class Wire {
