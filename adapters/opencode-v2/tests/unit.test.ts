@@ -5,7 +5,8 @@ import { Wire, SubscriberError, LeaseUnavailable, subscriberError } from "../src
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
   expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
-  for (const known of [["secret\nstack"], ["https://token.example.com"], Array(33).fill("be"), [42], "secret"]) {
+  expect(subscriberError({ code: "identity_unknown", known: ["_task", "-task", ...Array(254).fill("be")] }, false).known).toEqual(["_task", "-task", "be"]);
+  for (const known of [["secret\nstack"], ["https://token.example.com"], Array(257).fill("be"), [42], "secret"]) {
     const error = subscriberError({ code: "identity_unknown", known }, false);
     expect(error.known).toBeUndefined();
     expect(error.message).toBe("Subscriber refused (identity_unknown)");

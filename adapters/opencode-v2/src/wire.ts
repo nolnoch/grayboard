@@ -13,7 +13,7 @@ export function subscriberError(value: unknown, leaseOperation: boolean): Subscr
   const code = (value as { code?: unknown } | undefined)?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
   const suggestions = (value as { known?: unknown } | undefined)?.known;
-  const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 32 && suggestions.every(name => typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,31}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
+  const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 256 && suggestions.every(name => typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
   return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known);
 }
 
