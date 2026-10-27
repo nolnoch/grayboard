@@ -26,8 +26,8 @@ import {
 import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
-import { attachmentIds } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { attachmentIds, type FileSend } from "./attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 
 export type ToolDef = {
@@ -328,8 +328,8 @@ export type BoardPostResult = {
 };
 
 // What only the mode knows. online: does this handle have a live session?
-// attachmentLimits: the caps a post's files are bound under; a mode without
-// them can't post files.
+// files: the caps a post's files are bound under and the user sending them;
+// a mode without it can't post files.
 // unbound: the live sessions with no name yet, for peer_list (#182).
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
@@ -338,7 +338,7 @@ export type BoardPostResult = {
 // claims held by any of them are the caller's. Default [handle].
 export type ToolContext = {
   online?: (handle: string) => boolean;
-  attachmentLimits?: AttachmentLimits;
+  files?: FileSend;
   unbound?: UnboundPeer[];
   human?: boolean;
   session?: string;
@@ -390,7 +390,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits }, strictIds: true },
+        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
       const isViewer = viewers(db);
       const result: BoardPostResult = {

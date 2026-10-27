@@ -689,6 +689,25 @@ test("S11: a restored_from naming another principal's session is unverified, eve
   expect(status("eng/api")).toBeNull();
 });
 
+// #367: an upload stays with the user who made it, so a team alias that
+// passes to another member doesn't carry its last holder's unsent files.
+test("#284 #367: a team alias's unsent upload doesn't pass to the next member who holds it", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  const mine = srv.client(alice, "eng/api");
+  expect((await mine.connect()).bind_ok.alias).toBe("eng/api");
+  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  expect(up.status).toBe(201);
+  expect((await mine.request({ type: "end" })).type).toBe("end_ok");
+
+  const theirs = srv.client(bob, "eng/api");
+  expect((await theirs.connect()).bind_ok.alias).toBe("eng/api");
+  const refused = `attachment ${up.body.id} isn't an unsent upload of yours`;
+  expect(await theirs.request({ type: "send", recipient: `${A}/be`, body: "x", attachment_ids: [up.body.id] })).toMatchObject({ type: "error", code: "bad_request", message: refused });
+  expect(await theirs.call("board_post", { board: "eng", body: "x", attachment_ids: [up.body.id] })).toMatchObject({ type: "error", message: expect.stringContaining(refused) });
+  expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
+});
+
 test("#284: a 1.x client's 16-hex restored_from is logged as the same session ID, unverified (S11)", async () => {
   const key = "d5".repeat(32);
   const ws = srv.client(alice, "api", { key });

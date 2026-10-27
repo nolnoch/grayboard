@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
-import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
-import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
@@ -571,7 +571,8 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
 // sessions' instructions. attachments: the poster's unbound uploads to
-// carry, bound in the post's transaction under the mode's size caps.
+// carry, bound in the post's transaction under the mode's size caps (send),
+// if the mode's user (send.principal) made them.
 // author_id: the posting session's ID (#284), when the writer is a session.
 // addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
 // queue claim held by any of them is acked, and none of them is pushed the post.
@@ -580,7 +581,7 @@ export type PostOpts = {
   addresses?: string[];
   author_id?: string;
   ttl_ms?: number;
-  attachments?: { ids: number[]; limits?: AttachmentLimits };
+  attachments?: { ids: number[]; send?: FileSend };
   // An author's own words: an @id: that can't receive refuses the post.
   // Unset (system posts), it goes unresolved.
   strictIds?: boolean;
@@ -725,7 +726,7 @@ export function post(
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
   }
   const files = opts.attachments ?? { ids: [] };
-  if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
+  if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
   const isViewer = viewers(db);
 
   return db.transaction((): PostResult => {
@@ -736,7 +737,8 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null) as Post;
-    const attachments = files.limits ? bindAttachments(db, files.ids, opts.addresses ?? [handle], { post_id: p.id }, files.limits) : [];
+    const { send } = files;
+    const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };

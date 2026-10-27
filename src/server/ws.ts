@@ -40,7 +40,7 @@ import { ownScope, type Principal } from "../core/resolver.ts";
 import { assertDeliverableId, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
-import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests } from "../core/attachments.ts";
+import { attachmentIds, dropUnsentUploads, sweepBlobs, uploadDigests, type Uploader } from "../core/attachments.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
@@ -615,6 +615,9 @@ function revokeAliases(hub: Hub, uses: (AliasUse & { reason: string })[], by: st
 }
 
 const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: authed.user_email });
+// Whose unsent uploads this connection may send: its addresses' (#284 S5),
+// made by its user (#367).
+const uploaderOf = (ws: Ws): Uploader => ({ addresses: ws.data.addresses, principal: ws.data.authed.user_email });
 
 function helloOkFields(hub: Hub, authed: AuthedUser): Pick<HelloOk, "user_email" | "teams" | "human" | "attachment_limits"> {
   const { repo } = hub;
@@ -1089,7 +1092,7 @@ function prepareSend(
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
-    digests = uploadDigests(db, ids, ws.data.addresses);
+    digests = uploadDigests(db, ids, uploaderOf(ws));
   } catch (e) {
     if (e instanceof CoreError) throw new SendRefused("bad_request", e.message);
     throw e;
@@ -1118,7 +1121,7 @@ function writeSend(hub: Hub, ws: Ws, p: PreparedSend): Written<SendResult> & { m
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.sessionId ?? null, ws.data.addresses);
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, ws.data.sessionId ?? null, uploaderOf(ws));
   } catch (e) {
     if (e instanceof CoreError) {
       const r = coreRefusal(e);
@@ -1170,7 +1173,7 @@ function writeOnce<W extends Written>(
   const out = dedupWrite(repo, hub.now(), {
     tool, session: ws.data.sessionId!, sender, actor: authed.user_email, transport: "wss", args, resend,
   }, write, () => {
-    for (const row of dropUnsentUploads(hub.db, uploads, ws.data.addresses)) {
+    for (const row of dropUnsentUploads(hub.db, uploads, uploaderOf(ws))) {
       writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
         identity: row.uploader, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
@@ -1306,7 +1309,7 @@ function handleCall(hub: Hub, ws: Ws, reqId: string, tool: string, args: Record<
   }
   const ctx: ToolContext = {
     online: (h: string) => hub.registry.get(h)?.data.ready === true,
-    attachmentLimits: hub.repo.attachmentLimits,
+    files: { limits: hub.repo.attachmentLimits, principal: ws.data.authed.user_email },
     human: ws.data.human,
     ...(ws.data.sessionId ? { session: ws.data.sessionId } : {}),
     addresses: ws.data.addresses,
@@ -1353,7 +1356,7 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, me: string, args: Reco
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
       parent_id: postArgs.parent_id ?? null,
-      attachments: uploadDigests(db, ids, ws.data.addresses),
+      attachments: uploadDigests(db, ids, uploaderOf(ws)),
     };
     out = writeOnce(hub, ws, "board_post", me, fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);

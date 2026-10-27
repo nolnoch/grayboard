@@ -53,9 +53,11 @@ describe("retention pruning", () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
     const file = { filename: "a.txt", type: "text/plain", data: new TextEncoder().encode("same bytes") };
-    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file)).id;
-    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, [await up("a@example.com/fe")]);
-    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, [await up("a@example.com/fe")]);
+    const quota = { principal: "a@example.com", unsent: 1_000_000, stored: 1_000_000 };
+    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota })).id;
+    const from = { addresses: ["a@example.com/fe"], principal: "a@example.com" };
+    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, [await up("a@example.com/fe")], null, from);
+    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, [await up("a@example.com/fe")], null, from);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);

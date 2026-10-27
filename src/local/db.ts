@@ -70,7 +70,7 @@ export function insertMessage(
       )
       .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0);
     const id = Number(lastInsertRowid);
-    return { id, attachments: bindAttachments(db, ids, uploaders, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
+    return { id, attachments: bindAttachments(db, ids, { addresses: uploaders, principal: null }, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
 }
 

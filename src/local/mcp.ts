@@ -639,7 +639,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const ctx = {
       ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(ADDRS) } : {}),
       ...(name === "peer_list" ? { unbound: await unboundPeers() } : {}),
-      attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+      files: { limits: DEFAULT_ATTACHMENT_LIMITS, principal: null },
       human: HUMAN,
       session: SESSION_ID,
       addresses: ADDRS,
