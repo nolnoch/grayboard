@@ -11,6 +11,8 @@ const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
 assert(root); assert.equal(Bun.version, "1.4.4");
 assert.equal((await Bun.file(join(root, "node_modules/@opencode/sdk/package.json")).json()).version, "2.1.4");
 const directory = readFileSync(join(root, "installed.txt"), "utf8").trim();
+const { observeSubscriberWork } = await import("./subscriber-work.ts");
+const subscriberWork = await observeSubscriberWork(directory);
 const { default: installed, Grayboard } = await import(pathToFileURL(join(directory, "src/index.ts")).href) as typeof import("../src/index.js");
 const issuer = "https://grayboard.example.com", resource = issuer + "/mcp", scope = "grayboard:delivery grayboard:tools";
 type State = { name: string | null; ownership: number | null; gen: number; capability?: string };
@@ -123,10 +125,13 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user_email: "you@example.com", identity_full: "you@example.com/" + s.name } }));
   }
   if (name.startsWith("delivery_")) {
-    if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, content: [{ type: "text", text: "no live delivery lease" }] });
+    if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, structuredContent: { code: "not_found" }, content: [{ type: "text", text: "no live delivery lease" }] });
     assert.equal(req.headers.get("X-Grayboard-Lease"), s.capability);
     if (durable && name === "delivery_receipt") {
-      try { durable.receipt(session, args.ids); } catch { throw new Error("fixture receipt connection disconnected"); }
+      try { durable.receipt(session, args.ids); } catch {
+        if (durable.scenario === "reload" && durable.phase === "admit") await durable.receiptRelease.promise;
+        throw new Error("fixture receipt connection disconnected");
+      }
       return json(b.id, result({ ok: true }));
     }
     if (name === "delivery_receipt") {
@@ -171,7 +176,7 @@ try {
   await host.mcp.connect({ server: "grayboard", location });
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tool");
   if (durable) {
-    await durableCases(durable, host, ctx, rpc, location, state);
+    await durableCases(durable, host, ctx, rpc, location, state, subscriberWork);
     assert.equal(codes, durable.phase === "reload" ? 0 : 1); assert.equal(refreshes, 0);
     console.log("DURABLE_NATIVE_AUTH_OK", JSON.stringify({ scenario: durable.scenario, boundary: durable.boundary, phase: durable.phase, codes, refreshes }));
     await Bun.write(join(root, "service.json"), JSON.stringify({ sessions: [...sessions], nextOwnership }));
@@ -223,7 +228,7 @@ try {
   await wait(async () => rpc.status({}, { location }), s => s.state === "active" && s.message.includes("parallel-final"), "final parallel binding active");
   await wait(async () => streams.get(parallel.id)?.size, n => n === 1, "exactly one live final stream");
   await wait(async () => receipted.has(parallel.id), Boolean, "final binding durable admission and receipt");
-  assert.equal((await host.session.context({ sessionID: parallel.id })).filter(m => m.type === "synthetic").length, 1);
+  assert.equal((await host.session.context({ sessionID: parallel.id })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 1);
   assert.deepEqual(opened.filter(o => o.session === parallel.id).map(o => o.name), ["parallel-first", "parallel-final"]);
   assert.equal(new Set(opened.filter(o => o.session === parallel.id).map(o => o.ownership)).size, 1);
   assert.equal(calls.some(c => c.session === parallel.id && c.name === "delivery_release"), false);
@@ -233,4 +238,4 @@ try {
   console.log("NATIVE_HOST_OK", JSON.stringify({ mode, codes, refreshes, roots: [a.id, b.id], child: child.id, grandchild: grandchild.id, opens: calls.filter(c => c.name === "delivery_open").length }));
   }
   }
-} finally { await host?.close(); globalThis.fetch = fetch0; }
+} finally { await host?.close(); subscriberWork.restore(); globalThis.fetch = fetch0; }

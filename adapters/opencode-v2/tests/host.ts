@@ -13,6 +13,7 @@ import { sessionContext } from "../../../src/server/hosted.ts";
 import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
+import { observeSubscriberWork } from "./subscriber-work.ts";
 import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
@@ -22,6 +23,7 @@ assert.equal((await Bun.file(join(root, "node_modules/@opencode/sdk/package.json
 assert.equal(Bun.which("grayboard"), null);
 const installed = readFileSync(join(root, "installed.txt"), "utf8").trim();
 const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
+const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
 const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HELLO_LIMIT : { burst: 10000, perSec: 10000 } };
@@ -170,10 +172,12 @@ try {
     assert(refused, "Unmodified production default burst is enforced");
     const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false); app.application.wake(["you@example.com/admission"]);
     if (process.env.GRAYBOARD_TEST_REAL_RACE === "admission-account") {
+      const retiredSubscriber = subscriberWork.current(s.id);
       await wait(() => subscriberThrottles, n => n > 0, "subscriber actual HTTP429 before account transition");
       email = "other@example.com"; await signIn(native.integrationID);
       await wait(() => rpc.status({}, { location }), s => s.state === "paused", "account transition aborts admission retry");
-      await Bun.sleep(1200);
+      await bounded(retiredSubscriber, 12_000, "Account drift must retire the actual admission-retry subscriber");
+      await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
       assert.equal(admissions.length, 0); assert.equal(app.repo.cursors.directFor("you@example.com/admission"), 0);
       console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
     } else {
@@ -253,7 +257,7 @@ try {
       console.log("REAL_BACKEND_CRASH_OK");
     } finally { crashWorker.kill("SIGKILL"); await crashWorker.exited; }
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE) {
-    await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location,
+    await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location, subscriberWork,
       enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
       pause: () => rpc.pause({}, { location }), status: () => rpc.status({}, { location }),
       account: async () => { email = "other@example.com"; await signIn(native.integrationID!); },
@@ -329,7 +333,7 @@ try {
   assert(admissions.at(-1)?.sessionID === a.id); held = false; release?.();
   await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === dm.id, "receipt after durable host acceptance");
   await host.session.wait({ sessionID: a.id });
-  const original = admissions.at(-1)!; assert((await host.session.context({ sessionID: a.id })).some(m => m.id === original.id));
+  const original = admissions.at(-1)!; assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === original.id));
   console.log("REAL_DURABLE_RECEIPT_NOT_ACK_OK", { cursor: dm.id, receiptAttempts });
   dropReceipt = true; const receiptsBeforeLoss = receiptAttempts;
   const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Replay after host reload", null, false); app.application.wake(["you@example.com/r4"]);
@@ -363,7 +367,7 @@ try {
   await wait(() => app.repo.cursors.directFor("you@example.com/r4"), n => n === lost.id, "restored lease replay receipt");
   await host.session.wait({ sessionID: a.id });
   const replay = [...admissions, ...childReload.inputs as Parameters<Context["session"]["synthetic"]>[0][]].filter(x => x.text.includes("Replay after host reload")); assert(replay.length >= 2); assert.equal(new Set(replay.map(x => x.id)).size, 1);
-  assert.equal((await host.session.context({ sessionID: a.id })).filter(m => m.id === replay[0]!.id).length, 1);
+  assert.equal((await host.session.context({ sessionID: a.id })).filter((m: { id?: string; type?: string }) => m.id === replay[0]!.id).length, 1);
   console.log("REAL_HOST_RELOAD_STABLE_ID_OK", { replay: replay.length, cursor: lost.id });
 
   // Separate regression: unfinished SDK execution resumes before duplicate forwarding.
@@ -418,7 +422,7 @@ try {
   held = false; release?.();
   await wait(() => rpc.status({}, { location }), s => s.state === "paused", "out-of-band real service rebind observed after old host admission");
   assert.equal(receiptAttempts, staleReceipts); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
-  assert((await host.session.context({ sessionID: a.id })).some(m => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some(m => m.id === oldAdmission.id));
+  assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id));
   console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");
   const revokeFixtureGrant = (grantID: string) => {
@@ -449,4 +453,4 @@ try {
   assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);
   console.log("REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
   }
-} finally { suspendedModel.released.release(); release?.(); raceGate.holding = false; await host?.close(); await app.stop(); globalThis.fetch = fetch0; }
+} finally { suspendedModel.released.release(); release?.(); raceGate.holding = false; await host?.close(); subscriberWork.restore(); await app.stop(); globalThis.fetch = fetch0; }

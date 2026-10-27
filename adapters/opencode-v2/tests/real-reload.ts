@@ -5,6 +5,7 @@ import { OpenCode } from "@opencode/sdk";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { assertStable, barrier, bounded, drainSessions } from "./reload-state.ts";
+import { afterProducers } from "./causal.ts";
 
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!, port = process.env.GRAYBOARD_REAL_BACKEND_PORT!;
 assert(root && port); assert.equal(Bun.version, "1.4.4");
@@ -18,6 +19,10 @@ const { default: plugin } = await import(pathToFileURL(join(installed, "src/inde
 const inputs: Parameters<Context["session"]["synthetic"]>[0][] = [], models: string[] = [];
 const replayEntered = barrier(), replayReleased = barrier(), replayReturned = barrier(), modelEntered = barrier(), modelReleased = barrier();
 let replayForwarded = false;
+const receiptCommits = new Set<string>();
+const forwarded = new Set<string>();
+const receiptsCommitted = barrier();
+const expectedRoots = new Set<string>([saved.input.sessionID, ...(saved.digestInput ? [saved.digestInput.sessionID] : [])]);
 let ready = false;
 const hold = async () => { ready = true; await Bun.sleep(1_800_000); throw new Error("Crash worker was not killed within its bounded lifetime"); };
 const originalFetch = globalThis.fetch;
@@ -25,7 +30,19 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), u = new URL(req.url);
   if (u.origin === "https://grayboard.example.com") {
     assert(!u.pathname.endsWith("/oauth/token"), "Reload must reuse current native access, not exchange or refresh");
-    return originalFetch(new Request(`http://127.0.0.1:${port}` + u.pathname + u.search, req));
+    const request = req.method === "POST" && u.pathname.endsWith("/mcp") ? await req.clone().json() as { method?: string; params?: { name?: string; arguments?: { ids?: unknown }; _meta?: Record<string, unknown> } } : undefined;
+    const response = await originalFetch(new Request(`http://127.0.0.1:${port}` + u.pathname + u.search, req));
+    if (req.headers.get("X-Grayboard-Client") === "subscriber" && request?.method === "tools/call" && request.params?.name === "delivery_receipt" && response.ok) {
+      const text = await response.clone().text();
+      const envelope = JSON.parse(text.startsWith("data:") ? text.slice(5) : text) as { result?: { isError?: boolean } };
+      const session = request.params._meta?.["ai.opencode/sessionID"];
+      const ids = request.params.arguments?.ids;
+      if (envelope.result && !envelope.result.isError && typeof session === "string" && Array.isArray(ids) && ids.length > 0 && ids.every(id => typeof id === "string")) {
+        receiptCommits.add(session);
+        if ([...expectedRoots].every(id => receiptCommits.has(id))) receiptsCommitted.release();
+      }
+    }
+    return response;
   }
   assert.equal(u.origin, "https://model.example.com");
   return new Response('data: {"id":"reload","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Reload fixture"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
@@ -54,11 +71,17 @@ const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({
     const value = await s.synthetic(input);
     if (suspendedResume && input.id === saved.input.id) replayReturned.release();
     if (mode === "hold-after") await hold();
+    forwarded.add(input.id!);
     return value;
   };
   return Reflect.get(s, k);
 } }) }); } });
 const host = await OpenCode.create({ plugins: [fixture, instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
+const settleReplay = (check: () => void) => bounded(afterProducers(async () => {
+  await receiptsCommitted.promise;
+  assert(forwarded.has(saved.input.id), "Action replay forwarding returned before its committed receipt");
+  if (saved.digestInput) assert(forwarded.has(saved.digestInput.id), "Digest replay forwarding returned before its committed receipt");
+}, () => drainSessions(join(root, "host.sqlite"), sessionID => host.session.wait({ sessionID })), check), 15_000, "Replay producers and all counted SDK sessions must finish");
 try {
   await host.agent.list({ location: saved.location });
   if (mode.startsWith("hold-")) {
@@ -84,33 +107,36 @@ try {
     replayReleased.release();
     await bounded(replayReturned.promise, 15_000, "Duplicate forwarding returned while resumed model was held");
     modelReleased.release();
-    await drainSessions(join(root, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
-    // Keep the same bounded observation after draining pending wakes, not just synthetic return.
+    await settleReplay(() => assert.deepEqual(models, [saved.input.sessionID], "Committed replay producers and every counted SDK execution finished without an extra primary"));
+    // Supplemental observation only; producer commits and global drain establish completion first.
     await Bun.sleep(700);
-    await drainSessions(join(root, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
+    await settleReplay(() => assert.deepEqual(models, [saved.input.sessionID]));
     assert.deepEqual(models, [saved.input.sessionID], "Forwarding adds no primary after resumed execution and pending wakes settle");
     assertStable(join(root, "host.sqlite"), saved.input);
     assert.deepEqual(inputs.find(i => i.id === saved.input.id), saved.input);
     await Bun.write(join(root, "real-suspended-result.json"), JSON.stringify({ pid: process.pid, inputs, models }));
     console.log("REAL_SUSPENDED_RESUME_BEFORE_REPLAY_OK");
   } else {
+    await settleReplay(() => {
+      if (saved.uncommitted) assert(models.includes(saved.input.sessionID), "Killed-before-commit delivery may wake on its first durable acceptance");
+      else assert.equal(models.length, 0, "Already delivered stable ID replay does not wake again after committed producers and global SDK drain");
+    });
     await Bun.sleep(700);
-    if (saved.uncommitted) assert(models.includes(saved.input.sessionID), "Killed-before-commit delivery may wake on its first durable acceptance");
-    else assert.equal(models.length, 0, "Already delivered stable ID replay does not wake again");
+    await settleReplay(() => { if (!saved.uncommitted) assert.equal(models.length, 0, "Supplemental observation does not replace causal completion"); });
     await host.session.wait({ sessionID: saved.input.sessionID });
     if (saved.settled) {
       await drainSessions(join(root, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
       assert.equal(models.length, 0, "Globally settled replay has no queued additional primary");
       assertStable(join(root, "host.sqlite"), saved.input);
     }
-    assert.equal((await host.session.context({ sessionID: saved.input.sessionID })).filter(m => m.id === saved.input.id).length, 1);
+    assert.equal((await host.session.context({ sessionID: saved.input.sessionID })).filter((m: { id?: string; type?: string }) => m.id === saved.input.id).length, 1);
     assert.deepEqual(inputs.find(i => i.id === saved.input.id), saved.input, "Exact original target, stable ID and payload survive process reload");
     if (saved.digestInput) {
       const before = models.length;
       await host.session.prompt({ sessionID: saved.digestInput.sessionID, text: "Explicit ordinary wake after idle process-replayed digest" });
       await host.session.wait({ sessionID: saved.digestInput.sessionID });
       assert(models.slice(before).includes(saved.digestInput.sessionID));
-      assert.equal((await host.session.context({ sessionID: saved.digestInput.sessionID })).filter(m => m.id === saved.digestInput.id).length, 1);
+      assert.equal((await host.session.context({ sessionID: saved.digestInput.sessionID })).filter((m: { id?: string; type?: string }) => m.id === saved.digestInput.id).length, 1);
       assert.equal((await host.session.inbox.list({ sessionID: saved.digestInput.sessionID })).length, 0);
     }
     await Bun.write(join(root, "real-reload-result.json"), JSON.stringify({ pid: process.pid, inputs, models }));

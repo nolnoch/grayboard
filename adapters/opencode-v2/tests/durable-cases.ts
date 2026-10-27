@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { OpenCode } from "@opencode/sdk";
+import { afterProducers } from "./causal.ts";
+import type { SubscriberWork } from "./subscriber-work.ts";
+import { bounded, drainSessions } from "./reload-state.ts";
 
 type Host = Awaited<ReturnType<typeof OpenCode.create>>;
 type Input = Parameters<Context["session"]["synthetic"]>[0];
@@ -21,6 +24,7 @@ export class DurableFixture {
   readonly models: string[] = [];
   readonly entered = deferred();
   readonly released = deferred();
+  readonly receiptRelease = deferred();
   revoked = false;
   configAway = false;
   dropReceipts = false;
@@ -44,7 +48,7 @@ async function until(read: () => boolean | Promise<boolean>, label: string) {
   for (let n = 0; n < 160; n++) { if (await read()) return; await Bun.sleep(50); }
   throw new Error("Durable wait expired: " + label);
 }
-export async function durableCases(f: DurableFixture, host: Host, ctx: Context, rpc: { enroll(input: { sessionID: string; name?: string }, options: { location: { directory: string } }): Promise<unknown>; pause(input: {}, options: { location: { directory: string } }): Promise<unknown>; status(input: {}, options: { location: { directory: string } }): Promise<unknown> }, location: { directory: string }, state: (id: string) => { name: string | null; ownership: number | null; gen: number; capability?: string }) {
+export async function durableCases(f: DurableFixture, host: Host, ctx: Context, rpc: { enroll(input: { sessionID: string; name?: string }, options: { location: { directory: string } }): Promise<unknown>; pause(input: {}, options: { location: { directory: string } }): Promise<unknown>; status(input: {}, options: { location: { directory: string } }): Promise<unknown> }, location: { directory: string }, state: (id: string) => { name: string | null; ownership: number | null; gen: number; capability?: string }, subscriberWork: SubscriberWork) {
   const replay = f.scenario === "reload";
   if (replay && f.phase === "reload") {
     const saved = await Bun.file(join(f.root, "durable.json")).json();
@@ -55,9 +59,14 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
       const old = saved.inputs.find((i: Input) => i.id === value.id);
       assert(old); assert.equal(value.sessionID, old.sessionID); assert.equal(value.payload.text, old.text);
     }
-    await Bun.sleep(500); assert.equal(f.models.length, 0, "delivered action replay and pending digest do not wake");
+    await bounded(afterProducers(async () => {
+      assert.equal(f.cursor.size, 2, "Both controlled replay producers committed their receipts after forwarding returned");
+      assert.equal(f.admitted.length, 2);
+    }, () => drainSessions(join(f.root, "native-host.sqlite"), sessionID => host.session.wait({ sessionID })), () => {
+      assert.equal(f.models.length, 0, "delivered action replay and pending digest do not wake after committed producers and all counted SDK executions finish");
+    }), 8_000, "Durable replay producer and SDK completion");
     assert.equal((await host.session.inbox.list({ sessionID: saved.digest })).length, 1);
-    assert.equal((await host.session.context({ sessionID: saved.action })).filter(m => m.type === "synthetic").length, 1);
+    assert.equal((await host.session.context({ sessionID: saved.action })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 1);
     assert.equal(f.cursor.size, 2);
     assert(f.inputs.every(i => i.text.includes("ALTERED REPLAY")), "replay uses changed incoming text to test immutable host records");
     assert.deepEqual(await host.session.inbox.list({ sessionID: saved.other }), []);
@@ -65,7 +74,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
     await host.session.prompt({ sessionID: saved.digest, text: "Explicit later ordinary prompt" });
     await host.session.wait({ sessionID: saved.digest });
     assert(f.models.includes(saved.digest), "digest drains only after an ordinary wake");
-    assert.equal((await host.session.context({ sessionID: saved.digest })).filter(m => m.type === "synthetic").length, 1);
+    assert.equal((await host.session.context({ sessionID: saved.digest })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 1);
     console.log("DURABLE_RELOAD_OK", JSON.stringify({ inputs: f.inputs, cursor: [...f.cursor], models: f.models }));
     return;
   }
@@ -78,21 +87,26 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
   await until(() => !!state(root).capability, "initial lease");
   const batch = (session: string, id: string, actionable: boolean): Batch => ({ id, actionable, event: { text: "IMMUTABLE ORIGINAL " + id }, ownership: state(session).ownership!, bind_gen: state(session).gen, name: state(session).name! });
   if (replay) {
+    try {
     const action = await create("Durable action");
     await rpc.enroll({ sessionID: action, name: "action" }, { location });
     await until(() => !!state(action).capability, "action lease");
     f.holding = false; f.dropReceipts = true;
     f.batches.set(root, [batch(root, "fixture:digest", false)]); f.batches.set(action, [batch(action, "fixture:action", true)]);
     await until(() => f.admitted.length >= 2 && f.receiptAttempts.length >= 2, "durable admissions before lost receipts");
-    await host.session.wait({ sessionID: action }); await Bun.sleep(200);
-    assert.equal(f.models.filter(id => id === root).length, 0, "digest stays idle");
+    await bounded(afterProducers(async () => {
+      assert(f.receiptAttempts.includes("fixture:digest") && f.receiptAttempts.includes("fixture:action"), "Both forwarding continuations reached the held failed-receipt response boundary");
+    }, () => drainSessions(join(f.root, "native-host.sqlite"), sessionID => host.session.wait({ sessionID })), () => {
+      assert.equal(f.models.filter(id => id === root).length, 0, "digest stays idle after all counted SDK executions finish while both delivery producers are held");
+    }), 8_000, "Lost receipt producers and global SDK drain");
     assert(f.models.includes(action), "actionable delivery wakes exact root");
     assert.equal((await host.session.inbox.list({ sessionID: root })).length, 1);
-    assert.equal((await host.session.context({ sessionID: action })).filter(m => m.type === "synthetic").length, 1);
+    assert.equal((await host.session.context({ sessionID: action })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 1);
     assert.equal(f.cursor.size, 0, "lost receipts never move fake cursor");
     await Bun.write(join(f.root, "durable.json"), JSON.stringify({ digest: root, action, other, child, inputs: f.inputs.slice(0, 2), batches: [...f.batches] }));
     console.log("DURABLE_ADMIT_OK", JSON.stringify({ inputs: f.inputs, cursor: [...f.cursor], receiptAttempts: f.receiptAttempts, models: f.models }));
     return;
+    } finally { f.receiptRelease.resolve(); }
   }
   f.batches.set(root, [batch(root, "fixture:race", true)]);
   await f.entered.promise;
@@ -100,6 +114,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
   assert.equal(old.sessionID, root); assert(old.id); assert(old.text.includes("IMMUTABLE ORIGINAL"));
   if (f.boundary === "before") assert.deepEqual(await host.session.inbox.list({ sessionID: root }), []);
   else { await host.session.wait({ sessionID: root }); assert(f.models.includes(root)); }
+  const retiredSubscriber = subscriberWork.current(root);
   let transition: Promise<unknown> = Promise.resolve();
   switch (f.scenario) {
     case "pause": transition = rpc.pause({}, { location }); break;
@@ -110,7 +125,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
     case "revocation": f.revoked = true; break;
     case "account": case "account-away-back": {
       const integrationID = (await ctx.mcp.list()).data.find(m => m.name === "grayboard")!.integrationID!;
-      const old = (await host.credential.list()).find(c => c.integrationID === integrationID && c.active); assert(old);
+      const old = (await host.credential.list()).find((c: { id: string; integrationID: string; active: boolean }) => c.integrationID === integrationID && c.active); assert(old);
       const method = (await ctx.integration.get({ integrationID })).data!.methods.find(m => m.type === "oauth")!;
       await host.credential.create({ integrationID, label: "Fixture other account", activate: true, value: { type: "oauth", methodID: method.id, access: "fixture-other-access", refresh: "fixture-other-refresh", expires: Date.now() + 3_600_000, metadata: { serverUrl: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", scope: "grayboard:delivery grayboard:tools", client: { client_id: "fixture-native-client" } } } });
       if (f.scenario === "account-away-back") await host.credential.activate({ credentialID: old.id });
@@ -126,14 +141,15 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
       break;
     default: throw new Error("Unknown durable case " + f.scenario);
   }
-  await Bun.sleep(200);
   if (["account", "account-away-back", "config", "away-back", "late-away-back"].includes(f.scenario)) {
     await until(async () => (await rpc.status({}, { location }) as { state: string }).state === "paused", "observed drift latched before forwarding/returning the held write");
   }
   f.holding = false; f.released.resolve();
   await transition;
   if (f.scenario === "rebind") f.batches.clear();
-  await Bun.sleep(700);
+  await bounded(retiredSubscriber, 8_000, "Original durable subscriber generation must finish its post-admission continuation");
+  await drainSessions(join(f.root, "native-host.sqlite"), sessionID => host.session.wait({ sessionID }));
+  await Bun.sleep(700); // Supplemental only, after producer retirement and global SDK drain.
   assert.deepEqual(f.inputs[0], old, "the authorized in-flight input never retargets or mutates");
   assert.equal(f.receiptAttempts.length, 0, "stale completion cannot attempt receipt or advance cursor");
   assert.equal(f.cursor.size, 0);
@@ -142,7 +158,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
     assert.equal(value.id, old.id); assert.equal(value.sessionID, old.sessionID);
     assert.equal(value.payload.text, old.text); assert.deepEqual(value.payload.metadata, old.metadata);
   }
-  assert.equal((await host.session.context({ sessionID: other })).filter(m => m.type === "synthetic").length, 0);
+  assert.equal((await host.session.context({ sessionID: other })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 0);
   assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);
   if (f.scenario === "delete") await assert.rejects(host.session.get({ sessionID: child }));
   else assert.deepEqual(await host.session.inbox.list({ sessionID: child }), []);
@@ -154,7 +170,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
   }
   else {
     await host.session.wait({ sessionID: root });
-    const synthetic = (await host.session.context({ sessionID: root })).filter(m => m.type === "synthetic");
+    const synthetic = (await host.session.context({ sessionID: root })).filter((m: { id?: string; type?: string }) => m.type === "synthetic");
     assert.equal(synthetic.length, 1); assert.equal(synthetic[0]!.id, old.id);
     assert(f.models.includes(root), "accepted old actionable write wakes only its original root");
   }

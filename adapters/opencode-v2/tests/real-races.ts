@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import type { SubscriberWork } from "./subscriber-work.ts";
+import { bounded, drainSessions } from "./reload-state.ts";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { OpenCode } from "@opencode/sdk";
 import type { startServer } from "../../../src/server/app.ts";
@@ -18,6 +21,7 @@ async function until(read: () => boolean | Promise<boolean>, label: string) {
 export async function realRace(f: {
   scenario: string; gate: AdmissionGate; host: Awaited<ReturnType<typeof OpenCode.create>>;
   ctx: Context; app: ReturnType<typeof startServer>; location: { directory: string };
+  subscriberWork: SubscriberWork;
   enroll(sessionID: string, name: string): Promise<unknown>; pause(): Promise<unknown>;
   status(): Promise<{ state: string }>; account(): Promise<void>; outage(value: boolean): void; receipts(): number;
 }) {
@@ -52,6 +56,7 @@ export async function realRace(f: {
     assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor);
     if (g.boundary === "after") { await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); }
     else assert.equal(g.accepted.length, 0);
+    const retiredSubscriber = f.subscriberWork.current(root);
     let transition: Promise<unknown> = Promise.resolve();
     switch (scenario) {
       case "pause": transition = f.pause(); break;
@@ -59,7 +64,7 @@ export async function realRace(f: {
       case "archive": transition = host.session.update({ sessionID: root, archived: true }); break;
       case "delete": transition = host.session.remove({ sessionID: root }); break;
       case "account": case "account-away-back": {
-        const old = (await host.credential.list()).find(c => c.active); assert(old);
+        const old = (await host.credential.list()).find((c: { id: string; active: boolean }) => c.active); assert(old);
         await f.account();
         if (scenario === "account-away-back") await host.credential.activate({ credentialID: old.id });
         break;
@@ -91,14 +96,16 @@ export async function realRace(f: {
       }
       default: throw new Error("Unknown real race " + scenario);
     }
-    await Bun.sleep(200);
     if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", "observed drift before releasing original write");
-    g.holding = false; release(); await transition; await Bun.sleep(700);
-    assert.deepEqual(g.inputs[0], original); assert.equal(g.inputs.length, 1, "No subsequent admission in bounded observed-drift window");
+    g.holding = false; release(); await transition;
+    await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
+    await drainSessions(join(process.env.GRAYBOARD_GIT_TEST_ROOT!, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
+    await Bun.sleep(700); // Supplemental only, after producer retirement and global SDK drain.
+    assert.deepEqual(g.inputs[0], original); assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
     assert.equal(f.receipts(), beforeReceipts, "No stale receipt attempt");
     assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
     assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);
-    assert.equal((await host.session.context({ sessionID: other })).filter(m => m.type === "synthetic").length, 0);
+    assert.equal((await host.session.context({ sessionID: other })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 0);
     assert(!g.models.includes(other)); assert(!g.models.includes(child));
     if (scenario === "delete") {
       await assert.rejects(host.session.get({ sessionID: root })); await assert.rejects(host.session.get({ sessionID: child }));
@@ -106,7 +113,7 @@ export async function realRace(f: {
       assert.equal(g.models.filter(s => s === root).length, g.boundary === "before" ? 0 : 1);
     } else {
       await host.session.wait({ sessionID: root });
-      const actual = (await host.session.context({ sessionID: root })).filter(m => m.type === "synthetic");
+      const actual = (await host.session.context({ sessionID: root })).filter((m: { id?: string; type?: string }) => m.type === "synthetic");
       assert.equal(actual.length, 1); assert.equal(actual[0]!.id, original.id);
       assert.deepEqual(await host.session.inbox.list({ sessionID: child }), []);
       assert(g.models.includes(root), "Accepted old actionable write may wake only exact approved root");
