@@ -27,8 +27,8 @@ class OAuthError extends Error {
 function fail(error = "invalid_request", status = 400): never { throw new OAuthError(error, status); }
 const headers = { "Cache-Control": "no-store", Pragma: "no-cache", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" };
 const json = (data: unknown, status = 200, extra: Record<string, string> = {}) => Response.json(data, { status, headers: { ...headers, ...extra } });
-const html = (body: string, status = 200) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
-  status, headers: { ...headers, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'", "X-Frame-Options": "DENY" },
+const html = (body: string, status = 200, callbackOrigin?: string) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
+  status, headers: { ...headers, ...(callbackOrigin ? { "Referrer-Policy": "same-origin" } : {}), "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'${callbackOrigin ? " " + callbackOrigin : ""}`, "X-Frame-Options": "DENY" },
 });
 const redirect = (url: string) => new Response(null, { status: 303, headers: { ...headers, Location: url } });
 
@@ -95,7 +95,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const clients = new Map(parseOAuthClients(JSON.stringify(config.oauthClients ?? [])).map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
   const cimd = createCimdResolver({ ...options.cimd, now });
-  const resolveClient = async (id: string) => clients.get(id) ?? await cimd.resolve(id);
+  const resolveClient = async (id: string) => {
+    const manual = clients.get(id);
+    if (manual) return manual;
+    const client = await cimd.resolve(id);
+    if (client?.redirectUris.some(uri => new URL(uri).origin === base.origin)) return undefined;
+    return client;
+  };
   const secure = base.protocol === "https:";
   const cookiePrefix = secure ? "__Secure-gb_oauth_" : "gb_oauth_";
   const cookiePath = prefix + "/oauth";
@@ -199,7 +205,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const user = repo.users.findById(b!.userId)!;
     const f = flows.get(r.requestHash)!;
     const client = f.client;
-    return html(`<h1>Authorize ${escapeHTML(client.name)}</h1><p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`);
+    const unverified = !clients.has(client.clientId) ? `<p>Unverified client: ${escapeHTML(new URL(client.clientId).host)}. The client name is self-declared.</p>` : "";
+    return html(`<h1>Authorize ${escapeHTML(client.name)}</h1>${unverified}<p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
   };
   const exchange = options.exchangeGoogle ?? (async (input: { code: string; verifier: string; redirectUri: string; nonce: string }) =>
     exchangeGoogleCode(input.code, input.verifier, input.redirectUri, googleClient.clientId, googleClient.clientSecret, config.orgDomain, input.nonce));

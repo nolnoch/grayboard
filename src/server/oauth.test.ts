@@ -127,6 +127,51 @@ test("internal grant liveness survives individual access revocation but never au
   expect(service.isGrantActive(grant.grantId)).toBe(false);
 });
 
+test("CIMD refuses every issuer-origin redirect before creating a phishing flow", async () => {
+  const clientId = "https://client.example/metadata.json";
+  for (const path of ["/oauth/callback/complete", "/other", "/oauth/google/callback"]) {
+    service.close();
+    const redirectUri = base + path;
+    service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => JSON.stringify({ client_id: clientId, client_name: "OpenCode", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }) });
+    const a = authorization(clientId, undefined, redirectUri);
+    const response = await fetch(a.url, { redirect: "manual" });
+    expect(response.status).toBe(400);
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(storage.db.query("SELECT count(*) AS n FROM oauth_requests").get()).toEqual({ n: 0 });
+    expect(exchanges).toBe(0);
+  }
+});
+
+test("CIMD consent marks the self-declared name unverified, escapes it, and permits only its validated callback origin", async () => {
+  service.close();
+  const clientId = "https://client.example/metadata.json";
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => JSON.stringify({ client_id: clientId, client_name: '<img src=x onerror="alert(1)">', redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none" }) });
+  const a = authorization(clientId);
+  const browser = new Browser();
+  const consent = await loginConsent(browser, a.url);
+  expect(consent.content).toContain("Unverified client: client.example");
+  expect(consent.content).toContain("&lt;img");
+  expect(consent.content).not.toContain("<img");
+  const page = await browser.request(base + "/oauth/consent?request=" + consent.request);
+  expect(page.headers.get("Referrer-Policy")).toBe("same-origin");
+  expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:34567");
+  expect((await decide(browser, consent, "approve", "null")).status).toBe(403);
+  expect((await decide(browser, consent)).status).toBe(303);
+});
+
+test("preregistered clients retain the explicit manual callback flow", async () => {
+  service.close();
+  const redirectUri = base + "/oauth/callback/complete";
+  config = { ...config, oauthClients: [...registrations, { ...registrations[0]!, clientId: "manual", redirectUris: [redirectUri] }] };
+  service = makeService();
+  const a = await issue("manual", "grayboard:tools", new Browser(), redirectUri);
+  const page = await a.browser.request(redirectUri + "?" + new URLSearchParams({ code: a.code, state: a.state, iss: base }));
+  expect(page.status).toBe(200);
+  expect(await page.text()).toContain("Return to your client");
+  expect((await redeem(a)).access_token).toMatch(/^[\w-]{43}$/);
+});
+
 class Browser {
   jar = new Map<string, string>();
   get cookie() { return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "); }
