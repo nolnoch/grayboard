@@ -77,8 +77,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const limited = authGate.refuse(caller, path);
       if (limited) return limited;
 
-      const address = server.requestIP(req)?.address;
-      const response = await oauth.fetch(req, address ? { remoteAddress: address } : undefined);
+      const response = await oauth.fetch(req, { key: caller.key });
       if (response) return response;
       const attachmentResponse = attachments.fetch(req);
       if (attachmentResponse) return attachmentResponse;

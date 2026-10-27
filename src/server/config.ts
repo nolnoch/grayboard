@@ -35,6 +35,8 @@ export type Config = {
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
+  oauthLimit?: RateLimit;
+  oauthGlobalLimit?: RateLimit;
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -75,6 +77,8 @@ export function loadConfig(): Config {
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
     hostedRequestLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, "requests"),
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
+    oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
+    oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };

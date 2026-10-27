@@ -1,6 +1,7 @@
 import type { Repo } from "./db.ts";
 
 export type AuditAction =
+  | `oauth.${string}`
   | `hosted.${string}`
   | "attachment.bound"
   | "attachment.downloaded"

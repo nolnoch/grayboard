@@ -595,6 +595,24 @@ test("HTTP concurrent code/refresh consumes have one winner and committed strict
   expect((service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${refreshed.access_token}` } })) as Response).status).toBe(401);
 });
 
+test("OAuth global rate bounds distinct callers and audits once per refusal streak", async () => {
+  service.close(); config.oauthGlobalLimit = { burst: 2, perSec: 1 };
+  service = makeService();
+  const request = new Request(base + "/oauth/unknown?access_token=private-value");
+  expect((await service.fetch(request, { key: "first" }))!.status).toBe(400);
+  expect((await service.fetch(request, { key: "second" }))!.status).toBe(400);
+  for (const key of ["third", "fourth"]) {
+    const response = (await service.fetch(request, { key }))!;
+    expect(response.status).toBe(429); expect(response.headers.get("retry-after")).toBe("1");
+  }
+  const audit = () => storage.db.query<{ action: string; detail: string }, []>("SELECT action, detail FROM access_log WHERE action LIKE 'oauth.rate%'").all();
+  expect(audit()).toHaveLength(1); expect(audit()[0]!.detail).toContain('"scope":"global"');
+  expect(JSON.stringify(audit())).not.toContain("private-value");
+  clock += 2000;
+  expect((await service.fetch(request, { key: "third" }))!.status).toBe(400);
+  expect(audit().filter(row => row.action === "oauth.rate_limit_ended")).toHaveLength(1);
+});
+
 test("expired upstream/consent/code never mints; browser pending capacity and trusted address rate limits bounded", async () => {
   const browser = new Browser(); const a = authorization();
   const r = await browser.request(a.url), google = new URL(r.headers.get("location")!);
@@ -609,10 +627,10 @@ test("expired upstream/consent/code never mints; browser pending capacity and tr
   for (let i = 0; i < 10; i++) expect((await pending.request(authorization().url)).status).toBe(303);
   expect((await pending.request(authorization().url)).status).toBe(429);
   const request = new Request(base + "/oauth/unknown", { headers: { "X-Real-IP": "attacker", Forwarded: "for=attacker" } });
-  for (let i = 0; i < 60; i++) expect((await service.fetch(request, { remoteAddress: "socket-peer" }))!.status).toBe(405);
-  expect((await service.fetch(request, { remoteAddress: "socket-peer" }))!.status).toBe(429);
+  for (let i = 0; i < 60; i++) expect((await service.fetch(request, { key: "socket-peer" }))!.status).toBe(405);
+  expect((await service.fetch(request, { key: "socket-peer" }))!.status).toBe(429);
   clock += 60_000;
-  expect((await service.fetch(request, { remoteAddress: "socket-peer" }))!.status).toBe(405);
+  expect((await service.fetch(request, { key: "socket-peer" }))!.status).toBe(405);
 });
 
 test("remote registered callback is escaped display-only with no assets or token redemption; production cookies are secure", async () => {

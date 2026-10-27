@@ -12,6 +12,35 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted
 
 const hostname = "127.0.0.1";
 
+for (const trusted of [true, false]) test(`OAuth address limits use the actual app's trusted proxy decision, trusted=${trusted}`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-oauth-rate-"));
+  let app: ReturnType<typeof startServer> | undefined;
+  let clock = Date.now();
+  try {
+    app = startServer({
+      dbPath: ":memory:", blobDir: dir, httpPort: 0,
+      googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://rate.example.com",
+      messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
+      trustedProxies: trusted ? DEFAULT_TRUSTED_PROXIES : [], oauthLimit: { burst: 1, perSec: 1 }, oauthGlobalLimit: { burst: 10, perSec: 1 },
+    }, { hostname, background: false, oauth: { now: () => clock } });
+    const request = (ip: string) => fetch(`http://${hostname}:${app!.server.port}/oauth/unknown?secret=not-for-audit`, { headers: { "X-Forwarded-For": ip } });
+    expect((await request("198.51.100.1")).status).toBe(405);
+    const refused = await request("198.51.100.1");
+    expect(refused.status).toBe(429); expect(refused.headers.get("retry-after")).toBe("1");
+    expect((await request("198.51.100.2")).status).toBe(trusted ? 405 : 429);
+    expect((await request("198.51.100.1")).status).toBe(429);
+    const audit = () => app!.db.query<{ action: string; detail: string }, []>("SELECT action, detail FROM access_log WHERE action LIKE 'oauth.rate%'").all();
+    expect(audit()).toHaveLength(1);
+    expect(audit()[0]!.detail).toContain('"scope":"address"');
+    expect(JSON.stringify(audit())).not.toContain("not-for-audit");
+    clock += 1000;
+    expect((await request("198.51.100.1")).status).toBe(405);
+    expect(audit().filter(row => row.action === "oauth.rate_limit_ended")).toHaveLength(1);
+  } finally {
+    await app?.stop(); app?.db.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const expired of [false, true]) test(`actual server restart restores or expires live graph, expired=${expired}`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-restart-"));
   const config = { dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES };

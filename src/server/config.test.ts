@@ -7,8 +7,9 @@ const KEYS = [
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
-   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
-   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
+  "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
+  "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
+  "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
 ];
 
@@ -40,6 +41,27 @@ describe("loadConfig", () => {
     process.env.GOOGLE_OAUTH_CLIENT_SECRET = "desktop-secret";
     process.env.GRAYBOARD_ORG_DOMAIN = "example.com";
   }
+
+  test("OAuth address and global rates use the shared configurable token-bucket bounds", () => {
+    primary();
+    expect(loadConfig()).toMatchObject({ oauthLimit: { burst: 60, perSec: 1 }, oauthGlobalLimit: { burst: 600, perSec: 10 } });
+    for (const prefix of ["GRAYBOARD_OAUTH", "GRAYBOARD_OAUTH_GLOBAL"]) {
+      process.env[prefix + "_BURST"] = "2";
+      process.env[prefix + "_PER_SEC"] = "0.5";
+      const config = loadConfig();
+      expect(prefix.endsWith("GLOBAL") ? config.oauthGlobalLimit : config.oauthLimit).toEqual({ burst: 2, perSec: 0.5 });
+      for (const value of ["0", "10001", "1e3"]) {
+        process.env[prefix + "_BURST"] = value;
+        expect(() => loadConfig()).toThrow(prefix + "_BURST");
+      }
+      process.env[prefix + "_BURST"] = "2";
+      for (const value of ["0.01", "NaN", "-1"]) {
+        process.env[prefix + "_PER_SEC"] = value;
+        expect(() => loadConfig()).toThrow(prefix + "_PER_SEC");
+      }
+      delete process.env[prefix + "_BURST"]; delete process.env[prefix + "_PER_SEC"];
+    }
+  });
 
   test("MCP Google override is optional and never replaces the retained primary pair", () => {
     primary();

@@ -6,6 +6,8 @@ import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, type 
 import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
+import { writeAudit } from "./audit.ts";
+import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 
 export type OAuthPrincipal = {
   authed: AuthedUser; grantId: string; clientId: string; scopes: string[]; accessHash: string; accessExpiry: number;
@@ -16,7 +18,7 @@ export type OAuthOptions = {
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
   exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<{ email: string; displayName: string | null }>;
 };
-export type OAuthNetworkContext = { remoteAddress: string };
+export type OAuthNetworkContext = { key: string };
 const random = () => randomBytes(32).toString("base64url");
 const challenge = (s: string) => createHash("sha256").update(s).digest("base64url");
 const escapeHTML = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -123,25 +125,34 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   type Flow = { client: OAuthClient; state: string; csrf: string; expiresAt: number; upstream?: { stateHash: string; verifier: string; nonce: string } };
   const flows = new Map<string, Flow>();
   const upstream = new Map<string, string>();
-  const attempts = new Map<string, { start: number; n: number }>();
+  const limiter = (limit: RateLimit, scope: string, maxKeys: number) => new RateLimiter(limit, {
+    start: (key, ctx, retryAfterMs) => {
+      console.error(`[grayboard] OAuth ${scope} rate limit reached`);
+      writeAudit(repo, "oauth.rate_limited", null, key, { scope, ...ctx, retry_after_ms: retryAfterMs });
+    },
+    end: (key, refused) => writeAudit(repo, "oauth.rate_limit_ended", null, key, { scope, refused }),
+    full: (tracked, uncharged) => {
+      console.error(`[grayboard] OAuth ${scope} rate limiter at key cap`);
+      writeAudit(repo, "oauth.rate_limit_full", null, null, { scope, tracked, uncharged });
+    },
+  }, now, maxKeys);
+  const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
+  const addressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "address", 1000);
   let closed = false;
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
-    for (const [k, a] of attempts) if (a.start + 60_000 <= t) attempts.delete(k);
+    globalLimit.sweep(); addressLimit.sweep();
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch {} }, 60_000);
   timer.unref();
-  const rate = (context?: OAuthNetworkContext) => {
-    const t = now();
-    for (const [k, a] of attempts) if (a.start + 60_000 <= t) attempts.delete(k);
-    for (const key of ["global", ...(context ? [hashToken(context.remoteAddress)] : [])]) {
-      const entry = attempts.get(key) ?? { start: t, n: 0 };
-      if (!attempts.has(key) && attempts.size >= 1000) fail("temporarily_unavailable", 429);
-      attempts.set(key, entry);
-      if (++entry.n > (key === "global" ? 600 : 60)) fail("temporarily_unavailable", 429);
+  const rate = (path: string, context?: OAuthNetworkContext): Response | undefined => {
+    const route = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
+    for (const [limit, key] of [[globalLimit, "global"], [addressLimit, context?.key ?? "unknown"]] as const) {
+      const result = limit.take(key, { path: route });
+      if (!result.ok) return json({ error: "temporarily_unavailable" }, 429, { "Retry-After": String(retrySecs(result.retryAfterMs)) });
     }
   };
   const sameOrigin = (req: Request, mandatory = false) => {
@@ -225,7 +236,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true });
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
-    rate(context);
+    const limited = rate(path, context);
+    if (limited) return limited;
     if (u.search.length > 8192) fail();
     if (["access_token", "client_secret"].some(k => u.searchParams.getAll(k).some(v => v !== ""))) fail();
     if (path === "/oauth/authorize" && req.method === "GET") {
@@ -417,6 +429,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const a = repo.oauth.findActiveAccess(principal.accessHash, resource, principal.scopes, now());
       return !!a && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
     },
-    close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); attempts.clear(); },
+    close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };
 }
