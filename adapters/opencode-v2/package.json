@@ -5,7 +5,7 @@
   "type": "module",
   "exports": { ".": "./src/index.ts", "./tui": "./src/tui.ts", "./rpc": "./src/rpc.ts" },
   "files": ["index.js", "tui.js", "src/*.ts", "dist", "README.md"],
-  "scripts": { "typecheck": "tsc --noEmit", "build:package": "tsc -p tsconfig.build.json", "test": "bun test tests/unit.test.ts tests/binding.test.ts tests/sessions.test.ts tests/controller.test.ts tests/causal.test.ts tests/logger.test.ts tests/effect-port.test.ts", "test:host": "sh tests/host.sh", "test:host-races": "sh tests/real-races.sh", "test:git": "sh tests/git-host.sh", "test:native-host": "sh tests/native-host.sh", "test:durable-host": "sh tests/durable-host.sh" },
+  "scripts": { "typecheck": "tsc --noEmit", "build:package": "tsc -p tsconfig.build.json", "test": "bun test tests/unit.test.ts tests/binding.test.ts tests/sessions.test.ts tests/controller.test.ts tests/causal.test.ts tests/logger.test.ts tests/effect-port.test.ts tests/cimd-fixture.test.ts", "test:host": "sh tests/host.sh", "test:host-races": "sh tests/real-races.sh", "test:git": "sh tests/git-host.sh", "test:native-host": "sh tests/native-host.sh", "test:durable-host": "sh tests/durable-host.sh" },
   "dependencies": { "@modelcontextprotocol/client": "2.4.0", "@opencode/plugin": "2.1.4", "zod": "4.6.7" },
   "peerDependencies": { "effect": "4.0.1" },
   "devDependencies": { "effect": "4.0.1", "@opencode/sdk": "2.1.4", "@modelcontextprotocol/server": "2.4.0", "@modelcontextprotocol/core": "2.4.0", "@modelcontextprotocol/sdk": "^1.32.1", "jose": "^5.0.0", "commander": "^12.0.0", "@types/bun": "1.3.11", "typescript": "5.9.3" }

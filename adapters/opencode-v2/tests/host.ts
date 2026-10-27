@@ -17,6 +17,7 @@ import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
+import { savedClientMetadata } from "./cimd-fixture.js";
 import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
@@ -30,7 +31,7 @@ const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
 const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HELLO_LIMIT : { burst: 10000, perSec: 10000 } };
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } }) } });
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
