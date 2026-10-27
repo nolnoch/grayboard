@@ -15,6 +15,7 @@ import { randomBytes } from "node:crypto";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import { OPENCODE_CLIENT, sessionContext } from "./hosted.ts";
+import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
@@ -48,6 +49,7 @@ afterEach(async () => {
   expect(hosted.activeBusListeners).toBe(0);
   expect(hosted.activeWatches).toBe(0);
   expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.activePosts).toBe(0);
   oauth.close();
   application.stopExpiry();
   await Bun.sleep(0);
@@ -552,7 +554,133 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
   } finally { releases.forEach(release => release()); hosted.sessions.snapshot = select; }
 });
 
+async function fairCapacity(limits: McpLimits) {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, limits });
+}
+const fairLimits: McpLimits = { listen: { global: 3, perUser: 1 }, legacy: { global: 3, perUser: 1 }, post: { global: 8, perUser: 4 } };
+async function otherClient(version = "2026-07-28") {
+  const original = token;
+  token = issuedOAuth(store.repo, oauth.resource, "bob@example.com").token;
+  try { return await connect(version); } finally { token = original; }
+}
+function capacityRows() {
+  return store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action='hosted.capacity_refused'").all();
+}
+
+test("one authenticated user cannot consume another user's modern listen share", async () => {
+  await fairCapacity(fairLimits);
+  const first = await connect(), second = await otherClient();
+  await first.callTool({ name: "board_create", arguments: { name: "fair", purpose: "fair shares" } });
+  const filter = { resourceSubscriptions: ["grayboard://boards/fair"] };
+  await expect(first.listen({ resourceSubscriptions: ["grayboard://boards/missing"] })).rejects.toThrow();
+  const held = await first.listen(filter);
+  await expect(first.listen(filter)).rejects.toThrow();
+  expect((await second.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "board_create", arguments: { name: "other", purpose: "other user's share" } })).isError).not.toBe(true);
+  const other = await second.listen({ resourceSubscriptions: ["grayboard://boards/other"] });
+  expect(hosted.activeListens).toBe(2);
+  expect(capacityRows()).toEqual([{ actor: "alice@example.com", detail: expect.any(String) }]);
+  expect(JSON.parse(capacityRows()[0]!.detail)).toEqual({ kind: "listen", scope: "user", client_id: OPENCODE_CLIENT });
+  await held.close();
+  const replacement = await first.listen(filter);
+  await replacement.close(); await other.close();
+  expect(hosted.activeListens).toBe(0);
+});
+
+test("legacy admission is fair and releases its reservation on protocol session deletion", async () => {
+  await fairCapacity(fairLimits);
+  let sid = "";
+  const first = await connect("2025-11-25", async response => { sid = response.headers.get("Mcp-Session-Id") ?? sid; });
+  await expect(connect("2025-11-25")).rejects.toThrow();
+  const other = await otherClient("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(2);
+  expect(JSON.parse(capacityRows()[0]!.detail)).toMatchObject({ kind: "legacy", scope: "user" });
+  const deleted = await hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers: { Authorization: `Bearer ${token}`, "Mcp-Session-Id": sid, "Mcp-Protocol-Version": "2025-11-25" } }));
+  expect(deleted.status).toBe(200);
+  await first.close();
+  await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(2);
+  await other.close();
+});
+
+for (const ending of ["end", "error", "cancel", "shutdown"] as const) test(`POST fair shares release exactly once after body ${ending}`, async () => {
+  await fairCapacity({ ...fairLimits, post: { global: 2, perUser: 1 } });
+  const first = await connect(), other = await otherClient();
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  let entered!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; }, pull() { entered(); return new Promise<void>(() => {}); } });
+  const abort = new AbortController();
+  const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", body, signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }));
+  await reading;
+  await expect(first.listResources()).rejects.toThrow();
+  await other.listResources();
+  expect(JSON.parse(capacityRows()[0]!.detail)).toMatchObject({ kind: "post", scope: "user" });
+  expect(capacityRows()[0]!.actor).toBe("alice@example.com");
+  if (ending === "end") { controller.enqueue(new TextEncoder().encode("{}")); controller.close(); }
+  else if (ending === "error") controller.error(new Error("fixture body error"));
+  else if (ending === "cancel") abort.abort();
+  else await hosted.close();
+  await pending;
+  expect(hosted.activePosts).toBe(0);
+  if (ending !== "shutdown") { await first.listResources(); await other.listResources(); }
+});
+
+test("global POST admission remains bounded across distinct authenticated users", async () => {
+  await fairCapacity({ ...fairLimits, post: { global: 2, perUser: 1 } });
+  const held = [token, issuedOAuth(store.repo, oauth.resource, "bob@example.com").token].map(access => {
+    const abort = new AbortController();
+    const body = new ReadableStream<Uint8Array>({ pull() { return new Promise<void>(() => {}); } });
+    return { abort, response: hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, body, headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" } })) };
+  });
+  try {
+    const access = issuedOAuth(store.repo, oauth.resource, "third@example.com").token;
+    const refused = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", body: "{}", headers: { Authorization: `Bearer ${access}` } }));
+    expect(refused.status).toBe(429);
+    expect(hosted.activePosts).toBe(2);
+    expect(capacityRows()).toEqual([{ actor: "third@example.com", detail: expect.any(String) }]);
+    expect(JSON.parse(capacityRows()[0]!.detail)).toEqual({ kind: "post", scope: "global", client_id: OPENCODE_CLIENT });
+  } finally {
+    held.forEach(request => request.abort.abort());
+    await Promise.all(held.map(request => request.response));
+  }
+  expect(hosted.activePosts).toBe(0);
+  await (await connect()).listResources();
+});
+
+for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
+  await hosted.close(); oauth.close();
+  let clock = Date.now();
+  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => clock });
+  const intervals: (() => void)[] = [];
+  const interval = globalThis.setInterval;
+  const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
+    if (ms === 1000) intervals.push(fn);
+    return interval(fn, ms, ...args);
+  }) as typeof setInterval);
+  try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, limits: fairLimits, now: () => clock }); }
+  finally { spy.mockRestore(); }
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], clock, OPENCODE_CLIENT).token;
+  const modern = await connect(), legacy = await connect("2025-11-25");
+  await modern.callTool({ name: "board_create", arguments: { name: "expiry", purpose: "admission lifecycle" } });
+  await modern.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
+  if (ending === "revoke") store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, clock);
+  else clock += OAUTH_TTL.access + 1;
+  for (const tick of intervals) tick();
+  await untilHosted(() => hosted.activeListens === 0 && hosted.activeLegacySessions === 0 && hosted.activePosts === 0);
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], clock, OPENCODE_CLIENT).token;
+  const replacement = await connect();
+  const listen = await replacement.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
+  await connect("2025-11-25");
+  expect(hosted.activeListens).toBe(1); expect(hosted.activeLegacySessions).toBe(1);
+  await listen.close();
+  await legacy.close();
+});
+
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, limits: { ...DEFAULT_MCP_LIMITS, listen: { global: 128, perUser: 128 }, post: { global: 256, perUser: 256 } } });
   const client = await connect();
   await client.callTool({ name: "board_create", arguments: { name: "bounded", purpose: "listen quota" } });
   const filter = { resourceSubscriptions: ["grayboard://boards/bounded"] };
@@ -572,7 +700,7 @@ test("modern listen capacity is reserved and reusable after cancellation", async
 test("legacy registry is bounded and idle disconnected sessions are reclaimed", async () => {
   await hosted.close();
   let clock = Date.now();
-  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => clock });
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => clock, limits: { ...DEFAULT_MCP_LIMITS, legacy: { global: 256, perUser: 256 } } });
   for (let i = 0; i < 256; i++) await connect("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(256);
   await expect(connect("2025-11-25")).rejects.toThrow();

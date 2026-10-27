@@ -11,6 +11,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
+  ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
 ];
 
 describe("loadConfig", () => {
@@ -41,6 +42,27 @@ describe("loadConfig", () => {
     process.env.GOOGLE_OAUTH_CLIENT_SECRET = "desktop-secret";
     process.env.GRAYBOARD_ORG_DOMAIN = "example.com";
   }
+
+  test("MCP fair shares are configurable beneath bounded global capacities", () => {
+    primary();
+    expect(loadConfig().mcpLimits).toEqual({ listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } });
+    for (const kind of ["LISTEN", "LEGACY", "POST"]) {
+      const prefix = `GRAYBOARD_MCP_${kind}`;
+      process.env[`${prefix}_GLOBAL`] = "4"; process.env[`${prefix}_PER_USER`] = "2";
+      expect(loadConfig().mcpLimits![kind.toLowerCase() as "listen" | "legacy" | "post"]).toEqual({ global: 4, perUser: 2 });
+      for (const value of ["0", "5", "1e3", " 2"]) {
+        process.env[`${prefix}_PER_USER`] = value;
+        expect(() => loadConfig()).toThrow(`${prefix}_PER_USER`);
+      }
+      delete process.env[`${prefix}_PER_USER`];
+      expect(loadConfig().mcpLimits![kind.toLowerCase() as "listen" | "legacy" | "post"].perUser).toBe(4);
+      for (const value of ["0", "257", "1e3"]) {
+        process.env[`${prefix}_GLOBAL`] = value;
+        expect(() => loadConfig()).toThrow(`${prefix}_GLOBAL`);
+      }
+      delete process.env[`${prefix}_GLOBAL`];
+    }
+  });
 
   test("OAuth address and global rates use the shared configurable token-bucket bounds", () => {
     primary();

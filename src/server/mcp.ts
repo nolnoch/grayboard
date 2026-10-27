@@ -16,6 +16,8 @@ import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
+import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
@@ -26,10 +28,10 @@ const attachmentIds = ids.describe("IDs uploaded through the authenticated attac
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
-type Legacy = { meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
+type Legacy = { meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   const permitsOrigin = (origin: string | null): boolean => {
@@ -41,7 +43,27 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       return serialized === parsed.origin && parsed.origin === trustedOrigin;
     } catch { return false; }
   };
-  let closed = false, posts = 0, modernReservations = 0, busListeners = 0;
+  let closed = false, posts = 0, busListeners = 0;
+  const limits = opts.limits ?? DEFAULT_MCP_LIMITS;
+  const capacity = { listen: new Map<number, number>(), legacy: new Map<number, number>(), post: new Map<number, number>() };
+  const used = { listen: 0, legacy: 0, post: 0 };
+  function reserve(kind: keyof McpLimits, principal: OAuthPrincipal): (() => void) | undefined {
+    const counts = capacity[kind], user = principal.authed.user_id;
+    const count = counts.get(user) ?? 0;
+    const scope = used[kind] >= limits[kind].global ? "global" : count >= limits[kind].perUser ? "user" : undefined;
+    if (scope) {
+      writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId });
+      return undefined;
+    }
+    used[kind]++; counts.set(user, count + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true; used[kind]--;
+      const remaining = counts.get(user)! - 1;
+      if (remaining) counts.set(user, remaining); else counts.delete(user);
+    };
+  }
   function isolatedBus(): ServerEventBus {
     const listeners = new Set<Parameters<ServerEventBus["subscribe"]>[0]>();
     return {
@@ -317,6 +339,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   function retire(legacy: Legacy) {
     if (legacy.stopped) return;
     legacy.stopped = true;
+    legacy.release();
     legacyAll.delete(legacy);
     for (const [id, value] of legacySessions) if (value === legacy) legacySessions.delete(id);
     legacy.stream?.stop();
@@ -327,7 +350,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const timer = setInterval(() => {
     for (const live of [...lives]) { try { valid(live); } catch { hostedFailure("mcp.stream"); live.stop(); } }
     for (const [stream, context] of streamContexts) { try { authorize(context); } catch { hostedFailure("mcp.stream"); track(stream.stop()); } }
-    for (const legacy of [...legacyAll]) if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
+    for (const legacy of [...legacyAll]) if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
@@ -365,20 +388,26 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       let role: HostedRole;
       try { role = hostedRole(original); } catch { return Response.json({ code: "bad_request", message: "unknown X-Grayboard-Client role" }, { status: 400 }); }
       const post = original.method === "POST";
+      let principal: OAuthPrincipal;
+      let postReservation: (() => void) | undefined;
+      try {
+        const authenticated = oauth.authenticate(original, roleScopes(role));
+        if (authenticated instanceof Response) return authenticated;
+        principal = authenticated;
+        postReservation = post ? reserve("post", principal) : undefined;
+      } catch { return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
+      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 });
       let released = false, legacyPost: Legacy | undefined;
       const releasePost = () => {
-        if (post && !released) { released = true; posts--; }
+        if (post && !released) { released = true; posts--; postReservation!(); }
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
-      if (post && posts >= 256) return new Response("MCP request capacity reached", { status: 429 });
-      if (pendingRequests.size >= 512) return new Response("MCP exchange capacity reached", { status: 429 });
       if (post) posts++;
+      if (pendingRequests.size >= 512) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
       try {
-        const principal = oauth.authenticate(original, roleScopes(role));
-        if (principal instanceof Response) { releasePost(); return principal; }
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
@@ -388,7 +417,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
           let newLegacy: Legacy | undefined;
-          let reserved = false;
+          let releaseListen: (() => void) | undefined;
           try {
             let response: Response;
             const modernMethod = req.method !== "POST" && (!req.headers.has("Mcp-Session-Id") || req.headers.get("Mcp-Protocol-Version") === "2026-07-28");
@@ -398,8 +427,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             if (!legacyRequest) {
               const listen = SubscriptionsListenRequestSchema.safeParse(body.parsedBody);
               if (listen.success) {
-                if (modernReservations >= 128) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
-                modernReservations++; reserved = true;
+                releaseListen = reserve("listen", principal);
+                if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
                 if (uris.length > 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
@@ -415,23 +444,25 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               const sid = req.headers.get("Mcp-Session-Id");
               let legacy = sid ? legacySessions.get(sid) : undefined;
               if (sid && !legacy) { releasePost(); return new Response("unknown MCP session", { status: 404 }); }
-              if (req.method === "GET" && legacy) exchange.meta = legacy.meta;
+              if (req.method !== "POST" && legacy) exchange.meta = legacy.meta;
               const context = exchange.context = await select(req);
               if (legacy && !matches(legacy.binding, binding(context))) { context.finish(); releasePost(); return new Response("MCP session binding mismatch", { status: 403 }); }
               if (!legacy) {
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
-                if (legacyAll.size >= 256) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
-                legacy = { meta: exchange.meta, binding: binding(context), subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
+                const release = reserve("legacy", principal);
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                legacy = { meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
                 const created = legacy;
+                newLegacy = legacy;
                 legacy.transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID(), keepAliveMs: 5000,
                   onsessioninitialized(id) { legacySessions.set(id, created); }, onsessionclosed() { retire(created); } });
                 legacy.server = makeServer(context, legacy);
                 legacyAll.add(legacy);
-                newLegacy = legacy;
                 await legacy.server.connect(legacy.transport);
                 if (closed || req.signal.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
               }
               exchange.legacy = legacy;
+              legacy.principal = principal;
               legacy.lastUsed = now();
               if (req.method === "GET") {
                 if (legacy.stream) { context.finish(); releasePost(); return new Response("MCP GET already active", { status: 409 }); }
@@ -450,17 +481,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             const refusal = exchange.refusal;
             if (refusal && !closed && !req.signal.aborted) {
               await response.body?.cancel(); live?.stop(); exchange.context?.finish();
-              if (reserved) { reserved = false; modernReservations--; }
+              releaseListen?.();
               releasePost(); return refusal;
             }
-            const done = () => { if (reserved) { reserved = false; modernReservations--; } releasePost(); };
+            const done = () => { releaseListen?.(); releasePost(); };
             return wrap(response, exchange.context, live, done);
           } catch (error) {
             if (newLegacy) retire(newLegacy);
             live?.stop();
             if (ownHandler) await ownHandler.close();
             exchange.context?.finish();
-            if (reserved) { reserved = false; modernReservations--; }
+            releaseListen?.();
             releasePost();
             if (exchange.refusal && !closed && !req.signal.aborted) return exchange.refusal;
             if (error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError) {

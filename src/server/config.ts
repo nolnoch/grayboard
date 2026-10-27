@@ -7,6 +7,9 @@ import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 
+export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
+export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
+
 export type Config = {
   dbPath: string;
   // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside the database.
@@ -37,6 +40,7 @@ export type Config = {
   authFailLimit: RateLimit;
   oauthLimit?: RateLimit;
   oauthGlobalLimit?: RateLimit;
+  mcpLimits?: McpLimits;
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -79,9 +83,22 @@ export function loadConfig(): Config {
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
     oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
+    mcpLimits: parseMcpLimits(process.env),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };
+}
+
+function parseMcpLimits(env: Record<string, string | undefined>): McpLimits {
+  const limits = {} as McpLimits;
+  for (const kind of ["listen", "legacy", "post"] as const) {
+    const prefix = `GRAYBOARD_MCP_${kind.toUpperCase()}`;
+    const defaults = DEFAULT_MCP_LIMITS[kind];
+    const global = positiveInt(env, `${prefix}_GLOBAL`, defaults.global, defaults.global, "requests");
+    const perUser = positiveInt(env, `${prefix}_PER_USER`, Math.min(defaults.perUser, global), global, "requests");
+    limits[kind] = { global, perUser };
+  }
+  return limits;
 }
 
 function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
