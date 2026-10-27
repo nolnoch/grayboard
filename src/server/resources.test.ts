@@ -1,6 +1,6 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +57,19 @@ test("canonical board URIs reject encoded, delimiter, traversal, case and newlin
     expect(() => parseBoardResourceUri(`grayboard://boards/${suffix}`)).toThrow("board resource not found");
   }
   expect(() => parseBoardResourceUri("GRAYBOARD://boards/e2e")).toThrow();
+});
+
+test("resource hook failures emit one fixed diagnostic without forged stack or cause", async () => {
+  const s = await select(alice);
+  application.call(s, "board_create", { name: "e2e", purpose: "test" });
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
+  try {
+    resources.watch(s, boardResourceUri("e2e"), { changed: async () => { throw forged; } });
+    application.call(s, "board_post", { board: "e2e", body: "test" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"resources.changed","category":"failure","level":"error"}']);
+  } finally { log.mockRestore(); }
 });
 
 test("separate multiwatcher fanout needs no attention subscriptions and preserves active ownership/status", async () => {

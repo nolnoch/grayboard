@@ -1,16 +1,17 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication } from "./application.ts";
+import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp, MCP_PROTOCOL_VERSIONS } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { OPENCODE_CLIENT, sessionContext } from "./hosted.ts";
+import { OAUTH_TTL } from "./oauth-types.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
@@ -59,6 +60,59 @@ async function connect(version: string, role = "subscriber", signal?: AbortSigna
   }));
   return client;
 }
+
+test("subscriber errors preserve domain codes through actual SDK tool and resource transports", async () => {
+  const headers = new Headers({ "X-Grayboard-Lease": "x".repeat(43) });
+  const client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const unknown = await client.callTool({ name: "bind", arguments: { name: "missing" } });
+  expect(unknown).toMatchObject({ isError: true, structuredContent: { code: "identity_unknown" } });
+  const stale = await client.callTool({ name: "delivery_renew", arguments: {} });
+  expect(stale).toMatchObject({ isError: true, structuredContent: { code: "not_found" } });
+  await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ code: -32602, data: { code: "not_found" } });
+  const original = hosted.delivery.pending;
+  hosted.delivery.pending = async () => { throw new ApplicationError("unbound", "bind again"); };
+  // A valid lease reaches pending rather than failing its header check.
+  const opened = await client.callTool({ name: "delivery_open", arguments: {} });
+  const cap = JSON.parse((opened.content as { text: string }[])[0]!.text).capability;
+  headers.set("X-Grayboard-Lease", cap);
+  try { await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ code: -32602, data: { code: "unbound" } }); }
+  finally { hosted.delivery.pending = original; }
+});
+
+test("hosted audit actors and clients survive grant deletion and ownership cleanup", async () => {
+  const client = await connect("2026-07-28");
+  const opened = await client.callTool({ name: "delivery_open", arguments: {} });
+  expect(opened.isError).not.toBe(true);
+  const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (p instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.register(p, sessionContext(p, meta), "audit-child");
+  await hosted.sessions.end(p, sessionContext(p, meta));
+  store.repo.oauth.cleanup(Date.now() + OAUTH_TTL.grant + 1);
+  const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action LIKE 'hosted.%'").all();
+  expect(rows.length).toBeGreaterThanOrEqual(5);
+  for (const row of rows) {
+    expect(row.actor).toBe("alice@example.com");
+    expect(JSON.parse(row.detail).client_id).toBe(OPENCODE_CLIENT);
+  }
+  expect(store.db.query("SELECT count(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
+});
+
+test("a live subscriber hint failure closes its stream with one private-safe diagnostic", async () => {
+  const headers = new Headers();
+  const sub = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await sub.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", JSON.parse((opened.content as { text: string }[])[0]!.text).capability);
+  const listen = await sub.listen({ resourceSubscriptions: ["grayboard://inbox"] });
+  const native = await connect("2026-07-28", "native");
+  const original = hosted.delivery.describe;
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  hosted.delivery.describe = () => { throw new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" }); };
+  try {
+    expect((await native.callTool({ name: "dm_send", arguments: { to: "be", body: "hint fixture" } })).isError).not.toBe(true);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"mcp.hint","category":"failure","level":"error"}']);
+    expect(hosted.activeListens).toBe(0);
+  } finally { hosted.delivery.describe = original; log.mockRestore(); await listen.close(); }
+});
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const creatorHeld of [false, true]) test(`${version}: canceled open cannot release a successful shared lease, creatorHeld=${creatorHeld}`, async () => {
   const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));

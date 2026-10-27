@@ -1,6 +1,6 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { auth, Client, StreamableHTTPClientTransport, type OAuthClientProvider, type OAuthDiscoveryState, type StoredOAuthTokens } from "@modelcontextprotocol/client";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { createHash, randomBytes } from "node:crypto";
@@ -255,6 +255,95 @@ function principal(tokens: Tokens, required?: string[]) {
   const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${tokens.access_token}` } }), required);
   expect(p).not.toBeInstanceOf(Response); return p as OAuthPrincipal;
 }
+
+test("OAuth event trail records decisions, grant, strict replay warnings and revocation without credentials", async () => {
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    expect((await fetch(base + "/oauth/authorize?client_id=PRIVATE-QUERY")).status).toBe(400);
+    const denied = new Browser();
+    await decide(denied, await loginConsent(denied, authorization().url), "deny");
+    const code = await issue();
+    const first = await redeem(code);
+    expect((await post("/oauth/token", tokenParams(code))).status).toBe(400);
+    const other = await issue();
+    const tokens = await redeem(other);
+    const refresh = { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token };
+    expect((await post("/oauth/token", refresh)).status).toBe(200);
+    expect((await post("/oauth/token", refresh)).status).toBe(400);
+    const third = await redeem(await issue());
+    expect((await post("/oauth/revoke", { client_id: "native", token: third.refresh_token })).status).toBe(200);
+    const rows = storage.db.query<{ action: string; actor: string | null; detail: string }, []>("SELECT action,actor,detail FROM access_log WHERE action LIKE 'oauth.%'").all();
+    const actions = rows.map(r => r.action);
+    for (const action of ["request_refused", "authorize", "google_authenticated", "consent_denied", "consent_approved", "grant_issued", "code_replay_revoked", "refreshed", "refresh_replay_revoked", "revoked", "revoke_requested"]) expect(actions).toContain("oauth." + action);
+    for (const row of rows.filter(r => /grant_issued|replay_revoked|refreshed|^oauth.revoked$/.test(r.action))) {
+      expect(row.actor).toBe("you@example.com");
+      expect(JSON.parse(row.detail).client_id).toBe("native");
+      if (row.action.includes("replay")) expect(JSON.parse(row.detail).level).toBe("warning");
+    }
+    expect(warning).toHaveBeenCalledTimes(2);
+    const serialized = JSON.stringify(rows) + JSON.stringify(warning.mock.calls);
+    for (const value of ["PRIVATE-QUERY", code.code, code.verifier, first.access_token, first.refresh_token, tokens.refresh_token]) expect(serialized).not.toContain(value);
+    clock += OAUTH_TTL.grant + 1;
+    storage.repo.oauth.cleanup(clock);
+    expect(storage.db.query("SELECT count(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
+    expect(storage.db.query("SELECT actor FROM access_log WHERE action = 'oauth.grant_issued' LIMIT 1").get()).toEqual({ actor: "you@example.com" });
+  } finally { warning.mockRestore(); }
+});
+
+test("OAuth sweep and upstream diagnostics never inspect exception strings, stacks or causes", async () => {
+  service.close();
+  const interval = spyOn(globalThis, "setInterval");
+  service = makeService();
+  const tick = interval.mock.calls[0]![0] as () => void;
+  interval.mockRestore();
+  const cleanup = storage.repo.oauth.cleanup;
+  const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  storage.repo.oauth.cleanup = () => { throw forged; };
+  try {
+    tick();
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error"}']);
+  } finally { storage.repo.oauth.cleanup = cleanup; }
+  try {
+    service.close();
+    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => { throw forged; } });
+    const browser = new Browser();
+    const begin = await browser.request(authorization().url);
+    const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
+    expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+    expect(log.mock.calls.flat()).toEqual([
+      '[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error"}',
+      '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error"}',
+    ]);
+    const trail = JSON.stringify(storage.db.query("SELECT * FROM access_log WHERE action LIKE 'oauth.%'").all());
+    expect(trail).toContain("oauth.google_failed");
+    for (const secret of ["PRIVATE", "refresh-token.ts", "AUTHORIZATION-CODE"]) expect(trail + JSON.stringify(log.mock.calls)).not.toContain(secret);
+  } finally { log.mockRestore(); }
+});
+
+test("CIMD, domain and unexpected OAuth failures retain safe audit categories", async () => {
+  service.close();
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => { throw new Error("Bearer PRIVATE\n at f (/private/refresh-token.ts:1:1)"); } });
+  expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
+  expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
+  service.close();
+  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null }) });
+  const browser = new Browser();
+  const first = await browser.request(authorization().url);
+  const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
+  expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+  expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.domain_refused'").get()).toEqual({ action: "oauth.domain_refused" });
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  const create = storage.repo.oauth.createRequest;
+  storage.repo.oauth.createRequest = () => { throw new Error("Bearer PRIVATE", { cause: "PRIVATE-CODE" }); };
+  try {
+    expect((await fetch(authorization().url)).status).toBe(500);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.request","category":"failure","level":"error"}']);
+    const trail = JSON.stringify(storage.db.query("SELECT * FROM access_log WHERE action LIKE 'oauth.%'").all());
+    expect(trail).toContain("oauth.request_failed");
+    expect(trail).not.toContain("PRIVATE"); expect(trail).not.toContain("refresh-token.ts");
+  } finally { storage.repo.oauth.createRequest = create; log.mockRestore(); }
+});
 
 test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
   for (const credentials of [{ googleClientSecret: "primary-private" }, { mcpGoogle: { clientId: "web-client", clientSecret: "web-private" } }]) {

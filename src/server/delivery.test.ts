@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +37,37 @@ beforeEach(async () => {
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = (body = "hello", pending = false) => application.send(sender, "bob@example.com/fe", body, { pending }).message_id;
+
+test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  send();
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
+  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
+  const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action = 'hosted.stale_capability'").all();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.actor).toBe(bob.authed.user_email);
+  expect(JSON.parse(rows[0]!.detail)).toEqual({ client_id: OPENCODE_CLIENT });
+  expect(JSON.stringify(rows)).not.toContain(lease.capability);
+  await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
+  expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+});
+
+test("delivery hook diagnostics never inspect forged stack messages or causes", async () => {
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
+  try {
+    const lease = await delivery.open(bob, context(bob), { changed: async () => { throw forged; }, closed: () => { throw forged; } });
+    send();
+    await Promise.resolve(); await Promise.resolve();
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"delivery.changed","category":"failure","level":"error"}']);
+    await delivery.release(bob, context(bob), lease.capability);
+    expect(log.mock.calls.flat()).toEqual([
+      '[grayboard] {"operation":"delivery.changed","category":"failure","level":"error"}',
+      '[grayboard] {"operation":"delivery.closed","category":"failure","level":"error"}',
+    ]);
+  } finally { log.mockRestore(); }
+});
 
 test("canceling duplicate open preserves accepted lease, children, receipts and notification owner", async () => {
   let originalHints = 0, duplicateHints = 0;

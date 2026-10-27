@@ -897,6 +897,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 }
 
 function makeOAuthStore(db: Database): OAuthStore {
+  const audit = (action: string, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
+    const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
+    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail })]);
+  };
   const invalid = { status: "invalid" } as const;
   const missing = { status: "not_found" } as const;
   const ok = <T>(value: T) => ({ status: "ok" as const, value });
@@ -1033,6 +1037,7 @@ function makeOAuthStore(db: Database): OAuthStore {
           const g = grant(row.grant_id);
           if (!g || g.expiresAt <= now) return missing;
           revokeGrant(g.id, now);
+          audit("oauth.code_replay_revoked", g, now, { level: "warning" });
           return { status: "replay" } as const;
         }
         if (row.expires_at <= now) return missing;
@@ -1045,6 +1050,7 @@ function makeOAuthStore(db: Database): OAuthStore {
         db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
         db.run("UPDATE oauth_codes SET grant_id = ? WHERE hash = ?", [g.id, input.codeHash]);
         insertPair(input.tokens, g.id, now);
+        audit("oauth.grant_issued", g, now);
         return ok({ grant: g, tokens: input.tokens });
       }).immediate();
     },
@@ -1070,6 +1076,7 @@ function makeOAuthStore(db: Database): OAuthStore {
         // A recognized ancestor revokes even after its sliding expiry; tombstones outlive it.
         if (t.spent_at !== null) {
           revokeGrant(g.id, now);
+          audit("oauth.refresh_replay_revoked", g, now, { level: "warning" });
           return { status: "replay" } as const;
         }
         if (t.revoked_at !== null || t.expires_at <= now || !validPair(input.tokens, input, now, Number.MAX_SAFE_INTEGER) ||
@@ -1078,6 +1085,7 @@ function makeOAuthStore(db: Database): OAuthStore {
           refreshExpiresAt: Math.min(input.tokens.refreshExpiresAt, g.expiresAt) };
         db.run("UPDATE oauth_tokens SET spent_at = ? WHERE hash = ?", [now, input.refreshHash]);
         insertPair(tokens, g.id, now);
+        audit("oauth.refreshed", g, now);
         return ok({ grant: g, tokens });
       }).immediate();
     },
@@ -1090,6 +1098,7 @@ function makeOAuthStore(db: Database): OAuthStore {
         if (!g || g.clientId !== clientId) return;
         if (t.kind === "refresh") revokeGrant(g.id, now);
         else db.run("UPDATE oauth_tokens SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL", [now, h]);
+        audit("oauth.revoked", g, now, { kind: t.kind });
       }).immediate();
     },
     findActiveAccess(h, resource, requiredScopes, now) {
@@ -1131,7 +1140,9 @@ function makeOAuthStore(db: Database): OAuthStore {
 function makeHostedStore(db: Database): HostedStore {
   const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
   const audit = (session: string, action: string, detail: Record<string, unknown>, now: number) => {
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, NULL, ?, ?, ?)", [now, action, session, JSON.stringify(detail)]);
+    const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
+      WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
+    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
   };
   const store: HostedStore = {
     atomic: fn => db.transaction(fn).immediate(),

@@ -5,6 +5,7 @@ import { ApplicationError, type ApplicationSession, type DeliveryEvent, type Ide
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 
 export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
@@ -16,7 +17,10 @@ type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
-const notify = (fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(() => {}); } catch {} };
+const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(() => hostedFailure(operation)); } catch { hostedFailure(operation); } };
+class StaleCapability extends ApplicationError {
+  constructor() { super("not_found", "no live delivery lease for this session; it was closed (expired or changed). Open a new one."); }
+}
 function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
   const stamp = { ownership: lease.ownership, bind_gen: lease.generation, name: lease.name };
   if (event.kind === "direct") return { id: `direct:${event.message.id}`, actionable: true, event, ...stamp };
@@ -40,7 +44,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
     application.close(lease.session);
-    lease.issued.clear(); lease.acknowledged.clear(); notify(lease.hooks.closed);
+    lease.issued.clear(); lease.acknowledged.clear(); notify("delivery.closed", lease.hooks.closed);
   }
   function matches(lease: Lease, row?: HostedSession) {
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
@@ -50,9 +54,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     for (const lease of [...leases.values()]) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
   });
   function stale(p: DeliveryPrincipal, context: SessionContext, capability: string): never {
+    throw new StaleCapability();
+  }
+  function refused(p: DeliveryPrincipal, context: SessionContext, error: unknown): never {
     const id = "id" in context ? context.id : "no-context";
-    hosted.audit(id, "hosted.stale_capability", { capability: capability.slice(0, 8), grant: p.grantId });
-    throw new ApplicationError("not_found", `no live delivery lease ${capability.slice(0, 8)} for this session; it was closed (expired or changed). Open a new one.`);
+    if (error instanceof StaleCapability) hosted.audit(id, "hosted.stale_capability", {}, p);
+    throw error;
   }
   function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession) {
     const lease = leases.get(capability);
@@ -64,7 +71,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   const describe = (l: Lease): DeliveryLease => ({ capability: l.capability, identity: structuredClone(l.identity), expiresAt: l.expiresAt, ownership: l.ownership, bind_gen: l.generation });
   const service = {
     get activeLeaseCount() { return leases.size; },
-    describe(p: DeliveryPrincipal, context: SessionContext, capability: string) { return describe(get(p, context, capability)); },
+    describe(p: DeliveryPrincipal, context: SessionContext, capability: string) { try { return describe(get(p, context, capability)); } catch (error) { return refused(p, context, error); } },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
@@ -82,7 +89,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const { row, expiresAt } = result;
         let lease!: Lease;
         const selected = application.hostedSession(p.authed, row.session_id, row.name, row.place, {
-          deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify(lease.hooks.changed); } },
+          deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           probe: async () => true,
           closed() { if (lease) finish(lease); },
         }, false, true);
@@ -115,7 +122,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         lease.expiresAt = deadline;
         if (hooks) lease.hooks = hooks;
         return describe(lease);
-      });
+      }).catch(error => refused(p, context, error));
     },
     async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100): Promise<PendingDelivery[]> {
       return hosted.control(p, context, false, async row => {
@@ -127,7 +134,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (lease.issued.size + unseen.length > 1000) throw new ApplicationError("bad_request", "delivery lease receipt capacity reached; release and reopen");
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), acked: false, ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         return items;
-      });
+      }).catch(error => refused(p, context, error));
     },
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async () => {
@@ -159,7 +166,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           records.lease.acknowledged.set(r.item.id, r);
         }
         while (records.lease.acknowledged.size > 1000) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
-      });
+      }).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, row => {
@@ -168,7 +175,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           store.end(row.session_id, "closed", now());
         });
         hosted.reconcile();
-      });
+      }).catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
       const attempt = attempts.get(result);
@@ -190,7 +197,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     revalidate() { hosted.sweep(); },
     close() {
       stopped = true; unlisten();
-      for (const lease of [...leases.values()]) { hosted.audit(lease.sessionId, "hosted.lease_closed", { reason: "shutdown" }); finish(lease); }
+      for (const lease of [...leases.values()]) { hosted.audit(lease.sessionId, "hosted.lease_closed", { reason: "shutdown" }, lease.principal); finish(lease); }
     },
   };
   return service;

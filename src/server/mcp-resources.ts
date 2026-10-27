@@ -7,6 +7,7 @@ import type { OAuthPrincipal } from "./oauth.ts";
 import type { Delivery } from "./delivery.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 
 export type HostedRole = "native" | "subscriber";
 export function hostedRole(request: Request): HostedRole {
@@ -21,7 +22,15 @@ const metadata = (uri: string, name: string) => ({ uri, name, mimeType: "applica
 const json = (uri: string, value: unknown) => ({ contents: [{ uri, mimeType: "application/json", text: JSON.stringify(value) }] });
 const expected = (error: unknown): error is ApplicationError | CoreError => error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError;
 const message = (error: unknown) => expected(error) ? error.message : "internal error";
-const resourceError = (error: unknown) => new ProtocolError(expected(error) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, message(error));
+const domainCode = (error: unknown) => error instanceof ApplicationError && error.code !== "internal" ? error.code : error instanceof CoreError ? "refused" : "internal_error";
+const resourceError = (error: unknown) => {
+  if (!expected(error)) hostedFailure("mcp.resource");
+  return new ProtocolError(expected(error) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, message(error), { code: domainCode(error) });
+};
+const toolError = (error: unknown) => {
+  if (!expected(error)) hostedFailure("mcp.subscriber");
+  return { isError: true, structuredContent: { code: domainCode(error) }, content: [{ type: "text" as const, text: `error: ${message(error)}` }] };
+};
 
 function boardRead(uri: string) {
   const separator = uri.indexOf("?");
@@ -98,6 +107,7 @@ export function registerHostedResources(server: McpServer, context: {
       const read = boardRead(params.uri);
       return json(params.uri, await hosted.run(principal, sessionContext, "board_read", session => resources.read(session, read.uri, read.options)));
     } catch (error) {
+      if (role === "subscriber") throw resourceError(error);
       if (error instanceof CoreError || error instanceof ApplicationError && error.code === "not_found") throw new ResourceNotFoundError(params.uri, "resource not found");
       throw resourceError(error);
     }
@@ -110,7 +120,7 @@ export function registerHostedResources(server: McpServer, context: {
       const value = await call();
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
-      return { isError: true, content: [{ type: "text" as const, text: `error: ${message(error)}` }] };
+      return toolError(error);
     }
   };
   server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: z.strictObject({}) }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
@@ -119,7 +129,7 @@ export function registerHostedResources(server: McpServer, context: {
     inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }),
   }, async (args, ctx) => {
     try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
-    catch (error) { return { isError: true, content: [{ type: "text" as const, text: `error: ${message(error)}` }] }; }
+    catch (error) { return toolError(error); }
   });
   server.registerTool("session_register", {
     description: "Register a descendant under this top-level root before its native calls.",

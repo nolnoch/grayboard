@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 
 export function boardResourceUri(board: string): string {
   if (!BOARD_NAME_RE.test(board) || board.trim() !== board) throw new ApplicationError("bad_request", "invalid board resource name");
@@ -27,8 +28,8 @@ type Watch = {
   hooks: ResourceHooks;
   unsubscribe?: () => void;
 };
-function notify(callback?: () => void | Promise<void>) {
-  try { void Promise.resolve(callback?.()).catch(() => {}); } catch {}
+function notify(operation: "resources.changed" | "resources.closed", callback?: () => void | Promise<void>) {
+  try { void Promise.resolve(callback?.()).catch(() => hostedFailure(operation)); } catch { hostedFailure(operation); }
 }
 
 export function createResources(application: Application, options: ResourceOptions) {
@@ -36,10 +37,10 @@ export function createResources(application: Application, options: ResourceOptio
   let stopped = false;
   function finish(watch: Watch) {
     if (!watches.delete(watch.id)) return;
-    try { watch.unsubscribe?.(); } finally { notify(watch.hooks.closed); }
+    try { watch.unsubscribe?.(); } finally { notify("resources.closed", watch.hooks.closed); }
   }
   function finishQuietly(watch: Watch) {
-    try { finish(watch); } catch {}
+    try { finish(watch); } catch { hostedFailure("resources.finish"); }
   }
   function authorized(session: ApplicationSession, allowUnbound = false): boolean {
     try {
@@ -61,7 +62,7 @@ export function createResources(application: Application, options: ResourceOptio
     // Background faults close the watch without failing a committed mutation.
     try {
       if (authorized(watch.session) && application.canReceiveBoard(watch.session, watch.board)) return true;
-    } catch {}
+    } catch { hostedFailure("resources.authorize"); }
     finishQuietly(watch);
     return false;
   }
@@ -87,7 +88,7 @@ export function createResources(application: Application, options: ResourceOptio
       watches.set(watch.id, watch);
       try {
         watch.unsubscribe = application.observeBoard(session, board, {
-          changed: () => { if (live(watch)) notify(() => hooks.changed()); },
+          changed: () => { if (live(watch)) notify("resources.changed", () => hooks.changed()); },
           closed: () => finishQuietly(watch),
         });
       } catch (error) { watches.delete(watch.id); throw error; }

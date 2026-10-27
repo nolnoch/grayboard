@@ -7,6 +7,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Deliv
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 
 export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
 export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
@@ -54,7 +55,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
     return { call: <T>(fn: () => Promise<T>) => enter(false, fn), bind: <T>(fn: () => Promise<T>) => enter(true, fn) };
   };
-  const audit = (id: string, action: `hosted.${string}`, detail: Record<string, unknown>) => writeAudit(repo, action, null, id, detail);
+  const audit = (id: string, action: `hosted.${string}`, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
+    const row = store.get(id);
+    const actor = principal?.authed.user_email ?? (row && repo.users.findById(row.user_id)?.email) ?? null;
+    writeAudit(repo, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
+  };
   function authorized(p: OAuthPrincipal) {
     if (stopped || !options.isAuthorized(p)) throw new ApplicationError("unauthenticated", "unauthenticated");
   }
@@ -351,7 +356,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   };
   const unsubscribe = store.subscribe(reconcile);
   sweep();
-  const timer = setInterval(() => { try { sweep(); } catch (error) { console.error("hosted expiry failed", error); } }, 250);
+  const timer = setInterval(() => { try { sweep(); } catch { hostedFailure("hosted.sweep"); } }, 250);
   timer.unref();
   return service;
 }

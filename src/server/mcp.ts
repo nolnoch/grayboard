@@ -15,6 +15,7 @@ import { unboundInstruction } from "../core/bindings.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
@@ -154,7 +155,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const unlistenHosted = hosted.listen(() => {
     for (const live of [...lives]) {
       try { if (!bindingLive(live.context)) live.stop(); }
-      catch { live.stop(); }
+      catch { hostedFailure("mcp.binding"); live.stop(); }
     }
   });
   function watchable(context: Context, uri: string): string | null {
@@ -188,8 +189,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           valid(live);
           if (handler) handler.notify.resourceUpdated(uri);
-          else if (legacy) track(legacy.server.server.notification({ method: "notifications/resources/updated", params: { uri } }).catch(() => live.stop()));
-        } catch { live.stop(); }
+          else if (legacy) track(legacy.server.server.notification({ method: "notifications/resources/updated", params: { uri } }).catch(() => { hostedFailure("mcp.hint"); live.stop(); }));
+        } catch { hostedFailure("mcp.hint"); live.stop(); }
       },
       stop() {
         if (live.stopped) return;
@@ -201,15 +202,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           for (const uri of live.uris.keys()) {
             try {
               if (!application.canReceiveBoard(context.session, parseBoardResourceUri(uri))) legacy.subscriptions.delete(uri);
-            } catch {}
+            } catch { hostedFailure("mcp.stream"); }
           }
         }
         if (legacy?.stream === live) legacy.stream = undefined;
         // The SDK closes the source first; application.close releases its observer set.
         if (live.stream) track(live.stream.stop());
         if (handler) track(handler.close());
-        if (legacy) { try { legacy.transport.closeStandaloneSSEStream(); } catch {} }
-        try { context.finish(); } catch {}
+        if (legacy) { try { legacy.transport.closeStandaloneSSEStream(); } catch { hostedFailure("mcp.stream"); } }
+        try { context.finish(); } catch { hostedFailure("mcp.stream"); }
       },
     };
     lives.add(live);
@@ -324,8 +325,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     track(legacy.transport.close());
   }
   const timer = setInterval(() => {
-    for (const live of [...lives]) { try { valid(live); } catch { live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch { track(stream.stop()); } }
+    for (const live of [...lives]) { try { valid(live); } catch { hostedFailure("mcp.stream"); live.stop(); } }
+    for (const [stream, context] of streamContexts) { try { authorize(context); } catch { hostedFailure("mcp.stream"); track(stream.stop()); } }
     for (const legacy of [...legacyAll]) if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
   }, 1000);
   timer.unref();
