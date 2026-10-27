@@ -135,11 +135,11 @@ export class Controller {
         });
       }
       await this.prepare(r, !!previous?.paused && !name);
-    } catch (error) { this.set(r, "approved", `Root approval saved; ${failureMessage(error)}`, "enroll", failureCode(error)); }
+    } catch (error) { this.set(r, r.paused ? "paused" : "approved", `${r.paused ? "Root approval unavailable" : "Root approval saved"}; ${failureMessage(error)}`, "enroll", failureCode(error)); }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
-  private async prepare(r: Root, resume = false) {
+  private async prepare(r: Root, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
     await this.temporary(r.e, async wire => {
       await this.guard(r, epoch, signal);
@@ -159,18 +159,22 @@ export class Controller {
       await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
         this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
-        this.start(r);
+        const started = this.start(r);
+        if (waitForStart) await started;
       }
     });
   }
   private start(r: Root) {
     if (r.task || r.paused || this.stopped) return;
     const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController();
-    r.task = this.run(r, e, epoch, abort.signal).catch(error => {
+    let ready!: () => void;
+    const started = new Promise<void>(resolve => { ready = resolve; });
+    r.task = this.run(r, e, epoch, abort.signal, ready).catch(error => {
       if (!abort.signal.aborted) { r.paused = true; this.set(r, "paused", failureMessage(error), "subscriber", failureCode(error)); }
-    });
+    }).finally(ready);
+    return started;
   }
-  private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal) {
+  private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal, ready: () => void) {
     let failures = 0, recoveries = 0, throttles = 0;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
@@ -192,6 +196,7 @@ export class Controller {
         r.lease = lease; wire.capability = lease.capability;
         recoveries = 0;
         this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
+        ready();
         let dirty = true, wake: (() => void) | undefined, closed = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
         const subscription = await wire.listen();
@@ -252,6 +257,7 @@ export class Controller {
           }
         }
         this.set(r, "retrying", `Revalidating the approved root before reopening delivery (${failureCode(error)})`, "reopen", failureCode(error));
+        ready();
         if (wire?.admissionRetryAfterMs) {
           if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");
           await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
@@ -300,7 +306,7 @@ export class Controller {
         if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
         await this.binding.check(e);
         this.watches.set(id, await this.binding.watch(e));
-        await this.prepare(r, true);
+        await this.prepare(r, true, true);
       } catch {
         const r = this.roots.get(id);
         if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", "Saved root unavailable; approval retained, explicitly enroll to retry", "restore"); }
