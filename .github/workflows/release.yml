@@ -178,8 +178,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           cp install.sh dist/
+          cp deploy/grayboard.service dist/deploy-grayboard.service
+          cp deploy/Caddyfile dist/deploy-Caddyfile
+          cp deploy/backup.sh dist/deploy-backup.sh
           cd dist
-          { echo "# grayboard ${TAG}"; sha256sum grayboard-* install.sh | LC_ALL=C sort -k2; } > SHA256SUMS
+          { echo "# grayboard ${TAG}"; sha256sum grayboard-* install.sh deploy-* | LC_ALL=C sort -k2; } > SHA256SUMS
           cat SHA256SUMS
 
       - name: Sign SHA256SUMS
@@ -214,6 +217,7 @@ jobs:
           subject-path: |
             dist/grayboard-*
             dist/install.sh
+            dist/deploy-*
             dist/SHA256SUMS
 
       # Hand-written notes for this tag, when the release needs them (the
@@ -236,6 +240,7 @@ jobs:
           files: |
             dist/grayboard-*
             dist/install.sh
+            dist/deploy-*
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
           fail_on_unmatched_files: true

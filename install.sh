@@ -13,8 +13,10 @@
 # Server install (one-deployment-per-org):
 #   curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
 #     | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-#   → also installs `grayboard-server`; if the grayboard systemd unit runs that binary,
-#     restarts it and waits for /healthz to report the installed release
+#   → also installs `grayboard-server`, the release's deploy files (the systemd unit,
+#     the Caddyfile, and `grayboard-backup` beside the binaries; each verified against
+#     the signed SHA256SUMS like the binaries), then, if the grayboard systemd unit
+#     runs that binary, restarts it and waits for /healthz to report the installed release
 #
 # Overrides:
 #   GRAYBOARD_VERSION=v2.0.0   pin a release (default: latest); a release
@@ -24,7 +26,12 @@
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   GRAYBOARD_RELEASES_URL=https://mirror.example.com
 #                              serves github.com's release paths instead of github.com
-#   INSTALL_SERVER=1           also fetch grayboard-server
+#   INSTALL_SERVER=1           also fetch grayboard-server and the deploy files
+#   GRAYBOARD_NO_DEPLOY=1      with INSTALL_SERVER=1, skip the deploy files
+#   GRAYBOARD_DEPLOY_REPLACE=1 replace a unit or Caddyfile that differs from the release's
+#                              (default: keep it and say so); the old one is kept as <file>.prev
+#   GRAYBOARD_UNIT_DIR=/dir    where the unit goes   (default: /etc/systemd/system)
+#   GRAYBOARD_CADDYFILE=/path  where the Caddyfile goes (default: /etc/caddy/Caddyfile)
 #   GRAYBOARD_NO_SETUP=1       skip `grayboard setup`
 
 set -euo pipefail
@@ -51,6 +58,11 @@ esac
 VERSION="${GRAYBOARD_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_SERVER="${INSTALL_SERVER:-0}"
+# Where a server install puts the release's deploy files (#311).
+unit_dest="${GRAYBOARD_UNIT_DIR:-/etc/systemd/system}/grayboard.service"
+caddy_dest="${GRAYBOARD_CADDYFILE:-/etc/caddy/Caddyfile}"
+backup_dest="${INSTALL_DIR}/grayboard-backup"
+DEPLOY_REPLACE="${GRAYBOARD_DEPLOY_REPLACE:-0}"
 
 # ── detect platform ──────────────────────────────────────────────────────────
 
@@ -140,8 +152,11 @@ PEM
 # ── download and verify ──────────────────────────────────────────────────────
 
 bins=(grayboard)
+deploy=0
+deploy_assets=(deploy-grayboard.service deploy-Caddyfile deploy-backup.sh)
 if [ "$INSTALL_SERVER" = "1" ]; then
   bins+=(grayboard-server)
+  [ "${GRAYBOARD_NO_DEPLOY:-0}" = "1" ] || deploy=1
 fi
 
 # Inside INSTALL_DIR, so each final mv is a rename on one filesystem.
@@ -187,8 +202,10 @@ sums_bad="$(awk '
 tagline="$(head -n 1 "${tmp}/SHA256SUMS")"
 [ "$tagline" = "# grayboard ${VERSION}" ] || refuse "SHA256SUMS is signed for ${tagline#\# grayboard }, not ${VERSION}"
 
-for bin in "${bins[@]}"; do
-  asset="${bin}-${target}"
+# verified <asset> <file in tmp>: download $1 only once SHA256SUMS and the
+# release API both list a sha256 for it, then require the file to match both.
+verified() {
+  local asset="$1" want_sum want_api got
   want_sum="$(awk -v n="$asset" 'NR > 1 && $2 == n { print $1 }' "${tmp}/SHA256SUMS")"
   [[ "$want_sum" =~ ^[0-9a-f]{64}$ ]] || refuse "${asset}: SHA256SUMS lists no sha256"
   want_api="$(asset_digest "$release_api" "$asset")" || want_api=""
@@ -196,16 +213,68 @@ for bin in "${bins[@]}"; do
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) refuse "${asset}: the release API lists no sha256 digest" ;;
   esac
-  fetch "$asset" "$bin"
-  got="$(binary_sum "${tmp}/${bin}")"
+  fetch "$asset" "$2"
+  got="$(binary_sum "${tmp}/$2")"
   [ "$got" = "$want_sum" ] || refuse "${asset}: sha256 ${got}, but SHA256SUMS lists ${want_sum}"
   [ "$got" = "${want_api#sha256:}" ] || refuse "${asset}: sha256 ${got}, but the release API lists ${want_api}"
+}
+
+for bin in "${bins[@]}"; do
+  verified "${bin}-${target}" "$bin"
   chmod +x "${tmp}/${bin}"
 done
+
+# A server install also takes the release's deploy files: the unit, the
+# Caddyfile and the backup script run as root or decide what does, so they
+# share the binaries' trust root rather than a raw fetch of master (#311).
+if [ "$deploy" = "1" ]; then
+  for f in "${deploy_assets[@]}"; do
+    verified "$f" "$f"
+  done
+fi
 
 reported="$("${tmp}/grayboard" --version 2>/dev/null)" || reported=""
 [ "$reported" = "${VERSION#v}" ] || refuse "the downloaded grayboard reports '${reported}', not ${VERSION}"
 echo "grayboard: verified ${VERSION} (SHA256SUMS signed by key ${keyid})"
+
+# place <staged> <dest> <mode>: write beside dest, then rename over it.
+place() {
+  { mkdir -p "$(dirname "$2")" && install -m "$3" "${tmp}/$1" "$2.new" && mv "$2.new" "$2"; } \
+    || { rm -f "$2.new" 2>/dev/null || true; refuse "couldn't write $2 (run as root?)"; }
+}
+
+# The unit and the Caddyfile are the operator's once placed (a source-mode
+# ExecStart, the real hostname), and a Caddy package ships its own Caddyfile,
+# so a file that differs from the release's is kept and said so; a replace
+# keeps the old one as <file>.prev. The backup script is configured by
+# environment only, so it's replaced like a binary.
+unit_new=0 unit_changed=0
+if [ "$deploy" = "1" ]; then
+  # keep_or_place <asset> <dest> <what>; sets placed=1 when it wrote dest.
+  keep_or_place() {
+    placed=0
+    if [ ! -e "$2" ]; then
+      place "$1" "$2" 644; placed=1; echo "grayboard: installed $2"
+    elif cmp -s "${tmp}/$1" "$2"; then
+      :
+    elif [ "$DEPLOY_REPLACE" = "1" ]; then
+      cp -p "$2" "$2.prev" || refuse "couldn't back up $2 to $2.prev"
+      place "$1" "$2" 644; placed=1; echo "grayboard: replaced $2 (the old one is $2.prev)"
+    else
+      echo "grayboard: kept your $2: it differs from the ${3} in this release (GRAYBOARD_DEPLOY_REPLACE=1 replaces it, keeping the old as $2.prev)"
+    fi
+  }
+  if [ ! -e "$unit_dest" ] && command -v systemctl >/dev/null 2>&1 && systemctl cat grayboard >/dev/null 2>&1; then
+    echo "grayboard: the grayboard unit is defined outside ${unit_dest}; left alone"
+  else
+    [ -e "$unit_dest" ] || unit_new=1
+    keep_or_place deploy-grayboard.service "$unit_dest" "unit"
+    unit_changed="$placed"
+  fi
+  keep_or_place deploy-Caddyfile "$caddy_dest" "Caddyfile"
+  place deploy-backup.sh "$backup_dest" 755
+  echo "grayboard: installed ${backup_dest}"
+fi
 
 # Every binary passed; only now is any replaced. Keep the server binary being
 # replaced, so a release that won't start can be rolled back; that copy is
@@ -214,9 +283,14 @@ if [ "$INSTALL_SERVER" = "1" ] && [ -f "${INSTALL_DIR}/grayboard-server" ]; then
   cp -p "${INSTALL_DIR}/grayboard-server" "${INSTALL_DIR}/grayboard-server.prev" \
     || refuse "couldn't back up ${INSTALL_DIR}/grayboard-server to grayboard-server.prev"
 fi
+
 for bin in "${bins[@]}"; do
   mv "${tmp}/${bin}" "${INSTALL_DIR}/${bin}"
 done
+
+if [ "$unit_changed" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || { echo "grayboard: systemctl daemon-reload failed after writing ${unit_dest} (run as root?)" >&2; exit 1; }
+fi
 
 # ── PATH check ───────────────────────────────────────────────────────────────
 
@@ -236,7 +310,7 @@ echo
 
 # The grayboard unit's binary, when systemd knows the unit; empty otherwise.
 unit_bin=""
-if [ "$INSTALL_SERVER" = "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl cat grayboard >/dev/null 2>&1; then
+if [ "$INSTALL_SERVER" = "1" ] && [ "$unit_new" != "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl cat grayboard >/dev/null 2>&1; then
   unit_bin="$(systemctl show -p ExecStart --value grayboard | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
 fi
 
@@ -266,14 +340,18 @@ elif [ -n "$unit_bin" ]; then
     exit 1
   fi
   echo "Restarted the grayboard service; /healthz reports ${got}."
+elif [ "$unit_new" = "1" ]; then
+  echo "Server installed with the release's unit (${unit_dest}), Caddyfile (${caddy_dest}) and"
+  echo "backup script (${backup_dest}). The service isn't started: set your hostname in the"
+  echo "Caddyfile, create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL,"
+  echo "GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET), then"
+  echo "\`systemctl enable --now grayboard\`."
 elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed; no grayboard systemd unit found. A server already running"
-  echo "from this binary keeps the old version until you restart it. For a new server:"
-  echo "  1. Create /etc/grayboard/env with GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL,"
-  echo "     GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET"
-  echo "  2. Install the systemd unit (deploy/grayboard.service in the repo)"
-  echo "  3. Put Caddy in front for TLS (deploy/Caddyfile)"
-  echo "  4. Schedule the nightly backup cron (deploy/backup.sh)"
+  echo "from this binary keeps the old version until you restart it. For a new server, rerun"
+  echo "without GRAYBOARD_NO_DEPLOY=1 (it installs the unit, Caddyfile and backup script),"
+  echo "then create /etc/grayboard/env with GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL,"
+  echo "GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET."
 elif [ "${GRAYBOARD_NO_SETUP:-0}" != "1" ] && [ -t 1 ] && (: < /dev/tty) 2>/dev/null; then
   # Under `curl | bash`, stdin is this script; setup asks its questions on the terminal.
   "${INSTALL_DIR}/grayboard" setup < /dev/tty
