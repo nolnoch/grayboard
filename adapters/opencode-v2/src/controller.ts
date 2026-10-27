@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Binding } from "./binding.js";
-import { LeaseUnavailable, Wire } from "./wire.js";
+import { LeaseUnavailable, SubscriberError, Wire } from "./wire.js";
 import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
 import { SessionRoutes, resolveRoot } from "./sessions.js";
 
@@ -26,7 +26,7 @@ export class Controller {
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name" };
-  constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire) {
+  constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire, private readonly wait = sleep) {
     this.binding = new Binding(ctx, options.mcpName, () => this.latch("Native binding changed; explicitly enroll again"));
   }
   status(): Status { return { ...this.state }; }
@@ -143,6 +143,8 @@ export class Controller {
   }
   private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal) {
     let failures = 0, recoveries = 0, throttles = 0;
+    let pendingItem: string | undefined;
+    const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
       let wire: Wire | undefined;
       try {
@@ -156,7 +158,7 @@ export class Controller {
         const lease = leaseOf(await wire.call("delivery_open"), e);
         await this.guard(r, epoch, signal);
         r.lease = lease; wire.capability = lease.capability;
-        failures = 0; recoveries = 0;
+        recoveries = 0;
         this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
         let dirty = true, wake: (() => void) | undefined, closed = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
@@ -169,6 +171,10 @@ export class Controller {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
               await admitPrefix(items, async item => {
+                pendingItem = /^(direct|push):[1-9][0-9]*$/.test(item.id) ? item.id : `item#${createHash("sha256").update(item.id).digest("hex").slice(0, 12)}`;
+                const count = (attempts.get(item.id) ?? 0) + 1;
+                if (count > 8) throw new Refusal("paused", `Retry limit reached for ${pendingItem}; item remains unreceipted; explicitly enroll again`);
+                attempts.set(item.id, count);
                 if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity) throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_renew");
@@ -180,8 +186,9 @@ export class Controller {
               }, async ids => {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
+                for (const id of ids) attempts.delete(id);
+                failures = 0; throttles = 0; pendingItem = undefined;
               });
-              throttles = 0;
               if (items.length === 100) dirty = true;
             }
             if (closed) throw new Error("Subscription closed");
@@ -201,16 +208,16 @@ export class Controller {
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;
           if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
-        } else if (error instanceof Error && /identity_in_use|already in use|identity_unknown/.test(error.message)) throw error;
+        } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code)) throw error;
         else failures++;
         this.set(r, "retrying", `Revalidating the approved root before reopening delivery: ${error instanceof Error ? error.message : "transport failure"}`);
         if (wire?.admissionRetryAfterMs) {
           if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");
-          await sleep(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
-        } else await sleep(Math.min(8000, 250 * 2 ** failures), signal);
+          await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
+        } else await this.wait(Math.min(8000, 250 * 2 ** failures), signal);
       } finally { await wire?.close().catch(() => {}); }
     }
-    if (failures >= 8) throw new Error("Retry limit reached; explicitly enroll again");
+    if (failures >= 8) throw new Error(`Retry limit reached${pendingItem ? ` for ${pendingItem}; item remains unreceipted` : " before inbox progress"}; explicitly enroll again`);
   }
   private async stop(r: Root) { r.epoch++; r.abort?.abort(); await r.task; r.task = undefined; r.abort = undefined; }
   private async release(r: Root) {

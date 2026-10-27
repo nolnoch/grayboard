@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
-import { Wire } from "../src/wire.js";
+import { Wire, SubscriberError, LeaseUnavailable } from "../src/wire.js";
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
 export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", name: "be" };
 export const identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };
@@ -41,6 +41,26 @@ test("HTTP429 retry stops on observed drift or abort and ignores untyped refusal
     expect(result.tokens).toBe(1);
     expect(result.guards).toBe(mode === "guard" ? 1 : 0);
   }
+});
+test("subscriber errors use structured tool codes and SDK resource data, never human prose or numeric codes", async () => {
+  const wire = new Wire(enrollment.configuration, { token: async () => "native-secret" }, new AbortController().signal, enrollment.sessionID);
+  for (const code of ["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error"]) {
+    wire.client.callTool = async () => ({ isError: true, structuredContent: { code }, content: [{ type: "text", text: "Bearer native-secret\n at secret-token.ts:123" }] });
+    try { await wire.call("delivery_renew"); throw new Error("expected refusal"); }
+    catch (error) {
+      expect(error).toBeInstanceOf(SubscriberError);
+      expect((error as SubscriberError).code).toBe(code);
+      expect(error instanceof LeaseUnavailable).toBe(code === "not_found" || code === "unbound");
+      expect((error as Error).message).not.toContain("native-secret");
+      expect((error as Error).message).not.toContain("secret-token.ts");
+    }
+    wire.client.readResource = async () => { throw Object.assign(new Error("untrusted resource prose"), { code: -32602, data: { code } }); };
+    await expect(wire.read("grayboard://inbox")).rejects.toMatchObject({ code });
+  }
+  wire.client.callTool = async () => ({ isError: true, content: [{ type: "text", text: "identity_unknown: no live delivery lease" }] });
+  await expect(wire.call("delivery_renew")).rejects.toMatchObject({ code: "invalid_response" });
+  wire.client.readResource = async () => { throw Object.assign(new Error("transport failure"), { code: "not_found" }); };
+  await expect(wire.read("grayboard://inbox")).rejects.toMatchObject({ message: "transport failure" });
 });
 test("enrollment fingerprint pins all logical fields independently of key order", () => {
   const hash = enrollmentHash(enrollment);

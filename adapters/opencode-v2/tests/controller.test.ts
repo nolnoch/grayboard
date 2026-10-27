@@ -2,13 +2,13 @@ import { expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
-import { Wire, LeaseUnavailable } from "../src/wire.js";
+import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
 import type { Enrollment, Item } from "../src/model.js";
 import { fixture } from "./binding.test.js";
 
 type Row = { name: string | null; ownership: number; generation: number; capability?: string };
 async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }
-function runtime(options: { name?: string; create?: boolean } = {}) {
+function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: number, signal: AbortSignal) => Promise<void>) {
   const f = fixture(), rows = new Map<string, Row>(), nodes = new Map<string, { id: string; parentID?: string; time: { archived?: number }; metadata: Record<string, unknown> }>();
   const storage = new Map<string, unknown>(), calls: { sessionID: string; name: string; args: Record<string, unknown> }[] = [], admissions: { sessionID: string; id: string; resume: boolean }[] = [];
   const batches = new Map<string, Item[]>();
@@ -29,7 +29,7 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true, candidates: ["be", "fe"] } : {}) };
       if (name === "bind") {
-        if (refuseBind) throw new Error('identity_in_use: identity is already in use by the live session holder');
+        if (refuseBind) throw new SubscriberError("identity_in_use");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
         return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
       }
@@ -40,10 +40,10 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
         row.capability = (String(row.ownership) + String(row.generation)).padEnd(43, "a");
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
       }
-      if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable("no live delivery lease");
+      if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_receipt") {
         if (holdReceipt) { holdReceipt = false; throw new Error("receipt failed"); }
-        batches.set(this.sessionID, []);
+        batches.set(this.sessionID, (batches.get(this.sessionID) ?? []).filter(item => !(args.ids as string[]).includes(item.id)));
       }
       return { ok: true };
     }
@@ -63,11 +63,58 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
     },
     tool: { list: async () => ["bind", "dm_send", "whoami"].map(name => ({ id: `grayboard_${name}`, options: { namespace: "grayboard" } })) },
   } as unknown as Context;
-  const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire);
+  const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
   return { ctx, controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
+test("a poison item exhausts eight attempts despite successful same-lease opens, without receipts or skipping", async () => {
+  const waits: number[] = [];
+  const r = runtime({}, async ms => { waits.push(ms); });
+  try {
+    r.bind("R", "be");
+    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" })));
+    r.admission(async () => { throw new Error("synthetic refused"); });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "paused");
+    expect(r.admissions).toHaveLength(8);
+    expect(new Set(r.admissions.map(a => a.id)).size).toBe(1);
+    expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(8);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
+    expect(r.batches.get("R")).toHaveLength(2);
+    expect(r.controller.status().message).toContain("direct:1; item remains unreceipted");
+    expect(waits).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000, 8000]);
+  } finally { await r.controller.close(); }
+});
+test("a successful receipt alone resets progress budget for the next item", async () => {
+  const r = runtime({}, async () => {});
+  try {
+    r.bind("R", "be");
+    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" })));
+    let tries = 0;
+    r.admission(async () => { if (++tries !== 8) throw new Error("synthetic refused"); });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "paused");
+    expect(r.admissions).toHaveLength(16);
+    expect(r.calls.filter(c => c.name === "delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.batches.get("R")?.map(i => i.id)).toEqual(["direct:2"]);
+    expect(r.controller.status().message).toContain("direct:2; item remains unreceipted");
+  } finally { await r.controller.close(); }
+});
+test("repeated successful opens reset lease recovery but cannot erase one item's attempt budget", async () => {
+  const r = runtime({}, async () => {});
+  try {
+    r.bind("R", "be");
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.admission(async () => { throw new LeaseUnavailable(); });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "paused");
+    expect(r.admissions).toHaveLength(8);
+    expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(9);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
+    expect(r.controller.status().message).toContain("direct:1; item remains unreceipted");
+  } finally { await r.controller.close(); }
+});
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
   const r = runtime();
   try {

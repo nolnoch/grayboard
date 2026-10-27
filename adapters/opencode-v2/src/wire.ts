@@ -2,7 +2,18 @@ import { Client, StreamableHTTPClientTransport, type AuthProvider } from "@model
 import type { Configuration } from "./model.js";
 import { setTimeout as sleep } from "node:timers/promises";
 
-export class LeaseUnavailable extends Error {}
+export class SubscriberError extends Error {
+  constructor(readonly code: string) { super(`Subscriber refused (${code})`); }
+}
+export class LeaseUnavailable extends SubscriberError {
+  constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
+}
+const domainCodes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited"]);
+export function subscriberError(value: unknown, leaseOperation: boolean): SubscriberError {
+  const code = (value as { code?: unknown } | undefined)?.code;
+  const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain);
+}
 
 export class Wire {
   readonly client = new Client({ name: "grayboard-opencode", version: "1.10.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
@@ -48,16 +59,18 @@ export class Wire {
   readonly connect: () => Promise<void>;
   options() { return { signal: this.signal, timeout: 10_000 }; }
   async read(uri: string): Promise<unknown> {
-    const value = await this.client.readResource({ uri, _meta: { "ai.opencode/sessionID": this.sessionID } }, this.options());
+    const value = await this.client.readResource({ uri, _meta: { "ai.opencode/sessionID": this.sessionID } }, this.options()).catch(error => {
+      // The SDK reconstructs JSON-RPC errors with numeric code and domain data.code.
+      if (error?.code === -32602 || error?.code === -32603) throw subscriberError(error.data, uri === "grayboard://inbox");
+      throw error;
+    });
     if (value.contents.length !== 1 || !("text" in value.contents[0]!)) throw new Error("Invalid resource response");
     return JSON.parse(value.contents[0]!.text as string);
   }
   async call(name: string, args: Record<string, unknown> = {}): Promise<unknown> {
     const value = await this.client.callTool({ name, arguments: args, _meta: { "ai.opencode/sessionID": this.sessionID } }, this.options());
     if (value.isError) {
-      const message = value.content.filter(c => c.type === "text").map(c => c.text).join("\n");
-      if (/^delivery_/.test(name) && /no live delivery lease|delivery lease or item not found/.test(message)) throw new LeaseUnavailable(message);
-      throw new Error(message || "Delivery operation refused");
+      throw subscriberError(value.structuredContent, name.startsWith("delivery_"));
     }
     if (value.structuredContent) return value.structuredContent;
     const content = value.content;
