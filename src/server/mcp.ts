@@ -93,7 +93,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
     application.revalidateSession(context.session, true);
-    hosted.sweep();
+    if ("id" in context.sessionContext) {
+      const row = hosted.row(context.sessionContext.id);
+      const root = row && hosted.rootOf(row);
+      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.sweep();
+    }
   }
   async function select(request: Request): Promise<Context> {
     const role = hostedRole(request);

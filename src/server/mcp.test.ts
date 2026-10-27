@@ -55,6 +55,17 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 
+test("resource authorization does not sweep unrelated hosted roots", async () => {
+  const client = await connect();
+  await client.callTool({ name: "board_create", arguments: { name: "general", purpose: "resource fixture" } });
+  const sweep = spyOn(hosted.sessions, "sweep");
+  try {
+    const resource = await client.readResource({ uri: "grayboard://boards/general" });
+    expect(resource.contents).toHaveLength(1);
+    expect(sweep).not.toHaveBeenCalled();
+  } finally { sweep.mockRestore(); }
+});
+
 test("legacy identity headers cannot select or create names; explicit bind retains closest-name refusal", async () => {
   const client = await connect("2026-07-28", undefined, new Headers({ "X-Grayboard-Identity": "bee" }));
   const identity = await client.callTool({ name: "whoami", arguments: {} });

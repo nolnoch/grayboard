@@ -42,7 +42,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user || (root && rows.filter(r => r.root_session_id === root).length >= limits.children)) throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
   }
   const holders = new Map<string, { row: HostedSession; session: ApplicationSession }>();
-  const listeners = new Set<(row: HostedSession | undefined, id: string) => void>();
+  const listeners = new Set<() => void>();
   let stopped = false;
   const gate = (id: string) => {
     const enter = async <T>(writer: boolean, fn: () => Promise<T>): Promise<T> => {
@@ -112,9 +112,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         }) }, true);
       holders.set(row.session_id, { row, session });
     }
-    for (const listener of listeners) for (const id of new Set([...live.keys(), ...holders.keys()])) listener(store.get(id), id);
-    // Lease listeners also need roots which have just disappeared.
-    for (const listener of listeners) listener(undefined, "");
+    for (const listener of listeners) listener();
   }
   function sweep() {
     if (stopped) return;
@@ -181,7 +179,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     audit,
     reconcile,
     sweep,
-    listen(fn: (row: HostedSession | undefined, id: string) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    listen(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row)); },
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T): Promise<T> {
       return withGate(p, context, false, async row => {

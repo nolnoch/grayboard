@@ -30,6 +30,17 @@ beforeEach(() => {
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
+test("one reconciliation invalidates listeners once, not once per root", async () => {
+  for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
+  let invalidations = 0;
+  const unlisten = hosted.listen(() => { invalidations++; });
+  try {
+    database.repo.hosted.atomic(() => {});
+    expect(invalidations).toBe(1);
+    expect(database.repo.hosted.all().filter(row => row.name)).toHaveLength(4);
+  } finally { unlisten(); }
+});
+
 test("hosted source IDs attribute child writes and release only the root alias hold", async () => {
   const root = context("root"), child = context("child");
   if (!("id" in root) || !("id" in child)) throw new Error("fixture context");
