@@ -690,6 +690,36 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   return lane;
 }
 
+// What decides whether `handle` may post (or reply) on a board now: it can see
+// it, the parent is a post on it, and only a human starts an announcement.
+// Throws CoreError; writes nothing.
+function postGate(db: Database, handle: string, boardInput: string, parentId: number | null) {
+  const b = visibleBoard(db, handle, boardInput);
+  if (parentId !== null) {
+    const parent = getPost(db, parentId);
+    if (!parent || parent.board !== b.name) {
+      throw new CoreError(`parent_id ${parentId} is not a post on #${b.name}`);
+    }
+  }
+  const a = access(db);
+  const announce = b.name === a.announceBoard;
+  const human = isHuman(db, handle);
+  const announcement = announce && parentId === null;
+  if (announcement && !human) {
+    throw new CoreError(
+      `only your user starts posts on #${b.name}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
+    );
+  }
+  return { b, a, announce, human, announcement };
+}
+
+// post()'s access checks alone, for a caller that must refuse before a
+// deduplicated write replays a first answer (#296): a repeat to a board the
+// caller has since lost is refused, not replayed.
+export function checkPostAccess(db: Database, handle: string, boardInput: string, parentId: number | null): void {
+  postGate(db, handle, boardInput, parentId);
+}
+
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
 // reply wakes the author of the post it answers and the thread's starter;
@@ -703,24 +733,9 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const b = visibleBoard(db, handle, boardInput);
+  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId);
   const board = b.name;
   checkBody(body);
-  if (parentId !== null) {
-    const parent = getPost(db, parentId);
-    if (!parent || parent.board !== board) {
-      throw new CoreError(`parent_id ${parentId} is not a post on #${board}`);
-    }
-  }
-  const a = access(db);
-  const announce = board === a.announceBoard;
-  const human = isHuman(db, handle);
-  const announcement = announce && parentId === null;
-  if (announcement && !human) {
-    throw new CoreError(
-      `only your user starts posts on #${board}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
-    );
-  }
   if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
   if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");

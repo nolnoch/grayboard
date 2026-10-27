@@ -247,6 +247,22 @@ describe("dedup and state answers (in process)", () => {
     expect(await be.call("board_post", { board: "e2e", body: [[1]] })).toMatchObject({ type: "error", code: "bad_request", message: "body must be a string" });
   });
 
+  // #296: the access checks run before the receipt lookup, so a repeat from a
+  // caller who has since lost the board is refused, not answered with the first post's result.
+  test("board_post: a repeat after the caller lost the board is refused, not replayed", async () => {
+    expect((await srv.api(you, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const be = await session("be");
+    const first = await be.call("board_post", { board: "eng", body: "ship it" });
+    expect(first.type).toBe("call_ok");
+    const postId = first.result.post_id as number;
+    // The same session, still inside the window, repeats: replayed while the board is visible.
+    expect((await be.call("board_post", { board: "eng", body: "ship it" })).result.replayed.ref.id).toBe(postId);
+
+    expect((await srv.api(you, "POST", "/api/teams/eng/leave")).status).toBe(200);
+    expect(await be.call("board_post", { board: "eng", body: "ship it" })).toMatchObject({ type: "error", code: "bad_request", message: "no such board #eng; see board_list" });
+    expect(n("SELECT COUNT(*) AS n FROM posts WHERE body = 'ship it'")).toBe(1);
+  });
+
   test("the window runs on the hub's clock: a repeat after it sends", async () => {
     await offline("fe");
     const be = await session("be");

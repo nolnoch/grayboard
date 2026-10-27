@@ -12,6 +12,7 @@ import {
   acknowledge,
   age,
   checkBody,
+  checkPostAccess,
   lastSeen,
   normalizeBoard,
   parseAliasMeta,
@@ -1352,6 +1353,8 @@ function handleBoardPost(hub: Hub, ws: Ws, reqId: string, me: string, args: Reco
     // Checked before it's fingerprinted: a non-string body is a bad request, not a canonicalJson failure.
     if (typeof postArgs.body !== "string") throw new CoreError("body must be a string");
     const ids = attachmentIds(postArgs.attachment_ids);
+    // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
+    checkPostAccess(db, me, postArgs.board, typeof postArgs.parent_id === "number" ? postArgs.parent_id : null);
     const fp = {
       board: normalizeBoard(postArgs.board),
       body: postArgs.body,
