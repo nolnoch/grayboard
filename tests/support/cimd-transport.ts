@@ -20,6 +20,7 @@ const peer = https.createServer({ key: readFileSync(key), cert: ca }, (req, res)
   assert.equal(req.headers.host, `client.example:${port}`);
   assert.equal((req.socket as import("node:tls").TLSSocket).servername, "client.example");
   if (mode === "redirect") { res.writeHead(302, { location: "https://127.0.0.1/private" }); res.end(); return; }
+  if (mode === "upstream") { res.writeHead(503); res.end(); return; }
   res.writeHead(200, { "content-type": "application/json" });
   if (mode === "slow") return;
   res.end(mode === "oversize" ? "x".repeat(32769) : mode === "utf8" ? Buffer.from([0xff]) : metadata);
@@ -52,13 +53,14 @@ mock.module("node:https", () => ({ request: (url: URL, options: https.RequestOpt
 } }));
 const { createCimdResolver } = await import("../../src/server/oauth-cimd.ts");
 try {
-  for (const scenario of ["ok4", "ok6", "redirect", "oversize", "utf8", "untrusted", "wrong-name", "slow"]) {
+  for (const scenario of ["ok4", "ok6", "redirect", "oversize", "utf8", "untrusted", "wrong-name", "upstream", "slow"]) {
     mode = scenario.startsWith("ok") ? "ok" : scenario;
     family = scenario === "ok6" ? 6 : 4;
     const beforeHits = hits, beforeRequests = requests, start = Date.now();
     const resolver = createCimdResolver({ resolve: async () => [{ address: family === 4 ? "8.8.8.8" : "2606:4700:4700::1111", family }] });
     try {
-      assert.equal(!!(await resolver.resolve(id)), mode === "ok", scenario);
+      if (["untrusted", "wrong-name", "upstream", "slow"].includes(mode)) await assert.rejects(resolver.resolve(id), /temporarily unavailable/);
+      else assert.equal(!!(await resolver.resolve(id)), mode === "ok", scenario);
       assert.equal(requests - beforeRequests, 1, "redirects are never followed");
       assert.equal(hits - beforeHits, ["untrusted", "wrong-name"].includes(mode) ? 0 : 1, scenario);
       if (mode === "slow") assert.ok(Date.now() - start >= 4900 && Date.now() - start < 6500);
@@ -67,7 +69,7 @@ try {
   }
   assert.ok(errors.includes("DEPTH_ZERO_SELF_SIGNED_CERT"), JSON.stringify(errors));
   assert.ok(errors.includes("ERR_TLS_CERT_ALTNAME_INVALID"), JSON.stringify(errors));
-  assert.equal(lookups, 8);
+  assert.equal(lookups, 9);
 } finally {
   peer.closeAllConnections();
   await new Promise<void>(resolve => peer.close(() => resolve()));

@@ -5,7 +5,7 @@ import type { Repo } from "./db.ts";
 import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
-import { createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
+import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
 
 export type OAuthPrincipal = {
   authed: AuthedUser; grantId: string; clientId: string; scopes: string[]; accessHash: string; accessExpiry: number;
@@ -392,6 +392,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     async fetch(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
       try { return await route(req, context); }
       catch (e) {
+        if (e instanceof CimdUnavailable) return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "30" });
         if (e instanceof OAuthError) return json({ error: e.error }, e.status, e.error === "invalid_client" ? { "WWW-Authenticate": "Basic realm=\"oauth\"" } : {});
         return json({ error: "server_error" }, 500);
       }

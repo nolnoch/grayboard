@@ -3,6 +3,11 @@ import { request } from "node:https";
 import { BlockList, isIP } from "node:net";
 import { OAUTH_SCOPES, validateRedirect, type OAuthClient } from "./oauth-config.ts";
 
+export class CimdUnavailable extends Error {
+  constructor() { super("CIMD temporarily unavailable"); }
+}
+class InvalidMetadata extends Error {}
+
 const blocked = new BlockList();
 for (const [address, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3]] as const) blocked.addSubnet(address, prefix);
 for (const [address, prefix] of [["2001::", 23], ["2001:db8::", 32], ["2002::", 16], ["3fff::", 20]] as const) blocked.addSubnet(address, prefix, "ipv6");
@@ -28,17 +33,18 @@ export type CimdOptions = {
 function readPinned(url: URL, address: Address, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = request(url, { agent: false, signal, lookup: (_host, options, callback) => options.all ? callback(null, [address]) : callback(null, address.address, address.family), headers: { Accept: "application/json" } }, response => {
-      if (response.statusCode !== 200 || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:;|$)/i.test(response.headers["content-type"] ?? "")) { response.destroy(); reject(new Error("invalid CIMD response")); return; }
+      if ((response.statusCode ?? 500) >= 500 || response.statusCode === 429) { response.destroy(); reject(new CimdUnavailable()); return; }
+      if (response.statusCode !== 200 || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:;|$)/i.test(response.headers["content-type"] ?? "")) { response.destroy(); reject(new InvalidMetadata("invalid CIMD response")); return; }
       const chunks: Buffer[] = [];
       let bytes = 0;
       response.on("data", chunk => {
         bytes += chunk.length;
-        if (bytes > 32_768) { response.destroy(new Error("CIMD document too large")); return; }
+        if (bytes > 32_768) { response.destroy(new InvalidMetadata("CIMD document too large")); return; }
         chunks.push(Buffer.from(chunk));
       });
       response.on("error", reject);
       response.on("end", () => {
-        try { resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); } catch (e) { reject(e); }
+        try { resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); } catch { reject(new InvalidMetadata("invalid UTF-8")); }
       });
     });
     req.on("error", reject);
@@ -56,7 +62,8 @@ export function parseCimd(id: string, text: string): OAuthClient {
 }
 export function createCimdResolver(options: CimdOptions = {}) {
   const now = options.now ?? Date.now;
-  const cache = new Map<string, { until: number; client?: OAuthClient }>();
+  const cache = new Map<string, { until: number; client: OAuthClient }>();
+  const failures = new Map<string, { until: number; transient: boolean }>();
   const pending = new Map<string, Promise<OAuthClient | undefined>>();
   const controllers = new Set<AbortController>();
   let closed = false;
@@ -66,11 +73,15 @@ export function createCimdResolver(options: CimdOptions = {}) {
       let url: URL;
       try { url = metadataUrl(id); } catch { return; }
       for (const [key, item] of cache) if (item.until <= now()) cache.delete(key);
+      for (const [key, item] of failures) if (item.until <= now()) failures.delete(key);
       const cached = cache.get(id);
       if (cached) return cached.client;
+      const failure = failures.get(id);
+      if (failure?.transient) throw new CimdUnavailable();
+      if (failure) return;
       const inflight = pending.get(id);
       if (inflight) return inflight;
-      if (pending.size >= 8 || cache.size >= 128) return;
+      if (pending.size >= 8 || cache.size + pending.size >= 128) throw new CimdUnavailable();
       const controller = new AbortController();
       controllers.add(controller);
       let timer: ReturnType<typeof setTimeout>;
@@ -78,22 +89,28 @@ export function createCimdResolver(options: CimdOptions = {}) {
         try {
           const load = async () => {
             const addresses = await (options.resolve ?? (host => lookup(host, { all: true, verbatim: true })))(url.hostname);
-            if (!addresses.length || addresses.length > 32 || addresses.some(a => !publicAddress(a.address) || isIP(a.address) !== a.family)) throw new Error("unsafe CIMD DNS answer");
+            if (!addresses.length) throw new CimdUnavailable();
+            if (addresses.length > 32 || addresses.some(a => !publicAddress(a.address) || isIP(a.address) !== a.family)) throw new InvalidMetadata("unsafe CIMD DNS answer");
             if (controller.signal.aborted) throw new Error("CIMD fetch aborted");
-            return parseCimd(id, await (options.read ?? readPinned)(url, addresses[0]!, controller.signal));
+            const text = await (options.read ?? readPinned)(url, addresses[0]!, controller.signal);
+            try { return parseCimd(id, text); } catch { throw new InvalidMetadata("invalid CIMD metadata"); }
           };
           const client = await Promise.race([load(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("CIMD timeout")); }, 5000); })]);
           if (closed) return;
           cache.set(id, { until: now() + 300_000, client });
           return client;
-        } catch {
-          if (!closed) cache.set(id, { until: now() + 30_000 });
+        } catch (error) {
+          if (closed) return;
+          const transient = !(error instanceof InvalidMetadata);
+          if (failures.size >= 128) failures.delete(failures.keys().next().value!);
+          failures.set(id, { until: now() + 30_000, transient });
+          if (transient) throw new CimdUnavailable();
           return undefined;
         } finally { clearTimeout(timer!); controllers.delete(controller); pending.delete(id); }
       })();
       pending.set(id, work);
       return work;
     },
-    close() { closed = true; for (const controller of controllers) controller.abort(); cache.clear(); },
+    close() { closed = true; for (const controller of controllers) controller.abort(); cache.clear(); failures.clear(); },
   };
 }

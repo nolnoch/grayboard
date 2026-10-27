@@ -5,7 +5,7 @@ import { matchesRedirect } from "./oauth-config.ts";
 test("production HTTPS lookup preserves both callback shapes, pinning and TLS/response guards", async () => {
   const proc = Bun.spawn([process.execPath, new URL("../../tests/support/cimd-transport.ts", import.meta.url).pathname], { stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-  expect({ exit, stderr, stdout }).toEqual({ exit: 0, stderr: "", stdout: "PASS ok4\nPASS ok6\nPASS redirect\nPASS oversize\nPASS utf8\nPASS untrusted\nPASS wrong-name\nPASS slow\n" });
+  expect({ exit, stderr, stdout }).toEqual({ exit: 0, stderr: "", stdout: "PASS ok4\nPASS ok6\nPASS redirect\nPASS oversize\nPASS utf8\nPASS untrusted\nPASS wrong-name\nPASS upstream\nPASS slow\n" });
 }, 15000);
 
 const id = "https://opencode.ai/oauth/opencode/client.json";
@@ -46,7 +46,7 @@ test("CIMD bounds parallel metadata work and aborts outstanding connections on c
   }) });
   const pending = Array.from({ length: 8 }, (_, i) => resolver.resolve(`https://client-${i}.example/client.json`));
   await allStarted;
-  expect(await resolver.resolve("https://overflow.example/client.json")).toBeUndefined();
+  await expect(resolver.resolve("https://overflow.example/client.json")).rejects.toThrow("temporarily unavailable");
   expect(reads).toBe(8);
   resolver.close();
   expect(await Promise.all(pending)).toEqual(Array(8).fill(undefined));
@@ -56,7 +56,7 @@ test("CIMD bounds parallel metadata work and aborts outstanding connections on c
 
 test("CIMD metadata deadline includes a stalled DNS lookup", async () => {
   const resolver = createCimdResolver({ resolve: () => new Promise(() => {}) });
-  try { expect(await resolver.resolve(id)).toBeUndefined(); } finally { resolver.close(); }
+  try { await expect(resolver.resolve(id)).rejects.toThrow("temporarily unavailable"); } finally { resolver.close(); }
 }, 7000);
 
 test("a mixed public/private DNS answer is refused before any connection and failures are negatively cached", async () => {
@@ -67,4 +67,29 @@ test("a mixed public/private DNS answer is refused before any connection and fai
     expect(await resolver.resolve(id)).toBeUndefined(); expect(dns).toBe(1);
     now = 30001; expect(await resolver.resolve(id)).toBeUndefined(); expect(dns).toBe(2);
   } finally { resolver.close(); }
+});
+
+test("bounded negative cache cannot evict or saturate positive metadata entries", async () => {
+  let reads = 0;
+  const resolver = createCimdResolver({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async url => { reads++; return url.href === id || url.hostname === "valid.example" ? document(url.href) : "invalid"; } });
+  try {
+    expect((await resolver.resolve(id))?.clientId).toBe(id);
+    for (let i = 0; i < 300; i++) expect(await resolver.resolve(`https://bad-${i}.example/client.json`)).toBeUndefined();
+    const before = reads;
+    expect((await resolver.resolve(id))?.clientId).toBe(id);
+    expect(reads).toBe(before);
+    expect((await resolver.resolve("https://valid.example/client.json"))?.clientId).toBe("https://valid.example/client.json");
+  } finally { resolver.close(); }
+});
+
+test("DNS and TLS outages remain transient and are negatively cached separately", async () => {
+  for (const phase of ["dns", "tls"] as const) {
+    let calls = 0;
+    const resolver = createCimdResolver({ resolve: async () => { calls++; if(phase === "dns") throw new Error("DNS unavailable"); return [{address:"8.8.8.8",family:4}]; }, read: async () => { throw new Error("TLS unavailable"); } });
+    try {
+      await expect(resolver.resolve(id)).rejects.toThrow("temporarily unavailable");
+      await expect(resolver.resolve(id)).rejects.toThrow("temporarily unavailable");
+      expect(calls).toBe(1);
+    } finally { resolver.close(); }
+  }
 });

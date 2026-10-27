@@ -172,6 +172,30 @@ test("preregistered clients retain the explicit manual callback flow", async () 
   expect((await redeem(a)).access_token).toMatch(/^[\w-]{43}$/);
 });
 
+test("CIMD outage during refresh or revocation returns retryable 503 without burning credentials", async () => {
+  service.close();
+  const clientId = "https://client.example/metadata.json";
+  let outage = false;
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => {
+    if (outage) throw new Error("upstream unavailable");
+    return JSON.stringify({client_id:clientId,client_name:"Client",redirect_uris:["http://127.0.0.1/callback"],token_endpoint_auth_method:"none"});
+  } });
+  const issued = await issue(clientId);
+  const tokens = await redeem(issued);
+  const grant = principal(tokens).grantId;
+  clock += 300_001; outage = true;
+  for (const [path, params] of [["/oauth/token", {grant_type:"refresh_token",refresh_token:tokens.refresh_token}], ["/oauth/revoke", {token:tokens.refresh_token}]] as const) {
+    const result = await post(path, {client_id:clientId,...params});
+    expect(result.status).toBe(503);
+    expect(await result.json()).toEqual({error:"temporarily_unavailable"});
+    expect(service.isGrantActive(grant)).toBe(true);
+  }
+  clock += 30_001; outage = false;
+  const refreshed = await post("/oauth/token", {client_id:clientId,grant_type:"refresh_token",refresh_token:tokens.refresh_token});
+  expect(refreshed.status).toBe(200);
+  expect(principal(await refreshed.json() as Tokens).grantId).toBe(grant);
+});
+
 class Browser {
   jar = new Map<string, string>();
   get cookie() { return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "); }
@@ -411,6 +435,8 @@ test("browser state, cookies, Origin, one-use CSRF, denial and restart invalidat
 });
 
 test("trusted authorization errors redirect with state/issuer; untrusted or ambiguous requests remain local", async () => {
+  service.close();
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => "invalid metadata" });
   const a = authorization();
   a.state = "opaque + &=/ state";
   const original = new URL(a.url); original.searchParams.set("state", a.state); a.url = original.href;
