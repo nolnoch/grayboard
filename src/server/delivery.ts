@@ -14,7 +14,7 @@ export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): bool
 type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
-  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
+  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
 const notify = (fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(() => {}); } catch {} };
 function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
@@ -40,7 +40,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
     application.close(lease.session);
-    lease.issued.clear(); notify(lease.hooks.closed);
+    lease.issued.clear(); lease.acknowledged.clear(); notify(lease.hooks.closed);
   }
   function matches(lease: Lease, row?: HostedSession) {
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
@@ -87,7 +87,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           closed() { if (lease) finish(lease); },
         }, false, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
-          ownership: row.ownership_id, generation: row.bind_gen, name: row.name!, session: selected.session, identity: selected.info, hooks, issued: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
+          ownership: row.ownership_id, generation: row.bind_gen, name: row.name!, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
         leases.set(lease.capability, lease);
         return opened(lease, true, hooks);
       });
@@ -104,7 +104,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       attempts.delete(result);
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
-      return hosted.control(p, context, true, row => {
+      return hosted.control(p, context, false, row => {
         const { lease, deadline } = store.atomic(() => {
           const fresh = store.get(row.session_id);
           const lease = get(p, context, capability, fresh), deadline = now() + ttl;
@@ -138,7 +138,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           const lease = get(p, context, capability, row);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
-          const records = ids.map(id => lease.issued.get(id) ?? stale(p, context, capability));
+          const records = ids.map(id => lease.issued.get(id) ?? lease.acknowledged.get(id) ?? stale(p, context, capability));
           for (const r of records) {
             if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || r.item.name !== row.name) stale(p, context, capability);
             if (r.item.event.kind === "board" && !application.canReceiveBoard(lease.session, r.item.event.item.kind === "push" ? r.item.event.item.post.board : r.item.event.item.board)) stale(p, context, capability);
@@ -151,9 +151,14 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           }
           application.receiptDirect(lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
           application.receiptBoards(lease.session, records.filter(r => !r.acked && r.ref).map(r => r.ref!));
-          return records;
+          return { lease, records };
         });
-        for (const r of records) r.acked = true;
+        for (const r of records.records) {
+          r.acked = true;
+          records.lease.issued.delete(r.item.id);
+          records.lease.acknowledged.set(r.item.id, r);
+        }
+        while (records.lease.acknowledged.size > 1000) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
       });
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {

@@ -231,19 +231,46 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   expect(delivery.describe(bob, context(bob), first.capability).capability).toBe(first.capability);
 });
 
-test("issued receipt capacity applies backpressure without evicting older receipt evidence", async () => {
+test("one lease admits more than 1000 deliveries with bounded idempotent receipt history", async () => {
   const lease = await delivery.open(bob, context(bob));
-  for (let i = 0; i < 1000; i++) send(`message ${i}`);
+  for (let i = 0; i < 1100; i++) send(`message ${i}`);
   let firstId = "";
-  for (let i = 0; i < 10; i++) {
+  let latest: string[] = [];
+  for (let i = 0; i < 11; i++) {
     const batch = await delivery.pending(bob, context(bob), lease.capability);
+    expect(batch).toHaveLength(100);
     firstId ||= batch[0]!.id;
-    await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+    latest = batch.map(item => item.id);
+    await delivery.receipt(bob, context(bob), lease.capability, latest);
+    await delivery.receipt(bob, context(bob), lease.capability, latest);
   }
-  send("over capacity");
-  await expect(delivery.pending(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "bad_request");
-  await delivery.receipt(bob, context(bob), lease.capability, [firstId]);
+  const cursor = store.repo.cursors.directFor("bob@example.com/fe");
+  await expect(delivery.receipt(bob, context(bob), lease.capability, [firstId])).rejects.toHaveProperty("code", "not_found");
+  expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(cursor);
+  expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
+  expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   expect(delivery.activeLeaseCount).toBe(1);
+});
+
+test("renew completes while a transfer holds the reader gate past the original deadline", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const transfer = hosted.transfer(bob, context(bob), async (_session, guard) => {
+    entered(); await held; guard();
+  });
+  await started;
+  try {
+    now += 20_000;
+    const renewed = await delivery.renew(bob, context(bob), lease.capability);
+    expect(renewed.expiresAt).toBe(now + 30_000);
+    now += 20_000;
+    hosted.sweep();
+    expect(delivery.activeLeaseCount).toBe(1);
+    expect(delivery.describe(bob, context(bob), lease.capability).ownership).toBe(lease.ownership);
+  } finally { release(); }
+  await transfer;
 });
 
 test("reattachment on successful open invalidates old grant capabilities", async () => {
