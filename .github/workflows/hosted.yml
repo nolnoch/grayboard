@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [strict, git, config, public, host, live, matrix, native, durable]
+        suite: [strict, git, config, host, matrix, native, durable]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,7 +31,6 @@ jobs:
       - name: Run hosted ${{ matrix.suite }}
         env:
           GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/hosted-run
-          GRAYBOARD_PUBLIC_REVISION: "4604e8b8fe0cdcbacfc5edf3ef8f169a6733ac58"
           SUITE: ${{ matrix.suite }}
         run: bash scripts/e2e.sh "hosted-$SUITE"
 

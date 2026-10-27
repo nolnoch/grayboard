@@ -49,6 +49,15 @@ jobs:
   hosted:
     uses: ./.github/workflows/hosted.yml
 
+  hosted-network:
+    name: Hosted network warnings and release gate
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: hosted-network
+
   build:
     name: Build ${{ matrix.target }}
     needs: [test, hosted]
@@ -152,7 +161,7 @@ jobs:
   # environment holds: a v* tag run its required reviewer approves (#162).
   release:
     name: Publish release
-    needs: [build, e2e, upgrade-matrix]
+    needs: [build, e2e, upgrade-matrix, hosted-network]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
@@ -242,3 +251,13 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
           fail_on_unmatched_files: true
+
+  hosted-post-release:
+    name: Verify published hosted source
+    needs: release
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: hosted-network
