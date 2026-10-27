@@ -8,6 +8,7 @@ import type { Delivery } from "./delivery.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { isValidIdentityName } from "../shared/addressing.ts";
 
 export type HostedRole = "native" | "subscriber";
 export function hostedRole(request: Request): HostedRole {
@@ -23,13 +24,33 @@ const json = (uri: string, value: unknown) => ({ contents: [{ uri, mimeType: "ap
 const expected = (error: unknown): error is ApplicationError | CoreError => error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError;
 const message = (error: unknown) => expected(error) ? error.message : "internal error";
 const domainCode = (error: unknown) => error instanceof ApplicationError && error.code !== "internal" ? error.code : error instanceof CoreError ? "refused" : "internal_error";
+function domainData(error: unknown): { code: string; known?: string[] } {
+  const result: { code: string; known?: string[] } = { code: domainCode(error) };
+  if (!(error instanceof ApplicationError) || result.code !== "identity_unknown") return result;
+  try {
+    const extra = Object.getOwnPropertyDescriptor(error, "extra")?.value;
+    if (!extra || typeof extra !== "object") return result;
+    const names = Object.getOwnPropertyDescriptor(extra, "known")?.value;
+    if (!Array.isArray(names)) return result;
+    const count = Object.getOwnPropertyDescriptor(names, "length")?.value;
+    if (!Number.isInteger(count) || count < 0 || count > 256) return result;
+    const known: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const name = Object.getOwnPropertyDescriptor(names, String(i))?.value;
+      if (typeof name !== "string" || name.length > 32 || !isValidIdentityName(name)) return result;
+      known.push(name);
+    }
+    result.known = known;
+  } catch {}
+  return result;
+}
 const resourceError = (error: unknown) => {
   if (!expected(error)) hostedFailure("mcp.resource");
-  return new ProtocolError(expected(error) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, message(error), { code: domainCode(error) });
+  return new ProtocolError(expected(error) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, message(error), domainData(error));
 };
 const toolError = (error: unknown) => {
   if (!expected(error)) hostedFailure("mcp.subscriber");
-  return { isError: true, structuredContent: { code: domainCode(error) }, content: [{ type: "text" as const, text: `error: ${message(error)}` }] };
+  return { isError: true, structuredContent: domainData(error), content: [{ type: "text" as const, text: `error: ${message(error)}` }] };
 };
 
 function boardRead(uri: string) {

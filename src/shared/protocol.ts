@@ -144,6 +144,7 @@ export type ServerMessage =
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
   | "rate_limited" | "internal" | "superseded"
+  | "receipt_capacity"
   // hello refused: another live connection holds this identity
   | "identity_in_use"
   // hello refused: create: false and the name has never existed

@@ -131,7 +131,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         get(p, context, capability);
         const items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
         const unseen = items.filter(item => !lease.issued.has(item.id));
-        if (lease.issued.size + unseen.length > 1000) throw new ApplicationError("bad_request", "delivery lease receipt capacity reached; release and reopen");
+        if (lease.issued.size + unseen.length > 1000) throw new ApplicationError("receipt_capacity", "delivery lease receipt capacity reached; release and reopen");
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), acked: false, ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         return items;
       }).catch(error => refused(p, context, error));

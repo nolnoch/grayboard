@@ -12,6 +12,7 @@ import { createOAuthServer } from "./oauth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { OPENCODE_CLIENT, sessionContext } from "./hosted.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
+import { createBoard, post, subscribe } from "../core/boards.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
@@ -77,6 +78,72 @@ test("subscriber errors preserve domain codes through actual SDK tool and resour
   headers.set("X-Grayboard-Lease", cap);
   try { await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ code: -32602, data: { code: "unbound" } }); }
   finally { hosted.delivery.pending = original; }
+});
+
+test("receipt capacity is structured and release then bind false reopens under a fresh ownership", async () => {
+  const headers = new Headers(), client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await client.callTool({ name: "delivery_open", arguments: {} });
+  const first = JSON.parse((opened.content as { text: string }[])[0]!.text);
+  headers.set("X-Grayboard-Lease", first.capability);
+  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  createBoard(store.db, "alice@example.com/be", "capacity", "digest receipt bound");
+  subscribe(store.db, "alice@example.com/be", "capacity", "digest");
+  for (let i = 0; i < 1000; i++) {
+    post(store.db, "alice@example.com/sender", "capacity", `version ${i}`);
+    await hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability);
+  }
+  post(store.db, "alice@example.com/sender", "capacity", "overflow");
+  await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ data: { code: "receipt_capacity" } });
+  const renew = hosted.delivery.renew;
+  hosted.delivery.renew = async () => { throw new ApplicationError("receipt_capacity", "receipt capacity reached"); };
+  try { expect((await client.callTool({ name: "delivery_renew", arguments: {} })).structuredContent).toEqual({ code: "receipt_capacity" }); }
+  finally { hosted.delivery.renew = renew; }
+  const alias = store.repo.aliases.find(grant.authed.user_email, "be");
+  await client.callTool({ name: "delivery_release", arguments: {} });
+  expect((await client.callTool({ name: "bind", arguments: { name: "be", create: false } })).isError).not.toBe(true);
+  const replacement = JSON.parse(((await client.callTool({ name: "delivery_open", arguments: {} })).content as { text: string }[])[0]!.text);
+  expect(replacement.capability).not.toBe(first.capability);
+  expect(replacement.ownership).not.toBe(first.ownership);
+  headers.set("X-Grayboard-Lease", replacement.capability);
+  expect((await client.readResource({ uri: "grayboard://inbox" })).contents).toHaveLength(1);
+  expect(store.repo.aliases.find(grant.authed.user_email, "be")).toEqual(alias);
+  await expect(hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability)).rejects.toHaveProperty("code", "not_found");
+});
+
+test("subscriber known suggestions stay account scoped and reject malformed extra fields without getters", async () => {
+  const bob = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
+  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${bob.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "private-name", create: true });
+  const client = await connect("2026-07-28");
+  expect((await client.callTool({ name: "bind", arguments: { name: "missing" } })).structuredContent).toEqual({ code: "identity_unknown", known: ["be"] });
+  const bind = hosted.sessions.bind;
+  let reads = 0;
+  const extra = Object.defineProperty({}, "known", { get() { reads++; throw new Error("PRIVATE"); } });
+  hosted.sessions.bind = async () => { throw new ApplicationError("identity_unknown", "unknown name", extra); };
+  try {
+    expect((await client.callTool({ name: "bind", arguments: { name: "missing" } })).structuredContent).toEqual({ code: "identity_unknown" });
+    for (const known of [["be", 1], "be", Array(257).fill("be"), ["x".repeat(33)]]) {
+      hosted.sessions.bind = async () => { throw new ApplicationError("identity_unknown", "unknown name", Object.defineProperty({}, "known", { value: known })); };
+      expect((await client.callTool({ name: "bind", arguments: { name: "missing" } })).structuredContent).toEqual({ code: "identity_unknown" });
+    }
+  }
+  finally { hosted.sessions.bind = bind; }
+  expect(reads).toBe(0);
+  const headers = new Headers();
+  const reader = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await reader.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", JSON.parse((opened.content as { text: string }[])[0]!.text).capability);
+  const pending = hosted.delivery.pending;
+  try {
+    hosted.delivery.pending = async () => { throw new ApplicationError("identity_unknown", "unknown name", { known: ["be"], holder: "PRIVATE" }); };
+    const refused = await reader.readResource({ uri: "grayboard://inbox" }).then(() => undefined, error => error);
+    expect(refused.data).toEqual({ code: "identity_unknown", known: ["be"] });
+    hosted.delivery.pending = async () => { throw Object.defineProperty(new Error(), "message", { get() { reads++; throw new Error("PRIVATE"); } }); };
+    await expect(reader.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ data: { code: "internal_error" }, message: "internal error" });
+    expect(reads).toBe(0);
+  } finally { hosted.delivery.pending = pending; }
 });
 
 test("hosted audit actors and clients survive grant deletion and ownership cleanup", async () => {

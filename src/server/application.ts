@@ -23,6 +23,7 @@ export type ApplicationCode =
   | "unauthenticated"
   | "forbidden"
   | "bad_request"
+  | "receipt_capacity"
   | "not_found"
   | "internal"
   | "superseded"
