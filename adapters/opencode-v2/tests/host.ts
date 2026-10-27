@@ -8,7 +8,7 @@ import { instrument, type NativeInput, type NativeAdmission } from "./effect-ins
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
@@ -30,7 +30,7 @@ const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed
 const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
-const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HELLO_LIMIT : { burst: 10000, perSec: 10000 } };
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 } };
 const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
@@ -164,7 +164,7 @@ try {
     let last: Response | undefined;
     await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
     let refused = false;
-    for (let id = 0; id < 100; id++) {
+    for (let id = 0; id < DEFAULT_HOSTED_REQUEST_LIMIT.burst * 2; id++) {
       const raw = "refused-admission-" + id;
       try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
       catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
