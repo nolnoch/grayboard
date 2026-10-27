@@ -28,7 +28,9 @@ export class Controller {
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name", roots: [] };
   private readonly diagnostics: Diagnostics;
+  private readonly directory: string;
   constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire, private readonly wait = sleep, sink?: DiagnosticSink) {
+    this.directory = ctx.location.directory;
     this.diagnostics = new Diagnostics(ctx.storage, sink);
     this.binding = new Binding(ctx, options.mcpName, () => this.latch("Native binding changed; explicitly enroll again"));
   }
@@ -74,7 +76,7 @@ export class Controller {
   }
   private async guard(r: Root, epoch: number, signal: AbortSignal) {
     const e = r.e, hash = enrollmentHash(e);
-    const check = () => { if (this.stopped || this.drifted || r.paused || signal.aborted || r.epoch !== epoch || this.roots.get(e.sessionID) !== r || enrollmentHash(r.e) !== hash) throw new Refusal("paused", "Admission target changed"); };
+    const check = () => { if (this.ctx.location.directory !== this.directory || this.stopped || this.drifted || r.paused || signal.aborted || r.epoch !== epoch || this.roots.get(e.sessionID) !== r || enrollmentHash(r.e) !== hash) throw new Refusal("paused", "Admission target changed"); };
     check();
     await this.binding.check(e);
     const session = await this.activeRoot(e.sessionID);
@@ -124,19 +126,30 @@ export class Controller {
     this.watches.set(sessionID, await this.binding.watch(e));
     this.set(r, "approved", "Root approved; bind a name to receive deliveries");
     try {
-      if (name) await this.temporary(e, w => w.call("bind", { name, create, where: this.ctx.location.directory }));
+      if (name) {
+        const epoch = r.epoch, signal = new AbortController().signal;
+        await this.temporary(e, async w => {
+          await this.guard(r, epoch, signal);
+          await w.call("bind", { name, create, where: this.ctx.location.directory });
+          await this.guard(r, epoch, signal);
+        });
+      }
       await this.prepare(r, !!previous?.paused && !name);
     } catch (error) { this.set(r, "approved", `Root approval saved; ${failureMessage(error)}`, "enroll", failureCode(error)); }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
   private async prepare(r: Root, resume = false) {
-    const epoch = r.epoch;
+    const epoch = r.epoch, signal = new AbortController().signal;
     await this.temporary(r.e, async wire => {
+      await this.guard(r, epoch, signal);
       let current = bindingOf(await wire.call("whoami"));
+      await this.guard(r, epoch, signal);
       if (!current.name && r.e.name && resume) {
         await wire.call("bind", { name: r.e.name, create: false, where: this.ctx.location.directory });
+        await this.guard(r, epoch, signal);
         current = bindingOf(await wire.call("whoami"));
+        await this.guard(r, epoch, signal);
       }
       if (r.epoch !== epoch || r.paused || this.stopped) return;
       if (!current.name) { this.set(r, "unbound", "Root approved, unbound; bind(name) to take one"); return; }
@@ -164,10 +177,13 @@ export class Controller {
       try {
         await this.guard(r, epoch, signal);
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
+        await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
+        await this.guard(r, epoch, signal);
         if (!current.name) {
           r.lease = undefined;
           await wire.call("bind", { name: e.name, create: false, where: this.ctx.location.directory });
+          await this.guard(r, epoch, signal);
         } else if (current.name !== e.name) throw new Refusal("identity", "Root binding changed without a native completion; explicitly enroll again");
         const lease = leaseOf(await wire.call("delivery_open"), e);
         await this.guard(r, epoch, signal);

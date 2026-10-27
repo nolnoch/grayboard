@@ -17,6 +17,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   let holdRegister: (() => Promise<void>) | undefined, admit: (() => Promise<void>) | undefined, holdReceipt = false, refuseBind = false;
   let ownership = 0, throttledReads = 0;
   let readFailure: (() => void) | undefined;
+  let observation: ((operation: string) => Promise<void>) | undefined;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
@@ -25,15 +26,16 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
     constructor(_config: unknown, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string) {}
-    async connect() {}
+    async connect() { await observation?.("connect"); }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
       calls.push({ sessionID: this.sessionID, name, args });
       let row = rows.get(this.sessionID);
-      if (name === "whoami") return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true, candidates: ["be", "fe"] } : {}) };
+      if (name === "whoami") { await observation?.("whoami"); return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true, candidates: ["be", "fe"] } : {}) }; }
       if (name === "bind") {
         if (refuseBind) throw new SubscriberError("identity_in_use");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
+        await observation?.("bind");
         return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
       }
       if (name === "session_register") { await holdRegister?.(); return { registered: true }; }
@@ -70,7 +72,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { ctx, controller, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("diagnostic failures never inspect hostile error properties and retain cleanup classification", async () => {
   let reads = 0; const error = new Error();
@@ -195,6 +197,33 @@ test("event resubscription cancellation ends backoff without another subscriber"
   const abort = new AbortController(); let attempts = 0;
   await observeEvents(async function* () { attempts++; throw new Error("closed"); }, async () => {}, () => {}, abort.signal, async () => { abort.abort(); });
   expect(attempts).toBe(1);
+});
+
+test.each(["connect", "whoami", "bind"].flatMap(boundary => ["approval", "generation", "directory", "account", "endpoint"].map(change => [boundary, change] as const)))("recovery fences %s completion after %s drift before new authority", async (boundary, change) => {
+  const r = runtime({}, async () => {}); let recovering = false, changed = false;
+  try {
+    r.bind("R", "be");
+    r.readFailure(() => { if (!recovering) { recovering = true; throw new SubscriberError("receipt_capacity"); } });
+    r.observe(async operation => {
+      if (!recovering || changed || operation !== boundary) return;
+      changed = true;
+      if (change === "approval") (r.nodes.get("R")!.metadata["grayboard.enrollment"] as { enabled: boolean }).enabled = false;
+      if (change === "generation") await r.controller.observe("credential.switched", { integrationID: "native-integration" });
+      if (change === "directory") (r.ctx.location as { directory: string }).directory = "/other";
+      if (change === "account") r.f.select("other");
+      if (change === "endpoint") r.f.config.url = "https://other.example.com/mcp";
+    });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
+    await r.controller.close();
+    expect(changed).toBe(true);
+    const release = r.calls.findIndex(call => call.name === "delivery_release"); expect(release).toBeGreaterThan(-1);
+    const authority = r.calls.slice(release + 1).filter(call => ["bind", "delivery_open"].includes(call.name));
+    expect(authority.map(call => call.name)).toEqual(boundary === "bind" ? ["bind"] : []);
+    if (authority.length) expect(authority[0]?.args.create).toBe(false);
+    expect(r.calls.filter(call => call.name === "delivery_receipt")).toHaveLength(0);
+    expect(r.admissions).toHaveLength(0);
+  } finally { await r.controller.close(); }
 });
 
 test("capacity recovery rebinds without creation and receipts the reissued item under new ownership", async () => {

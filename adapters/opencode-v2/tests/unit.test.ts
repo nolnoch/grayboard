@@ -80,7 +80,7 @@ test("enrollment fingerprint pins all logical fields independently of key order"
 });
 test("edited root metadata cannot manufacture restored approval", async () => {
   const stored: Record<string, unknown> = { rootSessionIDs: [enrollment.sessionID], [`enrollmentHash:${enrollment.sessionID}`]: enrollmentHash(enrollment) };
-  const ctx = { storage: { get: async (key: string) => stored[key] }, session: { get: async () => ({ id: enrollment.sessionID, time: {}, metadata: { [METADATA]: { enabled: true, enrollment: { ...enrollment, connectionID: "forged" } } } }) } } as unknown as Context;
+  const ctx = { location: { directory: "/worktree" }, storage: { get: async (key: string) => stored[key] }, session: { get: async () => ({ id: enrollment.sessionID, time: {}, metadata: { [METADATA]: { enabled: true, enrollment: { ...enrollment, connectionID: "forged" } } } }) } } as unknown as Context;
   const controller = new Controller(ctx, { mcpName: "grayboard" });
   let checked = false;
   controller.binding.check = async () => { checked = true; };
