@@ -31,7 +31,7 @@ export function identityOf(value: unknown, e: Enrollment): Identity {
 }
 export function bindingOf(value: unknown): BindingState {
   const b = value as BindingState;
-  if (!b || !(b.name === null || typeof b.name === "string") || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child) throw new Refusal("root", "Invalid root binding response");
+  if (!b || !(b.name === null || typeof b.name === "string" && /^[a-z0-9_-]{1,32}$/.test(b.name)) || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child) throw new Refusal("root", "Invalid root binding response");
   return b;
 }
 export function leaseOf(value: unknown, e: Enrollment): Lease {

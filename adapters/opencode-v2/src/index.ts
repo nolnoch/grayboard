@@ -17,12 +17,12 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
     status: async () => controller.status(),
     enroll: async input => {
       try { await restoring; return await controller.enroll(input.sessionID, input.name, input.create); }
-      catch (error) { return { state: "paused", message: error instanceof Refusal ? error.message : "Enrollment refused; check the active root, trusted issuer and native MCP configuration/sign-in" }; }
+      catch { controller.backgroundFailure("enroll"); return { state: "paused", message: "Enrollment refused; check the active root, trusted issuer and native MCP configuration/sign-in", roots: controller.status().roots }; }
     },
     pause: async () => { await restoring; return controller.pause(); },
   });
   const before = await ctx.tool.hook("execute.before", event => controller.before(event));
-  const after = await ctx.tool.hook("execute.after", event => controller.after(event).catch(() => {}));
+  const after = await ctx.tool.hook("execute.after", event => controller.after(event).catch(() => controller.backgroundFailure("after")));
   const events = new AbortController();
   const listening = observeEvents(
     () => ctx.event.subscribe({ signal: events.signal }),
@@ -46,8 +46,9 @@ export default Plugin.define({ id: "grayboard", async setup(ctx) {
     await controller.close();
     await restoring;
     await listening;
-    await before.dispose().catch(() => {});
-    await after.dispose().catch(() => {});
-    await rpc.dispose().catch(() => {});
+    await before.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
+    await after.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
+    await rpc.dispose().catch(() => controller.backgroundFailure("rpc_dispose"));
+    await controller.flushDiagnostics();
   };
 } });

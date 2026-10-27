@@ -4,9 +4,10 @@ import { Binding } from "./binding.js";
 import { LeaseUnavailable, SubscriberError, Wire } from "./wire.js";
 import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
 import { SessionRoutes, resolveRoot } from "./sessions.js";
+import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Status } from "./diagnostics.js";
+export type { Status } from "./diagnostics.js";
 
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
-export type Status = { state: string; message: string; sessionID?: string };
 type Root = { e: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 type Invocation = { tool: string; sessionID: string; id: string };
 function sleep(ms: number, signal: AbortSignal) {
@@ -25,12 +26,21 @@ export class Controller {
   private stopped = false;
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
-  private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name" };
-  constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire, private readonly wait = sleep) {
+  private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name", roots: [] };
+  private readonly diagnostics: Diagnostics;
+  constructor(readonly ctx: Context, readonly options: Options, readonly Transport: typeof Wire = Wire, private readonly wait = sleep, sink?: DiagnosticSink) {
+    this.diagnostics = new Diagnostics(ctx.storage, sink);
     this.binding = new Binding(ctx, options.mcpName, () => this.latch("Native binding changed; explicitly enroll again"));
   }
-  status(): Status { return { ...this.state }; }
-  private set(r: Root, state: string, message: string) { this.state = r.status = { state, message, sessionID: r.e.sessionID }; }
+  status(): Status { return this.diagnostics.status(); }
+  async flushDiagnostics() { await this.diagnostics.flush(); }
+  private set(r: Root, state: string, message: string, operation = "delivery", code?: string) {
+    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), ...(code ? { code } : {}) });
+    r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
+  }
+  private failure(operation: string, error: unknown, r?: Root) {
+    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...(r ? { sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}) } : {}), code: failureCode(error) });
+  }
   private serial<T>(call: () => Promise<T>): Promise<T> {
     const result = this.controls.then(call, call);
     this.controls = result.catch(() => {});
@@ -40,7 +50,7 @@ export class Controller {
     this.drifted = true;
     for (const r of this.roots.values()) {
       r.paused = true; r.epoch++; r.abort?.abort(); this.set(r, "paused", message);
-      void this.ctx.storage.set(`paused:${r.e.sessionID}`, true).catch(() => {});
+      void this.ctx.storage.set(`paused:${r.e.sessionID}`, true).catch(error => this.failure("latch_save", error, r));
     }
   }
   private async path(sessionID: string) {
@@ -89,7 +99,7 @@ export class Controller {
   }
   private async temporary<T>(e: Enrollment, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID) {
     const wire = await this.wire(e, sessionID);
-    try { return await call(wire); } finally { await wire.close().catch(() => {}); }
+    try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
   private async capture(sessionID: string): Promise<Enrollment> {
     const captured = await this.binding.capture();
@@ -116,8 +126,9 @@ export class Controller {
     try {
       if (name) await this.temporary(e, w => w.call("bind", { name, create, where: this.ctx.location.directory }));
       await this.prepare(r, !!previous?.paused && !name);
-    } catch (error) { this.set(r, "approved", `Root approval saved; binding refused: ${error instanceof Error ? error.message : "unknown refusal"}`); }
-    return this.status();
+    } catch (error) { this.set(r, "approved", `Root approval saved; ${failureMessage(error)}`, "enroll", failureCode(error)); }
+    await this.diagnostics.flush();
+    return { ...r.status, roots: this.status().roots };
   }); }
   private async prepare(r: Root, resume = false) {
     const epoch = r.epoch;
@@ -128,17 +139,20 @@ export class Controller {
         current = bindingOf(await wire.call("whoami"));
       }
       if (r.epoch !== epoch || r.paused || this.stopped) return;
-      if (!current.name) { this.set(r, "unbound", `Root approved, unbound; bind(name) to take one. Candidates: ${JSON.stringify(current.candidates ?? [])}`); return; }
+      if (!current.name) { this.set(r, "unbound", "Root approved, unbound; bind(name) to take one"); return; }
       r.e = { ...r.e, name: current.name };
       await this.save(r);
-      if (r.epoch === epoch && !r.paused && !this.stopped) this.start(r);
+      if (r.epoch === epoch && !r.paused && !this.stopped) {
+        this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
+        this.start(r);
+      }
     });
   }
   private start(r: Root) {
     if (r.task || r.paused || this.stopped) return;
     const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController();
     r.task = this.run(r, e, epoch, abort.signal).catch(error => {
-      if (!abort.signal.aborted) { r.paused = true; this.set(r, "paused", error instanceof Error ? error.message : "Subscriber stopped"); void this.ctx.storage.set(`paused:${e.sessionID}`, true); }
+      if (!abort.signal.aborted) { r.paused = true; this.set(r, "paused", failureMessage(error), "subscriber", failureCode(error)); }
     });
   }
   private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal) {
@@ -173,7 +187,7 @@ export class Controller {
               await admitPrefix(items, async item => {
                 pendingItem = /^(direct|push):[1-9][0-9]*$/.test(item.id) ? item.id : `item#${createHash("sha256").update(item.id).digest("hex").slice(0, 12)}`;
                 const count = (attempts.get(item.id) ?? 0) + 1;
-                if (count > 8) throw new Refusal("paused", `Retry limit reached for ${pendingItem}; item remains unreceipted; explicitly enroll again`);
+                if (count > 8) throw new DeliveryStopped(pendingItem);
                 attempts.set(item.id, count);
                 if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity) throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
@@ -201,10 +215,10 @@ export class Controller {
             await Promise.race([sleep(1000, AbortSignal.any([signal, timer.signal])), new Promise<void>(resolve => { wake = resolve; })]);
             wake = undefined; timer.abort();
           }
-        } finally { await subscription.close().catch(() => {}); }
+        } finally { await subscription.close().catch(error => this.failure("subscription_close", error, r)); }
       } catch (error) {
         if (signal.aborted) break;
-        if (error instanceof Refusal) throw error;
+        if (error instanceof Refusal || error instanceof DeliveryStopped) throw error;
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;
           if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
@@ -219,33 +233,34 @@ export class Controller {
             await this.guard(r, epoch, signal);
           }
         }
-        this.set(r, "retrying", `Revalidating the approved root before reopening delivery: ${error instanceof Error ? error.message : "transport failure"}`);
+        this.set(r, "retrying", `Revalidating the approved root before reopening delivery (${failureCode(error)})`, "reopen", failureCode(error));
         if (wire?.admissionRetryAfterMs) {
           if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");
           await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
         } else await this.wait(Math.min(8000, 250 * 2 ** failures), signal);
-      } finally { await wire?.close().catch(() => {}); }
+      } finally { await wire?.close().catch(error => this.failure("wire_close", error, r)); }
     }
-    if (failures >= 8) throw new Error(`Retry limit reached${pendingItem ? ` for ${pendingItem}; item remains unreceipted` : " before inbox progress"}; explicitly enroll again`);
+    if (failures >= 8) throw new DeliveryStopped(pendingItem);
   }
   private async stop(r: Root) { r.epoch++; r.abort?.abort(); await r.task; r.task = undefined; r.abort = undefined; }
   private async release(r: Root) {
     const lease = r.lease; r.lease = undefined;
     await this.temporary(r.e, async wire => {
-      if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(() => {}); }
+      if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(error => this.failure("delivery_release", error, r)); }
       await wire.call("session_end");
     });
   }
   async pause(message = "Ownership ended; explicitly enroll to resume") { return this.serial(async () => {
     for (const r of this.roots.values()) {
       r.paused = true; await this.stop(r);
-      await this.release(r).catch(() => {});
-      await this.save(r, false).catch(() => {});
+      await this.release(r).catch(error => this.failure("session_end", error, r));
+      await this.save(r, false).catch(error => this.failure("pause_save", error, r));
       this.set(r, "paused", message);
     }
     return this.status();
   }); }
   async restore() {
+    await this.diagnostics.restore();
     const ids = await this.ctx.storage.get("rootSessionIDs");
     if (!Array.isArray(ids)) return;
     for (const id of ids) {
@@ -257,7 +272,8 @@ export class Controller {
         const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
         const e = saved?.enrollment;
         if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
-        const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true;
+        const previous = this.status().roots.find(record => record.sessionID === id);
+        const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true || previous?.state === "paused";
         const r: Root = { e, epoch: 0, paused, status: this.state };
         this.roots.set(id, r);
         if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
@@ -266,13 +282,13 @@ export class Controller {
         await this.prepare(r, true);
       } catch {
         const r = this.roots.get(id);
-        if (r) { r.paused = true; await this.stop(r); this.set(r, "paused", "Saved root unavailable; approval retained, explicitly enroll to retry"); }
-        else this.state = { state: "paused", sessionID: id, message: "Saved enrollment invalid; explicitly enroll again" };
+        if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", "Saved root unavailable; approval retained, explicitly enroll to retry", "restore"); }
+        else this.diagnostics.record({ state: "paused", sessionID: id, message: "Saved enrollment invalid; explicitly enroll again", operation: "restore" });
       }
     }
   }
-  backgroundFailure(operation: "event" | "stream" | "restore") {
-    this.state = { state: "degraded", message: `Background ${operation} failed; existing root ownerships retained` };
+  backgroundFailure(operation: "event" | "stream" | "restore" | "enroll" | "after" | "hook_dispose" | "rpc_dispose") {
+    this.failure(operation, undefined);
   }
   private async native(tool: string) {
     const namespace = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -289,7 +305,8 @@ export class Controller {
     const bindID = this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_") + "_bind";
     if (event.tool === bindID && path.root === event.sessionID) await this.serial(async () => {
       const current = this.roots.get(path.root);
-      if (current) await this.stop(current);
+      if (current) { this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind"); await this.stop(current); }
+      else this.diagnostics.record({ state: "rebinding", sessionID: path.root, message: "Native bind pending; receiving requires approval", operation: "before_bind" });
     });
   }
   async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
@@ -313,7 +330,7 @@ export class Controller {
           if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every(line => typeof line === "string")) throw new Error("Native bind completion lacked validated output");
         }
         await this.prepare(r, false);
-      } catch (error) { this.set(r, "approved", `Approval retained; lease unavailable: ${error instanceof Error ? error.message : "unknown refusal"}`); }
+      } catch (error) { this.set(r, "approved", failureMessage(error), "after", failureCode(error)); }
     });
   }
   async observe(type: string, data: unknown) {
@@ -326,8 +343,8 @@ export class Controller {
           try {
             const e = await this.capture(id);
             await this.temporary(e, w => w.call("bind", { name: this.options.name, create: this.options.create === true, where: this.ctx.location.directory }));
-            this.state = { state: "unenrolled", sessionID: id, message: `Bound ${this.options.name}; receiving still requires human approval` };
-          } catch (error) { this.state = { state: "unbound", sessionID: id, message: error instanceof Error ? error.message : "Configured binding refused" }; }
+            this.diagnostics.record({ state: "unenrolled", sessionID: id, message: "Configured binding completed; receiving still requires human approval", operation: "configured_bind" });
+          } catch (error) { this.diagnostics.record({ state: "unbound", sessionID: id, message: failureMessage(error), operation: "configured_bind", code: failureCode(error) }); }
         }
       }
     }
@@ -344,12 +361,12 @@ export class Controller {
       if (id === path.root && r) {
         r.paused = true; r.epoch++; r.abort?.abort();
         await this.serial(async () => {
-          await this.stop(r); await this.release(r).catch(() => {});
+          await this.stop(r); await this.release(r).catch(error => this.failure("session_end", error, r));
           await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released");
         });
       } else {
         const e = r?.e ?? await this.capture(path.root);
-        await this.temporary(e, w => w.call("session_end"), id).catch(() => {});
+        await this.temporary(e, w => w.call("session_end"), id).catch(error => this.failure("child_end", error, r));
       }
     }
   }
@@ -358,7 +375,8 @@ export class Controller {
     for (const r of this.roots.values()) r.abort?.abort();
     await this.controls;
     for (const r of this.roots.values()) await this.stop(r);
-    for (const watch of this.watches.values()) await watch.dispose().catch(() => {});
+    for (const watch of this.watches.values()) await watch.dispose().catch(error => this.failure("watch_dispose", error));
     this.watches.clear();
+    await this.diagnostics.flush();
   }
 }

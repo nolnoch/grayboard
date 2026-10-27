@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
+import { Diagnostics, failureCode, failureMessage } from "../src/diagnostics.js";
 import { observeEvents } from "../src/events.js";
 import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
 import type { Enrollment, Item } from "../src/model.js";
@@ -71,6 +72,61 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
   return { ctx, controller, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
+test("diagnostic failures never inspect hostile error properties and retain cleanup classification", async () => {
+  let reads = 0; const error = new Error();
+  for (const key of ["message", "stack", "cause", "code"]) Object.defineProperty(error, key, { get() { reads++; throw new Error("secret"); } });
+  expect(failureCode(error)).toBe("operation_failed");
+  expect(failureMessage(error)).not.toContain("secret");
+  expect(reads).toBe(0);
+  const storage = new Map<string, unknown>(), emitted: unknown[] = [];
+  const d = new Diagnostics({ get: async key => storage.get(key), set: async (key, value) => { storage.set(key, structuredClone(value)); } } as Context["storage"], record => { emitted.push(record); });
+  d.record({ state: "degraded", message: "Cleanup failed", operation: "session_end", code: failureCode(error), sessionID: "R" });
+  d.record({ state: "paused", message: "Ownership ended", operation: "pause", sessionID: "R" });
+  await d.flush();
+  expect(d.status().roots[0]?.failure).toMatchObject({ operation: "session_end", code: "operation_failed" });
+  expect(emitted).toHaveLength(2);
+  const restored = new Diagnostics({ get: async key => storage.get(key) } as Context["storage"]); await restored.restore();
+  expect(restored.status().roots[0]?.failure).toMatchObject({ operation: "session_end", code: "operation_failed" });
+  const broken = new Diagnostics({ set: async () => { throw error; } } as Context["storage"]);
+  broken.record({ state: "active", message: "Active", operation: "delivery", sessionID: "R" });
+  expect(await broken.flush()).toBe(false); expect(broken.status().state).toBe("degraded"); expect(reads).toBe(0);
+});
+
+test("diagnostics retain each root across unrelated activity and restart without granting approval", async () => {
+  const r = runtime({}, async () => {}); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.admission(async () => { throw new Error("secret-token\n at bearer-token.ts:1"); });
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused");
+    r.admission(async () => {});
+    const reply = await r.controller.enroll("B");
+    expect(reply.message).toContain("fe");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(r.controller.status().roots.find(root => root.sessionID === "R")?.message).toContain("direct:1");
+    expect(r.controller.status().state).toBe("paused");
+    await r.controller.close();
+    expect(JSON.stringify(r.storage.get("diagnostics:v1"))).not.toContain("secret-token");
+    restarted = r.restart(); const start = r.calls.length; await restarted.restore();
+    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
+    expect(r.calls.slice(start).some(call => call.name === "delivery_open" && call.sessionID === "R")).toBe(false);
+    expect(r.storage.get("paused:R")).toBe(false);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+
+test("before bind immediately reports rebinding without waiting for an after hook", async () => {
+  const r = runtime();
+  try {
+    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    await r.before("R", "grayboard_bind");
+    expect(r.controller.status().roots.find(root => root.sessionID === "R")?.state).toBe("rebinding");
+    await r.before("B", "grayboard_bind");
+    expect(r.controller.status().roots.find(root => root.sessionID === "B")?.state).toBe("rebinding");
+    expect(r.nodes.get("B")!.metadata).toEqual({});
+  } finally { await r.controller.close(); }
+});
+
 test.each(["edited", "prepare"])("restore isolates a %s root without releasing a healthy root or persisting human pause", async mode => {
   const r = runtime(); let restored: Controller | undefined;
   try {
@@ -346,7 +402,8 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
     await r.controller.pause(); await r.controller.close();
     restarted = r.restart(); await restarted.restore();
     expect(restarted.status().state).toBe("paused");
-    await restarted.enroll("B"); await until(() => restarted!.status().state === "active");
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
     expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
 });
