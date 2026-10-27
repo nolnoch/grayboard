@@ -57,6 +57,7 @@ jobs:
     uses: ./.github/workflows/e2e.yml
     with:
       suite: hosted-network
+      public_revision: ${{ github.sha }}
 
   build:
     name: Build ${{ matrix.target }}
@@ -261,3 +262,4 @@ jobs:
     uses: ./.github/workflows/e2e.yml
     with:
       suite: hosted-network
+      public_revision: ${{ github.sha }}

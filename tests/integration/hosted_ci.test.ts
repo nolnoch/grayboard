@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -85,7 +85,7 @@ test("outside-network hosted suites run only nightly, explicitly, or across the 
   const steps = nightly.jobs.e2e.steps;
   const resolve = steps.find((s: any) => s.id === "public");
   expect(resolve.if).toBe("matrix.suite == 'hosted-public'");
-  expect(resolve.run).toContain('revision="$(bash scripts/hosted-public-revision.sh)"');
+  expect(resolve.env.REVISION).toBe("${{ inputs.public_revision || github.sha }}");
   const checkout = steps.find((s: any) => s.with?.ref);
   expect(checkout.with.ref).toBe("${{ steps.public.outputs.revision }}");
   expect(checkout.if).toBe(resolve.if);
@@ -94,12 +94,13 @@ test("outside-network hosted suites run only nightly, explicitly, or across the 
   expect(upload.with.name).toBe("e2e-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}");
   expect(upload.with.path).toContain("${{ runner.temp }}/e2e-run/evidence");
   expect(upload.with.path).toContain("!startsWith(matrix.suite, 'hosted-')");
-  expect(steps.find((s: any) => s.name === "Require hosted package in the selected release").run).toContain("exit 1");
+  expect(steps.find((s: any) => s.name === "Require hosted package in the selected commit").run).toContain("exit 1");
   expect(read(".github/workflows/e2e.yml")).not.toMatch(/GRAYBOARD_PUBLIC_REVISION: "[a-f0-9]{40}"/);
   const release = Bun.YAML.parse(read(".github/workflows/release.yml")) as any;
   for (const id of ["hosted-network", "hosted-post-release"]) {
     expect(release.jobs[id].uses).toBe("./.github/workflows/e2e.yml");
     expect(release.jobs[id].with.suite).toBe("hosted-network");
+    expect(release.jobs[id].with.public_revision).toBe("${{ github.sha }}");
     expect(release.jobs[id]["continue-on-error"]).toBeUndefined();
   }
   expect(release.jobs.release.needs).toContain("hosted-network");
@@ -110,21 +111,28 @@ test("outside-network hosted suites run only nightly, explicitly, or across the 
   expect(runner).toContain('if [[ "$1" == public ]]; then');
 });
 
-test("public source resolves the latest release's peeled commit and fails closed without fallbacks", () => {
+test("public source validates the triggering or explicit commit without release lookup or fallbacks", () => {
+  const workflow = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;
+  expect(workflow.on.workflow_call.inputs.public_revision).toEqual({ description: "Public install commit; empty uses the triggering commit", type: "string", required: false, default: "" });
+  const step = workflow.jobs.e2e.steps.find((s: any) => s.id === "public");
+  expect(step.env.REVISION).toBe("${{ inputs.public_revision || github.sha }}");
+  const select = new Function("inputs", "github", `return ${step.env.REVISION.slice(3, -2)}`);
+  const sha = "a".repeat(40), explicit = "b".repeat(40);
+  expect(select({}, { sha })).toBe(sha);
+  expect(select({ public_revision: "" }, { sha })).toBe(sha);
+  expect(select({ public_revision: explicit }, { sha })).toBe(explicit);
+  expect(select({ public_revision: "master" }, { sha })).toBe("master"); // Invalid explicit input must not fall back.
+  expect(step.run).not.toMatch(/gh |git |latest|refs\/|fallback/);
+  expect(read(".github/workflows/e2e.yml")).not.toContain("hosted-public-revision.sh");
   const directory = mkdtempSync(resolve(tmpdir(), "gb-public-revision-"));
   try {
-    const bin = resolve(directory, "bin"); mkdirSync(bin);
-    for (const [command, body] of Object.entries({
-      gh: 'test "$*" = "release view --repo nolnoch/grayboard --json tagName --jq .tagName" || exit 81\nprintf "%s\\n" "$TEST_TAG"\nexit "${TEST_GH_EXIT:-0}"',
-      git: 'test "$*" = "ls-remote https://github.com/nolnoch/grayboard.git refs/tags/$TEST_TAG refs/tags/$TEST_TAG^{}" || exit 82\nprintf "%s\\n" "$TEST_REFS"\nexit "${TEST_GIT_EXIT:-0}"',
-    })) { const path = resolve(bin, command); writeFileSync(path, "#!/bin/bash\n" + body + "\n"); chmodSync(path, 0o700); }
-    const direct = "a".repeat(40), peeled = "b".repeat(40);
-    const run = (overrides: Record<string, string>) => Bun.spawnSync(["bash", resolve(root, "scripts/hosted-public-revision.sh")], { env: { ...Bun.env, PATH: bin + ":" + Bun.env.PATH, TEST_TAG: "v2.0.0", TEST_REFS: `${direct}\trefs/tags/v2.0.0\n${peeled}\trefs/tags/v2.0.0^{}`, ...overrides } });
-    expect(run({}).stdout.toString().trim()).toBe(peeled);
-    expect(run({ TEST_REFS: `${direct}\trefs/tags/v2.0.0` }).stdout.toString().trim()).toBe(direct);
-    const failures: Record<string, string>[] = [{ TEST_GH_EXIT: "1" }, { TEST_GIT_EXIT: "1" }, { TEST_TAG: "main" }, { TEST_TAG: "v2.0.0;false" }, { TEST_REFS: "" }, { TEST_REFS: `${direct}\trefs/heads/main` }, { TEST_REFS: "bad\trefs/tags/v2.0.0" }];
-    for (const overrides of failures) {
-      const result = run(overrides); expect(result.exitCode).not.toBe(0); expect(result.stdout.toString()).toBe("");
+    for (const [index, revision] of ["a".repeat(40), "0123456789abcdef".repeat(2) + "01234567", "", "master", "v2.0.0", "a".repeat(39), "a".repeat(41), "A".repeat(40), "a".repeat(40) + "\n", "a".repeat(40) + ";false"].entries()) {
+      const output = resolve(directory, String(index));
+      const result = Bun.spawnSync(["bash", "-e", "-c", step.run], { env: { ...Bun.env, REVISION: revision, GITHUB_OUTPUT: output } });
+      const valid = revision.length === 40 && /^[a-f0-9]{40}$/.test(revision);
+      expect(result.exitCode === 0).toBe(valid);
+      expect(Bun.file(output).size > 0).toBe(valid);
+      if (valid) expect(readFileSync(output, "utf8")).toBe(`revision=${revision}\n`);
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
@@ -141,7 +149,7 @@ test("hosted entry point uses frozen package commands and retains no private sta
   expect(runner).toContain('"$root/scripts/hosted-provenance.ts"');
   expect(read(".github/workflows/hosted.yml")).not.toContain("path: adapters/opencode-v2");
   expect(read(".github/workflows/hosted.yml")).not.toContain("path: ${{ runner.temp }}/grayboard-hosted");
-  for (const script of ["scripts/e2e.sh", "scripts/hosted-e2e.sh", "scripts/hosted-public-revision.sh", "scripts/hooks/pre-push"]) {
+  for (const script of ["scripts/e2e.sh", "scripts/hosted-e2e.sh", "scripts/hooks/pre-push"]) {
     const result = Bun.spawnSync(["bash", "-n", resolve(root, script)]);
     expect(result.exitCode, result.stderr.toString()).toBe(0);
   }

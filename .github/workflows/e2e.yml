@@ -18,6 +18,11 @@ on:
       suite:
         type: string
         required: true
+      public_revision:
+        description: "Public install commit; empty uses the triggering commit"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -36,26 +41,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Resolve latest published public source
+      - name: Validate public source commit
         if: matrix.suite == 'hosted-public'
         id: public
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVISION: ${{ inputs.public_revision || github.sha }}
         run: |
-          revision="$(bash scripts/hosted-public-revision.sh)"
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          [[ "$REVISION" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::Public revision must be a full commit SHA.'; exit 1; }
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
 
-      # Public installation is compared to that release's source, not nightly HEAD.
+      # Compare installed bytes to the exact public commit under test.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: matrix.suite == 'hosted-public'
         with:
           ref: ${{ steps.public.outputs.revision }}
           persist-credentials: false
 
-      - name: Require hosted package in the selected release
+      - name: Require hosted package in the selected commit
         if: matrix.suite == 'hosted-public'
         run: |
-          test -f adapters/opencode-v2/package.json || { echo '::error::Latest release lacks the hosted package; first hosted release bootstrap requires maintainer policy.'; exit 1; }
+          test -f adapters/opencode-v2/package.json || { echo '::error::Selected commit lacks the hosted package.'; exit 1; }
 
       - uses: ./.github/actions/setup
         with:
