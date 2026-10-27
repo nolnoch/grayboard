@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -217,4 +217,86 @@ test("internal operation failures are redacted, including paths and SQL", async 
     expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: internal error" }] });
   } finally { application.call = original; }
   expect(hosted.activeContexts).toBe(0);
+});
+
+for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: unexpected hosted repo failures log once without credentials or tool arguments`, async () => {
+  const client = await connect(version);
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  const original = store.repo.messages.insert;
+  const secret = `Bearer ${token} client_secret=hidden https://user:password@example.com/auth?code=hidden`;
+  store.repo.messages.insert = () => { throw new Error(secret, { cause: new Error(secret) }); };
+  try {
+    const result = await client.callTool({ name: "dm_send", arguments: { to: "be", body: "private tool body" } });
+    expect(result).toMatchObject({ isError: true, content: [{ type: "text", text: "error: internal error" }] });
+    expect(logs).toHaveBeenCalledTimes(1);
+    const line = String(logs.mock.calls[0]![0]);
+    expect(line).toContain('"tool":"dm_send"');
+    expect(line).toContain('"principal":');
+    expect(line).toContain('"session":');
+    for (const hidden of [token, "hidden", "password", "private tool body", "client_secret", "/auth?"]) expect(line).not.toContain(hidden);
+  } finally { store.repo.messages.insert = original; logs.mockRestore(); }
+});
+
+for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: factory errors log once, expected refusals do not log, and lost authentication returns 401`, async () => {
+  let last!: Response;
+  const client = await connect(version, async response => { last = response.clone(); });
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  const original = application.admitIdentity;
+  try {
+    application.admitIdentity = () => async () => { throw new Error(`token=${token}`); };
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(500);
+    expect(logs).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(token);
+    logs.mockClear();
+    application.admitIdentity = () => async () => { throw new ApplicationError("unauthenticated", `revoked ${token}`); };
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(401);
+    expect(await last.text()).not.toContain(token);
+    expect(logs).not.toHaveBeenCalled();
+    application.admitIdentity = () => async () => { throw new ApplicationError("rate_limited", "retry", { retry_after_ms: 1000 }); };
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(429);
+    expect(logs).not.toHaveBeenCalled();
+  } finally { application.admitIdentity = original; logs.mockRestore(); }
+});
+
+test("Origin and identity diagnostics are address-limited and omit URL secrets", async () => {
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (let n = 0; n < 5; n++) {
+      const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Origin: "https://user:password@foreign.example.com/path?token=hidden", Authorization: `Bearer ${token}` } }), "192.0.2.1");
+      expect(response.status).toBe(403);
+    }
+    expect(logs).toHaveBeenCalledTimes(1);
+    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "human" } }), "192.0.2.2");
+    expect(response.status).toBe(400);
+    expect(logs).toHaveBeenCalledTimes(2);
+    const text = JSON.stringify(logs.mock.calls);
+    expect(text).toContain("https://foreign.example.com");
+    expect(text).toContain("https://grayboard.example.com");
+    for (const secret of [token, "password", "hidden", "?token"]) expect(text).not.toContain(secret);
+  } finally { logs.mockRestore(); }
+});
+
+for (const revoked of [false, true]) test(`authentication lost between HTTP preflight and factory (${revoked ? "revoked" : "disabled"}) returns 401 without an unexpected log`, async () => {
+  let last!: Response;
+  const client = await connect("2026-07-28", async response => { last = response.clone(); });
+  const original = application.admitIdentity;
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  application.admitIdentity = (...args) => {
+    const select = original(...args);
+    if (revoked) store.repo.sessions.revoke(user.session_id);
+    return async sink => {
+      store.repo.users.setDisabled(user.user_id, true);
+      return select(sink);
+    };
+  };
+  try {
+    await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
+    expect(last.status).toBe(401);
+    expect(await last.json()).toMatchObject({ code: "unauthenticated" });
+    expect(logs).not.toHaveBeenCalled();
+    expect(hosted.activeContexts).toBe(0);
+  } finally { application.admitIdentity = original; logs.mockRestore(); }
 });

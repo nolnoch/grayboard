@@ -37,7 +37,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
-  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin, touches });
+  const mcp = createHostedMcp(application, repo, { trustedOrigin: new URL(config.publicUrl).origin, touches, now: opts.now });
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   const slack = config.slack ? new SlackBridge({
@@ -69,7 +69,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const limited = authGate.refuse(caller, path);
       if (limited) return limited;
 
-      if (path === "/mcp") return mcp.fetch(req).then(res => authGate.chargeRefusedToken(caller, req, path, res));
+      if (path === "/mcp") return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
         const raw = extractBearer(req);
         // No token costs nothing: a page can open a WebSocket cross-origin (auth_gate.ts).

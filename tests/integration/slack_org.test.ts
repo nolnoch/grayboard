@@ -1,7 +1,8 @@
 // The org Slack bridge (src/server/slack.ts) end to end: an in-memory server
 // with a fake Slack, and agents as server-mode `grayboard mcp` children.
 // Linking, the human identity's round trip, who may reach it, and unlinking.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { ApplicationError } from "../../src/server/application.ts";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -169,6 +170,34 @@ test("only the bridge may hello as human", async () => {
   // And not over HTTP either.
   expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
 }, 30_000);
+
+test("unexpected bridge bus failures log once and reply generically; expected refusals retain their message", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = srv.client(alice, "be");
+  expect((await be.connect()).type).toBe("hello_ok");
+  expect(await be.request({ type: "send", recipient: "human", body: "diagnostic fixture" })).toMatchObject({ type: "send_ok" });
+  const top = await until(() => slack.posts().find(p => p.markdown_text === "**be** diagnostic fixture"));
+  const original = srv.app.application.send;
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  const secret = `Bearer ${alice} client_secret=hidden https://user:password@example.com/?token=hidden`;
+  try {
+    srv.app.application.send = () => { throw new Error(secret, { cause: new Error(secret) }); };
+    const failed = slack.say("private body", { thread_ts: tsOf(top) });
+    const reply = await until(() => slack.posts().find(p => p.thread_ts === tsOf(top) && p.markdown_text?.includes("internal error")));
+    await until(() => slack.acks.includes(failed.envelope));
+    expect(logs).toHaveBeenCalledTimes(1);
+    const text = JSON.stringify([reply, logs.mock.calls]);
+    expect(text).toContain("dm_send");
+    for (const hidden of [alice, "password", "hidden", "private body", "client_secret"]) expect(text).not.toContain(hidden);
+    logs.mockClear();
+    srv.app.application.send = () => { throw new ApplicationError("forbidden", "safe expected refusal"); };
+    const refused = slack.say("second reply", { thread_ts: tsOf(top) });
+    await until(() => slack.posts().find(p => p.markdown_text?.includes("safe expected refusal")));
+    await until(() => slack.acks.includes(refused.envelope));
+    expect(logs).not.toHaveBeenCalled();
+  } finally { srv.app.application.send = original; logs.mockRestore(); }
+});
 
 test("another user's agents reach a human only as teammates", async () => {
   const alice = await login("alice@example.com");
