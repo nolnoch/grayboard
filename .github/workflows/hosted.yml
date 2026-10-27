@@ -43,3 +43,15 @@ jobs:
           path: ${{ runner.temp }}/hosted-run/evidence
           retention-days: 7
           if-no-files-found: warn
+
+  required:
+    name: Hosted required
+    needs: hosted
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every hosted matrix leg to succeed
+        env:
+          RESULT: ${{ needs.hosted.result }}
+        run: test "$RESULT" = success

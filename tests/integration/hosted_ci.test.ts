@@ -30,6 +30,21 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   expect(read(".github/workflows/test.yml")).toContain("RestartBogus=1");
 });
 
+test("the stable hosted aggregator runs even when matrix dependencies fail, cancel or skip", () => {
+  const workflow = Bun.YAML.parse(read(".github/workflows/hosted.yml")) as any;
+  const job = workflow.jobs.required;
+  expect(job.name).toBe("Hosted required"); expect(job.needs).toBe("hosted");
+  expect(job.if).toBe("${{ always() }}"); expect(job.steps).toHaveLength(1);
+  expect(job.steps[0].env.RESULT).toBe("${{ needs.hosted.result }}");
+  expect(workflow.jobs.hosted.if).toBeUndefined();
+  expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
+  expect(workflow.jobs.hosted["continue-on-error"]).toBeUndefined();
+  for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
+    const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result } });
+    expect(process.exitCode === 0).toBe(result === "success");
+  }
+});
+
 test("hosted gates preserve the signed tag-only release boundary", () => {
   const release = Bun.YAML.parse(read(".github/workflows/release.yml")) as any;
   expect(Object.keys(release.on)).toEqual(["push"]);
