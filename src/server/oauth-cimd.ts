@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
-import { request } from "node:https";
+import { Agent, request } from "node:https";
+import type { ConnectionOptions, TLSSocket } from "node:tls";
 import { BlockList, isIP } from "node:net";
 import { OAUTH_SCOPES, validateRedirect, type OAuthClient } from "./oauth-config.ts";
 
@@ -29,10 +30,14 @@ export type CimdOptions = {
   resolve?: (host: string) => Promise<Address[]>;
   // Trusted test seam; production always uses the pinned TLS connection below.
   read?: (url: URL, address: Address, signal: AbortSignal) => Promise<string>;
+  // Constructor-only test routing; absent in deployed configuration.
+  testConnect?: (target: { hostname: string; address: Address }, options: ConnectionOptions) => TLSSocket;
 };
-function readPinned(url: URL, address: Address, signal: AbortSignal): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const req = request(url, { agent: false, signal, lookup: (_host, options, callback) => options.all ? callback(null, [address]) : callback(null, address.address, address.family), headers: { Accept: "application/json" } }, response => {
+function readPinned(url: URL, address: Address, signal: AbortSignal, connect?: CimdOptions["testConnect"]): Promise<string> {
+  const agent = connect ? new Agent({ keepAlive: false }) : undefined;
+  if (agent) agent.createConnection = options => connect!({ hostname: url.hostname, address }, options as ConnectionOptions);
+  const reading = new Promise<string>((resolve, reject) => {
+    const req = request(url, { agent: agent ?? false, signal, lookup: (_host, options, callback) => options.all ? callback(null, [address]) : callback(null, address.address, address.family), headers: { Accept: "application/json" } }, response => {
       if ((response.statusCode ?? 500) >= 500 || response.statusCode === 429) { response.destroy(); reject(new CimdUnavailable()); return; }
       if (response.statusCode !== 200 || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:;|$)/i.test(response.headers["content-type"] ?? "")) { response.destroy(); reject(new InvalidMetadata("invalid CIMD response")); return; }
       const chunks: Buffer[] = [];
@@ -50,6 +55,7 @@ function readPinned(url: URL, address: Address, signal: AbortSignal): Promise<st
     req.on("error", reject);
     req.end();
   });
+  return agent ? reading.finally(() => agent.destroy()) : reading;
 }
 export function parseCimd(id: string, text: string): OAuthClient {
   if (Buffer.byteLength(text) > 32_768) throw new Error("CIMD document too large");
@@ -92,7 +98,7 @@ export function createCimdResolver(options: CimdOptions = {}) {
             if (!addresses.length) throw new CimdUnavailable();
             if (addresses.length > 32 || addresses.some(a => !publicAddress(a.address) || isIP(a.address) !== a.family)) throw new InvalidMetadata("unsafe CIMD DNS answer");
             if (controller.signal.aborted) throw new Error("CIMD fetch aborted");
-            const text = await (options.read ?? readPinned)(url, addresses[0]!, controller.signal);
+            const text = await (options.read ?? ((url, address, signal) => readPinned(url, address, signal, options.testConnect)))(url, addresses[0]!, controller.signal);
             try { return parseCimd(id, text); } catch { throw new InvalidMetadata("invalid CIMD metadata"); }
           };
           const client = await Promise.race([load(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("CIMD timeout")); }, 5000); })]);
