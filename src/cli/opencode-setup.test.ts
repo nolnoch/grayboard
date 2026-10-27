@@ -157,19 +157,21 @@ for (const position of ["first", "last", "only", "trailing"]) test(`V1 property 
   expect(f.run().changed).toBe(false);
 });
 
-test("recognized adapter symlink itself moves, never changing checkout target", () => {
+test("intentional adapter symlink is never followed or moved during migration", () => {
   const f = fixture();
   const target = join(f.root, "checkout-adapter.ts");
   writeFileSync(target, source);
   mkdirSync(join(f.root, "plugin"));
   symlinkSync(target, f.adapter);
-  f.run({ migrate: true });
-  expect(lstatSync(f.adapter + ".grayboard-backup").isSymbolicLink()).toBe(true);
-  expect(readlinkSync(f.adapter + ".grayboard-backup")).toBe(target);
+  expect(() => f.run({ migrate: true })).toThrow("Intentional adapter symlink");
+  expect(lstatSync(f.adapter).isSymbolicLink()).toBe(true);
+  expect(readlinkSync(f.adapter)).toBe(target);
   expect(readFileSync(target, "utf8")).toBe(source);
+  expect(existsSync(f.config)).toBe(false);
+  expect(existsSync(f.adapter + ".grayboard-backup")).toBe(false);
 });
 
-for (const kind of ["custom", "dangling", "custom-link", "backup", "config-backup"]) test(`migration preflight refuses ${kind} without writes`, () => {
+for (const kind of ["custom", "dangling", "custom-link"]) test(`migration preflight refuses ${kind} without writes`, () => {
   const f = fixture();
   writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
   f.seedAdapter(kind === "custom" ? "user code" : source);
@@ -179,14 +181,12 @@ for (const kind of ["custom", "dangling", "custom-link", "backup", "config-backu
     if (kind === "custom-link") writeFileSync(target, "user code");
     symlinkSync(target, f.adapter);
   }
-  if (kind === "backup") writeFileSync(f.adapter + ".grayboard-backup", "existing backup");
-  if (kind === "config-backup") writeFileSync(f.config + ".grayboard-backup", "existing backup");
+
   const before = readFileSync(f.config, "utf8");
   expect(() => f.run({ migrate: true })).toThrow();
   expect(readFileSync(f.config, "utf8")).toBe(before);
   expect(lstatSync(f.adapter)).toBeDefined();
-  if (kind === "backup") expect(readFileSync(f.adapter + ".grayboard-backup", "utf8")).toBe("existing backup");
-  if (kind === "config-backup") expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe("existing backup");
+
 });
 
 test("migration dry-run validates all inputs without creating backups or moving adapter", () => {
@@ -259,18 +259,6 @@ test("unrecognized commands and remote secrets refuse migration", () => {
     expect(() => f.run({ migrate: true })).toThrow("Unrecognized");
     expect(readFileSync(f.config, "utf8")).toBe(before);
   }
-});
-
-test("recognized fixed-header profile migrates explicitly to native OAuth defaults", () => {
-  const f = fixture();
-  const legacy = { type: "remote", url: f.opts.url, headers: { "X-Grayboard-Identity": "fe" }, oauth: { client_id: "operator-public", scope: "grayboard:tools grayboard:delivery" } };
-  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: legacy } } }));
-  expect(isHostedGrayboard(legacy)).toBe(true);
-  expect(() => f.run()).toThrow("--migrate");
-  f.run({ migrate: true });
-  expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
-  expect(isHostedGrayboard({ ...legacy, oauth: { ...legacy.oauth, scope: "grayboard:tools" } })).toBe(false);
-  expect(isHostedGrayboard({ ...legacy, headers: { "X-Grayboard-Identity": "human" } })).toBe(false);
 });
 
 test("plugin source migration preserves option bytes/enrollment and unrelated entries", () => {
@@ -440,34 +428,19 @@ test("optional name explicitly defaults create false and preserves unrelated plu
   expect(f.read().plugins[0].options).toEqual({ name: "be", create: true });
 });
 
-for (const directive of ["{env:PRIVATE_TOKEN}", "{file:./private-token}", "prefix-{env:PRIVATE_TOKEN}-suffix", "prefix-{file:./private-token}-suffix"]) test("public client ID and emitted plugin path reject substitutions before writes", () => {
+for (const directive of ["{env:PRIVATE_TOKEN}", "{file:./private-token}", "prefix-{env:PRIVATE_TOKEN}-suffix", "prefix-{file:./private-token}-suffix"]) test("installed plugin path rejects substitutions before writes", () => {
   const f = fixture();
-  const before = readdirSync(f.root).sort();
-  expect(() => f.run({ plugin: undefined, revision: directive })).toThrow();
-  expect(readdirSync(f.root).sort()).toEqual(before);
-  const result = invoke(f, [...cliArgs(f), "--revision", directive, "--dry-run"]);
-  expect(result.exitCode).toBe(1);
-  expect(result.stderr.toString()).not.toContain(directive);
-  expect(readdirSync(f.root).sort()).toEqual(before);
-  f.run();
-  const native = f.read().mcp.servers.grayboard;
-  const unsafe = { ...native, oauth: { ...native.oauth, client_id: directive } };
-  expect(isHostedGrayboard(unsafe)).toBe(false);
-  const original = JSON.stringify({ mcp: { servers: { grayboard: unsafe } } });
-  writeFileSync(f.config, original);
-  expect(opencodeShimGuard(f.root).skip).toBe(true);
-  expect(() => f.run({ migrate: true })).toThrow("Unrecognized");
-  expect(readFileSync(f.config, "utf8")).toBe(original);
-  expect(existsSync(f.config + ".grayboard-backup")).toBe(false);
-  rmSync(f.config);
+  // Positive control: the same valid source shape reaches and passes directory validation.
+  expect(invoke(f, [...cliArgs(f), "--dry-run"]).exitCode).toBe(0);
   const plugin = join(f.root, directive);
   mkdirSync(plugin, { recursive: true });
   writeFileSync(join(plugin, "package.json"), '{"name":"grayboard-opencode"}');
   writeFileSync(join(plugin, "index.js"), "export default {};");
   const installed = readdirSync(f.root).sort();
-  expect(() => f.run({ plugin })).toThrow();
-  const badPlugin = invoke(f, [...cliArgs(f), "--plugin", plugin]);
+  expect(() => f.run({ plugin })).toThrow("literal path without OpenCode substitutions");
+  const badPlugin = invoke(f, ["setup-opencode", "--url", f.opts.url, "--plugin", plugin, "--config", f.config]);
   expect(badPlugin.exitCode).toBe(1);
+  expect(badPlugin.stderr.toString()).toContain("literal path without OpenCode substitutions");
   expect(badPlugin.stderr.toString()).not.toContain(plugin);
   expect(readdirSync(f.root).sort()).toEqual(installed);
   expect(existsSync(f.config)).toBe(false);
@@ -492,6 +465,10 @@ for (const replacement of ["file", "symlink"]) test(`rollback preserves concurre
   expect(failure).toBeInstanceOf(Error);
   expect((failure as Error).cause).toBe(injected);
   expect((failure as Error).message).toContain("manual recovery");
+  expect((failure as Error).message).toContain(f.config + ".grayboard-backup");
+  expect((failure as Error).message).toContain(f.adapter + ".grayboard-backup");
+  expect((failure as Error).message).toContain("Restore adapter");
+  expect((failure as Error).message).toContain("EEXIST");
   expect(readFileSync(f.adapter, "utf8")).toBe("concurrent user replacement");
   if (replacement === "symlink") expect(readlinkSync(f.adapter)).toBe(target);
   expect(readFileSync(f.adapter + ".grayboard-backup", "utf8")).toBe(source);
@@ -506,9 +483,7 @@ test("temp cleanup failure does not skip restoring any moved adapter and retains
   f.seedAdapter();
   const second = join(f.root, ".opencode", "plugin", "grayboard.ts");
   mkdirSync(join(f.root, ".opencode", "plugin"), { recursive: true });
-  const target = join(f.root, "carried.ts");
-  writeFileSync(target, source);
-  symlinkSync(target, second);
+  writeFileSync(second, source);
   const injected = new Error("injected failure");
   let failure: unknown;
   try {
@@ -522,8 +497,8 @@ test("temp cleanup failure does not skip restoring any moved adapter and retains
   expect((failure as Error).cause).toBe(injected);
   expect((failure as Error).message).toContain("manual recovery");
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
-  expect(lstatSync(second).isSymbolicLink()).toBe(true);
-  expect(readlinkSync(second)).toBe(target);
+  expect(lstatSync(second).isFile()).toBe(true);
+  expect(readFileSync(second, "utf8")).toBe(source);
   expect(existsSync(f.adapter + ".grayboard-backup")).toBe(false);
   expect(existsSync(second + ".grayboard-backup")).toBe(false);
   expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe(original);
@@ -544,6 +519,114 @@ for (const enabled of [true, false]) test(`explicit migration recognizes retaine
   f.run({ migrate: true });
   expect(f.read().mcp.grayboard).toBeUndefined();
   expect(f.read().mcp.servers.grayboard).toEqual({ type: "remote", url: f.opts.url });
+});
+
+test("revision bumps and retry after rollback retain unique non-overwriting backups", () => {
+  const f = fixture();
+  f.run({ plugin: undefined, revision: "a".repeat(40) });
+  const first = readFileSync(f.config, "utf8");
+  const b = f.run({ plugin: undefined, revision: "b".repeat(40), migrate: true });
+  const second = readFileSync(f.config, "utf8");
+  const c = f.run({ plugin: undefined, revision: "c".repeat(40), migrate: true });
+  expect(b.backups).toEqual([f.config + ".grayboard-backup"]);
+  expect(c.backups).toEqual([f.config + ".grayboard-backup.1"]);
+  expect(readFileSync(b.backups![0]!, "utf8")).toBe(first);
+  expect(readFileSync(c.backups![0]!, "utf8")).toBe(second);
+  expect(() => setupOpenCode({ ...f.opts, plugin: undefined, revision: "d".repeat(40), migrate: true }, source, () => { throw new Error("do-not-print-secret"); })).toThrow(".grayboard-backup.2");
+  const retry = f.run({ plugin: undefined, revision: "d".repeat(40), migrate: true });
+  expect(retry.backups).toEqual([f.config + ".grayboard-backup.3"]);
+  expect(readFileSync(b.backups![0]!, "utf8")).toBe(first);
+});
+
+for (const digest of ["d398eb6efd4b8ab967e35e0b9d656dd0215e0fd28586624e61e2c734fb8d55a0", "f30e54c3a02a43ddb680f5941f32cdfdbd2829947b5d6d9e6849951034b5cb1d"]) test("released adapter source is recognized exactly, not by a managed-looking prefix", () => {
+  const released = readFileSync(new URL(`../../tests/fixtures/opencode-released/${digest}.txt`, import.meta.url), "utf8");
+  expect(new Bun.CryptoHasher("sha256").update(released).digest("hex")).toBe(digest);
+  const f = fixture(); f.seedAdapter(released);
+  writeFileSync(f.adapter + ".grayboard-backup", "older backup");
+  const result = f.run({ migrate: true });
+  expect(result.backups).toContain(f.adapter + ".grayboard-backup.1");
+  expect(readFileSync(f.adapter + ".grayboard-backup.1", "utf8")).toBe(released);
+  expect(readFileSync(f.adapter + ".grayboard-backup", "utf8")).toBe("older backup");
+  const custom = fixture(); custom.seedAdapter(released + "\n// user customization\n");
+  expect(() => custom.run({ migrate: true })).toThrow("refusing to move user code");
+  expect(readFileSync(custom.adapter, "utf8")).toBe(released + "\n// user customization\n");
+});
+
+test("classification follows V1 config symlinks read-only and warns with failing path and cause", () => {
+  const f = fixture();
+  const target = join(f.root, "dotfile.json");
+  writeFileSync(target, JSON.stringify({ mcp: { grayboard: f.old } }));
+  symlinkSync(target, f.config);
+  expect(opencodeShimGuard(f.root)).toEqual({ skip: false });
+  expect(lstatSync(f.config).isSymbolicLink()).toBe(true);
+  expect(() => f.run({ migrate: true })).toThrow(f.config);
+  writeFileSync(target, '{"secret":"do-not-print-secret",');
+  const warning = opencodeShimGuard(f.root).warning!;
+  expect(warning).toContain(f.config); expect(warning).toContain("INVALID_JSON");
+  expect(warning).not.toContain("do-not-print-secret");
+  rmSync(target);
+  expect(opencodeShimGuard(f.root).warning).toContain("ENOENT");
+});
+
+test("CLI returns actual backup paths and refresh warnings on stdout", () => {
+  const f = fixture(); writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
+  const result = invoke(f, [...cliArgs(f), "--migrate"]);
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout.toString()).toContain(`Retained backup: ${f.config}.grayboard-backup`);
+  const oc = join(f.root, "config", "opencode"); mkdirSync(join(oc, "plugin"), { recursive: true });
+  writeFileSync(join(oc, "plugin", "grayboard.ts"), "stale adapter");
+  writeFileSync(join(oc, "opencode.json"), "broken-secret-config");
+  const refresh = invoke(f, ["refresh-adapters"]);
+  expect(refresh.stdout.toString()).toContain(join(oc, "opencode.json"));
+  expect(refresh.stdout.toString()).toContain("INVALID_JSON");
+  expect(refresh.stdout.toString()).not.toContain("broken-secret-config");
+});
+
+test("plugin validation and sibling errors name the actual file without manifest contents", () => {
+  const f = fixture();
+  expect(() => f.run({ plugin: join(f.root, "missing") })).toThrow("ENOENT");
+  expect(() => f.run({ plugin: join(f.root, "missing") })).toThrow(join(f.root, "missing"));
+  writeFileSync(join(f.plugin, "package.json"), '{"secret":"do-not-print-secret",');
+  let message = ""; try { f.run(); } catch (e) { message = (e as Error).message; }
+  expect(message).toContain(join(f.plugin, "package.json")); expect(message).not.toContain("do-not-print-secret");
+  writeFileSync(join(f.plugin, "package.json"), '{"name":"grayboard-opencode"}');
+  symlinkSync(join(f.root, "missing"), f.config.slice(0, -1));
+  expect(() => f.run()).toThrow(f.config.slice(0, -1));
+});
+
+test("ordinary setup and refresh through a V1 config symlink retain the link and install the shim", () => {
+  const f = fixture();
+  const directory = join(f.root, "config", "opencode");
+  mkdirSync(join(directory, "plugin"), { recursive: true });
+  const config = join(directory, "opencode.json"), target = join(f.root, "dotfile.json");
+  writeFileSync(target, JSON.stringify({ mcp: { grayboard: f.old } }));
+  symlinkSync(target, config); fakeOpenCode(f);
+  const adapter = join(directory, "plugin", "grayboard.ts");
+  for (const args of [["setup", "--local", "-y"], ["refresh-adapters"]]) {
+    writeFileSync(adapter, "stale shim");
+    const result = invoke(f, args);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(lstatSync(config).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(config)).toBe(target);
+    expect(readFileSync(adapter, "utf8")).toBe(source);
+    expect(JSON.parse(readFileSync(target, "utf8")).mcp.grayboard.enabled).toBe(false);
+  }
+});
+
+test("classifier and plugin validation preserve EACCES paths and causes without secret bytes", () => {
+  const f = fixture(); writeFileSync(f.config, '{"secret":"do-not-print-secret"}');
+  chmodSync(f.config, 0o000);
+  try {
+    const warning = opencodeShimGuard(f.root).warning!;
+    expect(warning).toContain(f.config); expect(warning).toContain("EACCES");
+    expect(warning).not.toContain("do-not-print-secret");
+  } finally { chmodSync(f.config, 0o600); }
+  const manifest = join(f.plugin, "package.json"); chmodSync(manifest, 0o000);
+  try {
+    let failure: any; try { f.run(); } catch (e) { failure = e; }
+    expect(failure.message).toContain(manifest); expect(failure.message).toContain("EACCES");
+    expect(failure.cause.code).toBe("EACCES");
+  } finally { chmodSync(manifest, 0o600); }
 });
 
 test("ordinary local/V1 setup and refresh still install carried shim; refresh respects symlinks", () => {

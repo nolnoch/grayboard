@@ -7,8 +7,21 @@ import { isValidIdentityName } from "../shared/addressing.ts";
 
 type ObjectValue = Record<string, any>;
 const object = (v: unknown): v is ObjectValue => !!v && typeof v === "object" && !Array.isArray(v);
-const scopes = "grayboard:tools grayboard:delivery";
 const backupSuffix = ".grayboard-backup";
+// Exact sources shipped in v1.0.0–v1.5.0 and v1.6.0–v1.10.0 respectively.
+const releasedAdapters = new Set([
+  "d398eb6efd4b8ab967e35e0b9d656dd0215e0fd28586624e61e2c734fb8d55a0",
+  "f30e54c3a02a43ddb680f5941f32cdfdbd2829947b5d6d9e6849951034b5cb1d",
+]);
+const errorCode = (e: unknown) => /^[A-Z][A-Z0-9_]+$/.test((e as NodeJS.ErrnoException)?.code ?? "") ? (e as NodeJS.ErrnoException).code! : "INVALID_DATA";
+function io<T>(path: string, action: string, work: () => T): T {
+  try { return work(); } catch (e) { throw Object.assign(new Error(`${action} ${JSON.stringify(path)} (${errorCode(e)}); no file contents were printed`, { cause: e }), { code: errorCode(e) }); }
+}
+function backupPath(path: string): string {
+  let candidate = path + backupSuffix;
+  for (let n = 1; info(candidate); n++) candidate = path + backupSuffix + "." + n;
+  return candidate;
+}
 
 function fail(message: string): never {
   throw new Error(`${message}. Resolve manually before configuring OpenCode; no configuration contents were printed`);
@@ -17,24 +30,25 @@ function fail(message: string): never {
 function info(path: string) {
   try { return lstatSync(path); } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw e;
+    return io(path, "Cannot inspect", () => { throw e; });
   }
 }
 
-function document(path: string): { text: string; value: ObjectValue; mode: number } {
-  const st = info(path);
-  if (!st) return { text: "", value: {}, mode: 0o600 };
-  if (!st.isFile() || st.isSymbolicLink()) fail("Config must be a regular file, not a symlink");
-  const text = readFileSync(path, "utf8");
+function document(path: string, readOnly = false): { text: string; value: ObjectValue; mode: number } {
+  const entry = info(path);
+  if (!entry) return { text: "", value: {}, mode: 0o600 };
+  const st = readOnly && entry.isSymbolicLink() ? io(path, "Cannot follow config", () => statSync(path)) : entry;
+  if (!st.isFile() || st.isSymbolicLink()) fail(`Config ${JSON.stringify(path)} must be a regular file, not a symlink`);
+  const text = io(path, "Cannot read config", () => readFileSync(path, "utf8"));
   const errors: ParseError[] = [];
   const tree = parseTree(text, errors, { allowTrailingComma: true, disallowComments: false });
-  if (errors.length || !tree || tree.type !== "object") fail("Invalid JSON/JSONC config object");
+  if (errors.length || !tree || tree.type !== "object") fail(`Invalid JSON/JSONC config object ${JSON.stringify(path)} (INVALID_JSON)`);
   const unique = (node: Node) => {
     if (node.type === "object") {
       const keys = new Set<string>();
       for (const prop of node.children ?? []) {
         const key = prop.children![0]!.value as string;
-        if (keys.has(key)) fail("Duplicate JSON/JSONC property");
+        if (keys.has(key)) fail(`Duplicate JSON/JSONC property in ${JSON.stringify(path)} (INVALID_JSON)`);
         keys.add(key);
       }
     }
@@ -42,7 +56,7 @@ function document(path: string): { text: string; value: ObjectValue; mode: numbe
   };
   unique(tree);
   const value = JSON.parse(JSON.stringify(getNodeValue(tree)));
-  shape(value);
+  io(path, "Cannot validate config shape", () => shape(value));
   return { text, value, mode: st.mode & 0o777 };
 }
 
@@ -94,26 +108,8 @@ function substitution(value: string): boolean {
   return /\{(?:env|file):/.test(value);
 }
 
-function publicClientId(value: unknown): value is string {
-  return typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value) && !substitution(value);
-}
-
 export function isHostedGrayboard(value: unknown): boolean {
-  if (object(value) && value.type === "remote" && Object.keys(value).every(k => ["type", "url"].includes(k))) {
-    try { hostedEndpoint(value.url); return true; } catch { return false; }
-  }
-  return isLegacyHostedGrayboard(value);
-}
-
-function isLegacyHostedGrayboard(value: unknown): boolean {
-  if (!object(value) || value.type !== "remote" || !object(value.headers) || !identity(value.headers["X-Grayboard-Identity"]) ||
-      !object(value.oauth) || !publicClientId(value.oauth.client_id) ||
-      typeof value.oauth.scope !== "string" ||
-      Object.keys(value).some(k => !["type", "url", "headers", "oauth"].includes(k)) ||
-      Object.keys(value.headers).some(k => k !== "X-Grayboard-Identity") ||
-      Object.keys(value.oauth).some(k => !["client_id", "scope"].includes(k))) return false;
-  const requested = value.oauth.scope.split(/\s+/).sort();
-  if (!isDeepStrictEqual(requested, scopes.split(" ").sort())) return false;
+  if (!object(value) || value.type !== "remote" || Object.keys(value).some(k => !["type", "url"].includes(k))) return false;
   try { hostedEndpoint(value.url); return true; } catch { return false; }
 }
 
@@ -126,7 +122,8 @@ export function opencodeShimGuard(directory: string): { skip: boolean; warning?:
   try {
     let hosted = false;
     for (const name of ["opencode.json", "opencode.jsonc"]) {
-      const cfg = document(join(directory, name)).value;
+      const path = join(directory, name);
+      const cfg = document(path, true).value;
       for (const entry of [cfg.mcp?.grayboard, cfg.mcp?.servers?.grayboard]) {
         if (entry === undefined || localEntry(entry, true)) continue;
         if (!isHostedGrayboard(entry)) return { skip: true, warning: "Remote or unrecognized grayboard MCP configuration found; leaving OpenCode unchanged" };
@@ -134,28 +131,28 @@ export function opencodeShimGuard(directory: string): { skip: boolean; warning?:
       }
     }
     return { skip: hosted, ...(hosted ? { warning: "Hosted OpenCode registration preserved; the CLI push adapter was not installed or refreshed" } : {}) };
-  } catch {
-    return { skip: true, warning: "OpenCode config is malformed, ambiguous, or symlinked; leaving its registration and adapter unchanged" };
+  } catch (e) {
+    return { skip: true, warning: `Cannot classify OpenCode config in ${JSON.stringify(directory)} (${errorCode(e)}): ${(e as Error).message}; leaving its registration and adapter unchanged` };
   }
 }
 
 function pluginDirectory(path: string): string {
   const directory = resolve(path);
   if (substitution(directory)) fail("Plugin directory must be a literal path without OpenCode substitutions");
-  try {
-    if (!statSync(directory).isDirectory()) fail("Plugin must be an installed directory");
-    const pkg = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
-    if (pkg.name !== "grayboard-opencode") fail("Plugin package must be grayboard-opencode");
-    const candidates = ["server.ts", "server.js", "server.mjs", "server.cjs", "index.ts", "index.js", "index.mjs", "index.cjs"];
-    const root = realpathSync(directory);
-    if (!candidates.some(entry => {
-      const target = resolve(directory, entry);
-      try { return target.startsWith(directory + "/") && statSync(target).isFile() && realpathSync(target).startsWith(root + "/") && /\.[cm]?[jt]s$/.test(target); } catch { return false; }
-    })) fail("Plugin directory has no loadable server/index entry");
-  } catch (e) {
-    if ((e as Error).message.includes("Resolve manually")) throw e;
-    fail("Cannot validate installed plugin directory");
-  }
+  if (!io(directory, "Cannot inspect plugin directory", () => statSync(directory)).isDirectory()) fail(`Plugin ${JSON.stringify(directory)} must be an installed directory (ENOTDIR)`);
+  const manifest = join(directory, "package.json");
+  const bytes = io(manifest, "Cannot read plugin manifest", () => readFileSync(manifest, "utf8"));
+  const pkg = io(manifest, "Cannot parse plugin manifest", () => JSON.parse(bytes));
+  if (!object(pkg) || pkg.name !== "grayboard-opencode") fail(`Plugin package ${JSON.stringify(manifest)} must be grayboard-opencode`);
+  const candidates = ["server.ts", "server.js", "server.mjs", "server.cjs", "index.ts", "index.js", "index.mjs", "index.cjs"];
+  const root = io(directory, "Cannot resolve plugin directory", () => realpathSync(directory));
+  if (!candidates.some(entry => {
+    const target = resolve(directory, entry);
+    try { return statSync(target).isFile() && realpathSync(target).startsWith(root + "/"); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+      return io(target, "Cannot validate plugin entry", () => { throw e; });
+    }
+  })) fail(`Plugin directory ${JSON.stringify(directory)} has no loadable server/index entry`);
   return directory;
 }
 
@@ -202,7 +199,7 @@ export type OpenCodeSetupOptions = {
 type Move = { path: string; backup: string; source: string };
 
 /** Adapter source is supplied by the CLI's existing build macro, not loaded from a checkout. */
-export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean } {
+export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean; backups?: string[] } {
   const url = hostedEndpoint(opts.url);
   if (!url.startsWith("https://")) fail("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
   if (opts.name !== undefined && !identity(opts.name)) fail("Name must be a lowercase simple agent name, not human or a full handle");
@@ -212,7 +209,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const plugin = opts.plugin ? pluginDirectory(opts.plugin) : `github:nolnoch/grayboard#${opts.revision}::path:adapters/opencode-v2`;
   const path = resolve(opts.config);
   if (![".json", ".jsonc"].includes(extname(path))) fail("Select an explicit JSON or JSONC config file");
-  if (!statSync(dirname(path)).isDirectory()) fail("Config parent directory must exist");
+  if (!io(dirname(path), "Cannot inspect config parent", () => statSync(dirname(path))).isDirectory()) fail(`Config parent ${JSON.stringify(dirname(path))} must be a directory (ENOTDIR)`);
   const current = document(path);
   const other = document(sibling(path)).value;
   if (other.mcp?.grayboard !== undefined || other.mcp?.servers?.grayboard !== undefined ||
@@ -236,15 +233,12 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   for (const adapter of adapterPaths) {
     const st = info(adapter);
     if (!st) continue;
-    if (!st.isFile() && !st.isSymbolicLink()) fail("Unrecognized Grayboard adapter; refusing to move user code");
-    let source: string;
-    try {
-      if (!statSync(adapter).isFile()) fail("Grayboard adapter target must be a regular file");
-      source = readFileSync(adapter, "utf8");
-    } catch { return fail("Dangling or unreadable Grayboard adapter requires manual migration"); }
-    if (source !== expectedAdapterSource) fail("Unrecognized Grayboard adapter; refusing to move user code");
-    const backup = adapter + backupSuffix;
-    if (info(backup)) fail("Adapter backup already exists");
+    if (st.isSymbolicLink()) fail(`Intentional adapter symlink ${JSON.stringify(adapter)} left unchanged; remove the link explicitly before hosted migration (not its target)`);
+    if (!st.isFile()) fail(`Unrecognized Grayboard adapter ${JSON.stringify(adapter)}; refusing to move user code`);
+    const source = io(adapter, "Cannot read adapter", () => readFileSync(adapter, "utf8"));
+    const digest = new Bun.CryptoHasher("sha256").update(source).digest("hex");
+    if (source !== expectedAdapterSource && !releasedAdapters.has(digest)) fail(`Unrecognized Grayboard adapter ${JSON.stringify(adapter)}; refusing to move user code`);
+    const backup = backupPath(adapter);
     moves.push({ path: adapter, backup, source });
   }
   const migration = old !== undefined || (native !== undefined && !isDeepStrictEqual(native, desired)) || moves.length > 0 ||
@@ -271,8 +265,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     } else set(["plugins", pluginIndex], pluginEntry);
   }
   const changed = text !== current.text;
-  const configBackup = path + backupSuffix;
-  if (migration && current.text && changed && info(configBackup)) fail("Config backup already exists");
+  let configBackup = backupPath(path);
   if (opts.dryRun || (!changed && !moves.length)) return { changed, migrated: migration, dryRun: !!opts.dryRun };
   // Preflight is complete. Keep the selected file atomic and roll back adapter moves on failure.
   const temp = path + `.grayboard-${process.pid}-${crypto.randomUUID()}.tmp`;
@@ -282,7 +275,13 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   try {
     if (document(path).text !== current.text) fail("Config changed during setup");
     if (migration && current.text && changed) {
-      writeFileSync(configBackup, current.text, { flag: "wx", mode: current.mode });
+      for (;;) {
+        try { writeFileSync(configBackup, current.text, { flag: "wx", mode: current.mode }); break; }
+        catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "EEXIST") io(configBackup, "Cannot create config backup", () => { throw e; });
+          configBackup = backupPath(path);
+        }
+      }
       backedUp = true;
     }
     for (const move of moves) {
@@ -300,11 +299,12 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     }
   } catch (e) {
     let incomplete = false;
-    const recover = (action: () => void) => {
-      try { action(); } catch { incomplete = true; }
+    const actions: string[] = [];
+    const recover = (description: string, action: () => void) => {
+      try { action(); } catch (failure) { incomplete = true; actions.push(`${description} (${errorCode(failure)})`); }
     };
-    if (tempCreated) recover(() => unlinkSync(temp));
-    for (const move of moved.reverse()) recover(() => {
+    if (tempCreated) recover(`Remove temporary entry ${JSON.stringify(temp)}`, () => unlinkSync(temp));
+    for (const move of moved.reverse()) recover(`Restore adapter ${JSON.stringify(move.backup)} to ${JSON.stringify(move.path)} without replacing concurrent entries`, () => {
       // Both creates are atomic no-replace; never hard-link a symlink's target.
       if (lstatSync(move.backup).isSymbolicLink()) symlinkSync(readlinkSync(move.backup), move.path);
       else linkSync(move.backup, move.path);
@@ -314,9 +314,11 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     if (backedUp) incomplete = true;
     if (incomplete) {
       const changed = e instanceof Error && e.message.startsWith("Config changed during setup") ? "Config changed during setup. " : "";
-      throw new Error(changed + "OpenCode setup failed; manual recovery required. Concurrent entries were preserved and config backups retained; recovery may be incomplete", { cause: e });
+      const backup = backedUp ? ` Inspect retained config backup ${JSON.stringify(configBackup)} before restoring ${JSON.stringify(path)}; do not replace concurrent data.` : "";
+      throw new Error(changed + `OpenCode setup failed for ${JSON.stringify(path)} (${errorCode(e)}); manual recovery required.${backup} ${actions.join(". ")}`, { cause: e });
     }
     throw e;
   }
-  return { changed, migrated: migration, dryRun: false };
+  const backups = [...(backedUp ? [configBackup] : []), ...moves.map(move => move.backup)];
+  return { changed, migrated: migration, dryRun: false, ...(backups.length ? { backups } : {}) };
 }

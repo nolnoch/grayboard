@@ -502,6 +502,7 @@ program
     try {
       const result = setupOpenCode(opts, ADAPTERS[1]!.source);
       console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
+      for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
     } catch (e) {
@@ -688,7 +689,7 @@ program
       if (a.path === ADAPTERS[1]!.path) {
         const guard = opencodeShimGuard(OC_DIR);
         if (guard.skip) {
-          if (guard.warning) console.warn(`[grayboard] ${guard.warning}`);
+          if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
           continue;
         }
       }
