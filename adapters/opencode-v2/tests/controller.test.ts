@@ -5,7 +5,7 @@ import { Controller } from "../src/controller.js";
 import { Diagnostics, failureCode, failureMessage } from "../src/diagnostics.js";
 import { observeEvents } from "../src/events.js";
 import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
-import type { Enrollment, Item } from "../src/model.js";
+import { METADATA, type Enrollment, type Item } from "../src/model.js";
 import { fixture } from "./binding.test.js";
 
 type Row = { name: string | null; ownership: number; generation: number; capability?: string };
@@ -87,11 +87,28 @@ test("diagnostic failures never inspect hostile error properties and retain clea
   await d.flush();
   expect(d.status().roots[0]?.failure).toMatchObject({ operation: "session_end", code: "operation_failed" });
   expect(emitted).toHaveLength(2);
-  const restored = new Diagnostics({ get: async key => storage.get(key) } as Context["storage"]); await restored.restore();
+  const restored = new Diagnostics({ get: async key => storage.get(key) } as Context["storage"]); await restored.restore(async id => id === "R");
   expect(restored.status().roots[0]?.failure).toMatchObject({ operation: "session_end", code: "operation_failed" });
-  const broken = new Diagnostics({ set: async () => { throw error; } } as Context["storage"]);
+  const broken = new Diagnostics({ get: async () => undefined, set: async () => { throw error; }, remove: async () => {}, scan: async () => ({ entries: [] }) });
   broken.record({ state: "active", message: "Active", operation: "delivery", sessionID: "R" });
   expect(await broken.flush()).toBe(false); expect(broken.status().state).toBe("degraded"); expect(reads).toBe(0);
+});
+
+test("stored diagnostics are closed DTOs and hostile records cannot escape or stop healthy history", async () => {
+  const sessionID = "ses_" + "b".repeat(64), secret = "PRIVATE_DIAGNOSTIC_CANARY";
+  let getters = 0;
+  const safe = { state: "paused", message: secret, sessionID, operation: "delivery", time: 1, name: "be", ownership: 1 };
+  const hostile = { ...safe, sessionID: "ses_" + "c".repeat(64) };
+  Object.defineProperty(hostile, "message", { enumerable: true, get() { getters++; throw new Error(secret); } });
+  const values = [hostile, { ...safe, ownership: -1 }, { ...safe, failure: { operation: "session_end", code: "operation_failed", time: 1, exception: secret } }, safe];
+  const d = new Diagnostics({ get: async () => values, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) });
+  await d.restore();
+  expect(getters).toBe(0); expect(d.status().roots).toHaveLength(1);
+  expect(d.status().roots[0]).toMatchObject({ state: "paused", sessionID, ownership: 1 });
+  expect(JSON.stringify(d.status())).not.toContain(secret);
+  d.record({ state: "active", message: "Active", sessionID, operation: "delivery" });
+  expect(JSON.stringify(d.status())).not.toContain(secret);
+  expect(d.status().roots[0]?.failure).toBeUndefined();
 });
 
 test("diagnostics retain each root across unrelated activity and restart without granting approval", async () => {
@@ -114,6 +131,40 @@ test("diagnostics retain each root across unrelated activity and restart without
     expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
     expect(r.calls.slice(start).some(call => call.name === "delivery_open" && call.sessionID === "R")).toBe(false);
     expect(r.storage.get("paused:R")).toBe(false);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+
+test("remembered-name bookkeeping cannot grant approval after a concurrent revocation", async () => {
+  const r = runtime(); const original = r.ctx.storage.set;
+  let revoked = false;
+  Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: async (key: string, value: Parameters<Context["storage"]["set"]>[1]) => {
+    await original(key, value);
+    if (key === "rememberedName:R" && !revoked) {
+      revoked = true;
+      const saved = r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean };
+      saved.enabled = false;
+    }
+  } });
+  try {
+    r.bind("R", "be"); await r.controller.enroll("R");
+    expect(revoked).toBe(true);
+    expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(false);
+    expect(r.calls.filter(c => c.name === "delivery_open")).toEqual([]);
+    Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: original });
+    await r.controller.enroll("R"); await until(() => r.controller.status().roots.some(root => root.sessionID === "R" && root.state === "active"));
+    expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
+  } finally { Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: original }); await r.controller.close(); }
+});
+
+test("diagnostic read failure does not block independently authorized roots", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); await r.controller.enroll("R"); await r.controller.close();
+    const original = r.ctx.storage.get;
+    Object.defineProperty(r.ctx.storage, "get", { value: async (key: string) => { if (key === "diagnostics:v1") throw new Error("secret storage failure"); return original(key); } });
+    restarted = r.restart(); await restarted.restore();
+    await until(() => restarted!.status().roots.some(root => root.sessionID === "R" && root.state === "active"));
+    expect(JSON.stringify(restarted.status())).not.toContain("secret storage failure");
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 
@@ -424,15 +475,17 @@ test("pause ends ownership, resume rebinds remembered name create:false; held na
 });
 test("restart skips ended roots, restores another root, and resumes a paused durable name", async () => {
   const r = runtime(); let restarted: Controller | undefined;
+  const ended = "ses_" + "a".repeat(64);
+  r.nodes.set(ended, { ...r.nodes.get("R")!, id: ended });
   try {
-    r.bind("R", "be"); r.bind("B", "fe");
-    await r.controller.enroll("R"); await r.controller.enroll("B");
-    r.nodes.delete("R"); await r.controller.observe("session.deleted", { sessionID: "R" });
+    r.bind(ended, "be"); r.bind("B", "fe");
+    await r.controller.enroll(ended); await r.controller.enroll("B");
+    r.nodes.delete(ended); await r.controller.observe("session.deleted", { sessionID: ended });
     await r.controller.pause(); await r.controller.close();
     restarted = r.restart(); await restarted.restore();
     expect(restarted.status().state).toBe("paused");
     await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
-    expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
+    expect(restarted.status().roots.find(root => root.sessionID === ended)?.state).toBe("paused");
     expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
 });

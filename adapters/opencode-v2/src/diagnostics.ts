@@ -10,7 +10,8 @@ export class DeliveryStopped extends Error {
 const key = "diagnostics:v1";
 const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-const codes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response"]);
+const operations = new Set(["pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose"]);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
   if (error instanceof SubscriberError) {
@@ -29,32 +30,72 @@ export function failureMessage(error: unknown): string {
   return "Operation failed; approval retained, explicitly enroll to retry";
 }
 
-// Diagnostic storage is never read by approval or ownership checks.
+function data(value: unknown, allowed: readonly string[]): Record<string, unknown> | undefined {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > allowed.length || keys.some(k => typeof k !== "string" || !allowed.includes(k))) return;
+    const result: Record<string, unknown> = {};
+    for (const k of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, k);
+      if (!descriptor || !("value" in descriptor)) return;
+      result[k] = descriptor.value;
+    }
+    return result;
+  } catch { return; }
+}
+const clock = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= Date.now() + 60_000;
+function failureDTO(value: unknown) {
+  const d = data(value, ["operation", "code", "time"]);
+  if (!d || typeof d.operation !== "string" || !operations.has(d.operation) || typeof d.code !== "string" || !codes.has(d.code) || !clock(d.time)) return;
+  return { operation: d.operation, code: d.code, time: d.time };
+}
+function project(value: unknown, restored = false): RecordStatus | undefined {
+  const d = data(value, fields);
+  if (!d || typeof d.state !== "string" || !states.has(d.state) || typeof d.operation !== "string" || !operations.has(d.operation) || !clock(d.time)) return;
+  if (d.sessionID !== undefined && (typeof d.sessionID !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(d.sessionID))) return;
+  if (d.name !== undefined && (typeof d.name !== "string" || !/^[a-z0-9_-]{1,32}$/.test(d.name))) return;
+  if (d.ownership !== undefined && (typeof d.ownership !== "number" || !Number.isSafeInteger(d.ownership) || d.ownership <= 0)) return;
+  if (d.code !== undefined && (typeof d.code !== "string" || !codes.has(d.code))) return;
+  const failure = d.failure === undefined ? undefined : failureDTO(d.failure);
+  if (d.failure !== undefined && !failure) return;
+  if (typeof d.message !== "string" || d.message.length > 16384) return;
+  const message = restored ? `Saved ${d.state} status${d.name ? ` for ${d.name}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
+  return { state: d.state, message, operation: d.operation, time: d.time, ...(typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}), ...(typeof d.name === "string" ? { name: d.name } : {}), ...(typeof d.ownership === "number" ? { ownership: d.ownership } : {}), ...(typeof d.code === "string" ? { code: d.code } : {}), ...(failure ? { failure } : {}) };
+}
+
+// Diagnostic storage never grants approval; a restored paused record only denies automatic restart.
 export class Diagnostics {
   private records = new Map<string, RecordStatus>();
   private pending: Promise<void> = Promise.resolve();
   private failed = false;
   constructor(private readonly storage: Context["storage"], private readonly sink?: DiagnosticSink) {}
-  async restore() {
-    const values = await this.storage.get(key);
-    if (!Array.isArray(values)) return;
-    for (const value of values.slice(-256)) {
-      if (!value || typeof value !== "object" || Object.keys(value).some(k => !fields.includes(k))) continue;
-      const r = value as RecordStatus;
-      if (typeof r.sessionID !== "string" || !states.has(r.state) || typeof r.message !== "string" || r.message.length > 16384 || typeof r.operation !== "string" || !Number.isFinite(r.time)) continue;
-      if (r.name !== undefined && !/^[a-z0-9_-]{1,32}$/.test(r.name) || r.ownership !== undefined && !Number.isSafeInteger(r.ownership)) continue;
-      this.records.set(r.sessionID, structuredClone(r));
-    }
+  async restore(acceptRoot?: (id: string) => Promise<boolean>) {
+    try {
+      const values = await this.storage.get(key);
+      if (!Array.isArray(values)) return;
+      const length = Object.getOwnPropertyDescriptor(values, "length")?.value;
+      if (typeof length !== "number" || !Number.isSafeInteger(length)) return;
+      for (let i = Math.max(0, length - 256); i < length; i++) {
+        try {
+          const r = project(Object.getOwnPropertyDescriptor(values, String(i))?.value, true);
+          if (!r) continue;
+          if (r.sessionID && !/^ses_[a-f0-9]{64}$/.test(r.sessionID) && !(acceptRoot && await acceptRoot(r.sessionID))) continue;
+          this.records.set(r.sessionID ?? "background", r);
+        } catch { continue; }
+      }
+    } catch { this.failed = true; }
   }
   record(input: Omit<RecordStatus, "time">) {
-    const previous = this.records.get(input.sessionID ?? "background");
+    const d = data(input, fields);
+    const previous = this.records.get(typeof d?.sessionID === "string" ? d.sessionID : "background");
     const time = Date.now();
-    const failure = input.code ? { operation: input.operation, code: input.code, time } : previous?.failure;
-    const record = { ...input, ...(failure ? { failure } : {}), time };
+    const failure = d?.code ? failureDTO({ operation: d.operation, code: d.code, time }) : failureDTO(previous?.failure);
+    const record: RecordStatus = project({ ...d, ...(failure ? { failure } : {}), time }) ?? { state: "degraded", message: "Diagnostic record unavailable; approval is unchanged", operation: "delivery", time };
     this.records.delete(record.sessionID ?? "background");
     this.records.set(record.sessionID ?? "background", record);
     while (this.records.size > 256) this.records.delete(this.records.keys().next().value!);
-    try { this.sink?.(Object.freeze({ ...record })); } catch { this.failed = true; }
+    try { this.sink?.(Object.freeze({ ...record, ...(record.failure ? { failure: Object.freeze({ ...record.failure }) } : {}) })); } catch { this.failed = true; }
     const snapshot = [...this.records.values()];
     this.pending = this.pending.then(() => this.storage.set(key, snapshot)).catch(() => { this.failed = true; });
     return record;

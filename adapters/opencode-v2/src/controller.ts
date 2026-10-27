@@ -8,7 +8,7 @@ import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type Diagnos
 export type { Status } from "./diagnostics.js";
 
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
-type Root = { e: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
+type Root = { e: Enrollment; approval: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 type Invocation = { tool: string; sessionID: string; id: string };
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
@@ -67,10 +67,10 @@ export class Controller {
     if (path.root !== sessionID) throw new Refusal("root", "An active top-level root is required");
     return this.ctx.session.get({ sessionID });
   }
-  private async save(r: Root, enabled = !r.paused) {
+  private async save(r: Root, enabled: boolean) {
     const session = await this.activeRoot(r.e.sessionID);
-    await this.ctx.session.update({ sessionID: session.id, metadata: { ...session.metadata, [METADATA]: { enabled, enrollment: r.e } } });
-    await this.ctx.storage.set(`enrollmentHash:${session.id}`, enrollmentHash(r.e));
+    await this.ctx.session.update({ sessionID: session.id, metadata: { ...session.metadata, [METADATA]: { enabled, enrollment: r.approval } } });
+    await this.ctx.storage.set(`enrollmentHash:${session.id}`, enrollmentHash(r.approval));
     await this.ctx.storage.set(`paused:${session.id}`, !enabled);
     await this.ctx.storage.set("rootSessionIDs", [...this.roots.keys()]);
   }
@@ -81,7 +81,7 @@ export class Controller {
     await this.binding.check(e);
     const session = await this.activeRoot(e.sessionID);
     const saved = session.metadata?.[METADATA] as { enabled?: boolean; enrollment?: Enrollment } | undefined;
-    if (!saved?.enabled || !same(saved.enrollment, e)) { r.paused = true; throw new Refusal("root", "Root approval changed; explicitly enroll again"); }
+    if (!saved?.enabled || !same(saved.enrollment, r.approval)) { r.paused = true; throw new Refusal("root", "Root approval changed; explicitly enroll again"); }
     check();
   }
   private async wire(e: Enrollment, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>) {
@@ -120,9 +120,9 @@ export class Controller {
     if (previous) await this.stop(previous);
     const captured = await this.capture(sessionID);
     const e = { ...captured, ...(previous?.e.name ? { name: previous.e.name } : {}) };
-    const r: Root = { e, epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state };
+    const r: Root = { e, approval: structuredClone(e), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state };
     this.roots.set(sessionID, r); this.drifted = false;
-    await this.save(r);
+    await this.save(r, true);
     this.watches.set(sessionID, await this.binding.watch(e));
     this.set(r, "approved", "Root approved; bind a name to receive deliveries");
     try {
@@ -153,8 +153,10 @@ export class Controller {
       }
       if (r.epoch !== epoch || r.paused || this.stopped) return;
       if (!current.name) { this.set(r, "unbound", "Root approved, unbound; bind(name) to take one"); return; }
+      await this.guard(r, epoch, signal);
       r.e = { ...r.e, name: current.name };
-      await this.save(r);
+      await this.ctx.storage.set(`rememberedName:${r.e.sessionID}`, { approval: enrollmentHash(r.approval), name: current.name });
+      await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
         this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
         this.start(r);
@@ -276,7 +278,7 @@ export class Controller {
     return this.status();
   }); }
   async restore() {
-    await this.diagnostics.restore();
+    await this.diagnostics.restore(async id => (await this.activeRoot(id)).id === id);
     const ids = await this.ctx.storage.get("rootSessionIDs");
     if (!Array.isArray(ids)) return;
     for (const id of ids) {
@@ -290,7 +292,10 @@ export class Controller {
         if (!e || e.version !== 2 || e.sessionID !== id || e.mcpName !== this.options.mcpName || await this.ctx.storage.get(`enrollmentHash:${id}`) !== enrollmentHash(e)) throw new Refusal("root", "Saved enrollment was edited; explicitly enroll again");
         const previous = this.status().roots.find(record => record.sessionID === id);
         const paused = !saved?.enabled || await this.ctx.storage.get(`paused:${id}`) === true || previous?.state === "paused";
-        const r: Root = { e, epoch: 0, paused, status: this.state };
+        const remembered = await this.ctx.storage.get(`rememberedName:${id}`);
+        const name = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "name")?.value : undefined;
+        const approval = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "approval")?.value : undefined;
+        const r: Root = { e: { ...e, ...(approval === enrollmentHash(e) && typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name) ? { name } : {}) }, approval: structuredClone(e), epoch: 0, paused, status: this.state };
         this.roots.set(id, r);
         if (paused) { this.set(r, "paused", "Saved approval paused; explicitly enroll to resume"); continue; }
         await this.binding.check(e);
