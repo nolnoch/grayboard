@@ -225,7 +225,8 @@ function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox
   const one = (sql: string, address: string) => {
     const db = new Database(path, { readonly: true });
     try {
-      return (db.query(sql).get(address) as { n: number | null }).n ?? 0;
+      // No row yet (a release that hasn't written this reader's cursor) is no read point.
+      return (db.query(sql).get(address) as { n: number | null } | null)?.n ?? 0;
     } finally {
       db.close();
     }
