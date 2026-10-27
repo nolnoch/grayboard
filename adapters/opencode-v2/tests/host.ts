@@ -14,6 +14,7 @@ import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
+import { FailedContinuation } from "./failed-continuation.js";
 import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
@@ -40,6 +41,7 @@ const calls: { name: string; session: string; subscriber: boolean; args: Record<
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
 const nativeCompleted: string[] = [], wrappers: string[] = [];
 let subscriberThrottles = 0;
+const expiryContinuation = new FailedContinuation();
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
@@ -53,8 +55,12 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   assert.equal(url.origin, new URL(issuer).origin, "Only fixture HTTPS endpoints and native OAuth callback allowed");
   assert(!url.pathname.endsWith("/register"), "CIMD must not use DCR");
   if (url.pathname.endsWith("/oauth/token")) { const form = new URLSearchParams(await req.clone().text()); if (form.get("grant_type") === "authorization_code") codes++; else refreshes++; assert.equal(form.get("client_id"), OPENCODE_CLIENT); }
-  if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") throw new Error("Real backend subscriber network deliberately unavailable");
   const b = req.method === "POST" && url.pathname.endsWith("/mcp") ? await req.clone().json() as any : undefined;
+  if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") {
+    const fail = async () => { throw new Error("Real backend subscriber network deliberately unavailable"); };
+    if (b?.method === "tools/call" && b.params?.name === "delivery_renew") return expiryContinuation.observe(fail);
+    return fail();
+  }
   if (b?.method === "tools/call") {
     const session = b.params?._meta?.["ai.opencode/sessionID"]; assert.equal(typeof session, "string");
     calls.push({ name: b.params.name, session, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber", args: b.params.arguments ?? {}, cap: req.headers.get("X-Grayboard-Lease"), accessHash: new Bun.CryptoHasher("sha256").update(req.headers.get("Authorization") ?? "").digest("hex") });
@@ -95,6 +101,7 @@ const instrumented = Plugin.define({ ...plugin, setup(c) { return plugin.setup({
     try { value = await s.synthetic(input); admitted.push(structuredClone(input)); raceGate.accepted.push(value); }
     finally { pendingAdmissions--; }
     if (raceGate.holding && raceGate.boundary === "after") { raceGate.entered(); await raceGate.released; }
+    if (process.env.GRAYBOARD_TEST_REAL_RACE === "expiry") expiryContinuation.returned();
     return value;
   };
   return Reflect.get(s, k);
@@ -257,7 +264,7 @@ try {
       console.log("REAL_BACKEND_CRASH_OK");
     } finally { crashWorker.kill("SIGKILL"); await crashWorker.exited; }
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE) {
-    await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location, subscriberWork,
+    await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location, subscriberWork, expiryContinuation,
       enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
       pause: () => rpc.pause({}, { location }), status: () => rpc.status({}, { location }),
       account: async () => { email = "other@example.com"; await signIn(native.integrationID!); },

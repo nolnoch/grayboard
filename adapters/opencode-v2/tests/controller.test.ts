@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
@@ -7,6 +8,10 @@ import { observeEvents } from "../src/events.js";
 import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
 import { METADATA, type Enrollment, type Item } from "../src/model.js";
 import { fixture } from "./binding.test.js";
+import { FailedContinuation } from "./failed-continuation.js";
+import { observeRuns } from "./subscriber-work.js";
+import { barrier, bounded } from "./reload-state.js";
+import { afterProducers } from "./causal.js";
 
 type Row = { name: string | null; ownership: number; generation: number; capability?: string };
 async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }
@@ -45,6 +50,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
         row.capability = (String(row.ownership) + String(row.generation)).padEnd(43, "a");
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
       }
+      if (name === "delivery_renew") await observation?.("delivery_renew");
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_receipt") {
         if (holdReceipt) { holdReceipt = false; throw new Error("receipt failed"); }
@@ -132,6 +138,43 @@ test("diagnostics retain each root across unrelated activity and restart without
     expect(r.calls.slice(start).some(call => call.name === "delivery_open" && call.sessionID === "R")).toBe(false);
     expect(r.storage.get("paused:R")).toBe(false);
   } finally { await restarted?.close(); await r.controller.close(); }
+});
+
+test.each([false, true])("expiry failed-continuation barrier joins actual subscriber admission and detects late model work (%j)", async forbidden => {
+  const work = observeRuns(Controller.prototype), gate = new FailedContinuation();
+  const admission = barrier(), releaseAdmission = barrier(), model = barrier();
+  const waits: number[] = [], models: string[] = [];
+  let outage = false, forwarded = false, retired = false;
+  const error = new Error("controlled network unavailable");
+  const r = runtime({}, async (ms, signal) => {
+    waits.push(ms);
+    if (waits.length >= 5 && !signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  try {
+    r.bind("R", "be");
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.admission(async () => { admission.release(); await releaseAdmission.promise; forwarded = true; gate.returned(); });
+    r.observe(async operation => {
+      if (outage && ["delivery_renew", "connect"].includes(operation)) await gate.observe(async () => { throw error; });
+    });
+    await r.controller.enroll("R"); await bounded(admission.promise, 1000, "Actual subscriber entered held admission");
+    const original = work.current("R"); void original.then(() => { retired = true; });
+    gate.arm(); outage = true; releaseAdmission.release();
+    await bounded(gate.failed.promise, 1000, "Actual post-admission renewal failed and is held");
+    expect(forwarded).toBe(true); expect(retired).toBe(false); expect(waits).toEqual([]);
+    expect(r.admissions).toHaveLength(1); expect(r.calls.filter(c => c.name === "delivery_receipt")).toEqual([]);
+    const completion = afterProducers(() => gate.failed.promise, async () => {
+      await model.promise; models.push("R"); if (forbidden) models.push("B");
+    }, () => assert.deepEqual(models, ["R"]));
+    const checked = forbidden ? assert.rejects(completion, /deep-equal/) : completion;
+    model.release(); await bounded(Promise.resolve(checked), 1000, "Counted model work drains before absence check");
+    gate.release();
+    await until(() => waits.length === 5);
+    expect(waits).toEqual([500, 1000, 2000, 4000, 8000]); expect(retired).toBe(false);
+    expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toEqual([]);
+    await r.controller.close(); await original; expect(retired).toBe(true);
+  } finally { gate.release(); releaseAdmission.release(); model.release(); await r.controller.close(); work.restore(); }
 });
 
 test("remembered-name bookkeeping cannot grant approval after a concurrent revocation", async () => {

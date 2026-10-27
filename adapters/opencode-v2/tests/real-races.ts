@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { FailedContinuation } from "./failed-continuation.js";
 import { join } from "node:path";
 import type { SubscriberWork } from "./subscriber-work.ts";
 import { bounded, drainSessions } from "./reload-state.ts";
@@ -22,6 +23,7 @@ export async function realRace(f: {
   scenario: string; gate: AdmissionGate; host: Awaited<ReturnType<typeof OpenCode.create>>;
   ctx: Context; app: ReturnType<typeof startServer>; location: { directory: string };
   subscriberWork: SubscriberWork;
+  expiryContinuation: FailedContinuation;
   enroll(sessionID: string, name: string): Promise<unknown>; pause(): Promise<unknown>;
   status(): Promise<{ state: string }>; account(): Promise<void>; outage(value: boolean): void; receipts(): number;
 }) {
@@ -84,6 +86,7 @@ export async function realRace(f: {
         break;
       }
       case "expiry": {
+        f.expiryContinuation.arm();
         f.outage(true); await Bun.sleep(31_000); app.mcp.sessions.sweep();
         assert.equal(app.db.prepare("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get(root), null, "Real wall-clock sticky deadline releases ownership");
         break;
@@ -98,7 +101,8 @@ export async function realRace(f: {
     }
     if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", "observed drift before releasing original write");
     g.holding = false; release(); await transition;
-    await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
+    if (scenario === "expiry") await bounded(f.expiryContinuation.failed.promise, 12_000, "Real forwarding returned and its failed post-admission transport completion is held before retry");
+    else await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
     await drainSessions(join(process.env.GRAYBOARD_GIT_TEST_ROOT!, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
     await Bun.sleep(700); // Supplemental only, after producer retirement and global SDK drain.
     assert.deepEqual(g.inputs[0], original); assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
@@ -120,5 +124,5 @@ export async function realRace(f: {
     }
     for (const a of g.accepted) { assert.equal(a.sessionID, original.sessionID); assert.equal(a.id, original.id); assert.equal(a.payload.text, original.text); assert.deepEqual(a.payload.metadata, original.metadata); }
     console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: app.repo.cursors.directFor("you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
-  } finally { g.holding = false; release(); }
+  } finally { g.holding = false; release(); f.expiryContinuation.release(); }
 }
