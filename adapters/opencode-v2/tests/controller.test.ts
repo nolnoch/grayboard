@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
 import { Wire, LeaseUnavailable } from "../src/wire.js";
@@ -65,7 +66,7 @@ function runtime(options: { name?: string; create?: boolean } = {}) {
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
   const r = runtime();
@@ -252,6 +253,77 @@ test("configured name binds create:false on root start without approving or leas
     await r.controller.observe("session.created", { sessionID: "R" });
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "be", create: false, where: "/worktree" } }]);
     expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(r.controller.status().state).toBe("unenrolled");
+  } finally { await r.controller.close(); }
+});
+test.each([true, false, undefined])("configured creation %s reaches startup bind without approval or lease", async create => {
+  const r = runtime({ name: "fe", create });
+  try {
+    await r.controller.observe("session.created", { sessionID: "C" });
+    expect(r.calls).toEqual([]);
+    await r.controller.observe("session.created", { sessionID: "R" });
+    expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
+    expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(r.nodes.get("R")!.metadata).toEqual({});
+    expect(r.admissions).toEqual([]);
+    expect(r.controller.status().state).toBe("unenrolled");
+  } finally { await r.controller.close(); }
+});
+test.each([true, false, undefined, "true", "false", 1, {}, null])("public directory entry forwards only literal true (%j) to actual startup binding", async create => {
+  const entry = "../index.js";
+  const { default: plugin } = await import(entry) as typeof import("../src/index.js");
+  const r = runtime();
+  let complete!: () => void;
+  const bound = new Promise<void>(resolve => { complete = resolve; });
+  const connect = spyOn(Client.prototype, "connect").mockResolvedValue(undefined);
+  const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
+  const call = spyOn(Wire.prototype, "call").mockImplementation(async function(this: Wire, name, args = {}) {
+    r.calls.push({ sessionID: this.sessionID, name, args });
+    complete();
+    return {};
+  });
+  let cleanup: (() => void | Promise<void>) | void = undefined;
+  try {
+    cleanup = await plugin.setup({ ...r.ctx, options: { name: "fe", create },
+      rpc: { register: async () => ({ dispose: async () => {} }) },
+      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }) },
+      event: { async *subscribe({ signal }: { signal: AbortSignal }) {
+        yield { type: "session.created", data: { sessionID: "R" } };
+        if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+      } },
+    } as unknown as Context);
+    await bound;
+    expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
+    expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(r.nodes.get("R")!.metadata).toEqual({});
+  } finally {
+    await cleanup?.(); await r.controller.close();
+    call.mockRestore(); connect.mockRestore(); close.mockRestore();
+  }
+});
+test("startup creation is not remembered as permission to create on resume or recovery", async () => {
+  const r = runtime({ name: "fe", create: true });
+  let restarted: Controller | undefined;
+  try {
+    await r.controller.observe("session.created", { sessionID: "R" });
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    await r.controller.pause(); await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "active");
+    r.rows.delete("R");
+    await r.controller.after({ sessionID: "R", tool: "grayboard_whoami", id: "call", status: "completed", result: { output: { unbound: true } } });
+    await until(() => r.controller.status().state === "active");
+    await r.controller.close(); r.rows.delete("R");
+    restarted = r.restart(); await restarted.restore();
+    await until(() => restarted!.status().state === "active");
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args.create)).toEqual([true, false, false, false]);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+test("configured creation alone never chooses a name or approves receiving", async () => {
+  const r = runtime({ create: true });
+  try {
+    await r.controller.observe("session.created", { sessionID: "R" });
+    expect(r.calls).toEqual([]);
+    expect(r.storage.size).toBe(0);
     expect(r.controller.status().state).toBe("unenrolled");
   } finally { await r.controller.close(); }
 });

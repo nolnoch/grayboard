@@ -5,7 +5,7 @@ import { LeaseUnavailable, Wire } from "./wire.js";
 import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
 import { SessionRoutes, resolveRoot } from "./sessions.js";
 
-export type Options = { mcpName: string; issuer?: string; name?: string };
+export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
 export type Status = { state: string; message: string; sessionID?: string };
 type Root = { e: Enrollment; epoch: number; paused: boolean; status: Status; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 type Invocation = { tool: string; sessionID: string; id: string };
@@ -300,7 +300,7 @@ export class Controller {
         if (path.root === id) {
           try {
             const e = await this.capture(id);
-            await this.temporary(e, w => w.call("bind", { name: this.options.name, create: false, where: this.ctx.location.directory }));
+            await this.temporary(e, w => w.call("bind", { name: this.options.name, create: this.options.create === true, where: this.ctx.location.directory }));
             this.state = { state: "unenrolled", sessionID: id, message: `Bound ${this.options.name}; receiving still requires human approval` };
           } catch (error) { this.state = { state: "unbound", sessionID: id, message: error instanceof Error ? error.message : "Configured binding refused" }; }
         }
