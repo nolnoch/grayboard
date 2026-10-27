@@ -1,54 +1,12 @@
-import { Plugin } from "@opencode/plugin";
-import { Controller, type Options } from "./controller.js";
-import { Grayboard } from "./rpc.js";
-import { Refusal } from "./model.js";
-import { observeEvents } from "./events.js";
+import { Plugin } from "@opencode/plugin/effect";
+import { fromPromise } from "@opencode/plugin/promise/adapter";
+import { Effect } from "effect";
+import { captureLogger } from "./logger.js";
+import { setup } from "./lifecycle.js";
 export { Grayboard } from "./rpc.js";
-export default Plugin.define({ id: "grayboard", async setup(ctx) {
-  const options: Options = {
-    mcpName: typeof ctx.options.mcpName === "string" ? ctx.options.mcpName : "grayboard",
-    issuer: typeof ctx.options.issuer === "string" ? ctx.options.issuer : "",
-    name: typeof ctx.options.name === "string" ? ctx.options.name : undefined,
-    create: ctx.options.create === true,
-  };
-  const controller = new Controller(ctx, options);
-  let restoring: Promise<unknown> = Promise.resolve();
-  const rpc = await ctx.rpc.register(Grayboard, {
-    status: async () => controller.status(),
-    enroll: async input => {
-      try { await restoring; return await controller.enroll(input.sessionID, input.name, input.create); }
-      catch { controller.backgroundFailure("enroll"); return { state: "paused", message: "Enrollment refused; check the active root, trusted issuer and native MCP configuration/sign-in", roots: controller.status().roots }; }
-    },
-    pause: async () => { await restoring; return controller.pause(); },
-  });
-  const before = await ctx.tool.hook("execute.before", event => controller.before(event));
-  const after = await ctx.tool.hook("execute.after", event => controller.after(event).catch(() => controller.backgroundFailure("after")));
-  const events = new AbortController();
-  const listening = observeEvents(
-    () => ctx.event.subscribe({ signal: events.signal }),
-    event => controller.observe(event.type, event.data),
-    operation => controller.backgroundFailure(operation),
-    events.signal,
-  );
-  restoring = (async () => {
-    await new Promise(resolve => setTimeout(resolve, 0));
-    for (let attempt = 0; attempt < 50 && !events.signal.aborted; attempt++) {
-      try { await controller.binding.configuration(); break; }
-      catch (error) {
-        if (!(error instanceof Refusal) || error.code !== "binding" || attempt === 49) break;
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
-    await controller.restore().catch(() => { if (!events.signal.aborted) controller.backgroundFailure("restore"); });
-  })();
-  return async () => {
-    events.abort();
-    await controller.close();
-    await restoring;
-    await listening;
-    await before.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
-    await after.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
-    await rpc.dispose().catch(() => controller.backgroundFailure("rpc_dispose"));
-    await controller.flushDiagnostics();
-  };
-} });
+
+export default Plugin.define({ id: "grayboard", effect: host => Effect.gen(function* () {
+  const logger = yield* captureLogger;
+  yield* Effect.addFinalizer(() => Effect.sync(() => logger.close()));
+  yield* fromPromise({ id: "grayboard", setup: ctx => setup(ctx, record => logger.emit(record)) }).effect(host);
+}) });

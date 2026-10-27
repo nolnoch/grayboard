@@ -3,14 +3,14 @@ import { SubscriberError } from "./wire.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
-export type DiagnosticSink = (record: Readonly<RecordStatus>) => void;
+export type DiagnosticSink = (record: Readonly<RecordStatus>) => void | Promise<void>;
 export class DeliveryStopped extends Error {
   constructor(readonly item?: string) { super("Delivery retry budget exhausted"); }
 }
 const key = "diagnostics:v1";
 const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-const operations = new Set(["pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose"]);
+const operations = new Set(["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose"]);
 const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
@@ -64,6 +64,14 @@ function project(value: unknown, restored = false): RecordStatus | undefined {
   return { state: d.state, message, operation: d.operation, time: d.time, ...(typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}), ...(typeof d.name === "string" ? { name: d.name } : {}), ...(typeof d.ownership === "number" ? { ownership: d.ownership } : {}), ...(typeof d.code === "string" ? { code: d.code } : {}), ...(failure ? { failure } : {}) };
 }
 
+export function logFields(value: unknown) {
+  const r = project(value, true);
+  if (!r) return;
+  return { category: "grayboard.subscriber", operation: r.operation, state: r.state, time: r.time,
+    ...(r.sessionID ? { root: r.sessionID } : {}), ...(r.name ? { name: r.name } : {}),
+    ...(r.ownership ? { ownership: r.ownership } : {}), ...(r.code ? { code: r.code } : {}) };
+}
+
 // Diagnostic storage never grants approval; a restored paused record only denies automatic restart.
 export class Diagnostics {
   private records = new Map<string, RecordStatus>();
@@ -84,7 +92,10 @@ export class Diagnostics {
           this.records.set(r.sessionID ?? "background", r);
         } catch { continue; }
       }
-    } catch { this.failed = true; }
+    } catch {
+      this.failed = true;
+      this.record({ state: "degraded", message: "Diagnostic restore unavailable; approval is unchanged", operation: "restore", code: "operation_failed" });
+    }
   }
   record(input: Omit<RecordStatus, "time">) {
     const d = data(input, fields);
@@ -95,9 +106,23 @@ export class Diagnostics {
     this.records.delete(record.sessionID ?? "background");
     this.records.set(record.sessionID ?? "background", record);
     while (this.records.size > 256) this.records.delete(this.records.keys().next().value!);
-    try { this.sink?.(Object.freeze({ ...record, ...(record.failure ? { failure: Object.freeze({ ...record.failure }) } : {}) })); } catch { this.failed = true; }
     const snapshot = [...this.records.values()];
-    this.pending = this.pending.then(() => this.storage.set(key, snapshot)).catch(() => { this.failed = true; });
+    const emitted = Object.freeze({ ...record, ...(record.failure ? { failure: Object.freeze({ ...record.failure }) } : {}) });
+    this.pending = this.pending.then(async () => {
+      let persisted = true;
+      try { await this.storage.set(key, snapshot); } catch { this.failed = true; persisted = false; }
+      try {
+        if (!persisted) await this.sink?.(Object.freeze({ ...emitted, state: "degraded", message: "Diagnostic persistence unavailable; approval is unchanged", operation: "diagnostic_save", code: "operation_failed" }));
+        await this.sink?.(emitted);
+      }
+      catch {
+        this.failed = true;
+        const time = Date.now();
+        const failure = { ...record, state: "degraded", message: "Diagnostic emission unavailable; approval is unchanged", operation: "diagnostic_emit", code: "operation_failed", time, failure: { operation: "diagnostic_emit", code: "operation_failed", time } };
+        this.records.set(record.sessionID ?? "background", failure);
+        await this.storage.set(key, [...this.records.values()]);
+      }
+    }).catch(() => { this.failed = true; });
     return record;
   }
   status(): Status {

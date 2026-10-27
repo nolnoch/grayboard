@@ -611,9 +611,11 @@ test.each([true, false, undefined])("configured creation %s reaches startup bind
     expect(r.controller.status().state).toBe("unenrolled");
   } finally { await r.controller.close(); }
 });
-test.each([true, false, undefined, "true", "false", 1, {}, null])("public directory entry forwards only literal true (%j) to actual startup binding", async create => {
+test.each([true, false, undefined, "true", "false", 1, {}, null])("Promise lifecycle forwards only literal true (%j) to actual startup binding", async create => {
   const entry = "../index.js";
   const { default: plugin } = await import(entry) as typeof import("../src/index.js");
+  const { setup } = await import("../src/lifecycle.js");
+  expect(typeof plugin.effect).toBe("function");
   const r = runtime();
   let complete!: () => void;
   const bound = new Promise<void>(resolve => { complete = resolve; });
@@ -626,14 +628,14 @@ test.each([true, false, undefined, "true", "false", 1, {}, null])("public direct
   });
   let cleanup: (() => void | Promise<void>) | void = undefined;
   try {
-    cleanup = await plugin.setup({ ...r.ctx, options: { name: "fe", create },
+    cleanup = await setup({ ...r.ctx, options: { name: "fe", create },
       rpc: { register: async () => ({ dispose: async () => {} }) },
       tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }) },
       event: { async *subscribe({ signal }: { signal: AbortSignal }) {
         yield { type: "session.created", data: { sessionID: "R" } };
         if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
       } },
-    } as unknown as Context);
+    } as unknown as Context, () => {});
     await bound;
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
     expect(r.storage.get("rootSessionIDs")).toBeUndefined();

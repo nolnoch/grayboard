@@ -314,6 +314,12 @@ export class Controller {
       }
     }
   }
+  async enrollmentFailure(sessionID: string) {
+    try {
+      const session = await this.activeRoot(sessionID);
+      this.diagnostics.record({ state: "degraded", message: "Enrollment failed; approval is unchanged", operation: "enroll", sessionID: session.id, code: "operation_failed" });
+    } catch { this.backgroundFailure("enroll"); }
+  }
   backgroundFailure(operation: "event" | "stream" | "restore" | "enroll" | "after" | "hook_dispose" | "rpc_dispose") {
     this.failure(operation, undefined);
   }
