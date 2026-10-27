@@ -110,8 +110,8 @@ export function junit(raw: string | undefined, failed: boolean): string {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites tests="${tests}" failures="${failures}" skipped="${skipped}"><testsuite name="hosted-gate" tests="${tests}" failures="${failures}" skipped="${skipped}">\n${cases}\n</testsuite></testsuites>\n`;
 }
 
-export function provenance(value: any, checkout = root) {
-  if (value?.bun !== "1.4.4" || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
+export function provenance(value: any, checkout = root, suite = "strict") {
+  if (!suites.includes(suite) || value?.bun !== "1.4.4" || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
   const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: checkout, env: repositoryGitEnv() });
   if (tracked.exitCode) throw new Error("Cannot enumerate public paths");
   const paths = new Set(tracked.stdout.toString().split("\0"));
@@ -124,6 +124,19 @@ export function provenance(value: any, checkout = root) {
     });
   };
   const installedChecks = entries(value.installedChecks, true), publicChecks = entries(value.publicChecks, true);
+  const expected = new Set(["package.json", "index.js", "tui.js", "README.md", ...[...paths].filter(path => path.startsWith("adapters/opencode-v2/src/")).map(path => path.slice("adapters/opencode-v2/".length))]);
+  const complete = (checks: typeof installedChecks, required: boolean, flag: boolean) => {
+    if (flag !== required || checks.length !== (required ? expected.size : 0)) throw new Error("Incomplete installation provenance");
+    const seen = new Set<string>();
+    for (const entry of checks) {
+      if (!expected.has(entry.path) || seen.has(entry.path)) throw new Error("Invalid installation inventory");
+      seen.add(entry.path);
+      const digest = new Bun.CryptoHasher("sha256").update(readFileSync(join(checkout, "adapters/opencode-v2", entry.path))).digest("hex");
+      if (entry.expected !== digest) throw new Error("Invalid installation source digest");
+    }
+  };
+  complete(installedChecks, suite !== "strict", value.installed);
+  complete(publicChecks, suite === "public", value.publicInstalled);
   const mismatches = [...installedChecks, ...publicChecks].filter(e => e.sha256 !== e.expected);
   return { bun: "1.4.4", installed: value.installed, publicInstalled: value.publicInstalled, installedChecks, publicChecks, mismatches, backend: entries(value.backend, false), drivers: entries(value.drivers, false) };
 }
@@ -161,7 +174,7 @@ async function main() {
   let matrix: ReturnType<typeof matrixObservation> | { phase: "invalid"; state: "failed" } = { phase: "invalid", state: "failed" };
   try {
     if (suite === "matrix") matrix = matrixObservation(readJUnit(join(raw, "matrix.jsonl"), 8192), runtimeExit);
-    const data = provenance(JSON.parse(readFileSync(join(raw, "provenance.json"), "utf8")));
+    const data = provenance(JSON.parse(readFileSync(join(raw, "provenance.json"), "utf8")), root, suite);
     if (data.mismatches.length) exit = 1;
     if (suite === "strict" && runtimeExit === 0 && !existsSync(join(raw, "unit.xml"))) throw new Error("Missing JUnit");
     xml = junit(existsSync(join(raw, "unit.xml")) ? readJUnit(join(raw, "unit.xml")) : undefined, exit !== 0);

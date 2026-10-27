@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { junit, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { junit, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -83,6 +83,7 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
   writeFileSync(join(root, "tests/e2e/opencode-config.ts"), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
+  for (const file of ["index.js", "tui.js", "README.md", "src/index.ts"]) writeFileSync(join(root, "adapters/opencode-v2", file), "fixture\n");
   const secrets = ["access-" + crypto.randomUUID(), "refresh-" + crypto.randomUUID(), "lease-" + crypto.randomUUID(), "fake-access-one", "synthetic-json-secret"];
   if (matrixMode) {
     writeFileSync(join(root, "injected-matrix"), matrixMode.raw.replaceAll("SECRET", secrets[0]!));
@@ -107,7 +108,7 @@ install)
  exit 0 ;;
 run)
  shift
- if [ "$1" = test:host-races ]; then cp "$PROBE_ROOT/injected-matrix" "$GRAYBOARD_E2E_RUN_DIR/matrix.jsonl"; printf '%s' '${secrets[0]}' >&2; exit ${matrixMode?.exit ?? 1}; fi
+ if [ "$1" = test:host-races ]; then mkdir -p "$GRAYBOARD_PACKAGE_TEST_DIR"; printf '%s' "$PROBE_ROOT/adapters/opencode-v2" > "$GRAYBOARD_PACKAGE_TEST_DIR/installed.txt"; cp "$PROBE_ROOT/injected-matrix" "$GRAYBOARD_E2E_RUN_DIR/matrix.jsonl"; printf '%s' '${secrets[0]}' >&2; exit ${matrixMode?.exit ?? 1}; fi
  if [ "$1" != test ]; then exit 0; fi
  shift
  if [ -f "$PROBE_ROOT/injected.xml" ]; then cp "$PROBE_ROOT/injected.xml" "$GRAYBOARD_E2E_RUN_DIR/unit.xml"; printf '%s' '${secrets[0]}' >&2; exit 0; fi
@@ -162,6 +163,36 @@ esac
   }
   if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(output, "evidence/result"), "utf8")).toBe("failed\n"); }
 }, 30_000);
+
+test("each hosted suite requires its complete actual installation inventory and flags", () => {
+  const root = mkdtempSync(join(tmpdir(), "gb-install-proof-")); roots.push(root);
+  const pkg = join(root, "adapters/opencode-v2"); mkdirSync(join(pkg, "src"), { recursive: true });
+  const files = ["package.json", "index.js", "tui.js", "README.md", "src/index.ts", "src/controller.ts"];
+  const checks = files.map(path => {
+    writeFileSync(join(pkg, path), path);
+    const sha256 = new Bun.CryptoHasher("sha256").update(path).digest("hex");
+    return { path, sha256, expected: sha256 };
+  });
+  const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
+  git("init", "-q"); git("add", "adapters"); git(...identity, "commit", "-qm", "fixture");
+  const base = { bun: "1.4.4", backend: [], drivers: [], installed: false, publicInstalled: false, installedChecks: [] as typeof checks, publicChecks: [] as typeof checks };
+  expect(provenance(base, root, "strict").installedChecks).toEqual([]);
+  expect(() => provenance({ ...base, installed: true, installedChecks: checks }, root, "strict")).toThrow();
+  for (const suite of ["git", "config", "public", "host", "live", "matrix", "native", "durable"]) {
+    const valid = { ...base, installed: true, publicInstalled: suite === "public", installedChecks: checks, publicChecks: suite === "public" ? checks : [] };
+    expect(provenance(valid, root, suite).mismatches).toEqual([]);
+    for (const change of [
+      { installed: false }, { installed: false, installedChecks: [] }, { installedChecks: [] },
+      { installedChecks: checks.slice(1) }, { installedChecks: [...checks, checks[0]!] },
+      { installedChecks: checks.map((c, i) => i === 1 ? checks[0]! : c) },
+      { installedChecks: checks.map(c => ({ ...c, expected: "a".repeat(64), sha256: "a".repeat(64) })) },
+      { publicInstalled: !valid.publicInstalled },
+      ...(suite === "public" ? [{ publicChecks: [] }, { publicChecks: checks.slice(1) }, { publicChecks: checks.map((c, i) => i === 1 ? checks[0]! : c) }] : [{ publicChecks: checks }]),
+    ]) expect(() => provenance({ ...valid, ...change }, root, suite)).toThrow();
+    const mismatched = checks.map((c, i) => i ? c : { ...c, sha256: "a".repeat(64) });
+    expect(provenance({ ...valid, installedChecks: mismatched }, root, suite).mismatches).toHaveLength(1);
+  }
+});
 
 test("fixture Git filtering covers documented local variables without clearing transport settings", () => {
   const result = Bun.spawnSync(["git", "rev-parse", "--local-env-vars"], { cwd: checkout, env: repositoryGitEnv() });
