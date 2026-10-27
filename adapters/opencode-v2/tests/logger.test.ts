@@ -42,7 +42,10 @@ test("logger rejection persists a safe root failure without recursive emission",
   diagnostics.record(record); expect(await diagnostics.flush()).toBe(false);
   expect(calls).toBe(1); expect(s.writes).toHaveLength(2);
   const restored = new Diagnostics(s.store); await restored.restore(async id => id === "R");
-  expect(restored.status().roots[0]!.operation).toBe("diagnostic_emit");
+  expect(restored.status().roots[0]!.state).toBe("paused");
+  expect(restored.status().roots[0]!.operation).toBe("subscriber");
+  expect(restored.status().roots[0]!.code).toBe("retry_exhausted");
+  expect(restored.status().roots[0]!.failure?.operation).toBe("diagnostic_emit");
   expect(JSON.stringify(restored.status())).not.toContain("secret-canary");
 });
 test("persistence failure still reaches the safe emitter without exposing exception properties", async () => {
@@ -52,6 +55,26 @@ test("persistence failure still reaches the safe emitter without exposing except
   expect(JSON.stringify(events)).toContain("diagnostic_save");
   expect(JSON.stringify(events)).not.toContain("private-storage-path-canary");
 });
+test("an older held logger rejection cannot overwrite a queued terminal pause", async () => {
+  const s = storage(); let entered!: () => void, release!: () => void, calls = 0;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const diagnostics = new Diagnostics(s.store, async () => {
+    if (++calls === 1) { entered(); await held; throw new Error("synthetic-private-error"); }
+  });
+  try {
+    diagnostics.record({ ...record, state: "active", operation: "delivery", code: undefined });
+    await started;
+    diagnostics.record(record);
+    release(); await diagnostics.flush();
+    const restored = new Diagnostics(s.store); await restored.restore(async id => id === "R");
+    const terminal = restored.status().roots[0]!;
+    expect(terminal.state).toBe("paused"); expect(terminal.code).toBe("retry_exhausted");
+    expect(terminal.operation).toBe("subscriber"); expect(terminal.failure?.operation).toBe("diagnostic_emit");
+    expect(calls).toBe(2); expect(JSON.stringify(restored.status())).not.toContain("synthetic-private-error");
+  } finally { release(); await diagnostics.flush(); }
+});
+
 test("host field projection never executes malformed getters or forwards nested error data", () => {
   let read = false;
   expect(logFields({ ...record, get message() { read = true; throw new Error("secret-canary"); } })).toBeUndefined();

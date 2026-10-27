@@ -177,6 +177,35 @@ test.each([false, true])("expiry failed-continuation barrier joins actual subscr
   } finally { gate.release(); releaseAdmission.release(); model.release(); await r.controller.close(); work.restore(); }
 });
 
+test.each([false, true])("terminal retry pause survives diagnostic emission failure and requires explicit re-enrollment (%j)", async reject => {
+  const r = runtime(); let exhausted = false, restored: Controller | undefined;
+  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async () => {}, async record => {
+    if (record.code === "retry_exhausted") exhausted = true;
+    if (reject) throw new Error("Bearer synthetic-private-error\\n at secret-canary.ts:1");
+  });
+  try {
+    r.bind("R", "be");
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.admission(async () => { throw new Error("synthetic-private-error"); });
+    await controller.enroll("R"); await until(() => exhausted); await controller.close();
+    expect(r.admissions).toHaveLength(8);
+    const terminal = (r.storage.get("diagnostics:v1") as { state: string; code?: string; operation: string; failure?: { operation: string } }[]).find(record => record.code === "retry_exhausted")!;
+    expect(terminal.state).toBe("paused"); expect(terminal.operation).toBe("subscriber");
+    if (reject) expect(terminal.failure?.operation).toBe("diagnostic_emit");
+    expect(JSON.stringify(r.storage.get("diagnostics:v1"))).not.toContain("synthetic-private-error");
+    expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
+    const opens = r.calls.filter(call => call.name === "delivery_open").length;
+    r.admission(async () => {});
+    restored = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async () => {});
+    await restored.restore(); await restored.flushDiagnostics();
+    expect(restored.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
+    expect(r.calls.filter(call => call.name === "delivery_open")).toHaveLength(opens);
+    expect(r.admissions).toHaveLength(8); expect(r.calls.filter(call => call.name === "delivery_receipt")).toEqual([]);
+    await restored.enroll("R"); await until(() => r.calls.some(call => call.name === "delivery_receipt"));
+    expect(r.admissions).toHaveLength(9);
+  } finally { await restored?.close(); await controller.close(); await r.controller.close(); }
+});
+
 test("remembered-name bookkeeping cannot grant approval after a concurrent revocation", async () => {
   const r = runtime(); const original = r.ctx.storage.set;
   let revoked = false;

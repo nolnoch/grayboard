@@ -110,7 +110,12 @@ export class Diagnostics {
     const emitted = Object.freeze({ ...record, ...(record.failure ? { failure: Object.freeze({ ...record.failure }) } : {}) });
     this.pending = this.pending.then(async () => {
       let persisted = true;
-      try { await this.storage.set(key, snapshot); } catch { this.failed = true; persisted = false; }
+      const retained = snapshot.map(saved => {
+        const latest = this.records.get(saved.sessionID ?? "background");
+        return latest?.failure?.operation === "diagnostic_emit" && latest.failure.time >= saved.time
+          ? { ...saved, failure: { ...latest.failure } } : saved;
+      });
+      try { await this.storage.set(key, retained); } catch { this.failed = true; persisted = false; }
       try {
         if (!persisted) await this.sink?.(Object.freeze({ ...emitted, state: "degraded", message: "Diagnostic persistence unavailable; approval is unchanged", operation: "diagnostic_save", code: "operation_failed" }));
         await this.sink?.(emitted);
@@ -118,7 +123,11 @@ export class Diagnostics {
       catch {
         this.failed = true;
         const time = Date.now();
-        const failure = { ...record, state: "degraded", message: "Diagnostic emission unavailable; approval is unchanged", operation: "diagnostic_emit", code: "operation_failed", time, failure: { operation: "diagnostic_emit", code: "operation_failed", time } };
+        const current = this.records.get(record.sessionID ?? "background") ?? record;
+        const emissionFailure = { operation: "diagnostic_emit", code: "operation_failed", time };
+        const failure = current.state === "paused"
+          ? { ...current, failure: emissionFailure }
+          : { ...current, state: "degraded", message: "Diagnostic emission unavailable; approval is unchanged", operation: "diagnostic_emit", code: "operation_failed", time, failure: emissionFailure };
         this.records.set(record.sessionID ?? "background", failure);
         await this.storage.set(key, [...this.records.values()]);
       }
