@@ -947,7 +947,7 @@ export type UnboundPeer = { session_id: string; unbound: true; online: true; whe
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
 // peer_list's match filter (#284 S13): exact, case-insensitive, ANDed. scope
-// is an alias's scope_ref, or an ID's principal.
+// is an alias's scope_ref, or an ID's principal where the caller may see it.
 export const MATCH_KEYS = ["id", "harness", "model", "effort", "task", "owner", "source_board", "spec_hash", "scope"] as const;
 export type PeerMatch = { [K in (typeof MATCH_KEYS)[number]]?: string };
 
@@ -1053,8 +1053,13 @@ export function who(
     const session = sessionFacts(r);
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
-    const scope = (r.scope_kind !== null ? r.scope_ref : r.principal) ?? undefined;
-    if (opts.match && !matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
+    // An ID row's scope is its principal, which the row doesn't show: it
+    // matches only for a caller that may act in that principal's scope (#371).
+    if (opts.match) {
+      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
+      if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
+    }
     all.push({
       handle: r.handle,
       online: own.has(r.handle) || online(r.handle),

@@ -254,3 +254,20 @@ test("peer_list's match over WSS: model, task, id and scope; an unknown key is r
   expect(await handles({ scope: "alice@example.com" })).toEqual(["alice@example.com/fe"]);
   expect(await member.call("peer_list", { match: { colour: "red" } })).toMatchObject({ type: "error", message: expect.stringContaining(`match has no key "colour"`) });
 });
+
+// #371: an ID row's scope is its principal, which the row doesn't show, so
+// another principal's match on it can't learn whose session it is.
+test("peer_list's match.scope finds an ID row for its own principal, never for another's", async () => {
+  const member = srv.client(alice, "fe");
+  await member.connect();
+  await member.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const unbound = srv.client(bob, null);
+  await unbound.connect();
+  expect((await unbound.call("board_subscribe", { board: "e2e", mode: "push" })).type).toBe("call_ok");
+  const mine = srv.client(bob, "be");
+  await mine.connect();
+  const handles = async (c: typeof member, scope: string) =>
+    ((await c.call("peer_list", { board: "e2e", match: { scope } })).result.peers as Any[]).map((p) => p.handle);
+  expect(await handles(mine, B)).toEqual([unbound.id]);
+  expect(await handles(member, B)).toEqual([]);
+});
