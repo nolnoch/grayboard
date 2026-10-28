@@ -302,7 +302,7 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 sudo apt update && sudo apt install -y caddy
 ```
 
-Create the `grayboard` system user and install the binaries (`grayboard-server`, plus the `grayboard` CLI for checks):
+Create the `grayboard` system user, then install the binaries (`grayboard-server`, plus the `grayboard` CLI for checks) and the release's deploy files: the systemd unit (`/etc/systemd/system/grayboard.service`), the Caddyfile (`/etc/caddy/Caddyfile`) and the backup script (`/usr/local/bin/grayboard-backup`). The deploy files are release assets listed in the same signed `SHA256SUMS` as the binaries, so the whole install rests on the release key:
 
 ```bash
 id grayboard || sudo useradd -r -m -d /var/lib/grayboard grayboard
@@ -310,19 +310,12 @@ sudo mkdir -p /var/lib/grayboard /etc/grayboard
 sudo chown grayboard:grayboard /var/lib/grayboard
 
 curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
-  | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
+  | sudo GRAYBOARD_DEPLOY_REPLACE=1 INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
 ```
 
-Fetch the systemd unit, Caddyfile and backup script:
+`GRAYBOARD_DEPLOY_REPLACE=1` is for this first install only: Caddy's package ships its own `/etc/caddy/Caddyfile`, which the release's replaces (the old one is kept as `Caddyfile.prev`). Without it, the installer keeps any unit or Caddyfile that differs from the release's and says so, with the two checksums and a `diff` command. A symlinked unit (for example a masked one) is never replaced. Your own edits, such as the hostname in step 3 or a source-mode `ExecStart`, then survive every update. `GRAYBOARD_NO_DEPLOY=1` installs only the binaries; a host without `systemctl` installs only the binaries too.
 
-```bash
-sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/grayboard.service -o /etc/systemd/system/grayboard.service
-sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/Caddyfile         -o /etc/caddy/Caddyfile
-sudo curl -fsSL https://raw.githubusercontent.com/nolnoch/grayboard/master/deploy/backup.sh         -o /usr/local/bin/grayboard-backup
-sudo chmod +x /usr/local/bin/grayboard-backup
-```
-
-**Check:** `grayboard --version` prints the release you expect, `ls -l /usr/local/bin/grayboard-server` shows the server binary, and `caddy version` runs.
+**Check:** `grayboard --version` prints the release you expect, `ls -l /usr/local/bin/grayboard-server /usr/local/bin/grayboard-backup /etc/systemd/system/grayboard.service /etc/caddy/Caddyfile` lists the files, and `caddy version` runs.
 
 <details>
 <summary>Alternative: run the server from a source checkout (for hacking on the server itself)</summary>
@@ -471,6 +464,8 @@ scripts/deploy_check.sh https://grayboard.example.com v2.0.0   # from a checkout
 ```
 
 The installer prints the release it installs, restarts the `grayboard` service, and waits up to 30 seconds for `/healthz` on the local port to report that release. If it doesn't, the installer exits 1 with the version it saw and prints the `journalctl` command and a one-line rollback to the binary it replaced (kept as `grayboard-server.prev`). A stopped unit isn't started, and a unit whose `ExecStart` is a different binary than the one installed isn't restarted. To pin a release, add `GRAYBOARD_VERSION=v2.0.0` after `sudo`. A release from before signed checksums (v1.x) has no `SHA256SUMS`, so this `install.sh` refuses it; to pin one, run that release's own `install.sh` (`https://github.com/nolnoch/grayboard/releases/download/v1.x.y/install.sh`). Clients reconnect on their own after the restart, which drops them for a few seconds. `scripts/deploy_check.sh` repeats the check from outside the host, through Caddy: it exits 1 unless `/healthz` answers ok with the release you name. From an address the server is rate-limiting after repeated authentication failures, every request gets 429, `/healthz` included; the check says so, and passes from another address or after the wait.
+
+The installer also refreshes the release's deploy files (see the install step above): `grayboard-backup` is replaced, and a unit or Caddyfile you have edited is kept, with a line saying so. Add `GRAYBOARD_DEPLOY_REPLACE=1` after `sudo` to take the release's copy instead (the old one is kept as `<file>.prev`, or `<file>.prev.<UTC time>` if a `.prev` is already there). On an update that swaps your Caddyfile's real hostname for the placeholder and reloads nothing: redo the hostname edit, then `sudo systemctl reload caddy`. The installer stages and backs up every file before it replaces any; if `systemctl daemon-reload` fails, it exits 1 with the binaries still the old release.
 
 ### Per-developer setup (one-time)
 
