@@ -116,7 +116,9 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
 // Sign-in routes: each call costs the caller's address an auth failure
 // (#240), charged on entry while the route is enabled. The router dispatches
 // them from this table, so a route can't be served without being charged.
-// #204's OAuth routes (authorize, token, registration) join here.
+// The OAuth AS routes stay out: oauth.fetch answers them first (app.ts) under
+// its own limiter, and charges token and revocation posts only for refused
+// grant material, since they must take form posts (#283).
 type SignInHandler = (req: Request, repo: Repo, config: Config, ip: string | null) => Promise<Response>;
 const SIGN_IN_ROUTES = new Map<string, { enabled: (config: Config) => boolean; handle: SignInHandler }>([
   ["/api/auth/exchange", { enabled: () => true, handle: authExchange }],

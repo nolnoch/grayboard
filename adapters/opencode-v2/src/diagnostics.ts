@@ -1,5 +1,5 @@
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { SubscriberError } from "./wire.js";
+import { SubscriberError, holderText } from "./wire.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
@@ -25,7 +25,8 @@ export function failureMessage(error: unknown): string {
   if (error instanceof SubscriberError) {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;
-    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}`;
+    const holder = Object.getOwnPropertyDescriptor(error, "holder")?.value;
+    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "identity_in_use" && holderText(holder) ? `; held by ${holder}` : ""}`;
   }
   return "Operation failed; approval retained, explicitly enroll to retry";
 }

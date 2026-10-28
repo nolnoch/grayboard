@@ -24,12 +24,20 @@ const json = (uri: string, value: unknown) => ({ contents: [{ uri, mimeType: "ap
 const expected = (error: unknown): error is ApplicationError | CoreError => error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError;
 const message = (error: unknown) => expected(error) ? error.message : "internal error";
 const domainCode = (error: unknown) => error instanceof ApplicationError && error.code !== "internal" ? error.code : error instanceof CoreError ? "refused" : "internal_error";
-function domainData(error: unknown): { code: string; known?: string[] } {
-  const result: { code: string; known?: string[] } = { code: domainCode(error) };
-  if (!(error instanceof ApplicationError) || result.code !== "identity_unknown") return result;
+// A holder names another session of the same account (bind only searches the caller's own); it reaches the
+// subscriber so a refused rebind can say who holds the name. Free text: bounded, and no control or bidi characters.
+const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
+function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
+  const result: { code: string; known?: string[]; holder?: string } = { code: domainCode(error) };
+  if (!(error instanceof ApplicationError) || (result.code !== "identity_unknown" && result.code !== "identity_in_use")) return result;
   try {
     const extra = Object.getOwnPropertyDescriptor(error, "extra")?.value;
     if (!extra || typeof extra !== "object") return result;
+    if (result.code === "identity_in_use") {
+      const holder = Object.getOwnPropertyDescriptor(extra, "holder")?.value;
+      if (holderText(holder)) result.holder = holder;
+      return result;
+    }
     const names = Object.getOwnPropertyDescriptor(extra, "known")?.value;
     if (!Array.isArray(names)) return result;
     const count = Object.getOwnPropertyDescriptor(names, "length")?.value;

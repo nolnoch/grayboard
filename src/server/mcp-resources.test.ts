@@ -147,6 +147,25 @@ test("subscriber known suggestions stay account scoped and reject malformed extr
   } finally { hosted.delivery.pending = pending; }
 });
 
+test("subscriber in-use refusals name the holder as bounded plain text", async () => {
+  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": "other-root" }), { name: "fe", create: true, where: "/work/app" });
+  const client = await connect("2026-07-28");
+  const refused = (await client.callTool({ name: "bind", arguments: { name: "fe", create: false } })).structuredContent as { code: string; holder: string };
+  expect(refused.code).toBe("identity_in_use");
+  expect(refused.holder).toMatch(/^the hosted session \S+, in \/work\/app, last seen \d+s ago$/);
+  const bind = hosted.sessions.bind;
+  try {
+    for (const holder of ["", "x".repeat(2049), "held\nby", "held\u009bby", "held‮by", 42]) {
+      hosted.sessions.bind = async () => { throw new ApplicationError("identity_in_use", "in use", Object.defineProperty({}, "holder", { value: holder })); };
+      expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "identity_in_use" });
+    }
+    hosted.sessions.bind = async () => { throw new ApplicationError("identity_in_use", "in use", { holder: "the live session x", known: ["be"] }); };
+    expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "identity_in_use", holder: "the live session x" });
+  } finally { hosted.sessions.bind = bind; }
+});
+
 test("hosted audit actors and clients survive grant deletion and ownership cleanup", async () => {
   const client = await connect("2026-07-28");
   const opened = await client.callTool({ name: "delivery_open", arguments: {} });

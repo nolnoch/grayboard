@@ -33,6 +33,7 @@ const json = (data: unknown, status = 200, extra: Record<string, string> = {}) =
 const html = (body: string, status = 200, callbackOrigin?: string) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
   status, headers: { ...headers, ...(callbackOrigin ? { "Referrer-Policy": "same-origin" } : {}), "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'${callbackOrigin ? " " + callbackOrigin : ""}`, "X-Frame-Options": "DENY" },
 });
+const refusal = (e: OAuthError) => json({ error: e.error }, e.status, e.error === "invalid_client" ? { "WWW-Authenticate": "Basic realm=\"oauth\"" } : {});
 const redirect = (url: string) => new Response(null, { status: 303, headers: { ...headers, Location: url } });
 
 function parameters(raw: string, allowed?: string[]): URLSearchParams {
@@ -142,26 +143,33 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   }, now, maxKeys);
   const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
   const addressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "address", 1000);
+  const tokenAddressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "token_address", 1000);
   let closed = false;
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
-    globalLimit.sweep(); addressLimit.sweep();
+    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep();
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
   timer.unref();
-  const rate = (path: string, context?: OAuthNetworkContext): Response | undefined => {
-    const route = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
+  const routeName = (path: string) => ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
+  // Token and revocation posts have their own address bucket and are charged
+  // only when they present grant material and are refused (#283): a
+  // cross-site form post reaches them, and must not lock an office NAT out of
+  // token refresh. Every other route is charged on entry.
+  type Buckets = readonly (readonly [RateLimiter, string])[];
+  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets =>
+    [[token ? tokenAddressLimit : addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
+  const spend = (checks: Buckets, path: string) => { for (const [limit, key] of checks) limit.spend(key, { path: routeName(path) }); };
+  const rate = (checks: Buckets, path: string): Response | undefined => {
     // The address goes first and nothing is spent until both pass: a request
     // its own address refuses must not drain the org-wide bucket.
-    const checks = [[addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]] as const;
     for (const [limit, key] of checks) {
-      const result = limit.check(key, { path: route });
+      const result = limit.check(key, { path: routeName(path) });
       if (!result.ok) return json({ error: "temporarily_unavailable" }, 429, { "Retry-After": String(retrySecs(result.retryAfterMs)) });
     }
-    for (const [limit, key] of checks) limit.spend(key, { path: route });
   };
   const sameOrigin = (req: Request, mandatory = false) => {
     const origin = req.headers.get("origin");
@@ -244,10 +252,16 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true });
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
-    const limited = rate(path, context);
+    const tokenRoute = req.method === "POST" && (path === "/oauth/token" || path === "/oauth/revoke");
+    const checks = buckets(context, tokenRoute);
+    const limited = rate(checks, path);
     if (limited) return limited;
-    if (u.search.length > 8192) fail();
-    if (["access_token", "client_secret"].some(k => u.searchParams.getAll(k).some(v => v !== ""))) fail();
+    if (!tokenRoute) spend(checks, path);
+    const strictQuery = () => {
+      if (u.search.length > 8192) fail();
+      if (["access_token", "client_secret"].some(k => u.searchParams.getAll(k).some(v => v !== ""))) fail();
+    };
+    if (!tokenRoute) strictQuery();
     if (path === "/oauth/authorize" && req.method === "GET") {
       const raw = parameters(u.search.slice(1));
       const p = recognized(withoutEmpty(raw), ["response_type", "client_id", "redirect_uri", "scope", "resource", "state", "code_challenge", "code_challenge_method"]);
@@ -350,55 +364,69 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       flows.delete(r.requestHash);
       return returnToClient(r, f, decision === "approve" ? { code } : { error: "access_denied" });
     }
-    if ((path === "/oauth/token" || path === "/oauth/revoke") && req.method === "POST") {
-      sameOrigin(req);
-      const query = parameters(u.search.slice(1));
-      const body = await form(req);
-      const securityFields = ["grant_type", "client_id", "client_secret", "access_token", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token", "token", "token_type_hint"];
-      if ([...query].some(([k, v]) => v !== "" && securityFields.includes(k)) || [...query.keys()].some(k => body.has(k))) fail();
-      if (body.has("resource") && !body.get("resource")) fail("invalid_grant");
-      const submitted = withoutEmpty(body);
-      if (submitted.has("access_token")) fail();
-      const client = await clientAuth(req, submitted);
-      if (path === "/oauth/revoke") {
-        const p = recognized(submitted, ["token", "token_type_hint"]);
-        repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
-        writeAudit(repo, "oauth.revoke_requested", null, null, { client_id: client.clientId });
-        return new Response(null, { status: 200, headers });
+    if (tokenRoute) {
+      // Set once the request presents grant material: before that it is
+      // refused uncharged and unaudited, since a cross-site form post can
+      // reach that far (#283), and clientAuth's CIMD fetch is never reached.
+      let material = false;
+      try {
+        sameOrigin(req);
+        strictQuery();
+        const query = parameters(u.search.slice(1));
+        const body = await form(req);
+        const securityFields = ["grant_type", "client_id", "client_secret", "access_token", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token", "token", "token_type_hint"];
+        if ([...query].some(([k, v]) => v !== "" && securityFields.includes(k)) || [...query.keys()].some(k => body.has(k))) fail();
+        if (body.has("resource") && !body.get("resource")) fail("invalid_grant");
+        const submitted = withoutEmpty(body);
+        if (submitted.has("access_token")) fail();
+        if (!req.headers.has("authorization") && !(path === "/oauth/token" ? ["code", "refresh_token"] : ["token"]).some(k => submitted.has(k))) fail();
+        material = true;
+        const client = await clientAuth(req, submitted);
+        if (path === "/oauth/revoke") {
+          const p = recognized(submitted, ["token", "token_type_hint"]);
+          repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
+          writeAudit(repo, "oauth.revoke_requested", null, null, { client_id: client.clientId });
+          return new Response(null, { status: 200, headers });
+        }
+        const p = recognized(submitted, ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token"]);
+        const grantType = required(p, "grant_type");
+        if (!["authorization_code", "refresh_token"].includes(grantType)) fail("unsupported_grant_type");
+        const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"] : ["grant_type", "client_id", "refresh_token", "resource", "scope"];
+        if ([...p].some(([k, v]) => v !== "" && !allowed.includes(k))) fail();
+        if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
+        const t = now();
+        const access = random(), refresh = random();
+        let selected: string[];
+        let result;
+        const pair = (selected: string[]) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
+          accessExpiresAt: t + OAUTH_TTL.access, refreshExpiresAt: t + OAUTH_TTL.refresh });
+        if (grantType === "authorization_code") {
+          const verifier = required(p, "code_verifier");
+          if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) fail("invalid_grant");
+          const codeHash = hashToken(required(p, "code")), redirectUri = required(p, "redirect_uri");
+          selected = repo.oauth.findCodeScopes(codeHash, client.clientId, resource, redirectUri, t) ?? [];
+          if (!selected.length) fail("invalid_grant");
+          if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
+          result = repo.oauth.redeemCode({ clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash,
+            grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t);
+        } else {
+          if (!client.allowRefresh) fail("invalid_grant");
+          const refreshHash = hashToken(required(p, "refresh_token"));
+          const grant = repo.oauth.findRefreshGrant(refreshHash, client.clientId, resource, t);
+          if (!grant) fail("invalid_grant");
+          selected = scopes(optional(p, "scope"), grant!.scopes);
+          if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
+          result = repo.oauth.rotateRefresh({ clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
+        }
+        if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
+        return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),
+          ...(client.allowRefresh ? { refresh_token: refresh } : {}) });
+      } catch (e) {
+        if (!(e instanceof OAuthError)) throw e;
+        if (!material) return refusal(e);
+        if (e.status < 500) spend(checks, path);
+        throw e;
       }
-      const p = recognized(submitted, ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token"]);
-      const grantType = required(p, "grant_type");
-      if (!["authorization_code", "refresh_token"].includes(grantType)) fail("unsupported_grant_type");
-      const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"] : ["grant_type", "client_id", "refresh_token", "resource", "scope"];
-      if ([...p].some(([k, v]) => v !== "" && !allowed.includes(k))) fail();
-      if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
-      const t = now();
-      const access = random(), refresh = random();
-      let selected: string[];
-      let result;
-      const pair = (selected: string[]) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
-        accessExpiresAt: t + OAUTH_TTL.access, refreshExpiresAt: t + OAUTH_TTL.refresh });
-      if (grantType === "authorization_code") {
-        const verifier = required(p, "code_verifier");
-        if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) fail("invalid_grant");
-        const codeHash = hashToken(required(p, "code")), redirectUri = required(p, "redirect_uri");
-        selected = repo.oauth.findCodeScopes(codeHash, client.clientId, resource, redirectUri, t) ?? [];
-        if (!selected.length) fail("invalid_grant");
-        if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
-        result = repo.oauth.redeemCode({ clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash,
-          grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t);
-      } else {
-        if (!client.allowRefresh) fail("invalid_grant");
-        const refreshHash = hashToken(required(p, "refresh_token"));
-        const grant = repo.oauth.findRefreshGrant(refreshHash, client.clientId, resource, t);
-        if (!grant) fail("invalid_grant");
-        selected = scopes(optional(p, "scope"), grant!.scopes);
-        if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
-        result = repo.oauth.rotateRefresh({ clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
-      }
-      if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
-      return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),
-        ...(client.allowRefresh ? { refresh_token: refresh } : {}) });
     }
     if (path === "/oauth/callback/complete" && req.method === "GET") {
       const p = parameters(u.search.slice(1), ["code", "state", "iss", "error", "error_description"]);
@@ -417,7 +445,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       try { return await route(req, context); }
       catch (e) {
         if (e instanceof CimdUnavailable) return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "30" });
-        if (e instanceof OAuthError) { writeAudit(repo, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return json({ error: e.error }, e.status, e.error === "invalid_client" ? { "WWW-Authenticate": "Basic realm=\"oauth\"" } : {}); }
+        if (e instanceof OAuthError) { writeAudit(repo, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return refusal(e); }
         hostedFailure("oauth.request", e);
         writeAudit(repo, "oauth.request_failed", null, null, { category: "unexpected" });
         return json({ error: "server_error" }, 500);
