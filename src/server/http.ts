@@ -136,7 +136,7 @@ export function signInRoute(method: string, path: string, config: Config): { cha
 // token close in the same tick (#351).
 function authLogout(authed: AuthedUser, repo: Repo, disconnectSession: SessionHooks["disconnectSession"]): Response {
   repo.sessions.revoke(authed.session_id);
-  writeAudit(repo, "auth.logout", authed.user_email, null);
+  writeAudit(repo, "auth.logout", authed.user_email, null, { token_session: authed.session_id });
   disconnectSession(authed.session_id, "logout");
   return json({ ok: true });
 }

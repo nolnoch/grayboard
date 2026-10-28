@@ -170,9 +170,10 @@ test("a refused token says to sign in again: at startup, in a running session's 
   const be = new GrayboardClient(srv.base, () => token, mintSessionKey(), noop, noop, msg, { tokenPollMs: 200 });
   be.connect();
   await be.ready();
-  // The server closes the revoked token's socket itself (#351), and the client says to sign in.
+  // The server closes the revoked token's socket itself (#351), and the client says to sign in. Within
+  // 500 ms, under the 1 s reconnect delay: a client that only learned of it from the reconnect's probe would be too late.
   await fetch(`${srv.base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-  await until(async () => (await be.request({ type: "inbox" }).then(() => "", (e: Error) => e.message)) === "sign in; reconnecting", 3000);
+  await until(async () => (await be.request({ type: "inbox" }).then(() => "", (e: Error) => e.message)) === "sign in; reconnecting", 500);
   // ...picks up a new sign-in at its next look at the token.
   token = await login("alice@example.com");
   await until(async () => (await be.request({ type: "inbox" }).catch(() => null))?.type === "inbox_ok", 3000);
@@ -186,6 +187,29 @@ test("a refused token says to sign in again: at startup, in a running session's 
     `Error (unauthenticated): your sign-in isn't valid on ${srv.base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${srv.base}`,
   );
 }, 20_000);
+
+test("a client refused unauthenticated after it was ready waits for a new sign-in; before that, startup fails", async () => {
+  const noop = async () => {};
+  const refusal = { type: "error", req_id: "h", code: "unauthenticated", message: "this sign-in was signed out" };
+
+  const running = new GrayboardClient(srv.base, () => "t", mintSessionKey(), noop, noop, () => "sign in; reconnecting") as any;
+  let closes = 0;
+  running.ws = { close: () => closes++ };
+  running.wasReady = true;
+  running.helloId = "h";
+  running.handleServerMessage(refusal);
+  expect(running.dead).toBe(false);
+  expect(running.refused).toBe("sign in; reconnecting");
+  expect(closes).toBe(1);
+
+  const starting = new GrayboardClient(srv.base, () => "t", mintSessionKey(), noop, noop, () => "sign in") as any;
+  starting.ws = { close: () => {} };
+  starting.helloId = "h";
+  const ready = starting.ready();
+  starting.handleServerMessage(refusal);
+  await expect(ready).rejects.toMatchObject({ code: "unauthenticated" });
+  expect(starting.dead).toBe(true);
+});
 
 test("a hello the server refuses exits at once with its reason, not a timeout (#74)", async () => {
   const token = await login("alice@example.com");

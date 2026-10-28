@@ -3,6 +3,7 @@
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { hashToken } from "../../src/server/auth.ts";
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -327,6 +328,7 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
   await a.connect();
   const closed = (c: WsClient) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
 
+  let pass = 0;
   for (const path of ["/api/admin/revoke-session", "/api/admin/disable-user"]) {
     await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
     const bob = await login("bob@example.com");
@@ -337,7 +339,7 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
     expect((await api(root, "POST", path, { email: "bob@example.com" })).status).toBe(200);
     expect(await live.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
     await gone;
-    expect(audits("auth.connection_closed").map((r) => JSON.parse(r.detail).why)).toContain("user_signed_out");
+    expect(audits("auth.connection_closed").filter((r) => JSON.parse(r.detail).why === "user_signed_out")).toHaveLength(2 * ++pass);
   }
   expect((await a.call("board_list")).type).toBe("call_ok");
 
@@ -362,7 +364,7 @@ test("logout closes only that token's connections and ends only their sessions, 
   await Promise.all([a1.connect(), a2.connect(), b.connect()]);
   const closed = (c: WsClient) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
   const gone = Promise.all([closed(a1), closed(a2)]);
-  const sidA = srv.app.repo.sessions.findByTokenHash(createHash("sha256").update(tokenA).digest("hex"))!.id;
+  const sidA = srv.app.repo.sessions.findByTokenHash(hashToken(tokenA))!.id;
 
   expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
   expect(await a1.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
@@ -380,6 +382,22 @@ test("logout closes only that token's connections and ends only their sessions, 
   for (const r of closes) expect(r.detail.token_session).toBe(sidA);
   expect(srv.app.repo.sessions.findById(sidA)!.revoked_at).not.toBeNull();
   expect(audits("id.ended").filter((r) => JSON.parse(r.detail).why === "signed_out").map((r) => r.target).sort()).toEqual([a1.id, a2.id].sort());
+});
+
+// A session in its grace has no connection, so only the token it last said
+// hello under (ids.token_session) finds it.
+test("logout ends the token's sessions in their grace too, and a resume on them is refused", async () => {
+  const [tokenA, tokenC] = [await login("alice@example.com"), await login("alice@example.com")];
+  const a = client(tokenA, "be");
+  await a.connect();
+  a.close();
+  await until(() => audits("id.detached").length === 1, 2000, "the grace");
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(srv.app.db.query(`SELECT ended_at FROM ids WHERE id = ?`).get(a.id)).toEqual({ ended_at: expect.any(Number) });
+  expect(audits("id.ended").map((r) => ({ target: r.target, why: JSON.parse(r.detail).why }))).toEqual([{ target: a.id, why: "signed_out" }]);
+
+  const back = client(tokenC, "be", { key: a.key, hello: { resume: true } });
+  expect(await back.connect()).toMatchObject({ type: "error", code: "id_collision" });
 });
 
 // A socket opened with a token that is revoked before it speaks is in no
@@ -403,6 +421,21 @@ test("a hello on a token revoked since the upgrade is refused, registers nothing
   expect(rows[0]).toMatchObject({ actor: "alice@example.com", detail: { why: "token_revoked" } });
 });
 
+test("a hello from a user disabled since the upgrade is refused, registers nothing, and is audited", async () => {
+  const token = await login("alice@example.com");
+  const ws = new (WebSocket as any)(`${srv.base.replace("http", "ws")}/ws`, { headers: { Authorization: `Bearer ${token}` } });
+  await new Promise((resolve) => (ws.onopen = resolve));
+  const frames: Any[] = [];
+  ws.onmessage = (e: MessageEvent) => frames.push(JSON.parse(e.data as string));
+  const closed = new Promise<void>((resolve) => (ws.onclose = () => resolve()));
+  srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail("alice@example.com")!.id, true);
+  ws.send(JSON.stringify({ type: "hello", req_id: "h", proto: PROTO, session_key: "cd".repeat(32) }));
+  await closed;
+  expect(frames.find((m) => m.type === "error")).toMatchObject({ req_id: "h", code: "unauthenticated" });
+  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM ids`).get()).toEqual({ n: 0 });
+  expect(audits("auth.hello_refused").map((r) => JSON.parse(r.detail).why)).toEqual(["user_disabled"]);
+});
+
 test("a token revoked while its hello probes a silent holder neither takes the session over nor registers", async () => {
   const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
   const holder = client(tokenB, "be", { pong: false });
@@ -417,13 +450,31 @@ test("a token revoked while its hello probes a silent holder neither takes the s
   expect(holder.ws.readyState).toBe(1);
 });
 
+// The wait for another hello's probe is an await too: a token revoked during
+// it must not go on to probe the new holder and collide as if it were live.
+test("a token revoked while its hello waits on another hello's probe is refused, not collided", async () => {
+  const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
+  const holder = client(tokenB, "be", { pong: false });
+  await holder.connect();
+  const first = client(tokenB, "be", { key: holder.key }).connect(); // probes the silent holder (150 ms)
+  await holder.next((m) => m.type === "ping");
+  // A beat for the second hello to reach the server and wait on the probe, as the sleeps above do.
+  await Bun.sleep(30);
+  const second = client(tokenA, "be", { key: holder.key }).connect();
+  await Bun.sleep(30);
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(await second).toMatchObject({ type: "error", code: "unauthenticated" });
+  expect((await first).type).toBe("hello_ok");
+  expect(audits("id.collision")).toEqual([]);
+});
+
 test("the heartbeat closes a revoked token's connections when no route said so, leaving the user's other token", async () => {
   const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
   const a = client(tokenA, "be");
   const b = client(tokenB, "fe");
   await Promise.all([a.connect(), b.connect()]);
   const gone = new Promise<void>((resolve) => a.ws.addEventListener("close", () => resolve()));
-  srv.app.repo.sessions.revoke(srv.app.repo.sessions.findByTokenHash(createHash("sha256").update(tokenA).digest("hex"))!.id);
+  srv.app.repo.sessions.revoke(srv.app.repo.sessions.findByTokenHash(hashToken(tokenA))!.id);
   srv.app.revalidate();
   await gone;
   expect(audits("auth.connection_closed").map((r) => JSON.parse(r.detail).why)).toEqual(["token_revoked"]);

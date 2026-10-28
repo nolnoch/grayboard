@@ -241,6 +241,10 @@ export function initCoreSchema(db: Database): void {
   for (const col of ["model", "effort"]) {
     if (!idCols.has(col)) db.exec(`ALTER TABLE ids ADD COLUMN ${col} TEXT`);
   }
+  // token_session: the server's token session (sessions.id) the ID last said
+  // hello under (#351), so a logout ends the token's IDs in their grace too,
+  // which have no connection to find them by. Server-only; null locally.
+  if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);
   const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
     if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);

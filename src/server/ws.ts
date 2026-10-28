@@ -455,15 +455,15 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
 
   // Auth is checked at the upgrade and again at each hello, so a connection
   // outlives its credential unless it is closed when the credential goes (#70,
-  // #351). closeConns closes the agent connections `match` selects: detached
-  // first (its close then records no grace), told why, audited, closed. It
-  // returns their IDs. The Slack bridge's humans have their own path
-  // (SlackBridge.userChanged) and hold no token.
+  // #351). closeConns closes the connections `match` selects: detached first
+  // (its close then records no grace), told why, audited, closed. It returns
+  // their IDs. The Slack bridge's humans never appear here: they hold no
+  // session, so hub.holders has none of them.
   const conns = () => [...hub.holders.values()];
   const closeConns = (match: (ws: Ws) => boolean, message: string, why: string): string[] => {
     const closed: string[] = [];
     for (const ws of conns()) {
-      if (ws.data.human || !match(ws)) continue;
+      if (!match(ws)) continue;
       const id = ws.data.sessionId!;
       detach(hub, ws);
       writeAudit(repo, "auth.connection_closed", ws.data.authed.user_email, id, { token_session: ws.data.authed.session_id, why });
@@ -482,32 +482,25 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     if (!email) return;
     endIds(hub, unendedIds(db, email), "revoked");
   };
-  // One token was revoked (logout, #351): only its connections close and only
-  // their sessions end; the user's other tokens keep theirs. A session of this
-  // token already in its grace has no connection to act with and ends through
-  // the sweep, as any grace does.
+  // One token was revoked (logout, #351): its connections close and its
+  // sessions end, live or in their grace; the user's other tokens keep theirs.
   const disconnectSession = (tokenSession: number, why: string) => {
-    endIds(hub, closeConns((ws) => ws.data.authed.session_id === tokenSession, "this sign-in was signed out", why), "signed_out");
+    const closed = closeConns((ws) => ws.data.authed.session_id === tokenSession, "this sign-in was signed out", why);
+    endIds(hub, [...new Set([...closed, ...idsOfToken(db, tokenSession)])], "signed_out");
   };
   // Catches a token revoked or user disabled with no server route to say so
-  // (a database reset, an operator edit, a disable while a hello was in
-  // flight), and an alias its session's principal may no longer act as (S9's
-  // backstop to accessChanged).
+  // (a database reset, an operator edit), and an alias its session's principal
+  // may no longer act as (S9's backstop to accessChanged).
   const revalidate = () => {
-    const tokens = new Set<number>();
+    const tokens = new Map<number, AuthedUser>();
+    for (const ws of conns()) tokens.set(ws.data.authed.session_id, ws.data.authed);
     const users = new Set<number>();
-    for (const ws of conns()) {
-      if (ws.data.human) continue;
-      tokens.add(ws.data.authed.session_id);
-      users.add(ws.data.authed.user_id);
+    for (const [sid, authed] of tokens) {
+      const lost = authLost(authed, repo);
+      if (lost === "token_revoked") disconnectSession(sid, "token_revoked");
+      else if (lost === "user_disabled") users.add(authed.user_id);
     }
-    for (const sid of tokens) {
-      const s = repo.sessions.findById(sid);
-      if (!s || s.revoked_at !== null) disconnectSession(sid, "token_revoked");
-    }
-    for (const id of users) {
-      if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
-    }
+    for (const id of users) disconnectUser(id);
     recheckAliases(hub, null, null);
   };
   // What a principal may act in changed (S9): a team leave or removal now,
@@ -542,6 +535,16 @@ function sweepSessions(hub: Hub, now: number): void {
     else if (until <= now) due.push(id);
   }
   endIds(hub, due, "grace");
+}
+
+// The token session an ID last said hello under, so a logout finds its IDs
+// in their grace too (#351).
+function setTokenSession(db: CoreDb, id: string, tokenSession: number): void {
+  db.prepare(`UPDATE ids SET token_session = ? WHERE id = ?`).run(tokenSession, id);
+}
+
+function idsOfToken(db: CoreDb, tokenSession: number): string[] {
+  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND token_session = ?`).all(tokenSession) as { id: string }[]).map((r) => r.id);
 }
 
 // Ends sessions, each in its own transaction (bounces, claim releases, holds
@@ -747,6 +750,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       // Another hello is probing the holder: whoever wins, it's settled after.
       await inFlight;
       if (ws.readyState !== 1 /* OPEN */) return;
+      // A revoked token must not register an ID after any wait (#351).
+      const lostWait = authLost(authed, repo);
+      if (lostWait) return refuseAuth(lostWait);
       continue;
     }
     const holder = holders.get(id);
@@ -769,10 +775,6 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       holder.close();
     }
   }
-  // The probe or an in-flight hello's wait is the last await: a token revoked
-  // during it must not register an ID (#351).
-  const lostLate = authLost(authed, repo);
-  if (lostLate) return refuseAuth(lostLate);
   // The row again: the session may have ended during an await.
   const now = idRow(db, id);
   if (now?.ended_at != null) return collide(`ended at ${new Date(now.ended_at).toISOString()}`);
@@ -799,6 +801,7 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     // Possession of the key is the proof; resume is detail only (S3).
     writeAudit(repo, "id.reattached", authed.user_email, id, { resume: m.resume === true, in_grace: hub.grace.has(id), place: where });
   }
+  setTokenSession(db, id, authed.session_id);
   hub.grace.delete(id);
   // Audited, changed or not (#184 review 4/6): a hold or tools-only
   // connection can't receive a delegation, so it's never a launcher.
