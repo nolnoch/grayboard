@@ -38,7 +38,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
       let row = rows.get(this.sessionID);
       if (name === "whoami") { await observation?.("whoami"); return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true, candidates: ["be", "fe"] } : {}) }; }
       if (name === "bind") {
-        if (refuseBind) throw new SubscriberError("identity_in_use");
+        if (refuseBind) throw new SubscriberError("identity_in_use", undefined, "the hosted session ses_other, in /work/app, last seen 3s ago");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
         await observation?.("bind");
         return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
@@ -580,6 +580,7 @@ test("pause ends ownership, resume rebinds remembered name create:false; held na
     expect(r.calls.find(c => c.name === "bind")?.args).toMatchObject({ name: "be", create: false });
     await r.controller.pause(); r.refuse(); await r.controller.enroll("R"); await Bun.sleep(20);
     expect(r.controller.status().message).toContain("approval saved");
+    expect(r.controller.status().message.split("; held by the hosted session ses_other, in /work/app, last seen 3s ago")).toHaveLength(2);
     expect(r.calls.filter(c => c.name === "bind")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
