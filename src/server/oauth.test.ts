@@ -91,7 +91,7 @@ for (const kind of ["multiline", "getter", "proxy"] as const) test(`OAuth limite
     storage.repo.audit.write = () => { throw fault; };
     expect(callbacks.at(-1)!).not.toThrow();
     expect(reads).toBe(0);
-    expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"rate_limit.end","category":"failure","level":"error"}`]]);
+    expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"rate_limit.end","category":"failure","level":"error","class":"${kind === "proxy" ? "non-error" : "Error"}"}`]]);
     storage.repo.audit.write = write;
     callbacks.at(-1)!(); callbacks.at(-1)!();
     const ended = storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='oauth.rate_limit_ended'").all();
@@ -333,7 +333,7 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   storage.repo.oauth.cleanup = () => { throw forged; };
   try {
     tick();
-    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error"}']);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error","class":"Error"}']);
   } finally { storage.repo.oauth.cleanup = cleanup; }
   try {
     service.close();
@@ -343,8 +343,8 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
     const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
     expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
     expect(log.mock.calls.flat()).toEqual([
-      '[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error"}',
-      '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error"}',
+      '[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error","class":"Error"}',
+      '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error","class":"Error"}',
     ]);
     const trail = JSON.stringify(storage.db.query("SELECT * FROM access_log WHERE action LIKE 'oauth.%'").all());
     expect(trail).toContain("oauth.google_failed");
@@ -369,7 +369,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   storage.repo.oauth.createRequest = () => { throw new Error("Bearer PRIVATE", { cause: "PRIVATE-CODE" }); };
   try {
     expect((await fetch(authorization().url)).status).toBe(500);
-    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.request","category":"failure","level":"error"}']);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.request","category":"failure","level":"error","class":"Error"}']);
     const trail = JSON.stringify(storage.db.query("SELECT * FROM access_log WHERE action LIKE 'oauth.%'").all());
     expect(trail).toContain("oauth.request_failed");
     expect(trail).not.toContain("PRIVATE"); expect(trail).not.toContain("refresh-token.ts");

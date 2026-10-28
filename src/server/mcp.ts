@@ -108,7 +108,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
     if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
-    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source) })}`);
+    console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error) })}`);
   };
   const logRefusal = (reason: string, exchange: Exchange) => {
     refusalLogs.sweep();
@@ -196,7 +196,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const unlistenHosted = hosted.listen(() => {
     for (const live of [...lives]) {
       try { if (!bindingLive(live.context)) live.stop(); }
-      catch { hostedFailure("mcp.binding"); live.stop(); }
+      catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
   });
   function watchable(context: Context, uri: string): string | null {
@@ -230,8 +230,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           valid(live);
           if (handler) handler.notify.resourceUpdated(uri);
-          else if (legacy) track(legacy.server.server.notification({ method: "notifications/resources/updated", params: { uri } }).catch(() => { hostedFailure("mcp.hint"); live.stop(); }));
-        } catch { hostedFailure("mcp.hint"); live.stop(); }
+          else if (legacy) track(legacy.server.server.notification({ method: "notifications/resources/updated", params: { uri } }).catch(e => { hostedFailure("mcp.hint", e); live.stop(); }));
+        } catch (e) { hostedFailure("mcp.hint", e); live.stop(); }
       },
       stop() {
         if (live.stopped) return;
@@ -243,15 +243,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           for (const uri of live.uris.keys()) {
             try {
               if (!application.canReceiveBoard(context.session, parseBoardResourceUri(uri))) legacy.subscriptions.delete(uri);
-            } catch { hostedFailure("mcp.stream"); }
+            } catch (e) { hostedFailure("mcp.stream", e); }
           }
         }
         if (legacy?.stream === live) legacy.stream = undefined;
         // The SDK closes the source first; application.close releases its observer set.
         if (live.stream) track(live.stream.stop());
         if (handler) track(handler.close());
-        if (legacy) { try { legacy.transport.closeStandaloneSSEStream(); } catch { hostedFailure("mcp.stream"); } }
-        try { context.finish(); } catch { hostedFailure("mcp.stream"); }
+        if (legacy) { try { legacy.transport.closeStandaloneSSEStream(); } catch (e) { hostedFailure("mcp.stream", e); } }
+        try { context.finish(); } catch (e) { hostedFailure("mcp.stream", e); }
       },
     };
     lives.add(live);
@@ -384,8 +384,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
     }
-    for (const live of [...lives]) { try { valid(live); } catch { hostedFailure("mcp.stream"); live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch { hostedFailure("mcp.stream"); track(stream.stop()); } }
+    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); live.stop(); } }
+    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); track(stream.stop()); } }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {

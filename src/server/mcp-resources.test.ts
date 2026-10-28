@@ -176,7 +176,7 @@ test("a live subscriber hint failure closes its stream with one private-safe dia
   hosted.delivery.describe = () => { throw new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" }); };
   try {
     expect((await native.callTool({ name: "dm_send", arguments: { to: "be", body: "hint fixture" } })).isError).not.toBe(true);
-    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"mcp.hint","category":"failure","level":"error"}']);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"mcp.hint","category":"failure","level":"error","class":"Error"}']);
     expect(hosted.activeListens).toBe(0);
   } finally { hosted.delivery.describe = original; log.mockRestore(); await listen.close(); }
 });

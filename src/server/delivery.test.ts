@@ -60,11 +60,11 @@ test("delivery hook diagnostics never inspect forged stack messages or causes", 
     const lease = await delivery.open(bob, context(bob), { changed: async () => { throw forged; }, closed: () => { throw forged; } });
     send();
     await Promise.resolve(); await Promise.resolve();
-    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"delivery.changed","category":"failure","level":"error"}']);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"delivery.changed","category":"failure","level":"error","class":"Error"}']);
     await delivery.release(bob, context(bob), lease.capability);
     expect(log.mock.calls.flat()).toEqual([
-      '[grayboard] {"operation":"delivery.changed","category":"failure","level":"error"}',
-      '[grayboard] {"operation":"delivery.closed","category":"failure","level":"error"}',
+      '[grayboard] {"operation":"delivery.changed","category":"failure","level":"error","class":"Error"}',
+      '[grayboard] {"operation":"delivery.closed","category":"failure","level":"error","class":"Error"}',
     ]);
   } finally { log.mockRestore(); }
 });

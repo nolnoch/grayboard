@@ -45,11 +45,11 @@ function domainData(error: unknown): { code: string; known?: string[] } {
   return result;
 }
 const resourceError = (error: unknown) => {
-  if (!expected(error)) hostedFailure("mcp.resource");
+  if (!expected(error)) hostedFailure("mcp.resource", error);
   return new ProtocolError(expected(error) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, message(error), domainData(error));
 };
 const toolError = (error: unknown) => {
-  if (!expected(error)) hostedFailure("mcp.subscriber");
+  if (!expected(error)) hostedFailure("mcp.subscriber", error);
   return { isError: true, structuredContent: domainData(error), content: [{ type: "text" as const, text: `error: ${message(error)}` }] };
 };
 

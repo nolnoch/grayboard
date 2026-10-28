@@ -356,7 +356,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   };
   const unsubscribe = store.subscribe(reconcile);
   sweep();
-  const timer = setInterval(() => { try { sweep(); } catch { hostedFailure("hosted.sweep"); } }, 250);
+  const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("hosted.sweep", e); } }, 250);
   timer.unref();
   return service;
 }

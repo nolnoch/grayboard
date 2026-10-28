@@ -188,8 +188,11 @@ test("unexpected bridge bus failures log once and reply generically; expected re
   const getters = new Error("untrusted properties");
   let reads = 0;
   for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
+  const named = Object.assign(new Error(secret), { name: "hidden Error", code: "ENOENT hidden" });
+  const errno = Object.assign(new Error(secret), { code: "ENOENT" });
+  const classes = new Map<Error, string>([[named, '\\"class\\":\\"[unrecognized]\\"}'], [errno, '\\"class\\":\\"Error\\",\\"code\\":\\"ENOENT\\"}']]);
   try {
-    for (const error of [multiline, forged, getters]) {
+    for (const error of [multiline, forged, getters, named, errno]) {
       logs.mockClear();
       srv.app.application.send = () => { throw error; };
       const before = slack.posts().length;
@@ -200,6 +203,7 @@ test("unexpected bridge bus failures log once and reply generically; expected re
       const text = JSON.stringify([reply, logs.mock.calls]);
       expect(text).toContain("dm_send");
       expect(text).toContain('\\"source\\":\\"src/server/slack.ts\\",\\"operation\\":\\"bus.call\\",\\"category\\":\\"unexpected\\"');
+      expect(text).toContain(classes.get(error) ?? '\\"class\\":\\"Error\\"}');
       expect(text.length).toBeLessThan(2048);
       for (const hidden of [alice, "password", "hidden", "private body", "client_secret", "12:34"]) expect(text).not.toContain(hidden);
     }

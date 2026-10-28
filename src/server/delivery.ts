@@ -17,7 +17,7 @@ type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
-const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(() => hostedFailure(operation)); } catch { hostedFailure(operation); } };
+const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
 class StaleCapability extends ApplicationError {
   constructor() { super("not_found", "no live delivery lease for this session; it was closed (expired or changed). Open a new one."); }
 }

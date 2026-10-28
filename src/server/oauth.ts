@@ -150,7 +150,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
-  const timer = setInterval(() => { try { sweep(); } catch { hostedFailure("oauth.sweep"); } }, 60_000);
+  const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
   timer.unref();
   const rate = (path: string, context?: OAuthNetworkContext): Response | undefined => {
     const route = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
@@ -313,7 +313,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
       let identity: { email: string; displayName: string | null };
       try { identity = await exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint("/oauth/google/callback") }); }
-      catch { hostedFailure("oauth.exchange"); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       const user = repo.users.upsertByEmail(identity!.email, identity!.displayName);
@@ -396,7 +396,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
         result = repo.oauth.rotateRefresh({ clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
       }
-      if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", "warning"); fail("invalid_grant"); }
+      if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
       return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),
         ...(client.allowRefresh ? { refresh_token: refresh } : {}) });
     }
@@ -418,7 +418,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       catch (e) {
         if (e instanceof CimdUnavailable) return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "30" });
         if (e instanceof OAuthError) { writeAudit(repo, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return json({ error: e.error }, e.status, e.error === "invalid_client" ? { "WWW-Authenticate": "Basic realm=\"oauth\"" } : {}); }
-        hostedFailure("oauth.request");
+        hostedFailure("oauth.request", e);
         writeAudit(repo, "oauth.request_failed", null, null, { category: "unexpected" });
         return json({ error: "server_error" }, 500);
       }

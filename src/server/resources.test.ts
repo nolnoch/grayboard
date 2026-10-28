@@ -68,7 +68,7 @@ test("resource hook failures emit one fixed diagnostic without forged stack or c
     resources.watch(s, boardResourceUri("e2e"), { changed: async () => { throw forged; } });
     application.call(s, "board_post", { board: "e2e", body: "test" });
     await Promise.resolve(); await Promise.resolve();
-    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"resources.changed","category":"failure","level":"error"}']);
+    expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"resources.changed","category":"failure","level":"error","class":"Error"}']);
   } finally { log.mockRestore(); }
 });
 

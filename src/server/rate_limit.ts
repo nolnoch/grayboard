@@ -98,8 +98,8 @@ export class RateLimiter {
       if (b.tokens < this.limit.burst) continue;
       try {
         this.endStreak(key, b);
-      } catch {
-        hostedFailure("rate_limit.end");
+      } catch (e) {
+        hostedFailure("rate_limit.end", e);
         continue;
       }
       this.buckets.delete(key);

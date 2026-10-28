@@ -29,7 +29,7 @@ type Watch = {
   unsubscribe?: () => void;
 };
 function notify(operation: "resources.changed" | "resources.closed", callback?: () => void | Promise<void>) {
-  try { void Promise.resolve(callback?.()).catch(() => hostedFailure(operation)); } catch { hostedFailure(operation); }
+  try { void Promise.resolve(callback?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); }
 }
 
 export function createResources(application: Application, options: ResourceOptions) {
@@ -40,7 +40,7 @@ export function createResources(application: Application, options: ResourceOptio
     try { watch.unsubscribe?.(); } finally { notify("resources.closed", watch.hooks.closed); }
   }
   function finishQuietly(watch: Watch) {
-    try { finish(watch); } catch { hostedFailure("resources.finish"); }
+    try { finish(watch); } catch (e) { hostedFailure("resources.finish", e); }
   }
   function authorized(session: ApplicationSession, allowUnbound = false): boolean {
     try {
@@ -62,7 +62,7 @@ export function createResources(application: Application, options: ResourceOptio
     // Background faults close the watch without failing a committed mutation.
     try {
       if (authorized(watch.session) && application.canReceiveBoard(watch.session, watch.board)) return true;
-    } catch { hostedFailure("resources.authorize"); }
+    } catch (e) { hostedFailure("resources.authorize", e); }
     finishQuietly(watch);
     return false;
   }

@@ -311,8 +311,11 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const getters = new Error("untrusted properties");
   let reads = 0;
   for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
+  const named = Object.assign(new Error(secret), { name: `${token}Error`, code: `E${token}` });
+  const sqlite = Object.assign(new Error(secret), { name: "SQLiteError", code: "SQLITE_BUSY" });
+  const classes = new Map<Error, string>([[named, '"class":"[unrecognized]"}'], [sqlite, '"class":"SQLiteError","code":"SQLITE_BUSY"}']]);
   try {
-    for (const error of [multiline, forged, cycle, getters]) {
+    for (const error of [multiline, forged, cycle, getters, named, sqlite]) {
       logs.mockClear();
       store.repo.messages.insert = () => { throw error; };
       const result = await client.callTool({ name: "dm_send", arguments: { to: "be", body: "private tool body" } });
@@ -323,6 +326,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
       expect(line).toContain('"principal":');
       expect(line).toContain('"session":');
       expect(line).toContain('"source":"src/server/mcp.ts","operation":"tool","category":"unexpected"');
+      expect(line).toContain(classes.get(error) ?? '"class":"Error"}');
       expect(line.length).toBeLessThan(1024);
       for (const hidden of [token, "hidden", "password", "private tool body", "client_secret", "/auth?", "12:34"]) expect(line).not.toContain(hidden);
       expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
