@@ -13,5 +13,6 @@ if ! git diff --quiet -- "${DOCS[@]}" || ! git diff --cached --quiet -- "${DOCS[
   exit 1
 fi
 
-git tag -f docs-baseline HEAD >/dev/null
+# Local-only marker: never signed or annotated, even under a global tag.gpgsign.
+git -c tag.gpgsign=false tag -f docs-baseline HEAD >/dev/null
 echo "docs-baseline → $(git rev-parse --short HEAD)"
