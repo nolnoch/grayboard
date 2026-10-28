@@ -964,6 +964,43 @@ export function getPost(db: Database, id: number): Post | undefined {
   return db.prepare(`SELECT ${POST_COLS} FROM posts WHERE id = ?`).get(id) as Post | undefined;
 }
 
+export function boardCatalog(db: Database, handle: string, after?: string): { boards: Board[]; next_after: string | null } {
+  if (after !== undefined && (typeof after !== "string" || !BOARD_NAME_RE.test(after) || after.trim() !== after)) {
+    throw new CoreError("invalid catalog cursor");
+  }
+  const boards: Board[] = [];
+  let cursor = after ?? "";
+  while (boards.length <= 100) {
+    const rows = db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT 100`).all(cursor) as Board[];
+    for (const board of rows) {
+      if (access(db).canSee(handle, board)) boards.push(board);
+      if (boards.length > 100) return { boards: boards.slice(0, 100), next_after: boards[99]!.name };
+    }
+    if (rows.length < 100) break;
+    cursor = rows[99]!.name;
+  }
+  return { boards, next_after: null };
+}
+
+export type SnapshotOptions = { limit?: number; before_id?: number };
+export type BoardSnapshot = { board: Board; posts: Post[]; next_before_id: number | null };
+
+// History without attention-queue or subscription side effects, oldest first per page.
+export function snapshot(db: Database, handle: string, boardInput: string, opts: SnapshotOptions = {}): BoardSnapshot {
+  const board = visibleBoard(db, handle, boardInput);
+  const limit = opts.limit === undefined ? 20 : opts.limit;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new CoreError("snapshot limit must be an integer from 1 to 100");
+  if (opts.before_id !== undefined && (!Number.isSafeInteger(opts.before_id) || opts.before_id < 1)) {
+    throw new CoreError("snapshot before_id must be a positive safe integer");
+  }
+  const rows = (opts.before_id === undefined
+    ? db.prepare(`SELECT * FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`).all(board.name, limit + 1)
+    : db.prepare(`SELECT * FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(board.name, opts.before_id, limit + 1)) as Post[];
+  const more = rows.length > limit;
+  const posts = rows.slice(0, limit).reverse();
+  return { board, posts: withAttachments(db, "post", posts), next_before_id: more ? posts[0]!.id : null };
+}
+
 export type ReadResult = { board: string; posts: Post[]; unread_remaining: number };
 
 // Default: your unread posts (oldest first); if none, the latest `limit`
@@ -1160,8 +1197,9 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 
 // Operator retention, not an agent operation. Replies outlive their pruned
 // parents as thread roots.
-export function prunePosts(db: Database, olderThanMs: number): void {
-  db.transaction(() => {
+export function prunePosts(db: Database, olderThanMs: number): string[] {
+  return db.transaction(() => {
+    const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
     db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
@@ -1176,5 +1214,6 @@ export function prunePosts(db: Database, olderThanMs: number): void {
          (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`,
     ).run(olderThanMs);
     // Expired claims are left to sweepExpired, which announces them.
+    return boards.map(b => b.board);
   })();
 }

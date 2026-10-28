@@ -1,0 +1,56 @@
+name: Hosted OpenCode
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  hosted:
+    name: Hosted ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [strict, git, config, host, matrix, native, durable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+        with:
+          node: "true"
+
+      - name: Independent frozen package install
+        working-directory: adapters/opencode-v2
+        run: bun install --frozen-lockfile
+
+      - name: Run hosted ${{ matrix.suite }}
+        env:
+          GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/hosted-run
+          SUITE: ${{ matrix.suite }}
+        run: bash scripts/e2e.sh "hosted-$SUITE"
+
+      - name: Upload allowlisted evidence only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-run/evidence
+          retention-days: 7
+          if-no-files-found: warn
+
+  required:
+    name: Hosted required
+    needs: hosted
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every hosted matrix leg to succeed
+        env:
+          RESULT: ${{ needs.hosted.result }}
+        run: test "$RESULT" = success

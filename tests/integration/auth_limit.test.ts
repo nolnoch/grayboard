@@ -106,7 +106,7 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
   const logins = audit(srv, "auth.login").map((r) => JSON.parse(r.detail).ip);
   expect(logins.slice(-3)).toEqual([X, X, X]);
 
-  const off = serve({ devAuth: false, googleClientSecret: "s" });
+  const off = serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
   const r = (from: string) => fetch(`${off.srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: "{}" });
   for (let i = 0; i < 5; i++) expect((await r(X)).status).toBe(404);
   expect(off.srv.app.authGate.size).toBe(0);
@@ -253,14 +253,14 @@ test("a 429 without grayboard's code is waited out by its Retry-After, and named
 }, 15_000);
 
 test("a token check that never answers is abandoned at its deadline and retried", async () => {
-  const checks: number[] = [];
+  let checks = 0;
   const server = Bun.serve({
     port: 0,
     fetch(req, server) {
       if (new URL(req.url).pathname === "/api/whoami") {
-        checks.push(Date.now());
+        checks++;
         // The first check stalls, as behind a proxy that never answers.
-        return checks.length === 1 ? new Promise<Response>(() => {}) : Response.json({});
+        return checks === 1 ? new Promise<Response>(() => {}) : Response.json({});
       }
       if (server.upgrade(req)) return;
       return new Response("no", { status: 400 });
@@ -275,11 +275,33 @@ test("a token check that never answers is abandoned at its deadline and retried"
   cleanup.push(() => server.stop(true));
   const c = new GrayboardClient(`http://localhost:${server.port}`, () => "t", "fe", mintSessionKey(), async () => {}, async () => {}, true, undefined, { probeTimeoutMs: 200 });
   cleanup.push(() => c.close());
-  c.connect();
-  await c.ready();
-  // The 200ms deadline, then the 1s backoff.
-  expect(checks.length).toBe(2);
-  expect(checks[1]! - checks[0]!).toBeGreaterThanOrEqual(1200);
+  const observed = c as unknown as {
+    checkToken(token: string): Promise<{ kind: string; why?: string }>;
+    reconnectIn(delay: number, why: string): void;
+  };
+  const check = observed.checkToken;
+  const reconnect = observed.reconnectIn;
+  const probes: { kind: string; why?: string }[] = [];
+  const delays: number[] = [];
+  observed.checkToken = async (token) => {
+    const result = await check.call(c, token);
+    probes.push(result);
+    return result;
+  };
+  observed.reconnectIn = (delay, why) => {
+    delays.push(delay);
+    reconnect.call(c, delay, why);
+  };
+  try {
+    c.connect();
+    await c.ready();
+    expect(checks).toBe(2);
+    expect(probes).toEqual([{ kind: "unanswered", why: "no answer within 0s" }, { kind: "ok" }]);
+    expect(delays).toEqual([1000]);
+  } finally {
+    observed.checkToken = check;
+    observed.reconnectIn = reconnect;
+  }
 }, 10_000);
 
 test("at startup a limited address is waited out when the retry fits the window, and named when it doesn't", async () => {

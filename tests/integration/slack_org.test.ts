@@ -1,7 +1,8 @@
 // The org Slack bridge (src/server/slack.ts) end to end: an in-memory server
 // with a fake Slack, and agents as server-mode `grayboard mcp` children.
 // Linking, the human identity's round trip, who may reach it, and unlinking.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { ApplicationError } from "../../src/server/application.ts";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -169,6 +170,52 @@ test("only the bridge may hello as human", async () => {
   // And not over HTTP either.
   expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
 }, 30_000);
+
+test("unexpected bridge bus failures log once and reply generically; expected refusals retain their message", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = srv.client(alice, "be");
+  expect((await be.connect()).type).toBe("hello_ok");
+  expect(await be.request({ type: "send", recipient: "human", body: "diagnostic fixture" })).toMatchObject({ type: "send_ok" });
+  const top = await until(() => slack.posts().find(p => p.markdown_text === "**be** diagnostic fixture"));
+  const original = srv.app.application.send;
+  const logs = spyOn(console, "error").mockImplementation(() => {});
+  const secret = `Bearer ${alice} client_secret=hidden https://user:password@example.com/?token=hidden`;
+  const multiline = new Error(`${secret}\n    at send (/private/server/${alice}.ts:12:34)\n    at send (/private/server/slack.ts:12:34)`);
+  const forged = new Error(secret);
+  forged.stack = `Error: failure\n    at send (/private/server/${alice}.js:12:34)`;
+  forged.cause = forged;
+  const getters = new Error("untrusted properties");
+  let reads = 0;
+  for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
+  const named = Object.assign(new Error(secret), { name: "hidden Error", code: "ENOENT hidden" });
+  const errno = Object.assign(new Error(secret), { code: "ENOENT" });
+  const classes = new Map<Error, string>([[named, '\\"class\\":\\"[unrecognized]\\"}'], [errno, '\\"class\\":\\"Error\\",\\"code\\":\\"ENOENT\\"}']]);
+  try {
+    for (const error of [multiline, forged, getters, named, errno]) {
+      logs.mockClear();
+      srv.app.application.send = () => { throw error; };
+      const before = slack.posts().length;
+      const failed = slack.say("private body", { thread_ts: tsOf(top) });
+      const reply = await until(() => slack.posts().slice(before).find(p => p.thread_ts === tsOf(top) && p.markdown_text?.includes("internal error")));
+      await until(() => slack.acks.includes(failed.envelope));
+      expect(logs).toHaveBeenCalledTimes(1);
+      const text = JSON.stringify([reply, logs.mock.calls]);
+      expect(text).toContain("dm_send");
+      expect(text).toContain('\\"source\\":\\"src/server/slack.ts\\",\\"operation\\":\\"bus.call\\",\\"category\\":\\"unexpected\\"');
+      expect(text).toContain(classes.get(error) ?? '\\"class\\":\\"Error\\"}');
+      expect(text.length).toBeLessThan(2048);
+      for (const hidden of [alice, "password", "hidden", "private body", "client_secret", "12:34"]) expect(text).not.toContain(hidden);
+    }
+    expect(reads).toBe(0);
+    logs.mockClear();
+    srv.app.application.send = () => { throw new ApplicationError("forbidden", "safe expected refusal"); };
+    const refused = slack.say("second reply", { thread_ts: tsOf(top) });
+    await until(() => slack.posts().find(p => p.markdown_text?.includes("safe expected refusal")));
+    await until(() => slack.acks.includes(refused.envelope));
+    expect(logs).not.toHaveBeenCalled();
+  } finally { srv.app.application.send = original; logs.mockRestore(); }
+});
 
 test("another user's agents reach a human only as teammates", async () => {
   const alice = await login("alice@example.com");
@@ -344,7 +391,7 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   // the notice doesn't repeat.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();
@@ -366,7 +413,7 @@ test("a bridge that fails at boot tells its linked users, via the durable links"
   // notify loop must run over the durable links, whose map is not empty.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const boot = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: "http://127.0.0.1:1/api/",
   });
   await boot.start().catch((e) => boot.stop({ fatal: true, detail: `not started: ${(e as Error).message}` }));
@@ -393,7 +440,7 @@ test("an armed but undelivered notice survives a restart inside the dedup window
   // of the newest death.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();
@@ -406,9 +453,7 @@ test("an armed but undelivered notice survives a restart inside the dedup window
   expect(bridgeNotices[0]).toContain("token revoked again");
 });
 
-// The guard at the drain site (only agent-session hellos drain) is what keeps
-// the bridge's own human hello from consuming the notice into a handshake
-// nobody reads: this test fails when the `if (!ws.data.human)` guard is removed.
+// Trusted human attachment must not consume the owner's notice.
 test("the bridge's own human hello doesn't drain the owner's notice", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -416,7 +461,7 @@ test("the bridge's own human hello doesn't drain the owner's notice", async () =
   // A restarted bridge attaches the same user: its attach sends a human hello.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, handlers: srv.app.handlers,
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();

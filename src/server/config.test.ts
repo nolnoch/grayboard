@@ -4,10 +4,14 @@ import { loadConfig } from "./config.ts";
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
+  "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
+  "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
+  "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
+  ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
 ];
 
 describe("loadConfig", () => {
@@ -33,9 +37,106 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/GRAYBOARD_DEV_AUTH=1/);
   });
 
+  function primary() {
+    process.env.GOOGLE_OAUTH_CLIENT_ID = "desktop-client";
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET = "desktop-secret";
+    process.env.GRAYBOARD_ORG_DOMAIN = "example.com";
+  }
+
+  test("MCP fair shares are configurable beneath bounded global capacities", () => {
+    primary();
+    expect(loadConfig().mcpLimits).toEqual({ listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } });
+    for (const kind of ["LISTEN", "LEGACY", "POST"]) {
+      const prefix = `GRAYBOARD_MCP_${kind}`;
+      process.env[`${prefix}_GLOBAL`] = "4"; process.env[`${prefix}_PER_USER`] = "2";
+      expect(loadConfig().mcpLimits![kind.toLowerCase() as "listen" | "legacy" | "post"]).toEqual({ global: 4, perUser: 2 });
+      for (const value of ["0", "5", "1e3", " 2"]) {
+        process.env[`${prefix}_PER_USER`] = value;
+        expect(() => loadConfig()).toThrow(`${prefix}_PER_USER`);
+      }
+      delete process.env[`${prefix}_PER_USER`];
+      expect(loadConfig().mcpLimits![kind.toLowerCase() as "listen" | "legacy" | "post"].perUser).toBe(4);
+      for (const value of ["0", "257", "1e3"]) {
+        process.env[`${prefix}_GLOBAL`] = value;
+        expect(() => loadConfig()).toThrow(`${prefix}_GLOBAL`);
+      }
+      delete process.env[`${prefix}_GLOBAL`];
+    }
+  });
+
+  test("OAuth address and global rates use the shared configurable token-bucket bounds", () => {
+    primary();
+    expect(loadConfig()).toMatchObject({ oauthLimit: { burst: 60, perSec: 1 }, oauthGlobalLimit: { burst: 600, perSec: 10 } });
+    for (const prefix of ["GRAYBOARD_OAUTH", "GRAYBOARD_OAUTH_GLOBAL"]) {
+      process.env[prefix + "_BURST"] = "2";
+      process.env[prefix + "_PER_SEC"] = "0.5";
+      const config = loadConfig();
+      expect(prefix.endsWith("GLOBAL") ? config.oauthGlobalLimit : config.oauthLimit).toEqual({ burst: 2, perSec: 0.5 });
+      for (const value of ["0", "10001", "1e3"]) {
+        process.env[prefix + "_BURST"] = value;
+        expect(() => loadConfig()).toThrow(prefix + "_BURST");
+      }
+      process.env[prefix + "_BURST"] = "2";
+      for (const value of ["0.01", "NaN", "-1"]) {
+        process.env[prefix + "_PER_SEC"] = value;
+        expect(() => loadConfig()).toThrow(prefix + "_PER_SEC");
+      }
+      delete process.env[prefix + "_BURST"]; delete process.env[prefix + "_PER_SEC"];
+    }
+  });
+
+  test("MCP Google override is optional and never replaces the retained primary pair", () => {
+    primary();
+    expect(loadConfig().mcpGoogle).toBeUndefined();
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "web-secret";
+    expect(loadConfig()).toMatchObject({ googleClientId: "desktop-client", googleClientSecret: "desktop-secret", mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } });
+    for (const name of ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]) {
+      delete process.env[name];
+      expect(() => loadConfig()).toThrow(`Required env var ${name} is not set`);
+      primary();
+    }
+  });
+
+  test("half, empty and malformed MCP Google pairs fail without exposing credentials", () => {
+    primary();
+    for (const [id, secret] of [["web-client", undefined], [undefined, "private-secret"], ["", "private-secret"], ["web-client", ""], ["", ""], ["bad client", "private-secret"], ["web-client", "private-secret\n"], ["web-client", "x".repeat(4097)]]) {
+      delete process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID;
+      delete process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET;
+      if (id !== undefined) process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = id;
+      if (secret !== undefined) process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = secret;
+      let message = "";
+      try { loadConfig(); } catch (error) { message = (error as Error).message; }
+      expect(message).toContain("set both GRAYBOARD_MCP_GOOGLE_CLIENT_ID");
+      expect(message).not.toContain("private-secret");
+      expect(message).not.toContain("web-client");
+    }
+  });
+
+  test("dev auth rejects the independent MCP Google secret", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "private-secret";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_DEV_AUTH=1/);
+  });
+
   test("dev auth starts without Google credentials", () => {
     process.env.GRAYBOARD_DEV_AUTH = "1";
     expect(loadConfig().devAuth).toBe(true);
+  });
+
+  test("hosted request limits are independently configured and validated", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().hostedRequestLimit).toEqual({ burst: 120, perSec: 20 });
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "240";
+    process.env.GRAYBOARD_HOSTED_REQUEST_PER_SEC = "40";
+    expect(loadConfig().hostedRequestLimit).toEqual({ burst: 240, perSec: 40 });
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_REQUEST_BURST/);
+    process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "120";
+    process.env.GRAYBOARD_HOSTED_REQUEST_PER_SEC = "0";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_REQUEST_PER_SEC/);
   });
 
   test("GRAYBOARD_ADMINS is a trimmed, lowercased email list; unset means none", () => {

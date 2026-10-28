@@ -176,13 +176,16 @@ function ownIdentity(name: string | null | undefined, authed: AuthedUser, repo: 
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
-async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void): Promise<Response> {
+async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
   const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
   const handle = ownIdentity(body.identity, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
   try {
     const outcome = callBoardTool(db, handle, body.tool, body.args ?? {});
+    if (outcome.boards?.length) {
+      try { void Promise.resolve(onBoardsChanged?.(outcome.boards)).catch(() => {}); } catch {}
+    }
     wake(outcome.wake);
     return json(outcome.result);
   } catch (e) {
@@ -235,7 +238,7 @@ function queryIdentity(url: URL, authed: AuthedUser, repo: Repo): string | Respo
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
-async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate): Promise<Response> {
+export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate, guard?: () => void, signal = req.signal): Promise<Response> {
   const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
@@ -252,10 +255,18 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
   try {
     // A declared length over the cap is refused before the body is read.
     new SizeTally(repo.attachmentLimits, 1).add(label, Number(declared));
-    release = await uploads.reserve(authed.user_email, Number(declared), req.signal);
-    const data = await readUploadBody(req, Number(declared), transferTimeoutMs(Number(declared)));
+    guard?.();
+    release = await uploads.reserve(authed.user_email, Number(declared), signal);
+    guard?.();
+    const data = await readUploadBody(req, Number(declared), transferTimeoutMs(Number(declared)), guard ? signal : undefined);
+    guard?.();
+    if (guard && data.length !== Number(declared)) return refuse("bad_request", "the body is shorter than its Content-Length", 400);
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
-    const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data));
+    const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data), {}, guard);
+    try { guard?.(); } catch (error) {
+      await releaseStored(repo, db, authed.user_email, handle, row.id);
+      throw error;
+    }
     return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
   } catch (e) {
     if (e instanceof TooLargeError) return refuse("too_large", e.message, 413);
@@ -266,13 +277,15 @@ async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo
     writeAudit(repo, "attachment.upload_failed", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), error: (e as Error).message });
     throw e;
   } finally {
-    release();
+    try {
+      if (guard && req.body && !req.body.locked) await req.body.cancel();
+    } finally { release(); }
   }
 }
 
 // GET /api/attachments/<id>?identity=: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
-async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
   const row = readableAttachment(repo, db, handle, Number(idStr));
@@ -290,6 +303,12 @@ async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, r
     if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
     throw e;
   }
+  return db.transaction(() => {
+  guard?.();
+  if (guard) {
+    const current = readableAttachment(repo, db, handle, row.id);
+    if (!current || current.sha256 !== row.sha256) return notFound();
+  }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
     headers: {
@@ -300,14 +319,17 @@ async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, r
       "Cache-Control": "private, no-store",
     },
   });
+  }).immediate();
 }
 
 // DELETE /api/attachments/<id>?identity=: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
-async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryIdentity(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr)) : null;
+  guard?.();
+  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr), {}, guard) : null;
+  guard?.();
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });
 }
@@ -456,6 +478,7 @@ export async function handleHttp(
   disconnectUser: (userId: number) => void,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
+  onBoardsChanged?: (boards: string[]) => void | Promise<void>,
 ): Promise<Response> {
   const url    = new URL(req.url);
   const path   = url.pathname;
@@ -473,7 +496,7 @@ export async function handleHttp(
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
-  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake);
+  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
 
   if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
   if (path.startsWith("/api/attachments/") && method === "GET") {

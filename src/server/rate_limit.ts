@@ -7,6 +7,7 @@
 export type RateLimit = { burst: number; perSec: number };
 
 export const DEFAULT_HELLO_LIMIT: RateLimit = { burst: 60, perSec: 1 };
+export const DEFAULT_HOSTED_REQUEST_LIMIT: RateLimit = { burst: 120, perSec: 20 };
 export const DEFAULT_AUTH_FAIL_LIMIT: RateLimit = { burst: 60, perSec: 1 };
 
 // What a request asked for: the tripping request's, carried to the streak's
@@ -98,7 +99,7 @@ export class RateLimiter {
       try {
         this.endStreak(key, b);
       } catch (e) {
-        console.error(`[grayboard] rate limiter: ending the run of refusals for ${key} failed: ${(e as Error).message}`);
+        hostedFailure("rate_limit.end", e);
         continue;
       }
       this.buckets.delete(key);
@@ -132,3 +133,4 @@ export class RateLimiter {
     this.hooks.full?.(this.buckets.size, n);
   }
 }
+import { hostedFailure } from "./hosted-diagnostics.ts";

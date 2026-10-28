@@ -92,9 +92,9 @@ export class TestServer {
     return mcpSession({ env: serverEnv(this.dir, this.base, token, identity, extra), cwd, args: ["mcp", "--mode", "server"] });
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     for (const c of this.clients.splice(0)) c.close();
-    this.app.stop();
+    await this.app.stop();
     rmSync(this.dir, { recursive: true, force: true });
   }
 }

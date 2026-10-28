@@ -17,9 +17,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 case "${1:-}" in
-  upgrade-matrix | binaries) suite="$1" ;;
+  upgrade-matrix | binaries | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
   *)
-    echo "usage: $0 upgrade-matrix|binaries" >&2
+    echo "usage: $0 upgrade-matrix|binaries|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
     exit 2
     ;;
 esac
@@ -47,6 +47,15 @@ verdict() {
 }
 
 case "$suite" in
+  hosted-*)
+    export GRAYBOARD_E2E_RUN_DIR="$run"
+    # The child stream and raw JUnit stay private; only constructed metadata is public.
+    if bun scripts/hosted-evidence.ts "${suite#hosted-}" "$run"; then
+      verdict 'passed'
+    else
+      verdict 'failed (safe evidence summary in the run dir; raw diagnostics private)'
+    fi
+    ;;
   upgrade-matrix)
     own="v$(jq -r .version package.json)"
     # One line per release: its tag, and whether its own `grayboard update`

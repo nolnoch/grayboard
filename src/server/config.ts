@@ -1,10 +1,14 @@
 import { dirname, join } from "node:path";
+import { parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
 import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
+
+export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
+export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
 
 export type Config = {
   dbPath: string;
@@ -13,6 +17,7 @@ export type Config = {
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
+  mcpGoogle?: { clientId: string; clientSecret: string };
   orgDomain: string;
   publicUrl: string;
   messageRetentionDays: number;
@@ -20,6 +25,7 @@ export type Config = {
   devAuth: boolean;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
+  oauthClients?: OAuthClient[];
   // Who can reach another user's human; default "team".
   humanReach?: HumanReach;
   // Attachment size caps per file and per message; default local mode's.
@@ -28,9 +34,13 @@ export type Config = {
   attachmentUserQuota?: number;
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
+  hostedRequestLimit?: RateLimit;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
+  oauthLimit?: RateLimit;
+  oauthGlobalLimit?: RateLimit;
+  mcpLimits?: McpLimits;
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -39,9 +49,9 @@ export type Config = {
 export function loadConfig(): Config {
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
-  if (devAuth && process.env.GOOGLE_OAUTH_CLIENT_SECRET) {
+  if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET)) {
     throw new Error(
-      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET (prevents prod misconfig)",
+      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET or GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET (prevents prod misconfig)",
     );
   }
 
@@ -58,19 +68,47 @@ export function loadConfig(): Config {
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
+    ...mcpGoogleConfig(),
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     admins: parseList(process.env.GRAYBOARD_ADMINS),
+    oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
+    hostedRequestLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, "requests"),
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
+    oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
+    oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
+    mcpLimits: parseMcpLimits(process.env),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };
+}
+
+function parseMcpLimits(env: Record<string, string | undefined>): McpLimits {
+  const limits = {} as McpLimits;
+  for (const kind of ["listen", "legacy", "post"] as const) {
+    const prefix = `GRAYBOARD_MCP_${kind.toUpperCase()}`;
+    const defaults = DEFAULT_MCP_LIMITS[kind];
+    const global = positiveInt(env, `${prefix}_GLOBAL`, defaults.global, defaults.global, "requests");
+    const perUser = positiveInt(env, `${prefix}_PER_USER`, Math.min(defaults.perUser, global), global, "requests");
+    limits[kind] = { global, perUser };
+  }
+  return limits;
+}
+
+function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
+  const clientId = process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET;
+  if (clientId === undefined && clientSecret === undefined) return {};
+  if (!clientId || !clientSecret || !/^[\x21-\x7e]{1,4096}$/.test(clientId) || !/^[\x21-\x7e]{1,4096}$/.test(clientSecret)) {
+    throw new Error("set both GRAYBOARD_MCP_GOOGLE_CLIENT_ID and GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET to nonempty credentials without whitespace, or neither");
+  }
+  return { mcpGoogle: { clientId, clientSecret } };
 }
 
 // The most an operator may raise the caps to. An upload's body is held in

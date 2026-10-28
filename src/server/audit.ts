@@ -1,6 +1,8 @@
 import type { Repo } from "./db.ts";
 
 export type AuditAction =
+  | `oauth.${string}`
+  | `hosted.${string}`
   | "attachment.bound"
   | "attachment.downloaded"
   | "attachment.download_failed"
@@ -25,6 +27,8 @@ export type AuditAction =
   | "alias.deleted"
   | "hello.rate_limit_ended"
   | "hello.rate_limited"
+  | "hosted.rate_limit_ended"
+  | "hosted.rate_limited"
   | "id.collision"
   | "message.retracted"
   | "request.replayed"

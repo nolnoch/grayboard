@@ -85,7 +85,7 @@ export class UploadGate {
 // Reads an upload's body of the declared `length`, failing once `ms` passes,
 // so a client that trickles bytes can't hold its reservation for long. The
 // body is cancelled on the way out, which ends the request's read.
-export async function readUploadBody(req: Request, length: number, ms: number): Promise<Uint8Array> {
+export async function readUploadBody(req: Request, length: number, ms: number, signal?: AbortSignal): Promise<Uint8Array> {
   const data = new Uint8Array(length);
   if (!req.body) return data.subarray(0, 0);
   const reader = req.body.getReader();
@@ -93,18 +93,38 @@ export async function readUploadBody(req: Request, length: number, ms: number): 
   const late = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new UploadTimeout(ms)), ms);
   });
+  let abort!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(signal!.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
+  let failure: unknown;
   let got = 0;
   try {
     for (;;) {
-      const { done, value } = await Promise.race([reader.read(), late]);
+      const { done, value } = await Promise.race([reader.read(), late, cancelled]);
       if (done) return data.subarray(0, got);
       if (got + value.length > length) throw new CoreError("the body is longer than its Content-Length");
       data.set(value, got);
       got += value.length;
     }
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
     clearTimeout(timer);
-    void reader.cancel().catch(() => {});
+    signal?.removeEventListener("abort", abort);
+    if (signal) {
+      try {
+        // Cancellation may perform asynchronous source cleanup; retain ownership until it settles.
+        await reader.cancel();
+      } catch (error) {
+        if (failure === undefined || failure === signal.reason || failure instanceof CoreError || failure instanceof UploadTimeout) throw error;
+      } finally { reader.releaseLock(); }
+    } else {
+      void reader.cancel().catch(() => {});
+    }
   }
 }
 

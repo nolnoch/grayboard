@@ -1,0 +1,22 @@
+import assert from "node:assert/strict";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
+
+const [checkout, scratch, output] = process.argv.slice(2);
+assert(checkout && scratch && output);
+const digest = (path: string) => new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex");
+const files = (directory: string): string[] => readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(directory, entry.name)) : entry.isFile() ? [join(directory, entry.name)] : []);
+const packageRoot = join(checkout, "adapters/opencode-v2");
+const installedFile = join(scratch, "installed.txt");
+const prepared = existsSync(installedFile) ? scratch : join(scratch, "prepared");
+const installed = existsSync(join(prepared, "installed.txt")) ? readFileSync(join(prepared, "installed.txt"), "utf8").trim() : undefined;
+const expected = ["package.json", "index.js", "tui.js", "README.md", ...files(join(packageRoot, "src")).map(p => relative(packageRoot, p))];
+const installedChecks = installed ? expected.map(path => ({ path, sha256: digest(join(installed, path)), expected: digest(join(packageRoot, path)) })) : [];
+const configInstalledFile = join(scratch, "config-installed.txt");
+const configInstalled = existsSync(configInstalledFile) ? readFileSync(configInstalledFile, "utf8").trim() : undefined;
+const publicChecks = configInstalled ? expected.map(path => ({ path, sha256: digest(join(configInstalled, path)), expected: digest(join(packageRoot, path)) })) : [];
+const mismatches = [...installedChecks, ...publicChecks].filter(x => x.sha256 !== x.expected);
+const backend = files(join(checkout, "src")).map(path => ({ path: relative(checkout, path), sha256: digest(path) }));
+const drivers = [...files(join(packageRoot, "tests")), join(checkout, "tests/e2e/opencode-config.ts")].map(path => ({ path: relative(checkout, path), sha256: digest(path) }));
+await Bun.write(output, JSON.stringify({ bun: Bun.version, installed: !!installed, publicInstalled: !!configInstalled, installedChecks, publicChecks, mismatches, backend, drivers }, null, 2) + "\n");
+assert.equal(mismatches.length, 0, "Installed package bytes must match this source tree");

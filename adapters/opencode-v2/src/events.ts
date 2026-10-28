@@ -1,0 +1,25 @@
+import { setTimeout as delay } from "node:timers/promises";
+
+// The budget is 8 consecutive stream ends: a stream that delivered an event
+// starts the count again, so a long-lived host isn't cut off by drops spread
+// over its lifetime.
+export async function observeEvents<T>(subscribe: () => AsyncIterable<T>, observe: (event: T) => Promise<void>, failure: (operation: "event" | "stream") => void, signal: AbortSignal, wait = async (ms: number) => { await delay(ms, undefined, { signal }); }) {
+  let failures = 0;
+  while (!signal.aborted) {
+    let delivered = false;
+    try {
+      for await (const event of subscribe()) {
+        if (signal.aborted) return;
+        delivered = true;
+        try { await observe(event); }
+        catch { if (!signal.aborted) failure("event"); }
+      }
+    } catch { if (signal.aborted) return; }
+    if (signal.aborted) return;
+    failure("stream");
+    if (delivered) failures = 0;
+    if (++failures >= 8) return;
+    try { await wait(Math.min(8000, 250 * 2 ** (failures - 1))); }
+    catch { if (!signal.aborted) failure("stream"); return; }
+  }
+}

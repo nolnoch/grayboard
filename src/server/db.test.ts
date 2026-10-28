@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
@@ -28,6 +28,31 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
     if (importPattern.test(text)) offenders.push(file);
   }
   expect(offenders).toEqual([]);
+});
+
+test("an existing pre-OAuth database opens additively without losing old data", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-old-db-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  const user = old.repo.users.upsertByEmail("you@example.com", "You");
+  const session = old.repo.sessions.create(user.id, "old-session-hash", "old client");
+  old.repo.aliases.create(user.email, "fe");
+  old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
+  for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
+  old.db.close();
+  const reopened = openDatabase(path, opts);
+  try {
+    expect(reopened.repo.users.findById(user.id)?.display_name).toBe("You");
+    expect(reopened.repo.sessions.findByTokenHash("old-session-hash")?.id).toBe(session.id);
+    expect(reopened.repo.aliases.listFor(user.email).map(i => i.name)).toEqual(["fe"]);
+    expect(reopened.repo.messages.history("you@example.com/fe")[0]?.body).toBe("preserved");
+    expect(reopened.repo.oauth.isGrantActive("missing", Date.now())).toBe(false);
+    expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
+  } finally {
+    reopened.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── basic CRUD ────────────────────────────────────────────────────────────────
