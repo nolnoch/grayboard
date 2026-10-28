@@ -68,6 +68,7 @@ export interface Repo {
   sessions: {
     create(userId: number, tokenHash: string, label: string | null): Session;
     findByTokenHash(hash: string): Session | undefined;
+    findById(sessionId: number): Session | undefined;
     revoke(sessionId: number): void;
     revokeAllForUser(userId: number): void;
     touch(sessionId: number, now: number): void;
@@ -473,6 +474,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             "SELECT * FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
           ).get(hash) ?? undefined
         );
+      },
+      // By row, revoked ones included: the caller reads revoked_at (#351).
+      findById(sessionId) {
+        return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
       },
       revoke(sessionId) {
         db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [Date.now(), sessionId]);

@@ -60,6 +60,16 @@ export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue)
   return { user_id: user.id, user_email: user.email, session_id: session.id };
 }
 
+export type AuthLost = "token_revoked" | "user_disabled";
+
+/** Why `authed`'s token no longer authenticates, or null while it does: verifySessionToken's two checks, by session id (#351). Never for a human (session_id 0). */
+export function authLost(authed: AuthedUser, repo: Repo): AuthLost | null {
+  const s = repo.sessions.findById(authed.session_id);
+  if (!s || s.revoked_at !== null) return "token_revoked";
+  const u = repo.users.findById(authed.user_id);
+  return !u || u.disabled_at !== null ? "user_disabled" : null;
+}
+
 export async function verifyGoogleIdToken(
   idToken: string,
   clientId: string,

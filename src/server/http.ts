@@ -132,9 +132,12 @@ export function signInRoute(method: string, path: string, config: Config): { cha
   return { charged: on, handle: on ? r.handle : async () => notFound() };
 }
 
-function authLogout(authed: AuthedUser, repo: Repo): Response {
+// Revoke first, so a reconnect cannot succeed; the open connections of this
+// token close in the same tick (#351).
+function authLogout(authed: AuthedUser, repo: Repo, disconnectSession: SessionHooks["disconnectSession"]): Response {
   repo.sessions.revoke(authed.session_id);
   writeAudit(repo, "auth.logout", authed.user_email, null);
+  disconnectSession(authed.session_id, "logout");
   return json({ ok: true });
 }
 
@@ -477,6 +480,8 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 // left a team stops acting as its aliases (#284 S9).
 export type SessionHooks = {
   disconnectUser: (userId: number) => void;
+  // One token's connections close and their sessions end (#351); why is audited.
+  disconnectSession: (tokenSession: number, why: string) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
   accessChanged: (principal: string, by: string) => void;
 };
@@ -499,7 +504,7 @@ export async function handleHttp(
   const authed = requireAuth(req, repo, touches);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
-  if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
+  if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo, sessions.disconnectSession);
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);

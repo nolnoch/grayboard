@@ -170,10 +170,9 @@ test("a refused token says to sign in again: at startup, in a running session's 
   const be = new GrayboardClient(srv.base, () => token, mintSessionKey(), noop, noop, msg, { tokenPollMs: 200 });
   be.connect();
   await be.ready();
+  // The server closes the revoked token's socket itself (#351), and the client says to sign in.
   await fetch(`${srv.base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-  (be as any).ws.close();
-  await Bun.sleep(1500); // the first reconnect (after 1s) is refused
-  await expect(be.request({ type: "inbox" })).rejects.toThrow("sign in; reconnecting");
+  await until(async () => (await be.request({ type: "inbox" }).then(() => "", (e: Error) => e.message)) === "sign in; reconnecting", 3000);
   // ...picks up a new sign-in at its next look at the token.
   token = await login("alice@example.com");
   await until(async () => (await be.request({ type: "inbox" }).catch(() => null))?.type === "inbox_ok", 3000);

@@ -6,7 +6,7 @@ import {
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { canSend, type HumanReach } from "./can_send.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
-import type { AuthedUser } from "./auth.ts";
+import { authLost, type AuthedUser, type AuthLost } from "./auth.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import {
   acknowledge,
@@ -453,27 +453,59 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     },
   };
 
-  // Auth is checked at the upgrade only. When an admin revokes or disables a
-  // user, close their connections (#70): reconnecting then fails auth. Their
-  // sessions end at once, live or in their grace, not through the grace (S4).
-  // The Slack bridge's humans have their own path (SlackBridge.userChanged).
+  // Auth is checked at the upgrade and again at each hello, so a connection
+  // outlives its credential unless it is closed when the credential goes (#70,
+  // #351). closeConns closes the agent connections `match` selects: detached
+  // first (its close then records no grace), told why, audited, closed. It
+  // returns their IDs. The Slack bridge's humans have their own path
+  // (SlackBridge.userChanged) and hold no token.
   const conns = () => [...hub.holders.values()];
-  const disconnectUser = (userId: number) => {
+  const closeConns = (match: (ws: Ws) => boolean, message: string, why: string): string[] => {
+    const closed: string[] = [];
     for (const ws of conns()) {
-      if (ws.data.authed.user_id !== userId) continue;
+      if (ws.data.human || !match(ws)) continue;
+      const id = ws.data.sessionId!;
       detach(hub, ws);
-      err(ws, undefined, "unauthenticated", "an admin signed this user out");
+      writeAudit(repo, "auth.connection_closed", ws.data.authed.user_email, id, { token_session: ws.data.authed.session_id, why });
+      err(ws, undefined, "unauthenticated", message);
       ws.close();
+      closed.push(id);
     }
+    return closed;
+  };
+  // An admin revoked or disabled a user: every connection of theirs closes,
+  // and their sessions end at once, live or in their grace, not through the
+  // grace (S4).
+  const disconnectUser = (userId: number) => {
+    closeConns((ws) => ws.data.authed.user_id === userId, "an admin signed this user out", "user_signed_out");
     const email = repo.users.findById(userId)?.email;
     if (!email) return;
     endIds(hub, unendedIds(db, email), "revoked");
   };
-  // Catches a user disabled while one of their hellos was in flight, and an
-  // alias its session's principal may no longer act as (S9's backstop to
-  // accessChanged).
+  // One token was revoked (logout, #351): only its connections close and only
+  // their sessions end; the user's other tokens keep theirs. A session of this
+  // token already in its grace has no connection to act with and ends through
+  // the sweep, as any grace does.
+  const disconnectSession = (tokenSession: number, why: string) => {
+    endIds(hub, closeConns((ws) => ws.data.authed.session_id === tokenSession, "this sign-in was signed out", why), "signed_out");
+  };
+  // Catches a token revoked or user disabled with no server route to say so
+  // (a database reset, an operator edit, a disable while a hello was in
+  // flight), and an alias its session's principal may no longer act as (S9's
+  // backstop to accessChanged).
   const revalidate = () => {
-    for (const id of new Set(conns().map((ws) => ws.data.authed.user_id))) {
+    const tokens = new Set<number>();
+    const users = new Set<number>();
+    for (const ws of conns()) {
+      if (ws.data.human) continue;
+      tokens.add(ws.data.authed.session_id);
+      users.add(ws.data.authed.user_id);
+    }
+    for (const sid of tokens) {
+      const s = repo.sessions.findById(sid);
+      if (!s || s.revoked_at !== null) disconnectSession(sid, "token_revoked");
+    }
+    for (const id of users) {
       if (repo.users.findById(id)?.disabled_at != null) disconnectUser(id);
     }
     recheckAliases(hub, null, null);
@@ -493,7 +525,7 @@ export function createWsHandlers(repo: Repo, db: CoreDb, opts: WsOptions & { hel
     }, 30_000);
 
   return {
-    handlers, startPing, revalidate, disconnectUser, accessChanged, stopExpiry: expiry.stop,
+    handlers, startPing, revalidate, disconnectUser, disconnectSession, accessChanged, stopExpiry: expiry.stop,
     sweepSessions: (now = hub.now()) => sweepSessions(hub, now),
     sweepHellos: () => hub.helloLimiter.sweep(),
     wake: (handles: string[]) => wake(hub, handles),
@@ -661,6 +693,14 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     send(ws, { type: "error", req_id: reqId, code, message });
     ws.close();
   };
+  // Auth is checked at the upgrade, so a token revoked since (logout, an
+  // out-of-band reset) or a user disabled since is refused here (#351).
+  const refuseAuth = (why: AuthLost) => {
+    writeAudit(repo, "auth.hello_refused", authed.user_email, id, { token_session: authed.session_id, why, place: where });
+    refuse("unauthenticated", why === "token_revoked" ? "this sign-in was signed out" : "this user is disabled");
+  };
+  const lost = authLost(authed, repo);
+  if (lost) return refuseAuth(lost);
   if (id === null) return refuse("bad_request", "a hello needs a session_key");
   const push = m.push !== false;
   const toolsOnly = !push && m.hold !== true;
@@ -717,6 +757,9 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
     hub.probing.set(id, probing);
     if (await probing) return collide("is live on another connection");
     if (ws.readyState !== 1 /* OPEN */) return;
+    // Before the holder is superseded: a revoked token must not take it over (#351).
+    const lostProbe = authLost(authed, repo);
+    if (lostProbe) return refuseAuth(lostProbe);
     if (holders.get(id) === holder) {
       // Detached first, so its close finds another connection holding the
       // ID and records no grace (S3).
@@ -726,6 +769,10 @@ async function handleHello(hub: Hub, ws: Ws, m: HelloRequest): Promise<void> {
       holder.close();
     }
   }
+  // The probe or an in-flight hello's wait is the last await: a token revoked
+  // during it must not register an ID (#351).
+  const lostLate = authLost(authed, repo);
+  if (lostLate) return refuseAuth(lostLate);
   // The row again: the session may have ended during an await.
   const now = idRow(db, id);
   if (now?.ended_at != null) return collide(`ended at ${new Date(now.ended_at).toISOString()}`);

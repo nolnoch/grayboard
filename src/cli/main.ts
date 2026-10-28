@@ -246,17 +246,21 @@ program
   .command("logout")
   .description("Revoke current session and delete local credentials")
   .action(async () => {
+    let revoked = true;
     try {
       await makeClient().post("/api/auth/logout");
     } catch {
       // best-effort; remove local creds regardless
+      revoked = false;
     }
     const file = credentialsPath();
     if (existsSync(file)) {
       writeFileSync(file, "");
       chmodSync(file, 0o600);
     }
-    console.log("Logged out. Note: active MCP server connections continue until they reconnect.");
+    console.log(revoked
+      ? "Logged out. The server closed this sign-in's open MCP connections."
+      : "Local credentials removed, but the server could not be reached: this sign-in stays valid there until it is revoked.");
   });
 
 program

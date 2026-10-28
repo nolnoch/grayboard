@@ -71,6 +71,9 @@ describe("Repo", () => {
     expect(found?.id).toBe(s.id);
     repo.sessions.revoke(s.id);
     expect(repo.sessions.findByTokenHash("hash123")).toBeUndefined();
+    // By row, a revoked one still reads, with its revoked_at.
+    expect(repo.sessions.findById(s.id)?.revoked_at).not.toBeNull();
+    expect(repo.sessions.findById(s.id + 100)).toBeUndefined();
   });
 
   test("aliases: create, list, remove", () => {

@@ -300,6 +300,16 @@ export class GrayboardClient {
           this.die(`session ${this.id} was taken over: ${msg.message}`);
           break;
         }
+        // The server closed this token's connection (a logout, an admin
+        // sign-out) or refused its hello after the token was revoked: say to
+        // sign in at once, then let the close run the reconnect, whose token
+        // probe waits for a new token (#351). A startup refusal (not
+        // wasReady) stays the fatal path below.
+        if (msg.code === "unauthenticated" && this.wasReady) {
+          this.refused = this.refusedMessage(true);
+          this.ws?.close();
+          break;
+        }
         // A resume refused because the session ended during the outage (its
         // grace ran out): an unkeyed session carries on under a new key at
         // once, and re-binds its aliases with the old key as proof (#284 S4).
