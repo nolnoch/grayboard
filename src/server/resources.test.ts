@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -27,8 +28,10 @@ const hooks = () => {
   const counts = { changed: 0, closed: 0 };
   return { counts, changed: () => { counts.changed++; }, closed: () => { counts.closed++; } };
 };
+// An upload is its user's (#284 #367): a send carries only uploads its principal made.
+const quotaOf = (user: AuthedUser) => ({ principal: user.user_email, unsent: 1 << 20, stored: 1 << 20 });
 async function select(user: AuthedUser, name = "be", push = false, events: DeliveryEvent[] = []) {
-  return (await application.selectIdentity(user, name, sink(events), { push })).session;
+  return (await application.selectIdentity(tokenSession(application.repo, user), name, sink(events), { push })).session;
 }
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
@@ -92,7 +95,8 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   expect(ownerEvents).toEqual([]);
   const peers = application.call(a, "peer_list", {}) as { peers: { handle: string; status?: string; online: boolean }[] };
   expect(peers.peers.find(p => p.handle === a.identityFull)).toMatchObject({ status: "working", online: true });
-  await expect(select(alice, "be", true)).rejects.toMatchObject({ code: "identity_in_use" });
+  // #284: a held alias refuses another session's bind as alias_held (was identity_in_use).
+  await expect(select(alice, "be", true)).rejects.toMatchObject({ code: "alias_held" });
   resources.close();
   expect([h1.counts.closed, h2.counts.closed, h3.counts.closed]).toEqual([1, 1, 1]);
   application.send(b, a.identityFull, "direct");
@@ -130,9 +134,9 @@ test("attachments are metadata only and cannot escape the selected board/page", 
   store.repo.teams.addMember(team.id, alice.user_id);
   const a = await select(alice), b = await select(bob);
   application.call(a, "board_create", { name: "open", purpose: "open" });
-  const file = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "visible.txt", type: "text/plain", data: new TextEncoder().encode("visible") });
+  const file = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "visible.txt", type: "text/plain", data: new TextEncoder().encode("visible") }, { quota: quotaOf(alice) });
   application.call(a, "board_post", { board: "open", body: "file", attachment_ids: [file.id] });
-  const hidden = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "hidden.txt", type: "text/plain", data: new TextEncoder().encode("hidden") });
+  const hidden = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "hidden.txt", type: "text/plain", data: new TextEncoder().encode("hidden") }, { quota: quotaOf(alice) });
   application.call(a, "board_post", { board: "private", body: "hidden", attachment_ids: [hidden.id] });
   const result = resources.read(b, boardResourceUri("open"));
   expect(result.posts[0]!.attachments).toEqual([{ id: file.id, filename: file.filename, type: file.type, size: file.size, sha256: file.sha256 }]);
@@ -241,7 +245,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, application.disconnectUser, "127.0.0.1", application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, { disconnectUser: application.disconnectUser, disconnectSession: application.disconnectSession, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {

@@ -133,8 +133,9 @@ export function initCoreSchema(db: Database): void {
 
     -- Claim history, since release and expiry delete the claims row. Append-
     -- only, written in the claim's own transaction; pruned with posts.
-    -- event: take, renew, refused (held_by has it), release, expire, moved
-    -- (a rebind took it to a new name; held_by has the old one).
+    -- event: take, renew, refused (held_by has it), release, expire; rows
+    -- from before 2.0 may also say moved (a rebind took it to a new name;
+    -- held_by has the old one).
     CREATE TABLE IF NOT EXISTS claim_events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       key         TEXT    NOT NULL,
@@ -231,6 +232,23 @@ export function initCoreSchema(db: Database): void {
   // audited id.reused rather than registering silently. Unkeyed IDs are
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
+  // Metadata (#284 S12). An ID's model and effort are what its launch
+  // reported (BUS_MODEL, BUS_EFFORT; the WSS hello), display facts that end
+  // with the session. An alias's task, owner, source_board, spec_hash and
+  // description are one-line labels its binder sets (`bind(…, meta)`), never
+  // a reference or task state (decision 12). When it was bound is
+  // binding_events' record, not a column.
+  for (const col of ["model", "effort"]) {
+    if (!idCols.has(col)) db.exec(`ALTER TABLE ids ADD COLUMN ${col} TEXT`);
+  }
+  // token_session: the server's token session (sessions.id) the ID last said
+  // hello under (#351), so a logout ends the token's IDs in their grace too,
+  // which have no connection to find them by. Server-only; null locally.
+  if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);
+  const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
+  for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
+    if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS pruned_ids (
       id         TEXT PRIMARY KEY,

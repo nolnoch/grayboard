@@ -191,7 +191,7 @@ test("an unbound live ID subscribed to a queue is a lane by its ID, then by the 
   const ID = "id:0123456789abc";
   registerId(db, { id: ID, principal: null, launcher: false });
   subscribe(db, ID, "work", "push");
-  const lanes = () => queueLanes(db, getBoard(db, "work")!, "be").sort();
+  const lanes = () => queueLanes(db, getBoard(db, "work")!, ["be"]).sort();
   expect(lanes()).toEqual(["fe", ID, "sim"].sort());
   expect(post(db, "be", "work", "for the live one", null, { online: (h) => h === ID }).wake).toEqual([ID]);
   ensureAlias(db, "qa", "test");
@@ -205,11 +205,42 @@ test("an unbound live ID subscribed to a queue is a lane by its ID, then by the 
   expect(lanes()).toEqual(["fe", "sim"]);
 });
 
+// #284 S13: a session's lane is its primary, once, however many aliases it holds.
+test("an ID-subscribed queue board counts a two-hold session once, by its primary", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  subscribe(db, ID, "work", "push");
+  for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
+  holdAlias(db, "zed", ID, 100);
+  holdAlias(db, "alpha", ID, 100);
+  expect(queueLanes(db, getBoard(db, "work")!, ["be"]).sort()).toEqual(["fe", "sim", "zed"]);
+});
+
+// #284 S5: a session posting as any of its aliases is never its own lane,
+// on the first delivery or a decline's redelivery.
+test("a session posting as its second alias never claims its own queue post", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  subscribe(db, ID, "work", "push");
+  for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
+  holdAlias(db, "zed", ID, 100);
+  holdAlias(db, "alpha", ID, 101);
+  const as = { addresses: ["alpha", "zed", ID], author_id: ID };
+  const posts = [1, 2, 3].map((n) => post(db, "alpha", "work", `item ${n}`, null, as));
+  expect(posts.map((r) => r.wake)).toEqual([["be"], ["fe"], ["sim"]]);
+  // be declines item 1: zed is the least-recently-woken other lane, but it
+  // is the author's session, so fe takes it.
+  release(db, "be", claimKey(posts[0]!.post.id), "not my lane");
+  expect(listClaims(db).filter((c) => c.holder === "zed")).toEqual([]);
+  expect(listClaims(db).find((c) => c.key === claimKey(posts[0]!.post.id))?.holder).toBe("fe");
+});
+
 test("a read-only viewer is never picked by the rotation", () => {
-  db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail', 'person', '~tail', 0, 0)`).run();
-  subscribe(db, "~tail", "work", "push");
+  const tail = "id:00000000000a1";
+  registerId(db, { id: tail, principal: null, launcher: false, viewer: true });
+  subscribe(db, tail, "work", "push");
   const r = post(db, "be", "work", "work item");
-  expect(r.wake).not.toContain("~tail");
+  expect(r.wake).not.toContain(tail);
 });
 
 test("claim_take refuses the reserved queue: keyspace", () => {
@@ -253,6 +284,7 @@ test("a decline's redelivery skips a lane that lost access to the board", () => 
     canSee: (h, b) => b.scope === null || members.has(h),
     checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
     resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+    seesAliasMeta: () => true,
     announceBoard: null,
   });
   createBoard(db, "be", "eng", "team queue", "team:eng", { kind: "queue" });

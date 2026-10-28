@@ -7,10 +7,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { SESSION_KEY, bindMissed, bindOk, bindTarget, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, localUnboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, logBinding, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -49,7 +49,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, siblingGone, thisSession, type Ended } from "./binding.ts";
+import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { isAlive, launcherName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
@@ -86,11 +86,14 @@ const PUSH = process.env.BUS_PUSH !== "off";
 // the ID before the process exists (#284 decision 2). The session is then an
 // attachment to its harness: it outlives this process, and a restart under
 // the same harness carries on as it (decision 3). Read once, here.
-const KEY = process.env.BUS_SESSION_KEY;
-if (KEY !== undefined && !SESSION_KEY.test(KEY)) {
-  console.error("[grayboard] BUS_SESSION_KEY must be 64 lowercase hex characters");
-  process.exit(1);
-}
+const KEY = (() => {
+  try {
+    return envSessionKey();
+  } catch (e) {
+    console.error(`[grayboard] ${(e as Error).message}`);
+    process.exit(1);
+  }
+})();
 const KEYED = KEY !== undefined;
 if (!KEYED && process.env.BUS_HARNESS_PID !== undefined) {
   console.error("[grayboard] BUS_HARNESS_PID names a keyed session's harness; set BUS_SESSION_KEY with it");
@@ -131,6 +134,10 @@ const LAUNCHER = process.env.BUS_LAUNCHER === "1";
 // the name, has no socket, and never touches the launcher flag (a sidecar
 // must not overwrite the owner's opt-in).
 const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
+// BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
+// peer_list rows (#284 S12). Self-reported, read once, ended with the session.
+const MODEL = process.env.BUS_MODEL || undefined;
+const EFFORT = process.env.BUS_EFFORT || undefined;
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
 // child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
@@ -168,11 +175,19 @@ if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no cha
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
 
-// The bus name this session holds, or null while unbound. bind() changes it,
-// only between drains.
-let bound: string | null = null;
-// Why this session started unbound, for its instructions.
-const unboundNotes: string[] = [];
+// The names this session holds, oldest first (#284 S1): the first is its
+// primary, which it sends as. bind() and unbind() change it, only between
+// drains. A tools-only process holds nothing and writes as WRITES_AS.
+let held: string[] = [];
+const WRITES_AS = PUSH ? null : SUGGESTED;
+// The address this session writes as by default, and every address it reads
+// mail, claims and uploads as (#284 S1): its holds and its ID. A tools-only
+// process receives nothing, so its ID isn't one of its addresses.
+const primary = (): string => WRITES_AS ?? primaryOf(held, SESSION_ID);
+const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...held, SESSION_ID]);
+// Notes on how this session started: why it has no name, or a name its
+// restart couldn't take back. For its instructions.
+const startNotes: string[] = [];
 // The name came back from the name record and the name's history shows the
 // recorded session (#211): the same harness session, so its peer status stays.
 let restored = false;
@@ -185,24 +200,23 @@ let restoredFrom: string | null = null;
 const RECORD_DIR = sockDir();
 const RECORDS = PUSH && !HUMAN && !KEYED;
 // A failed write costs only the restore after a restart; the bind itself stands.
-const writeName = (name: string | null) => {
+const writeNames = () => {
   if (!RECORDS) return;
   try {
-    writeRecord(RECORD_DIR, { name, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+    writeRecord(RECORD_DIR, { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
 };
-if (!PUSH) {
-  bound = SUGGESTED;
-  ensureAlias(db, bound!, bound!);
+if (WRITES_AS) {
+  ensureAlias(db, WRITES_AS, WRITES_AS);
   // Its liveness is its own process, keyed or not: it ends on exit, and a
   // key shared with a live session collides rather than attaching.
   try {
-    registerSession(db, thisSession(SESSION_ID), { writesAs: bound!, keyed: KEYED });
+    registerSession(db, thisSession(SESSION_ID), { writesAs: WRITES_AS, keyed: KEYED, model: MODEL, effort: EFFORT });
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
-    writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid, tools_only: true });
+    writeCoreAudit(db, "id.collision", e.id, e.id, { why: e.why, delivery: "none", ended_at: e.endedAt, pid: process.pid });
     console.error(`[grayboard] ${e.message}`);
     process.exit(1);
   }
@@ -215,7 +229,7 @@ if (!PUSH) {
   // it first if the harness had died, so attaching is refused then.
   let attached = false;
   try {
-    registerSession(db, self, { launcher: EFFECTIVE_LAUNCHER });
+    registerSession(db, self, { launcher: EFFECTIVE_LAUNCHER, model: MODEL, effort: EFFORT });
     // The flag is the session's (ids.launcher), so it's audited once, here.
     writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   } catch (e) {
@@ -227,61 +241,71 @@ if (!PUSH) {
         process.exit(1);
       }
       attached = true;
-      bound = r.held;
+      held = r.held;
     } else {
-      writeCoreAudit(db, "id.collision", e.id, e.id, { ended_at: e.endedAt, pid: process.pid });
+      writeCoreAudit(db, "id.collision", e.id, e.id, { why: e.why, ended_at: e.endedAt, pid: process.pid });
       console.error(`[grayboard] ${e.message}`);
       process.exit(1);
     }
   }
   if (RECORDS) sweepRecords(RECORD_DIR);
-  // A restart under the same harness takes back its predecessor's name, ahead
-  // of BUS_IDENTITY: it's the same session, mid-task.
+  // A restart under the same harness takes back its predecessor's names, in
+  // their order, ahead of BUS_IDENTITY: it's the same session, mid-task
+  // (#284 S10). Each is judged on its own; the first taken is the primary.
   const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
-  if (rec?.name) {
-    const n = normalizeIdentityName(rec.name);
-    // The process it replaces may not have exited yet.
-    if (n.ok) await siblingGone(db, n.name, process.ppid);
-    const r = n.ok
-      ? await acquireName(db, SESSION_ID, n.name, { create: false, previous: null, restartOf: rec.session_id })
-      : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
-    await deliverEnded(db, r.ended);
-    if (r.ok) {
-      bound = r.name;
-      restored = r.restored;
-      if (restored) restoredFrom = rec.session_id;
-    } else unboundNotes.push(restoreNote(rec.name, r.error));
+  if (rec?.names.length) {
+    // A record is this machine's file, not proof: past MAX_HOLDS its names
+    // are reported, not tried.
+    const missed = rec.names.slice(MAX_HOLDS).map((name) => ({ name, why: `a session holds at most ${MAX_HOLDS} names` }));
+    // The process it replaces may not have exited yet: one wait for all of
+    // its names, not one per name.
+    const deadline = Date.now() + SIBLING_WAIT_MS;
+    for (const name of rec.names.slice(0, MAX_HOLDS)) {
+      const n = normalizeIdentityName(name);
+      if (n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
+      const r = n.ok
+        ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
+        : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
+      await deliverEnded(db, r.ended);
+      if (!r.ok) {
+        missed.push({ name, why: r.error });
+        continue;
+      }
+      held.push(r.name);
+      // The status carries over once, from the first name that verifies.
+      if (r.restored && !restored) {
+        restored = true;
+        restoredFrom = rec.session_id;
+      }
+    }
+    for (const m of missed) startNotes.push(restoreNote(m.name, m.why, held.length > 0));
   } else if (EXPLICIT && !attached) {
-    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, previous: null, allowHuman: HUMAN });
+    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, allowHuman: HUMAN });
     await deliverEnded(db, r.ended);
-    if (r.ok) bound = r.name;
+    if (r.ok) held.push(r.name);
     else if (HUMAN) {
       // A bridge has no agent to read a candidate list; refuse loudly.
       console.error(`[grayboard] ${r.error}`);
       await deliverEnded(db, endLocalSession(db, SESSION_ID));
       process.exit(1);
-    } else unboundNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
+    } else startNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
-  if (!bound && !KEYED) {
+  if (!held.length && !KEYED) {
     const launcher = launcherName(process.ppid);
-    if (launcher) unboundNotes.push(launcherNote(launcher));
+    if (launcher) startNotes.push(launcherNote(launcher));
   }
-  writeName(bound);
+  writeNames();
 }
-console.error(`[grayboard] local mode, session ${SESSION_ID}, ${bound ? `identity "${bound}"` : "unbound"}`);
+console.error(`[grayboard] local mode, session ${SESSION_ID}, ${held.length ? `identity "${held.join('", "')}"` : WRITES_AS ? `writing as "${WRITES_AS}"` : "unbound"}`);
 
-// The address set of a session whose primary is `primary` (#284 S5): its
-// alias and its ID. A tools-only process writes as its owner's alias and
-// receives nothing, so its ID isn't one of its addresses.
-function addressesOf(primary: string): string[] {
-  return PUSH ? [...new Set([primary, SESSION_ID])] : [primary];
-}
-
-// What a session acting as `name` is told (core's boundInstructions), with
-// local mode's human and announcement sentences, and its claims last: the
-// longest, and the one to lose if the client cuts the text. `lead` opens the
-// variable part: an unbound session's line about binding a name.
-function localBoundInstructions(name: string, general: boolean, lead: string[] = []): string[] {
+// What the session is told as it is now (core's boundInstructions): as its
+// primary, with local mode's human and announcement sentences, and its claims
+// last: the longest, and the one to lose if the client cuts the text. An
+// unbound session's variable part opens with its line about binding a name;
+// `notes` are why it started as it did.
+function localInstructions(general: boolean, notes: string[] = []): string[] {
+  const name = primary();
+  const lead = !WRITES_AS && !held.length ? [unboundInstruction(SESSION_ID, unboundCandidates, notes)] : notes;
   return boundInstructions(
     name,
     general,
@@ -292,11 +316,15 @@ function localBoundInstructions(name: string, general: boolean, lead: string[] =
     ],
     [
       ...lead,
-      ...undeliveredInstruction(undeliveredFrom(addressesOf(name), Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
-      ...claimsInstruction(listClaims(db), addressesOf(name)),
+      ...undeliveredInstruction(undeliveredFrom(addresses(), Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
+      ...claimsInstruction(listClaims(db), addresses()),
     ],
+    held.slice(1),
   );
 }
+// The candidates an unbound session is offered: read at start, and again when
+// an unbind leaves it holding nothing.
+let unboundCandidates = !WRITES_AS && !held.length ? await candidateNames(db, SUGGESTED) : [];
 
 const mcp = new Server(
   { name: "grayboard", version: pkg.version },
@@ -306,12 +334,7 @@ const mcp = new Server(
       tools: {},
     },
     // Unbound: the session acts as its ID, with a line on binding a name.
-    instructions: [
-      ...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []),
-      ...(bound
-        ? localBoundInstructions(bound, true)
-        : localBoundInstructions(SESSION_ID, true, [localUnboundInstruction(SESSION_ID, await candidateNames(db, SUGGESTED), unboundNotes)])),
-    ].join(" "),
+    instructions: [...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []), ...localInstructions(true, startNotes)].join(" "),
   },
 );
 
@@ -369,11 +392,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   const { name, arguments: args = {} } = req.params;
   if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
   const run = async () => {
-    if (bound) touchAlias(db, bound);
+    for (const a of WRITES_AS ? [WRITES_AS] : held) touchAlias(db, a);
     touchId(db, SESSION_ID);
     return call(name, args, signal);
   };
-  const pending = name === "bind" ? gate.bind(run) : gate.call(run);
+  // bind and unbind change the address set: no call overlaps either.
+  const pending = name === "bind" || name === "unbind" ? gate.bind(run) : gate.call(run);
   calls.add(pending);
   let r: { content: { type: string; text: string }[]; isError?: boolean; structuredContent?: unknown };
   try {
@@ -386,12 +410,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   if (signal.aborted) return r;
   const extra = notices();
   let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
-  if (instructionsStale && !out.structuredContent && bound) {
+  if (instructionsStale && !out.structuredContent) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: bound, instructions: localBoundInstructions(bound, true) } };
+    out = { ...out, structuredContent: { name: primary(), instructions: localInstructions(true) } };
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String(args.name), "it was cancelled", r.content[0]!.text));
     requeued.push(...extra);
     if (out.structuredContent) instructionsStale = true;
   });
@@ -413,11 +438,16 @@ async function call(name: string, args: Record<string, unknown>, signal: AbortSi
 
 async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal) {
   if (name === "bind") return bind(a, signal);
+  if (name === "unbind") return unbind(a, signal);
+  // Local mode has one implicit scope: no principal (#284 S6).
+  if (name === "whoami") return text({ id: SESSION_ID, primary: primary(), aliases: held, principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}) });
   // With no name, the session acts as its ID (#284 S13).
-  const IDENTITY = bound ?? SESSION_ID;
+  const IDENTITY = primary();
   // What this session reads mail, claims and uploads as; IDENTITY is the
   // primary it writes as.
-  const ADDRS = addressesOf(IDENTITY);
+  const ADDRS = addresses();
+  // What `as` may name (#284 S3): the human's session acts only as its handle.
+  const AS_ADDRS = HUMAN ? [IDENTITY] : ADDRS;
   // Only a message's sender and recipient can see it or thread from it.
   const mine = (m: Message | undefined): m is Message => !!m && (ADDRS.includes(m.sender) || ADDRS.includes(m.recipient));
 
@@ -427,8 +457,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // requester settles the thread (#184). Same result fields as dm_send, via
     // the shared builder, so the modes can't drift.
     const live = await liveHandles(ADDRS);
-    // A launcher inside its bind swap still answers under its old name: filter
-    // it like dm_send does (a released name's socket isn't the session).
+    // A name just released (an unbind, or a 1.x rebind sharing the file) can
+    // still answer on its socket: filter it like dm_send does (a released
+    // name's socket isn't the session).
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
     let d;
     try {
@@ -493,6 +524,10 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       parent_id?: number;
       pending?: boolean;
     };
+    const parent = parent_id === undefined ? undefined : getMessage(parent_id);
+    // `as` wins; a reply defaults to the held alias its parent reached or was
+    // sent as (#284 S4); else the primary.
+    const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, held) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
     const parsed = addressParts(to);
@@ -503,15 +538,16 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
         isError: true,
       };
     }
-    if (parent_id !== undefined && !mine(getMessage(parent_id))) {
+    if (parent_id !== undefined && !mine(parent)) {
       return {
         ...text(`error: parent_id ${parent_id} is not a message you sent or received`),
         isError: true,
       };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(IDENTITY, files, (ids) => insertMessage(IDENTITY, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids));
-    const p = { ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
+    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }));
+    // The result names the sender whenever it isn't the primary.
+    const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
     const delivered = (await poke(recipient)) && !lastWasRelease(db, recipient);
@@ -540,7 +576,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
   if (name === "dm_inbox") {
     const since = Date.now() - inboxDays(a.days) * 86_400_000;
-    const owed = unanswered(ADDRS, receivedUnacked(ADDRS, since), getThread);
+    const owed = unanswered(ADDRS, receivedUnacked(ADDRS, since), getThread, IDENTITY);
     const promises = promised(ADDRS, sentPending(ADDRS, Date.now() - PROMISE_DAYS * 86_400_000), getThread);
     const queued = undeliveredFrom(ADDRS).map((u) => {
       const seen = lastSeen(db, u.recipient);
@@ -588,7 +624,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const id = checkAttachmentId(a.id);
     const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
     const row = getAttachment(db, id);
-    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)), ADDRS)) {
+    if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)), { addresses: ADDRS, principal: null })) {
       return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
     }
     const path = await saveAttachment(row, await blobs.get(row.sha256), target);
@@ -603,16 +639,17 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const ctx = {
       ...(name === "peer_list" || (name === "board_post" && (HUMAN || queuePost)) ? { online: await liveHandles(ADDRS) } : {}),
       ...(name === "peer_list" ? { unbound: await unboundPeers() } : {}),
-      attachmentLimits: DEFAULT_ATTACHMENT_LIMITS,
+      files: { limits: DEFAULT_ATTACHMENT_LIMITS, principal: null },
       human: HUMAN,
       session: SESSION_ID,
       addresses: ADDRS,
     };
-    const { attachments: paths, ...args } = a;
+    const actor = boardActor(db, name, a, { addresses: ADDRS, asAddresses: AS_ADDRS, ownScope: null });
+    const { attachments: paths, as: _as, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
     // Bound in the post's transaction; a refused post releases the uploads.
-    const { result, wake } = await withUploads(IDENTITY, files, (ids) =>
-      db.transaction(() => callBoardTool(db, IDENTITY, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
+    const { result, wake } = await withUploads(actor, files, (ids) =>
+      db.transaction(() => callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
     );
     await wakeAll(wake);
     return text(result);
@@ -681,36 +718,47 @@ function drainToClaude(): Promise<void> {
 async function drainLoop(): Promise<void> {
   await initialized;
   // Read once: a cursor written under one name must never get another's ids.
-  const readers = bound ? addressesOf(bound) : [SESSION_ID];
+  const readers = addresses();
   while (!shuttingDown) {
     const first = firstDrain;
     firstDrain = false;
     let any = false;
     for (const reader of readers) {
       const batch = unreadFor(reader);
-      // A human's session has no tokens to save; a DM is already waking the agent.
-      const boardItems = pendingFor(db, reader, { all: first || HUMAN || batch.length > 0 });
-      if (batch.length === 0 && boardItems.length === 0) continue;
-      any = true;
+      if (batch.length > 0) any = true;
       for (const msg of batch) {
         if (shuttingDown) return;
-        const params = dmNotification(msg);
+        const params = dmNotification(msg, primary());
         if (isHuman(db, msg.sender)) params.meta.human = "true";
         await mcp.notification({ method: "notifications/claude/channel", params });
         if (sessionEnded) return;
         setCursor(reader, msg.id);
       }
-      for (const item of boardItems) {
-        if (shuttingDown) return;
-        const params = boardNotification(item);
-        if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params,
-        });
-        if (sessionEnded) return;
-        markDelivered(db, reader, item);
+    }
+    // A post pending for several addresses (an ID and an alias subscription)
+    // is pushed once and marked delivered for each (#361), as the server's
+    // drain and board_ack do. A human's session has no tokens to save; a DM
+    // is already waking the agent.
+    const boardItems = new Map<string, { item: Pending; readers: string[] }>();
+    for (const reader of readers) {
+      for (const item of pendingFor(db, reader, { all: first || HUMAN || any })) {
+        const key = pendingKey(refOf(item));
+        const seen = boardItems.get(key);
+        if (seen) seen.readers.push(reader);
+        else boardItems.set(key, { item, readers: [reader] });
       }
+    }
+    if (boardItems.size > 0) any = true;
+    for (const { item, readers: pendingTo } of boardItems.values()) {
+      if (shuttingDown) return;
+      const params = boardNotification(item);
+      if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params,
+      });
+      if (sessionEnded) return;
+      for (const reader of pendingTo) markDelivered(db, reader, item);
     }
     if (!any) break;
   }
@@ -724,55 +772,119 @@ const onWake = () => {
     console.error("grayboard drain error:", err);
   });
 };
-// The alias's wakeup socket, swapped by bind; the ID's is this process's
-// from start to exit.
-let stopListening = () => {};
+// Each held alias's wakeup socket, opened once its hold commits and closed
+// before it drops (#284 S7); the ID's is this process's from start to exit.
+const listeners = new Map<string, () => void>();
 let stopIdListening = () => {};
 
-// bind(name, create?): take a name, or move to another (#182). The new name
-// is acquired first (its row, in one transaction); only then does the old
-// name's socket close. Claims stay with the name they were taken under. Drains stop for
-// the swap, so a DM to the old name is either delivered under it before the
-// swap or stays queued for its next holder; never consumed under the new one.
-// It runs behind the gate, so no tool call overlaps it (#182 audit 11).
+function listen(alias: string): void {
+  if (DELIVER && !listeners.has(alias)) listeners.set(alias, listenForWakeup(alias, onWake));
+}
+
+function stopListening(alias: string): void {
+  listeners.get(alias)?.();
+  listeners.delete(alias);
+}
+
+// The name a bind or unbind names: bare, in local mode's one scope.
+function bareName(raw: string, verb: "bind" | "unbind"): { ok: true; name: string } | { ok: false; error: string } {
+  // A server alias's scope ("eng/x", "you@example.com/x") means nothing here.
+  if (raw.includes("/")) return { ok: false, error: `local mode has one scope; ${verb} a bare name, not "${raw}"` };
+  return normalizeIdentityName(raw);
+}
+
+// bind(name, create?, meta?): take another name (#182, #284 S1). It never
+// drops a hold: the new one is acquired (its row, in one transaction), then
+// its socket opens. Drains stop for it, so the first drain under the new name
+// starts from its own cursor. It runs behind the gate, so no tool call
+// overlaps it (#182 audit 11). A name already held only takes its labels.
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
-  const n = bindTarget(a, bound, PUSH);
-  if ("result" in n) return n.result;
+  if (!PUSH) return fail(TOOLS_ONLY_BIND);
+  // The human's handle is a declaration, fixed for its bridge's session (#363), as the server's HumanConn.
+  if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it binds nothing`);
+  const n = bareName(String(a.name), "bind");
+  if (!n.ok) return fail(n.error);
+  let meta: AliasMetaSet | undefined;
+  try {
+    meta = a.meta === undefined ? undefined : parseAliasMeta(a.meta);
+  } catch (e) {
+    // Audited like the server's refusal of the same bind.
+    if (e instanceof CoreError) logBinding(db, SESSION_ID, n.name, "refused", e.message);
+    throw e;
+  }
+  if (held.includes(n.name)) {
+    if (meta && !setHeldMeta(db, SESSION_ID, n.name, meta)) throw new Error(`grayboard: session ${SESSION_ID} lost its hold on "${n.name}"`);
+    return text(`already bound to "${n.name}"`);
+  }
   swapping = true;
   try {
     await inflight;
-    const previous = bound;
-    const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, previous });
+    const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, meta });
     await deliverEnded(db, r.ended);
     if (!r.ok) return fail(r.error);
     // The row holds the new name from here: so does this process, whatever
-    // follows fails, or the finally's drain would read a name it no longer holds.
-    bound = n.name;
-    writeName(bound);
+    // follows fails.
+    held.push(n.name);
+    writeNames();
     firstDrain = true;
     testPause("bind:after-acquire");
     try {
-      if (DELIVER) {
-        stopListening();
-        stopListening = () => {};
-        stopListening = listenForWakeup(n.name, onWake);
-      }
-      if (previous) touchAlias(db, previous);
+      listen(n.name);
       touchAlias(db, n.name);
     } catch (e) {
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
-      throw new CoreError(`bound "${n.name}"${previous ? ` (was "${previous}")` : ""}, but setting it up failed: ${(e as Error).message}`);
+      throw new CoreError(`bound "${n.name}", but setting it up failed: ${(e as Error).message}`);
     }
-    console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"${previous ? ` (was "${previous}")` : ""}`);
-    // Claims stay with the name they were taken under (#284 S6): say which
-    // ones this session no longer holds.
-    const left = previous ? listClaims(db).filter((c) => c.holder === previous).map((c) => c.key) : [];
-    const notes = left.length ? [`Claims stay with the name they were taken under; these are now "${previous}"'s next holder's: ${left.join(", ")}.`] : [];
-    const ok = bindOk(n.name, previous, [], (general) => localBoundInstructions(n.name, general), notes, true);
+    console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}"; holds "${held.join('", "')}"`);
+    const ok = bindOk(n.name, held, (general) => localInstructions(general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
       missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      instructionsStale = true;
+    }
+    return ok;
+  } finally {
+    swapping = false;
+    if (DELIVER) onWake();
+  }
+}
+
+// unbind(name): release one hold (#284 S2), in shutdown's order: drains stop
+// and the one in flight finishes, the name's socket closes while the row
+// still holds it (nobody can take the name with this socket answering), then
+// one transaction drops the hold. Its mail and claims stay with the name.
+async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
+  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  if (!PUSH) return fail(TOOLS_ONLY_BIND);
+  if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it unbinds nothing`);
+  const n = bareName(String(a.name), "unbind");
+  if (!n.ok) return fail(n.error);
+  if (!held.includes(n.name)) return text(notHolding(n.name));
+  swapping = true;
+  try {
+    await inflight;
+    const before = primary();
+    stopListening(n.name);
+    testPause("unbind:before-txn");
+    let released: boolean;
+    try {
+      released = releaseName(db, SESSION_ID, n.name);
+    } catch (e) {
+      // The row still holds the name: answer on its socket again, or a
+      // retried unbind or bind finds it held and nothing re-listens.
+      listen(n.name);
+      throw e;
+    }
+    held = held.filter((h) => h !== n.name);
+    writeNames();
+    if (!released) return text(notHolding(n.name));
+    console.error(`[grayboard] session ${SESSION_ID} released "${n.name}"; ${held.length ? `holds "${held.join('", "')}"` : "unbound"}`);
+    if (!held.length) unboundCandidates = await candidateNames(db, SUGGESTED);
+    const left = listClaims(db).filter((c) => c.holder === n.name).map((c) => c.key);
+    const ok = unbindOk(n.name, before, primary(), left, (general) => localInstructions(general));
+    if (signal.aborted) {
+      missedBindNotice = unbindMissed(n.name, "it was cancelled", ok.content[0]!.text);
       instructionsStale = true;
     }
     return ok;
@@ -789,7 +901,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
 // A restored name is the same harness session restarted: its status carries
 // over to this session's ID.
 if (restoredFrom) inheritStatus(db, SESSION_ID, restoredFrom);
-if (bound) touchAlias(db, bound);
+for (const h of held) touchAlias(db, h);
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
 late.watch(transport);
@@ -804,14 +916,14 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
-    if (bound) touchAlias(db, bound);
+    for (const h of held) touchAlias(db, h);
   } catch (err) {
     // The bus may already be closed at shutdown; exiting matters more.
-    console.error("grayboard shutdown: touching the alias failed:", err);
+    console.error("grayboard shutdown: touching the aliases failed:", err);
   }
-  // The sockets go first, while the row still holds the name, so nobody
-  // takes the name with this socket still in place.
-  stopListening();
+  // The sockets go first, while the rows still hold the names, so nobody
+  // takes a name with its socket still in place.
+  for (const h of [...listeners.keys()]) stopListening(h);
   stopIdListening();
   await Promise.race([Promise.allSettled([...calls, inflight]), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   let ended: Ended = NOTHING_ENDED;
@@ -825,7 +937,7 @@ const shutdown = async () => {
     console.error(`grayboard shutdown: ending ${SESSION_ID} failed:`, err);
   }
   sessionEnded = true;
-  if (RECORDS && !bound) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
+  if (RECORDS && !held.length) dropUnboundRecord(RECORD_DIR, process.ppid, SESSION_ID);
   await Promise.race([deliverEnded(db, ended).catch(() => {}), Bun.sleep(SHUTDOWN_WAKE_MS)]);
   process.exit(0);
 };
@@ -841,7 +953,7 @@ await deliverEnded(db, openEnded);
 
 if (DELIVER) {
   stopIdListening = listenForWakeup(SESSION_ID, onWake);
-  if (bound) stopListening = listenForWakeup(bound, onWake);
+  for (const h of held) listen(h);
   drainToClaude().catch((err) => {
     console.error("grayboard initial drain error:", err);
   });

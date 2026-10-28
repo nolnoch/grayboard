@@ -54,8 +54,8 @@ test("who: live sessions are online; a stopped one is offline with last_seen", a
   await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
   await call(sim, "board_subscribe", { board: "e2e", mode: "quiet" });
   expect((await call(sim, "peer_list", { board: "#e2e" })).peers).toEqual([
-    { handle: "be", online: true, last_seen: expect.any(Number), mode: "push", where: expect.any(String) },
-    { handle: "sim", online: true, last_seen: expect.any(Number), self: true, mode: "quiet", where: expect.any(String) },
+    { handle: "be", online: true, last_seen: expect.any(Number), id: expect.stringMatching(/^id:/), harness: expect.any(String), mode: "push", where: expect.any(String) },
+    { handle: "sim", online: true, last_seen: expect.any(Number), self: true, id: expect.stringMatching(/^id:/), harness: expect.any(String), mode: "quiet", where: expect.any(String) },
   ]);
 }, 20_000);
 
@@ -194,7 +194,7 @@ test("a wrong argument name gets an error naming the expected call", async () =>
   const be = await start("be");
   await start("fe");
   await expect(call(be, "dm_send", { recipient: "fe", body: "hi" })).rejects.toThrow(
-    "dm_send(to, body, parent_id?, pending?, attachments?, resend?): missing to; unknown recipient.",
+    "dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?): missing to; unknown recipient.",
   );
 }, 20_000);
 
@@ -358,10 +358,12 @@ test("grayboard claim take/release acts as the shell's bound session; held exits
   expect(unbound.code).toBe(1);
   expect(unbound.err).toContain("hasn't bound a name yet");
   await call(api, "bind", { name: "api", create: true });
+  // A second hold doesn't change what the shell acts as: the primary (#284 S1).
+  await call(api, "bind", { name: "api-b", create: true });
   // A tools-only process beside it in the checkout (#284 S7) owns no shell:
   // the bound session is still the only candidate.
   await localSession(dir, "api", { cwd: repo, extra: { BUS_PUSH: "off" } });
-  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout)\n" });
+  expect(await gb(undefined, repo, "whoami")).toMatchObject({ code: 0, out: "api (from the session in this checkout; that session also holds api-b)\n" });
   const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
   expect((await gb(undefined, elsewhere, "whoami")).err).toContain("no live session runs this shell or this checkout");
   expect(JSON.parse((await gb("be", dir, "--json", "whoami")).out)).toEqual({ handle: "be", source: "BUS_IDENTITY" });

@@ -69,7 +69,7 @@ export class TestServer {
   }
 
   async upload(token: string, identity: string, filename: string, data: Uint8Array | string): Promise<{ status: number; body: Record<string, any> }> {
-    const q = `identity=${encodeURIComponent(identity)}&filename=${encodeURIComponent(filename)}`;
+    const q = `as=${encodeURIComponent(identity)}&filename=${encodeURIComponent(filename)}`;
     const r = await fetch(`${this.base}/api/attachments?${q}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
@@ -78,7 +78,7 @@ export class TestServer {
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
-  // A raw WebSocket client (identity null: a read-only hello); closed by stop().
+  // A raw WebSocket client (identity null: an unbound session); closed by stop().
   client(token: string, identity: string | null, opts: WsClientOptions = {}): WsClient {
     const c = new WsClient(this.base, token, identity, opts);
     this.clients.push(c);

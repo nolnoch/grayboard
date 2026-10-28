@@ -7,6 +7,7 @@ import {
   unsubscribeScope,
   type CoreDb,
 } from "../core/boards.ts";
+import { addressParts } from "../core/addresses.ts";
 import type { Repo, Team } from "./db.ts";
 
 export const teamScope = (name: string) => `team:${name}`;
@@ -23,17 +24,23 @@ function follow(db: CoreDb, handle: string, team: Team): void {
 
 export function onTeamJoined(db: CoreDb, repo: Repo, team: Team, email: string): void {
   ensureTeamBoard(db, team, email);
-  for (const alias of repo.aliases.listFor(email)) follow(db, alias.address, team);
+  for (const alias of repo.aliases.listForScope("person", email)) follow(db, alias.address, team);
 }
 
 export function onTeamLeft(db: CoreDb, repo: Repo, team: Team, email: string): void {
-  for (const alias of repo.aliases.listFor(email)) unsubscribeScope(db, alias.address, teamScope(team.name));
+  for (const alias of repo.aliases.listForScope("person", email)) unsubscribeScope(db, alias.address, teamScope(team.name));
 }
 
+// A person's alias follows each of its user's teams; a team's alias follows
+// only its own team (#284 S9), whoever created it.
 export function onAliasCreated(db: CoreDb, repo: Repo, userId: number, handle: string): void {
-  const email = handle.slice(0, handle.lastIndexOf("/"));
-  for (const team of repo.teams.listForUser(userId)) {
-    ensureTeamBoard(db, team, email);
+  const creator = repo.users.findById(userId)?.email;
+  if (!creator) return;
+  const p = addressParts(handle);
+  if (p?.kind !== "alias") return;
+  const teams = p.scopeKind === "person" ? repo.teams.listForUser(userId) : [repo.teams.findByName(p.scope)].filter((t): t is Team => !!t);
+  for (const team of teams) {
+    ensureTeamBoard(db, team, creator);
     follow(db, handle, team);
   }
 }

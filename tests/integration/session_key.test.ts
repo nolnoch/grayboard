@@ -78,6 +78,22 @@ test("a SIGKILLed child restarted under its live harness re-attaches: same ID, n
   expect(peer.pushes.filter((p) => p.meta.kind === "bounce")).toEqual([]);
 }, 30_000);
 
+test("#284 S7: a keyed restart keeps every hold, oldest first, and both names' mail arrives", async () => {
+  const key = mintSessionKey();
+  const id = idAddress(key);
+  let s = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key } });
+  const peer = await localSession(dir, "fe");
+  await s.call("bind", { name: "api", create: true });
+  await s.call("bind", { name: "web", create: true });
+  s = await s.restart("crash");
+  expect(s.c.getInstructions()).toStartWith(`You are identity "api" on the grayboard bus, which coordinates between agents. You also hold "web"; you send as "api" unless a call passes as, and a reply goes as the alias its message reached.`);
+  expect(rows<{ address: string }>(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at`, id)).toEqual([{ address: "api" }, { address: "web" }]);
+  for (const to of ["api", "web"]) {
+    await peer.call("dm_send", { to, body: `to ${to}` });
+    await until(() => s.pushes.some((p) => p.content === `to ${to}`));
+  }
+}, 30_000);
+
 test("a clean exit under a live harness detaches; the harness's exit ends the session at the next open, and the key is refused", async () => {
   const key = mintSessionKey();
   const id = idAddress(key);
@@ -160,7 +176,7 @@ test("a tools-only process sharing a live session's key is refused: it never att
   const owner = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key } });
   const err = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } }).then(() => "started", (e: Error) => e.message);
   expect(err).toContain(`id_collision: ${id} is a live session's; start with a new session key`);
-  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ ended_at: null, tools_only: true })]);
+  expect(audit("id.collision", id)).toEqual([expect.objectContaining({ why: "is a live session's", delivery: "none", ended_at: null })]);
   expect(binding(id)).toMatchObject({ pid: owner.harnessPid, detached_at: null });
   expect(rows(`SELECT delivery, ended_at FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "push", ended_at: null }]);
 }, 30_000);
@@ -170,7 +186,7 @@ test("a keyed tools-only process alone registers its key's ID as keyed, so reten
   const id = idAddress(key);
   const s = await localSession(dir, "api", { extra: { BUS_SESSION_KEY: key, BUS_PUSH: "off" } });
   expect(rows(`SELECT delivery, keyed FROM ids WHERE id = ?`, id)).toEqual([{ delivery: "none", keyed: 1 }]);
-  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ tools_only: true, keyed: true })]);
+  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ delivery: "none", keyed: true })]);
   await stop(s.c);
 }, 30_000);
 

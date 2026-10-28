@@ -74,7 +74,11 @@ function toZod(s: JsonSchema, at: string): any {
   else if (s.type === "array") {
     if (!s.items) throw new Error(`grayboard: ${at}: array without items`);
     out = z.array(toZod(s.items, `${at}[]`));
-  } else if (s.type === "object") out = z.object(toShape(s, at));
+  } else if (s.type === "object") {
+    // A property-less object (bind's meta, peer_list's match) is a free map
+    // the bus validates; z.object({}) would strip every key.
+    out = s.properties ? z.object(toShape(s, at)) : z.record(z.string(), z.unknown());
+  }
   else throw new Error(`grayboard: ${at}: unsupported schema ${JSON.stringify(s)}`);
   return s.description ? out.describe(s.description) : out;
 }

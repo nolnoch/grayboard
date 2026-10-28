@@ -1,7 +1,7 @@
 import type { Pending, PendingRef } from "../core/boards.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
-import { SESSION_KEY, asSessionId, type Candidate } from "../core/bindings.ts";
+import { SESSION_KEY, asSessionId } from "../core/bindings.ts";
 import { SESSION_ID } from "../core/session_id.ts";
 
 export type Message = {
@@ -21,38 +21,57 @@ export type Message = {
 };
 
 // Client -> Server
-// push: false is a tools-only connection beside the session that owns the
-// identity (a harness that can't show pushes): no pushes, not "online".
+// The hello is the session (#284 S1): its ID is derived from session_key
+// (idAddress), the client process's secret, so no connection can present
+// another session's ID. A key with no ids row registers the session; one
+// whose session is in its grace re-attaches it, holds and all (S3).
+// proto: 2; a 1.x client's hello is refused with an update hint (S15).
+// keyed: the key came from BUS_SESSION_KEY (an orchestrator minted it); such
+// a session never mints a replacement after its end (#284 decision 2).
+// push: false is a connection that receives nothing: with hold, a session
+// whose harness can't show pushes (Claude Code without channels), which
+// binds and holds an alias as push does; without, a tools-only connection
+// beside the session that owns delivery, writing as writes_as (S7).
 // where: the client's describeLocation (the server can't see its files).
-// resume: a reconnect within one session, so its peer_status stays (#211, below).
-// session_key: the client process's secret (#182 audit 4); the server
-// derives the session ID, the key of its binding_events, from it
-// (idAddress), so no connection can present another session's ID.
-// hold: with push: false, the connection holds its name as push does (the
-// probe, binding events, claim moves) but gets no pushes and isn't online:
-// a session whose harness can't show pushes (Claude Code without channels).
-// from: the name a rebind leaves; its claims move to the new name if this
-// session holds it by the record. Sent on a bind's first hello only.
-// restored_from: the session ID of the process this one restarted from,
-// taking back its name (#182 decision 14). Its status stays, and the bound
-// event says so, only when the name's latest bound or moved event is that
-// session's (#211); likewise a resume's own session. Ignored with from.
-// create: false refuses a name that has never existed (identity_unknown);
-// absent, the name is created lazily, as before #182.
-// read_only: an unbound session's connection (no identity; push must be
-// false): board_list, board_read, peer_list and claim_list only. suggested:
-// the checkout's default name, listed first among hello_ok.candidates.
+// resume: a reconnect within one session; audit detail only, as possession
+// of the key is the proof.
+// The Slack bridge's in-process humans send no key: ws.data.human is set
+// only in-process, and no network hello can reach that path (S16).
 export type HelloRequest = {
-  type: "hello"; req_id: string; identity?: string; push?: boolean; where?: string; resume?: boolean;
-  session_key?: string; hold?: boolean; from?: string; create?: boolean; read_only?: boolean; suggested?: string; restored_from?: string;
+  type: "hello"; req_id: string; proto: 2; session_key?: string; keyed?: boolean;
+  push?: boolean; hold?: boolean; where?: string; resume?: boolean; writes_as?: string;
   // This session's harness can spawn subagents, so delegate requests may land
-  // here (#184). Recorded on the handle's row; peer_list shows it.
+  // here (#184). Recorded on the session's ids row; peer_list shows it.
   launcher?: boolean;
+  // What the session runs on, self-reported (#284 S12): the harness's
+  // command name, BUS_MODEL, BUS_EFFORT. Recorded when the hello registers
+  // the session; peer_list shows them and `match` filters on them.
+  harness?: string; model?: string; effort?: string;
 };
+// Add an alias to this session's holds (#284 PR 4 S1): a bare name in the
+// caller's own person scope, or scope/name. One already held answers ok and
+// only applies meta. create: false refuses a name that has never existed
+// (identity_unknown); absent, it's created lazily. meta: the alias's labels
+// (S12, core parseAliasMeta). restored_from: the public ID of the process
+// this one restarted from, kept as audit only (S11: it proves nothing, so
+// no status carries over). previous_key: the key of this process's own
+// ended session, after a reconnect past the grace (PR 3 S4): a secret, so it
+// proves descent where a public ID can't (#259), and the status carries over.
+export type BindRequest = {
+  type: "bind"; req_id: string; alias: string; create?: boolean; meta?: Record<string, unknown>; restored_from?: string; previous_key?: string;
+};
+// Release one of this session's holds (S2); its mail and claims stay with it.
+export type UnbindRequest = { type: "unbind"; req_id: string; alias: string };
+// A clean exit of an unkeyed session (S4): it ends at once.
+export type EndRequest = { type: "end"; req_id: string };
 // attachment_ids: the sender's uploads (POST /api/attachments) to carry.
 // resend: true sends again though an identical send landed within the dedup
 // window (#254, src/server/write_dedup.ts); otherwise that one's result replays.
-export type SendRequest    = { type: "send";    req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean };
+// as: send as another of the session's addresses (#284 S3); without it a
+// reply goes as the held alias its parent reached or was sent as (S4).
+export type SendRequest    = {
+  type: "send"; req_id: string; recipient: string; body: string; parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string;
+};
 // Hand work to a launcher session (#184): the server resolves the launcher
 // (explicit `to`, or any live one; none live → the requester's human) and
 // sends the payload pending. The reply is send_ok with `to` (and
@@ -70,12 +89,18 @@ export type CallRequest    = { type: "call";      req_id: string; tool: string; 
 export type BoardAckRequest = { type: "board_ack"; req_id: string; refs: PendingRef[] };
 
 export type ClientMessage =
-  | HelloRequest | DelegateRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
+  | HelloRequest | BindRequest | UnbindRequest | EndRequest | DelegateRequest | SendRequest | HistoryRequest | ThreadRequest | AckRequest | PongMessage
   | CallRequest | BoardAckRequest | InboxRequest | DmAckRequest | DmRetractRequest;
 
 // Server -> Client
 export type HelloOk     = {
-  type: "hello_ok"; req_id: string; identity_full: string; user_email: string; teams: string[];
+  type: "hello_ok"; req_id: string;
+  // This session's ID, its address while it holds no alias.
+  id: string;
+  // The aliases a re-attached session already holds, oldest first (it sends
+  // as the first): the client then binds and restores nothing at start (S1).
+  bound?: string[];
+  user_email: string; teams: string[];
   // Sentences for the session's MCP instructions: active claims, and direct
   // messages you sent that still haven't arrived a day later.
   notices?: string[];
@@ -84,20 +109,24 @@ export type HelloOk     = {
   // linked: whether anyone reads it (the user has linked Slack).
   human?: { handle: string; linked: boolean };
   // This server's attachment size caps, for the client's checks before upload.
-  attachment_limits?: AttachmentLimits;
-  // A read-only hello: the user's free names an unbound session can bind.
-  candidates?: Candidate[];
-  // A hello that holds its name: the claim keys that moved from the name the
-  // session left ([] when none did). A server from before #182 never sends
-  // it, which is how the client tells it can't move claims or refuse names.
-  moved?: string[];
-  // A rebind whose claims stayed behind: why.
-  not_moved?: string;
-  // This server deduplicates this session's append writes (#254): a hello
-  // with a session_key, so a reconnect keeps the session. A server from before
-  // #254, or a keyless hello, sends none, and a retry may write twice.
-  write_dedup?: boolean;
+  attachment_limits: AttachmentLimits;
 };
+// alias: the full address bound. held: every alias the session holds now,
+// oldest first. notices: as hello_ok's, for the set now held. restored: a
+// bind that named restored_from or previous_key, whether the alias's history
+// verified it and so carried the status over (#284 PR 4 S11); also in the
+// alias's binding_events row.
+export type BindOk      = {
+  type: "bind_ok"; req_id: string; alias: string; held: string[]; notices?: string[]; restored?: { verified: boolean; detail: string };
+};
+// alias: the full address named. released: false when the session didn't
+// hold it (nothing changed). held: the holds left, oldest first. left: the
+// claims that stay with the released alias.
+export type UnbindOk    = { type: "unbind_ok"; req_id: string; alias: string; released: boolean; held: string[]; left?: string[] };
+export type EndOk       = { type: "end_ok"; req_id: string };
+// The server released an alias this session held (#284 S9: its user left the
+// alias's team). The session keeps its ID and acts as it from here.
+export type AliasLost   = { type: "alias_lost"; alias: string; reason: string };
 // The row an append write made (#254): a direct message or a board post.
 export type WriteRef = { kind: "message" | "post"; id: number };
 // On a result that repeats an earlier identical call's (#254): when that one
@@ -109,6 +138,8 @@ export type SendResult  = {
   // Echoed when the request set it, so a client can tell this server recorded it.
   pending?: true;
   attachments?: AttachmentInfo[];
+  // The address it went out as, when that isn't the session's primary (#284 S4).
+  sent_as?: string;
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
@@ -133,33 +164,48 @@ export type PingMessage = { type: "ping" };
 export type CallOk      = { type: "call_ok";    req_id: string; result: unknown };
 export type BoardPush   = { type: "board_push"; item: Pending };
 // known: with identity_unknown, the user's names closest to the one asked for.
-// holder: with identity_in_use, the live session that holds the name.
-// retry_after_ms: on a rate_limited hello, the wait until one is accepted again.
+// holder: with alias_held, the session that holds the alias.
+// retry_after_ms: on a rate_limited hello, the wait until one is accepted
+// again; on alias_held, the wait until the holder's grace ends and the sweep
+// after it runs (absent for a live holder).
 export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
 
 export type ServerMessage =
-  | HelloOk | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
+  | HelloOk | BindOk | UnbindOk | EndOk | AliasLost | SendOk | DelegateOk | HistoryOk | ThreadOk | AckOk | PushMessage | PingMessage | ErrorMessage
   | CallOk | BoardPush | InboxOk;
 
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
   | "rate_limited" | "internal" | "superseded"
+  // a hosted delivery lease holds as many receipts as it can (#204)
   | "receipt_capacity"
-  // hello refused: another live connection holds this identity
-  | "identity_in_use"
-  // hello refused: create: false and the name has never existed
+  // bind refused: another session holds the alias
+  | "alias_held"
+  // bind refused: create: false and the name has never existed
   | "identity_unknown"
-  // a read-only connection asked for something that needs a name
-  | "unbound"
-  // hello refused: the session key's ID is another principal's session (#284)
+  // hello refused: the session key's ID is another principal's session, has
+  // ended, or is live on another connection (#284)
   | "id_collision"
-
+  // the session has ended (#284 S4), or a send or mention named an ended ID
+  | "id_ended"
+  // a send or mention named an ID that receives nothing (a tools-only session)
+  | "no_delivery"
+  // Hosted MCP only (src/server/hosted.ts), never on the WSS wire: a hosted
+  // bind refused because another session holds the name, a hosted call that
+  // needs a bound name, and the hosted child-session registration refusals.
+  | "identity_in_use"
+  | "unbound"
   | "child_session"
   | "invalid_registration"
   | "root_is_child"
   | "child_bound"
   | "child_registered_elsewhere"
   | "has_children";
+
+/** The protocol version a hello must carry (#284 S15). */
+export const PROTO = 2;
+/** What a hello without it is told: a 1.x client against a 2.x server. */
+export const PROTO_REFUSAL = "this grayboard server is 2.x; update the CLI (`grayboard update`)";
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
@@ -168,28 +214,39 @@ export function parseClientMessage(raw: unknown): ClientMessage {
   switch (m.type) {
     case "hello":
       assertStr(m, "req_id");
-      if (m.read_only !== undefined && typeof m.read_only !== "boolean") throw new Error("read_only must be boolean");
-      if (m.read_only === true) {
-        if (m.identity !== undefined) throw new Error("a read_only hello has no identity");
-        if (m.push !== false) throw new Error("a read_only hello needs push: false");
-      } else assertStr(m, "identity");
-      if (m.push !== undefined && typeof m.push !== "boolean") throw new Error("push must be boolean");
-      if (m.create !== undefined && typeof m.create !== "boolean") throw new Error("create must be boolean");
+      if (m.proto !== PROTO) throw new Error(PROTO_REFUSAL);
       if (m.session_key !== undefined && (typeof m.session_key !== "string" || !SESSION_KEY.test(m.session_key)))
         throw new Error("session_key must be 64 lowercase hex characters");
-      if (m.hold !== undefined && typeof m.hold !== "boolean") throw new Error("hold must be boolean");
-      if (m.hold === true && (m.push !== false || m.read_only === true)) throw new Error("hold needs push: false and a name");
-      if (m.from !== undefined && (typeof m.from !== "string" || m.read_only === true)) throw new Error("from must be a string, on a hello with a name");
+      for (const k of ["keyed", "push", "hold", "resume", "launcher"]) {
+        if (m[k] !== undefined && typeof m[k] !== "boolean") throw new Error(`${k} must be boolean`);
+      }
+      if (m.hold === true && m.push !== false) throw new Error("hold needs push: false");
+      for (const k of ["where", "harness", "model", "effort"]) {
+        if (m[k] !== undefined && typeof m[k] !== "string") throw new Error(`${k} must be a string`);
+      }
+      // A tools-only connection names what it writes as; nothing else may.
+      if (m.push === false && m.hold !== true) assertStr(m, "writes_as");
+      else if (m.writes_as !== undefined) throw new Error("writes_as is a tools-only connection's (push: false, no hold)");
+      return m as unknown as HelloRequest;
+    case "bind":
+      assertStr(m, "req_id"); assertStr(m, "alias");
+      if (m.create !== undefined && typeof m.create !== "boolean") throw new Error("create must be boolean");
+      if (m.meta !== undefined && (typeof m.meta !== "object" || m.meta === null || Array.isArray(m.meta))) throw new Error("meta must be an object");
       // A 1.x client records its session ID as 16 hex characters: the same
       // 64 bits, re-encoded here so its restore still matches the history.
       if (typeof m.restored_from === "string") m.restored_from = asSessionId(m.restored_from);
       if (m.restored_from !== undefined && (typeof m.restored_from !== "string" || !SESSION_ID.test(m.restored_from)))
         throw new Error("restored_from must be a session ID (id: and 13 characters, or a 1.x client's 16 hex)");
-      if (m.suggested !== undefined && typeof m.suggested !== "string") throw new Error("suggested must be a string");
-      if (m.resume !== undefined && typeof m.resume !== "boolean") throw new Error("resume must be boolean");
-      if (m.where !== undefined && typeof m.where !== "string") throw new Error("where must be a string");
-      if (m.launcher !== undefined && typeof m.launcher !== "boolean") throw new Error("launcher must be boolean");
-      return m as unknown as HelloRequest;
+      if (m.previous_key !== undefined && (typeof m.previous_key !== "string" || !SESSION_KEY.test(m.previous_key)))
+        throw new Error("previous_key must be 64 lowercase hex characters");
+      if (m.previous_key !== undefined && m.restored_from !== undefined) throw new Error("a bind names restored_from or previous_key, not both");
+      return m as unknown as BindRequest;
+    case "unbind":
+      assertStr(m, "req_id"); assertStr(m, "alias");
+      return m as unknown as UnbindRequest;
+    case "end":
+      assertStr(m, "req_id");
+      return m as unknown as EndRequest;
     case "send":
       assertStr(m, "req_id"); assertStr(m, "recipient"); assertStr(m, "body");
       if (m.parent_id !== undefined && typeof m.parent_id !== "number")
@@ -198,6 +255,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       if (m.attachment_ids !== undefined && (!Array.isArray(m.attachment_ids) || !m.attachment_ids.every(x => typeof x === "number")))
         throw new Error("attachment_ids must be number[]");
       if (m.resend !== undefined && typeof m.resend !== "boolean") throw new Error("resend must be boolean");
+      if (m.as !== undefined && typeof m.as !== "string") throw new Error("as must be string");
       return m as unknown as SendRequest;
     case "history":
       assertStr(m, "req_id");

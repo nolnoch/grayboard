@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -6,7 +7,7 @@ import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelconte
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationError, createApplication, type DeliveryEvent } from "./application.ts";
+import { ApplicationError, GRACE_MS, SWEEP_MS, createApplication, type DeliveryEvent } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -76,7 +77,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   const refused = await client.callTool({ name: "bind", arguments: { name: "bee" } });
   expect(refused.isError).toBe(true);
   expect(refused.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"known":\s*\[\s*"be"\s*\]/) })]);
-  expect(store.repo.aliases.find(user.user_email, "bee")).toBeUndefined();
+  expect(store.repo.aliases.find(`${user.user_email}/bee`)).toBeUndefined();
   expect(hosted.activeContexts).toBe(0);
 });
 
@@ -124,7 +125,7 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: tools-only contexts preserve live owner and its status`, async () => {
   const events: DeliveryEvent[] = [];
-  const owner = (await application.selectIdentity(user, "fe", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
+  const owner = (await application.selectIdentity(tokenSession(application.repo, user), "fe", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
   application.call(owner, "peer_status", { text: "working" });
   const client = await connect(version);
   for (let n = 0; n < 10; n++) {
@@ -135,7 +136,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
   expect(store.repo.cursors.directFor(owner.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(application.selectIdentity(user, "fe", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "identity_in_use" });
+  await expect(application.selectIdentity(tokenSession(application.repo, user), "fe", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
@@ -164,7 +165,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
     }
   }
   expect(selections).toBe(0);
-  expect(store.repo.aliases.find(user.user_email, "refused")).toBeUndefined();
+  expect(store.repo.aliases.find(`${user.user_email}/refused`)).toBeUndefined();
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
@@ -257,9 +258,9 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: native delegation uses the bound root and retains own-user targeting`, async () => {
-  const owner = await application.selectIdentity(user, "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const owner = await application.selectIdentity(tokenSession(application.repo, user), "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
   const foreign = issuedOAuth(store.repo, oauth.resource, "bob@example.com").authed;
-  const other = await application.selectIdentity(foreign, "outsider", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const other = await application.selectIdentity(tokenSession(application.repo, foreign), "outsider", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
   try {
     const client = await connect(version);
     expect((await client.listTools()).tools.some(t => t.name === "delegate")).toBe(true);
@@ -277,8 +278,10 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 test("hosted bind does not inherit a previous WS launcher's opt-in", async () => {
-  const prior = await application.selectIdentity(user, "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const prior = await application.selectIdentity(tokenSession(application.repo, user), "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
   application.close(prior.session);
+  // #284 S4: the closed WSS session holds "launcher" through its grace; the sweep ends it.
+  application.sweepSessions(Date.now() + GRACE_MS + SWEEP_MS);
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
   expect(store.db.query("SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
@@ -907,7 +910,7 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
     const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
-    expect(store.repo.aliases.find(user.user_email, "unselected")).toBeUndefined();
+    expect(store.repo.aliases.find(`${user.user_email}/unselected`)).toBeUndefined();
   } finally { store.repo.oauth.findActiveAccess = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });

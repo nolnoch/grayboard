@@ -1,11 +1,11 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
-import type { AttachmentInfo, AttachmentLimits } from "../shared/attachments.ts";
-import { bindAttachments, dropAttachments, withAttachments } from "./attachments.ts";
+import type { AttachmentInfo } from "../shared/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
-import { addressParts, aliasScope } from "./addresses.ts";
-import { writeCoreAudit } from "./audit.ts";
+import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
+import { writeCoreAudit, type AuditSink } from "./audit.ts";
 import { SESSION_ID_PATTERN } from "./session_id.ts";
 import { undeliverableId } from "./session_end.ts";
 
@@ -23,7 +23,7 @@ export function checkBody(body: unknown): string {
   }
   return body;
 }
-// @id:<13 Crockford> (a session, #284), @name, @local/name, @user@org.com/name.
+// @id:<13 Crockford> (a session, #284), @name, @scope/name, @user@org.com/name.
 // Not preceded by a word char or @, so plain email addresses in prose aren't
 // mentions. A malformed @id:… is the alias "id", as before IDs.
 const MENTION_RE = new RegExp(
@@ -85,6 +85,10 @@ export type Access = {
   resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
+  // Whether the principal of `handle` (the calling session's ID) may read an alias's labels (task, owner,
+  // source board, spec hash, description) in peer_list: only inside a scope
+  // it may act in (#284 S13).
+  seesAliasMeta(handle: string, scope: Omit<AliasScope, "name">): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
 };
@@ -95,6 +99,7 @@ export const ANNOUNCE_BOARD = "announce";
 export const openAccess = (db: Database): Access => ({
   announceBoard: ANNOUNCE_BOARD,
   canSee: () => true,
+  seesAliasMeta: () => true,
   checkCreate: (_h, scope) => (scope === null ? null : "team boards need distributed mode"),
   // An @id: is the session itself; one that can't receive refuses an
   // author's post, as a direct message to it would (#284 S7, S9). A system
@@ -103,7 +108,7 @@ export const openAccess = (db: Database): Access => ({
   resolveMention: (token, _author, _board, strict) => {
     if (addressParts(token)?.kind === "id") {
       const why = undeliverableId(db, token);
-      if (why && strict) throw new CoreError(why);
+      if (why && strict) throw why;
       return why ? null : token;
     }
     if (!BOARD_NAME_RE.test(token)) return null;
@@ -174,6 +179,9 @@ export type IdFacts = {
   viewer?: boolean;
   // The ID came from a session key (#284 S10): retention leaves a tombstone for it.
   keyed?: boolean;
+  // Self-reported at launch (BUS_MODEL, BUS_EFFORT; the WSS hello), shown in peer_list (#284 S12).
+  model?: string | null;
+  effort?: string | null;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -183,8 +191,12 @@ export function idCollisionText(id: string, why: string): string {
 
 /** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
 export class IdCollision extends CoreError {
+  // Why the ID can't be this session's: its id.collision audit's `why`.
+  readonly why: string;
   constructor(readonly id: string, readonly endedAt: number | null) {
-    super(idCollisionText(id, endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`));
+    const why = endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`;
+    super(idCollisionText(id, why));
+    this.why = why;
   }
 }
 
@@ -201,8 +213,8 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, f.harness ?? null, f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort));
   return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
 }
 
@@ -219,10 +231,11 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
   }).immediate();
 }
 
-/** The principal of session `id`'s row, or undefined when it has none. */
-export function idPrincipal(db: Database, id: string): string | null | undefined {
-  const row = db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(id) as { principal: string | null } | null;
-  return row ? row.principal : undefined;
+// A self-reported session fact (harness, model, effort; #284 S12) as stored:
+// one line of at most 64 characters, since peer_list puts it in other
+// agents' prompts. Empty is none.
+function cleanFact(v: string | null | undefined): string | null {
+  return v ? oneLine(v).slice(0, 64) || null : null;
 }
 
 /** A session used the bus: its last_seen moves. */
@@ -270,7 +283,7 @@ export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-const cleanPlace = (place: string | null): string | null => place?.replace(/\s+/g, " ").trim().slice(0, 200) || null;
+export const cleanPlace = (place: string | null): string | null => (place === null ? "" : oneLine(place)).slice(0, 200) || null;
 
 // Server mode: where the session runs, as its client described it.
 export function setPlace(db: Database, id: string, place: string | null): void {
@@ -279,11 +292,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
+/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+export function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+}
+
 // One line saying what the session holding `handle` is doing; empty clears
 // it. Status is the session's (#284), so it goes to the alias's holder: a
 // tools-only process sets its owner's.
 export function setStatus(db: Database, handle: string, text: string, now = Date.now()): void {
-  const t = text.replace(/\s+/g, " ").trim();
+  const t = oneLine(text);
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
   touchAlias(db, handle, now);
   // An ID-only session (#284 S13) sets its own row; a name, its holder's.
@@ -397,23 +415,59 @@ const NOT_PUSHED = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.
 const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AND o.post_id = p.id
   AND (o.wake = 1 OR o.delivered_at IS NOT NULL))`;
 
+// A post not written by the reader's session (#284 S5): neither as the
+// reader's address nor by the session that is it or holds it, whichever of
+// its addresses it wrote as. Binds the reader's address three times.
+const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND p.author_id = COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?))`;
+
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
-export function listBoards(db: Database, handle: string): BoardSummary[] {
-  const rows = db
-    .prepare(
-      `SELECT b.*, s.mode AS mode,
-              (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
-              CASE WHEN s.handle IS NULL THEN 0 ELSE
-                (SELECT COUNT(*) FROM posts p
-                  WHERE p.board = b.name AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}) END AS unread
-         FROM boards b
-         LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
-        ORDER BY b.name`,
-    )
-    .all(handle, handle, handle) as BoardSummary[];
+// What a board call without `as` acts for (#284 S14, #366): "read"
+// (board_read, board_list's rows) and "subscribe" (board_subscribe) prefer an
+// address subscribed to the board, so a held alias's own subscription can be
+// read and changed; "read" puts one with unread posts first, so repeated
+// reads drain each subscribed address in turn. "post" (board_post) takes the
+// first that can see the board, as every use does when none is subscribed.
+export type BoardUse = "read" | "subscribe" | "post";
+
+// Each of `handles`' view of the boards it can see (of `board` alone, when given).
+function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
+  const q = db.prepare(
+    `SELECT b.*, s.mode AS mode,
+            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+            CASE WHEN s.handle IS NULL THEN 0 ELSE
+              (SELECT COUNT(*) FROM posts p
+                WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
+       FROM boards b
+       LEFT JOIN subscriptions s ON s.board = b.name AND s.handle = ?
+      WHERE ? IS NULL OR b.name = ?
+      ORDER BY b.name`,
+  );
   const a = access(db);
-  return rows.filter((b) => a.canSee(handle, b));
+  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
+}
+
+// The view a use acts as, from one board's views in address order.
+function pickView<T extends { row: BoardSummary }>(views: T[], use: BoardUse): T | undefined {
+  const subscribed = views.filter((v) => v.row.mode !== null);
+  const preferred = use === "read" ? (subscribed.find((v) => v.row.unread > 0) ?? subscribed[0]) : use === "subscribe" ? subscribed[0] : undefined;
+  return preferred ?? views[0];
+}
+
+/** The first of `handles` (primary first) that `use` of `board` acts as; undefined when none can see it. */
+export function boardAddress(db: Database, board: string, handles: string[], use: BoardUse): string | undefined {
+  return pickView(boardViews(db, handles, board), use)?.handle;
+}
+
+/**
+ * The boards `handles` can see: each row is the view of the address
+ * board_read without `as` would act as (boardAddress's "read"), so its mode
+ * and unread count are that address's subscription's.
+ */
+export function listBoards(db: Database, handles: string[]): BoardSummary[] {
+  const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
+  for (const v of boardViews(db, handles, null)) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
+  return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.
@@ -517,16 +571,17 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // online: which handles have a live session (the mode knows); a human's
 // announcement needs it. ttl_ms: how long an announcement stays in new
 // sessions' instructions. attachments: the poster's unbound uploads to
-// carry, bound in the post's transaction under the mode's size caps.
+// carry, bound in the post's transaction under the mode's size caps (send),
+// if the mode's user (send.principal) made them.
 // author_id: the posting session's ID (#284), when the writer is a session.
-// addresses: the poster's address set (#284 S5), `handle` its primary; a
+// addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
 // queue claim held by any of them is acked, and none of them is pushed the post.
 export type PostOpts = {
   online?: (handle: string) => boolean;
   addresses?: string[];
   author_id?: string;
   ttl_ms?: number;
-  attachments?: { ids: number[]; limits?: AttachmentLimits };
+  attachments?: { ids: number[]; send?: FileSend };
   // An author's own words: an @id: that can't receive refuses the post.
   // Unset (system posts), it goes unresolved.
   strictIds?: boolean;
@@ -534,16 +589,18 @@ export type PostOpts = {
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
 // (never-woken first, then by handle). A lane is a push subscriber who isn't
-// the poster, hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer. A session's lane is the alias it holds, else its ID
-// (#284 S8; an ID can't opt out), whichever address it subscribed under: a
-// session that subscribed unbound stays in the rotation after it binds. With
+// one of the poster's addresses (its address set: a session's own lane never
+// takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), and isn't a
+// read-only viewer. A session's lane is its primary, the oldest alias it
+// holds, else its ID (#284 S8, S13; an ID can't opt out), whichever address
+// it subscribed under: a session that subscribed unbound stays in the
+// rotation after it binds, once however many aliases it holds. With
 // `online`, live lanes come first; offline lanes are the fallback in the same
 // order, so an empty live set still delivers.
 export function queueLanes(
   db: Database,
   b: Board,
-  poster: string,
+  poster: string[],
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
@@ -552,17 +609,17 @@ export function queueLanes(
     db
       .prepare(
         `WITH lanes AS (
-           SELECT COALESCE(ah.address, s.handle) AS lane FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle
+           SELECT COALESCE(${primaryHoldSql("s.handle")}, s.handle) AS lane FROM subscriptions s
            WHERE s.board = ?1 AND s.mode = 'push')
          SELECT l.lane AS handle FROM lanes l LEFT JOIN aliases h ON h.address = l.lane
          LEFT JOIN ids i ON i.id = l.lane
-         WHERE l.lane != ?2
+         WHERE l.lane NOT IN (SELECT value FROM json_each(?2))
            AND (h.address IS NOT NULL AND h.queue_off IS NULL OR i.id IS NOT NULL AND i.ended_at IS NULL)
          GROUP BY l.lane
          ORDER BY (SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
                     WHERE o2.handle = l.lane AND p2.board = ?1) ASC NULLS FIRST, l.lane ASC`,
       )
-      .all(b.name, poster) as { handle: string }[]
+      .all(b.name, JSON.stringify(poster)) as { handle: string }[]
   )
     .map((r) => r.handle)
     .filter((h) => !isViewer(h) && a.canSee(h, b));
@@ -603,6 +660,16 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
 // decline's own redelivery from a later claim (#254).
 export const REDELIVERED_NOTE = "queue post (redelivered)";
 
+// A post's author's address set as of now: the author, and its writing
+// session's ID and the aliases that session holds (#284 S5).
+function postAddresses(db: Database, postId: number): string[] {
+  return (db.prepare(
+    `SELECT p.author AS a FROM posts p WHERE p.id = ?1
+     UNION SELECT p.author_id FROM posts p WHERE p.id = ?1 AND p.author_id IS NOT NULL
+     UNION SELECT h.address FROM posts p JOIN alias_holds h ON h.id = p.author_id WHERE p.id = ?1`,
+  ).all(postId) as { a: string }[]).map((r) => r.a);
+}
+
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
 // offer the original post to the next eligible lane. The previous holder is
 // excluded - it held the post for a full TTL, or declined. With no other
@@ -617,10 +684,40 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   const b = getBoard(db, m[1]!);
   const p = getPost(db, Number(m[2]));
   if (!b || !p || p.board !== b.name) return null;
-  const lane = queueLanes(db, b, p.author).find((h) => h !== prevHolder);
+  const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => h !== prevHolder);
   if (!lane) return null;
   claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
   return lane;
+}
+
+// What decides whether `handle` may post (or reply) on a board now: it can see
+// it, the parent is a post on it, and only a human starts an announcement.
+// Throws CoreError; writes nothing.
+function postGate(db: Database, handle: string, boardInput: string, parentId: number | null) {
+  const b = visibleBoard(db, handle, boardInput);
+  if (parentId !== null) {
+    const parent = getPost(db, parentId);
+    if (!parent || parent.board !== b.name) {
+      throw new CoreError(`parent_id ${parentId} is not a post on #${b.name}`);
+    }
+  }
+  const a = access(db);
+  const announce = b.name === a.announceBoard;
+  const human = isHuman(db, handle);
+  const announcement = announce && parentId === null;
+  if (announcement && !human) {
+    throw new CoreError(
+      `only your user starts posts on #${b.name}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
+    );
+  }
+  return { b, a, announce, human, announcement };
+}
+
+// post()'s access checks alone, for a caller that must refuse before a
+// deduplicated write replays a first answer (#296): a repeat to a board the
+// caller has since lost is refused, not replayed.
+export function checkPostAccess(db: Database, handle: string, boardInput: string, parentId: number | null): void {
+  postGate(db, handle, boardInput, parentId);
 }
 
 // Inserts the post and queues pushes for handles that can see the board.
@@ -636,30 +733,15 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const b = visibleBoard(db, handle, boardInput);
+  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId);
   const board = b.name;
   checkBody(body);
-  if (parentId !== null) {
-    const parent = getPost(db, parentId);
-    if (!parent || parent.board !== board) {
-      throw new CoreError(`parent_id ${parentId} is not a post on #${board}`);
-    }
-  }
-  const a = access(db);
-  const announce = board === a.announceBoard;
-  const human = isHuman(db, handle);
-  const announcement = announce && parentId === null;
-  if (announcement && !human) {
-    throw new CoreError(
-      `only your user starts posts on #${board}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
-    );
-  }
   if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
   if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
     throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
   }
   const files = opts.attachments ?? { ids: [] };
-  if (files.ids.length && !files.limits) throw new CoreError("this mode can't post files");
+  if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
   const isViewer = viewers(db);
 
   return db.transaction((): PostResult => {
@@ -670,7 +752,8 @@ export function post(
          VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
       .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null) as Post;
-    const attachments = files.limits ? bindAttachments(db, files.ids, handle, { post_id: p.id }, files.limits) : [];
+    const { send } = files;
+    const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
@@ -701,7 +784,7 @@ export function post(
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
         // live lanes idle (#192 review).
-        const picked = queueLanes(db, b, handle, { online: opts.online })[0];
+        const picked = queueLanes(db, b, opts.addresses ?? [handle], { online: opts.online })[0];
         if (picked) {
           targets.set(picked, { reason: "subscription", wake: true });
           claimQueuePost(db, board, p, picked, now);
@@ -796,11 +879,62 @@ function threadRoot(db: Database, postId: number): number {
 
 // ── who ──────────────────────────────────────────────────────────────────────
 
+// An alias's owner-set labels (#284 S12): one line each, set by its binder.
+export const ALIAS_META_KEYS = ["task", "owner", "source_board", "spec_hash", "description"] as const;
+export type AliasMeta = { [K in (typeof ALIAS_META_KEYS)[number]]?: string };
+// bind's `meta` once checked: a key present with null clears that label.
+export type AliasMetaSet = { [K in (typeof ALIAS_META_KEYS)[number]]?: string | null };
+
+const MAX_LABEL = 200;
+
+/**
+ * bind's `meta` argument, checked (#284 S12): an object of known keys, each a
+ * one-line string of at most 200 characters ("" clears it); `source_board`
+ * must be a board name (it may name a board since deleted).
+ */
+export function parseAliasMeta(v: unknown): AliasMetaSet {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new CoreError("meta must be an object of labels");
+  const out: AliasMetaSet = {};
+  for (const [k, raw] of Object.entries(v)) {
+    if (!(ALIAS_META_KEYS as readonly string[]).includes(k)) throw new CoreError(`unknown meta key ${JSON.stringify(oneLine(k).slice(0, 40))}; known: ${ALIAS_META_KEYS.join(", ")}`);
+    if (typeof raw !== "string") throw new CoreError(`meta.${k} must be a string`);
+    const t = oneLine(raw);
+    if (t.length > MAX_LABEL) throw new CoreError(`meta.${k} must be at most ${MAX_LABEL} chars`);
+    out[k as keyof AliasMetaSet] = t === "" ? null : k === "source_board" ? normalizeBoard(t) : t;
+  }
+  return out;
+}
+
+/**
+ * Set an alias's labels from a parsed `meta`, as `session` binding it.
+ * Only the fields whose value changes are written, and audited as one
+ * alias.meta_set; those fields are returned (empty: nothing changed). Call
+ * inside the bind's write transaction.
+ */
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink): AliasMetaSet {
+  const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
+  if (!keys.length) return {};
+  const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
+  if (!cur) throw new Error(`grayboard: no alias "${address}" to label`);
+  const fields: AliasMetaSet = {};
+  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) fields[k] = meta[k] ?? null;
+  const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
+  if (!changed.length) return {};
+  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
+  audit("alias.meta_set", session, address, { address, fields, session });
+  return fields;
+}
+
+// A session's self-reported facts (#284 S12), shown on its rows.
+type SessionFacts = { harness?: string; model?: string; effort?: string };
+
 export type Peer = {
   handle: string;
   online: boolean;
   last_seen: number;
   self?: true;
+  // The session the row's facts come from (#284 S13; ALIAS_SESSION_SQL).
+  id?: string;
   mode?: SubMode;
   where?: string;
   status?: string;
@@ -808,66 +942,104 @@ export type Peer = {
   human?: true;
   queue_off?: true;
   launcher?: true;
-};
+} & SessionFacts &
+  AliasMeta;
 /**
  * Which handles are read-only viewers, kept out of the roster, rotations and
- * notified lists: a `grayboard tail` session (ids.viewer, #284 S9), and the
- * "~" handles no identity can have: a 1.x local tail's "~tail-<pid>", and a
- * server's "<email>/~<id>" (until PR 3). Read once per call.
+ * notified lists: a `grayboard tail` session (ids.viewer, #284 S9). Read
+ * once per call.
  */
 export function viewers(db: Database): (handle: string) => boolean {
   const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
-  return (h) => h.startsWith("~") || h.includes("/~") || ids.has(h);
+  return (h) => ids.has(h);
 }
 
 // A live session with no name yet (#182), addressed by its session ID
 // (#284), with the status it set as that ID.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true };
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true } & SessionFacts;
 
 // `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
 
-// The session an alias's metadata comes from (#284): its holder, or once
-// it's offline, the session that last bound it, from the binding history,
-// unless that session has since bound another name (its facts are that
-// name's now). `a` is the aliases row in the query that uses it.
+// peer_list's match filter (#284 S13): exact, case-insensitive, ANDed. scope
+// is an alias's scope_ref, or an ID's principal where the caller may see it.
+export const MATCH_KEYS = ["id", "harness", "model", "effort", "task", "owner", "source_board", "spec_hash", "scope"] as const;
+export type PeerMatch = { [K in (typeof MATCH_KEYS)[number]]?: string };
+
+/** peer_list's `match` argument, checked; undefined when absent. */
+export function parseMatch(v: unknown): PeerMatch | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "object" || Array.isArray(v)) throw new CoreError("match must be an object");
+  const out: PeerMatch = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (!(MATCH_KEYS as readonly string[]).includes(k)) throw new CoreError(`match has no key "${k}"; it takes ${MATCH_KEYS.join(", ")}`);
+    if (typeof val !== "string" || val === "") throw new CoreError(`match.${k} must be a non-empty string`);
+    out[k as keyof PeerMatch] = val;
+  }
+  return out;
+}
+
+function matches(m: PeerMatch, fields: PeerMatch): boolean {
+  return Object.entries(m).every(([k, v]) => fields[k as keyof PeerMatch]?.toLowerCase() === v.toLowerCase());
+}
+
+/** SQL for session `id`'s primary hold (#284 S1): its oldest, or NULL. `id` is an SQL expression. */
+export function primaryHoldSql(id: string): string {
+  return `(SELECT address FROM alias_holds WHERE id = ${id} ORDER BY bound_at, address LIMIT 1)`;
+}
+
+// The session an alias's facts come from (#284 S13): its holder, or once
+// it's offline, the session that last bound it, once that session has
+// ended. A live session's facts show only on the aliases it holds: one that
+// released this alias shows them on its others. `a` is the aliases row in
+// the query that uses it.
 export const ALIAS_SESSION_SQL = `COALESCE(
     (SELECT id FROM alias_holds WHERE address = a.address),
-    (SELECT l.session_id FROM (SELECT id, session_id FROM binding_events WHERE name = a.address AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1) l
-      WHERE NOT EXISTS (SELECT 1 FROM binding_events e WHERE e.session_id = l.session_id AND e.event IN ('bound', 'moved') AND e.id > l.id)))`;
+    (SELECT l.session_id FROM (SELECT session_id FROM binding_events WHERE name = a.address AND event IN ('bound', 'moved') ORDER BY id DESC LIMIT 1) l
+      JOIN ids e ON e.id = l.session_id WHERE e.ended_at IS NOT NULL))`;
 
 // The roster: every alias a session has used (aliases with a last_seen),
 // or a board's subscribers, each with its session's facts (ALIAS_SESSION_SQL).
 // A status is shown only while a session holds the alias: it's the
-// session's, and clears when the session ends (#284 decision 11).
+// session's, and clears when the session ends (#284 decision 11). An alias's
+// labels are shown only to a caller that may act in its scope (#284 S13),
+// and `match` filters after that cut, so a hidden label can't be probed.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
+// `addresses`: the caller's address set, each row of which is its own and
+// online; `handle` is its primary. `session`: the caller's ID, whose
+// principal the label cut is judged for (a primary can be a team's alias).
 export function who(
   db: Database,
   handle: string,
-  opts: { board?: string; include_offline?: boolean },
+  opts: { board?: string; include_offline?: boolean; match?: PeerMatch },
   online: (h: string) => boolean,
-  unbound: UnboundPeer[] = [],
+  ctx: { unbound?: UnboundPeer[]; addresses?: string[]; session?: string } = {},
 ): WhoResult {
   const isViewer = viewers(db);
-  type Row = { handle: string; last_seen: number | null; mode?: SubMode; cwd: string | null; place: string | null; status: string | null; status_at: number | null; human: number | null; queue_off: number | null; launcher: number | null };
+  const acc = access(db);
+  const own = new Set(ctx.addresses ?? [handle]);
+  type Row = {
+    handle: string; last_seen: number | null; mode?: SubMode; id: string | null; principal: string | null; cwd: string | null; place: string | null;
+    status: string | null; status_at: number | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null;
+    human: number | null; queue_off: number | null; scope_kind: ScopeKind | null; scope_ref: string | null;
+  } & { [K in keyof AliasMeta]-?: string | null };
   const held = `EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address AND h.id = i.id)`;
-  const cols = `a.last_seen, i.cwd, i.place, CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
+  const facts = `i.id, i.principal, i.cwd, i.place, i.harness, i.model, i.effort, i.launcher,
+    a.human, a.queue_off, a.scope_kind, a.scope_ref, ${ALIAS_META_KEYS.map((k) => `a.${k}`).join(", ")}`;
   let rows: Row[];
   if (opts.board !== undefined) {
     const b = visibleBoard(db, handle, opts.board);
-    const acc = access(db);
-    // A subscription an unbound session took as its ID is listed under the
-    // name the session now holds (as queueLanes does), or as the ID with its
-    // own session's facts; a name's own subscription wins over its ID's.
-    const idCols = `COALESCE(a.last_seen, i.last_seen) AS last_seen, i.cwd, i.place,
-      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
-      CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at, a.human, a.queue_off, i.launcher`;
+    // A subscription a session took as its ID is listed under its primary
+    // (as queueLanes does), or as the ID with its own session's facts; a
+    // name's own subscription wins over its ID's.
     const subs = db
       .prepare(
-        `SELECT m.handle, m.mode, m.own, ${idCols} FROM (
-             SELECT COALESCE(ah.address, s.handle) AS handle, s.mode, ah.address IS NULL AS own
-               FROM subscriptions s LEFT JOIN alias_holds ah ON ah.id = s.handle WHERE s.board = ?) m
+        `SELECT m.handle, m.mode, m.own, COALESCE(a.last_seen, i.last_seen) AS last_seen, ${facts},
+             CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
+             CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at FROM (
+             SELECT COALESCE(s.ph, s.handle) AS handle, s.mode, s.ph IS NULL AS own
+               FROM (SELECT s0.handle, s0.mode, ${primaryHoldSql("s0.handle")} AS ph FROM subscriptions s0 WHERE s0.board = ?) s) m
            LEFT JOIN aliases a ON a.address = m.handle
            LEFT JOIN ids i ON i.id = COALESCE(${ALIAS_SESSION_SQL}, m.handle)
           ORDER BY m.handle, m.own DESC`,
@@ -880,35 +1052,70 @@ export function who(
   } else {
     rows = db
       .prepare(
-        `SELECT a.address AS handle, ${cols} FROM aliases a
+        `SELECT a.address AS handle, a.last_seen, ${facts},
+             CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at FROM aliases a
            LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
           WHERE a.last_seen IS NOT NULL ORDER BY a.address`,
       )
-      .all() as typeof rows;
+      .all() as Row[];
   }
   const now = Date.now();
-  const all: Peer[] = rows.filter((r) => !isViewer(r.handle)).map((r) => {
+  const all: Peer[] = [];
+  for (const r of rows) {
+    if (isViewer(r.handle)) continue;
     const where = r.cwd ? describeLocation(r.cwd) : r.place;
-    return {
+    const seesMeta = r.scope_kind !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    const session = sessionFacts(r);
+    const meta: AliasMeta = {};
+    if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
+    // An ID row's scope is its principal, which the row doesn't show: it
+    // matches only for a caller that may act in that principal's scope (#371).
+    if (opts.match) {
+      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
+      if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
+    }
+    all.push({
       handle: r.handle,
-      online: r.handle === handle || online(r.handle),
+      online: own.has(r.handle) || online(r.handle),
       last_seen: r.last_seen ?? 0,
-      ...(r.handle === handle ? { self: true as const } : {}),
+      ...(own.has(r.handle) ? { self: true as const } : {}),
+      ...(r.id ? { id: r.id } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
       ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...session,
+      ...meta,
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
       ...(r.launcher ? { launcher: true as const } : {}),
-    };
-  });
+    });
+  }
   // A board's roster lists its unbound subscribers by ID among its peers.
-  const sessions = opts.board === undefined && unbound.length ? { unbound_sessions: unbound } : {};
+  const unbound = opts.board === undefined ? unboundRows(db, ctx.unbound ?? [], opts.match) : [];
+  const sessions = unbound.length ? { unbound_sessions: unbound } : {};
   const you = isViewer(handle) ? {} : { you: handle };
   if (opts.include_offline) return { ...you, peers: all, ...sessions };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
   return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
+}
+
+function sessionFacts(r: { harness: string | null; model: string | null; effort: string | null }): SessionFacts {
+  return { ...(r.harness ? { harness: r.harness } : {}), ...(r.model ? { model: r.model } : {}), ...(r.effort ? { effort: r.effort } : {}) };
+}
+
+// The mode's unbound sessions with their ID facts, filtered by `match`.
+function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
+  const q = db.prepare(`SELECT principal, harness, model, effort FROM ids WHERE id = ?`);
+  const out: UnboundPeer[] = [];
+  for (const u of unbound) {
+    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null } | null;
+    const session = r ? sessionFacts(r) : {};
+    if (match && !matches(match, { id: u.session_id, ...session, scope: r?.principal ?? undefined })) continue;
+    out.push({ ...u, ...session });
+  }
+  return out;
 }
 
 // When a handle last had a session, or null if it never connected. An ID's
@@ -917,17 +1124,6 @@ export function lastSeen(db: Database, handle: string): number | null {
   const sql = addressParts(handle)?.kind === "id" ? `SELECT last_seen FROM ids WHERE id = ?` : `SELECT last_seen FROM aliases WHERE address = ?`;
   const row = db.prepare(sql).get(handle) as { last_seen: number | null } | undefined;
   return row?.last_seen ?? null;
-}
-
-/** When and where each of `handles` last had a session; those that never connected are absent. */
-export function sessionsSeen(db: Database, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
-  const rows = db
-    .prepare(
-      `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
-        WHERE a.address IN (SELECT value FROM json_each(?)) AND a.last_seen IS NOT NULL`,
-    )
-    .all(JSON.stringify(handles)) as { address: string; last_seen: number; cwd: string | null; place: string | null }[];
-  return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
 /** Every handle in the roster: the aliases that have had a session. */
@@ -1042,10 +1238,10 @@ export function read(
     posts = sub
       ? (db
           .prepare(
-            `SELECT ${P_POST_COLS} FROM posts p WHERE board = ? AND id > ? AND author != ? AND ${NOT_PUSHED_YET}
+            `SELECT ${P_POST_COLS} FROM posts p WHERE board = ? AND id > ? AND ${NOT_OWN} AND ${NOT_PUSHED_YET}
               ORDER BY id ASC LIMIT ?`,
           )
-          .all(board, sub.cursor, handle, handle, limit) as Post[])
+          .all(board, sub.cursor, handle, handle, handle, handle, limit) as Post[])
       : [];
     if (posts.length === 0) {
       posts = (
@@ -1073,9 +1269,9 @@ export function read(
     .prepare(
       `SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s
          ON s.board = p.board AND s.handle = ?
-        WHERE p.board = ? AND p.id > s.cursor AND p.author != ? AND ${NOT_PUSHED_YET}`,
+        WHERE p.board = ? AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}`,
     )
-    .get(handle, board, handle, handle) as { n: number };
+    .get(handle, board, handle, handle, handle, handle) as { n: number };
 
   return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
 }
@@ -1127,13 +1323,13 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
     .prepare(
       `SELECT s.board, s.cursor,
               (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
-                 AND p.author != ? AND ${NOT_PUSHED}) AS unread,
-              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND p.author != ? AND ${NOT_PUSHED}) AS latest_id
+                 AND ${NOT_OWN} AND ${NOT_PUSHED}) AS unread,
+              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND ${NOT_OWN} AND ${NOT_PUSHED}) AS latest_id
          FROM subscriptions s
         WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
           AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
     )
-    .all(handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
+    .all(handle, handle, handle, handle, handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
     if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
       out.push({ kind: "digest", board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! });
@@ -1146,6 +1342,15 @@ export function refOf(item: Pending): PendingRef {
   return item.kind === "push"
     ? { kind: "push", post_id: item.post.id }
     : { kind: "digest", board: item.board, latest_id: item.latest.id };
+}
+
+/**
+ * One key per pending item a session is sent once, whichever of its
+ * addresses it is pending for (#361): a push by post; a digest by board, so
+ * until one is acked newer posts don't send another.
+ */
+export function pendingKey(r: PendingRef): string {
+  return r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}`;
 }
 
 export function markDelivered(db: Database, handle: string, item: Pending): void {
@@ -1208,7 +1413,7 @@ export function prunePosts(db: Database, olderThanMs: number): string[] {
     db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
     db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
     // Each name's latest bound or moved event outlives retention: who holds a
-    // name by the record (lastBoundBy, continuityOf) is read from it (#211).
+    // name by the record (latestBinder, continuityOf) is read from it (#211).
     db.prepare(
       `DELETE FROM binding_events WHERE COALESCE(last_at, at) < ? AND id NOT IN
          (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`,

@@ -8,6 +8,11 @@ export interface HostedStore {
   atomic<T>(fn: () => T): T;
   subscribe(fn: () => void): () => void;
   get(id: string): HostedSession | undefined;
+  // Whether the session ID is a hosted session's: a root's ownership row
+  // stays after it ends; a child's row only while it is registered. The WSS
+  // session lifecycle (#284 S4's grace, a revocation's end) never ends a
+  // hosted ID.
+  owned(id: string): boolean;
   all(): HostedSession[];
   insert(row: HostedSession): void;
   update(row: HostedSession): void;

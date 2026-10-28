@@ -213,6 +213,7 @@ test("server: a launcher that can't receive isn't advertised or instructed (revi
     const token = await srv.login("you@example.com");
     // A tools-only connection beside the owner: it never becomes the
     // launcher, whatever its env says.
+    await srv.session(token, "be");
     await srv.session(token, "be", { BUS_LAUNCHER: "1", BUS_PUSH: "off" });
     const sim = await srv.session(token, "sim");
     const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
@@ -341,9 +342,9 @@ test("server: a hold owner with the launcher flag isn't advertised or instructed
     expect(pushHello.type).toBe("hello_ok");
     expect((pushHello.notices ?? []).join("\n")).toContain("You're a launcher session");
 
-    const held = srv.client(token, "bo", { push: false, hello: { hold: true, launcher: true } });
+    const held = srv.client(token, "bo", { push: false, hold: true, hello: { launcher: true } });
     const heldHello = await held.connect();
-    expect(heldHello.type).toBe("hello_ok");
+    expect(heldHello).toMatchObject({ type: "hello_ok" });
     expect((heldHello.notices ?? []).join("\n")).not.toContain("You're a launcher session");
 
     const sim = await srv.session(token, "sim");
@@ -398,5 +399,31 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
   } finally {
     srv.stop();
     slack.stop();
+  }
+}, 40_000);
+
+// #284 PR 4: the launcher flag is the session's, so it stands behind every
+// alias the session holds; a delegate to its second alias lands on it.
+test("local and server: a delegate to a launcher session's second alias is accepted", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  await call(be.c, "bind", { name: "be2", create: true });
+  const sim = await localSession(dir, "sim");
+  const r = await call(sim.c, "delegate", { persona: "p", task: "local t", to: "be2" });
+  expect(r).toMatchObject({ to: "be2", delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes('"task": "local t"')), 10_000, "the local push");
+
+  const srv = new TestServer();
+  try {
+    const token = await srv.login("you@example.com");
+    const sbe = await srv.session(token, "be", { BUS_LAUNCHER: "1" });
+    await call(sbe.c, "bind", { name: "be2", create: true });
+    const ssim = await srv.session(token, "sim");
+    const peers = (await call(ssim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
+    expect(peers.find((p) => p.handle === "you@example.com/be2")?.launcher).toBe(true);
+    const s = await call(ssim.c, "delegate", { persona: "p", task: "server t", to: "be2" });
+    expect(s).toMatchObject({ to: "you@example.com/be2", delivered_now: true });
+    await until(() => sbe.pushes.some((p) => String(p.content).includes('"task": "server t"')), 10_000, "the server push");
+  } finally {
+    srv.stop();
   }
 }, 40_000);

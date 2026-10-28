@@ -44,6 +44,9 @@ async function run(msg: any): Promise<unknown> {
       return hooks.event({ event: msg.event });
     case "call":
       return hooks.tool[msg.tool].execute(msg.args, ctx());
+    case "parse":
+      // What opencode's runtime hands execute: the args through the tool's zod.
+      return tool.schema.object(hooks.tool[msg.tool].args).parse(msg.args);
     case "system": {
       const output = { system: [] as string[] };
       await hooks["experimental.chat.system.transform"]({ sessionID: msg.sessionID, model: {} }, output);

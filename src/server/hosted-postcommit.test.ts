@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -42,7 +43,7 @@ beforeEach(async () => {
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
   events = [];
-  recipient = await application.selectIdentity(principal.authed, "launcher", { deliver(event) { events.push(event); }, closed() {}, probe: async () => true }, { push: true, launcher: true });
+  recipient = await application.selectIdentity(tokenSession(application.repo, principal.authed), "launcher", { deliver(event) { events.push(event); }, closed() {}, probe: async () => true }, { push: true, launcher: true });
 });
 afterEach(async () => {
   await mcp.close(); oauth.close(); application.stopExpiry(); database.db.close();
@@ -84,7 +85,7 @@ test("live sink sees committed message and both delegation audits on a separate 
   recipient.session.sink.deliver = event => {
     expect(database.db.inTransaction).toBe(false);
     expect(event.kind).toBe("direct");
-    expect(reader.repo.messages.history("you@example.com/launcher")).toHaveLength(1);
+    expect(reader.repo.messages.history(["you@example.com/launcher"])).toHaveLength(1);
     expect(reader.db.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
     visible = true; events.push(event);
   };

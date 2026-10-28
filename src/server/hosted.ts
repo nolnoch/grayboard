@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
-import { asSessionId, bindOk, boundInstructions, UNBOUND_READS, unboundInstruction } from "../core/bindings.ts";
+import { asSessionId, boundInstructions, describeCandidate, type Candidate } from "../core/bindings.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
@@ -27,6 +27,29 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const raw = meta && typeof meta === "object" ? (meta as Record<string, unknown>)[OPENCODE_SESSION_META] : undefined;
   if (typeof raw !== "string" || !raw.length || raw.length > 1024 || /[\x00-\x1f\x7f]/.test(raw)) return { missing: `the key _meta["${OPENCODE_SESSION_META}"] is missing` };
   return { id: hostedSessionId(principal.authed.user_id, principal.clientId, raw), raw };
+}
+// A hosted session with no name reads and nothing else (master's model; see
+// UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
+// as its ID (#284 S13).
+export function hostedUnboundInstruction(candidates: Candidate[], notes: string[] = []): string {
+  const why = notes.map((n) => ` ${n}`).join("");
+  const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
+  return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+}
+// A hosted bind's result: a hosted session holds one name, so a bind
+// replaces it and its claims follow (master's #182 text, kept for hosted).
+// TODO(#284 port): a WSS session's bind adds a hold and moves nothing (S6);
+// should a hosted rebind keep moving claims?
+function hostedBindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
+  const text = [
+    previous
+      ? `Bound to "${name}" (was "${previous}"); DMs queued to "${previous}" stay for its next holder.`
+      : `Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`,
+    ...(moved.length ? [`Your claims moved from "${previous}" to "${name}": ${moved.join(", ")}.`] : []),
+    ...notes,
+    ...instructions(previous === null),
+  ].join(" ");
+  return { content: [{ type: "text" as const, text }], structuredContent: { name, instructions: instructions(true) } };
 }
 const quietSink: DeliverySink = { deliver() {}, probe: async () => true, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
@@ -259,9 +282,11 @@ export function createHostedSessions(application: Application, options: { now?: 
           application.hostedRefused(row.session_id, full, holder);
           throw new ApplicationError("identity_in_use", `identity "${name}" is already in use by ${holder}; bind another name.`, { holder });
         }
-        const holder = application.hostedHolder(full);
-        if (holder && holder.sessionId !== row.session_id && !other) {
-          const who = `the live session ${holder.sessionId}${holder.place ? `, in ${holder.place}` : ""}`;
+        // Any session's hold, live or in its WSS grace (#284 S4): a grace
+        // holder may come back for it.
+        const holder = application.aliasHolder(full);
+        if (holder && holder.id !== row.session_id && !other) {
+          const who = holder.who;
           application.hostedRefused(row.session_id, full, who);
           throw new ApplicationError("identity_in_use", `identity "${name}" is already in use by ${who}; bind another name.`, { holder: who });
         }
@@ -279,7 +304,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         }
         throw error;
       });
-      const response = bindOk(result.name, result.previous, result.moved,
+      const response = hostedBindOk(result.name, result.previous, result.moved,
         general => boundInstructions(result.name, general, () => [], []),
         [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the plugin opens one.`]);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
@@ -352,7 +377,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       for (const { session } of holders.values()) application.close(session);
       holders.clear(); listeners.clear();
     },
-    instructions: unboundInstruction,
+    instructions: hostedUnboundInstruction,
   };
   const unsubscribe = store.subscribe(reconcile);
   sweep();

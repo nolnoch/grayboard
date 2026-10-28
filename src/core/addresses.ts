@@ -20,8 +20,8 @@ export type ParsedAddress =
 /**
  * An address's parts, or null if it isn't one. An alias splits at its first
  * `/` (a scope is one segment, #104 nests by parent, not by path); a scope
- * that is an email makes it a person, one with no `@` a principal. The
- * server's wire addresses (user and team) parse in src/shared/addressing.ts.
+ * that is an email makes it a person, one with no `@` a principal (which
+ * one, a team or a service, is the Resolver's to say).
  */
 export function addressParts(input: string): ParsedAddress | null {
   const s = input.toLowerCase();
@@ -39,17 +39,38 @@ export function addressParts(input: string): ParsedAddress | null {
   return scope.includes("@") ? null : { kind: "alias", address: s, scope, scopeKind: "principal", name };
 }
 
-/** An aliases row's scope columns: a person scope (an email), or null for local mode's implicit one. */
-export type AliasScope = { scope_kind: "person"; scope_ref: string | null; name: string };
+/**
+ * A name a server session may bind (#284 S9), lowercased: a bare name (the
+ * caller's own scope) or scope/name. Whether the caller may act in that
+ * scope is the server's to judge at bind.
+ */
+export function normalizeAliasName(raw: string): { ok: true; name: string } | { ok: false; error: string } {
+  const p = addressParts(raw);
+  if (p?.kind === "bare" || p?.kind === "alias") return { ok: true, name: p.address };
+  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+}
+
+/** Who owns an alias's scope: a person, a team or a service principal. */
+export type ScopeKind = "person" | "team" | "service";
+
+/** An aliases row's scope columns: scope_ref is null only for local mode's implicit person scope. */
+export type AliasScope = { scope_kind: ScopeKind; scope_ref: string | null; name: string };
 
 /**
- * Where an alias address sits. Every alias written so far is a person's:
- * a server user's `email/name`, or a bare local name. An ID, a team
- * broadcast or a principal scope can't name one here.
+ * Where an alias address sits: a server user's `email/name`, a bare local
+ * name, or `scope/name` in a principal's scope. A principal scope's kind
+ * comes from `principalKind` (the server's principals table); without it,
+ * or for a scope no team or service owns, the address names no alias. An
+ * ID or a team broadcast never does.
  */
-export function aliasScope(address: string): AliasScope {
+export function aliasScope(address: string, principalKind?: (name: string) => "team" | "service" | null): AliasScope {
   const p = addressParts(address);
   if (p?.kind === "bare") return { scope_kind: "person", scope_ref: null, name: p.name };
   if (p?.kind === "alias" && p.scopeKind === "person") return { scope_kind: "person", scope_ref: p.scope, name: p.name };
-  throw new CoreError(`"${address}" isn't a person's alias`);
+  if (p?.kind === "alias") {
+    const kind = principalKind?.(p.scope);
+    if (kind) return { scope_kind: kind, scope_ref: p.scope, name: p.name };
+    throw new CoreError(`"${address}": no team or service is named "${p.scope}"`);
+  }
+  throw new CoreError(`"${address}" isn't an alias`);
 }

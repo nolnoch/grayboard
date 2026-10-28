@@ -27,13 +27,14 @@ function serve(o: ConstructorParameters<typeof TestServer>[0]): TestServer {
 const count = (srv: TestServer, sql: string, ...args: string[]) => (srv.app.db.query(sql).get(...args) as { n: number }).n;
 
 test("a hello over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
-  const srv = serve({ helloLimit: { burst: 2, perSec: 4 } });
+  // A hello and a bind each take a token (#284: binds create aliases).
+  const srv = serve({ helloLimit: { burst: 3, perSec: 4 } });
   const alice = await srv.login(A);
   const bob = await srv.login("bob@example.com");
   expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
   expect((await srv.client(alice, "be").connect()).type).toBe("hello_ok");
 
-  // A named, owning hello that would create its name and log a refusal.
+  // A session that would bind, create its name and log a refusal.
   const r = await srv.client(alice, "fe", { hello: { create: false } }).connect();
   expect(r).toMatchObject({ type: "error", req_id: "h", code: "rate_limited" });
   expect(r.retry_after_ms).toBeGreaterThan(0);
@@ -50,18 +51,18 @@ test("a hello over the user's bucket is refused with a wait, writes nothing abou
   expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'hello.rate_limited' AND actor = ?`, A)).toBe(1);
   // The start row names the hello that tripped it and the wait it was given.
   const start = JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'hello.rate_limited'`).get() as { detail: string }).detail);
-  expect(start).toMatchObject({ name: "fe", place: null });
+  expect(start).toMatchObject({ session_id: expect.stringMatching(/^id:/), place: null });
   expect(start.retry_after_ms).toBe(r.retry_after_ms);
 
-  await until(async () => (await srv.client(alice, "fe").connect()).type === "hello_ok");
-  // The run ends only once the bucket is full again (2 tokens at 4/s: 500ms
+  // The run ends only once the bucket is full again (3 tokens at 4/s: 750ms
   // from empty). The wait is the bucket's own clock, not a race; polling with
   // hellos would keep it from filling.
-  const fullAt = Date.now() + 550;
+  const fullAt = Date.now() + 800;
   await until(() => Date.now() >= fullAt);
   expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
   expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'hello.rate_limit_ended'`)).toBe(1);
   expect(JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'hello.rate_limit_ended'`).get() as { detail: string }).detail).refused).toBeGreaterThanOrEqual(2);
+  expect((await srv.client(alice, "fe").connect()).bind_ok.alias).toBe(`${A}/fe`);
 });
 
 test("the Slack bridge's human connection is exempt", async () => {
@@ -78,13 +79,28 @@ test("the Slack bridge's human connection is exempt", async () => {
   await until(() => count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ? AND event = 'bound'`, `${A}/human`) === 1);
 });
 
+test("a bind spends the user's hello bucket: binds and hellos drain one bucket", async () => {
+  const srv = serve({ helloLimit: { burst: 3, perSec: 0.01 } });
+  const alice = await srv.login(A);
+  const a = srv.client(alice, null);
+  expect((await a.connect()).type).toBe("hello_ok");
+  expect((await a.bind("be")).type).toBe("bind_ok");
+  expect((await a.bind("fe")).type).toBe("bind_ok");
+  // Three tokens spent, one by the hello and two by binds: the next of either is refused.
+  const bind = await a.bind("ops");
+  expect(bind).toMatchObject({ type: "error", code: "rate_limited", message: expect.stringMatching(/too many binds for this user; retry in \d+s/) });
+  expect(bind.retry_after_ms).toBeGreaterThan(0);
+  expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/ops`)).toBe(0);
+  expect((await srv.client(alice, null).connect()).code).toBe("rate_limited");
+});
+
 test("a session started while its user is rate-limited waits and binds", async () => {
   const srv = serve({ helloLimit: { burst: 1, perSec: 1 } });
   const alice = await srv.login(A);
   expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
   const s = await srv.session(alice, "fe");
   expect(s.c.getInstructions()).toContain(`identity "fe"`);
-  expect(s.stderr()).toMatch(/connection as "fe" rate limited \(too many connections for this user; retry in 1s\); reconnecting in \d+ms/);
+  expect(s.stderr()).toMatch(/connection as session id:\w+ rate limited \(too many connections for this user; retry in 1s\); reconnecting in \d+ms/);
 }, 15_000);
 
 test("a limited session outwaits HELLO_MS and binds", async () => {
@@ -134,13 +150,13 @@ function stub(reply: (n: number) => Record<string, unknown>) {
 }
 
 function client(url: string): GrayboardClient {
-  const c = new GrayboardClient(url, () => "t", "fe", mintSessionKey(), async () => {}, async () => {});
+  const c = new GrayboardClient(url, () => "t", mintSessionKey(), async () => {}, async () => {});
   cleanup.push(() => c.close());
   c.connect();
   return c;
 }
 
-const HELLO_OK = { type: "hello_ok", identity_full: `${A}/fe`, user_email: A, teams: [] };
+const HELLO_OK = { type: "hello_ok", id: "id:aaaaaaaaaaaaa", user_email: A, teams: [] };
 
 test("the client waits the server's retry_after_ms and reports why while it waits", async () => {
   const s = stub((n) => (n === 1 ? { type: "error", code: "rate_limited", message: "slow down", retry_after_ms: 300 } : HELLO_OK));

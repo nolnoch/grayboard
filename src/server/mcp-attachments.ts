@@ -65,14 +65,15 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
         const asserted = url.searchParams.get("identity");
         if (asserted !== null && asserted !== session.identityName) return error("forbidden", "identity differs from current source binding", 403);
         const selected = new URL(url);
-        selected.searchParams.set("identity", session.identityName);
+        // The HTTP routes act as `as` (#284): the hosted session's name.
+        selected.searchParams.delete("identity");
+        selected.searchParams.set("as", session.identityFull);
         const guard = () => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
           const current = oauth.authenticate(req, ["grayboard:tools"]);
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard();
-          const alias = repo.aliases.find(principal.authed.user_email, session.identityName);
-          if (!alias || alias.address !== session.identityFull) throw new Refusal(error("not_found", "identity not found", 404));
+          if (!repo.aliases.find(session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
         guard();
         const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)

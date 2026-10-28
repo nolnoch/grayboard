@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -137,7 +138,7 @@ test("unbound context cannot write or implicitly create names", async () => {
   await expect(hosted.run(principal, context("one"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   await expect(hosted.bind(principal, context("one"), { name: "fe" })).rejects.toHaveProperty("code", "identity_unknown");
   await expect(hosted.bind(principal, { missing: "metadata missing" }, { name: "fe", create: true })).rejects.toHaveProperty("code", "unbound");
-  expect(database.repo.aliases.listFor(principal.authed.user_email)).toEqual([]);
+  expect(database.repo.aliases.listForScope("person", principal.authed.user_email)).toEqual([]);
 });
 
 test("two contexts execute tools under distinct bound identities", async () => {
@@ -251,7 +252,7 @@ async function paused<T>(point: string, start: () => Promise<T>, overlap: () => 
 test("pending holds the reader gate while rebind waits; stale receipt cannot move the old cursor", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const lease = await delivery.open(principal, context("root"));
-  const sender = (await application.selectIdentity(principal.authed, "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
+  const sender = (await application.selectIdentity(tokenSession(application.repo, principal.authed), "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
   application.send(sender, "you@example.com/fe", "old mailbox");
   let binding!: ReturnType<typeof hosted.bind>, finished = false;
   const issued = await paused("hosted:pending:in-gate", () => delivery.pending(principal, context("root"), lease.capability), async () => {
@@ -278,7 +279,7 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
 
 test("bind publishes its new holder before the after-commit pause and old-mailbox DMs stay queued", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
-  const sender = (await application.selectIdentity(principal.authed, "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
+  const sender = (await application.selectIdentity(tokenSession(application.repo, principal.authed), "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     application.send(sender, "you@example.com/fe", "not for be");
     expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
@@ -292,9 +293,9 @@ test("bind publishes its new holder before the after-commit pause and old-mailbo
 test("WSS contender releases a never-leased hosted owner only after the idle window", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const sink = { deliver() {}, closed() {}, probe: async () => true };
-  await expect(application.selectIdentity(principal.authed, "fe", sink)).rejects.toHaveProperty("code", "identity_in_use");
+  await expect(application.selectIdentity(tokenSession(application.repo, principal.authed), "fe", sink)).rejects.toHaveProperty("code", "alias_held"); // #284: a WSS bind's refusal (was identity_in_use)
   now += 900_001;
-  const acquired = await application.selectIdentity(principal.authed, "fe", sink);
+  const acquired = await application.selectIdentity(tokenSession(application.repo, principal.authed), "fe", sink);
   expect(acquired.session.identityFull).toBe("you@example.com/fe");
   expect(database.repo.hosted.all()).toEqual([]);
   application.close(acquired.session);

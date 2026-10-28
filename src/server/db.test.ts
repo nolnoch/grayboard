@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { Glob } from "bun";
 import { openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
+const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
+
 // ── repository isolation ───────────────────────────────────────────────────────
 
 test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tree)", async () => {
@@ -37,7 +39,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const old = openDatabase(path, opts);
   const user = old.repo.users.upsertByEmail("you@example.com", "You");
   const session = old.repo.sessions.create(user.id, "old-session-hash", "old client");
-  old.repo.aliases.create(user.email, "fe");
+  old.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
   old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
   for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
   old.db.close();
@@ -45,8 +47,8 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   try {
     expect(reopened.repo.users.findById(user.id)?.display_name).toBe("You");
     expect(reopened.repo.sessions.findByTokenHash("old-session-hash")?.id).toBe(session.id);
-    expect(reopened.repo.aliases.listFor(user.email).map(i => i.name)).toEqual(["fe"]);
-    expect(reopened.repo.messages.history("you@example.com/fe")[0]?.body).toBe("preserved");
+    expect(reopened.repo.aliases.listForScope("person", user.email).map(i => i.name)).toEqual(["fe"]);
+    expect(reopened.repo.messages.history(["you@example.com/fe"])[0]?.body).toBe("preserved");
     expect(reopened.repo.oauth.isGrantActive("missing", Date.now())).toBe(false);
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
   } finally {
@@ -94,21 +96,45 @@ describe("Repo", () => {
     expect(found?.id).toBe(s.id);
     repo.sessions.revoke(s.id);
     expect(repo.sessions.findByTokenHash("hash123")).toBeUndefined();
+    // By row, a revoked one still reads, with its revoked_at.
+    expect(repo.sessions.findById(s.id)?.revoked_at).not.toBeNull();
+    expect(repo.sessions.findById(s.id + 100)).toBeUndefined();
   });
 
   test("aliases: create, list, remove", () => {
     repo.users.upsertByEmail("you@example.com", null);
-    expect(repo.aliases.create("you@example.com", "fe").address).toBe("you@example.com/fe");
-    repo.aliases.create("you@example.com", "be");
-    expect(repo.aliases.listFor("you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
+    expect(repo.aliases.create(person("you@example.com", "fe"), "you@example.com").address).toBe("you@example.com/fe");
+    repo.aliases.create(person("you@example.com", "be"), "you@example.com");
+    expect(repo.aliases.listForScope("person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
     repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 7);
-    repo.aliases.remove("you@example.com", "fe");
-    expect(repo.aliases.listFor("you@example.com")).toHaveLength(1);
+    repo.aliases.remove("you@example.com/fe");
+    expect(repo.aliases.listForScope("person", "you@example.com")).toHaveLength(1);
     // Its read point goes with it: a new alias of the name starts from scratch.
     expect(repo.cursors.directFor("you@example.com/fe")).toBe(0);
   });
 
+  // #284 S9: aliases are keyed by address in any scope.
+  test("aliases: a team scope's alias is its own address, listed under its scope", () => {
+    const u = repo.users.upsertByEmail("you@example.com", null);
+    repo.teams.create("eng", u.id);
+    repo.aliases.create(person("you@example.com", "be"), "you@example.com");
+    const team = repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
+    expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
+    expect(repo.aliases.find("eng/be")?.id).toBe(team.id);
+    expect(repo.aliases.find("eng/fe")).toBeUndefined();
+    expect(repo.aliases.listForScope("team", "eng").map((a) => a.address)).toEqual(["eng/be"]);
+    expect(repo.aliases.listForScope("person", "you@example.com").map((a) => a.address)).toEqual(["you@example.com/be"]);
+    expect(repo.aliases.listForScope("person", "eng")).toEqual([]);
+    expect(repo.aliases.findAllByName("be").map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
+  });
 
+  test("principals: findByName reads users and teams", () => {
+    const u = repo.users.upsertByEmail("you@example.com", null);
+    const eng = repo.teams.create("eng", u.id);
+    expect(repo.principals.findByName("you@example.com")).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
+    expect(repo.principals.findByName("eng")).toMatchObject({ kind: "team", user_id: null, team_id: eng.id });
+    expect(repo.principals.findByName("ops")).toBeUndefined();
+  });
 
   test("teams: create, join, leave, list members", () => {
     const u1 = repo.users.upsertByEmail("a@example.com", null);
@@ -147,6 +173,61 @@ describe("Repo", () => {
     expect(unread[0].id).toBe(m2.id);
   });
 
+  // #284 S8: a session reads as every address it has, its ID and its alias.
+  test("history, undeliveredFrom, receivedUnacked and sentPending take an address set", () => {
+    const [id, alias, peer, other] = ["id:s1", "a@example.com/fe", "b@example.com/be", "c@example.com/qa"];
+    const toId = repo.messages.insert(peer, "user", id, "to the id", null);
+    const fromAlias = repo.messages.insert(alias, "user", peer, "from the alias", null, true);
+    const toAlias = repo.messages.insert(peer, "user", alias, "to the alias", null);
+    const fromId = repo.messages.insert(id, "user", other, "from the id", null, true);
+    repo.messages.insert(peer, "user", other, "not ours", null);
+    const set = [id, alias];
+    const ids = (rows: { id: number }[]) => rows.map((m) => m.id);
+
+    expect(ids(repo.messages.history(set))).toEqual([fromId.id, toAlias.id, fromAlias.id, toId.id]);
+    expect(ids(repo.messages.history(set, peer))).toEqual([toAlias.id, fromAlias.id, toId.id]);
+    expect(ids(repo.messages.history(set, peer, 20, toAlias.id))).toEqual([fromAlias.id, toId.id]);
+    expect(ids(repo.messages.history([alias]))).toEqual([toAlias.id, fromAlias.id]);
+
+    expect(repo.messages.undeliveredFrom(set)).toEqual([
+      { recipient: peer, n: 1, oldest_id: fromAlias.id },
+      { recipient: other, n: 1, oldest_id: fromId.id },
+    ]);
+    expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toId.id, toAlias.id]);
+    expect(ids(repo.messages.sentPending(set, 0))).toEqual([fromAlias.id, fromId.id]);
+    // An ack counts for the address the row names, not any address of the set.
+    repo.messages.ack(alias, toId.id);
+    expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toId.id, toAlias.id]);
+    repo.messages.ack(id, toId.id);
+    repo.messages.ack(id, fromId.id);
+    expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toAlias.id]);
+    expect(ids(repo.messages.sentPending(set, 0))).toEqual([fromAlias.id]);
+  });
+
+  // #284 S5: the MailPort core endSession runs on the server.
+  test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", () => {
+    const [id, peer] = ["id:s1", "b@example.com/be"];
+    const read = repo.messages.insert(peer, "user", id, "read", null);
+    const unread = repo.messages.insert(peer, "user", id, "unread", null);
+    repo.messages.insert(id, "user", id, "to itself", null);
+    repo.messages.insert(peer, "team", id, "a team stream of the same name", null);
+    repo.messages.insert(peer, "user", "a@example.com/fe", "to someone else", null);
+    repo.cursors.advance(id, "direct", id, read.id);
+    expect(repo.mail.unread(id)).toEqual([{ id: unread.id, sender: peer }]);
+
+    repo.mail.bounce(id, peer, unread.id, "returned", 1234);
+    const [bounce] = repo.messages.history([peer]).filter((m) => m.kind === "bounce");
+    expect(bounce).toMatchObject({ sender: id, recipient_type: "user", recipient: peer, body: "returned", parent_id: unread.id, created_at: 1234, pending: 0, kind: "bounce" });
+    expect(repo.messages.getById(unread.id)?.kind).toBeNull();
+
+    repo.messages.ack(id, unread.id);
+    repo.messages.ack(peer, bounce!.id);
+    repo.mail.dropReader(id);
+    expect(repo.cursors.directFor(id)).toBe(0);
+    expect(repo.messages.receivedUnacked([id], 0).map((m) => m.id)).toEqual([read.id, unread.id]);
+    expect(repo.messages.receivedUnacked([peer], 0)).toEqual([]);
+  });
+
   test("audit.write and prune", () => {
     const oldTs = Date.now() - 100;
     repo.audit.write({ at: oldTs, actor: "wade@example.com", action: "auth.login", target: null, detail: null });
@@ -177,13 +258,13 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {
   const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   repo.users.upsertByEmail("a@example.com", null);
-  repo.aliases.create("a@example.com", "fe");
+  repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
   repo.users.upsertByEmail("b@example.com", null);
-  repo.aliases.create("b@example.com", "be");
+  repo.aliases.create(person("b@example.com", "be"), "b@example.com");
   repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
   repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
   const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
-    .all("a@example.com/fe", Number.MAX_SAFE_INTEGER) as { detail: string }[];
+    .all(JSON.stringify(["a@example.com/fe"]), Number.MAX_SAFE_INTEGER) as { detail: string }[];
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
   expect(detail).not.toContain("SCAN c");
@@ -193,9 +274,9 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
 test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", () => {
   const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   repo.users.upsertByEmail("a@example.com", null);
-  repo.aliases.create("a@example.com", "fe");
+  repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
   repo.users.upsertByEmail("b@example.com", null);
-  repo.aliases.create("b@example.com", "be");
+  repo.aliases.create(person("b@example.com", "be"), "b@example.com");
   repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
   repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
   const detail = (sql: string, ...args: (string | number)[]) =>

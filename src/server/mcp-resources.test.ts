@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -99,7 +100,7 @@ test("receipt capacity is structured and release then bind false reopens under a
   hosted.delivery.renew = async () => { throw new ApplicationError("receipt_capacity", "receipt capacity reached"); };
   try { expect((await client.callTool({ name: "delivery_renew", arguments: {} })).structuredContent).toEqual({ code: "receipt_capacity" }); }
   finally { hosted.delivery.renew = renew; }
-  const alias = store.repo.aliases.find(grant.authed.user_email, "be");
+  const alias = store.repo.aliases.find(`${grant.authed.user_email}/be`);
   await client.callTool({ name: "delivery_release", arguments: {} });
   expect((await client.callTool({ name: "bind", arguments: { name: "be", create: false } })).isError).not.toBe(true);
   const replacement = JSON.parse(((await client.callTool({ name: "delivery_open", arguments: {} })).content as { text: string }[])[0]!.text);
@@ -107,7 +108,7 @@ test("receipt capacity is structured and release then bind false reopens under a
   expect(replacement.ownership).not.toBe(first.ownership);
   headers.set("X-Grayboard-Lease", replacement.capability);
   expect((await client.readResource({ uri: "grayboard://inbox" })).contents).toHaveLength(1);
-  expect(store.repo.aliases.find(grant.authed.user_email, "be")).toEqual(alias);
+  expect(store.repo.aliases.find(`${grant.authed.user_email}/be`)).toEqual(alias);
   await expect(hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability)).rejects.toHaveProperty("code", "not_found");
 });
 
@@ -241,7 +242,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = await application.selectIdentity(grant.authed, "be", { deliver() {}, probe: async () => true, closed() {} });
+      const replacement = await application.selectIdentity(tokenSession(application.repo, grant.authed), "be", { deliver() {}, probe: async () => true, closed() {} });
       application.close(replacement.session);
     }
   } finally { resume(); hosted.delivery.open = original; }

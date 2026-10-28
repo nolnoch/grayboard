@@ -49,15 +49,28 @@ export function createTouchQueue(): TouchQueue {
   };
 }
 
+export type AuthLost = "token_revoked" | "user_disabled";
+
+/** The one rule for a token: why a session row and its user row no longer authenticate, or null while they do (#351). Revoked wins over disabled. */
+function lostOf(session: { revoked_at: number | null } | null | undefined, user: { disabled_at: number | null } | null | undefined): AuthLost | null {
+  if (!session || session.revoked_at !== null) return "token_revoked";
+  return !user || user.disabled_at !== null ? "user_disabled" : null;
+}
+
 export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue): AuthedUser | null {
   const hash = hashToken(raw);
   const session = repo.sessions.findByTokenHash(hash);
   if (!session) return null;
   const user = repo.users.findById(session.user_id);
-  if (!user || user.disabled_at !== null) return null;
+  if (lostOf(session, user)) return null;
   // Off the request path: last-used is a stamp, not a result the caller waits on.
   touches.schedule(() => repo.sessions.touch(session.id, Date.now()));
-  return { user_id: user.id, user_email: user.email, session_id: session.id };
+  return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
+}
+
+/** Why `authed`'s token no longer authenticates, or null while it does: verifySessionToken's rule, by session id. */
+export function authLost(authed: AuthedUser, repo: Repo): AuthLost | null {
+  return lostOf(repo.sessions.findById(authed.session_id), repo.users.findById(authed.user_id));
 }
 
 export async function verifyGoogleIdToken(

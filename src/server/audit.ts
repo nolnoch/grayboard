@@ -1,4 +1,5 @@
 import type { Repo } from "./db.ts";
+import type { AuditSink } from "../core/audit.ts";
 
 export type AuditAction =
   | `oauth.${string}`
@@ -13,6 +14,8 @@ export type AuditAction =
   | "attachment.upload_failed"
   | "attachment.upload_refused"
   | "attachment.uploaded"
+  | "auth.connection_closed"
+  | "auth.hello_refused"
   | "auth.login"
   | "auth.logout"
   | "auth.rate_limit_ended"
@@ -24,12 +27,21 @@ export type AuditAction =
   | "bridge.notified"
   | "bridge.stopped"
   | "alias.created"
+  | "alias.meta_set"
+  | "alias.revoked"
   | "alias.deleted"
   | "hello.rate_limit_ended"
   | "hello.rate_limited"
   | "hosted.rate_limit_ended"
   | "hosted.rate_limited"
   | "id.collision"
+  | "id.detached"
+  | "id.end_failed"
+  | "id.superseded"
+  | "id.ended"
+  | "id.reattached"
+  | "id.registered"
+  | "id.reused"
   | "message.retracted"
   | "request.replayed"
   | "request.resent"
@@ -62,3 +74,6 @@ export function writeAudit(
     detail: detail ? JSON.stringify(detail) : null,
   });
 }
+
+/** Core's audit rows, written on the server: access_log through the Repo (#342). */
+export const serverAuditSink = (repo: Repo): AuditSink => (action, actor, target, detail) => writeAudit(repo, action, actor, target, detail);

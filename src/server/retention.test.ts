@@ -54,9 +54,11 @@ describe("retention pruning", () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
     const file = { filename: "a.txt", type: "text/plain", data: new TextEncoder().encode("same bytes") };
-    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file)).id;
-    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, [await up("a@example.com/fe")]);
-    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, [await up("a@example.com/fe")]);
+    const quota = { principal: "a@example.com", unsent: 1_000_000, stored: 1_000_000 };
+    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota })).id;
+    const from = { addresses: ["a@example.com/fe"], principal: "a@example.com" };
+    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, [await up("a@example.com/fe")], null, from);
+    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, [await up("a@example.com/fe")], null, from);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
@@ -71,6 +73,9 @@ describe("retention pruning", () => {
   test("post retention signals actual committed boards, isolates failed callbacks, and skips empty runs", async () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
+    // A board reads as missing to an address no principal owns (#284).
+    r.users.upsertByEmail("a@example.com", null);
+    r.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
     createBoard(db, "a@example.com/be", "e2e", "test");
     post(db, "a@example.com/be", "e2e", "old");
     db.run("UPDATE posts SET created_at = 0");

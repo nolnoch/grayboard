@@ -5,8 +5,11 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
-import { bindAttachments, dropAttachments, withAttachments, type BlobStore } from "../core/attachments.ts";
+import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
+import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import type { MailPort } from "../core/session_end.ts";
 import { afterCommit, openSqlite } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
@@ -17,17 +20,20 @@ import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization,
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
-// A person-scope alias (#284): one of a user's names, `email/name`.
-export type Alias = { id: number; address: string; name: string; created_at: number };
+// An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
+// ref is the user's email; a team or service scope's is the principal's name.
+export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_ref: string; name: string; created_at: number };
+// A scope owner (#284 decision 5): a user (name = email), a team or a service principal.
+export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; attachments?: AttachmentInfo[] };
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; kind: "bounce" | null; attachments?: AttachmentInfo[] };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
-// doesn't leak.
-export function participant(m: MessageRow | undefined, me: string): m is MessageRow {
-  return !!m && m.recipient_type === "user" && (m.sender === me || m.recipient === me);
+// doesn't leak. `me`: every address the caller reads as (#284 S8).
+export function participant(m: MessageRow | undefined, me: string[]): m is MessageRow {
+  return !!m && m.recipient_type === "user" && (me.includes(m.sender) || me.includes(m.recipient));
 }
 // A user's Slack link: their member ID and their DM with the bridge's app.
 export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
@@ -45,8 +51,9 @@ export type WriteReceipt = {
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads and pushes.
-const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, pending`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.pending`;
+const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, pending, kind`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
+const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
@@ -66,18 +73,27 @@ export interface Repo {
   sessions: {
     create(userId: number, tokenHash: string, label: string | null): Session;
     findByTokenHash(hash: string): Session | undefined;
+    findById(sessionId: number): Session | undefined;
     revoke(sessionId: number): void;
     revokeAllForUser(userId: number): void;
     touch(sessionId: number, now: number): void;
   };
-  // A user's names, keyed by the user's email (the person scope).
+  principals: {
+    findByName(name: string): PrincipalRow | undefined;
+  };
+  // Who an address acts for (#284 S12): an ID's registering user, an
+  // alias's scope owner, a team broadcast's team.
+  resolver: Resolver;
+  // Names in scopes, keyed by address.
   aliases: {
-    create(email: string, name: string): Alias;
-    listFor(email: string): Alias[];
-    find(email: string, name: string): Alias | undefined;
-    findAllByName(name: string): { email: string; name: string }[];
+    // createdBy: the principal that made it (the binder's user for a lazy create).
+    create(scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
+    find(address: string): Alias | undefined;
+    listForScope(kind: ScopeKind, ref: string): Alias[];
+    // Every scope's alias of this name.
+    findAllByName(name: string): Alias[];
     // Also deletes the alias's read points.
-    remove(email: string, name: string): void;
+    remove(address: string): void;
   };
   teams: {
     // Inserts the team's principal in the same transaction; throws
@@ -92,30 +108,41 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    // attachmentIds: the sender's unbound uploads, bound in the insert's
+    // attachmentIds: unbound uploads of `uploader` (the sending session's
+    // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
     // transaction (a refused id throws CoreError and nothing is written).
-    // senderId: the sending session's ID (#284); null for a writer with no session.
-    insert(sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[], senderId?: string | null): MessageRow;
+    // senderId: the sending session's ID (#284); null for a writer with no
+    // session.
+    insert(
+      sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[],
+      senderId?: string | null, uploader?: Uploader,
+    ): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
-    history(identityFull: string, peer?: string, limit?: number, beforeId?: number): MessageRow[];
+    // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
+    bouncesFrom(id: string): MessageRow[];
+    // A session's direct messages, sent or received by any of its addresses
+    // (#284 S8): with peer, only those between the set and peer.
+    history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
     thread(id: number): MessageRow[];
     unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     // Direct messages to each of recipients still past its cursor, sent by
     // someone else; recipients with none are absent.
     queuedTo(recipients: string[]): Map<string, number>;
-    // Direct messages from sender still past each recipient's cursor, per recipient.
-    undeliveredFrom(sender: string, olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
-    // Direct messages to reader since `since` that it hasn't acked, oldest first.
-    receivedUnacked(reader: string, since: number): MessageRow[];
-    // Direct messages from sender since `since` sent pending and not acked by it, oldest first.
-    sentPending(sender: string, since: number): MessageRow[];
+    // Direct messages from any of senders still past each recipient's cursor, per recipient.
+    undeliveredFrom(senders: string[], olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
+    // Direct messages to any of readers since `since` that their recipient hasn't acked, oldest first.
+    receivedUnacked(readers: string[], since: number): MessageRow[];
+    // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
+    sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
     // and has no reply. False if any of that doesn't hold.
     retract(sender: string, id: number): boolean;
     prune(olderThanMs: number): void;
   };
+  // An ended session's mail, as core endSession reaches it (#284 decision 4).
+  mail: MailPort;
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
@@ -178,7 +205,7 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 // plan of the exact statement the code executes, not a hand-copied drift.
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
              LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
-            WHERE m.sender = ? AND m.recipient_type = 'user' AND m.recipient != m.sender
+            WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
@@ -207,7 +234,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     seedSchema(d, first);
   });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
-  setAccess(db, serverAccess(repo, opts.humanReach ?? "team"));
+  setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
 }
 
@@ -411,10 +438,12 @@ function initSchema(db: Database): void {
   db.exec("CREATE INDEX IF NOT EXISTS idx_oauth_codes_grant ON oauth_codes(grant_id)");
   // dm_send pending: the sender owes a follow-up in the thread. sender_id:
   // the sending session's ID (#284), beside the address it sent as; null for
-  // messages from before it, and for writers with no session.
+  // messages from before it, and for writers with no session. kind: 'bounce'
+  // for mail returned because its recipient session ended (#284 decision 10).
   const msgCols = db.prepare(`PRAGMA table_info(messages)`).all() as { name: string }[];
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
   if (!msgCols.some((c) => c.name === "sender_id")) db.exec(`ALTER TABLE messages ADD COLUMN sender_id TEXT`);
+  if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -447,6 +476,8 @@ export class PrincipalTaken extends Error {
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  const principalByName = (name: string): PrincipalRow | undefined =>
+    db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   const observers = new Set<() => void>();
   const changed = () => afterCommit(db, () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } });
   const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
@@ -514,6 +545,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           ).get(hash) ?? undefined
         );
       },
+      // By row, revoked ones included: the caller reads revoked_at (#351).
+      findById(sessionId) {
+        return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
+      },
       revoke(sessionId) {
         db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [Date.now(), sessionId]);
       },
@@ -532,31 +567,45 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
+    principals: {
+      findByName: principalByName,
+    },
+
+    resolver: {
+      principalOf(address) {
+        const p = addressParts(address);
+        if (!p || p.kind === "bare") return null;
+        const name = p.kind === "id"
+          ? db.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
+          : p.kind === "alias" ? p.scope : p.name;
+        const row = name ? principalByName(name) : undefined;
+        // team:x names a team, never a service; a person scope (an email) is only a user's.
+        if (!row || (p.kind === "team" && row.kind !== "team")) return null;
+        if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
+        return { kind: row.kind, name: row.name };
+      },
+    },
+
     aliases: {
-      create(email, name) {
-        return db.query<Alias, [string, string, string, string, number]>(
+      create({ scope_kind, scope_ref, name }, createdBy) {
+        return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
-           VALUES (?, 'person', ?, ?, ?, ?) RETURNING id, address, name, created_at`,
-        ).get(`${email}/${name}`, email, name, email, Date.now())!;
+           VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
+        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, Date.now())!;
       },
-      listFor(email) {
-        return db.query<Alias, [string]>(
-          "SELECT id, address, name, created_at FROM aliases WHERE scope_ref = ? AND scope_kind = 'person' ORDER BY name",
-        ).all(email);
+      find(address) {
+        return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
       },
-      find(email, name) {
+      listForScope(kind, ref) {
         return db.query<Alias, [string, string]>(
-          "SELECT id, address, name, created_at FROM aliases WHERE scope_ref = ? AND scope_kind = 'person' AND name = ?",
-        ).get(email, name) ?? undefined;
+          `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
+        ).all(ref, kind);
       },
       findAllByName(name) {
-        return db.query<{ email: string; name: string }, [string]>(
-          "SELECT scope_ref AS email, name FROM aliases WHERE name = ? AND scope_kind = 'person'",
-        ).all(name);
+        return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
       },
-      remove(email, name) {
+      remove(address) {
         db.transaction(() => {
-          const address = `${email}/${name}`;
           db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);
           db.run("DELETE FROM aliases WHERE address = ?", [address]);
         })();
@@ -611,49 +660,43 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null, uploader) {
+        if (attachmentIds.length && !uploader) throw new Error("messages.insert: attachments need their uploader");
         return db.transaction(() => {
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
           ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
-          const attachments = bindAttachments(db, attachmentIds, sender, { message_id: row.id }, attachmentLimits);
+          const attachments = bindAttachments(db, attachmentIds, uploader!, { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      history(identityFull, peer, limit = 20, beforeId) {
+      bouncesFrom(id) {
+        return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);
+      },
+      history(addresses, peer, limit = 20, beforeId) {
+        const set = JSON.stringify(addresses);
+        const before = beforeId ?? Number.MAX_SAFE_INTEGER;
         const cap = Math.min(limit, 200);
         if (peer) {
-          if (beforeId !== undefined) {
-            return att(db.query<MessageRow, [string, string, string, string, number, number]>(
-              `SELECT ${MSG_COLS} FROM messages
-               WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
-                 AND recipient_type = 'user' AND id < ?
-               ORDER BY id DESC LIMIT ?`,
-            ).all(identityFull, peer, peer, identityFull, beforeId, cap));
-          }
-          return att(db.query<MessageRow, [string, string, string, string, number]>(
-            `SELECT ${MSG_COLS} FROM messages
-             WHERE ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))
-               AND recipient_type = 'user'
-             ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, peer, peer, identityFull, cap));
-        }
-        if (beforeId !== undefined) {
           return att(db.query<MessageRow, [string, string, number, number]>(
             `SELECT ${MSG_COLS} FROM messages
-             WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user')) AND id < ?
-             ORDER BY id DESC LIMIT ?`,
-          ).all(identityFull, identityFull, beforeId, cap));
+             WHERE ((sender IN (SELECT value FROM json_each(?1)) AND recipient = ?2)
+                 OR (sender = ?2 AND recipient IN (SELECT value FROM json_each(?1))))
+               AND recipient_type = 'user' AND id < ?3
+             ORDER BY id DESC LIMIT ?4`,
+          ).all(set, peer, before, cap));
         }
-        return att(db.query<MessageRow, [string, string, number]>(
+        return att(db.query<MessageRow, [string, number, number]>(
           `SELECT ${MSG_COLS} FROM messages
-           WHERE (sender = ? OR (recipient = ? AND recipient_type = 'user'))
-           ORDER BY id DESC LIMIT ?`,
-        ).all(identityFull, identityFull, cap));
+           WHERE (sender IN (SELECT value FROM json_each(?1))
+               OR (recipient IN (SELECT value FROM json_each(?1)) AND recipient_type = 'user'))
+             AND id < ?2
+           ORDER BY id DESC LIMIT ?3`,
+        ).all(set, before, cap));
       },
       // The whole thread containing message `id`: walk up to its root, then down.
       thread(id) {
@@ -690,26 +733,26 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(JSON.stringify(recipients));
         return new Map(rows.map((r) => [r.recipient, r.n]));
       },
-      undeliveredFrom(sender, olderThan = Number.MAX_SAFE_INTEGER) {
+      undeliveredFrom(senders, olderThan = Number.MAX_SAFE_INTEGER) {
         return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           UNDELIVERED_FROM_SQL,
-        ).all(sender, olderThan);
+        ).all(JSON.stringify(senders), olderThan);
       },
-      receivedUnacked(reader, since) {
+      receivedUnacked(readers, since) {
         return att(db.query<MessageRow, [string, number]>(
           `SELECT ${M_MSG_COLS} FROM messages m
-            WHERE m.recipient_type = 'user' AND m.recipient = ? AND m.sender != m.recipient AND m.created_at >= ?
+            WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.sender != m.recipient AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(reader, since));
+        ).all(JSON.stringify(readers), since));
       },
-      sentPending(sender, since) {
+      sentPending(senders, since) {
         return att(db.query<MessageRow, [string, number]>(
           `SELECT ${M_MSG_COLS} FROM messages m
-            WHERE m.recipient_type = 'user' AND m.sender = ? AND m.pending = 1 AND m.created_at >= ?
+            WHERE m.recipient_type = 'user' AND m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
-        ).all(sender, since));
+        ).all(JSON.stringify(senders), since));
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
@@ -740,6 +783,28 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           dropAttachments(db, "message", "SELECT id FROM messages WHERE created_at < ?", olderThanMs);
           db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
         })();
+      },
+    },
+
+    mail: {
+      unread(id) {
+        return db.query<{ id: number; sender: string }, [string]>(
+          `SELECT m.id, m.sender FROM messages m
+            WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
+              AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                    WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
+            ORDER BY m.id`,
+        ).all(id);
+      },
+      bounce(from, to, parentId, body, now) {
+        db.query(
+          `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
+           VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+        ).run(from, to, body, parentId, now);
+      },
+      dropReader(id) {
+        db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
+        db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
       },
     },
 
@@ -1148,6 +1213,9 @@ function makeHostedStore(db: Database): HostedStore {
     atomic: fn => db.transaction(fn).immediate(),
     subscribe: () => () => {},
     get,
+    owned: (id) => db.query<{ n: number }, [string, string]>(
+      "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
+    ).get(id, id) !== null,
     all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions").all(),
     start(session, user, client, now) {
       const r = db.run("INSERT INTO hosted_ownerships(session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?)", [session, user, client, now]);

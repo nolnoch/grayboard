@@ -146,10 +146,9 @@ describe("sessionIdentity", () => {
     // No repo pin: an env value from a user-level registration (claude mcp
     // add -e, pi's user mcp.json) is a chosen task name, used verbatim in
     // every worktree. Two worktree sessions then resolve to the same name;
-    // the second is refused at startup (identity_in_use / the local refusal),
-    // which keeps one live session per name instead of the silent push-loss
-    // the suffix used to paper over. #182 specifies an unbound start instead
-    // of a refusal; until it lands, the refusal is today's behavior.
+    // the second starts unbound and names the holder (#182), which keeps one
+    // live session per name instead of the silent push-loss the suffix used
+    // to paper over.
     expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBe("be");
     expect(sessionIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "be-throughput"))).toBe("be");
   });

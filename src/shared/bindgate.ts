@@ -1,11 +1,11 @@
-// Tool calls run concurrently, but none overlaps a bind (#182 audit 11): a
-// call that started under the old name could otherwise land on it after its
-// claims moved, or be cut off with its connection. Both modes use it.
+// Tool calls run concurrently, but none overlaps a bind or an unbind (#182
+// audit 11): a call picks the address it acts as from the session's holds
+// when it starts (#284 S3, S4, S14), so a change to them mid-call would let
+// it act as an alias the session no longer holds. Both modes use it.
 export class BindGate {
   private active = 0;
   private drained: (() => void) | null = null;
   private closed: Promise<unknown> | null = null;
-  private held: Promise<unknown> | null = null;
 
   /** Run a tool call once no bind is waiting or running. */
   async call<T>(fn: () => Promise<T>): Promise<T> {
@@ -18,7 +18,7 @@ export class BindGate {
     }
   }
 
-  /** Run a bind alone: after the calls in flight finish, and before any that arrive meanwhile. */
+  /** Run a bind or unbind alone: after the calls in flight finish, and before any that arrive meanwhile. */
   async bind<T>(fn: () => Promise<T>): Promise<T> {
     while (this.closed) await this.closed;
     let open!: () => void;
@@ -29,19 +29,8 @@ export class BindGate {
       this.drained = null;
       return await fn();
     } finally {
-      const reopen = () => {
-        if (this.closed === closed) this.closed = null;
-        open();
-      };
-      const held = this.held;
-      this.held = null;
-      if (held) held.then(reopen, reopen);
-      else reopen();
+      if (this.closed === closed) this.closed = null;
+      open();
     }
-  }
-
-  /** Called inside a bind: keep calls waiting after its result, until `p` settles. */
-  holdUntil(p: Promise<unknown>): void {
-    this.held = p;
   }
 }
