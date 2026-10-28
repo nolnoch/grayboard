@@ -19,7 +19,7 @@ import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { savedClientMetadata } from "./cimd-fixture.js";
 import { rootRetrying, rootStatus, SubscriberAdmission } from "./causal.ts";
-import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
+import { assertStable, barrier, bounded, drainSessions, sessionStates, savedInput } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
@@ -268,6 +268,8 @@ try {
       const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/crash", "Crash at actual " + boundary + " admission", null, false); app.application.wake(["you@example.com/crash"]);
       await wait(() => Bun.file(join(root, "real-worker-held.json")).exists(), Boolean, "actual admission crash boundary");
       const saved = await Bun.file(join(root, "real-worker-held.json")).json();
+      savedInput(saved.input); assert.equal(saved.input.sessionID, crashedRoot.id, "Held handoff preserves the exact crash root");
+      assert.equal(saved.input.resume, true); assert.equal(saved.pid, crashWorker.pid);
       assert.equal(app.repo.cursors.directFor("you@example.com/crash"), 0, "Held actual host write has not receipted real item");
       crashWorker.kill("SIGKILL"); await crashWorker.exited;
       assert.equal(saved.models.length, boundary === "before" ? 0 : 1, "Historical wake belongs only to already committed actionable root");

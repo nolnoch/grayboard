@@ -6,7 +6,7 @@ import { fromPromise } from "@opencode/plugin/promise/adapter";
 import { instrument, type NativeInput } from "./effect-instrument.js";
 import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { assertStable, barrier, bounded, drainSessions } from "./reload-state.ts";
+import { assertStable, barrier, bounded, drainSessions, workerBootstrap, heldInput, committedRoots } from "./reload-state.ts";
 import { afterProducers } from "./causal.ts";
 
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!, port = process.env.GRAYBOARD_REAL_BACKEND_PORT!;
@@ -14,7 +14,9 @@ assert(root && port); assert.equal(Bun.version, "1.4.4");
 assert.equal((await Bun.file(join(root, "node_modules/@opencode/sdk/package.json")).json()).version, "2.1.4");
 const mode = process.env.GRAYBOARD_REAL_WORKER_MODE ?? "replay";
 const suspendedResume = mode === "suspended-resume";
-const saved = await Bun.file(join(root, suspendedResume ? "real-suspended.json" : "real-reload.json")).json();
+const saved = workerBootstrap(mode, await Bun.file(join(root, suspendedResume ? "real-suspended.json" : "real-reload.json")).json());
+const replay = saved.kind === "replay" ? saved : undefined;
+const digestInput = replay?.digestInput;
 assert.notEqual(process.pid, saved.pid, "Reload must cross an OS-process boundary");
 const installed = (await Bun.file(join(root, "installed.txt")).text()).trim();
 const { default: plugin } = await import(pathToFileURL(join(installed, "src/index.ts")).href) as typeof import("../src/index.js");
@@ -24,7 +26,7 @@ let replayForwarded = false;
 const receiptCommits = new Set<string>();
 const forwarded = new Set<string>();
 const receiptsCommitted = barrier();
-const expectedRoots = new Set<string>([saved.input.sessionID, ...(saved.digestInput ? [saved.digestInput.sessionID] : [])]);
+const expectedRoots = saved.expectedRoots;
 let ready = false;
 const hold = async () => { ready = true; await Bun.sleep(1_800_000); throw new Error("Crash worker was not killed within its bounded lifetime"); };
 const originalFetch = globalThis.fetch;
@@ -41,7 +43,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const ids = request.params.arguments?.ids;
       if (envelope.result && !envelope.result.isError && typeof session === "string" && Array.isArray(ids) && ids.length > 0 && ids.every(id => typeof id === "string")) {
         receiptCommits.add(session);
-        if ([...expectedRoots].every(id => receiptCommits.has(id))) receiptsCommitted.release();
+        if (committedRoots(expectedRoots, receiptCommits)) receiptsCommitted.release();
       }
     }
     return response;
@@ -57,46 +59,49 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   await c.session.hook("http.request", async e => {
     if (e.kind !== "primary") return;
     models.push(e.sessionID);
-    if (suspendedResume && e.sessionID === saved.input.sessionID) {
+    if (suspendedResume && e.sessionID === replay!.input.sessionID) {
       assert.equal(replayForwarded, false, "Resumed primary must enter before duplicate forwarding");
       modelEntered.release(); await modelReleased.promise;
     }
   });
 } });
 const instrumented = instrument(plugin, async (input, forward) => {
+    if (saved.kind === "hold") heldInput(saved, input);
     inputs.push(structuredClone(input));
     if (mode === "hold-before") await hold();
-    if (suspendedResume && input.id === saved.input.id) {
+    if (suspendedResume && input.id === replay!.input.id) {
       replayEntered.release(); await replayReleased.promise; replayForwarded = true;
     }
     const value = await forward(input);
-    if (suspendedResume && input.id === saved.input.id) replayReturned.release();
+    if (suspendedResume && input.id === replay!.input.id) replayReturned.release();
     if (mode === "hold-after") await hold();
     forwarded.add(input.id!);
     return value;
 });
 const host = await createFixtureHost({ plugins: [fromPromise(fixture), instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
 const settleReplay = (check: () => void) => bounded(afterProducers(async () => {
+  assert(saved.kind === "replay");
   await receiptsCommitted.promise;
   assert(forwarded.has(saved.input.id), "Action replay forwarding returned before its committed receipt");
-  if (saved.digestInput) assert(forwarded.has(saved.digestInput.id), "Digest replay forwarding returned before its committed receipt");
+  if (digestInput) assert(forwarded.has(digestInput.id), "Digest replay forwarding returned before its committed receipt");
 }, () => drainSessions(join(root, "host.sqlite"), sessionID => host.session.wait({ sessionID })), check), 15_000, "Replay producers and all counted SDK sessions must finish");
 try {
   await host.agent.list({ location: saved.location });
-  if (mode.startsWith("hold-")) {
+  if (saved.kind === "hold") {
     await Bun.write(join(root, "real-worker-ready.json"), JSON.stringify({ pid: process.pid }));
     for (let n = 0; n < 300 && !ready; n++) await Bun.sleep(50);
     assert(ready, "Installed plugin reached real admission crash boundary");
     if (mode === "hold-after") await host.session.wait({ sessionID: saved.sessionID });
-    await Bun.write(join(root, "real-worker-held.json"), JSON.stringify({ pid: process.pid, input: inputs[0], models }));
+    await Bun.write(join(root, "real-worker-held.json"), JSON.stringify({ pid: process.pid, input: heldInput(saved, inputs[0]), models }));
     await Bun.sleep(1_800_000); throw new Error("Crash worker was not killed");
   }
+  assert(saved.kind === "replay");
   for (let n = 0; n < 300 && !inputs.some(i => i.id === saved.input.id); n++) await Bun.sleep(50);
   assert(inputs.some(i => i.id === saved.input.id), "Installed plugin replayed same real issued item after process reload");
-  if (saved.digestInput) {
-    for (let n = 0; n < 300 && !inputs.some(i => i.id === saved.digestInput.id); n++) await Bun.sleep(50);
-    assert.deepEqual(inputs.find(i => i.id === saved.digestInput.id), saved.digestInput);
-    assert.equal((await host.session.inbox.list({ sessionID: saved.digestInput.sessionID })).length, 1, "Digest remains pending after separate-process replay");
+  if (digestInput) {
+    for (let n = 0; n < 300 && !inputs.some(i => i.id === digestInput.id); n++) await Bun.sleep(50);
+    assert.deepEqual(inputs.find(i => i.id === digestInput.id), digestInput);
+    assert.equal((await host.session.inbox.list({ sessionID: digestInput.sessionID })).length, 1, "Digest remains pending after separate-process replay");
   }
   if (suspendedResume) {
     await bounded(Promise.all([replayEntered.promise, modelEntered.promise]), 15_000, "Suspended primary and held duplicate reached their barriers");
@@ -130,13 +135,13 @@ try {
     }
     assert.equal((await host.session.context({ sessionID: saved.input.sessionID })).filter((m: { id?: string; type?: string }) => m.id === saved.input.id).length, 1);
     assert.deepEqual(inputs.find(i => i.id === saved.input.id), saved.input, "Exact original target, stable ID and payload survive process reload");
-    if (saved.digestInput) {
+    if (digestInput) {
       const before = models.length;
-      await host.session.prompt({ sessionID: saved.digestInput.sessionID, text: "Explicit ordinary wake after idle process-replayed digest" });
-      await host.session.wait({ sessionID: saved.digestInput.sessionID });
-      assert(models.slice(before).includes(saved.digestInput.sessionID));
-      assert.equal((await host.session.context({ sessionID: saved.digestInput.sessionID })).filter((m: { id?: string; type?: string }) => m.id === saved.digestInput.id).length, 1);
-      assert.equal((await host.session.inbox.list({ sessionID: saved.digestInput.sessionID })).length, 0);
+      await host.session.prompt({ sessionID: digestInput.sessionID, text: "Explicit ordinary wake after idle process-replayed digest" });
+      await host.session.wait({ sessionID: digestInput.sessionID });
+      assert(models.slice(before).includes(digestInput.sessionID));
+      assert.equal((await host.session.context({ sessionID: digestInput.sessionID })).filter((m: { id?: string; type?: string }) => m.id === digestInput.id).length, 1);
+      assert.equal((await host.session.inbox.list({ sessionID: digestInput.sessionID })).length, 0);
     }
     await Bun.write(join(root, "real-reload-result.json"), JSON.stringify({ pid: process.pid, inputs, models }));
     console.log("REAL_PROCESS_RELOAD_STABLE_ID_OK", JSON.stringify({ pid: process.pid, inputs, models }));
