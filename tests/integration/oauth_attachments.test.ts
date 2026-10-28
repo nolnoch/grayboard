@@ -51,7 +51,7 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
   const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
-  app.repo.aliases.create(outsider.authed.user_email, "be");
+  app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email);
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
@@ -114,15 +114,15 @@ test("private board visibility is checked again after reading the blob", async (
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
   const alice = issue();
-  app.repo.aliases.create(alice.authed.user_email, "be");
+  app.repo.aliases.create({ scope_kind: "person", scope_ref: alice.authed.user_email, name: "be" }, alice.authed.user_email);
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
-  const oldUpload = await fetch(`${base}/api/attachments?identity=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
+  const oldUpload = await fetch(`${base}/api/attachments?as=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
   expect(oldUpload.status).toBe(201);
   const id = (await oldUpload.json() as { id: number }).id;
-  expect((await fetch(`${base}/api/attachments/${id}?identity=be`, { headers: { Authorization: `Bearer ${legacy}` } })).status).toBe(200);
+  expect((await fetch(`${base}/api/attachments/${id}?as=be`, { headers: { Authorization: `Bearer ${legacy}` } })).status).toBe(200);
   expect((await attachment(legacy, "GET", id)).status).toBe(401);
-  for (const path of ["/api/attachments/1?identity=be", "/api/identities", "/api/admin/users", "/api/teams"]) {
+  for (const path of ["/api/attachments/1?as=be", "/api/identities", "/api/admin/users", "/api/teams"]) {
     const response = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${alice.token}` } });
     expect(response.status).toBe(401);
     await response.arrayBuffer();

@@ -1000,32 +1000,27 @@ test("#284 S10: a name record from before several aliases (one `name`) still res
 }, 30_000);
 
 // #284 S16: the Slack bridge's human is its user's `human` and nothing else.
-// A connection shaped as the bridge's (in-process, `human: true`) binds,
-// unbinds and ends nothing, and keeps its hold.
+// Its in-process attachment binds, unbinds and ends nothing, and keeps its
+// hold.
 test("the bridge's human connection binds, unbinds and ends nothing", async () => {
+  // #284 port: on master (#402) the bridge attaches its human through the
+  // application's trusted method, not a WSS frame, so the refusals are the
+  // application's.
   const user = srv.app.repo.users.findByEmail(A)!;
-  const frames: Record<string, any>[] = [];
-  const conn = {
-    readyState: 1,
-    data: { authed: { user_id: user.id, user_email: A, session_id: 0 }, primary: "", addresses: [], holds: [], ready: false, human: true },
-    send: (raw: string) => frames.push(JSON.parse(raw)),
-    close() {},
-  };
-  const ask = async (frame: Record<string, unknown>) => {
-    const req_id = `h${frames.length}-${frame.type}`;
-    srv.app.handlers.message(conn as never, JSON.stringify({ ...frame, req_id }));
-    return until(() => frames.find((f) => f.req_id === req_id));
-  };
-  expect(await ask({ type: "hello", proto: PROTO })).toMatchObject({ type: "hello_ok", id: "human" });
+  const pushes: string[] = [];
+  const sink = { deliver: (e: any) => { if (e.kind === "direct") pushes.push(e.message.body); }, probe: async () => true, closed() {} };
+  const { session, ok } = await srv.app.application.attachHuman({ user_id: user.id, user_email: A, session_id: 0 }, sink);
+  expect(ok).toMatchObject({ id: "human" });
   const human = `${A}/human`;
-  expect(await ask({ type: "unbind", alias: human })).toEqual({ type: "error", req_id: expect.any(String), code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it unbinds nothing` });
-  expect(await ask({ type: "bind", alias: "fe", create: true })).toMatchObject({ type: "error", code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it binds nothing` });
-  expect(await ask({ type: "end" })).toMatchObject({ type: "error", code: "bad_request", message: "the Slack bridge's humans have no session to end" });
+  const refused = async (f: () => unknown) => { try { await f(); } catch (e) { return { code: (e as any).code, message: (e as Error).message }; } return undefined; };
+  expect(await refused(() => srv.app.application.unbind(session, human))).toEqual({ code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it unbinds nothing` });
+  expect(await refused(() => srv.app.application.bind(session, { alias: "fe", create: true }))).toEqual({ code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it binds nothing` });
+  expect(await refused(() => srv.app.application.end(session))).toEqual({ code: "bad_request", message: "the Slack bridge's humans have no session to end" });
   // Still the human: a DM to it is pushed to this connection.
   const be = srv.client(alice, "be");
   await be.connect();
   expect(await be.request({ type: "send", recipient: "human", body: "still you" })).toMatchObject({ type: "send_ok" });
-  await until(() => frames.some((f) => f.type === "push" && f.message.body === "still you"));
+  await until(() => pushes.includes("still you"));
 });
 
 // #284 S5, decision 20: claims are the session's across its address set; a

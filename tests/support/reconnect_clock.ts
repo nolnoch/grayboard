@@ -44,7 +44,7 @@ async function scenario(fault?: "immediate-retry" | "missing-abort") {
     constructor() { opened++; }
     close() {}
   } as unknown as typeof WebSocket;
-  const client = new GrayboardClient("http://controlled.invalid", () => "stand-in", "fe", "stand-in", async () => {}, async () => {}, true, undefined, { probeTimeoutMs: 200 });
+  const client = new GrayboardClient("http://controlled.invalid", () => "stand-in", "stand-in", async () => {}, async () => {}, undefined, { probeTimeoutMs: 200 });
   try {
     client.connect();
     await flush();
