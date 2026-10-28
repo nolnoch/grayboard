@@ -32,6 +32,15 @@ export function mayActIn(repo: Repo, p: Principal, scope: { scope_kind: ScopeKin
   return userId != null && team && repo.teams.isMember(team.id, userId) ? null : `${p.name} isn't a member of team ${ref}`;
 }
 
+// Board visibility is the principal's: an org board is everyone's, a team
+// board its team's and members'. canSee resolves an address to this.
+export function principalCanSee(repo: Repo, p: Principal, board: Board): boolean {
+  if (board.scope === null) return true;
+  const team = teamOf(board.scope);
+  if (team === null) return false;
+  return p.kind === "team" ? p.name === team : mayActIn(repo, p, { scope_kind: "team", scope_ref: team }) === null;
+}
+
 export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "team"): Access {
   // Whether p acts inside team `teamName`: the team itself, or a member.
   const inTeam = (p: Principal, teamName: string): boolean =>
@@ -39,10 +48,7 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 
   const canSee = (handle: string, board: Board): boolean => {
     const p = repo.resolver.principalOf(handle);
-    if (!p) return false;
-    if (board.scope === null) return true;
-    const team = teamOf(board.scope);
-    return team !== null && inTeam(p, team);
+    return !!p && principalCanSee(repo, p, board);
   };
 
   return {

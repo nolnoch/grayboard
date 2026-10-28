@@ -246,6 +246,39 @@ test("hosted Slack has no dependency on the transitional wire adapter", async ()
 
 // #284 port: a WSS session with no alias acts as its ID (S13); the
 // read-only unbound model is hosted MCP's, so it's tested there.
+// An unbound hosted session acts as no address (#229): its reads are judged
+// by its user's principal, never as `<email>/human`, the bridge's reserved
+// identity that #announce authority rests on.
+test("unbound hosted reads never use the human address and still list and read boards", async () => {
+  const owner = (await application.selectIdentity(alice, "be", delivery(sink()), { session_key: "owner-secret" })).session;
+  application.call(owner, "board_create", { name: "e2e", purpose: "fixture" });
+  application.call(owner, "board_post", { board: "e2e", body: "hello" });
+  const team = store.repo.teams.create("private", bob.user_id);
+  store.repo.teams.addMember(team.id, bob.user_id);
+  const bobBe = (await application.selectIdentity(bob, "be", delivery(sink()), { session_key: "bob-secret" })).session;
+  application.call(bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" });
+  const asked: string[] = [];
+  const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
+  store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
+  // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
+  const unregistered = application.hostedSession(alice, "id:0000000000000", null, null, delivery(sink())).session;
+  application.hostedRegister(alice, "id:1111111111111");
+  const registered = application.hostedSession(alice, "id:1111111111111", null, null, delivery(sink())).session;
+  for (const session of [unregistered, registered]) {
+    expect(application.boardCatalog(session).boards.map(b => b.name)).toContain("e2e");
+    expect(application.boardCatalog(session).boards.map(b => b.name)).not.toContain("secret");
+    expect(application.boardSnapshot(session, "e2e").posts.map(p => p.body)).toEqual(["hello"]);
+    expect(() => application.boardSnapshot(session, "secret")).toThrow();
+  }
+  expect((application.call(registered, "board_list", {}) as { name: string }[]).map(b => b.name)).toContain("e2e");
+  expect((application.call(registered, "board_read", { board: "e2e" }) as { posts: { body: string }[] }).posts.map(p => p.body)).toEqual(["hello"]);
+  expect(asked.filter(a => a.endsWith("/human"))).toEqual([]);
+  expect(store.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect(store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE handle LIKE '%/human'").get()).toEqual({ n: 0 });
+  application.close(owner);
+  application.close(bobBe);
+});
+
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
   const { session, info } = application.hostedSession(alice, "hosted-unbound", null, null, delivery(sink()));
   expect(session.writerId).toBeUndefined();

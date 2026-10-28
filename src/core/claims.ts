@@ -196,8 +196,7 @@ export function release(
 // as master's hosted bind did. WSS and local sessions keep their claims on
 // the address they were taken under (#284 S6, PR 4: claims stay with an
 // unbound alias); only src/server/application.ts hostedBind calls this.
-// TODO(#284 port): should hosted rebind follow S6 too (claims stay with the
-// alias), or keep moving them as the hosted matrix (host.ts) asserts?
+// Hosted holds one name, so its claims move with it; S6 applies to WSS and local (#407).
 // Runs inside the caller's transaction (the bind's). Each move is a "moved"
 // event under the new holder, held_by naming the old one.
 export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {

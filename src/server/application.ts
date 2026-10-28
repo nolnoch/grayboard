@@ -22,8 +22,8 @@ import { serverAuditSink, writeAudit } from "./audit.ts";
 import { authLost, type AuthedUser, type AuthLost } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, cleanPlace, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
-  setAliasMeta, setPlace, touchAlias, touchId, registerId, idCollisionText, inheritStatus, normalizeBoard,
-  type AliasMetaSet, type CoreDb, type Pending, type PendingRef, type SnapshotOptions, type UnboundPeer,
+  setAliasMeta, setPlace, touchAlias, touchId, registerId, idCollisionText, inheritStatus, normalizeBoard, getBoard,
+  type AliasMetaSet, type Board, type CoreDb, type Viewer, type Pending, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -34,7 +34,7 @@ import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploa
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
-import { mayActIn } from "./access.ts";
+import { mayActIn, principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import { afterCommit } from "../core/sqlite.ts";
 
@@ -101,9 +101,8 @@ export const SWEEP_MS = 5_000;
 
 /**
  * The reads a hosted session with no name may make (master's read-only
- * model, kept for hosted MCP). TODO(#284 port): a WSS session with no alias
- * acts as its ID (S13); should an unbound hosted session do the same, or stay
- * read-only?
+ * model, kept for hosted MCP). Unlike a WSS session (S13), it doesn't act
+ * as its ID: the hosted session ID is routing, not a capability (#229).
  */
 export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
 const UNBOUND_ERROR = "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
@@ -450,7 +449,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!observers.has(observer)) return false;
     try {
       valid(observer.session);
-      if ((observer.session.readOnly ? [seer(observer.session)] : observer.session.addresses).some((a) => canSeeBoard(db, a, observer.board))) return true;
+      const s = observer.session;
+      if (s.readOnly ? seesBoard(s, observer.board) : s.addresses.some((a) => canSeeBoard(db, a, observer.board))) return true;
     } catch {}
     removeObserver(observer);
     return false;
@@ -621,9 +621,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // hold is released, and a live one is told (alias_lost) and sends as its
   // primary from here. A tools-only session writes only as its writes_as,
   // so it has nothing left to be: its session ends, and its reconnect's
-  // hello is refused. TODO(#284 port): a hosted session's hold is released
-  // in the database only; hosted binds only the user's own scope, so no
-  // hosted hold is revoked today.
+  // hello is refused. A hosted session's hold is released in the database
+  // only (#408); hosted binds only the user's own scope, so none is revoked
+  // today.
   function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): void {
     if (!uses.length) return;
     const ended: string[] = [];
@@ -877,8 +877,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     // Another session's hold is never taken over, live or in its grace. A
     // hosted holder is probed as master's hello did (#402): one idle past the
-    // hosted window ends, and frees the alias. TODO(#284 port): should a WSS
-    // bind ever take a hosted session's name, or refuse like any other hold?
+    // hosted window ends, and frees the alias; a live one refuses the bind.
     let holder = holderOf(db, address);
     const hosted = holder === null ? undefined : hub.hostedHolders.get(holder);
     if (hosted) {
@@ -984,9 +983,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       session.place = place;
       session.readOnly = name === null;
       const full = name === null ? null : `${authed.user_email}/${name}`;
-      // TODO(#284 port): a hosted session holds one name (its bind tool's),
-      // reads as it and its ID, and writes as the name; multi-alias, unbind
-      // and `as` on hosted aren't designed.
+      // A hosted session holds one name (its bind tool's), reads as it and
+      // its ID, and writes as the name; multi-alias, unbind and `as` on
+      // hosted aren't designed (#407).
       session.holds = full ? [full] : [];
       session.primary = full ?? id;
       session.addresses = full ? [full, id] : [id];
@@ -1249,17 +1248,21 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const observer of [...observers]) removeObserver(observer);
     },
   };
-  // A hosted session with no name has no address a principal owns (its ID
-  // may have no ids row), so a side-effect-free visibility check (catalog,
-  // snapshot) asks as an address in its user's scope, which canSee judges
-  // by principal alone. TODO(#284 port): master read as a synthetic
-  // email/~id handle; should an unbound hosted session's reads act as its
-  // ID (registering it), as a WSS session's do (S13)?
-  function seer(session: ApplicationSession): string {
-    return `${session.authed.user_email}/${HUMAN_NAME}`;
+  // A hosted session with no name doesn't act as its ID (routing, not a
+  // capability, #229), and acts as no address: its side-effect-free reads
+  // (catalog, snapshot, resource watches) are judged by its user's principal
+  // directly, never as an address in the user's scope (`human` there is the
+  // bridge's reserved identity).
+  function seer(session: ApplicationSession): (board: Board) => boolean {
+    const p = { kind: "user" as const, name: session.authed.user_email };
+    return (board) => principalCanSee(repo, p, board);
   }
-  // The address a board read acts as: the first of the session's that can see it (S14).
-  function reader(session: ApplicationSession, board: string): string {
+  function seesBoard(session: ApplicationSession, name: string): boolean {
+    const board = getBoard(db, normalizeBoard(name));
+    return !!board && seer(session)(board);
+  }
+  // Who a board read is judged for: the first of the session's addresses that can see it (S14).
+  function reader(session: ApplicationSession, board: string): Viewer {
     if (session.readOnly) return seer(session);
     try {
       return boardActor(db, "board_read", { board }, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });

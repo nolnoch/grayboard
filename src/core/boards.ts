@@ -386,10 +386,16 @@ export function getBoard(db: Database, name: string): Board | undefined {
 }
 
 // A board you can't see reads as missing, so its existence doesn't leak.
-function visibleBoard(db: Database, handle: string, input: string): Board {
+// Who a side-effect-free read is judged for: an address, or a predicate for a
+// reader that has none (an unbound hosted session, judged by its principal).
+export type Viewer = string | ((board: Board) => boolean);
+const sees = (db: Database, viewer: Viewer, b: Board): boolean =>
+  typeof viewer === "string" ? access(db).canSee(viewer, b) : viewer(b);
+
+function visibleBoard(db: Database, handle: Viewer, input: string): Board {
   const name = normalizeBoard(input);
   const b = getBoard(db, name);
-  if (!b || !access(db).canSee(handle, b)) {
+  if (!b || !sees(db, handle, b)) {
     throw new CoreError(`no such board #${name}; see board_list`);
   }
   return b;
@@ -1160,7 +1166,7 @@ export function getPost(db: Database, id: number): Post | undefined {
   return db.prepare(`SELECT ${POST_COLS} FROM posts WHERE id = ?`).get(id) as Post | undefined;
 }
 
-export function boardCatalog(db: Database, handle: string, after?: string): { boards: Board[]; next_after: string | null } {
+export function boardCatalog(db: Database, handle: Viewer, after?: string): { boards: Board[]; next_after: string | null } {
   if (after !== undefined && (typeof after !== "string" || !BOARD_NAME_RE.test(after) || after.trim() !== after)) {
     throw new CoreError("invalid catalog cursor");
   }
@@ -1169,7 +1175,7 @@ export function boardCatalog(db: Database, handle: string, after?: string): { bo
   while (boards.length <= 100) {
     const rows = db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT 100`).all(cursor) as Board[];
     for (const board of rows) {
-      if (access(db).canSee(handle, board)) boards.push(board);
+      if (sees(db, handle, board)) boards.push(board);
       if (boards.length > 100) return { boards: boards.slice(0, 100), next_after: boards[99]!.name };
     }
     if (rows.length < 100) break;
@@ -1182,7 +1188,7 @@ export type SnapshotOptions = { limit?: number; before_id?: number };
 export type BoardSnapshot = { board: Board; posts: Post[]; next_before_id: number | null };
 
 // History without attention-queue or subscription side effects, oldest first per page.
-export function snapshot(db: Database, handle: string, boardInput: string, opts: SnapshotOptions = {}): BoardSnapshot {
+export function snapshot(db: Database, handle: Viewer, boardInput: string, opts: SnapshotOptions = {}): BoardSnapshot {
   const board = visibleBoard(db, handle, boardInput);
   const limit = opts.limit === undefined ? 20 : opts.limit;
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new CoreError("snapshot limit must be an integer from 1 to 100");

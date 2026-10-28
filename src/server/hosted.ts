@@ -38,8 +38,7 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
 }
 // A hosted bind's result: a hosted session holds one name, so a bind
 // replaces it and its claims follow (master's #182 text, kept for hosted).
-// TODO(#284 port): a WSS session's bind adds a hold and moves nothing (S6);
-// should a hosted rebind keep moving claims?
+// Hosted holds one name, so its claims move with it; S6 applies to WSS and local (#407).
 function hostedBindOk(name: string, previous: string | null, moved: string[], instructions: (general: boolean) => string[], notes: string[] = []) {
   const text = [
     previous
