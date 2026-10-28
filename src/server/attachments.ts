@@ -25,13 +25,21 @@ export async function storeUpload(
   handle: string,
   file: AttachmentFile,
   detail: Record<string, unknown> = {},
+  guard?: () => void,
 ): Promise<AttachmentRow> {
   const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
-  const row = await storeAttachment(db, repo.blobs, handle, file, { quota });
-  writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
-    identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
-  });
-  return row;
+  const row = await storeAttachment(db, repo.blobs, handle, file, { quota, guard });
+  try {
+    guard?.();
+    writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
+      identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
+    });
+    return row;
+  } catch (error) {
+    // Only this upload, and only while unbound; concurrent sends keep their bytes.
+    if (guard) await releaseUpload(db, repo.blobs, row.id, handle);
+    throw error;
+  }
 }
 
 // Drops one of `handle`'s unsent uploads and audits it, for a send that
@@ -43,8 +51,9 @@ export async function releaseStored(
   handle: string,
   id: number,
   detail: Record<string, unknown> = {},
+  guard?: () => void,
 ): Promise<AttachmentRow | null> {
-  const row = await releaseUpload(db, repo.blobs, id, handle);
+  const row = await releaseUpload(db, repo.blobs, id, handle, guard);
   if (row) {
     writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,

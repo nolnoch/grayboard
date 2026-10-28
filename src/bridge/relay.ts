@@ -94,6 +94,8 @@ const HINT =
 
 export class Relay {
   private draining = false;
+  private drained: Promise<void> = Promise.resolve();
+  private finishDrain?: () => void;
   private again = false;
   private stopped = false;
   private readonly log: (msg: string) => void;
@@ -107,6 +109,7 @@ export class Relay {
   // New threads from Slack whose bus call is out and whose mapping isn't
   // stored yet (`mapping`).
   private unmapped = new Set<Promise<void>>();
+  private publishing: { done: Promise<void>; finish: () => void } | null = null;
 
   constructor(
     private readonly store: RelayStore,
@@ -123,6 +126,12 @@ export class Relay {
 
   stop(): void {
     this.stopped = true;
+    this.publishing?.finish();
+  }
+
+  /** After stop, wait before closing the store; never awaited from a relay callback. */
+  async settled(): Promise<void> {
+    await Promise.all([this.drained, this.inbound]);
   }
 
   // ── grayboard → Slack ──────────────────────────────────────────────────────
@@ -142,6 +151,7 @@ export class Relay {
       return;
     }
     this.draining = true;
+    this.drained = new Promise(resolve => { this.finishDrain = resolve; });
     try {
       do {
         this.again = false;
@@ -155,6 +165,8 @@ export class Relay {
       if (!this.stopped) this.log(`outbox: ${(e as Error).message}`);
     } finally {
       this.draining = false;
+      this.finishDrain?.();
+      this.finishDrain = undefined;
     }
   }
 
@@ -232,14 +244,27 @@ export class Relay {
       const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
       // The item's message ts; null when Slack took it but never said where.
       let ts: string | null | undefined;
-      if (progress.files?.length) ts = await this.share(progress, save, text(), row?.thread_ts);
-      if (ts === undefined) ts = await this.postText(text(), name, row?.thread_ts);
-      if (row) this.store.advance(row.thread_ts, x.id);
-      else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
-      const errors = [progress.refused?.length ? "files_refused" : null, !row && !ts ? "ts_unknown" : null].filter(Boolean);
-      progress.error = errors.length ? errors.join(",") : null;
-      progress.posted = true;
-      save();
+      // Slack may deliver a reply before the post's HTTP response reaches us.
+      let finish!: () => void;
+      const publishing = row ? null : { done: new Promise<void>((r) => (finish = r)), finish: () => finish() };
+      if (publishing) this.publishing = publishing;
+      try {
+        if (this.stopped) throw new Error("relay stopped");
+        if (progress.files?.length) ts = await this.share(progress, save, text(), row?.thread_ts);
+        if (ts === undefined) {
+          if (this.stopped) throw new Error("relay stopped");
+          ts = await this.postText(text(), name, row?.thread_ts);
+        }
+        if (row) this.store.advance(row.thread_ts, x.id);
+        else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
+        const errors = [progress.refused?.length ? "files_refused" : null, !row && !ts ? "ts_unknown" : null].filter(Boolean);
+        progress.error = errors.length ? errors.join(",") : null;
+        progress.posted = true;
+        save();
+      } finally {
+        publishing?.finish();
+        if (this.publishing === publishing) this.publishing = null;
+      }
       if (!row && !ts) {
         this.log(`slack: no ts for grayboard ${x.kind} ${x.id}; its Slack thread isn't mapped`);
         await this.say(null, `⚠️ Slack didn't say where it put ${x.kind === "dm" ? "message" : "post"} ${x.id} from ${name}, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead.`);
@@ -428,7 +453,17 @@ export class Relay {
   }
 
   private async reply(threadTs: string, ts: string, text: string, files: Record<string, any>[]): Promise<void> {
-    const row = this.store.byTs(threadTs);
+    let row = this.store.byTs(threadTs);
+    const publishing = this.publishing;
+    if (!row && publishing) {
+      await publishing.done;
+      if (this.stopped) {
+        this.log(`slack: reply ${JSON.stringify(ts)} in thread ${JSON.stringify(threadTs)} not sent: relay stopped while awaiting mapping`);
+        await this.say(threadTs, "Not sent: the bridge stopped while connecting this thread. Send your reply again after it restarts.");
+        return;
+      }
+      row = this.store.byTs(threadTs);
+    }
     if (!row) {
       await this.say(threadTs, `This thread isn't connected to a grayboard conversation. ${HINT}`);
       return;

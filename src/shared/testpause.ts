@@ -8,6 +8,17 @@
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
+export async function testPauseAsync(point: string, env = process.env): Promise<void> {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file) return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname(file))) throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 export function testPause(point: string, env = process.env): void {
   const file = env.BUS_TEST_PAUSE_FILE;
   if (env.BUS_TEST_PAUSE !== point || !file) return;

@@ -305,7 +305,7 @@ function optNum(a: Record<string, unknown>, k: string): number | undefined {
   return v;
 }
 
-export type ToolOutcome = { result: unknown; wake: string[] };
+export type ToolOutcome = { result: unknown; wake: string[]; boards?: string[] };
 
 // board_post's result.
 export type BoardPostResult = {
@@ -364,7 +364,7 @@ export function callBoardTool(
         return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
       }
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
-      return { result: b, wake: [] };
+      return { result: b, wake: [], boards: [b.name] };
     }
 
     case "board_post": {
@@ -388,7 +388,7 @@ export function callBoardTool(
         ...(deferred.length ? { deferred } : {}),
         ...(unresolved.length ? { unresolved } : {}),
       };
-      return { result, wake };
+      return { result, wake, boards: [p.board] };
     }
 
     case "board_read": {
@@ -447,14 +447,14 @@ export function callBoardTool(
         addresses: ctx.addresses,
         session: ctx.session,
       });
-      const { wake, ...rest } = r;
-      return { result: rest, wake };
+      const { wake, boards, ...rest } = r;
+      return { result: rest, wake, boards };
     }
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
-      return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake };
+      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
+      return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake, boards };
     }
 
     case "claim_watch":

@@ -9,6 +9,7 @@ import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { adapterSource } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
+import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
 
 function writeCredentials(creds: Credentials): void {
@@ -487,6 +488,30 @@ program
 const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard";
 
 program
+  .command("setup-opencode")
+  .description("Configure an explicitly selected OpenCode V2 hosted MCP scope; no login or package installation")
+  .requiredOption("--url <endpoint>", "Hosted MCP endpoint ending in /mcp")
+  .option("--revision <sha>", "Full Git commit hash for the default Git/subdirectory plugin source")
+  .option("--plugin <directory>", "Fallback: installed grayboard-opencode directory instead of Git")
+  .option("--name <name>", "Optional startup mailbox binding; does not enroll delivery")
+  .option("--create", "Explicitly allow creating the configured name (default false)")
+  .requiredOption("--config <path>", "Selected OpenCode JSON/JSONC file")
+  .option("--migrate", "Explicitly migrate recognized Grayboard entries and back up owned adapters")
+  .option("--dry-run", "Validate and report targeted changes without filesystem writes")
+  .action((opts: OpenCodeSetupOptions) => {
+    try {
+      const result = setupOpenCode(opts, ADAPTERS[1]!.source);
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
+      for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
+      console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
+      console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
+    } catch (e) {
+      console.error(`[grayboard] ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+program
   .command("setup")
   .description("Choose local or team-server mode and register grayboard with Claude Code, omp, opencode, and pi")
   .option("--local", "Agents talk on this machine only")
@@ -594,7 +619,9 @@ program
     // entry, disabled, is the plugin's config. opencode merges opencode.json
     // and opencode.jsonc, so this leaves a commented .jsonc alone.
     const opencode = !!Bun.which("opencode");
-    if (opts.register && opencode && (await confirm("Make grayboard available in every opencode project?", true))) {
+    const ocGuard = opts.register && opencode ? opencodeShimGuard(OC_DIR) : { skip: false };
+    if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
+    if (opts.register && opencode && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       const plugin = ADAPTERS[1]!;
@@ -659,6 +686,13 @@ program
       // A symlink means a checkout is installed there on purpose: leave it,
       // and the entry its version expects.
       if (!existsSync(a.path) || lstatSync(a.path).isSymbolicLink()) continue;
+      if (a.path === ADAPTERS[1]!.path) {
+        const guard = opencodeShimGuard(OC_DIR);
+        if (guard.skip) {
+          if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
+          continue;
+        }
+      }
       writeAdapter(a.path, a.source);
       console.log(`Refreshed ${a.path}`);
       if (!a.config) continue;

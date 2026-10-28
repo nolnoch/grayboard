@@ -306,7 +306,7 @@ test("a repeated decline (its answer lost, #254) succeeds without a second relea
   const outbox = () => db.prepare(`SELECT handle, delivered_at, wake FROM outbox WHERE post_id = ? ORDER BY handle`).all(r.post.id);
   const before = { outbox: outbox(), events: claimEvents(claimKey(r.post.id)) };
   const again = release(db, "fe", claimKey(r.post.id), "not my lane");
-  expect(again).toEqual({ wake: [], releasedAt: expect.any(Number) });
+  expect(again).toEqual({ wake: [], boards: [], releasedAt: expect.any(Number) });
   expect(claimEvents(claimKey(r.post.id))).toEqual(before.events);
   expect(outbox()).toEqual(before.outbox);
   expect(listClaims(db).find((c) => c.key === claimKey(r.post.id))?.holder).toBe("sim");

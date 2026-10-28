@@ -35,6 +35,11 @@ for i in "${!shas[@]}"; do
   fi
 done
 
+if [[ "$(bun --version)" != "1.4.4" ]]; then
+  echo "[pre-push] Use Bun 1.4.4, matching CI and the package fixtures; push aborted." >&2
+  exit 1
+fi
+
 echo "[pre-push] Typecheck..."
 if ! bun run typecheck; then
   echo "[pre-push] Typecheck failed; push aborted." >&2
@@ -42,7 +47,14 @@ if ! bun run typecheck; then
 fi
 
 echo "[pre-push] Tests..."
-if ! bun test; then
+if ! bun run test; then
   echo "[pre-push] Tests failed; push aborted." >&2
+  exit 1
+fi
+
+if ! bun run test:opencode ||
+   ! bun run test:opencode:host ||
+   ! bun run test:opencode:config; then
+  echo "[pre-push] OpenCode package gate failed; push aborted." >&2
   exit 1
 fi

@@ -11,13 +11,18 @@ on:
       suite:
         description: "Suite to run"
         type: choice
-        options: [upgrade-matrix]
+        options: [upgrade-matrix, hosted-live, hosted-public, hosted-network]
         default: upgrade-matrix
   workflow_call:
     inputs:
       suite:
         type: string
         required: true
+      public_revision:
+        description: "Public install commit; empty uses the triggering commit"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -30,19 +35,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix"]' || format('["{0}"]', inputs.suite)) }}
+        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix","hosted-live","hosted-public"]' || inputs.suite == 'hosted-network' && '["hosted-live","hosted-public"]' || format('["{0}"]', inputs.suite)) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Validate public source commit
+        if: matrix.suite == 'hosted-public'
+        id: public
+        env:
+          REVISION: ${{ inputs.public_revision || github.sha }}
+        run: |
+          [[ "$REVISION" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::Public revision must be a full commit SHA.'; exit 1; }
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+      # Compare installed bytes to the exact public commit under test.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.suite == 'hosted-public'
+        with:
+          ref: ${{ steps.public.outputs.revision }}
+          persist-credentials: false
+
+      - name: Require hosted package in the selected commit
+        if: matrix.suite == 'hosted-public'
+        run: |
+          test -f adapters/opencode-v2/package.json || { echo '::error::Selected commit lacks the hosted package.'; exit 1; }
+
       - uses: ./.github/actions/setup
+        with:
+          node: "true"
+
+      - name: Independent frozen hosted package install
+        if: startsWith(matrix.suite, 'hosted-')
+        working-directory: adapters/opencode-v2
+        run: bun install --frozen-lockfile
 
       - name: Run ${{ matrix.suite }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # lifts the releases API's anonymous rate limit
           GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
           SUITE: ${{ matrix.suite }}
+          GRAYBOARD_PUBLIC_REVISION: ${{ steps.public.outputs.revision }}
         run: scripts/e2e.sh "$SUITE"
 
       - name: Upload run dir
@@ -50,7 +84,10 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/e2e-run
+          path: |
+            ${{ runner.temp }}/e2e-run/result
+            ${{ runner.temp }}/e2e-run/evidence
+            ${{ !startsWith(matrix.suite, 'hosted-') && format('{0}/e2e-run', runner.temp) || '' }}
           retention-days: 7
           if-no-files-found: warn
 
@@ -66,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ["upgrade-matrix"]   # the schedule's suites, as in e2e's matrix
+        suite: ["upgrade-matrix", "hosted-live", "hosted-public"]   # the schedule's suites, as in e2e's matrix
     permissions:
       issues: write
     steps:

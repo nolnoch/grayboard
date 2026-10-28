@@ -144,6 +144,7 @@ export type ServerMessage =
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
   | "rate_limited" | "internal" | "superseded"
+  | "receipt_capacity"
   // hello refused: another live connection holds this identity
   | "identity_in_use"
   // hello refused: create: false and the name has never existed
@@ -151,7 +152,14 @@ export type ErrorCode =
   // a read-only connection asked for something that needs a name
   | "unbound"
   // hello refused: the session key's ID is another principal's session (#284)
-  | "id_collision";
+  | "id_collision"
+
+  | "child_session"
+  | "invalid_registration"
+  | "root_is_child"
+  | "child_bound"
+  | "child_registered_elsewhere"
+  | "has_children";
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");
