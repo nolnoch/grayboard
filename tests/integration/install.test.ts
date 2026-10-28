@@ -4,7 +4,7 @@
 // decides what the unit looks like and what /healthz says. Each run uses a copy of
 // install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
@@ -21,11 +21,6 @@ const target = `${process.platform}-${process.arch}`;
 const BINS = ["grayboard", "grayboard-server"] as const;
 type Bins = Partial<Record<(typeof BINS)[number], string>>;
 
-/**
- * Publish the release the curl stub serves: `bins` as the assets; the API's
- * digests over `api` and a SHA256SUMS for `sumsTag` over `sums` (each
- * defaulting to `bins`; a bin left out isn't listed), signed by `key`.
- */
 // The deploy files a server install takes (#311): asset name -> body.
 const DEPLOY = {
   "deploy-grayboard.service": "[Service]\nExecStart=/usr/local/bin/grayboard-server\n",
@@ -34,6 +29,11 @@ const DEPLOY = {
 };
 type Deploy = Record<string, string>;
 
+/**
+ * Publish the release the curl stub serves: `bins` as the assets; the API's
+ * digests over `api` and a SHA256SUMS for `sumsTag` over `sums` (each
+ * defaulting to `bins`; a bin left out isn't listed), signed by `key`.
+ */
 function publish(
   bins: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN },
   o: { api?: Bins; sums?: Bins; sumsTag?: string; key?: TestKey; deploy?: Deploy; deploySums?: Deploy; deployApi?: Deploy } = {},
@@ -101,7 +101,8 @@ case "$STUB_HEALTH" in
 esac`);
   writeStub("systemctl", `
 case "$1 $2 $3" in
-  "cat grayboard "*) [ "$STUB_UNIT" = 1 ] ;;
+  "cat grayboard "*) [ "$STUB_UNIT" = 1 ] || [ -f "$GRAYBOARD_UNIT_DIR/grayboard.service" ] ;;
+  "show -p NeedDaemonReload") echo "\${STUB_NEEDRELOAD:-no}" ;;
   "show -p ExecStart") echo "{ path=$STUB_EXEC ; argv[]=$STUB_EXEC ; ignore_errors=no }" ;;
   "show -p ActiveState") echo "$STUB_STATE" ;;
   "show -p EnvironmentFiles") echo "${dir}/env (ignore_errors=no)" ;;
@@ -447,16 +448,160 @@ test("a deploy file SHA256SUMS doesn't list, or whose bytes differ from it, or t
   expectRefused(install(), `deploy-grayboard.service: sha256 ${sha(DEPLOY["deploy-grayboard.service"])}, but the release API lists sha256:${sha("other")}`);
 });
 
-test("an unwritable deploy destination refuses before any binary is replaced", () => {
+test("an unwritable first deploy destination refuses before any binary is replaced", () => {
   mkdirSync(join(dir, "etc"), { recursive: true });
   writeFileSync(UNIT_DIR(), "a file where the directory should be");
   expectRefused(install({ unit: false }), `couldn't write ${UNIT()} (run as root?)`);
 });
 
-test("a failed daemon-reload after writing the unit is reported", () => {
-  const r = install({ unit: false, reloadRc: 1 });
+// #395 item 1: a failure on a LATER destination used to leave the earlier ones written.
+test("an unwritable later deploy destination leaves nothing written: no unit, no temp files, no reload, old binaries", () => {
+  mkdirSync(join(dir, "etc"), { recursive: true });
+  writeFileSync(join(dir, "etc", "caddy"), "a file where the directory should be");
+  expectRefused(install({ unit: false }), `couldn't write ${CADDYFILE()} (run as root?)`);
+  expect(readdirSync(UNIT_DIR())).toEqual([]);
+  expect(reloads()).toBe(0);
+});
+
+test("a server binary backup that can't be taken refuses with no deploy file replaced and no .prev left behind", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  mkdirSync(join(dir, "etc", "caddy"), { recursive: true });
+  writeFileSync(UNIT(), "old unit");
+  writeFileSync(CADDYFILE(), "stock caddyfile");
+  writeFileSync(join(dir, "bin", "grayboard-server.prev"), "older");
+  chmodSync(join(dir, "bin", "grayboard-server.prev"), 0o444);
+  const r = install({ env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
   expect(r.code).toBe(1);
-  expect(r.err).toContain("systemctl daemon-reload failed");
+  expect(r.err).toContain("couldn't back up");
+  expect(readFileSync(UNIT(), "utf8")).toBe("old unit");
+  expect(readFileSync(CADDYFILE(), "utf8")).toBe("stock caddyfile");
+  expect(readdirSync(UNIT_DIR())).toEqual(["grayboard.service"]);
+  expect(readdirSync(join(dir, "etc", "caddy"))).toEqual(["Caddyfile"]);
+  expect(existsSync(BACKUP())).toBe(false);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
+  expect(reloads()).toBe(0);
+});
+
+test("a failed daemon-reload leaves the binaries old and says so; a rerun reloads because systemd reports the unit changed", () => {
+  const failed = install({ unit: false, reloadRc: 1 });
+  expect(failed.code).toBe(1);
+  expect(failed.err).toContain("systemctl daemon-reload failed");
+  expect(failed.err).toContain("binaries were NOT replaced");
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
+  // The unit on disk now equals the release's, so only NeedDaemonReload says it's unloaded.
+  const rerun = install({ env: { STUB_NEEDRELOAD: "yes" } });
+  expect(rerun.code, rerun.err).toBe(0);
+  expect(reloads()).toBe(2);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe(STUB_BIN);
+  expect(restarts()).toBe(1);
+});
+
+test("an unchanged unit systemd has already loaded isn't reloaded", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  writeFileSync(UNIT(), DEPLOY["deploy-grayboard.service"]);
+  expect(install({ env: { STUB_NEEDRELOAD: "no" } }).code).toBe(0);
+  expect(reloads()).toBe(0);
+});
+
+test("deploy files are written mode 644 (unit, Caddyfile) and 755 (backup script)", () => {
+  expect(install({ unit: false }).code).toBe(0);
+  expect(statSync(UNIT()).mode & 0o777).toBe(0o644);
+  expect(statSync(CADDYFILE()).mode & 0o777).toBe(0o644);
+  expect(statSync(BACKUP()).mode & 0o777).toBe(0o755);
+});
+
+// #395 item 2: the closing message must not claim a Caddyfile that was kept.
+test("a first install that kept an existing Caddyfile says so and how to take the release's", () => {
+  mkdirSync(join(dir, "etc", "caddy"), { recursive: true });
+  writeFileSync(CADDYFILE(), "stock caddyfile");
+  const r = install({ unit: false });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`kept your ${CADDYFILE()}`);
+  expect(r.out).toContain(`diff -u ${CADDYFILE()} -`);
+  expect(r.out).toContain(`sha256 ${sha("stock caddyfile").slice(0, 12)}`);
+  expect(r.out).toContain(`Your ${CADDYFILE()} was kept, not the release's`);
+  expect(r.out).not.toContain("Set your hostname");
+  expect(r.out).toContain(`schedule ${BACKUP()}`);
+  expect(readFileSync(CADDYFILE(), "utf8")).toBe("stock caddyfile");
+});
+
+test("a second GRAYBOARD_DEPLOY_REPLACE keeps the first's .prev and backs the new differing file up beside it", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  writeFileSync(UNIT(), "operator's first unit");
+  const env = { GRAYBOARD_DEPLOY_REPLACE: "1" };
+  expect(install({ env }).code).toBe(0);
+  writeFileSync(UNIT(), "operator's second unit");
+  expect(install({ env }).code).toBe(0);
+  expect(readFileSync(`${UNIT()}.prev`, "utf8")).toBe("operator's first unit");
+  const timestamped = readdirSync(UNIT_DIR()).filter((f) => f.startsWith("grayboard.service.prev."));
+  expect(timestamped.length).toBe(1);
+  expect(readFileSync(join(UNIT_DIR(), timestamped[0]!), "utf8")).toBe("operator's second unit");
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+});
+
+test("a symlinked unit (a mask) is kept, never replaced, even with GRAYBOARD_DEPLOY_REPLACE=1", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  symlinkSync("/dev/null", UNIT());
+  const r = install({ env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain("it is a symlink");
+  expect(lstatSync(UNIT()).isSymbolicLink()).toBe(true);
+  expect(readlinkSync(UNIT())).toBe("/dev/null");
+  expect(existsSync(`${UNIT()}.prev`)).toBe(false);
+});
+
+test("a new unit whose ExecStart isn't the server this run installed is warned about", () => {
+  const r = install({ unit: false });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`WARNING: the unit runs /usr/local/bin/grayboard-server, but this install put the server at ${join(dir, "bin", "grayboard-server")}`);
+  publish(undefined, { deploy: { ...DEPLOY, "deploy-grayboard.service": `[Service]\nExecStart=${join(dir, "bin", "grayboard-server")} --flag\n` } });
+  rmSync(UNIT());
+  const ok = install({ unit: false });
+  expect(ok.code, ok.err).toBe(0);
+  expect(ok.out).not.toContain("WARNING");
+});
+
+test("a failed restart after replacing the unit prints a rollback that restores the unit and reloads too", () => {
+  mkdirSync(UNIT_DIR(), { recursive: true });
+  writeFileSync(UNIT(), "old unit");
+  const r = install({ health: "stale", env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain(`Roll back: cp -p ${UNIT()}.prev ${UNIT()} && systemctl daemon-reload && cp -p ${join(dir, "bin", "grayboard-server.prev")}`);
+});
+
+// A host without systemctl can't be a systemd server: the binaries install, the deploy files don't.
+test("a host with no systemctl installs the binaries, fetches no deploy files, and says why", () => {
+  const bare = join(dir, "bare");
+  mkdirSync(bare);
+  for (const d of [join(dir, "stubs"), ...(process.env.PATH ?? "").split(":")]) {
+    if (!d || !existsSync(d)) continue;
+    for (const f of readdirSync(d)) {
+      if (f === "systemctl" || existsSync(join(bare, f))) continue;
+      try { symlinkSync(join(d, f), join(bare, f)); } catch {}
+    }
+  }
+  const r = install({ path: bare });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain("this host has no systemctl");
+  expect(readFileSync(join(dir, "downloads.log"), "utf8")).not.toContain("deploy-");
+  for (const f of [UNIT(), CADDYFILE(), BACKUP()]) expect(existsSync(f), f).toBe(false);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe(STUB_BIN);
+});
+
+// The release publishes what install.sh asks for by name (#395 item 6): a typo here
+// fails every server install after the release, and releases are immutable.
+test("every deploy asset install.sh takes is one release.yml publishes and signs", () => {
+  const sh = readFileSync(join(ROOT, "install.sh"), "utf8");
+  const yml = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8");
+  const names = sh.match(/^deploy_assets=\(([^)]*)\)/m)?.[1]?.trim().split(/\s+/) ?? [];
+  expect(names.length).toBe(3);
+  for (const name of names) {
+    expect(yml, name).toContain(name);
+    expect(yml, `${name} is copied into the release dir`).toMatch(new RegExp(`cp [^\\n]*${name.replace(/[.-]/g, "\\$&")}`));
+  }
+  expect(yml).toMatch(/sha256sum[^\n]*deploy-\*/);
 });
 
 test("GRAYBOARD_NO_DEPLOY=1, and a CLI-only install, fetch and place no deploy files", () => {
