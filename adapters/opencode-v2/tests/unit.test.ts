@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
 import { Wire, SubscriberError, LeaseUnavailable, subscriberError } from "../src/wire.js";
+import { failureMessage } from "../src/diagnostics.js";
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
   expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
@@ -13,6 +14,22 @@ test("typed unknown-name suggestions are bounded validated account names, not ar
   }
   expect(subscriberError({ code: "bad_request", known: ["be"] }, false).known).toBeUndefined();
   expect(subscriberError({ code: "receipt_capacity" }, true).code).toBe("receipt_capacity");
+});
+test("an in-use refusal carries a bounded plain-text holder; other codes and unsafe text drop it", () => {
+  const holder = "the hosted session ses_other, in /work/app, last seen 3s ago";
+  const error = subscriberError({ code: "identity_in_use", holder }, false);
+  expect(error.holder).toBe(holder);
+  expect(failureMessage(error)).toBe(`Operation refused (identity_in_use); held by ${holder}`);
+  expect(subscriberError({ code: "identity_in_use", holder: `the hosted session x, in /${"d".repeat(1024)}, last seen 0s ago` }, false).holder).toBeDefined();
+  for (const unsafe of ["", "x".repeat(2049), "held\nby", "held\u009bby", "held‮by", "held⁧by", 42, ["held"]]) {
+    const refused = subscriberError({ code: "identity_in_use", holder: unsafe }, false);
+    expect(refused.holder).toBeUndefined();
+    expect(failureMessage(refused)).toBe("Operation refused (identity_in_use)");
+  }
+  expect(subscriberError({ code: "identity_unknown", holder }, false).holder).toBeUndefined();
+  expect(subscriberError({ code: "not_found", holder }, true).holder).toBeUndefined();
+  expect(failureMessage(Object.assign(new SubscriberError("identity_unknown"), { holder }))).toBe("Operation refused (identity_unknown)");
+  expect(failureMessage(Object.assign(new SubscriberError("identity_in_use"), { holder: "held‮by" }))).toBe("Operation refused (identity_in_use)");
 });
 export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", name: "be" };
 export const identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };

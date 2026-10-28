@@ -3,8 +3,10 @@ import type { Configuration } from "./model.js";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export class SubscriberError extends Error {
-  constructor(readonly code: string, readonly known?: string[]) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}`); }
+  constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
 }
+// The server's holder is free text naming the account's other session; it is shown, so it must not carry control or bidi characters.
+export const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
@@ -14,7 +16,8 @@ export function subscriberError(value: unknown, leaseOperation: boolean): Subscr
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
   const suggestions = (value as { known?: unknown } | undefined)?.known;
   const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 256 && suggestions.every(name => typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
-  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known);
+  const holder = (value as { holder?: unknown } | undefined)?.holder;
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "identity_in_use" && holderText(holder) ? holder : undefined);
 }
 
 export class Wire {
