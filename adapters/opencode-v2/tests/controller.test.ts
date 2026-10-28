@@ -140,6 +140,23 @@ test("diagnostics retain each root across unrelated activity and restart without
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 
+test("an ended root stays listed but never speaks for the live roots", async () => {
+  const r = runtime({}, async () => {}); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
+    r.nodes.delete("B"); await r.controller.observe("session.deleted", { sessionID: "B" });
+    expect(r.controller.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "paused", operation: "session_end" });
+    expect(r.controller.status()).toMatchObject({ state: "active", sessionID: "R" });
+    expect(r.controller.status().message).toContain("be");
+    await r.controller.close();
+    restarted = r.restart(); await restarted.restore();
+    await until(() => restarted!.status().state === "active");
+    expect(restarted.status().sessionID).toBe("R");
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+
 test.each([false, true])("expiry failed-continuation barrier joins actual subscriber admission and detects late model work (%j)", async forbidden => {
   const work = observeRuns(Controller.prototype), gate = new FailedContinuation();
   const admission = barrier(), releaseAdmission = barrier(), model = barrier();

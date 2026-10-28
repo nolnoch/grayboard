@@ -136,8 +136,10 @@ export class Diagnostics {
   }
   status(): Status {
     const roots = structuredClone([...this.records.values()]);
-    const failed = roots.find(r => r.state === "paused" || r.state === "degraded");
-    const last = failed ?? roots.at(-1);
+    // An ended root's pause asks nothing of anyone; it stays listed but never speaks for the others.
+    const live = roots.filter(r => !(r.state === "paused" && r.operation === "session_end"));
+    const failed = live.find(r => r.state === "paused" || r.state === "degraded");
+    const last = failed ?? live.at(-1) ?? roots.at(-1);
     return { state: this.failed ? "degraded" : last?.state ?? "unenrolled", message: this.failed ? "Diagnostic persistence unavailable; approval is unchanged" : last?.message ?? "Approve an active root; approval does not bind a name", ...(last?.sessionID ? { sessionID: last.sessionID } : {}), roots };
   }
   async flush() { await this.pending; return !this.failed; }

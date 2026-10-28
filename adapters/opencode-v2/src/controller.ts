@@ -398,7 +398,7 @@ export class Controller {
         r.paused = true; r.epoch++; r.abort?.abort();
         await this.serial(async () => {
           await this.stop(r); await this.release(r).catch(error => this.failure("session_end", error, r));
-          await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released");
+          await this.ctx.storage.set(`paused:${id}`, true); this.set(r, "paused", "Root ended; ownership released", "session_end");
         });
       } else {
         const e = r?.e ?? await this.capture(path.root);
