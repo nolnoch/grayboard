@@ -744,6 +744,47 @@ test("one address refused by its own limit can't drain the global OAuth bucket",
   expect(scopes).toEqual(["address"]);
 });
 
+// The token routes are charged only for a refused request that carries grant
+// material (#283): a cross-site form post reaches them, and must not lock an
+// office NAT out of token refresh.
+const tokenPost = (path: string, params: Record<string, string>, headers: Record<string, string> = {}) =>
+  service.fetch(new Request(base + path, { method: "POST", body: new URLSearchParams(params), headers }), { key: "office" }).then(r => r!.status);
+const refusedRows = () => storage.db.query("SELECT 1 FROM access_log WHERE action = 'oauth.request_refused'").all().length;
+
+test("token posts without grant material or from a foreign origin cost nothing; only refused grants spend the token bucket", async () => {
+  const code = await issue(), spent = await issue();
+  await redeem(spent);
+  service.close(); config.oauthLimit = { burst: 2, perSec: 1 };
+  service = makeService();
+  for (let i = 0; i < 20; i++) {
+    expect(await tokenPost("/oauth/token", { grant_type: "authorization_code", client_id: "native" })).toBe(400);
+    expect(await tokenPost("/oauth/revoke", { client_id: "native", token_type_hint: "refresh_token" })).toBe(400);
+    expect(await tokenPost("/oauth/token", tokenParams(code), { Origin: "https://foreign.example" })).toBe(403);
+    expect(await tokenPost("/oauth/token?access_token=x", tokenParams(code))).toBe(400);
+  }
+  expect(refusedRows()).toBe(0);
+  expect(await tokenPost("/oauth/token", tokenParams(code))).toBe(200);
+  expect(await tokenPost("/oauth/token", tokenParams(spent))).toBe(400);
+  expect(await tokenPost("/oauth/token", tokenParams(spent))).toBe(400);
+  expect(refusedRows()).toBe(2);
+  expect(await tokenPost("/oauth/token", tokenParams(spent))).toBe(429);
+  expect(await tokenPost("/oauth/revoke", { client_id: "native", token: random() })).toBe(429);
+  const scopes = storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'oauth.rate_limited'").all().map(r => JSON.parse(r.detail).scope);
+  expect(scopes).toEqual(["token_address"]);
+  expect((await service.fetch(new Request(authorization().url), { key: "office" }))!.status).toBe(303);
+});
+
+test("a drained browser-route bucket doesn't block token refresh from the same address", async () => {
+  const tokens = await redeem(await issue());
+  service.close(); config.oauthLimit = { burst: 2, perSec: 1 };
+  service = makeService();
+  const browse = () => service.fetch(new Request(base + "/oauth/unknown"), { key: "office" }).then(r => r!.status);
+  for (let i = 0; i < 2; i++) expect(await browse()).toBe(405);
+  expect(await browse()).toBe(429);
+  expect((await service.fetch(new Request(authorization().url), { key: "office" }))!.status).toBe(429);
+  expect(await tokenPost("/oauth/token", { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token, resource: service.resource })).toBe(200);
+});
+
 test("expired upstream/consent/code never mints; browser pending capacity and trusted address rate limits bounded", async () => {
   const browser = new Browser(); const a = authorization();
   const r = await browser.request(a.url), google = new URL(r.headers.get("location")!);
