@@ -89,6 +89,7 @@ export async function startSlackBridge(
     socket?.stop();
     relay?.stop();
     await client.close().catch(() => {});
+    await relay?.settled();
     store.close();
     await rm(scratchRoot, { recursive: true, force: true });
     finish(code);

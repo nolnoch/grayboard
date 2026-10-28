@@ -261,15 +261,14 @@ export class SlackBridge implements SlackLinker {
       progress: (id) => repo.slack.progress(link.user_id, ref(id)),
       setProgress: (id, progress) => repo.slack.setProgress(link.user_id, ref(id), progress),
       done: (id) => {
-        repo.slack.clearProgress(link.user_id, ref(id));
         const p = outbox.get(id);
-        outbox.delete(id);
         const m = p?.meta ?? {};
-        if (!session.active) return;
-        try {
-          if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
-          else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)]);
-        } catch {}
+        if (!session.active) throw new Error("Slack delivery session ended before receipt");
+        // Receipt is synchronous and validates the live session; retain progress on any refusal.
+        if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
+        else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)]);
+        repo.slack.clearProgress(link.user_id, ref(id));
+        outbox.delete(id);
       },
     };
 
