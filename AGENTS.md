@@ -24,7 +24,7 @@ Install once per clone: `git config core.hooksPath scripts/hooks`. `scripts/hook
 
 ## Contributions
 
-- Commits are signed — `commit.gpgsign` is on in these checkouts; unsigned commits don't merge.
+- Signed commits are encouraged, not enforced: the ruleset doesn't require signatures, so an unsigned commit still merges. Where `commit.gpgsign` is on and a commit fails to sign, ask the user to unlock the key rather than committing unsigned.
 - GitHub Actions are pinned by full commit SHA with the release in a trailing comment (`@<sha> # vX.Y.Z`, the commit an annotated tag points to, not the tag object); the repo's `sha_pinning_required` setting fails any run that uses a tag. Dependabot (`.github/dependabot.yml`) opens the bump PRs.
 - Commit and PR subjects carry the issue key; conventional prefixes (`feat:`, `fix:`, `chore:`…) on commits and PR titles.
 - Issues and PRs open with the concise front — the problem, the value of solving it, the proposed solution — 2–5 bullets each; verbose detail after, for agents. Templates live in `.github/`; the filer applies the surface label (server, local, core, cli, adapters, bridge, ci).
