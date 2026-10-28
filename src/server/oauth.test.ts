@@ -733,6 +733,17 @@ test("OAuth global rate bounds distinct callers and audits once per refusal stre
   expect(audit().filter(row => row.action === "oauth.rate_limit_ended")).toHaveLength(1);
 });
 
+test("one address refused by its own limit can't drain the global OAuth bucket", async () => {
+  service.close(); config.oauthGlobalLimit = { burst: 5, perSec: 1 }; config.oauthLimit = { burst: 2, perSec: 1 };
+  service = makeService();
+  const request = new Request(base + "/oauth/unknown");
+  for (let i = 0; i < 2; i++) expect((await service.fetch(request, { key: "noisy" }))!.status).not.toBe(429);
+  for (let i = 0; i < 50; i++) expect((await service.fetch(request, { key: "noisy" }))!.status).toBe(429);
+  expect((await service.fetch(request, { key: "quiet" }))!.status).not.toBe(429);
+  const scopes = storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'oauth.rate_limited'").all().map(r => JSON.parse(r.detail).scope);
+  expect(scopes).toEqual(["address"]);
+});
+
 test("expired upstream/consent/code never mints; browser pending capacity and trusted address rate limits bounded", async () => {
   const browser = new Browser(); const a = authorization();
   const r = await browser.request(a.url), google = new URL(r.headers.get("location")!);

@@ -154,10 +154,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   timer.unref();
   const rate = (path: string, context?: OAuthNetworkContext): Response | undefined => {
     const route = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
-    for (const [limit, key] of [[globalLimit, "global"], [addressLimit, context?.key ?? "unknown"]] as const) {
-      const result = limit.take(key, { path: route });
+    // The address goes first and nothing is spent until both pass: a request
+    // its own address refuses must not drain the org-wide bucket.
+    const checks = [[addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]] as const;
+    for (const [limit, key] of checks) {
+      const result = limit.check(key, { path: route });
       if (!result.ok) return json({ error: "temporarily_unavailable" }, 429, { "Retry-After": String(retrySecs(result.retryAfterMs)) });
     }
+    for (const [limit, key] of checks) limit.spend(key, { path: route });
   };
   const sameOrigin = (req: Request, mandatory = false) => {
     const origin = req.headers.get("origin");
