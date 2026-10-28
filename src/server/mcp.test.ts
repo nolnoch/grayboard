@@ -314,7 +314,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const getters = new Error("untrusted properties");
   let reads = 0;
   for (const key of ["message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; throw new Error(secret); } });
-  const named = Object.assign(new Error(secret), { name: `${token}Error`, code: `E${token}` });
+  const named = Object.assign(new Error(secret), { name: `${token}-Error`, code: `E${token}` });
   const sqlite = Object.assign(new Error(secret), { name: "SQLiteError", code: "SQLITE_BUSY" });
   const classes = new Map<Error, string>([[named, '"class":"[unrecognized]"}'], [sqlite, '"class":"SQLiteError","code":"SQLITE_BUSY"}']]);
   try {
