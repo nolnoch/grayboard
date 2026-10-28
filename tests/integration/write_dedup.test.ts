@@ -57,7 +57,7 @@ describe("a lost answer over WSS, then the same call (server process)", () => {
   async function lostThenRepeated(identity: string, frame: Record<string, unknown>): Promise<{ again: WsClient; retry: Any }> {
     const session_key = mintSessionKey();
     rmSync(go(), { force: true });
-    const first = client(alice, identity, { session_key });
+    const first = client(alice, identity, { session_key }, false);
     expect((await first.connect()).type).toBe("hello_ok");
     const before = hits("hit");
     first.ws.send(JSON.stringify({ ...frame, req_id: "lost" }));
@@ -66,9 +66,10 @@ describe("a lost answer over WSS, then the same call (server process)", () => {
     const released = hits("released");
     writeFileSync(go(), "");
     await until(() => hits("released") > released, 10_000, "the pause's release");
-    // Tools-only, so the reconnect needn't wait out the old holder's probe; the session is the same.
+    // Tools-only on both sides (a re-attach is the kind its row registered, S1),
+    // so the reconnect needn't wait out the old holder's probe.
     const again = client(alice, identity, { session_key, resume: true }, false);
-    expect((await again.connect()).type).toBe("hello_ok");
+    expect(await again.connect()).toMatchObject({ type: "hello_ok" });
     const retry = await again.request(frame);
     expect(retry.req_id).toBe("r1");
     return { again, retry };
@@ -225,7 +226,8 @@ describe("dedup and state answers (in process)", () => {
     const sibling = await session("be", { push: false });
     expect((await sibling.request({ type: "send", recipient: "fe", body: "hello" })).replayed).toBeUndefined();
     // The same session on a new connection (a reconnect) still collides.
-    const reconnect = await session("be", { push: false, session_key: key });
+    be.close();
+    const reconnect = await session("be", { session_key: key });
     expect((await reconnect.request({ type: "send", recipient: "fe", body: "hello" })).replayed.ref.id).toBe(first.message_id);
     expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hello'")).toBe(2);
   });
@@ -241,6 +243,23 @@ describe("dedup and state answers (in process)", () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
     expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
     expect(await be.call("board_post", { board: "e2e", body: [[1]] })).toMatchObject({ type: "error", code: "bad_request", message: "body must be a string" });
+    expect(await be.call("board_post", { board: "e2e", body: "reply", parent_id: "1" })).toMatchObject({ type: "error", code: "bad_request", message: "parent_id must be a number" });
+  });
+
+  // #296: the access checks run before the receipt lookup, so a repeat from a
+  // caller who has since lost the board is refused, not answered with the first post's result.
+  test("board_post: a repeat after the caller lost the board is refused, not replayed", async () => {
+    expect((await srv.api(you, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const be = await session("be");
+    const first = await be.call("board_post", { board: "eng", body: "ship it" });
+    expect(first.type).toBe("call_ok");
+    const postId = first.result.post_id as number;
+    // The same session, still inside the window, repeats: replayed while the board is visible.
+    expect((await be.call("board_post", { board: "eng", body: "ship it" })).result.replayed.ref.id).toBe(postId);
+
+    expect((await srv.api(you, "POST", "/api/teams/eng/leave")).status).toBe(200);
+    expect(await be.call("board_post", { board: "eng", body: "ship it" })).toMatchObject({ type: "error", code: "bad_request", message: "no such board #eng; see board_list" });
+    expect(n("SELECT COUNT(*) AS n FROM posts WHERE body = 'ship it'")).toBe(1);
   });
 
   test("the window runs on the hub's clock: a repeat after it sends", async () => {

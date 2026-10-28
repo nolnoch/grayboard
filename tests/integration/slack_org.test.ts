@@ -164,9 +164,9 @@ test("a post Slack refuses is retried and lands once", async () => {
   expect(slack.posts().filter((p) => p.markdown_text === "**be** flaky")).toHaveLength(2);
 }, 30_000);
 
-test("only the bridge may hello as human", async () => {
+test("only the bridge may hold human: no session binds it", async () => {
   const alice = await login("alice@example.com");
-  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "bad_request" });
+  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "forbidden" });
   // And not over HTTP either.
   expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
 }, 30_000);
@@ -229,8 +229,8 @@ test("another user's agents reach a human only as teammates", async () => {
   // A bare "human" is your own, and bob hasn't linked.
   await expect(fe.call("dm_send", { to: "human", body: "hi" })).rejects.toThrow(/hasn't linked Slack/);
   await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
-  const blocked = await fe.call("board_post", { board: "e2e", body: "@alice/human look" });
-  expect(blocked.unresolved).toEqual(["alice/human"]);
+  const blocked = await fe.call("board_post", { board: "e2e", body: "@alice@example.com/human look" });
+  expect(blocked.unresolved).toEqual(["alice@example.com/human"]);
 
   expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
@@ -238,10 +238,10 @@ test("another user's agents reach a human only as teammates", async () => {
   expect((await fe.call("dm_send", { to: "alice@example.com/human", body: "hi alice" })).delivered_now).toBe(true);
   const dm = await until(() => slack.posts().find((p) => p.markdown_text?.endsWith("hi alice")));
   expect(dm.username).toBe("bob@example.com/fe");
-  const ok = await fe.call("board_post", { board: "e2e", body: "@alice/human look again" });
+  const ok = await fe.call("board_post", { board: "e2e", body: "@alice@example.com/human look again" });
   expect(ok.unresolved ?? []).toEqual([]);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("look again")));
-  expect(slack.posts().some((p) => p.markdown_text?.endsWith("@alice/human look"))).toBe(false);
+  expect(slack.posts().some((p) => p.markdown_text?.endsWith("@alice@example.com/human look"))).toBe(false);
 }, 30_000);
 
 test("unlink in Slack removes the human; the HTTP unlink then has nothing to remove", async () => {

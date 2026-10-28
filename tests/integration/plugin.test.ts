@@ -113,9 +113,10 @@ test("grayboard claims in server mode reads /api/claims and leaves out boards", 
 test("the client reports where it runs, and a dropped connection resumes without clearing its status", async () => {
   const alice = await login("alice@example.com");
   const noop = async () => {};
-  const be = new GrayboardClient(srv.base, () => alice, "be", mintSessionKey(), noop, noop);
+  const be = new GrayboardClient(srv.base, () => alice, mintSessionKey(), noop, noop);
   be.connect();
   await be.ready();
+  await be.request({ type: "bind", alias: "be" });
   await be.request({ type: "call", tool: "peer_status", args: { text: "soaking" } });
 
   (be as any).ws.close();
@@ -127,23 +128,52 @@ test("the client reports where it runs, and a dropped connection resumes without
   expect(me).toMatchObject({ online: true, where: describeLocation(process.cwd()), status: "soaking" });
 }, 20_000);
 
+// Audit A4 (#345): a delivery that finishes while the socket is down (or on
+// a new one before its hello_ok) acks after the next hello_ok, not before it.
+test("an ack whose socket is gone goes out after the next hello_ok", async () => {
+  const alice = await login("alice@example.com");
+  const noop = async () => {};
+  // The first delivery finishes when the test says; later ones never do, so
+  // only the first one's ack can move the cursor.
+  let finish!: () => void;
+  const first = new Promise<void>((r) => (finish = r));
+  let delivered = 0;
+  const onPush = () => (++delivered === 1 ? first : new Promise<void>(() => {}));
+  const be = new GrayboardClient(srv.base, () => alice, mintSessionKey(), onPush, noop);
+  be.connect();
+  await be.ready();
+  await be.request({ type: "bind", alias: "be" });
+  const fe = await session(await login("bob@example.com"), "fe");
+  const { message_id } = await fe.call("dm_send", { to: "alice@example.com/be", body: "hi" });
+  await until(() => delivered === 1, 5000, "the push");
+  (be as any).ws.close();
+  await until(() => (be as any).ws === null, 5000, "the close");
+  finish();
+  await be.ready();
+  const cursor = () => srv.app.db.query(`SELECT last_seen_id FROM mailbox_cursors WHERE address = 'alice@example.com/be' AND stream_type = 'direct'`).get();
+  await until(() => cursor(), 5000, "the ack");
+  expect(cursor()).toEqual({ last_seen_id: message_id });
+  expect(await be.request({ type: "inbox" })).toMatchObject({ type: "inbox_ok" });
+  be.close();
+}, 20_000);
+
 test("a refused token says to sign in again: at startup, in a running session's tools, and in the CLI", async () => {
   const noop = async () => {};
   const msg = (running: boolean) => (running ? "sign in; reconnecting" : "sign in");
 
-  const stale = new GrayboardClient(srv.base, () => "stale", "be", mintSessionKey(), noop, noop, true, msg);
+  const stale = new GrayboardClient(srv.base, () => "stale", mintSessionKey(), noop, noop, msg);
   stale.connect();
   await expect(stale.ready()).rejects.toThrow(/^sign in$/);
 
   // A running session whose token is revoked (as by a database reset)...
   let token = await login("alice@example.com");
-  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop, true, msg, { tokenPollMs: 200 });
+  const be = new GrayboardClient(srv.base, () => token, mintSessionKey(), noop, noop, msg, { tokenPollMs: 200 });
   be.connect();
   await be.ready();
+  // The server closes the revoked token's socket itself (#351), and the client says to sign in. Within
+  // 500 ms, under the 1 s reconnect delay: a client that only learned of it from the reconnect's probe would be too late.
   await fetch(`${srv.base}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-  (be as any).ws.close();
-  await Bun.sleep(1500); // the first reconnect (after 1s) is refused
-  await expect(be.request({ type: "inbox" })).rejects.toThrow("sign in; reconnecting");
+  await until(async () => (await be.request({ type: "inbox" }).then(() => "", (e: Error) => e.message)) === "sign in; reconnecting", 500);
   // ...picks up a new sign-in at its next look at the token.
   token = await login("alice@example.com");
   await until(async () => (await be.request({ type: "inbox" }).catch(() => null))?.type === "inbox_ok", 3000);
@@ -157,6 +187,29 @@ test("a refused token says to sign in again: at startup, in a running session's 
     `Error (unauthenticated): your sign-in isn't valid on ${srv.base} (signed out, expired, revoked, or the server's database was reset). Run: grayboard login --server ${srv.base}`,
   );
 }, 20_000);
+
+test("a client refused unauthenticated after it was ready waits for a new sign-in; before that, startup fails", async () => {
+  const noop = async () => {};
+  const refusal = { type: "error", req_id: "h", code: "unauthenticated", message: "this sign-in was signed out" };
+
+  const running = new GrayboardClient(srv.base, () => "t", mintSessionKey(), noop, noop, () => "sign in; reconnecting") as any;
+  let closes = 0;
+  running.ws = { close: () => closes++ };
+  running.wasReady = true;
+  running.helloId = "h";
+  running.handleServerMessage(refusal);
+  expect(running.dead).toBe(false);
+  expect(running.refused).toBe("sign in; reconnecting");
+  expect(closes).toBe(1);
+
+  const starting = new GrayboardClient(srv.base, () => "t", mintSessionKey(), noop, noop, () => "sign in") as any;
+  starting.ws = { close: () => {} };
+  starting.helloId = "h";
+  const ready = starting.ready();
+  starting.handleServerMessage(refusal);
+  await expect(ready).rejects.toMatchObject({ code: "unauthenticated" });
+  expect(starting.dead).toBe(true);
+});
 
 test("a hello the server refuses exits at once with its reason, not a timeout (#74)", async () => {
   const token = await login("alice@example.com");
@@ -216,13 +269,13 @@ test("grayboard claim in server mode acts as one of your identities; its session
 
   const unknown = await gb(alice, "alice@example.com", "nope", "claim", "take", "k");
   expect(unknown.code).toBe(1);
-  expect(unknown.err).toContain(`no session has used identity "nope"`);
+  expect(unknown.err).toContain(`no session has used "alice@example.com/nope"`);
 }, 20_000);
 
 test("a frame the server can't parse is answered with its req_id, so the call fails instead of hanging (#40)", async () => {
   const noop = async () => {};
   const token = await login("alice@example.com");
-  const be = new GrayboardClient(srv.base, () => token, "be", mintSessionKey(), noop, noop);
+  const be = new GrayboardClient(srv.base, () => token, mintSessionKey(), noop, noop);
   be.connect();
   await be.ready();
   await expect(be.request({ type: "send", recipient: "alice@example.com/be", body: "x", parent_id: "5" })).rejects.toThrow(/bad_request: .*parent_id/);
@@ -365,15 +418,10 @@ test("a lost answer says a retry is safe, and the retry replays the first result
   }
 }, 30_000);
 
-test("a lost answer from a server that doesn't deduplicate says a retry may send twice", async () => {
-  // A server from before #254: its hello_ok has no write_dedup.
+test("a repeat of a lost write after the session's holds changed is refused until resend: the server can't match it (A2)", async () => {
   let lose = false;
   const p = proxy(() => undefined, (frame) => {
-    const msg = JSON.parse(frame) as { type: string; write_dedup?: boolean };
-    if (msg.type === "hello_ok") {
-      delete msg.write_dedup;
-      return JSON.stringify(msg);
-    }
+    const msg = JSON.parse(frame) as { type: string };
     if (!lose || msg.type !== "send_ok") return frame;
     lose = false;
     setTimeout(() => p.drop(), 0);
@@ -382,13 +430,46 @@ test("a lost answer from a server that doesn't deduplicate says a retry may send
   try {
     const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
     lose = true;
-    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(
-      "the write may have landed. This server doesn't deduplicate writes, so calling again may send twice: check dm_history, board_read or dm_inbox's promised list first.",
-    );
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow("Calling again with the same arguments within 10 minutes is safe");
+    await until(() => be.call("peer_list", {}).catch(() => null), 10_000, "the reconnect");
+    // The dedup key holds the sender, which the holds can change (a reply
+    // default, #284 S4): after a bind the plugin can't match the repeat.
+    await be.call("bind", { name: "ops", create: true });
+    const refused = `this repeats a dm_send whose answer was lost while this session held "be"; this session has changed since, so the server can't match the repeat to it, and the first may have landed.`;
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
+    await expect(be.call("dm_send", { to: "be", body: "once" })).rejects.toThrow(refused);
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 1 });
+    expect((await be.call("dm_send", { to: "be", body: "once", resend: true })).replayed).toBeUndefined();
+    // Settled: a further repeat goes out, and the server replays the resend.
+    expect((await be.call("dm_send", { to: "be", body: "once" })).replayed).toBeDefined();
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages WHERE body = 'once'").get()).toEqual({ n: 2 });
   } finally {
     p.stop(true);
   }
 }, 20_000);
+
+test("a repeat of a lost dm_send with `as`, holds unchanged, replays the first result", async () => {
+  let lose = false;
+  const p = proxy(() => undefined, (frame) => {
+    const msg = JSON.parse(frame) as { type: string };
+    if (!lose || msg.type !== "send_ok") return frame;
+    lose = false;
+    setTimeout(() => p.drop(), 0);
+    return JSON.stringify({ ...msg, req_id: "lost" });
+  });
+  try {
+    const be = await session(await login("alice@example.com"), "be", { GRAYBOARD_SERVER: `http://localhost:${p.port}` });
+    await be.call("bind", { name: "ops", create: true });
+    lose = true;
+    await expect(be.call("dm_send", { to: "be", body: "as ops", as: "ops" })).rejects.toThrow("Calling again with the same arguments within 10 minutes is safe");
+    const retry = await until(() => be.call("dm_send", { to: "be", body: "as ops", as: "ops" }).catch(() => null), 10_000, "the reconnect");
+    const rows = srv.app.db.query("SELECT id, sender FROM messages WHERE body = 'as ops'").all() as { id: number; sender: string }[];
+    expect(rows).toEqual([{ id: expect.any(Number), sender: "alice@example.com/ops" }]);
+    expect(retry).toMatchObject({ message_id: rows[0]!.id, replayed: { ref: { kind: "message", id: rows[0]!.id } } });
+  } finally {
+    p.stop(true);
+  }
+}, 30_000);
 
 test("the plugin checks files against the server's limits from hello_ok before uploading", async () => {
   srv.stop();
@@ -445,27 +526,6 @@ const helloRewrite = (edit: (hello: Record<string, unknown>) => void) => (frame:
   edit(msg);
   return JSON.stringify(msg);
 };
-
-test("attachments against a server from before them: hello_ok without limits says the server needs updating", async () => {
-  const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
-  writeFileSync(join(dir, "notes.md"), "# notes");
-  let uploads = 0;
-  const old = proxy(
-    (_, u) => (u.pathname.startsWith("/api/attachments") && ++uploads ? Response.json({ code: "not_found", message: "not found" }, { status: 404 }) : undefined),
-    helloRewrite((h) => delete h.attachment_limits),
-  );
-  try {
-    const alice = await login("alice@example.com");
-    const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${old.port}` });
-    const outdated = "this server doesn't take attachments; it needs updating";
-    await expect(be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).rejects.toThrow(outdated);
-    await expect(be.call("attachment_get", { id: 1 })).rejects.toThrow(outdated);
-    expect(uploads).toBe(0);
-    expect(await be.call("dm_send", { to: "be", body: "plain" })).toMatchObject({ message_id: expect.any(Number) });
-  } finally {
-    old.stop(true);
-  }
-}, 20_000);
 
 test("the plugin takes attachment limits from the hello_ok of each reconnect", async () => {
   const dir = mkdtempSync(join(srv.dir, "gb-attach-"));
@@ -537,9 +597,10 @@ test("attachment_get saves nothing unless the bytes match the server's Repr-Dige
     const save = join(dir, "saved");
     const be = await session(alice, "be", { GRAYBOARD_SERVER: `http://localhost:${bad.port}`, GRAYBOARD_ATTACHMENTS_DIR: save });
     const [notes] = (await be.call("dm_send", { to: "be", body: "x", attachments: [join(dir, "notes.md")] })).attachments;
-    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the server sent no digest; it needs updating`);
+    const mismatch = `attachment ${notes.id}: the bytes received don't match the server's sha256`;
+    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(mismatch);
     mode = "alter";
-    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(`attachment ${notes.id}: the bytes received don't match the server's sha256`);
+    await expect(be.call("attachment_get", { id: notes.id })).rejects.toThrow(mismatch);
     // The default directory exists (resolved before the download); nothing is in it.
     expect(readdirSync(save, { recursive: true }).filter((n) => String(n).endsWith("notes.md"))).toEqual([]);
   } finally {

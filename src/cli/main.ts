@@ -247,17 +247,23 @@ program
   .command("logout")
   .description("Revoke current session and delete local credentials")
   .action(async () => {
+    // Local credentials go regardless; what the server did decides the message.
+    let outcome = "Logged out. The server closed this sign-in's open MCP connections.";
     try {
       await makeClient().post("/api/auth/logout");
-    } catch {
-      // best-effort; remove local creds regardless
+    } catch (e) {
+      outcome = e instanceof ApiError
+        ? e.status === 401
+          ? "Local credentials removed. The server already refuses this sign-in."
+          : `Local credentials removed, but the server answered ${e.status} (${e.message}): this sign-in may still be valid there.`
+        : "Local credentials removed, but the server could not be reached: this sign-in stays valid there until it is revoked.";
     }
     const file = credentialsPath();
     if (existsSync(file)) {
       writeFileSync(file, "");
       chmodSync(file, 0o600);
     }
-    console.log("Logged out. Note: active MCP server connections continue until they reconnect.");
+    console.log(outcome);
   });
 
 program
@@ -267,11 +273,13 @@ program
     const { actingName, busHandle } = await import("./claim.ts");
     let acting;
     try {
-      const { name, source } = await actingName(globalAs());
-      acting = { handle: busHandle(name), source };
+      const { name, source, held } = await actingName(globalAs());
+      // A session holding several aliases acts as the first (#284 S6).
+      acting = { handle: busHandle(name), source, ...(held && held.length > 1 ? { held } : {}) };
     } catch (e) { console.error(`[grayboard] whoami: ${(e as Error).message}`); process.exit(1); }
     if (busMode() === "local") {
-      output(globalJson() ? acting : `${acting.handle} (from ${acting.source})`, globalJson());
+      const also = acting.held ? `; that session also holds ${acting.held.slice(1).join(", ")}` : "";
+      output(globalJson() ? acting : `${acting.handle} (from ${acting.source}${also})`, globalJson());
       return;
     }
     try {

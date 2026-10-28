@@ -16,6 +16,7 @@ import {
   setStatus,
   subscribe,
   viewers,
+  parseMatch,
   who,
   type Pending,
   type Post,
@@ -25,8 +26,8 @@ import {
 import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
-import { attachmentIds } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { attachmentIds, type FileSend } from "./attachments.ts";
+import { ATTACHMENTS_PARAM, formatAttachmentsMeta, type AttachmentInfo } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
 
 export type ToolDef = {
@@ -42,6 +43,9 @@ const BOARD = { type: "string", description: 'Board name, with or without the "#
 // identical call within its dedup window with the first one's result (#254,
 // src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
 export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
+
+// On the writes a session can make as another of its addresses (#284 S3).
+export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
 
 export function boardTools(opts: { teams: boolean }): ToolDef[] {
   return [
@@ -81,7 +85,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?, attachments?, resend?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        "board_post(board, body, parent_id?, attachments?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
@@ -90,6 +94,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
           attachments: ATTACHMENTS_PARAM,
           resend: RESEND_PARAM,
+          as: AS_PARAM,
         },
         required: ["board", "body"],
       },
@@ -129,12 +134,16 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "peer_list",
       description:
-        "peer_list(board?, include_offline?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own row has self: true. With board: its subscribers and their mode (a team's board is its roster).",
+        "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
       inputSchema: {
         type: "object",
         properties: {
           board: { type: "string", description: "Optional. Only this board's subscribers." },
           include_offline: { type: "boolean", description: "Also list offline handles with last_seen (default false)." },
+          match: {
+            type: "object",
+            description: "Optional. Only rows whose fields equal these (case-insensitive): id, harness, model, effort, task, owner, source_board, spec_hash, scope.",
+          },
         },
       },
     },
@@ -155,7 +164,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
     {
       name: "claim_take",
       description:
-        'claim_take(key, ttl_minutes? | until?, note?, board?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
+        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
       inputSchema: {
         type: "object",
         properties: {
@@ -167,6 +176,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
           },
           note: { type: "string", description: "Optional. What you're doing with it." },
           board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on." },
+          as: AS_PARAM,
         },
         required: ["key"],
       },
@@ -318,17 +328,17 @@ export type BoardPostResult = {
 };
 
 // What only the mode knows. online: does this handle have a live session?
-// attachmentLimits: the caps a post's files are bound under; a mode without
-// them can't post files.
+// files: the caps a post's files are bound under and the user sending them;
+// a mode without it can't post files.
 // unbound: the live sessions with no name yet, for peer_list (#182).
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
 // `session`: the calling session's ID, recorded on its posts (#284).
-// `addresses`: the caller's address set, `handle` its primary (#284 S5);
+// `addresses`: the caller's address set, `handle` the one it acts as (#284 S5);
 // claims held by any of them are the caller's. Default [handle].
 export type ToolContext = {
   online?: (handle: string) => boolean;
-  attachmentLimits?: AttachmentLimits;
+  files?: FileSend;
   unbound?: UnboundPeer[];
   human?: boolean;
   session?: string;
@@ -343,9 +353,12 @@ export function callBoardTool(
   ctx: ToolContext = {},
 ): ToolOutcome {
   const a = args ?? {};
+  // `handle` is already the acting address (boardActor).
+  if (a.as !== undefined) throw new Error(`${name}: "as" must be resolved by boardActor before callBoardTool`);
   switch (name) {
     case "board_list":
-      return { result: listBoards(db, handle), wake: [] };
+      // Each row acts as the first address that can see its board (S14).
+      return { result: listBoards(db, [handle, ...(ctx.addresses ?? []).filter((h) => h !== handle)]), wake: [] };
 
     case "board_create": {
       const team = optStr(a, "team");
@@ -377,7 +390,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), limits: ctx.attachmentLimits }, strictIds: true },
+        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
       const isViewer = viewers(db);
       const result: BoardPostResult = {
@@ -434,7 +447,11 @@ export function callBoardTool(
     case "peer_list": {
       if (!ctx.online) throw new CoreError("peer_list isn't available in this mode");
       const board = optStr(a, "board");
-      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline") }, ctx.online, ctx.unbound);
+      const r = who(db, handle, { board, include_offline: optBool(a, "include_offline"), match: parseMatch(a.match) }, ctx.online, {
+        unbound: ctx.unbound,
+        addresses: ctx.addresses,
+        session: ctx.session,
+      });
       return { result: r, wake: [] };
     }
 
@@ -476,8 +493,14 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 }
 
 // The channel notification for a direct message. Same shape in every mode.
-export function dmNotification(msg: { id: number; sender: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] }): { content: string; meta: Record<string, string> } {
+// `to` names the address the mail came to when it isn't the session's
+// `primary` (#284 S4): a one-address session pays nothing for it.
+export function dmNotification(
+  msg: { id: number; sender: string; recipient?: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] },
+  primary?: string,
+): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary) meta.to = msg.recipient;
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
   if (msg.kind) meta.kind = msg.kind;
   addFiles(meta, msg.attachments);

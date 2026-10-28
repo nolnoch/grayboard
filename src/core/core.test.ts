@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  cleanPlace,
+  parseAliasMeta,
   acknowledge,
   activeAnnouncements,
   createBoard,
@@ -203,7 +205,7 @@ describe("#announce", () => {
 test("new subscribers start at the tip", () => {
   post(db, "be", "e2e", "old news");
   subscribe(db, "sim", "e2e", "digest");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(0);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(0);
   expect(pendingFor(db, "sim")).toEqual([]);
 });
 
@@ -214,7 +216,7 @@ test("push-mode subscriber gets full post; author does not", () => {
   expect(items).toHaveLength(1);
   expect(items[0]).toMatchObject({ kind: "push", reason: "subscription" });
   expect(drain("sim")).toEqual([]);
-  expect(listBoards(db, "be")[0]!.unread).toBe(0); // push counts as read
+  expect(listBoards(db, ["be"])[0]!.unread).toBe(0); // push counts as read
 });
 
 test("digest coalesces until the reader catches up", () => {
@@ -241,7 +243,7 @@ test("posting does not mark others' unread posts as read", () => {
   post(db, "be", "e2e", "one");
   post(db, "be", "e2e", "two");
   post(db, "sim", "e2e", "reply without reading");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(2);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(2);
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 2 }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
@@ -250,7 +252,7 @@ test("a mention doesn't also count toward the mentioned subscriber's digest", ()
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "@sim look at this");
   expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention" }]);
-  expect(listBoards(db, "sim")[0]!.unread).toBe(0);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(0);
   post(db, "be", "e2e", "unrelated");
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
@@ -260,7 +262,7 @@ test("quiet subscribers are never pushed but see unread counts", () => {
   subscribe(db, "sim", "e2e", "quiet");
   const { wake } = post(db, "be", "e2e", "hi");
   expect(wake).not.toContain("sim");
-  expect(listBoards(db, "sim")[0]!.unread).toBe(1);
+  expect(listBoards(db, ["sim"])[0]!.unread).toBe(1);
 });
 
 test("mentions push to known handles even without a subscription", () => {
@@ -301,7 +303,7 @@ test("a deferred push shows as unread, and reading the board delivers it", () =>
   drain("sim");
   drain("fe");
   expect(post(db, "fe", "e2e", "answer", mid.id).deferred).toEqual(["be"]);
-  expect(listBoards(db, "be")[0]!.unread).toBe(1);
+  expect(listBoards(db, ["be"])[0]!.unread).toBe(1);
   expect(read(db, "be", "e2e").posts.map((p) => p.body)).toEqual(["answer"]);
   // Delivered by the read; the earlier pushes (be was push-subscribed) it didn't show still come.
   expect(drain("be", true).map((i) => i.kind === "push" && i.post.body)).toEqual(["question", "me too"]);
@@ -341,7 +343,7 @@ test("a muted thread stops pushing replies, but @mentions still land", () => {
   callBoardTool(db, "fe", "board_subscribe", { board: "e2e", mode: "push", thread: root.id });
   expect(post(db, "sim", "e2e", "routine 3", root.id).deferred).toEqual(["fe"]);
   // The board's own mode is untouched, and other threads still push.
-  expect(listBoards(db, "be").find((b) => b.name === "e2e")?.mode).toBe("push");
+  expect(listBoards(db, ["be"]).find((b) => b.name === "e2e")?.mode).toBe("push");
   expect(post(db, "sim", "e2e", "new topic").wake).toEqual(["be"]);
 });
 
@@ -730,19 +732,21 @@ describe("who", () => {
     expect(() => who(db, "be", { board: "nope" }, online)).toThrow(/no such board/);
   });
 
-  test("tail viewers (~ handles) aren't peers", () => {
-    subscribe(db, "~tail-1", "e2e", "push");
-    db.prepare(`INSERT INTO aliases (address, scope_kind, name, created_at, last_seen) VALUES ('~tail-1', 'person', '~tail-1', 0, 0)`).run();
+  const TAIL = "id:00000000000a1";
+  test("tail viewers aren't peers", () => {
+    registerId(db, { id: TAIL, principal: null, launcher: false, viewer: true });
+    subscribe(db, TAIL, "e2e", "push");
     const any = () => true;
     expect(who(db, "be", { board: "e2e" }, any).peers.map((p) => p.handle)).toEqual(["be"]);
     expect(who(db, "be", {}, any).peers.map((p) => p.handle)).toEqual(["be", "fe", "sim"]);
   });
 
   test("a post wakes tail viewers but doesn't report them as notified", () => {
-    subscribe(db, "~tail-1", "e2e", "push");
+    registerId(db, { id: TAIL, principal: null, launcher: false, viewer: true });
+    subscribe(db, TAIL, "e2e", "push");
     const out = callBoardTool(db, "fe", "board_post", { board: "e2e", body: "hi" });
-    expect(out.wake).toContain("~tail-1");
-    expect((out.result as { notified: string[] }).notified).not.toContain("~tail-1");
+    expect(out.wake).toContain(TAIL);
+    expect((out.result as { notified: string[] }).notified).not.toContain(TAIL);
   });
 
   test("the tool needs the mode's liveness check", () => {
@@ -758,6 +762,8 @@ describe("with a scoped access policy", () => {
     canSee: (h, b) => b.scope === null || members.has(h),
     checkCreate: (h, scope) => (scope === null || members.has(h) ? null : "not a member"),
     resolveMention: (t) => (["be", "sim", "fe"].includes(t) ? t : null),
+    // The test's sessions are named for their members: id:…be acts in eng.
+    seesAliasMeta: (h, scope) => scope.scope_ref !== "eng" || [...members].some((m) => h.endsWith(m)),
     announceBoard: null,
   };
   beforeEach(() => {
@@ -766,8 +772,8 @@ describe("with a scoped access policy", () => {
   });
 
   test("non-members can't see, read, post, or subscribe", () => {
-    expect(listBoards(db, "fe").map((b) => b.name)).toEqual(["e2e"]);
-    expect(listBoards(db, "sim").map((b) => b.name)).toEqual(["e2e", "eng"]);
+    expect(listBoards(db, ["fe"]).map((b) => b.name)).toEqual(["e2e"]);
+    expect(listBoards(db, ["sim"]).map((b) => b.name)).toEqual(["e2e", "eng"]);
     expect(() => read(db, "fe", "eng")).toThrow(/no such board/);
     expect(() => post(db, "fe", "eng", "hi")).toThrow(/no such board/);
     expect(() => subscribe(db, "fe", "eng", "push")).toThrow(/no such board/);
@@ -805,6 +811,26 @@ describe("with a scoped access policy", () => {
     } finally {
       members.add("sim");
     }
+  });
+
+  // #284 S13: an alias's labels reach only a principal that may act in its
+  // scope, and match runs after that cut. ID facts follow the row.
+  test("a team alias's labels are hidden from a non-member's peer_list and its match", () => {
+    db.prepare(
+      `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task, source_board) VALUES ('eng/x', 'team', 'eng', 'x', 1, 1, 'ENG-142', 'eng')`,
+    ).run();
+    registerId(db, { id: "id:0000000000s01", principal: null, launcher: false, model: "opus" });
+    holdAlias(db, "eng/x", "id:0000000000s01");
+    const row = (caller: string, session: string, match?: Record<string, string>) =>
+      who(db, caller, { include_offline: true, match }, () => true, { session }).peers.find((p) => p.handle === "eng/x");
+    expect(row("be", "id:00000000000be")).toMatchObject({ task: "ENG-142", source_board: "eng", model: "opus" });
+    expect(row("be", "id:00000000000be", { task: "eng-142" })).toBeDefined();
+    expect(row("be", "id:00000000000be", { scope: "eng" })).toBeDefined();
+    const outsider = row("fe", "id:00000000000fe")!;
+    expect(outsider).toMatchObject({ handle: "eng/x", model: "opus" });
+    expect(outsider.task).toBeUndefined();
+    expect(outsider.source_board).toBeUndefined();
+    expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();
   });
 
   test("claims hide a board the viewer can't see", () => {
@@ -864,21 +890,111 @@ test("peer_status queue param is the explicit rotation opt-out; status text neve
 });
 
 // #284 decision 11: a session's facts sit on its ID, an alias's on the alias.
-test("peer_list shows the session's facts through its alias; on a rebind they move and the alias's stay", () => {
+test("peer_list shows the session's facts through its alias; after unbind and bind they move and the alias's stay", () => {
   hold("fe", "id:0000000000001", { cwd: "/tmp/checkout", launcher: true });
   callBoardTool(db, "fe", "peer_status", { text: "on ENG-142", queue: "off" });
   const peer = (h: string) => who(db, "be", { include_offline: true }, () => true).peers.find((p) => p.handle === h);
   expect(peer("fe")).toMatchObject({ status: "on ENG-142", queue_off: true, launcher: true, where: expect.any(String) });
-  // The session rebinds to fe2: its status and launcher flag go with it, fe keeps its queue opt-out.
+  // The session unbinds fe and binds fe2: its status and launcher flag go with it, fe keeps its queue opt-out.
   seen("fe2");
   dropHold(db, "fe", "id:0000000000001");
+  logBinding(db, "id:0000000000001", "fe", "released", "unbind");
   holdAlias(db, "fe2", "id:0000000000001");
-  logBinding(db, "id:0000000000001", "fe2", "moved", "fe");
+  logBinding(db, "id:0000000000001", "fe2", "bound");
   expect(peer("fe2")).toMatchObject({ status: "on ENG-142", launcher: true });
   expect(peer("fe2")?.queue_off).toBeUndefined();
   expect(peer("fe")?.queue_off).toBe(true);
+  expect(peer("fe")?.launcher).toBeUndefined();
   // A name no session holds has no session to set a status on.
   expect(() => callBoardTool(db, "sim", "peer_status", { text: "x" })).toThrow(/no live session holds "sim"/);
+});
+
+// #284 S13: rows carry the session's ID and facts and the alias's labels,
+// a session's own rows are all self and online, and match filters them.
+describe("peer_list with several aliases per session", () => {
+  const S = "id:000000000000s";
+  const T = "id:000000000000t";
+  const labels = (address: string, meta: Record<string, string>) => {
+    for (const [k, v] of Object.entries(meta)) db.prepare(`UPDATE aliases SET ${k} = ? WHERE address = ?`).run(v, address);
+  };
+  beforeEach(() => {
+    registerId(db, { id: S, principal: null, harness: "claude", launcher: false, model: "opus", effort: "high" });
+    registerId(db, { id: T, principal: null, harness: "pi", launcher: false, model: "sonnet" });
+    for (const a of ["a", "b", "t"]) seen(a);
+    holdAlias(db, "a", S, 100);
+    logBinding(db, S, "a", "bound");
+    holdAlias(db, "b", S, 100);
+    logBinding(db, S, "b", "bound");
+    holdAlias(db, "t", T);
+    logBinding(db, T, "t", "bound");
+    labels("a", { task: "ENG-142 audit", owner: "orchestrator" });
+  });
+  const rows = (opts: Parameters<typeof who>[2] = {}, addresses = ["a", "b", S]) =>
+    who(db, "a", { include_offline: true, ...opts }, (h) => h === "t", { addresses, session: S });
+
+  test("each own alias is self and online, every row names its session and facts", () => {
+    const r = rows();
+    expect(r.you).toBe("a");
+    expect(r.peers.find((p) => p.handle === "a")).toEqual({
+      handle: "a", online: true, last_seen: expect.any(Number), self: true, id: S,
+      harness: "claude", model: "opus", effort: "high", task: "ENG-142 audit", owner: "orchestrator",
+    });
+    expect(r.peers.find((p) => p.handle === "b")).toMatchObject({ online: true, self: true, id: S, model: "opus" });
+    expect(r.peers.find((p) => p.handle === "t")).toMatchObject({ online: true, id: T, harness: "pi", model: "sonnet" });
+    expect(r.peers.find((p) => p.handle === "t")!.self).toBeUndefined();
+    expect(r.peers.find((p) => p.handle === "be")!.id).toBeUndefined();
+    // Without the set, only the primary is the caller's (the old view).
+    expect(rows({}, ["a"]).peers.find((p) => p.handle === "b")).toMatchObject({ online: false });
+  });
+
+  test("match: exact, case-insensitive, ANDed, over id, facts, labels and scope", () => {
+    const handles = (match: Record<string, string>) => rows({ match }).peers.map((p) => p.handle);
+    expect(handles({ id: S })).toEqual(["a", "b"]);
+    expect(handles({ model: "OPUS" })).toEqual(["a", "b"]);
+    expect(handles({ model: "opus", task: "eng-142 audit" })).toEqual(["a"]);
+    expect(handles({ harness: "pi" })).toEqual(["t"]);
+    expect(handles({ model: "opu" })).toEqual([]);
+    // Local aliases have no scope_ref: a scope match finds none.
+    expect(handles({ scope: "eng" })).toEqual([]);
+    const call = (match: unknown) => callBoardTool(db, "a", "peer_list", { include_offline: true, match }, { online: () => false, addresses: ["a", "b", S], session: S });
+    expect((call({ id: T }).result as { peers: { handle: string }[] }).peers.map((p) => p.handle)).toEqual(["t"]);
+    expect(() => call({ colour: "red" })).toThrow(/match has no key "colour"/);
+    expect(() => call({ model: 3 })).toThrow(/match.model must be a non-empty string/);
+    expect(() => call(["model"])).toThrow(/match must be an object/);
+  });
+
+  test("match filters the unbound sessions by their ID facts", () => {
+    const U = "id:000000000000u";
+    registerId(db, { id: U, principal: null, launcher: false, model: "haiku" });
+    const unbound = [{ session_id: U, unbound: true as const, online: true as const }];
+    const r = (match?: Record<string, string>) => who(db, "a", { match }, () => false, { unbound, addresses: ["a", "b", S], session: S }).unbound_sessions;
+    expect(r()).toEqual([{ session_id: U, unbound: true, online: true, model: "haiku" }]);
+    expect(r({ model: "haiku" })).toHaveLength(1);
+    expect(r({ model: "opus" })).toBeUndefined();
+  });
+
+  // AC 8: model moves with the session, task stays with the alias.
+  test("after unbind(a) and bind(c), c shows the model; a keeps its task and shows no model until the session ends", () => {
+    seen("c");
+    dropHold(db, "a", S);
+    logBinding(db, S, "a", "released", "unbind");
+    holdAlias(db, "c", S);
+    logBinding(db, S, "c", "bound");
+    const peer = (h: string) => rows({}, ["b", "c", S]).peers.find((p) => p.handle === h)!;
+    expect(peer("c")).toMatchObject({ id: S, model: "opus" });
+    expect(peer("a")).toMatchObject({ task: "ENG-142 audit" });
+    expect(peer("a").model).toBeUndefined();
+    expect(peer("a").id).toBeUndefined();
+    db.prepare(`UPDATE ids SET ended_at = 1 WHERE id = ?`).run(S);
+    expect(peer("a")).toMatchObject({ id: S, model: "opus", task: "ENG-142 audit" });
+  });
+
+  test("a board's roster lists an ID subscription once, under the session's primary", () => {
+    subscribe(db, S, "e2e", "push");
+    const r = who(db, "t", { board: "e2e", include_offline: true }, () => true, { session: T });
+    expect(r.peers.map((p) => p.handle)).toEqual(["a", "be"]);
+    expect(r.peers[0]).toMatchObject({ id: S, model: "opus", mode: "push" });
+  });
 });
 
 // #284 S6: an unbound live push session is addressable by its ID; a bound,
@@ -922,4 +1038,34 @@ test("claim_release and board_create repeats answer from state; another's histor
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "other" })).toThrow(/already exists/);
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures", team: "core" })).toThrow(/team boards need distributed mode/);
   expect(() => callBoardTool(db, "be", "board_create", { name: "runs", purpose: "fixtures" }, { human: true })).toThrow(/already exists/);
+});
+
+test("a place and an unknown meta key are single bounded lines", () => {
+  expect(cleanPlace("host\u0007 /repo\u001b[31m\n  lane")).toBe("host /repo[31m lane");
+  expect(cleanPlace(null)).toBeNull();
+  expect(cleanPlace(" \u0000 ")).toBeNull();
+  const key = `k\n${"x".repeat(500)}`;
+  expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
+});
+
+// #284 S5 (audit P2): a session's own post is not unread on any of its
+// addresses, whichever one it wrote as.
+test("a post written as one alias is not unread, digested or read back on the session's others", () => {
+  const S = "id:000000000000s";
+  registerId(db, { id: S, principal: null, launcher: false });
+  for (const a of ["a", "b"]) seen(a);
+  holdAlias(db, "a", S, 100);
+  holdAlias(db, "b", S, 101);
+  subscribe(db, "a", "e2e", "digest");
+  subscribe(db, S, "e2e", "digest");
+  post(db, "b", "e2e", "mine", null, { addresses: ["b", "a", S], author_id: S });
+  for (const h of ["a", S]) {
+    expect(listBoards(db, [h])[0]!.unread).toBe(0);
+    expect(pendingFor(db, h, { all: true })).toEqual([]);
+    expect(read(db, h, "e2e").unread_remaining).toBe(0);
+  }
+  // Another session's post is still unread for both.
+  post(db, "sim", "e2e", "theirs");
+  expect(listBoards(db, ["a"])[0]!.unread).toBe(1);
+  expect(pendingFor(db, S, { all: true })).toMatchObject([{ kind: "digest", board: "e2e", unread: 1 }]);
 });

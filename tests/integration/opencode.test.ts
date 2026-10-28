@@ -72,7 +72,7 @@ function driver(identity: string | undefined, e: Record<string, unknown>): Drive
 function normalize(s: any): any {
   if (Array.isArray(s)) return s.map(normalize);
   if (!s || typeof s !== "object") return s;
-  const { $schema, additionalProperties, ...rest } = s;
+  const { $schema, additionalProperties, propertyNames, ...rest } = s;
   if (Array.isArray(rest.required) && rest.required.length === 0) delete rest.required;
   if (rest.type === "object" && !rest.properties) rest.properties = {};
   return Object.fromEntries(Object.entries(rest).map(([k, v]) => [k, normalize(v)]));
@@ -86,6 +86,13 @@ for (const mode of ["local", "server"] as const) {
     for (const t of listed) expect([t.name, normalize(tools[`grayboard_${t.name}`])]).toEqual([t.name, normalize(t.inputSchema)]);
   });
 }
+
+test("opencode: a free-map argument (bind's meta, peer_list's match) keeps its keys through the zod parse", async () => {
+  const oc = driver("oc", entry("local"));
+  await oc.send("init");
+  expect(await oc.send("parse", { tool: "grayboard_bind", args: { name: "x", meta: { task: "t", owner: "o" } } })).toEqual({ name: "x", meta: { task: "t", owner: "o" } });
+  expect(await oc.send("parse", { tool: "grayboard_peer_list", args: { match: { model: "m" } } })).toEqual({ match: { model: "m" } });
+});
 
 test("opencode: an unbound session acts as its ID; bind and rebind move the one grayboard process and the system prompt follows in full", async () => {
   const peer = await localSession(dir, "peer");
@@ -105,8 +112,10 @@ test("opencode: an unbound session acts as its ID; bind and rebind move the one 
   const toId = await peer.call("dm_send", { to: id, body: "to your id" });
   await until(async () => (await oc.send("state")).prompts.some((p: any) => p.text.includes(`message_id="${toId.message_id}"`)), 15_000, "DM to the ID delivered");
   expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-tmp", create: true } })).toContain('Bound to "oc-tmp"');
-  // A rebind replaces the prompt section with the full set, not just the name's part.
-  expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-task", create: true } })).toContain('Bound to "oc-task" (was "oc-tmp")');
+  // Moving to another name (#284 S1: bind it, unbind the old) replaces the
+  // prompt section with the full set, not just the name's part.
+  expect(await oc.send("call", { tool: "grayboard_bind", args: { name: "oc-task", create: true } })).toContain('you hold "oc-tmp", "oc-task" and send as "oc-tmp"');
+  expect(await oc.send("call", { tool: "grayboard_unbind", args: { name: "oc-tmp" } })).toContain('"oc-task"');
   const system = (await oc.send("system", { sessionID: "s1" })).join("\n");
   expect(system).toContain('You are identity "oc-task" on the grayboard bus');
   expect(system).toContain('Direct messages arrive as <channel source="grayboard"');

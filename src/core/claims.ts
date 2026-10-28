@@ -42,6 +42,7 @@ function validKey(key: string): string {
   return k;
 }
 
+// "moved": a hosted rebind carried the claim to the new name (moveClaims).
 type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire" | "moved";
 
 // One claim_events row; callers are inside the claim's transaction.
@@ -191,11 +192,13 @@ export function release(
   }).immediate();
 }
 
-// A session that rebinds takes its claims to the new name (#182). Server mode
-// only: a local session keeps its claims on the address they were taken
-// under (#284 S6), and PR 3 brings the server to the same rule. Runs inside
-// the caller's transaction (the bind's), so the claims move with the name.
-// Each move is a "moved" event under the new holder, held_by naming the old one.
+// A hosted session that rebinds takes its claims to the new name (#182),
+// as master's hosted bind did. WSS and local sessions keep their claims on
+// the address they were taken under (#284 S6, PR 4: claims stay with an
+// unbound alias); only src/server/application.ts hostedBind calls this.
+// Hosted holds one name, so its claims move with it; S6 applies to WSS and local (#407).
+// Runs inside the caller's transaction (the bind's). Each move is a "moved"
+// event under the new holder, held_by naming the old one.
 export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {
   const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
   for (const c of moved) logEvent(db, "moved", to, c, now, from);

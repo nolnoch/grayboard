@@ -15,12 +15,24 @@ import { sha256Hex } from "../shared/hash.ts";
 
 export type AttachmentRow = AttachmentInfo & {
   uploader: string;
+  // The user who stored it, on a server; null in local mode and for rows an earlier release stored without one.
+  uploader_principal: string | null;
   message_id: number | null;
   post_id: number | null;
   created_at: number;
 };
 
 export type AttachTarget = { message_id: number } | { post_id: number };
+
+// Who may send an unsent upload: the sending session's addresses (#284 S5)
+// and, on a server, its user. An address can pass to another user (a team
+// alias rebound), so an upload goes only with the user who made it (#367).
+// principal is null in local mode, which has one user.
+export type Uploader = { addresses: string[]; principal: string | null };
+
+// A mode that sends files: the caps a write's files are bound under, and the
+// user sending them.
+export type FileSend = { limits: AttachmentLimits; principal: string | null };
 type Kind = "message_id" | "post_id";
 
 const INFO = `id, filename, type, size, sha256`;
@@ -122,17 +134,17 @@ export function attachmentIds(v: unknown): number[] {
 }
 
 // Binds uploads to the message or post just written. Run it inside that
-// write's transaction: each id must be `uploader`'s and still unbound, or the
+// write's transaction: each id must be an unbound upload of `from`, or the
 // write rolls back with it.
 export function bindAttachments(
   db: Database,
   ids: number[],
-  uploader: string,
+  from: Uploader,
   target: AttachTarget,
   limits: AttachmentLimits,
 ): AttachmentInfo[] {
   if (ids.length === 0) return [];
-  const rows = unsentUploads(db, ids, uploader);
+  const rows = unsentUploads(db, ids, from);
   // Each upload was checked alone when stored; the message's total is known only here.
   const tally = new SizeTally(limits, ids.length);
   for (const r of rows) tally.add(`attachment ${r.id}`, r.size);
@@ -141,12 +153,16 @@ export function bindAttachments(
   return rows.map(info);
 }
 
-// `uploader`'s unsent uploads `ids`, in call order. Throws on an id that
+// `from`'s unsent uploads among ids ?1, as SQL over ?2 (its addresses) and ?3
+// (its user, or null in local mode).
+const UNSENT = `id IN (SELECT value FROM json_each(?1)) AND uploader IN (SELECT value FROM json_each(?2))
+  AND (?3 IS NULL OR uploader_principal = ?3) AND message_id IS NULL AND post_id IS NULL`;
+const unsentArgs = (ids: number[], from: Uploader) => [JSON.stringify(ids), JSON.stringify(from.addresses), from.principal] as const;
+
+// The unsent uploads `ids` of `from`, in call order. Throws on an id that
 // isn't one: someone else's, unknown, or already on a message or post.
-function unsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
-  const rows = db
-    .prepare(`SELECT * FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL`)
-    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
+function unsentUploads(db: Database, ids: number[], from: Uploader): AttachmentRow[] {
+  const rows = db.prepare(`SELECT * FROM attachments WHERE ${UNSENT}`).all(...unsentArgs(ids, from)) as AttachmentRow[];
   const by = new Map(rows.map((r) => [r.id, r]));
   return ids.map((id) => {
     const r = by.get(id);
@@ -155,23 +171,21 @@ function unsentUploads(db: Database, ids: number[], uploader: string): Attachmen
   });
 }
 
-// The blob digests of `uploader`'s unsent uploads `ids`, in call order: what
+// The blob digests of `from`'s unsent uploads `ids`, in call order: what
 // a write's fingerprint keys its files by (#254), since every attempt uploads
 // afresh under new ids while the blob is content-addressed. Refuses an id
 // bindAttachments would.
-export function uploadDigests(db: Database, ids: number[], uploader: string): string[] {
-  return ids.length === 0 ? [] : unsentUploads(db, ids, uploader).map((r) => r.sha256);
+export function uploadDigests(db: Database, ids: number[], from: Uploader): string[] {
+  return ids.length === 0 ? [] : unsentUploads(db, ids, from).map((r) => r.sha256);
 }
 
-// Drops `uploader`'s unsent uploads `ids`, for a replayed write (#254): the
+// Drops `from`'s unsent uploads `ids`, for a replayed write (#254): the
 // retry uploaded its files afresh and nothing will bind them. Run it inside
 // the replay's transaction; sweepBlobs after it commits deletes the bytes
 // (none, while the first write's copy names the blob).
-export function dropUnsentUploads(db: Database, ids: number[], uploader: string): AttachmentRow[] {
+export function dropUnsentUploads(db: Database, ids: number[], from: Uploader): AttachmentRow[] {
   if (ids.length === 0) return [];
-  return db
-    .prepare(`DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?)) AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`)
-    .all(JSON.stringify(ids), uploader) as AttachmentRow[];
+  return db.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).all(...unsentArgs(ids, from)) as AttachmentRow[];
 }
 
 const info = (r: AttachmentInfo): AttachmentInfo => ({ id: r.id, filename: r.filename, type: r.type, size: r.size, sha256: r.sha256 });
@@ -203,21 +217,23 @@ export function getAttachment(db: Database, id: number): AttachmentRow | undefin
 
 // Whether `handle` may fetch an attachment: one on a post, if it can see the
 // post's board; on a direct message, if dmVisible (the mode's sender or
-// recipient check) says so; an unbound upload, only its uploader: one of
-// `addresses`, the caller's address set (#284 S5).
+// recipient check) says so; an unbound upload, only the user who made it, from
+// one of `from.addresses`, the caller's address set (#284 S5). An address can
+// pass to another user, so on a server `from.principal` must be that user and
+// never null (#367); null means local mode, which has one user.
 export function canReadAttachment(
   db: Database,
   handle: string,
   a: AttachmentRow,
   dmVisible: (messageId: number) => boolean,
-  addresses: string[] = [handle],
+  from: Uploader = { addresses: [handle], principal: null },
 ): boolean {
   if (a.post_id !== null) {
     const p = getPost(db, a.post_id);
     return !!p && canSeeBoard(db, handle, p.board);
   }
   if (a.message_id !== null) return dmVisible(a.message_id);
-  return addresses.includes(a.uploader);
+  return from.addresses.includes(a.uploader) && (from.principal === null || a.uploader_principal === from.principal);
 }
 
 // Deletes the attachments of the messages or posts `ownersSql` selects (a
@@ -250,12 +266,14 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
     .get(principal, sha256);
 }
 
-// Drops one of `uploader`'s unsent uploads, for a send that failed after
-// uploading. Null if it isn't theirs or a message or post already carries it.
-export async function releaseUpload(db: Database, blobs: BlobStore, id: number, uploader: string, guard?: () => void): Promise<AttachmentRow | null> {
+// Drops one of `from`'s unsent uploads, for a send that failed after
+// uploading. Null if it isn't theirs (any address of `from`, made by its user,
+// #367) or a message or post already carries it. guard: a hosted transfer's
+// binding check, run inside the delete's transaction.
+export async function releaseUpload(db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void): Promise<AttachmentRow | null> {
   const row = db.transaction(() => {
     guard?.();
-    return db.prepare(`DELETE FROM attachments WHERE id = ? AND uploader = ? AND message_id IS NULL AND post_id IS NULL RETURNING *`).get(id, uploader) as AttachmentRow | null;
+    return db.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).get(...unsentArgs([id], from)) as AttachmentRow | null;
   }).immediate();
   if (row) await sweepBlobs(db, blobs);
   return row;

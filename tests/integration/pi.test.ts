@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
-test("pi unbound: the session acts as its ID; bind and rebind through the extension's tool bind the session's one grayboard", () => piUnboundScenario(dir), 90_000);
+test("pi unbound: the session acts as its ID; two binds and an unbind through the extension's tools move the session's one grayboard onto its second name", () => piUnboundScenario(dir), 90_000);
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
 test("pi: a grayboard that stops reading makes the next write fail with EPIPE, which pi survives and reports", () => piStdinClosedScenario(dir), 60_000);

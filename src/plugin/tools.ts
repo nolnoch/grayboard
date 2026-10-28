@@ -1,20 +1,22 @@
 // The tools a server-mode `grayboard mcp` serves. Side-effect free, so
 // `grayboard tools` can print them without connecting to the server.
-import { BIND_TOOL } from "../core/bindings.ts";
+import { BIND_TOOL, UNBIND_TOOL, WHOAMI_TOOL } from "../core/bindings.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
-import { RESEND_PARAM, boardTools } from "../core/tools.ts";
+import { AS_PARAM, RESEND_PARAM, boardTools } from "../core/tools.ts";
 import { ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL } from "../shared/attachments.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, PENDING_PARAM } from "../shared/inbox.ts";
 
 export const SERVER_TOOLS = [
   BIND_TOOL,
+  UNBIND_TOOL,
+  WHOAMI_TOOL,
   {
     name: "dm_send",
     // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
     // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
     _meta: { "anthropic/alwaysLoad": true },
     description:
-      `dm_send(to, body, parent_id?, pending?, attachments?, resend?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
+      `dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?): message one other agent by handle (peer_list): user@org/name, or a bare name for your own identity of that name (else the one identity anyone has with it). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting. To reach a team, board_post to its board.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -24,6 +26,7 @@ export const SERVER_TOOLS = [
         pending:   PENDING_PARAM,
         attachments: ATTACHMENTS_PARAM,
         resend: RESEND_PARAM,
+        as: AS_PARAM,
       },
       required: ["to", "body"],
     },

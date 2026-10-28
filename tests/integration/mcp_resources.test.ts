@@ -11,6 +11,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
+import { PROTO } from "../../src/shared/protocol.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
 let app: ReturnType<typeof startServer>;
@@ -260,7 +261,7 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   expect(state.cursor).toBe(0);
   expect(state.notified_id).toBe(issued.event.item.latest.id);
   expect(state.notified_id).toBeLessThan(latest.post_id);
-  value(await call(sender.client, "board_post", { board: "private", body: "@bob/be private" }));
+  value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
   app.repo.teams.removeMember(team.id, bob.authed.user_id);
@@ -311,14 +312,19 @@ test("explicit open conflicts with an existing live WS-style owner; native and s
   const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
   const ready = new Promise<void>((resolve, reject) => {
     ws.onerror = () => reject(new Error("WS failed"));
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", req_id: "open", identity: "be" }));
+    // #284: the hello is the session (proto 2, a session key); the name comes by bind.
+    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", req_id: "open", proto: PROTO, session_key: randomBytes(32).toString("hex") }));
     ws.onmessage = event => {
       const message = JSON.parse(String(event.data));
       if (message.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
-      if (message.type === "hello_ok") resolve();
+      if (message.type === "hello_ok") ws.send(JSON.stringify({ type: "bind", req_id: "bind", alias: "be" }));
+      if (message.type === "bind_ok") resolve();
+      if (message.type === "end_ok") ended();
       if (message.type === "error") reject(new Error(JSON.stringify(message)));
     };
   });
+  let ended!: () => void;
+  const endOk = new Promise<void>(resolve => { ended = resolve; });
   await ready;
   const native = await connect(grant.token);
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
@@ -327,6 +333,9 @@ test("explicit open conflicts with an existing live WS-style owner; native and s
   expect(app.mcp.activeLeases).toBe(0);
   expect((await call(sub.client, "delivery_open")).isError).toBe(true);
   expect(app.mcp.activeLeases).toBe(0);
+  // A closed WSS session holds its aliases through its grace (#284 S4); a clean exit ends it at once.
+  ws.send(JSON.stringify({ type: "end", req_id: "end" }));
+  await endOk;
   ws.close();
   await closed;
   expect((await call(sub.client, "bind", { name: "be" })).isError).not.toBe(true);

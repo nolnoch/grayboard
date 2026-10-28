@@ -68,7 +68,7 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
   expect(config).toContain("helloLimit: DEFAULT_HELLO_LIMIT");
   expect(config).toContain("authFailLimit: DEFAULT_AUTH_FAIL_LIMIT");
   expect(config).toContain("trustedProxies: DEFAULT_TRUSTED_PROXIES");
-  expect(config).toContain('app.repo.aliases.find("you@example.com", "be")');
+  expect(config).toContain('app.repo.aliases.find("you@example.com/be")');
   expect(config).not.toMatch(/FROM handles|repo\.identities/);
 });
 

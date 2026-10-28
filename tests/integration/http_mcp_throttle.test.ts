@@ -15,8 +15,8 @@ test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaust
     const other = await srv.login("bob@example.com");
     const hostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
     const otherHostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com").token;
-    srv.app.repo.aliases.create("alice@example.com", "be");
-    srv.app.repo.aliases.create("bob@example.com", "be");
+    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${hostedToken}` } },
       fetch: async (input, init) => {
@@ -60,7 +60,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   try {
     const { token, authed } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     const user = srv.app.repo.users.findByEmail("alice@example.com")!;
-    srv.app.repo.aliases.create(user.email, "be");
+    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "be" }, user.email);
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
       fetch: async (input, init) => {
@@ -113,12 +113,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
     const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
-    srv.app.repo.aliases.create("alice@example.com", "be");
+    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
     const aliases = srv.app.repo.aliases;
-    const find = aliases.find.bind(aliases), listFor = aliases.listFor.bind(aliases);
+    const find = aliases.find.bind(aliases), listFor = aliases.listForScope.bind(aliases);
     let finds = 0, lists = 0;
     aliases.find = (...args) => { finds++; return find(...args); };
-    aliases.listFor = (...args) => { lists++; return listFor(...args); };
+    aliases.listForScope = (...args) => { lists++; return listFor(...args); };
     let legacySession: string | null = null;
     const call = async (name: string, id: number, extra: Record<string, string> = {}) => {
       const response = await fetch(`${srv.base}/mcp`, {
@@ -138,7 +138,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
     expect(second.response.status).toBe(200);
     expect(second.text).toContain('"tools"');
     expect(srv.app.repo.hosted.all()).toEqual([]);
-    expect(srv.app.repo.aliases.listFor("alice@example.com").map(alias => alias.name)).toEqual(["be"]);
+    expect(srv.app.repo.aliases.listForScope("person", "alice@example.com").map(alias => alias.name)).toEqual(["be"]);
     const before = [finds, lists];
     expect(finds).toBe(0);
     expect(lists).toBeGreaterThan(1);

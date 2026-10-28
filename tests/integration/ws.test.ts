@@ -3,13 +3,16 @@
 // docs/architecture.md §4–5.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { createTouchQueue, hashToken, verifySessionToken } from "../../src/server/auth.ts";
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
+import { PROTO } from "../../src/shared/protocol.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 import type { Any, WsClient, WsClientOptions } from "../support/ws_client.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
@@ -138,7 +141,8 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   const first = await s.next(boardPush);
   await closeAndSettle(s);
 
-  const s2 = client(alice, "sim");
+  // A reconnect is the same session: its key.
+  const s2 = client(alice, "sim", { key: s.key });
   await s2.connect();
   const again = await s2.next(boardPush);
   expect(again.item.post.id).toBe(first.item.post.id);
@@ -146,7 +150,7 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
   expect((await s2.request({ type: "board_ack", refs })).type).toBe("ack_ok");
   await closeAndSettle(s2);
 
-  const s3 = client(alice, "sim");
+  const s3 = client(alice, "sim", { key: s.key });
   await s3.connect();
   await s3.none(boardPush);
 });
@@ -170,6 +174,8 @@ test("peer_list shows where the client says it runs; a resumed hello keeps the s
   await resumed.connect();
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
+  // A session that ends frees the alias; the next one starts its own status.
+  expect((await resumed.request({ type: "end" })).type).toBe("end_ok");
   await closeAndSettle(resumed);
   await client(alice, "be").connect();
   const fresh = await be();
@@ -195,7 +201,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   await a.call("board_post", { board: "eng", body: "standup in 5" });
   await c.none(boardPush);
   await closeAndSettle(c);
-  const c2 = client(carol, "sim");
+  const c2 = client(carol, "sim", { key: c.key });
   await c2.connect();
   const digest = await c2.next(boardPush);
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
@@ -225,7 +231,7 @@ test("leaving a team drops its board and pending pushes", async () => {
   await a.connect();
   // carol is offline when mentioned, then leaves before connecting.
   await api(carol, "POST", "/api/identities", { name: "sim" });
-  await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
+  await a.call("board_post", { board: "eng", body: "@carol@example.com/sim are you there" });
   await api(carol, "POST", "/api/teams/eng/leave");
 
   const c = client(carol, "sim");
@@ -242,7 +248,7 @@ test("removing a member drops their board and pending pushes", async () => {
   const a = client(alice, "be");
   await a.connect();
   await api(carol, "POST", "/api/identities", { name: "sim" });
-  await a.call("board_post", { board: "eng", body: "@carol/sim are you there" });
+  await a.call("board_post", { board: "eng", body: "@carol@example.com/sim are you there" });
   expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "carol@example.com" })).status).toBe(200);
 
   const c = client(carol, "sim");
@@ -322,6 +328,7 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
   await a.connect();
   const closed = (c: WsClient) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
 
+  let pass = 0;
   for (const path of ["/api/admin/revoke-session", "/api/admin/disable-user"]) {
     await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" });
     const bob = await login("bob@example.com");
@@ -332,6 +339,7 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
     expect((await api(root, "POST", path, { email: "bob@example.com" })).status).toBe(200);
     expect(await live.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
     await gone;
+    expect(audits("auth.connection_closed").filter((r) => JSON.parse(r.detail).why === "user_signed_out")).toHaveLength(2 * ++pass);
   }
   expect((await a.call("board_list")).type).toBe("call_ok");
 
@@ -344,6 +352,133 @@ test("revoking or disabling a user closes their open connections; the heartbeat 
   srv.app.revalidate();
   await gone;
   expect((await a.call("board_list")).type).toBe("call_ok");
+});
+
+// #351: a logout revokes one token. Its connections close and their sessions
+// end; the same user's other token keeps its own.
+test("logout closes only that token's connections and ends only their sessions, audited", async () => {
+  const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
+  const a1 = client(tokenA, "be");
+  const a2 = client(tokenA, "fe", { push: false });
+  const b = client(tokenB, "sim");
+  await Promise.all([a1.connect(), a2.connect(), b.connect()]);
+  const closed = (c: WsClient) => new Promise<void>((resolve) => c.ws.addEventListener("close", () => resolve()));
+  const gone = Promise.all([closed(a1), closed(a2)]);
+  const sidA = srv.app.repo.sessions.findByTokenHash(hashToken(tokenA))!.id;
+
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(await a1.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
+  expect(await a2.next((m) => m.type === "error")).toMatchObject({ code: "unauthenticated" });
+  await gone;
+
+  expect((await b.call("board_list")).type).toBe("call_ok");
+  const ended = (id: string) => srv.app.db.query(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null };
+  expect(ended(a1.id).ended_at).not.toBeNull();
+  expect(ended(a2.id).ended_at).not.toBeNull();
+  expect(ended(b.id).ended_at).toBeNull();
+  const closes = audits("auth.connection_closed").map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  expect(closes.map((r) => r.target).sort()).toEqual([a1.id, a2.id].sort());
+  for (const r of closes) expect(r).toMatchObject({ actor: "alice@example.com", detail: { why: "logout" } });
+  for (const r of closes) expect(r.detail.token_session).toBe(sidA);
+  expect(srv.app.repo.sessions.findById(sidA)!.revoked_at).not.toBeNull();
+  expect(audits("id.ended").filter((r) => JSON.parse(r.detail).why === "signed_out").map((r) => r.target).sort()).toEqual([a1.id, a2.id].sort());
+});
+
+// A session in its grace has no connection, so only the token it last said
+// hello under (ids.token_session) finds it.
+test("logout ends the token's sessions in their grace too, and a resume on them is refused", async () => {
+  const [tokenA, tokenC] = [await login("alice@example.com"), await login("alice@example.com")];
+  const a = client(tokenA, "be");
+  await a.connect();
+  a.close();
+  await until(() => audits("id.detached").length === 1, 2000, "the grace");
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(srv.app.db.query(`SELECT ended_at FROM ids WHERE id = ?`).get(a.id)).toEqual({ ended_at: expect.any(Number) });
+  expect(audits("id.ended").map((r) => ({ target: r.target, why: JSON.parse(r.detail).why }))).toEqual([{ target: a.id, why: "signed_out" }]);
+
+  const back = client(tokenC, "be", { key: a.key, hello: { resume: true } });
+  expect(await back.connect()).toMatchObject({ type: "error", code: "id_collision" });
+});
+
+// A socket opened with a token that is revoked before it speaks is in no
+// registry, so only the hello can refuse it.
+test("a hello on a token revoked since the upgrade is refused, registers nothing, and is audited", async () => {
+  const token = await login("alice@example.com");
+  const key = "ab".repeat(32);
+  const ws = new (WebSocket as any)(`${srv.base.replace("http", "ws")}/ws`, { headers: { Authorization: `Bearer ${token}` } });
+  await new Promise((resolve) => (ws.onopen = resolve));
+  const frames: Any[] = [];
+  ws.onmessage = (e: MessageEvent) => frames.push(JSON.parse(e.data as string));
+  const closed = new Promise<void>((resolve) => (ws.onclose = () => resolve()));
+  expect((await api(token, "POST", "/api/auth/logout")).status).toBe(200);
+  ws.send(JSON.stringify({ type: "hello", req_id: "h", proto: PROTO, session_key: key }));
+  await closed;
+  expect(frames.find((m) => m.type === "error")).toMatchObject({ req_id: "h", code: "unauthenticated" });
+  expect(frames.some((m) => m.type === "hello_ok")).toBe(false);
+  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM ids`).get()).toEqual({ n: 0 });
+  const rows = audits("auth.hello_refused").map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ actor: "alice@example.com", detail: { why: "token_revoked" } });
+});
+
+test("a hello from a user disabled since the upgrade is refused, registers nothing, and is audited", async () => {
+  const token = await login("alice@example.com");
+  const ws = new (WebSocket as any)(`${srv.base.replace("http", "ws")}/ws`, { headers: { Authorization: `Bearer ${token}` } });
+  await new Promise((resolve) => (ws.onopen = resolve));
+  const frames: Any[] = [];
+  ws.onmessage = (e: MessageEvent) => frames.push(JSON.parse(e.data as string));
+  const closed = new Promise<void>((resolve) => (ws.onclose = () => resolve()));
+  srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail("alice@example.com")!.id, true);
+  ws.send(JSON.stringify({ type: "hello", req_id: "h", proto: PROTO, session_key: "cd".repeat(32) }));
+  await closed;
+  expect(frames.find((m) => m.type === "error")).toMatchObject({ req_id: "h", code: "unauthenticated" });
+  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM ids`).get()).toEqual({ n: 0 });
+  expect(audits("auth.hello_refused").map((r) => JSON.parse(r.detail).why)).toEqual(["user_disabled"]);
+});
+
+test("a token revoked while its hello probes a silent holder neither takes the session over nor registers", async () => {
+  const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
+  const holder = client(tokenB, "be", { pong: false });
+  await holder.connect();
+  const hello = client(tokenA, "be", { key: holder.key }).connect().catch((e) => e);
+  await holder.next((m) => m.type === "ping"); // the probe is under way
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(await hello).toMatchObject({ type: "error", code: "unauthenticated" });
+  expect(audits("id.superseded")).toEqual([]);
+  expect(audits("auth.hello_refused")).toHaveLength(1);
+  // The holder is still the session's connection.
+  expect(holder.ws.readyState).toBe(1);
+});
+
+// The wait for another hello's probe is an await too: a token revoked during
+// it must not go on to probe the new holder and collide as if it were live.
+test("a token revoked while its hello waits on another hello's probe is refused, not collided", async () => {
+  const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
+  const holder = client(tokenB, "be", { pong: false });
+  await holder.connect();
+  const first = client(tokenB, "be", { key: holder.key }).connect(); // probes the silent holder (150 ms)
+  await holder.next((m) => m.type === "ping");
+  // A beat for the second hello to reach the server and wait on the probe, as the sleeps above do.
+  await Bun.sleep(30);
+  const second = client(tokenA, "be", { key: holder.key }).connect();
+  await Bun.sleep(30);
+  expect((await api(tokenA, "POST", "/api/auth/logout")).status).toBe(200);
+  expect(await second).toMatchObject({ type: "error", code: "unauthenticated" });
+  expect((await first).type).toBe("hello_ok");
+  expect(audits("id.collision")).toEqual([]);
+});
+
+test("the heartbeat closes a revoked token's connections when no route said so, leaving the user's other token", async () => {
+  const [tokenA, tokenB] = [await login("alice@example.com"), await login("alice@example.com")];
+  const a = client(tokenA, "be");
+  const b = client(tokenB, "fe");
+  await Promise.all([a.connect(), b.connect()]);
+  const gone = new Promise<void>((resolve) => a.ws.addEventListener("close", () => resolve()));
+  srv.app.repo.sessions.revoke(srv.app.repo.sessions.findByTokenHash(hashToken(tokenA))!.id);
+  srv.app.revalidate();
+  await gone;
+  expect(audits("auth.connection_closed").map((r) => JSON.parse(r.detail).why)).toEqual(["token_revoked"]);
+  expect((await b.call("board_list")).type).toBe("call_ok");
 });
 
 test("an admin can manage a team they're not in, e.g. after its last member left", async () => {
@@ -409,38 +544,82 @@ test("claims are org-wide and atomic across users", async () => {
   expect((await b.call("claim_list")).result.map((c: any) => c.key)).toEqual(["ticket:ENG-1"]);
 });
 
-test("a live identity refuses a second connection", async () => {
+test("an alias a live session holds refuses another session's bind", async () => {
   const alice = await login("alice@example.com");
   const first = client(alice, "be");
   await first.connect();
   const second = client(alice, "be");
-  expect(await second.connect()).toMatchObject({ type: "error", code: "identity_in_use" });
+  expect(await second.connect()).toMatchObject({ type: "error", code: "alias_held", holder: `the session ${first.id}` });
   // The first connection still works.
   expect((await first.call("board_list")).type).toBe("call_ok");
 });
 
-test("a connection that doesn't answer the probe is replaced", async () => {
+test("a connection that doesn't answer the probe is replaced, audited id.superseded with both places", async () => {
   const alice = await login("alice@example.com");
-  const stale = client(alice, "be", { pong: false });
+  const stale = client(alice, "be", { pong: false, hello: { where: "old box" } });
   await stale.connect();
-  const fresh = client(alice, "be");
+  // A place is cleaned once, before any audit carries it (audit S6).
+  const fresh = client(alice, "be", { key: stale.key, hello: { where: "  new\n box " } });
   expect((await fresh.connect()).type).toBe("hello_ok");
   expect(await stale.next((m) => m.type === "error")).toMatchObject({ code: "superseded" });
+  const rows = srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'id.superseded'`).all() as { actor: string; target: string; detail: string }[];
+  expect(rows.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([
+    { actor: "alice@example.com", target: stale.id, detail: { old_place: "old box", place: "new box" } },
+  ]);
+});
+
+// Audit S2 (#345): a hello awaits the probe; a second hello on the same
+// connection meanwhile is refused and closes it, and the first never
+// supersedes the holder from a closed socket.
+test("a second hello while the first is probing is refused and closes the connection", async () => {
+  const alice = await login("alice@example.com");
+  const dead = client(alice, "be", { pong: false });
+  await dead.connect();
+  const twice = client(alice, "be", { key: dead.key });
+  const first = twice.connect(); // probes the dead holder (150 ms)
+  await until(() => twice.ws.readyState === 1);
+  twice.ws.send(JSON.stringify({ type: "hello", req_id: "h2", proto: PROTO, session_key: dead.key }));
+  expect(await twice.next((m) => m.req_id === "h2")).toMatchObject({ type: "error", code: "bad_request", message: "a hello is already in flight on this connection" });
+  await expect(first).rejects.toThrow("socket closed");
+  await dead.none((m: Any) => m.type === "error", 300);
+});
+
+// Audit S1 (#345): a re-attach is the session its row registered: a
+// tools-only hello on a push session's key, or a push hello on a tools-only
+// session's, is id_collision, refused before the probe, so it never
+// supersedes the holder.
+test("a re-attach whose writes_as differs from the session's row is id_collision and supersedes nothing", async () => {
+  const alice = await login("alice@example.com");
+  const holder = client(alice, "be", { pong: false });
+  await holder.connect();
+  const sidecar = client(alice, "be", { key: holder.key, push: false });
+  expect(await sidecar.connect()).toMatchObject({
+    type: "error", code: "id_collision", message: expect.stringContaining(`registered writing as its own addresses, and this hello writes as "alice@example.com/be"`),
+  });
+  await holder.none((m: Any) => m.type === "error", 300);
+
+  const writer = client(alice, "fe", { push: false });
+  await writer.connect();
+  writer.close();
+  const pushed = client(alice, "fe", { key: writer.key });
+  expect(await pushed.connect()).toMatchObject({ type: "error", code: "id_collision", message: expect.stringContaining(`registered writing as "alice@example.com/fe"`) });
+  const audited = srv.app.db.prepare(`SELECT target FROM access_log WHERE action = 'id.collision' ORDER BY id`).all();
+  expect(audited).toEqual([{ target: holder.id }, { target: writer.id }]);
 });
 
 test("a hello arriving while another probes the holder waits for it, so only one wins", async () => {
   const [alice, bob] = await Promise.all([login("alice@example.com"), login("bob@example.com")]);
   const dead = client(alice, "be", { pong: false });
   await dead.connect();
-  const n1 = client(alice, "be");
+  const n1 = client(alice, "be", { key: dead.key });
   const first = n1.connect(); // probes the dead holder (150 ms)
   await Bun.sleep(40);
   dead.close(); // the holder goes away mid-probe
   await Bun.sleep(40);
-  const n2 = client(alice, "be");
+  const n2 = client(alice, "be", { key: dead.key });
   const [r1, r2] = await Promise.all([first, n2.connect()]);
   expect(r1.type).toBe("hello_ok");
-  expect(r2).toMatchObject({ type: "error", code: "identity_in_use" });
+  expect(r2).toMatchObject({ type: "error", code: "id_collision" });
 
   const b = client(bob, "fe");
   await b.connect();
@@ -532,7 +711,7 @@ test("senders see what hasn't reached an offline peer", async () => {
     (await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.delivered);
   expect(await delivered()).toEqual([false, false]);
 
-  const b2 = client(bob, "fe");
+  const b2 = client(bob, "fe", { key: b.key });
   await b2.connect();
   const ids = [(await b2.next((m) => m.type === "push")).message.id, (await b2.next((m) => m.type === "push")).message.id];
   await b2.request({ type: "ack", message_ids: ids });
@@ -560,7 +739,7 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   expect((await a.request({ type: "history", peer: "bob@example.com/fe" })).messages.map((m: any) => m.body)).toEqual(["fresh"]);
 
   // Pushed but not acked: the cursor hasn't moved, but bob is live.
-  const b2 = client(bob, "fe");
+  const b2 = client(bob, "fe", { key: b.key });
   await b2.connect();
   expect((await b2.next((m) => m.type === "push")).message.body).toBe("fresh");
   await b2.none((m) => m.type === "push");
@@ -582,11 +761,37 @@ test("hello_ok carries active claims and DMs undelivered after a day", async () 
   srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
   await closeAndSettle(a);
 
-  const notices: string[] = (await client(alice, "be").connect()).notices;
+  const notices: string[] = (await client(alice, "be", { key: a.key }).connect()).notices;
   expect(notices).toHaveLength(2);
   expect(notices[0]).toContain(`bob@example.com/fe: 1 since message_id ${old.message_id} (last seen`);
   expect(notices[1]).toMatch(/Yours: ticket:ENG-2 \(until \d{4}-\d\d-\d\dT\d\d:\d\dZ: on it\)\./);
   expect((await client(alice, "sim").connect()).notices[0]).toContain("Others': ticket:ENG-2.");
+});
+
+// Audit F2 (#345): bind_ok's notices cover the session's whole address set,
+// so a claim taken as the ID before the bind is still listed as its own.
+test("bind_ok's notices list the claims the session took as its ID before the bind", async () => {
+  const alice = await login("alice@example.com");
+  const a = srv.client(alice, null);
+  await a.connect();
+  await a.call("claim_take", { key: "ticket:ENG-3", note: "as the ID" });
+  const b = await a.bind("be");
+  expect(b.notices.at(-1)).toMatch(/Yours: ticket:ENG-3 \(until [^)]*: as the ID\)\./);
+});
+
+// Audit W2 (#345): deleting an identity would drop its holds under a live
+// holder, and a second session could then bind it: refused while in use.
+test("an identity a session holds or writes as can't be deleted until those sessions end", async () => {
+  const alice = await login("alice@example.com");
+  const a = client(alice, "be");
+  await a.connect();
+  const sidecar = client(alice, "be", { push: false });
+  await sidecar.connect();
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by the session") } });
+  expect(await a.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(sidecar.id) } });
+  expect(await sidecar.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 200, body: { ok: true } });
 });
 
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
@@ -683,7 +888,7 @@ test("a tools-only connection works beside the live owner without taking its pus
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
 const download = (token: string, identity: string, id: number) =>
-  fetch(`${srv.base}/api/attachments/${id}?identity=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
+  fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
 const audits = (action: string) =>
   (srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
@@ -851,7 +1056,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
   expect((await upload(alice, "be", "d.txt", "d".repeat(20))).status).toBe(201);
 
   // A streamed body declares no length.
-  const streamed = await fetch(`${srv.base}/api/attachments?identity=be&filename=e.txt`, {
+  const streamed = await fetch(`${srv.base}/api/attachments?as=be&filename=e.txt`, {
     method: "POST",
     headers: { Authorization: `Bearer ${alice}` },
     body: new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }),
@@ -870,4 +1075,62 @@ test("the server reports its version: /healthz and --version", async () => {
   const p = Bun.spawnSync([process.execPath, SERVER, "--version"], { env: { PATH: process.env.PATH ?? "" } });
   expect(p.exitCode).toBe(0);
   expect(p.stdout.toString().trim()).toBe(pkg.version);
+});
+
+// Audits W1, W4 (#345): after a bind, the session still reads as its ID:
+// it replies in a thread it received as the ID, and downloads a file DM'd to
+// the ID with ?as= its alias. Another user's session's ID never joins the
+// set: bob acting as his own alias can't read alice's ID's file.
+// Once the session ends, ?as= its ID is refused.
+test("after a bind, a session replies to a thread and reads a file it received as its ID", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  const a = srv.client(alice, null);
+  await a.connect();
+  const b = client(bob, "fe");
+  await b.connect();
+  const up = await upload(bob, "fe", "shot.png", PNG);
+  const sent = await b.request({ type: "send", recipient: a.id, body: "for your ID", attachment_ids: [up.body.id] });
+  expect(sent.type).toBe("send_ok");
+  expect((await a.bind("be")).type).toBe("bind_ok");
+
+  expect(await a.request({ type: "send", recipient: "bob@example.com/fe", body: "got it", parent_id: sent.message_id })).toMatchObject({ type: "send_ok" });
+  expect((await download(alice, "alice@example.com/be", up.body.id)).status).toBe(200);
+  expect((await download(alice, a.id, up.body.id)).status).toBe(200);
+  const other = client(bob, "ops");
+  await other.connect();
+  expect((await download(bob, "bob@example.com/ops", up.body.id)).status).toBe(404);
+  // Nothing acts as an ended session, even its own user (S11).
+  expect(await a.request({ type: "end" })).toMatchObject({ type: "end_ok" });
+  const gone = await download(alice, a.id, up.body.id);
+  expect({ status: gone.status, body: await gone.json() }).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
+});
+
+// Audit A7 (#345): a frame still in flight on a connection that left the hub
+// (superseded, revoked) is refused, so it can't act for the session's
+// successor: an `end` there would end the live session.
+test("a frame on a connection that no longer holds its session is refused and acts on nothing", async () => {
+  const alice = await login("alice@example.com");
+  // #284 port: the WSS adapter keeps the application session on ws.data,
+  // so the stale connection is a real one the live client supersedes.
+  const out: Any[] = [];
+  let closed = false;
+  const stale = {
+    data: { authed: verifySessionToken(alice, srv.app.repo, createTouchQueue())!, ready: false },
+    readyState: 1,
+    send: (d: string) => out.push(JSON.parse(d)),
+    close: () => { closed = true; },
+  };
+  const key = "a".repeat(64);
+  srv.app.handlers.message(stale as any, JSON.stringify({ type: "hello", req_id: "h", proto: PROTO, session_key: key }));
+  await until(() => out.find(m => m.req_id === "h"));
+  // Silent to the probe, the stale connection is superseded by its session's restart.
+  const live = client(alice, "be", { key });
+  await live.connect();
+  expect(closed).toBe(true);
+  out.length = 0;
+  srv.app.handlers.message(stale as any, JSON.stringify({ type: "end", req_id: "e" }));
+  expect(out).toEqual([{ type: "error", req_id: "e", code: "superseded", message: "this connection no longer holds its session" }]);
+  expect(srv.app.db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(live.id)).toEqual({ ended_at: null });
+  expect((await live.call("board_list")).type).toBe("call_ok");
 });

@@ -67,6 +67,6 @@ test("an upload during a sweep of the same bytes keeps them", async () => {
   db.prepare(`DELETE FROM attachments WHERE id = ?`).run(first.id);
   const [, again] = await Promise.all([sweepBlobs(db, slow), Bun.sleep(5).then(() => storeAttachment(db, slow, "fe", file))]);
   expect(new TextDecoder().decode(await disk.get(again.sha256))).toBe("again");
-  expect(await releaseUpload(db, slow, again.id, "fe")).toMatchObject({ id: again.id });
+  expect(await releaseUpload(db, slow, again.id, { addresses: ["fe"], principal: null })).toMatchObject({ id: again.id });
   await expect(disk.get(again.sha256)).rejects.toThrow("are missing");
 });

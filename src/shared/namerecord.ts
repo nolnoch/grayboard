@@ -1,9 +1,9 @@
 // The name record (#182 decision 14): `bind.<harness pid>` in the bus's
 // socket directory, written by the process that owns delivery whenever its
-// name changes (a name, or null while unbound). A grayboard mcp restarted
-// under the same harness process (`/mcp` reconnect, a crash) finds it and
-// takes the name back, so a session that bound a name mid-task doesn't come
-// back unbound. A record whose harness has exited, or whose pid now belongs
+// names change (every name it holds, oldest first; none while unbound). A
+// grayboard mcp restarted under the same harness process (`/mcp` reconnect, a
+// crash) finds it and takes the names back, so a session that bound names
+// mid-task doesn't come back unbound. A record whose harness has exited, or whose pid now belongs
 // to another process, is stale: it's deleted, never honoured.
 //
 // The file is writable by any process running as the user, the same trust
@@ -14,8 +14,8 @@ import { procStart, procStarts } from "./proc.ts";
 import { asSessionId } from "../core/bindings.ts";
 
 export type NameRecord = {
-  // The bound name, or null while the session is unbound.
-  name: string | null;
+  // Every name the session holds, oldest first (#284 S10); empty while unbound.
+  names: string[];
   // The session that wrote it, for the binding history: an `id:` address. A
   // 1.x record's 16-hex ID is re-encoded on read (the same 64 bits), so a
   // restart across the upgrade still matches its history.
@@ -54,11 +54,17 @@ export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "
   return rec;
 }
 
+// A record from before #284 PR 4 carries one `name` (a string, or null while
+// unbound): read as that one-name list. Client files can't be migrated.
 function parse(text: string): NameRecord | null {
   try {
-    const r = JSON.parse(text) as NameRecord;
+    const { name, ...r } = JSON.parse(text) as NameRecord & { name?: unknown };
     if (typeof r.harness_pid !== "number" || typeof r.harness_start !== "string" || typeof r.bus !== "string") return null;
-    if (r.name !== null && typeof r.name !== "string") return null;
+    if (r.names === undefined) {
+      if (name !== null && typeof name !== "string") return null;
+      return { ...r, names: name === null ? [] : [name] };
+    }
+    if (!Array.isArray(r.names) || !r.names.every((n) => typeof n === "string")) return null;
     return r;
   } catch {
     return null;
@@ -116,7 +122,7 @@ export function sweepRecords(dir: string): void {
 /**
  * At exit: delete this session's record if it holds no name. A bound exit
  * keeps its record, so a grayboard restarted under the same harness (`/mcp`
- * reconnect) takes the name back; a record a successor already rewrote is left.
+ * reconnect) takes the names back; a record a successor already rewrote is left.
  */
 export function dropUnboundRecord(dir: string, harnessPid: number, sessionId: string): void {
   const path = recordPath(dir, harnessPid);
@@ -126,7 +132,7 @@ export function dropUnboundRecord(dir: string, harnessPid: number, sessionId: st
   } catch {
     return;
   }
-  if (r && r.session_id === sessionId && r.name === null) rm(path);
+  if (r && r.session_id === sessionId && r.names.length === 0) rm(path);
 }
 
 function rm(path: string): void {

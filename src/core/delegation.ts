@@ -16,7 +16,7 @@
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
-import { ALIAS_SESSION_SQL, humanHandles, lastSeen, rosterHandles } from "./boards.ts";
+import { ALIAS_SESSION_SQL, humanHandles, lastSeen, primaryHoldSql, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 
@@ -27,8 +27,11 @@ import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
   WHERE i.launcher = 1 AND (a.human IS NULL OR a.human = 0)`;
 
+// The auto-pick's candidates: one per launcher session, its primary (#284
+// S13), so a session holding several aliases isn't picked several times.
 export function launchers(db: Database): string[] {
-  return (db.prepare(`${LAUNCHER_SQL} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
+  const primary = `(a.address = ${primaryHoldSql("i.id")} OR NOT EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address))`;
+  return (db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
 }
 
 // The session's capability, rewritten by each of its owner hellos on a server
@@ -37,6 +40,7 @@ export function setLauncher(db: Database, id: string, on: boolean): void {
   db.prepare(`UPDATE ids SET launcher = ? WHERE id = ?`).run(on ? 1 : 0, id);
 }
 
+// An explicit delegate(to) may name any alias a launcher session holds.
 export function isLauncher(db: Database, handle: string): boolean {
   return !!db.prepare(`${LAUNCHER_SQL} AND a.address = ?`).get(handle);
 }

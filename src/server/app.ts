@@ -1,7 +1,7 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsHandlers, type WsData, type WsOptions } from "./ws.ts";
-import { createApplication } from "./application.ts";
+import { SWEEP_MS, createApplication } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { createHostedMcp } from "./mcp.ts";
@@ -29,7 +29,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const application = createApplication(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,
   });
-  const { revalidate, disconnectUser, stopExpiry, wake } = application;
+  const { revalidate, disconnectUser, disconnectSession, accessChanged, stopExpiry, wake, sweepSessions } = application;
   const { handlers, startPing } = createWsHandlers(application);
 
   const authGate = new AuthGate(repo, {
@@ -92,12 +92,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
           return Response.json({ code: "unauthenticated", message: "invalid token" }, { status: 401 });
         }
         const upgraded = server.upgrade(req, {
-          data: {
-            authed,
-            identityName: "",
-            identityFull: "",
-            ready: false,
-          },
+          data: { authed, ready: false },
         });
         if (upgraded) return;
         return new Response("WebSocket upgrade failed", { status: 500 });
@@ -110,7 +105,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, disconnectUser, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, disconnectSession, accessChanged }, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: handlers,
@@ -128,7 +123,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopRetention: (() => void) | undefined;
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
-    timers.push(startPing(), setInterval(sweepLimits, 30_000));
+    timers.push(startPing(), setInterval(sweepLimits, 30_000), setInterval(() => sweepSessions(), SWEEP_MS));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
 
@@ -145,6 +140,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // The heartbeat's auth re-check and limiter sweep, for tests that run without it.
     revalidate,
     sweepLimits,
+    // Ends sessions past their grace (S4), for tests that run without the interval.
+    sweepSessions,
     authGate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),

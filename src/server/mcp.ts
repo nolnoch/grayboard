@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
+import { AS_PARAM, boardTools, BOARD_INSTRUCTIONS, ownHumanInstruction } from "../core/tools.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
@@ -10,8 +10,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, sessionContext, type SessionContext, type HostedSessions } from "./hosted.ts";
-import { unboundInstruction } from "../core/bindings.ts";
+import { createHostedSessions, hostedUnboundInstruction, sessionContext, type SessionContext, type HostedSessions } from "./hosted.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -280,7 +279,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : context.session.readOnly ? unboundInstruction(info.candidates ?? []) : [
+      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : [
         `You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`,
         ...BOARD_INSTRUCTIONS.slice(1),
         ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
@@ -589,7 +588,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   }
   server.registerTool("dm_send", {
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
-    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional() }),
+    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), as: z.string().describe(AS_PARAM.description).optional() }),
   }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,

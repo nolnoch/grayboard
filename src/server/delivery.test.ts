@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { tokenSession } from "../../tests/support/token_session.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { GRACE_MS, SWEEP_MS, createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
 import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
 import { openDatabase } from "./db.ts";
@@ -32,7 +33,7 @@ beforeEach(async () => {
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  sender = (await application.selectIdentity(alice.authed, "be", sink, { push: false })).session;
+  sender = (await application.selectIdentity(tokenSession(application.repo, alice.authed), "be", sink, { push: false })).session;
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -197,10 +198,13 @@ test("explicit release ends ownership and closes all children", async () => {
 });
 
 test("cross WSS/hosted holders share one exclusion path", async () => {
-  await expect(application.selectIdentity(bob.authed, "fe", sink)).rejects.toHaveProperty("code", "identity_in_use");
-  const wss = (await application.selectIdentity(bob.authed, "be", sink)).session;
+  await expect(application.selectIdentity(tokenSession(application.repo, bob.authed), "fe", sink)).rejects.toHaveProperty("code", "alias_held"); // #284: a WSS bind's refusal (was identity_in_use)
+  const wss = (await application.selectIdentity(tokenSession(application.repo, bob.authed), "be", sink)).session;
   await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
   application.close(wss);
+  // #284 S4: a closed WSS session holds its aliases through its grace; the sweep ends it.
+  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
+  application.sweepSessions(Date.now() + GRACE_MS + SWEEP_MS);
   await hosted.bind(bob, context(bob), { name: "be" });
   expect(await hosted.whoami(bob, context(bob))).toHaveProperty("name", "be");
 });

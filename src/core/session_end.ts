@@ -10,7 +10,7 @@
 // core.
 import type { Database } from "bun:sqlite";
 
-import { writeCoreAudit } from "./audit.ts";
+import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
 import { logBinding } from "./bindings.ts";
@@ -29,28 +29,31 @@ export interface MailPort {
 }
 
 export type EndedSession = {
+  /** False when the session had already ended: this call changed nothing. */
+  ended: boolean;
   /** The aliases it held, now released. */
   held: string[];
   /** Addresses to poke once the transaction commits: bounce recipients, release and redelivery wakes. */
   wake: string[];
 };
 
-const NOT_ENDED: EndedSession = { held: [], wake: [] };
+const NOT_ENDED: EndedSession = { ended: false, held: [], wake: [] };
 
 /**
  * End session `id`. Callers are inside a BEGIN IMMEDIATE transaction and
  * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
+ * `audit`: where the id.ended row goes (the server's access_log); audit_log when absent.
  * A session already ended is left alone.
  */
 export function endSession(
   db: Database,
   mail: MailPort,
   id: string,
-  opts: { why?: string | null; legacyNames?: string[]; now?: number } = {},
+  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
-  const row = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null } | null;
+  const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
   if (row?.ended_at != null) return NOT_ENDED;
   const holds = (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
   const held = [...new Set([...holds, ...(opts.legacyNames ?? [])])];
@@ -103,7 +106,8 @@ export function endSession(
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(id);
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
-  writeCoreAudit(db, "id.ended", id, id, {
+  (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
+    principal: row?.principal ?? null,
     held,
     why: opts.why ?? null,
     bounced,
@@ -111,7 +115,7 @@ export function endSession(
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
   });
   wake.delete(id);
-  return { held, wake: [...wake] };
+  return { ended: true, held, wake: [...wake] };
 }
 
 function isEndedId(db: Database, address: string): boolean {
@@ -137,21 +141,35 @@ export function bounceBody(id: string, endedAt: number, held: string[]): string 
  */
 export function assertDeliverableId(db: Database, id: string): void {
   const why = undeliverableId(db, id);
-  if (why) throw new CoreError(why);
+  if (why) throw why;
+}
+
+/**
+ * assertDeliverableId's refusal. Its message reads `<code>: <detail>`, the
+ * text a local tool error shows; the server sends `code` as the error
+ * frame's code and `detail` as its message, so both modes read the same.
+ */
+export class Undeliverable extends CoreError {
+  constructor(
+    readonly code: "not_found" | "id_ended" | "no_delivery",
+    readonly detail: string,
+  ) {
+    super(`${code}: ${detail}`);
+  }
 }
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
-export function undeliverableId(db: Database, id: string): string | null {
+export function undeliverableId(db: Database, id: string): Undeliverable | null {
   const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
     | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
     | null;
-  if (!r || r.viewer) return `not_found: no session ${id}`;
+  if (!r || r.viewer) return new Undeliverable("not_found", `no session ${id}`);
   if (r.ended_at != null) {
     const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-    return `id_ended: ${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`;
+    return new Undeliverable("id_ended", `${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
   }
   if (r.delivery === "none") {
-    return `no_delivery: ${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`;
+    return new Undeliverable("no_delivery", `${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
   }
   return null;
 }

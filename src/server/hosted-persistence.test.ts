@@ -125,7 +125,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
     expect(fresh.name).toBe(change === "convert" ? null : "be");
-    expect(database.repo.aliases.find(p.authed.user_email, "new")).toBeUndefined();
+    expect(database.repo.aliases.find(`${p.authed.user_email}/new`)).toBeUndefined();
     expect(database.repo.hosted.all().some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
   });
@@ -267,11 +267,11 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
   const first = issue();
-  database.repo.aliases.create(first.authed.user_email, "fe");
+  database.repo.aliases.create({ scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
   const message = database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   close(); open();
-  expect(database.repo.aliases.listFor(first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
+  expect(database.repo.aliases.listForScope("person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
   expect(database.repo.oauth.isGrantActive(first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(database.repo.hosted.all()).toEqual([]);

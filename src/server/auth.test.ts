@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTouchQueue, hashToken, mintToken, verifySessionToken, verifyGoogleIdToken } from "./auth.ts";
+import { authLost, createTouchQueue, hashToken, mintToken, verifySessionToken, verifyGoogleIdToken } from "./auth.ts";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
 import { openDatabase, type Repo } from "./db.ts";
 
@@ -84,5 +84,20 @@ describe("verifySessionToken", () => {
     repo.users.setDisabled(u.id, true);
     repo.users.setDisabled(u.id, false);
     expect(verifySessionToken(raw, repo, touches)).not.toBeNull();
+  });
+
+  // #351: why a connection's token stopped authenticating.
+  test("authLost names why a token stopped authenticating, and clears with a re-enable", () => {
+    const u = repo.users.upsertByEmail("wade@example.com", null);
+    const s = repo.sessions.create(u.id, hashToken(mintToken()), null);
+    const authed = { user_id: u.id, user_email: u.email, session_id: s.id };
+    expect(authLost(authed, repo)).toBeNull();
+    repo.users.setDisabled(u.id, true);
+    expect(authLost(authed, repo)).toBe("user_disabled");
+    repo.users.setDisabled(u.id, false);
+    expect(authLost(authed, repo)).toBeNull();
+    repo.sessions.revoke(s.id);
+    expect(authLost(authed, repo)).toBe("token_revoked");
+    expect(authLost({ ...authed, session_id: 0 }, repo)).toBe("token_revoked");
   });
 });
