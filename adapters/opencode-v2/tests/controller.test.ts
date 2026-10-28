@@ -316,6 +316,17 @@ test("expired capture deleting an unenrolled child does not terminate later cred
   } finally { abort.abort(); await r.controller.close(); }
 });
 
+test("a stream that delivered events restarts the resubscription budget", async () => {
+  const abort = new AbortController(), waits: number[] = []; let subscriptions = 0;
+  await observeEvents(async function* () {
+    if (++subscriptions === 20) abort.abort();
+    yield { type: "session.idle", data: {} };
+    throw new Error("closed");
+  }, async () => {}, () => {}, abort.signal, async ms => { waits.push(ms); });
+  expect(subscriptions).toBe(20);
+  expect(waits).toEqual(Array(19).fill(250));
+});
+
 test("event resubscription cancellation ends backoff without another subscriber", async () => {
   const abort = new AbortController(); let attempts = 0;
   await observeEvents(async function* () { attempts++; throw new Error("closed"); }, async () => {}, () => {}, abort.signal, async () => { abort.abort(); });
@@ -434,6 +445,16 @@ test("repeated successful opens reset lease recovery but cannot erase one item's
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(9);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
     expect(r.controller.status().message).toContain("direct:1; item remains unreceipted");
+  } finally { await r.controller.close(); }
+});
+test("a lease lost outside any item pauses after bounded recoveries despite successful opens", async () => {
+  const r = runtime({}, async () => {});
+  try {
+    r.bind("R", "be");
+    r.readFailure(() => { throw new LeaseUnavailable(); });
+    await r.controller.enroll("R");
+    await until(() => r.controller.status().state === "paused");
+    expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(4);
   } finally { await r.controller.close(); }
 });
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {

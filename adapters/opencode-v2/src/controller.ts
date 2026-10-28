@@ -175,7 +175,9 @@ export class Controller {
     return started;
   }
   private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal, ready: () => void) {
-    let failures = 0, recoveries = 0, throttles = 0;
+    // recoveries counts lease losses outside an item (inbox read, renew) since
+    // the lease last proved healthy; a loss inside an item spends that item's attempts.
+    let failures = 0, recoveries = 0, throttles = 0, inItem = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
@@ -194,7 +196,6 @@ export class Controller {
         const lease = leaseOf(await wire.call("delivery_open"), e);
         await this.guard(r, epoch, signal);
         r.lease = lease; wire.capability = lease.capability;
-        recoveries = 0;
         this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake: (() => void) | undefined, closed = false;
@@ -208,6 +209,7 @@ export class Controller {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
               await admitPrefix(items, async item => {
+                inItem = true;
                 pendingItem = /^(direct|push):[1-9][0-9]*$/.test(item.id) ? item.id : `item#${createHash("sha256").update(item.id).digest("hex").slice(0, 12)}`;
                 const count = (attempts.get(item.id) ?? 0) + 1;
                 if (count > 8) throw new DeliveryStopped(pendingItem);
@@ -220,18 +222,19 @@ export class Controller {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
+                inItem = false;
               }, async ids => {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
                 for (const id of ids) attempts.delete(id);
-                failures = 0; throttles = 0; pendingItem = undefined;
+                failures = 0; throttles = 0; recoveries = 0; pendingItem = undefined;
               });
               if (items.length === 100) dirty = true;
             }
             if (closed) throw new Error("Subscription closed");
             if (Date.now() >= renewal) {
               await this.guard(r, epoch, signal); await wire.call("delivery_renew");
-              renewal = Date.now() + 10_000; dirty = true;
+              renewal = Date.now() + 10_000; dirty = true; recoveries = 0;
             }
             if (dirty) continue;
             const timer = new AbortController();
@@ -244,7 +247,7 @@ export class Controller {
         if (error instanceof Refusal || error instanceof DeliveryStopped) throw error;
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;
-          if (++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
+          if (!inItem && ++recoveries > 3) throw new Refusal("paused", "Lease recovery limit reached; explicitly enroll again");
         } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code)) throw error;
         else {
           failures++;
@@ -262,7 +265,7 @@ export class Controller {
           if (++throttles > 8) throw new Error("Admission retry limit reached; explicitly enroll again");
           await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
         } else await this.wait(Math.min(8000, 250 * 2 ** failures), signal);
-      } finally { await wire?.close().catch(error => this.failure("wire_close", error, r)); }
+      } finally { inItem = false; await wire?.close().catch(error => this.failure("wire_close", error, r)); }
     }
     if (failures >= 8) throw new DeliveryStopped(pendingItem);
   }
