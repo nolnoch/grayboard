@@ -223,7 +223,7 @@ The installed directory is `$HOME/.local/share/grayboard-opencode/node_modules/g
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [{ "package": "github:nolnoch/grayboard#51ed7d865df9d60077772656a4175e3d90da80ef::path:adapters/opencode-v2" }],
+  "plugins": [{ "package": "github:nolnoch/grayboard#fa07b36e2d1dfca9df3f11de6258d31d7a81ffac::path:adapters/opencode-v2" }],
   "mcp": {
     "servers": {
       "grayboard": {
@@ -257,7 +257,7 @@ The companion uses the connected server's public RPC; it does not start Grayboar
 ```sh
 bun src/cli/main.ts setup-opencode \
   --url https://grayboard.example.com/mcp \
-  --revision 51ed7d865df9d60077772656a4175e3d90da80ef \
+  --revision fa07b36e2d1dfca9df3f11de6258d31d7a81ffac \
   --config /absolute/selected/opencode.jsonc --dry-run
 ```
 
