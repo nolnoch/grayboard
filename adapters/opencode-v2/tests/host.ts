@@ -18,6 +18,7 @@ import { realRace, type AdmissionGate } from "./real-races.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { savedClientMetadata } from "./cimd-fixture.js";
+import { rootRetrying, rootStatus } from "./causal.ts";
 import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
@@ -328,6 +329,11 @@ try {
   console.log("REAL_FOUR_REBINDS_OK", { ownership, opens: opens.length, streams: app.mcp.activeInboxListeners });
   await rpc.pause({}, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id), null); assert.equal(row(child.id), null, "Explicit root pause ends registered descendants");
   await rpc.enroll({ sessionID: a.id }, { location });
+  const assertBPaused = async () => {
+    assert.equal(rootStatus(await rpc.status({}, { location }), b.id)?.state, "paused", "B remains deliberately paused");
+    const session = await host!.session.get({ sessionID: b.id });
+    assert.equal((session.metadata?.["grayboard.enrollment"] as { enabled?: unknown } | undefined)?.enabled, false, "B approval remains disabled");
+  };
   await wait(() => app.mcp.activeLeases, n => n === 1, "pause resume remembered name");
   assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === "r4" && c.args.create === false));
   const board = createBoard(app.db, "you@example.com/r4", "fixture", "Fixture board"); subscribe(app.db, "you@example.com/r4", board.name, "digest");
@@ -346,7 +352,7 @@ try {
   const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Replay after host reload", null, false); app.application.wake(["you@example.com/r4"]);
   await wait(() => admissions, xs => xs.some(x => x.text.includes("Replay after host reload")), "lost receipt durable admission");
   await wait(() => receiptAttempts, n => n > receiptsBeforeLoss, "lost receipt attempted after real durable admission");
-  await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "lost receipt retry boundary before host reload");
+  await wait(() => rpc.status({}, { location }), s => rootRetrying(s, a.id), "lost receipt retry boundary before host reload"); await assertBPaused();
   const lostInput = admissions.find(x => x.text.includes("Replay after host reload"))!;
   await wait(() => admitted.some(x => x.id === lostInput.id), Boolean, "actual lost-receipt admission returned");
   const cursorBeforeReload = app.repo.cursors.directFor("you@example.com/r4");
@@ -357,7 +363,7 @@ try {
   assertStable(join(root, "host.sqlite"), lostInput);
   assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
   assert.equal(app.repo.cursors.directFor("you@example.com/r4"), cursorBeforeReload);
-  assert.equal(dropReceipt, true); assert.equal((await rpc.status({}, { location })).state, "retrying");
+  assert.equal(dropReceipt, true); assert(rootRetrying(await rpc.status({}, { location }), a.id)); await assertBPaused();
   assert.equal(pendingAdmissions, 0); assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
   assertStable(join(root, "host.sqlite"), lostInput);
   assert.deepEqual(admitted.find(input => input.id === lostInput.id), lostInput, "Exact stable envelope survives actual admission");
@@ -385,7 +391,7 @@ try {
   await bounded(suspendedModel.entered.promise, 20_000, "Target model reached owned suspension barrier");
   await wait(() => admitted.find(x => x.text.includes("Suspended SDK execution across reload")), Boolean, "suspended input admission returned");
   await wait(() => receiptAttempts, n => n > suspendedReceipts, "suspended lost receipt attempted");
-  await wait(() => rpc.status({}, { location }), s => s.state === "retrying", "suspended lost receipt retrying");
+  await wait(() => rpc.status({}, { location }), s => rootRetrying(s, a.id), "suspended lost receipt retrying"); await assertBPaused();
   const suspendedInput = admitted.find(x => x.text.includes("Suspended SDK execution across reload"))!;
   await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }), a.id);
   assertStable(join(root, "host.sqlite"), suspendedInput);
@@ -417,7 +423,7 @@ try {
   assert.equal(app.repo.aliases.listFor("you@example.com").some(i => i.name === "does-not-exist"), false);
   await rpc.enroll({ sessionID: a.id, name: "r4" }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit reapproval existing name");
   const drift = await ctx.mcp.transform(e => { const old = e.get("grayboard"); assert(old?.type === "remote"); e.set("grayboard", { ...old, headers: { "X-Fixture-Drift": "away" } }); }); await ctx.mcp.reload();
-  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "real config drift"); await drift.dispose(); await ctx.mcp.reload(); assert.equal((await rpc.status({}, { location })).state, "paused");
+  await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "real config drift"); await drift.dispose(); await ctx.mcp.reload(); assert.equal(rootStatus(await rpc.status({}, { location }), a.id)?.state, "paused");
   console.log("REAL_CONFIG_AWAY_BACK_LATCH_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "reenroll after observed drift");
   held = true; const staleEntered = new Promise<void>(r => { entered = r; });
@@ -427,7 +433,7 @@ try {
   const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
   await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
   held = false; release?.();
-  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "out-of-band real service rebind observed after old host admission");
+  await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "out-of-band real service rebind observed after old host admission");
   assert.equal(receiptAttempts, staleReceipts); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
   assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id));
   console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
@@ -437,7 +443,7 @@ try {
     app.repo.oauth.revokeToken(token.hash, OPENCODE_CLIENT, Date.now());
   };
   const g1 = row(a.id)!.grant_id, second = await signIn(native.integrationID); assert(second?.type === "credential");
-  await wait(() => rpc.status({}, { location }), s => s.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });
+  await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });
   await invoke(a.id, "peer_list", {}); assert.equal(row(a.id)!.grant_id, g1, "Ordinary G2 tools cannot attach ownership");
   await invoke(a.id, "bind", { name: "final" }); assert.notEqual(row(a.id)!.grant_id, g1, "Only owning G2 success attaches grant");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "G2 attached lease");
@@ -445,10 +451,10 @@ try {
   assert.equal(row(a.id)?.name, "final", "Revoking old G1 does not release G2 owner");
   revokeFixtureGrant(row(a.id)!.grant_id);
   await wait(() => app.mcp.activeLeases, n => n === 0, "G2 revoke ends actual lease"); assert.equal(row(a.id), null);
-  await wait(() => rpc.status({}, { location }), s => s.state === "auth" || s.state === "paused", "revoked token fail closed");
+  await wait(() => rpc.status({}, { location }), s => ["auth", "paused"].includes(rootStatus(s, a.id)?.state ?? ""), "revoked token fail closed");
   console.log("REAL_G1_G2_ATTACH_REVOKE_OK");
   email = "other@example.com"; await signIn(native.integrationID); await host.mcp.connect({ server: "grayboard", location });
-  assert.equal((await rpc.status({}, { location })).state, "paused", "A new native account never retargets old approval");
+  assert.equal(rootStatus(await rpc.status({}, { location }), a.id)?.state, "paused", "A new native account never retargets old approval");
   const oldPending = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/final", "Old account must not retarget", null, false);
   await rpc.enroll({ sessionID: a.id, name: "final", create: true }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit new account approval");
   const lastOpen = await host.session.get({ sessionID: a.id }); assert(lastOpen.metadata);

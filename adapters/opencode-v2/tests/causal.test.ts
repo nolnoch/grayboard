@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterProducers } from "./causal.ts";
+import { afterProducers, rootRetrying, rootStatus } from "./causal.ts";
 import { observeRuns } from "./subscriber-work.ts";
 import { barrier, bounded, drainSessions } from "./reload-state.ts";
 
@@ -68,6 +68,35 @@ test("retired-generation barrier joins the real continuation, not synthetic retu
     expect(observation.current("root")).not.toBe(retired);
   } finally { released.release(); replacement.release(); await Promise.all([first, second]); observation.restore(); }
   expect(Subscriber.prototype.run).toBe(original);
+});
+
+test("exact root retry is visible while the aggregate legitimately prioritizes another paused root", () => {
+  const b = Object.freeze({ sessionID: "B", state: "paused", operation: "delivery" });
+  const a = Object.freeze({ sessionID: "A", state: "retrying", operation: "reopen", code: "operation_failed" });
+  const status = { state: "paused", sessionID: "B", roots: Object.freeze([b, a]) };
+  expect(rootRetrying(status, "A")).toBe(true);
+  expect(rootStatus(status, "B")).toBe(b);
+  expect(rootStatus(status, "B")?.state).toBe("paused");
+  expect(status.state).toBe("paused");
+});
+
+test("another root retry cannot satisfy a paused target's retry boundary", () => {
+  const status = { state: "retrying", roots: [
+    { sessionID: "B", state: "retrying", operation: "reopen", code: "operation_failed" },
+    { sessionID: "A", state: "paused", operation: "subscriber", code: "retry_exhausted" },
+  ] };
+  expect(rootRetrying(status, "A")).toBe(false);
+  expect(rootStatus(status, "A")?.state).toBe("paused");
+});
+
+test("a missing exact root cannot satisfy the retry boundary", () => {
+  const status = { roots: [{ sessionID: "B", state: "retrying", operation: "reopen", code: "operation_failed" }] };
+  expect(rootRetrying(status, "A")).toBe(false);
+  expect(rootStatus(status, "A")).toBeUndefined();
+});
+
+test.each([{ operation: "subscriber", code: "operation_failed" }, { operation: "reopen", code: "not_found" }])("a different retry phase or cause cannot satisfy the lost-transport boundary: %j", phase => {
+  expect(rootRetrying({ roots: [{ sessionID: "A", state: "retrying", ...phase }] }, "A")).toBe(false);
 });
 
 test("producer refusal fails closed before any no-model assertion", async () => {
