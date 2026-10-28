@@ -148,8 +148,11 @@ export function boardActor(
   return boardAddress(db, board, s.addresses, use) ?? primary;
 }
 
-// The board tools whose schema takes `as`.
-const AS_TOOLS = new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name));
+// The board tools whose schema takes `as`. Built on first use: tools.ts ->
+// boards.ts -> session_end.ts -> this module is an import cycle, so when
+// tools.ts loads first, boardTools isn't ready at this module's load.
+let asTools: Set<string> | undefined;
+const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
 const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
 
