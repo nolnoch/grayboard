@@ -801,7 +801,7 @@ function bareName(raw: string, verb: "bind" | "unbind"): { ok: true; name: strin
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
   if (!PUSH) return fail(TOOLS_ONLY_BIND);
-  // The human's handle is a declaration, fixed for its bridge's session (#363), as the server's HumanConn.
+  // The human's handle is a declaration, fixed for its bridge's session (#363), as the server's attachHuman session.
   if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it binds nothing`);
   const n = bareName(String(a.name), "bind");
   if (!n.ok) return fail(n.error);
