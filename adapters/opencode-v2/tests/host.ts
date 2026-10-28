@@ -18,7 +18,7 @@ import { realRace, type AdmissionGate } from "./real-races.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { savedClientMetadata } from "./cimd-fixture.js";
-import { rootRetrying, rootStatus } from "./causal.ts";
+import { rootRetrying, rootStatus, SubscriberAdmission } from "./causal.ts";
 import { assertStable, barrier, bounded, drainSessions, sessionStates } from "./reload-state.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
@@ -32,7 +32,10 @@ const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
 const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 } };
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
+const admissionCase = process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission");
+let admissionNow: number | undefined;
+let admissionGate: SubscriberAdmission | undefined;
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
@@ -72,7 +75,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     console.log("SUBCALL", b.params.name, session);
     if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
   }
-  const res = await fetch0(new Request(`http://127.0.0.1:${app.server.port}` + url.pathname + url.search, req));
+  const forward = () => fetch0(new Request(`http://127.0.0.1:${app.server.port}` + url.pathname + url.search, req));
+  const res = admissionGate ? await admissionGate.forward(req, b, forward) : await forward();
   if (res.status === 429 && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberThrottles++;
   if (b?.method === "tools/call" && req.headers.get("X-Grayboard-Client") === "subscriber") { const text = await res.clone().text(); if (text.includes('"isError":true')) console.log("SUBSCRIBER_ERROR", b.params.name, text); }
   if (b?.params?.name === "delivery_open" && res.ok) {
@@ -163,37 +167,48 @@ try {
     const { Client, StreamableHTTPClientTransport } = await import("@modelcontextprotocol/client");
     const drain = new Client({ name: "default-admission-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     let last: Response | undefined;
-    await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
-    let refused = false;
-    for (let id = 0; id < DEFAULT_HOSTED_REQUEST_LIMIT.burst * 2; id++) {
-      const raw = "refused-admission-" + id;
-      try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
-      catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
-      const response = last!;
-      if (response.status !== 429) { assert(response.ok); continue; }
-      const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
-      assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
-      assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
-      assert.equal(row(raw), null, "Refused admission creates no hosted source row"); refused = true; break;
-    }
-    await drain.close();
-    assert(refused, "Unmodified production default burst is enforced");
+    admissionNow = Date.now();
+    const gate = admissionGate = new SubscriberAdmission(s.id, () => admissionNow!);
     const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false); app.application.wake(["you@example.com/admission"]);
-    if (process.env.GRAYBOARD_TEST_REAL_RACE === "admission-account") {
-      const retiredSubscriber = subscriberWork.current(s.id);
-      await wait(() => subscriberThrottles, n => n > 0, "subscriber actual HTTP429 before account transition");
-      email = "other@example.com"; await signIn(native.integrationID);
-      await wait(() => rpc.status({}, { location }), s => s.state === "paused", "account transition aborts admission retry");
-      await bounded(retiredSubscriber, 12_000, "Account drift must retire the actual admission-retry subscriber");
-      await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
-      assert.equal(admissions.length, 0); assert.equal(app.repo.cursors.directFor("you@example.com/admission"), 0);
-      console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
-    } else {
-      await wait(() => app.repo.cursors.directFor("you@example.com/admission"), n => n === message.id, "actual plugin recovers shared default admission", 30_000);
-      assert(subscriberThrottles > 0); assert(admissions.length >= 1); assert.equal(new Set(admissions.map(input => input.id)).size, 1); assert(admissions.every(input => input.sessionID === s.id));
-      await host.session.wait({ sessionID: s.id });
-      console.log("REAL_DEFAULT_ADMISSION_RECOVERY_OK", { subscriberThrottles, cursor: message.id, admissions: admissions.length });
-    }
+    try {
+      await bounded(gate.entered.promise, 20_000, "Exact-root subscriber request held before actual backend admission");
+      await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
+      let refused = false;
+      for (let id = 0; id < DEFAULT_HOSTED_REQUEST_LIMIT.burst * 2; id++) {
+        const raw = "refused-admission-" + id;
+        try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
+        catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
+        const response = last!;
+        if (response.status !== 429) { assert(response.ok); continue; }
+        const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
+        assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
+        assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
+        assert.equal(row(raw), null, "Refused admission creates no hosted source row"); refused = true; break;
+      }
+      assert(refused, "Unmodified production default burst is enforced");
+      gate.releaseInitial();
+      await bounded(gate.retryEntered.promise, 20_000, "Actual selected-root HTTP429 followed by the held original retry");
+      console.log("REAL_SUBSCRIBER_ADMISSION_REFUSAL", gate.requireRefused());
+      assert(subscriberThrottles > 0);
+      if (process.env.GRAYBOARD_TEST_REAL_RACE === "admission-account") {
+        const retiredSubscriber = subscriberWork.current(s.id);
+        email = "other@example.com"; await signIn(native.integrationID);
+        await wait(() => rpc.status({}, { location }), status => rootStatus(status, s.id)?.state === "paused", "account transition aborts admission retry");
+        await bounded(retiredSubscriber, 12_000, "Account drift must retire the actual admission-retry subscriber");
+        await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
+        assert.equal(gate.retryForwarded, false, "Aborted original continuation never reaches backend admission");
+        assert.equal(admissions.length, 0); assert.equal(app.repo.cursors.directFor("you@example.com/admission"), 0);
+        console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
+      } else {
+        gate.requireRefused();
+        admissionNow += DEFAULT_HOSTED_REQUEST_LIMIT.burst / DEFAULT_HOSTED_REQUEST_LIMIT.perSec * 1000;
+        gate.releaseRecovery();
+        await wait(() => app.repo.cursors.directFor("you@example.com/admission"), n => n === message.id, "actual plugin recovers shared default admission", 30_000);
+        assert(subscriberThrottles > 0); assert(admissions.length >= 1); assert.equal(new Set(admissions.map(input => input.id)).size, 1); assert(admissions.every(input => input.sessionID === s.id));
+        await host.session.wait({ sessionID: s.id });
+        console.log("REAL_DEFAULT_ADMISSION_RECOVERY_OK", { subscriberThrottles, cursor: message.id, admissions: admissions.length });
+      }
+    } finally { gate.close(); await drain.close(); }
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE === "native-refresh") {
     const s = await makeRoot("Native host owns refresh");
     await rpc.enroll({ sessionID: s.id, name: "refresh", create: true }, { location });

@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterProducers, rootRetrying, rootStatus } from "./causal.ts";
+import { afterProducers, rootRetrying, rootStatus, SubscriberAdmission } from "./causal.ts";
 import { observeRuns } from "./subscriber-work.ts";
 import { barrier, bounded, drainSessions } from "./reload-state.ts";
 
@@ -97,6 +97,81 @@ test("a missing exact root cannot satisfy the retry boundary", () => {
 
 test.each([{ operation: "subscriber", code: "operation_failed" }, { operation: "reopen", code: "not_found" }])("a different retry phase or cause cannot satisfy the lost-transport boundary: %j", phase => {
   expect(rootRetrying({ roots: [{ sessionID: "A", state: "retrying", ...phase }] }, "A")).toBe(false);
+});
+
+const admissionBody = (root = "A", id = 7) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "delivery_renew", _meta: { "ai.opencode/sessionID": root } } });
+const admissionRequest = (role = "subscriber", signal?: AbortSignal) => new Request("https://fixture.example.com/mcp", { method: "POST", headers: role ? { "X-Grayboard-Client": role } : {}, signal });
+// Protocol-only unit stand-in; actual server refusal is checked separately by the bounded loopback control.
+const unitRefusal = () => Response.json({ jsonrpc: "2.0", id: 7, error: { code: -32000, data: { code: "rate_limited", retry_after_ms: 50 } } }, { status: 429, headers: { "Retry-After": "1" } });
+
+test("admission setup holds the exact subscriber, observes its refusal, then releases its original retry", async () => {
+  let now = 100, forwarded = 0;
+  const gate = new SubscriberAdmission("A", () => now);
+  const first = gate.forward(admissionRequest(), admissionBody(), async () => { forwarded++; return unitRefusal(); });
+  let retry: Promise<Response> | undefined;
+  try {
+    await gate.entered.promise;
+    expect(forwarded).toBe(0); expect(() => gate.requireRefused()).toThrow();
+    gate.releaseInitial(); expect((await first).status).toBe(429);
+    expect(gate.requireRefused()).toEqual({ root: "A", role: "subscriber", operation: "delivery_renew", id: 7, at: 100, status: 429, retryAfterMs: 50 });
+    retry = gate.forward(admissionRequest(), admissionBody(), async () => { forwarded++; return new Response(); });
+    await gate.retryEntered.promise;
+    expect(forwarded).toBe(1); expect(gate.retryForwarded).toBe(false);
+    expect(() => gate.releaseRecovery()).toThrow("refill");
+    now += 6000; gate.releaseRecovery(); expect((await retry).status).toBe(200);
+    expect(forwarded).toBe(2); expect(gate.retryForwarded).toBe(true);
+    expect((await gate.forward(admissionRequest(), admissionBody("A", 8), async () => new Response())).status).toBe(200);
+  } finally { gate.close(); await first.catch(() => {}); await retry?.catch(() => {}); }
+});
+
+test.each(["unrelated", "wrong-root", "headerless"])("%s HTTP429 cannot establish the selected subscriber precondition", async kind => {
+  const gate = new SubscriberAdmission("A", () => 100);
+  try {
+    const response = await gate.forward(admissionRequest(kind === "headerless" ? "" : kind === "unrelated" ? "native" : "subscriber"), admissionBody(kind === "wrong-root" ? "B" : "A"), async () => unitRefusal());
+    expect(response.status).toBe(429);
+    expect(() => gate.requireRefused()).toThrow("no genuine selected-root");
+    const laterSuccess = gate.forward(admissionRequest(), admissionBody(), async () => new Response());
+    const rejected = assert.rejects(laterSuccess, /must receive an actual HTTP429/);
+    await gate.entered.promise; gate.releaseInitial(); await rejected;
+    expect(() => gate.requireRefused()).toThrow("no genuine selected-root");
+  } finally { gate.close(); }
+});
+
+test("refill before release fails causal setup rather than passing as throttle recovery", async () => {
+  let now = 100, forwarded = 0;
+  const gate = new SubscriberAdmission("A", () => now);
+  const pending = gate.forward(admissionRequest(), admissionBody(), async () => { forwarded++; return new Response(); });
+  const rejected = assert.rejects(pending, /refill moved before/);
+  try {
+    await gate.entered.promise; now += 6000; gate.releaseInitial(); await rejected;
+    expect(forwarded).toBe(0); expect(() => gate.requireRefused()).toThrow();
+  } finally { gate.close(); }
+});
+
+test("account-transition abort retires the held original retry without forwarding or delivery", async () => {
+  const gate = new SubscriberAdmission("A", () => 100), account = new AbortController();
+  let forwarded = 0, admissions = 0, cursor = 0;
+  const first = gate.forward(admissionRequest(), admissionBody(), async () => { forwarded++; return unitRefusal(); });
+  let retry: Promise<Response> | undefined;
+  try {
+    await gate.entered.promise; gate.releaseInitial(); await first;
+    retry = gate.forward(admissionRequest("subscriber", account.signal), admissionBody(), async () => { forwarded++; admissions++; cursor++; return new Response(); });
+    const retired = assert.rejects(retry, /account selection changed/);
+    await gate.retryEntered.promise; gate.requireRefused();
+    account.abort(new Error("account selection changed"));
+    await bounded(retired, 1000, "Aborted held request must retire");
+    expect(gate.retryForwarded).toBe(false); expect(forwarded).toBe(1);
+    expect(admissions).toBe(0); expect(cursor).toBe(0);
+  } finally { gate.close(); account.abort(); await retry?.catch(() => {}); }
+});
+
+test("cleanup rejects a held initial request without forwarding it", async () => {
+  const gate = new SubscriberAdmission("A", () => 100);
+  let forwarded = false;
+  const pending = gate.forward(admissionRequest(), admissionBody(), async () => { forwarded = true; return unitRefusal(); });
+  const rejected = assert.rejects(pending, /barrier closed/);
+  await gate.entered.promise; gate.close(); await bounded(rejected, 1000, "Fixture cleanup must join a held request");
+  expect(forwarded).toBe(false);
 });
 
 test("producer refusal fails closed before any no-model assertion", async () => {
