@@ -15,13 +15,15 @@ export const CACHE = join(ROOT, ".e2e-cache");
 // The support floor: older databases aren't expected to open under HEAD.
 export const FLOOR = "v1.0.0";
 
-// The last release whose `grayboard update` ignores GRAYBOARD_RELEASES_URL:
-// from it back, the update test runs a build of this tree versioned 0.0.0.
-export const LAST_WITHOUT_RELEASES_URL = "v1.10.0";
+// The first release whose `grayboard update` honours GRAYBOARD_RELEASES_URL
+// is also the first signed by the real release key (#162; v1.10.0 was the
+// last that ignored the URL). Such a release's update can run against a local
+// release server, but it trusts only the real keys, so it refuses the
+// test-signed build under test (#420). Before it, the update test runs a
+// build of this tree versioned 0.0.0.
+export const FIRST_SIGNED = "v2.0.0";
 
-// Whether the release's own `grayboard update` can run against a local
-// release server.
-export const ownUpdater = (tag: string): boolean => newer(tag, LAST_WITHOUT_RELEASES_URL);
+export const signedRelease = (tag: string): boolean => !newer(FIRST_SIGNED, tag);
 
 type Asset = { name: string; digest: string | null };
 type Release = { tag_name: string; draft: boolean; prerelease: boolean; assets: Asset[] };
