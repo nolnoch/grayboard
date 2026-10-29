@@ -206,6 +206,8 @@ export type ErrorCode =
 export const PROTO = 2;
 /** What a hello without it is told: a 1.x client against a 2.x server. */
 export const PROTO_REFUSAL = "this grayboard server is 2.x; update the CLI (`grayboard update`)";
+/** A self-reported session fact (harness, model, effort) is stored as at most this many characters. */
+export const SESSION_FACT_MAX = 64;
 
 export function parseClientMessage(raw: unknown): ClientMessage {
   if (typeof raw !== "object" || raw === null) throw new Error("expected object");

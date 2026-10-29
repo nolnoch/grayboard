@@ -21,6 +21,10 @@ test("sessionSource is an operator boolean opt-in, refused on any https: client 
     expect(parsed({ clientId }).sessionSource).toBe(false);
   }
   expect(parsed({ clientId: "http://client.example/client.json", sessionSource: true }).sessionSource).toBe(true);
+  // peer_list shows the ID as its sessions' harness, so it must fit the stored fact exactly.
+  expect(parsed({ clientId: "c".repeat(64), sessionSource: true }).sessionSource).toBe(true);
+  expect(() => parsed({ clientId: "c".repeat(65), sessionSource: true })).toThrow("sessionSource needs a client ID of at most 64 characters");
+  expect(parsed({ clientId: "c".repeat(65) }).sessionSource).toBe(false);
   // Normalized output parses again (the OAuth server re-parses its configured clients).
   const clients = parseOAuthClients(JSON.stringify(parseOAuthClients(JSON.stringify([{ ...client, sessionSource: true }, { ...client, clientId: "plain" }, { ...client, clientId: OPENCODE_CLIENT }]))));
   const map = new Map(clients.map(c => [c.clientId, c]));

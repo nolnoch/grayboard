@@ -1,4 +1,7 @@
+import { SESSION_FACT_MAX } from "../shared/protocol.ts";
+
 export const OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"] as const;
+
 export type OAuthClient = {
   clientId: string;
   name: string;
@@ -12,8 +15,9 @@ export type OAuthClient = {
 };
 
 // Hosted session source mapping (#414): the `_meta` key that carries a client's raw
-// session source. OpenCode's CIMD client keeps its own key; an operator client maps
-// the generic key only with `sessionSource`; every other client is unmapped (reads only).
+// session source, and the harness its sessions show in peer_list. OpenCode's CIMD client
+// keeps its own key; an operator client maps the generic key only with `sessionSource`;
+// every other client is unmapped (reads only).
 export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
 export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
 export const GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
@@ -21,6 +25,9 @@ export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAut
   if (clientId === OPENCODE_CLIENT) return OPENCODE_SESSION_META;
   return clients.get(clientId)?.sessionSource === true ? GRAYBOARD_SESSION_META : null;
 }
+// Only a mapped client registers sessions; the parser keeps an opted-in ID within
+// SESSION_FACT_MAX, so the label is the exact client ID.
+export const harnessFor = (clientId: string) => clientId === OPENCODE_CLIENT ? "opencode" : clientId;
 const httpsId = (id: string) => { try { return new URL(id).protocol === "https:"; } catch { return false; } };
 
 const unsafe = /[\x00-\x20\x7f\\]/;
@@ -88,6 +95,8 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
     // https: ID never maps the generic key: a grant consented under a metadata document can't
     // turn write-capable because the operator later registers the same ID.
     if (v.sessionSource === true && httpsId(v.clientId)) throw new Error("sessionSource is refused on an https: client ID");
+    // peer_list shows an opted-in client's ID as its sessions' harness; a longer ID would be cut.
+    if (v.sessionSource === true && v.clientId.length > SESSION_FACT_MAX) throw new Error(`sessionSource needs a client ID of at most ${SESSION_FACT_MAX} characters`);
     if (v.tokenEndpointAuthMethod === "none" ? v.clientSecretHash !== undefined :
       typeof v.clientSecretHash !== "string" || !/^[a-f0-9]{64}$/.test(v.clientSecretHash)) throw new Error("invalid OAuth client authentication configuration");
     for (const uri of v.redirectUris) validateRedirect(uri);

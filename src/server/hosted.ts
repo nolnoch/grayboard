@@ -5,7 +5,7 @@ import { asSessionId, boundInstructions, describeCandidate, type Candidate } fro
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import { OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { harnessFor } from "./oauth-config.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -32,9 +32,6 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   return sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
 }
-// peer_list's harness: OpenCode's fixed label, else the opted-in operator client's ID
-// (registerId bounds it as a session fact).
-const harnessOf = (p: OAuthPrincipal) => p.sourceKey === OPENCODE_SESSION_META ? "opencode" : p.clientId;
 // A hosted session with no name reads and nothing else (master's model; see
 // UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
 // as its ID (#284 S13).
@@ -102,7 +99,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, name: null, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
-      application.hostedRegister(p.authed, row.session_id, harnessOf(p));
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId));
       store.insert(row);
     }
     return row;
@@ -344,7 +341,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           touch(attached);
           if (existing?.root_session_id === root.session_id) return { message: "already registered" };
           if (existing) store.end(existing.session_id, "closed", now());
-          application.hostedRegister(p.authed, childId, harnessOf(p));
+          application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, name: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
