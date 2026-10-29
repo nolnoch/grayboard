@@ -63,16 +63,15 @@ const HEARTBEAT_MS = 1000;
 // (and event-loop delay); a gap within this bound is no measurable downtime.
 const LIVE_STALENESS_MS = 2 * HEARTBEAT_MS;
 const DELIVERY_TTL_MS = 30_000;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; leaseTtlMs?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? "900");
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive integer");
   const idle = rawIdle * 1000;
-  // A delivery lease's TTL; createDelivery defaults to it, and the restart
-  // credit caps a deadline at one TTL past startup (#423).
-  const leaseTtl = options.leaseTtlMs ?? DELIVERY_TTL_MS;
-  if (!Number.isFinite(leaseTtl) || leaseTtl < 1) throw new Error("invalid delivery TTL");
+  // A delivery lease's TTL (createDelivery reads it from the service); the
+  // restart credit caps a deadline at one TTL past startup (#423).
+  const leaseTtl = DELIVERY_TTL_MS;
   const gates = new Map<string, { gate: BindGate; users: number }>();
   const limits = { user: 256, global: 4096, children: 128 };
   function admit(user: number, root?: string) {
@@ -181,9 +180,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   // transaction makes a second start measure ~0, so the credit is applied once.
   function creditDowntime() {
     store.atomic(() => {
-      const t = now(), alive = store.aliveAt();
-      if (alive !== undefined && t - alive > LIVE_STALENESS_MS) {
-        const downtime = t - alive;
+      const t = now(), alive = store.aliveAt(), downtime = alive === undefined ? null : t - alive;
+      let credited = 0;
+      if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
         for (const row of store.all()) {
           if (row.root_session_id || repo.users.findById(row.user_id)?.disabled_at != null) continue;
           let credit: { field: "lease_deadline" | "last_seen_at"; before: number; after: number } | undefined;
@@ -193,8 +192,12 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (!credit || credit.after <= credit.before) continue;
           store.update({ ...row, [credit.field]: credit.after });
           audit(row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
+          credited++;
         }
       }
+      // One row per start, credited or not, so an outage is auditable even
+      // when no lease was live (alive_at null: no heartbeat on this schema yet).
+      writeAudit(repo, "server.started", null, null, { alive_at: alive ?? null, now: t, downtime_ms: downtime, credited });
       store.heartbeat(t);
     });
   }

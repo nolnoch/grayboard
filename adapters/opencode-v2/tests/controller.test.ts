@@ -503,8 +503,10 @@ test("server outages and subscription closures never spend the failure budget, a
     });
     o.stop();
     await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
-    expect(o.waits).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, ...Array(10).fill(500)]);
+    // Closures back off too: only a healthy lease (renew or receipt) resets it.
+    expect(o.waits).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, ...Array(10).fill(8000)]);
     expect(o.codes).toContain("server_unreachable");
+    expect(o.codes).toContain("subscription_closed");
     expect(o.codes).not.toContain("retry_exhausted");
     expect(o.r.calls.filter(c => c.name === "delivery_open")).toHaveLength(12);
     expect(o.r.admissions).toHaveLength(1);
@@ -535,6 +537,19 @@ test("a native token that expires during an outage keeps retrying; outside one i
     expect(connects).toBe(3);
     expect(p.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await p.controller.close(); }
+});
+test("a closed subscription is not an outage: native expiry on the reconnect pauses, even wrapped by the SDK", async () => {
+  const o = await outage();
+  try {
+    let connects = 0;
+    // The SDK wraps errors thrown during connect (EraNegotiationFailed {cause}).
+    o.r.observe(async operation => { if (operation === "connect" && ++connects === 1) throw new Error("era negotiation failed", { cause: new NativeAccessExpired() }); });
+    o.stop();
+    await until(() => o.controller.status().state === "paused");
+    expect(connects).toBe(1);
+    expect(o.codes).toContain("subscription_closed");
+    expect(o.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
+  } finally { await o.controller.close(); await o.r.controller.close(); }
 });
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
   const r = runtime();

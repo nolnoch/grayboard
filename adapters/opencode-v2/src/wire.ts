@@ -26,6 +26,12 @@ export function subscriberError(value: unknown, leaseOperation: boolean): Subscr
 export class ServerUnreachable extends Error {
   constructor(cause: unknown) { super("Server unreachable", { cause }); }
 }
+// The server closed the inbox stream: an outage, or a refusal (expired
+// access, rebind, revocation) the reconnect will classify. Never itself
+// proof of an outage (#423).
+export class SubscriptionClosed extends Error {
+  constructor() { super("Subscription closed"); }
+}
 const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
 const gatewayStatuses = new Set([502, 503, 504]);
 // Walks the cause chain: the SDK rethrows fetch failures from requests, but

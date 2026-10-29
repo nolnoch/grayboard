@@ -59,6 +59,7 @@ async function leasedRoot(app: ReturnType<typeof startServer>) {
 }
 
 const restartCredits = (app: ReturnType<typeof startServer>) => app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='hosted.lease_restart_credit'").all().map(row => JSON.parse(row.detail));
+const serverStarts = (app: ReturnType<typeof startServer>) => app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='server.started' ORDER BY id").all().map(row => JSON.parse(row.detail));
 
 // Between the stop and the restart the test rewrites the stopped server's
 // liveness and the lease, so a 5- or 20-minute outage costs no wall time (#423).
@@ -91,6 +92,15 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
     const credits = restartCredits(app);
     const released = () => app!.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='released' AND detail='expired'").get()?.count;
     expect(app.repo.hosted.aliveAt()).toBeGreaterThanOrEqual(before);
+    // Every start is audited, credited or not; a fresh database has no heartbeat.
+    const starts = serverStarts(app);
+    expect(starts).toHaveLength(2);
+    expect(starts[0]).toEqual({ alive_at: null, now: expect.any(Number), downtime_ms: null, credited: 0 });
+    if (scenario === "no-heartbeat") expect(starts[1]).toEqual({ alive_at: null, now: expect.any(Number), downtime_ms: null, credited: 0 });
+    else {
+      expect(starts[1]).toEqual({ alive_at: alive, now: expect.any(Number), downtime_ms: starts[1].now - alive, credited: scenario === "expired" ? 0 : 1 });
+      expect(starts[1].now).toBeGreaterThanOrEqual(before);
+    }
     if (scenario === "expired") {
       expect(rows).toEqual([]);
       expect(credits).toEqual([]);

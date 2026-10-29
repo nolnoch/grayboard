@@ -547,10 +547,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       shutdown.abort();
       for (const live of [...lives]) live.stop();
       for (const legacy of [...legacyAll]) retire(legacy);
-      // A failed drain mustn't skip the final heartbeat or leave the hosted timer
-      // running against a closed database (#423).
+      // A failed drain or lease detach mustn't skip the final heartbeat or leave
+      // the hosted timer running against a closed database (#423).
       try { await Promise.all([...forwarding].map(stream => stream.stop())); }
-      finally { unlistenHosted(); resources.close(); delivery.close(); hosted.close(); }
+      finally { try { unlistenHosted(); resources.close(); delivery.close(); } finally { hosted.close(); } }
       await modern.close();
       await Promise.allSettled([...bodyReads]);
       while (closing.size) await Promise.all([...closing]);
