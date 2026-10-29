@@ -7,7 +7,7 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import type { FixtureHost } from "./effect-host.js";
 import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import type { startServer } from "../../../src/server/app.ts";
-import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
+import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 
 type Input = NativeInput;

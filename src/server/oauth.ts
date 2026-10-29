@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { exchangeGoogleCode, hashToken, type AuthedUser } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
-import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
+import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
@@ -10,8 +10,10 @@ import { writeAudit } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
+// `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
+// (unmapped: reads only). A pure function of the client ID and the startup config.
 export type OAuthPrincipal = {
-  authed: AuthedUser; grantId: string; clientId: string; scopes: string[]; accessHash: string; accessExpiry: number;
+  authed: AuthedUser; grantId: string; clientId: string; sourceKey: string | null; scopes: string[]; accessHash: string; accessExpiry: number;
 };
 export type OAuthOptions = {
   now?: () => number;
@@ -463,7 +465,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const user = repo.users.findById(access.userId);
       if (!user || user.disabled_at !== null) return bearerError(401, "invalid_token", requiredScopes);
       return { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
-        scopes: access.scopes, accessHash, accessExpiry: access.expiresAt };
+        sourceKey: sourceKeyFor(access.clientId, clients), scopes: access.scopes, accessHash, accessExpiry: access.expiresAt };
     },
     isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(grantId, now()); },
     isAuthorized(principal: OAuthPrincipal): boolean {

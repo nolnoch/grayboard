@@ -4,7 +4,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { OPENCODE_CLIENT } from "../../src/server/hosted.ts";
+import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 
 test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaustion is isolated", async () => {
   let now = 0;

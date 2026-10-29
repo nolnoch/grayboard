@@ -7,6 +7,7 @@ import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
 import { writeCoreAudit, type AuditSink } from "./audit.ts";
 import { SESSION_ID_PATTERN } from "./session_id.ts";
+import { SESSION_FACT_MAX } from "../shared/protocol.ts";
 import { undeliverableId } from "./session_end.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
@@ -232,10 +233,10 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
 }
 
 // A self-reported session fact (harness, model, effort; #284 S12) as stored:
-// one line of at most 64 characters, since peer_list puts it in other
-// agents' prompts. Empty is none.
+// one line of at most SESSION_FACT_MAX characters, since peer_list puts it in
+// other agents' prompts. Empty is none.
 function cleanFact(v: string | null | undefined): string | null {
-  return v ? oneLine(v).slice(0, 64) || null : null;
+  return v ? oneLine(v).slice(0, SESSION_FACT_MAX) || null : null;
 }
 
 /** A session used the bus: its last_seen moves. */

@@ -1,4 +1,7 @@
+import { SESSION_FACT_MAX } from "../shared/protocol.ts";
+
 export const OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"] as const;
+
 export type OAuthClient = {
   clientId: string;
   name: string;
@@ -7,7 +10,25 @@ export type OAuthClient = {
   tokenEndpointAuthMethod: "none" | "client_secret_basic";
   clientSecretHash?: string;
   allowRefresh?: boolean;
+  // Operator opt-in to the generic hosted session source key; never set for a CIMD client.
+  sessionSource?: boolean;
 };
+
+// Hosted session source mapping (#414): the `_meta` key that carries a client's raw
+// session source, and the harness its sessions show in peer_list. OpenCode's CIMD client
+// keeps its own key; an operator client maps the generic key only with `sessionSource`;
+// every other client is unmapped (reads only).
+export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
+export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
+export const GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
+export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>): string | null {
+  if (clientId === OPENCODE_CLIENT) return OPENCODE_SESSION_META;
+  return clients.get(clientId)?.sessionSource === true ? GRAYBOARD_SESSION_META : null;
+}
+// Only a mapped client registers sessions; the parser keeps an opted-in ID within
+// SESSION_FACT_MAX, so the label is the exact client ID.
+export const harnessFor = (clientId: string) => clientId === OPENCODE_CLIENT ? "opencode" : clientId;
+const httpsId = (id: string) => { try { return new URL(id).protocol === "https:"; } catch { return false; } };
 
 const unsafe = /[\x00-\x20\x7f\\]/;
 export const isLoopback = (host: string) => ["localhost", "127.0.0.1", "[::1]"].includes(host);
@@ -61,14 +82,21 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
   return value.map((c: unknown) => {
     if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("invalid OAuth client configuration");
     const v = c as Record<string, unknown>;
-    if (Object.keys(v).some(k => !["clientId", "name", "redirectUris", "scopes", "tokenEndpointAuthMethod", "clientSecretHash", "allowRefresh"].includes(k)) ||
+    if (Object.keys(v).some(k => !["clientId", "name", "redirectUris", "scopes", "tokenEndpointAuthMethod", "clientSecretHash", "allowRefresh", "sessionSource"].includes(k)) ||
       typeof v.clientId !== "string" || !/^[\x21-\x7e]{1,512}$/.test(v.clientId) || ids.has(v.clientId) ||
       typeof v.name !== "string" || !v.name.trim() || v.name.length > 200 || /[\x00-\x1f\x7f]/.test(v.name) ||
       !Array.isArray(v.redirectUris) || !v.redirectUris.length || v.redirectUris.length > 16 ||
       !Array.isArray(v.scopes) || !v.scopes.length || v.scopes.some(s => !(OAUTH_SCOPES as readonly unknown[]).includes(s)) ||
       new Set(v.scopes).size !== v.scopes.length ||
       !["none", "client_secret_basic"].includes(String(v.tokenEndpointAuthMethod)) ||
-      (v.allowRefresh !== undefined && typeof v.allowRefresh !== "boolean")) throw new Error("invalid OAuth client configuration");
+      (v.allowRefresh !== undefined && typeof v.allowRefresh !== "boolean") ||
+      (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
+    // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
+    // https: ID never maps the generic key: a grant consented under a metadata document can't
+    // turn write-capable because the operator later registers the same ID.
+    if (v.sessionSource === true && httpsId(v.clientId)) throw new Error("sessionSource is refused on an https: client ID");
+    // peer_list shows an opted-in client's ID as its sessions' harness; a longer ID would be cut.
+    if (v.sessionSource === true && v.clientId.length > SESSION_FACT_MAX) throw new Error(`sessionSource needs a client ID of at most ${SESSION_FACT_MAX} characters`);
     if (v.tokenEndpointAuthMethod === "none" ? v.clientSecretHash !== undefined :
       typeof v.clientSecretHash !== "string" || !/^[a-f0-9]{64}$/.test(v.clientSecretHash)) throw new Error("invalid OAuth client authentication configuration");
     for (const uri of v.redirectUris) validateRedirect(uri);
@@ -76,6 +104,6 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
     ids.add(v.clientId);
     return { clientId: v.clientId, name: v.name, redirectUris: [...v.redirectUris], scopes: [...v.scopes].sort(),
       tokenEndpointAuthMethod: v.tokenEndpointAuthMethod, ...(v.clientSecretHash ? { clientSecretHash: v.clientSecretHash } : {}),
-      allowRefresh: v.allowRefresh === true } as OAuthClient;
+      allowRefresh: v.allowRefresh === true, sessionSource: v.sessionSource === true } as OAuthClient;
   });
 }

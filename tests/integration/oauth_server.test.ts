@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { bindFixture, withSessionMeta } from "../helpers/hosted.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -130,7 +131,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(resource), {
     authProvider: provider,
-    fetch: async (input, init) => fetchFn(await withSessionMeta(new Request(input, init), "oauth-root")),
+    fetch: async (input, init) => fetchFn(await withSessionMeta(new Request(input, init), OPENCODE_SESSION_META, "oauth-root")),
   }));
   await bindFixture(client, "be");
   expect(client.getNegotiatedProtocolVersion()).toBe(version);

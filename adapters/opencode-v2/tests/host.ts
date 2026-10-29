@@ -10,7 +10,7 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
-import { OPENCODE_CLIENT } from "../../../tests/helpers/hosted.ts";
+import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";

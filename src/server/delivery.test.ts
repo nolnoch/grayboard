@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GRACE_MS, SWEEP_MS, createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
-import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
 
@@ -27,7 +28,7 @@ beforeEach(async () => {
   application = createApplication(store.repo, store.db);
   const principal = (email: string): DeliveryPrincipal => {
     const user = store.repo.users.upsertByEmail(email, null);
-    return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
+    return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
   alice = principal("alice@example.com"); bob = principal("bob@example.com");
   now = Date.now(); authorized = true;

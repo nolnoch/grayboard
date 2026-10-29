@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { matchesRedirect, oauthPublicUrl, parseOAuthClients, validateRedirect, type OAuthClient } from "./oauth-config.ts";
+import { GRAYBOARD_SESSION_META, matchesRedirect, oauthPublicUrl, OPENCODE_CLIENT, OPENCODE_SESSION_META, parseOAuthClients, sourceKeyFor, validateRedirect, type OAuthClient } from "./oauth-config.ts";
 const client: OAuthClient = { clientId: "native", name: "Native", redirectUris: ["http://127.0.0.1/callback?fixed=1", "http://[::1]/callback", "https://client.example/callback"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "none" };
 test("client registration is strict, bounded, hash-only, and opt-in for refresh", () => {
   expect(parseOAuthClients(undefined)).toEqual([]);
@@ -9,6 +9,26 @@ test("client registration is strict, bounded, hash-only, and opt-in for refresh"
   }
   expect(() => parseOAuthClients(JSON.stringify([client, client]))).toThrow();
   expect(parseOAuthClients(JSON.stringify([{ ...client, tokenEndpointAuthMethod: "client_secret_basic", clientSecretHash: "a".repeat(64) }]))).toHaveLength(1);
+});
+test("sessionSource is an operator boolean opt-in, refused on any https: client ID", () => {
+  const parsed = (patch: Partial<OAuthClient> | Record<string, unknown>) => parseOAuthClients(JSON.stringify([{ ...client, ...patch }]))[0]!;
+  expect(parsed({}).sessionSource).toBe(false);
+  expect(parsed({ sessionSource: false }).sessionSource).toBe(false);
+  expect(parsed({ sessionSource: true }).sessionSource).toBe(true);
+  for (const value of ["yes", 1, null, {}, []]) expect(() => parsed({ sessionSource: value })).toThrow("invalid OAuth client configuration");
+  for (const clientId of [OPENCODE_CLIENT, "https://client.example/client.json", "HTTPS://client.example/client.json", "https://client.example"]) {
+    expect(() => parsed({ clientId, sessionSource: true })).toThrow("sessionSource is refused on an https: client ID");
+    expect(parsed({ clientId }).sessionSource).toBe(false);
+  }
+  expect(parsed({ clientId: "http://client.example/client.json", sessionSource: true }).sessionSource).toBe(true);
+  // peer_list shows the ID as its sessions' harness, so it must fit the stored fact exactly.
+  expect(parsed({ clientId: "c".repeat(64), sessionSource: true }).sessionSource).toBe(true);
+  expect(() => parsed({ clientId: "c".repeat(65), sessionSource: true })).toThrow("sessionSource needs a client ID of at most 64 characters");
+  expect(parsed({ clientId: "c".repeat(65) }).sessionSource).toBe(false);
+  // Normalized output parses again (the OAuth server re-parses its configured clients).
+  const clients = parseOAuthClients(JSON.stringify(parseOAuthClients(JSON.stringify([{ ...client, sessionSource: true }, { ...client, clientId: "plain" }, { ...client, clientId: OPENCODE_CLIENT }]))));
+  const map = new Map(clients.map(c => [c.clientId, c]));
+  expect(["native", "plain", OPENCODE_CLIENT, "unregistered"].map(id => sourceKeyFor(id, map))).toEqual([GRAYBOARD_SESSION_META, null, OPENCODE_SESSION_META, null]);
 });
 test("redirect matching is exact except a registered loopback HTTP port", () => {
   for (const url of ["http://127.0.0.1:45678/callback?fixed=1", "http://[::1]:45678/callback", "https://client.example/callback"]) expect(matchesRedirect(client, url)).toBe(true);

@@ -5,12 +5,11 @@ import { asSessionId, boundInstructions, describeCandidate, type Candidate } fro
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
+import { harnessFor } from "./oauth-config.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
-export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
-export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
 export type SessionContext = { id: string; raw: string } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
@@ -22,11 +21,16 @@ export function hostedSessionId(user: number, client: string, raw: string): stri
   }
   return asSessionId(hash.digest("hex").slice(0, 16));
 }
-export function sessionContext(principal: OAuthPrincipal, meta: unknown): SessionContext {
-  if (principal.clientId !== OPENCODE_CLIENT) return { missing: "the client has no mapped source" };
-  const raw = meta && typeof meta === "object" ? (meta as Record<string, unknown>)[OPENCODE_SESSION_META] : undefined;
-  if (typeof raw !== "string" || !raw.length || raw.length > 1024 || /[\x00-\x1f\x7f]/.test(raw)) return { missing: `the key _meta["${OPENCODE_SESSION_META}"] is missing` };
+// The one source mapping (#414): `_meta`, child registration and the attachment byte
+// routes all map a raw source through the principal's own key, namespaced per client.
+export function sourceContext(principal: OAuthPrincipal, raw: unknown): SessionContext {
+  if (principal.sourceKey === null) return { missing: "the client has no mapped source" };
+  if (typeof raw !== "string" || !raw.length || raw.length > 1024 || /[\x00-\x1f\x7f]/.test(raw)) return { missing: `the key _meta["${principal.sourceKey}"] is missing` };
   return { id: hostedSessionId(principal.authed.user_id, principal.clientId, raw), raw };
+}
+export function sessionContext(principal: OAuthPrincipal, meta: unknown): SessionContext {
+  const key = principal.sourceKey;
+  return sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
 }
 // A hosted session with no name reads and nothing else (master's model; see
 // UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
@@ -95,14 +99,14 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, name: null, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
-      application.hostedRegister(p.authed, row.session_id);
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId));
       store.insert(row);
     }
     return row;
   }
   function rootOf(row: HostedSession): HostedSession {
     const root = row.root_session_id ? store.get(row.root_session_id) : row;
-    if (!root || root.ownership_id !== row.ownership_id) throw new ApplicationError("unbound", "unbound; register this child again through the grayboard plugin");
+    if (!root || root.ownership_id !== row.ownership_id) throw new ApplicationError("unbound", "unbound; its root's ownership changed, so the root must register this child again (session_register)");
     return root;
   }
   function rootOnly(row: HostedSession) {
@@ -211,7 +215,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(row) : undefined;
-        if (!root?.name && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first; child sessions need the grayboard plugin to register them");
+        if (!root?.name && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         const selected = snapshot(p, row);
         try {
           await testPauseAsync("hosted:tool:in-gate");
@@ -305,12 +309,12 @@ export function createHostedSessions(application: Application, options: { now?: 
       });
       const response = hostedBindOk(result.name, result.previous, result.moved,
         general => boundInstructions(result.name, general, () => [], []),
-        [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the plugin opens one.`]);
+        [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the client opens one (delivery_open).`]);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     async register(p: OAuthPrincipal, context: SessionContext, child: string, via: string[] = []) {
       if (!("id" in context)) throw new ApplicationError("unbound", "registration requires session context");
-      const mapped = sessionContext(p, { [OPENCODE_SESSION_META]: child });
+      const mapped = sourceContext(p, child);
       if (!("id" in mapped) || !Array.isArray(via) || via.length > 16 || via.some(value => typeof value !== "string" || !value.length || value.length > 1024 || /[\x00-\x1f\x7f]/.test(value))) throw new ApplicationError("invalid_registration", "invalid child session source or ancestry");
       const childId = mapped.id;
       if (childId === context.id) throw new ApplicationError("invalid_registration", "a session cannot register itself");
@@ -337,7 +341,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           touch(attached);
           if (existing?.root_session_id === root.session_id) return { message: "already registered" };
           if (existing) store.end(existing.session_id, "closed", now());
-          application.hostedRegister(p.authed, childId);
+          application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, name: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });

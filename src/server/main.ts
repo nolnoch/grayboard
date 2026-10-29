@@ -8,9 +8,13 @@ if (process.argv.includes("--version")) {
   process.exit(0);
 }
 
-const { server, stop } = startServer(loadConfig());
+const config = loadConfig();
+const { server, stop } = startServer(config);
 
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
+// Write-capable hosted clients are an operator trust decision (#414); say which at every start.
+const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
+console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
 
 let stopping = false;
 async function shutdown() {
