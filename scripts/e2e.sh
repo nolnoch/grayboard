@@ -59,13 +59,16 @@ case "$suite" in
   upgrade-matrix)
     own="v$(jq -r .version package.json)"
     # One line per release: its tag, and whether its own `grayboard update`
-    # honours GRAYBOARD_RELEASES_URL (releases.ts: ownUpdater).
-    list="$(bun -e 'import { ownUpdater, releases } from "./tests/support/releases.ts"; for (const t of await releases()) console.log(t, ownUpdater(t) ? "own" : "built")')"
+    # honours GRAYBOARD_RELEASES_URL, which from v2.0.0 on means it's signed
+    # (releases.ts: signedRelease).
+    list="$(bun -e 'import { releases, signedRelease } from "./tests/support/releases.ts"; for (const t of await releases()) console.log(t, signedRelease(t) ? "own" : "built")')"
     [ -n "$list" ] || verdict "failed: no releases listed"
     failed=()
     ran=0
-    # The installers once: only the update test depends on the release, and
-    # up to v1.10.0 a build of this tree runs it, the same for every tag.
+    # The installers once: only the update test depends on the release. Its
+    # replacing leg is a build of this tree for every tag; a signed release's
+    # own update runs only up to the signature check, which refuses the
+    # test-signed build (#420).
     echo "e2e: installers"
     suite_run installers ./tests/integration/upgrade_install.test.ts || failed+=(installers)
     # The list comes in on fd 3, so a test reading stdin can't eat it.

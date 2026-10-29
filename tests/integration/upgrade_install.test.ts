@@ -17,7 +17,7 @@ import { runCli, type CliResult } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { sign, signSums, testInstallSh, testKey, testKeys } from "../support/release_keys.ts";
 import { ReleaseServer, type SignedOverride } from "../support/release_server.ts";
-import { ownUpdater, previousRelease, releaseBinaries } from "../support/releases.ts";
+import { previousRelease, releaseBinaries, signedRelease } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
 import { copyFileSync } from "node:fs";
@@ -234,9 +234,21 @@ test("a CLI built with the real key list refuses a test-signed release", async (
 
 test(`update from ${FROM} replaces it with the build under test and refreshes its adapters`, async () => {
   label = `update-from-${FROM}`;
-  const old = ownUpdater(FROM)
-    ? { tag: FROM, cli: (await releaseBinaries(FROM)).cli }
-    : { tag: "v0.0.0", cli: await buildCli(join(dir, "grayboard-v0.0.0"), { version: "0.0.0", keys: testKeys() }) };
+  if (signedRelease(FROM)) {
+    // A signed release trusts only the real keys, which no test can sign
+    // with (#420): its own update reaches verification and refuses the
+    // test-signed build, and a build of this tree takes the replacing leg.
+    releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built }, [FROM]: { [ASSET]: (await releaseBinaries(FROM)).cli } });
+    await expectOk(install({ GRAYBOARD_VERSION: FROM }));
+    const r = await grayboard("update");
+    expect(r.code, `${r.out}${r.err}`).not.toBe(0);
+    expect(r.err).toContain(`SHA256SUMS.sig: unknown key id ${testKey("a").id}`);
+    expect(releases.requests).toContain(`GET /${REPO}/releases/download/${TAG}/SHA256SUMS.sig`);
+    expect((await expectOk(grayboard("--version"))).trim()).toBe(FROM.slice(1));
+    releases.stop();
+    rmSync(bin, { recursive: true, force: true });
+  }
+  const old = { tag: "v0.0.0", cli: await buildCli(join(dir, "grayboard-v0.0.0"), { version: "0.0.0", keys: testKeys() }) };
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built }, [old.tag]: { [ASSET]: old.cli } });
   await expectOk(install({ GRAYBOARD_VERSION: old.tag }));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(old.tag.slice(1));
