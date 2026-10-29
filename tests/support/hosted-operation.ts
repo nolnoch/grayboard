@@ -1,7 +1,8 @@
 import { createApplication } from "../../src/server/application.ts";
 import { createDelivery } from "../../src/server/delivery.ts";
 import { openDatabase } from "../../src/server/db.ts";
-import { createHostedSessions, OPENCODE_SESSION_META, sessionContext } from "../../src/server/hosted.ts";
+import { createHostedSessions, sessionContext } from "../../src/server/hosted.ts";
+import { OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import type { OAuthPrincipal } from "../../src/server/oauth.ts";
 
 const [path, blobs, raw] = process.argv.slice(2);

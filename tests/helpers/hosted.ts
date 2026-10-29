@@ -1,11 +1,9 @@
 import type { Client } from "@modelcontextprotocol/client";
-import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/hosted.ts";
-
-export { OPENCODE_CLIENT };
-export async function withSessionMeta(request: Request, raw: string): Promise<Request> {
+// `key` is the `_meta` key the connecting client's source mapping reads (#414).
+export async function withSessionMeta(request: Request, key: string, raw: string): Promise<Request> {
   if (request.method !== "POST") return request;
   const body = await request.clone().json() as { params?: Record<string, unknown> };
-  body.params = { ...body.params, _meta: { ...(body.params?._meta as Record<string, unknown> | undefined), [OPENCODE_SESSION_META]: raw } };
+  body.params = { ...body.params, _meta: { ...(body.params?._meta as Record<string, unknown> | undefined), [key]: raw } };
   return new Request(request, { body: JSON.stringify(body) });
 }
 export async function bindFixture(client: Client, name: string) {

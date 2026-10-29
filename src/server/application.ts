@@ -1002,10 +1002,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       };
       return { session, info };
     },
-    hostedRegister(authed: AuthedUser, id: string) {
+    // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
+    hostedRegister(authed: AuthedUser, id: string, harness: string) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) fail("id_collision", idCollisionText(id, "is another principal's session"));
-      if (!prior) registerId(db, { id, principal: authed.user_email, harness: "opencode", launcher: false });
+      if (!prior) registerId(db, { id, principal: authed.user_email, harness, launcher: false });
       else touchId(db, id);
     },
     hostedBind(authed: AuthedUser, id: string, name: string, previous: string | null, place: string | null, create: boolean) {

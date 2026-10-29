@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { bindFixture, withSessionMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
@@ -65,7 +66,7 @@ async function connect(token: string, version: string, role?: string, identity =
       const request = new Request(input, { ...init, ...(signal ? { signal } : {}) });
       headers.forEach((v, k) => request.headers.set(k, v));
       if (request.method === "GET") { getHeaders.push(new Headers(request.headers)); await getGate; }
-      const response = await fetch(await withSessionMeta(request, identity));
+      const response = await fetch(await withSessionMeta(request, OPENCODE_SESSION_META, identity));
       if (typeof init?.body === "string" && JSON.parse(init.body).method === "notifications/cancelled") cancelled();
       return response;
     },

@@ -7,7 +7,8 @@ import { hashToken } from "./auth.ts";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
@@ -29,7 +30,7 @@ function open() {
 function close() { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); }
 function issue(email = "you@example.com") {
   const issued = issueOAuth(database.repo, resource, email, ["grayboard:tools", "grayboard:delivery"], now, OPENCODE_CLIENT);
-  const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
+  const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
   return { ...issued, principal };
 }
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gb-hosted-durable-")); now = Date.now(); open(); });

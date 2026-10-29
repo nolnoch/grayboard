@@ -10,7 +10,8 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { bindFixture, OPENCODE_CLIENT, withSessionMeta } from "../helpers/hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { bindFixture, withSessionMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -34,7 +35,7 @@ async function connect(token: string, version: string) {
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
-    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), "attachment-root")),
+    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), OPENCODE_SESSION_META, "attachment-root")),
   }));
   await bindFixture(client, "be");
   return client;

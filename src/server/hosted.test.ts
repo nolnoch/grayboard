@@ -5,8 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
-import { createHostedSessions, OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
-import type { OAuthPrincipal } from "./oauth.ts";
+import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
+import { GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
+import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 
@@ -24,7 +28,7 @@ beforeEach(() => {
   database = openDatabase(":memory:", { blobDir });
   application = createApplication(database.repo, database.db);
   const user = database.repo.users.upsertByEmail("you@example.com", null);
-  principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
+  principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
@@ -130,8 +134,41 @@ test("queued readers and writers retain one gate through retirement and root con
 
 test("native metadata is mapped only for the registered client", () => {
   expect(context("one")).not.toEqual(context("two"));
-  expect(sessionContext({ ...principal, clientId: "other" }, { [OPENCODE_SESSION_META]: "one" })).toHaveProperty("missing");
+  expect(sessionContext({ ...principal, sourceKey: null }, { [OPENCODE_SESSION_META]: "one" })).toHaveProperty("missing");
   expect(sessionContext(principal, {})).toHaveProperty("missing");
+});
+
+test("the authenticated client selects the source key and harness; nothing else maps", async () => {
+  const oauth = createOAuthServer(database.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, oauthClients: [
+    { clientId: "broker", name: "Broker", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", sessionSource: true },
+    { clientId: "plain", name: "Plain", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none" },
+  ] });
+  try {
+    const authenticate = (clientId: string) => {
+      const issued = issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
+      const p = oauth.authenticate(new Request(oauth.resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
+      if (p instanceof Response) throw new Error("fixture authorization failed");
+      return p;
+    };
+    const [broker, opencode, plain, cimd] = ["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json"].map(authenticate);
+    expect([broker!.sourceKey, opencode!.sourceKey, plain!.sourceKey, cimd!.sourceKey]).toEqual([GRAYBOARD_SESSION_META, OPENCODE_SESSION_META, null, null]);
+    const both = { [GRAYBOARD_SESSION_META]: "generic", [OPENCODE_SESSION_META]: "opencode" };
+    expect(sessionContext(broker!, both)).toMatchObject({ raw: "generic" });
+    expect(sessionContext(opencode!, both)).toMatchObject({ raw: "opencode" });
+    expect(sessionContext(broker!, { [OPENCODE_SESSION_META]: "root" })).toEqual({ missing: `the key _meta["${GRAYBOARD_SESSION_META}"] is missing` });
+    expect(sessionContext(opencode!, { [GRAYBOARD_SESSION_META]: "root" })).toEqual({ missing: `the key _meta["${OPENCODE_SESSION_META}"] is missing` });
+    for (const p of [plain!, cimd!]) expect(sessionContext(p, both)).toEqual({ missing: "the client has no mapped source" });
+    const brokerRoot = sessionContext(broker!, { [GRAYBOARD_SESSION_META]: "same" }), opencodeRoot = sessionContext(opencode!, { [OPENCODE_SESSION_META]: "same" });
+    if (!("id" in brokerRoot) || !("id" in opencodeRoot)) throw new Error("fixture source mapping");
+    expect(brokerRoot.id).not.toBe(opencodeRoot.id);
+    await hosted.bind(broker!, brokerRoot, { name: "broker-run", create: true });
+    await hosted.register(broker!, brokerRoot, "broker-child");
+    await hosted.bind(opencode!, opencodeRoot, { name: "oc-run", create: true });
+    const harness = (id: string) => database.db.query<{ harness: string }, [string]>("SELECT harness FROM ids WHERE id = ?").get(id)?.harness;
+    const child = sessionContext(broker!, { [GRAYBOARD_SESSION_META]: "broker-child" });
+    if (!("id" in child)) throw new Error("fixture source mapping");
+    expect([harness(brokerRoot.id), harness(child.id), harness(opencodeRoot.id)]).toEqual(["broker", "broker", "opencode"]);
+  } finally { oauth.close(); }
 });
 
 test("unbound context cannot write or implicitly create names", async () => {
@@ -198,7 +235,7 @@ test("registration rejects invalid ownership graphs without moving an existing c
   expect(await hosted.whoami(outsider, outsiderContext)).toHaveProperty("unbound", true);
   await hosted.bind(outsider, outsiderContext, { name: "fe", create: true });
   expect(await hosted.whoami(principal, context("root"))).toHaveProperty("name", "fe");
-  const wrongClient = { ...principal, clientId: "https://other.example/client.json" };
+  const wrongClient = { ...principal, clientId: "https://other.example/client.json", sourceKey: null };
   await expect(hosted.bind(wrongClient, sessionContext(wrongClient, { [OPENCODE_SESSION_META]: "root" }), { name: "fe" })).rejects.toHaveProperty("code", "unbound");
 });
 

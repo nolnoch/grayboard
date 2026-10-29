@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { startServer } from "./app.ts";
 
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
-import { OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+import { sessionContext } from "./hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 
 const hostname = "127.0.0.1";
 

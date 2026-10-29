@@ -9,7 +9,8 @@ import { openDatabase } from "./db.ts";
 import { createApplication, type DeliveryEvent } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
-import { OPENCODE_CLIENT, OPENCODE_SESSION_META, sessionContext } from "./hosted.ts";
+import { sessionContext } from "./hosted.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { afterCommit } from "../core/sqlite.ts";
 

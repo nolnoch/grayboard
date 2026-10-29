@@ -9,7 +9,7 @@ import { setupOpenCode } from "../../src/cli/opencode-setup.ts";
 import { startServer } from "../../src/server/app.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { OPENCODE_CLIENT } from "../helpers/hosted.ts";
+import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 import { createBoard, post, subscribe } from "../../src/core/boards.ts";
 
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;

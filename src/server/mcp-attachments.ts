@@ -1,6 +1,6 @@
 import type { CoreDb } from "../core/boards.ts";
 import { ApplicationError } from "./application.ts";
-import { OPENCODE_SESSION_META, sessionContext, type HostedSessions } from "./hosted.ts";
+import { sourceContext, type HostedSessions } from "./hosted.ts";
 import type { Repo } from "./db.ts";
 import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.ts";
 import type { createOAuthServer } from "./oauth.ts";
@@ -54,7 +54,7 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
           if (encodeURIComponent(raw) !== source) return error("bad_request", "noncanonical source context", 400);
         }
       } catch { return error("bad_request", "invalid source context", 400); }
-      const context = sessionContext(principal, { [OPENCODE_SESSION_META]: raw });
+      const context = sourceContext(principal, raw);
       if (id !== undefined && (!/^[1-9]\d{0,14}$/.test(id) || !Number.isSafeInteger(Number(id)))) return error("bad_request", "invalid attachment id", 400);
       if (req.method === "POST") {
         const filename = url.searchParams.get("filename");

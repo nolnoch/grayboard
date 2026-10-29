@@ -262,7 +262,7 @@ test("unbound hosted reads never use the human address and still list and read b
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
   const unregistered = application.hostedSession(alice, "id:0000000000000", null, null, delivery(sink())).session;
-  application.hostedRegister(alice, "id:1111111111111");
+  application.hostedRegister(alice, "id:1111111111111", "opencode");
   const registered = application.hostedSession(alice, "id:1111111111111", null, null, delivery(sink())).session;
   for (const session of [unregistered, registered]) {
     expect(application.boardCatalog(session).boards.map(b => b.name)).toContain("e2e");
