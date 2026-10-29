@@ -115,6 +115,7 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
   store.repo.teams.addMember(team.id, user.user_id);
   expect((await owner.callTool({ name: "board_create", arguments: { name: "secret", purpose: "team only", team: "private" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "secret", body: "team hello" } })).isError).not.toBe(true);
+  for (const board of ["general", "secret"]) expect((await owner.callTool({ name: "claim_take", arguments: { key: `lane:${board}`, board } })).isError).not.toBe(true);
   const access = mapped ? token : issueOAuth(store.repo, oauth.resource, "reader@example.com").token;
   const client = new Client({ name: "unbound-reader", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
   clients.push(client);
@@ -137,10 +138,13 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
   if (mapped) expect(names).toContain("secret");
   else expect(names).not.toContain("secret");
   for (const b of listed) expect(b).toMatchObject({ mode: null, unread: 0 });
-  expect(text(await client.callTool({ name: "board_read", arguments: { board: "general" } })).posts.map((p: { body: string }) => p.body)).toEqual(["open hello"]);
+  expect(text(await client.callTool({ name: "board_read", arguments: { board: "general" } })).posts.map((p: { body: string }) => p.body)).toEqual(["open hello", "[claim] lane:general"]);
   const secret = await client.callTool({ name: "board_read", arguments: { board: "secret" } });
-  if (mapped) expect(text(secret).posts.map((p: { body: string }) => p.body)).toEqual(["team hello"]);
+  if (mapped) expect(text(secret).posts.map((p: { body: string }) => p.body)).toEqual(["team hello", "[claim] lane:secret"]);
   else expect(secret.isError).toBe(true);
+  const claims = text(await client.callTool({ name: "claim_list", arguments: { prefix: "lane:" } })) as { key: string; board: string | null }[];
+  expect(claims.map(c => [c.key, c.board])).toEqual([["lane:general", "general"], ["lane:secret", mapped ? "secret" : null]]);
+  expect(text(await client.callTool({ name: "peer_list", arguments: { board: "general" } }))).toHaveProperty("peers");
   expect(state()).toEqual(before);
   expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
   expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);

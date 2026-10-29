@@ -404,9 +404,9 @@ function visibleBoard(db: Database, handle: Viewer, input: string): Board {
   return b;
 }
 
-export function canSeeBoard(db: Database, handle: string, name: string): boolean {
+export function canSeeBoard(db: Database, viewer: Viewer, name: string): boolean {
   const b = getBoard(db, name);
-  return !!b && access(db).canSee(handle, b);
+  return !!b && sees(db, viewer, b);
 }
 
 function tipOf(db: Database, board: string): number {
@@ -1026,12 +1026,13 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // `addresses`: the caller's address set, each row of which is its own and
 // online; `handle` is its primary. `session`: the caller's ID, whose
 // principal the label cut is judged for (a primary can be a team's alias).
+// `reader`: an addressless caller's board visibility (an unbound hosted session).
 export function who(
   db: Database,
   handle: string,
   opts: { board?: string; include_offline?: boolean; match?: PeerMatch },
   online: (h: string) => boolean,
-  ctx: { unbound?: UnboundPeer[]; addresses?: string[]; session?: string } = {},
+  ctx: { unbound?: UnboundPeer[]; addresses?: string[]; session?: string; reader?: BoardPredicate } = {},
 ): WhoResult {
   const isViewer = viewers(db);
   const acc = access(db);
@@ -1046,7 +1047,7 @@ export function who(
     a.human, a.queue_off, a.scope_kind, a.scope_ref, ${ALIAS_META_KEYS.map((k) => `a.${k}`).join(", ")}`;
   let rows: Row[];
   if (opts.board !== undefined) {
-    const b = visibleBoard(db, handle, opts.board);
+    const b = visibleBoard(db, ctx.reader ?? handle, opts.board);
     // A subscription a session took as its ID is listed under its primary
     // (as queueLanes does), or as the ID with its own session's facts; a
     // name's own subscription wins over its ID's.

@@ -344,8 +344,9 @@ export type ToolContext = {
   human?: boolean;
   session?: string;
   addresses?: string[];
-  // A reader with no address (an unbound hosted session): board_list and
-  // board_read are judged by it instead of `handle`, and touch no cursor.
+  // A reader with no address (an unbound hosted session): board_list,
+  // board_read, claim_list and peer_list judge board visibility by it
+  // instead of `handle`, and touch no cursor.
   reader?: BoardPredicate;
 };
 
@@ -455,6 +456,7 @@ export function callBoardTool(
         unbound: ctx.unbound,
         addresses: ctx.addresses,
         session: ctx.session,
+        reader: ctx.reader,
       });
       return { result: r, wake: [] };
     }
@@ -482,7 +484,7 @@ export function callBoardTool(
       return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses), wake: [] };
 
     case "claim_list":
-      return { result: listClaims(db, optStr(a, "prefix"), handle), wake: [] };
+      return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle), wake: [] };
   }
   throw new CoreError(`unknown tool: ${name}`);
 }
