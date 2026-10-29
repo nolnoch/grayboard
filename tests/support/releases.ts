@@ -1,5 +1,5 @@
-// Published grayboard releases, for the upgrade tier: which tag came before
-// this tree, and that release's CLI and server binaries for this machine.
+// Published grayboard releases, for the upgrade tier and the mixed-version
+// tests: which tag came before this tree, and that release's CLI and server binaries for this machine.
 // Binaries are downloaded once into .e2e-cache/releases/<tag>/ and reused;
 // each, cached or fresh, must match the sha256 GitHub lists for the asset, so
 // a re-tagged release or a truncated file is fetched again, never trusted. A

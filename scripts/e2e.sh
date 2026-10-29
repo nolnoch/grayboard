@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The one entry point for the e2e suites, for CI and by hand:
-#   scripts/e2e.sh upgrade-matrix   every v1.x release's databases (and, where
+#   scripts/e2e.sh upgrade-matrix   every release's databases (and, where
 #                                   its own updater runs, `grayboard update`)
 #                                   upgrade to this tree; the installers once
 #                                   (needs network)

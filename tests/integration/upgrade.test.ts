@@ -6,7 +6,7 @@
 // back through this tree's tools. The same for the local Slack bridge's store.
 // Per push: the latest release, which carries this tree's version until the
 // next bump. GRAYBOARD_UPGRADE_FROM=<tag> picks another (the nightly matrix
-// runs every v1.x tag). Under scripts/e2e.sh each test keeps the files as the
+// runs every release at or above v1.0.0). Under scripts/e2e.sh each test keeps the files as the
 // release left them and as this tree left them in the run dir.
 import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
