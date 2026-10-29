@@ -11,11 +11,8 @@ if (process.argv.includes("--version")) {
 const config = loadConfig();
 const { server, stop } = startServer(config);
 
-console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
-// Write-capable hosted clients are an operator trust decision (#414); say which at every start.
-const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
-console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
-
+// Handlers go in before the listening line: a supervisor (or test) that
+// signals on seeing it must reach shutdown, not the default kill (#422).
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
@@ -30,3 +27,9 @@ async function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
+// Write-capable hosted clients are an operator trust decision (#414); say which at every start.
+const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
+console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
+
