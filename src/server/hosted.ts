@@ -56,12 +56,23 @@ function hostedBindOk(name: string, previous: string | null, moved: string[], in
 }
 const quietSink: DeliverySink = { deliver() {}, probe: async () => true, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
+// How often the sweep timer records the server's liveness; after a crash the
+// restart credit can overshoot the real downtime by at most this (#423).
+const HEARTBEAT_MS = 1000;
+// A running server's alive_at lags by up to a heartbeat plus a timer tick
+// (and event-loop delay); a gap within this bound is no measurable downtime.
+const LIVE_STALENESS_MS = 2 * HEARTBEAT_MS;
+const DELIVERY_TTL_MS = 30_000;
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; leaseTtlMs?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? "900");
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive integer");
   const idle = rawIdle * 1000;
+  // A delivery lease's TTL; createDelivery defaults to it, and the restart
+  // credit caps a deadline at one TTL past startup (#423).
+  const leaseTtl = options.leaseTtlMs ?? DELIVERY_TTL_MS;
+  if (!Number.isFinite(leaseTtl) || leaseTtl < 1) throw new Error("invalid delivery TTL");
   const gates = new Map<string, { gate: BindGate; users: number }>();
   const limits = { user: 256, global: 4096, children: 128 };
   function admit(user: number, root?: string) {
@@ -156,6 +167,37 @@ export function createHostedSessions(application: Application, options: { now?: 
     });
     reconcile();
   }
+  // The lease and idle clocks stop while the server is down (#423). A root
+  // whose lease was still live at the last heartbeat gets its deadline pushed
+  // out by the downtime, capped at one TTL past now: a stale heartbeat (a
+  // rollback to a release without it, or failing heartbeat writes while
+  // renewals succeed) must not let a dead owner hold its name for longer. An
+  // unleased root that wasn't yet idle at the last heartbeat gets its
+  // last_seen_at moved the same way, capped at now. A lease that had already
+  // expired while the server was up, and a disabled user's root, are left for
+  // the sweep. With no heartbeat yet on this schema there is no downtime to
+  // measure, and a gap within LIVE_STALENESS_MS is indistinguishable from a
+  // live server (a concurrent opener). Writing alive_at in the same
+  // transaction makes a second start measure ~0, so the credit is applied once.
+  function creditDowntime() {
+    store.atomic(() => {
+      const t = now(), alive = store.aliveAt();
+      if (alive !== undefined && t - alive > LIVE_STALENESS_MS) {
+        const downtime = t - alive;
+        for (const row of store.all()) {
+          if (row.root_session_id || repo.users.findById(row.user_id)?.disabled_at != null) continue;
+          let credit: { field: "lease_deadline" | "last_seen_at"; before: number; after: number } | undefined;
+          if (row.lease_deadline !== null) {
+            if (row.lease_deadline > alive) credit = { field: "lease_deadline", before: row.lease_deadline, after: Math.min(row.lease_deadline + downtime, t + leaseTtl) };
+          } else if (row.last_seen_at > alive - idle) credit = { field: "last_seen_at", before: row.last_seen_at, after: Math.min(row.last_seen_at + downtime, t) };
+          if (!credit || credit.after <= credit.before) continue;
+          store.update({ ...row, [credit.field]: credit.after });
+          audit(row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
+        }
+      }
+      store.heartbeat(t);
+    });
+  }
   async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
     authorized(p);
     if (!("id" in context)) return fn(undefined);
@@ -203,6 +245,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     limits,
     get gateCount() { return gates.size; },
     now,
+    leaseTtl,
     gate,
     row(id: string) { return store.get(id); },
     rootOf,
@@ -379,12 +422,21 @@ export function createHostedSessions(application: Application, options: { now?: 
       unsubscribe();
       for (const { session } of holders.values()) application.close(session);
       holders.clear(); listeners.clear();
+      // A clean stop records its exact time, so the next start credits leases
+      // with the real downtime rather than up to a heartbeat interval more.
+      try { store.heartbeat(now()); } catch (e) { hostedFailure("hosted.heartbeat", e); }
     },
     instructions: hostedUnboundInstruction,
   };
   const unsubscribe = store.subscribe(reconcile);
+  creditDowntime();
   sweep();
-  const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("hosted.sweep", e); } }, 250);
+  let beat = now();
+  const timer = setInterval(() => {
+    try { sweep(); } catch (e) { hostedFailure("hosted.sweep", e); }
+    const t = now();
+    if (t - beat >= HEARTBEAT_MS || t < beat) try { store.heartbeat(t); beat = t; } catch (e) { hostedFailure("hosted.heartbeat", e); }
+  }, 250);
   timer.unref();
   return service;
 }

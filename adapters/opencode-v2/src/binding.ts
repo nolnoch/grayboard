@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { MCPEditor } from "@opencode/plugin/promise/mcp";
-import { Refusal, same, type Configuration, type Enrollment } from "./model.js";
+import { NativeAccessExpired, Refusal, same, type Configuration, type Enrollment } from "./model.js";
 
 type Expected = Pick<Enrollment, "configuration" | "integrationID" | "connectionID">;
 export class Binding {
@@ -55,7 +55,8 @@ export class Binding {
   }
   private async project(selected: Awaited<ReturnType<Binding["selection"]>>, endpoint: Awaited<ReturnType<Binding["configuration"]>>) {
     const credential = await this.ctx.integration.connection.resolve(selected.connection);
-    if (credential?.type !== "oauth" || credential.expires <= Date.now() || !credential.access) throw new Refusal("auth", "Native access expired; reconnect or sign in using OpenCode");
+    if (credential?.type !== "oauth" || !credential.access) throw new Refusal("auth", "Native access unavailable; reconnect or sign in using OpenCode");
+    if (credential.expires <= Date.now()) throw new NativeAccessExpired();
     const m = credential.metadata as { serverUrl?: unknown; issuer?: unknown; scope?: unknown; client?: { client_id?: unknown } } | undefined;
     if (!m || m.serverUrl !== endpoint.url || typeof m.issuer !== "string" || typeof m.scope !== "string" || typeof m.client?.client_id !== "string") throw new Refusal("auth", "Native OAuth projection lacks server, issuer, client or scopes; reconnect using native MCP");
     const issuer = new URL(m.issuer);

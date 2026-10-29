@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
+import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
-import { Wire, SubscriberError, LeaseUnavailable, subscriberError } from "../src/wire.js";
+import { Wire, SubscriberError, LeaseUnavailable, ServerUnreachable, subscriberError, unreachable } from "../src/wire.js";
 import { failureMessage } from "../src/diagnostics.js";
 import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
@@ -89,6 +90,29 @@ test("subscriber errors use structured tool codes and SDK resource data, never h
   await expect(wire.call("delivery_renew")).rejects.toMatchObject({ code: "invalid_response" });
   wire.client.readResource = async () => { throw Object.assign(new Error("transport failure"), { code: "not_found" }); };
   await expect(wire.read("grayboard://inbox")).rejects.toMatchObject({ message: "transport failure" });
+});
+// #423: an outage must surface as ServerUnreachable so the controller waits it out; anything else keeps its own classification.
+const wireAt = (url: string, signal = new AbortController().signal, token = "native") => new Wire({ ...enrollment.configuration, url }, { token: async () => token }, signal, enrollment.sessionID);
+test("connect to a closed port or a gateway status is an outage; other HTTP refusals are not", async () => {
+  await expect(wireAt("http://127.0.0.1:1/mcp").connect()).rejects.toBeInstanceOf(ServerUnreachable);
+  for (const status of [502, 503, 504, 404, 500]) {
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("down", { status }) });
+    try {
+      const error = await wireAt(`http://127.0.0.1:${server.port}/mcp`).connect().then(() => undefined, e => e);
+      expect(error).toBeDefined();
+      expect(error instanceof ServerUnreachable).toBe(status >= 502);
+    } finally { server.stop(true); }
+  }
+});
+test("SDK timeouts and closed connections are outages; an abort of the wire's own signal never is", async () => {
+  expect(unreachable(new SdkError(SdkErrorCode.RequestTimeout, "t"))).toBe(true);
+  expect(unreachable(new SdkError(SdkErrorCode.ConnectionClosed, "c"))).toBe(true);
+  expect(unreachable(new Error("wrapped", { cause: Object.assign(new TypeError("fetch failed"), { code: "ECONNREFUSED" }) }))).toBe(true);
+  expect(unreachable(new Error("other"))).toBe(false);
+  const abort = new AbortController(), wire = wireAt("http://127.0.0.1:1/mcp", abort.signal);
+  const refused = Object.assign(new TypeError("fetch failed"), { code: "ECONNREFUSED" });
+  wire.client.callTool = async () => { abort.abort(); throw refused; };
+  await expect(wire.call("whoami")).rejects.toBe(refused);
 });
 test("enrollment fingerprint pins all logical fields independently of key order", () => {
   const hash = enrollmentHash(enrollment);

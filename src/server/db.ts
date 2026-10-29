@@ -254,6 +254,9 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_ownership ON hosted_sessions(ownership_id);
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;
+    -- Server-wide scalar state. alive_at: the server's last heartbeat (epoch ms),
+    -- so a restart can credit hosted leases with the downtime (#423).
+    CREATE TABLE IF NOT EXISTS server_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS oauth_requests (
       hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, data TEXT NOT NULL
     );
@@ -1251,6 +1254,10 @@ function makeHostedStore(db: Database): HostedStore {
       for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
+    },
+    aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
+    heartbeat(now) {
+      db.run("INSERT INTO server_state(key, value) VALUES ('alive_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [now]);
     },
   };
   return store;

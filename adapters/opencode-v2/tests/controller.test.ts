@@ -5,8 +5,8 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller } from "../src/controller.js";
 import { Diagnostics, failureCode, failureMessage } from "../src/diagnostics.js";
 import { observeEvents } from "../src/events.js";
-import { Wire, LeaseUnavailable, SubscriberError } from "../src/wire.js";
-import { METADATA, type Enrollment, type Item } from "../src/model.js";
+import { Wire, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/wire.js";
+import { METADATA, NativeAccessExpired, type Enrollment, type Item } from "../src/model.js";
 import { fixture } from "./binding.test.js";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
@@ -23,6 +23,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   let ownership = 0, throttledReads = 0;
   let readFailure: (() => void) | undefined;
   let observation: ((operation: string) => Promise<void>) | undefined;
+  let subscription: (() => Promise<void> | undefined) | undefined;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
@@ -63,7 +64,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
       if (throttledReads > 0) { throttledReads--; this.admissionRetryAfterMs = 100; throw new Error("typed HTTP429"); }
       return { items: batches.get(this.sessionID) ?? [] };
     }
-    async listen() { return { closed: new Promise<void>(() => {}), close: async () => {} }; }
+    async listen() { return { closed: subscription?.() ?? new Promise<void>(() => {}), close: async () => {} }; }
   }
   const ctx = {
     ...f.ctx, location: { directory: "/worktree" },
@@ -78,7 +79,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, subscriptions: (call: () => Promise<void> | undefined) => { subscription = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("diagnostic failures never inspect hostile error properties and retain cleanup classification", async () => {
   let reads = 0; const error = new Error();
@@ -473,6 +474,67 @@ test("a lease lost outside any item pauses after bounded recoveries despite succ
     await until(() => r.controller.status().state === "paused");
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(4);
   } finally { await r.controller.close(); }
+});
+// An approved root on an actual controller with an immediate backoff, whose
+// first subscription closes on demand (the server stopping, #423).
+async function outage() {
+  const r = runtime(), waits: number[] = [], codes: string[] = [];
+  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async ms => { waits.push(ms); }, record => { if (record.code) codes.push(record.code); });
+  const first = Promise.withResolvers<void>();
+  let listens = 0;
+  r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
+  r.bind("R", "be");
+  await controller.enroll("R");
+  await until(() => controller.status().state === "active" && listens === 1);
+  return { r, controller, waits, codes, stop: () => first.resolve() };
+}
+const item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" };
+test("server outages and subscription closures never spend the failure budget, and recovery reopens", async () => {
+  const o = await outage();
+  try {
+    let refused = 10;
+    o.r.observe(async operation => { if (operation === "connect" && refused > 0) { refused--; throw new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })); } });
+    // After the outage: ten more closed subscriptions, then a live one with an item.
+    let closures = 10;
+    o.r.subscriptions(() => {
+      if (closures-- > 0) return Promise.resolve();
+      o.r.batches.set("R", [item]);
+      return undefined;
+    });
+    o.stop();
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    expect(o.waits).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, ...Array(10).fill(500)]);
+    expect(o.codes).toContain("server_unreachable");
+    expect(o.codes).not.toContain("retry_exhausted");
+    expect(o.r.calls.filter(c => c.name === "delivery_open")).toHaveLength(12);
+    expect(o.r.admissions).toHaveLength(1);
+    expect(o.controller.status().state).toBe("active");
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+test("a native token that expires during an outage keeps retrying; outside one it pauses", async () => {
+  const o = await outage();
+  try {
+    const failures: Error[] = [new ServerUnreachable(new Error("down")), new NativeAccessExpired(), new NativeAccessExpired()];
+    o.r.observe(async operation => { if (operation === "connect" && failures.length) throw failures.shift()!; });
+    o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
+    o.stop();
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    expect(o.waits).toEqual([500, 1000, 2000, 4000]);
+    expect(o.codes).toContain("native_access_expired");
+    expect(o.controller.status().state).toBe("active");
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+  // Outside an outage: an ordinary failure reconnects, and that connect finds the token expired.
+  const p = runtime({}, async () => {});
+  try {
+    let connects = 0;
+    p.readFailure(() => { p.readFailure(() => {}); throw new Error("transient"); });
+    p.observe(async operation => { if (operation === "connect" && ++connects === 3) throw new NativeAccessExpired(); });
+    p.bind("R", "be");
+    await p.controller.enroll("R");
+    await until(() => p.controller.status().state === "paused");
+    expect(connects).toBe(3);
+    expect(p.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
+  } finally { await p.controller.close(); }
 });
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
   const r = runtime();
