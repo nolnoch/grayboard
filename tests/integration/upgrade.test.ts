@@ -234,6 +234,15 @@ function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox
   return { readPoint: (a) => one(readPointSql, a), newest: (a) => one(newestSql, a) };
 }
 
+function hasTable(path: string, name: string): boolean {
+  const db = new Database(path, { readonly: true });
+  try {
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
+  } finally {
+    db.close();
+  }
+}
+
 // Waits until each agent's read point covers what it was pushed, takes both
 // offline, and has a third agent DM each of them.
 async function sendWhileOffline(m: Mailbox, be: Session, fe: Session, sim: () => Promise<Session>, beHandle: string, feHandle: string): Promise<void> {
@@ -277,9 +286,13 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
       expect(r.code, r.err).toBe(0);
     }
   }
+  // A 2.x server keeps read points by address (#284); a 1.x server by identity.
+  const byAddress = hasTable(dbPath, "mailbox_cursors");
   const m = mailbox(
     dbPath,
-    `SELECT MAX(last_seen_id) AS n FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?`,
+    byAddress
+      ? `SELECT last_seen_id AS n FROM mailbox_cursors WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1`
+      : `SELECT MAX(last_seen_id) AS n FROM cursors WHERE stream_type = 'direct' AND stream_ref = ?`,
     `SELECT MAX(id) AS n FROM messages WHERE recipient_type = 'user' AND recipient = ?`,
   );
   await sendWhileOffline(m, be, fe, () => session(old!.base, alice, "sim", rel.cli), "alice@example.com/be", "bob@example.com/fe");

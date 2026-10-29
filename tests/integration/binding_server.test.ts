@@ -10,7 +10,7 @@ import { runCli } from "../support/cli.ts";
 import { cleanEnv, serverEnv } from "../support/env.ts";
 import { PROTO, PROTO_REFUSAL } from "../../src/shared/protocol.ts";
 import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
-import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { idAddress } from "../../src/core/bindings.ts";
 import { GRACE_MS, SWEEP_MS } from "../../src/server/ws.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -526,7 +526,7 @@ test("16, 18: raw binds: create: false, lazy create; a hello needs a key, and an
 
 let rel: ReleaseBinaries;
 beforeAll(async () => {
-  rel = await releaseBinaries(await latestRelease());
+  rel = await releaseBinaries(await latestV1Release());
 }, 120_000);
 
 test("18: against a 1.x server, a 2.x session fails at start with the server's refusal", async () => {
