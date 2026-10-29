@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -244,7 +244,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 
 // Claims are visible to everyone on the bus. The announcing board's name is
 // hidden from handles that can't see that board.
-export function listClaims(db: Database, prefix?: string, viewer?: string): Claim[] {
+export function listClaims(db: Database, prefix?: string, viewer?: Viewer): Claim[] {
   const rows = db
     .prepare(
       `SELECT * FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,

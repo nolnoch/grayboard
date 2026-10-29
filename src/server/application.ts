@@ -449,8 +449,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!observers.has(observer)) return false;
     try {
       valid(observer.session);
-      const s = observer.session;
-      if (s.readOnly ? seesBoard(s, observer.board) : s.addresses.some((a) => canSeeBoard(db, a, observer.board))) return true;
+      if (observer.session.addresses.some((a) => canSeeBoard(db, a, observer.board))) return true;
     } catch {}
     removeObserver(observer);
     return false;
@@ -1132,7 +1131,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     boardCatalog(session: ApplicationSession, after?: string) {
       valid(session, true);
-      return boardCatalog(db, session.readOnly ? seer(session) : session.primary, after);
+      return boardCatalog(db, session.readOnly ? seer(repo, session) : session.primary, after);
     },
     boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       valid(session, true);
@@ -1248,22 +1247,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const observer of [...observers]) removeObserver(observer);
     },
   };
-  // A hosted session with no name doesn't act as its ID (routing, not a
-  // capability, #229), and acts as no address: its side-effect-free reads
-  // (catalog, snapshot, resource watches) are judged by its user's principal
-  // directly, never as an address in the user's scope (`human` there is the
-  // bridge's reserved identity).
-  function seer(session: ApplicationSession): (board: Board) => boolean {
-    const p = { kind: "user" as const, name: session.authed.user_email };
-    return (board) => principalCanSee(repo, p, board);
-  }
-  function seesBoard(session: ApplicationSession, name: string): boolean {
-    const board = getBoard(db, normalizeBoard(name));
-    return !!board && seer(session)(board);
-  }
   // Who a board read is judged for: the first of the session's addresses that can see it (S14).
   function reader(session: ApplicationSession, board: string): Viewer {
-    if (session.readOnly) return seer(session);
+    if (session.readOnly) return seer(repo, session);
     try {
       return boardActor(db, "board_read", { board }, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
     } catch (e) {
@@ -1274,6 +1260,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   return application;
 }
 export type Application = ReturnType<typeof createApplication>;
+
+// A hosted session with no name doesn't act as its ID (routing, not a
+// capability, #229), and acts as no address: its side-effect-free reads
+// (catalog, snapshot, board_list, board_read, and the board visibility in
+// claim_list and peer_list) are judged by
+// its user's principal directly, never as an address in the user's scope
+// (`human` there is the bridge's reserved identity), #410.
+function seer(repo: Repo, session: ApplicationSession): (board: Board) => boolean {
+  const p = { kind: "user" as const, name: session.authed.user_email };
+  return (board) => principalCanSee(repo, p, board);
+}
 
 // A hosted unbound session's candidates: the user's own names nobody holds.
 function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
@@ -1564,6 +1561,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     human: session.human,
     ...(session.writerId ? { session: session.writerId } : {}),
     addresses: session.addresses,
+    ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),
   };
   // `as`, else the first address that can see the board (#284 S3, S14).
@@ -1583,7 +1581,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
-  // A hosted session with no name reads as its ID, but is nobody (#402).
+  // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
   if (session.readOnly && tool === "peer_list" && outcome.result && typeof outcome.result === "object") delete (outcome.result as { you?: string }).you;
   for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
   // The transitional adapter publishes its answer before the resulting deliveries.
