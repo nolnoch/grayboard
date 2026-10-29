@@ -45,6 +45,7 @@ export type AuditAction =
   | "message.retracted"
   | "request.replayed"
   | "request.resent"
+  | "server.started"
   | "slack.linked"
   | "slack.unlinked"
   | "team.created"

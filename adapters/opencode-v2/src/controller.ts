@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Binding } from "./binding.js";
-import { LeaseUnavailable, SubscriberError, Wire } from "./wire.js";
-import { METADATA, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, render, same, stableID, type Enrollment, type Lease } from "./model.js";
+import { LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire } from "./wire.js";
+import { METADATA, NativeAccessExpired, Refusal, admitPrefix, bindingOf, enrollmentHash, itemsOf, leaseOf, nativeExpiry, render, same, stableID, type Enrollment, type Lease } from "./model.js";
 import { SessionRoutes, resolveRoot } from "./sessions.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Status } from "./diagnostics.js";
 export type { Status } from "./diagnostics.js";
@@ -177,7 +177,13 @@ export class Controller {
   private async run(r: Root, e: Enrollment, epoch: number, signal: AbortSignal, ready: () => void) {
     // recoveries counts lease losses outside an item (inbox read, renew) since
     // the lease last proved healthy; a loss inside an item spends that item's attempts.
-    let failures = 0, recoveries = 0, throttles = 0, inItem = false;
+    // unreachable counts consecutive outage retries (the server down, or the
+    // subscription closed under it): they back off without limit and never
+    // spend failures, since leases don't count server downtime (#423); only a
+    // healthy lease (renew or receipt) resets the backoff. outage is set only
+    // by a failed request: the server also closes the stream when native
+    // access expires, and that expiry must still pause.
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
@@ -187,6 +193,7 @@ export class Controller {
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
+        outage = false;
         await this.guard(r, epoch, signal);
         if (!current.name) {
           r.lease = undefined;
@@ -227,14 +234,14 @@ export class Controller {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
                 for (const id of ids) attempts.delete(id);
-                failures = 0; throttles = 0; recoveries = 0; pendingItem = undefined;
+                failures = 0; throttles = 0; recoveries = 0; unreachable = 0; pendingItem = undefined;
               });
               if (items.length === 100) dirty = true;
             }
-            if (closed) throw new Error("Subscription closed");
+            if (closed) throw new SubscriptionClosed();
             if (Date.now() >= renewal) {
               await this.guard(r, epoch, signal); await wire.call("delivery_renew");
-              renewal = Date.now() + 10_000; dirty = true; recoveries = 0;
+              renewal = Date.now() + 10_000; dirty = true; recoveries = 0; unreachable = 0;
             }
             if (dirty) continue;
             const timer = new AbortController();
@@ -242,8 +249,18 @@ export class Controller {
             wake = undefined; timer.abort();
           }
         } finally { await subscription.close().catch(error => this.failure("subscription_close", error, r)); }
-      } catch (error) {
+      } catch (caught) {
         if (signal.aborted) break;
+        const error = nativeExpiry(caught) ?? caught;
+        // A native token that expires mid-outage couldn't be refreshed either;
+        // wait for native MCP rather than pausing.
+        if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || (error instanceof NativeAccessExpired && outage)) {
+          if (error instanceof ServerUnreachable) outage = true;
+          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : "Native access expired during a server outage; retrying until native MCP refreshes it", "reopen", failureCode(error));
+          ready();
+          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          continue;
+        }
         if (error instanceof Refusal || error instanceof DeliveryStopped) throw error;
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;

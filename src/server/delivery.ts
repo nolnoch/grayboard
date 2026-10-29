@@ -11,7 +11,7 @@ export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
 export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; name: string };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
-export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; ttlMs?: number; now?: () => number };
+export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number };
 type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
@@ -29,8 +29,7 @@ function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
 }
 export function createDelivery(hosted: HostedSessions, options: DeliveryOptions) {
   const application = hosted.application, store = application.repo.hosted;
-  const ttl = options.ttlMs ?? 30_000, now = options.now ?? hosted.now;
-  if (!Number.isFinite(ttl) || ttl < 1) throw new Error("invalid delivery TTL");
+  const ttl = hosted.leaseTtl, now = options.now ?? hosted.now;
   const leases = new Map<string, Lease>();
   const attempts = new WeakMap<DeliveryLease, { lease: Lease; version: number; created: boolean; hooks: DeliveryHooks }>();
   function opened(lease: Lease, created: boolean, hooks: DeliveryHooks) {
@@ -197,7 +196,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     revalidate() { hosted.sweep(); },
     close() {
       stopped = true; unlisten();
-      for (const lease of [...leases.values()]) { hosted.audit(lease.sessionId, "hosted.lease_closed", { reason: "shutdown" }, lease.principal); finish(lease); }
+      // The capability is dropped, but the lease row stays; a restart credits it with the downtime (#423).
+      for (const lease of [...leases.values()]) { hosted.audit(lease.sessionId, "hosted.lease_detached", { reason: "shutdown" }, lease.principal); finish(lease); }
     },
   };
   return service;

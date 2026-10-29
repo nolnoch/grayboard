@@ -211,7 +211,7 @@ for (const child of [false, true]) test(`external rebind during native dispatch 
   expect(database.db.query<{ status: string | null }, [string]>("SELECT status FROM ids WHERE id=?").get((context(principal, child ? "child" : "root") as { id: string }).id)?.status).not.toBe("stale write");
 });
 
-test("two restarts retain ownership and deadline; expiry rebuild releases exactly once", async () => {
+test("two restarts retain ownership and deadline; downtime is credited; expiry releases exactly once", async () => {
   const { principal } = issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   await hosted.register(principal, context(principal), "child");
@@ -226,8 +226,12 @@ test("two restarts retain ownership and deadline; expiry rebuild releases exactl
   close(); now += 5_000; open();
   expect(releases()).toEqual([]);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
+  // Downtime longer than the TTL doesn't count against the lease (#423)...
   close(); now += 31_000; open();
-  hosted.sweep();
+  expect(releases()).toEqual([]);
+  expect(database.repo.hosted.all()).toHaveLength(2);
+  // ...but time while the server is up does.
+  now += 31_000; hosted.sweep();
   expect(database.repo.hosted.all()).toEqual([]);
   expect(releases()).toEqual([{ detail: "expired" }]);
   close(); open();

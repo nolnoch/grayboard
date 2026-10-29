@@ -19,4 +19,8 @@ export interface HostedStore {
   start(session: string, user: number, client: string, now: number): number;
   end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
   childEnd(session: string, now: number): void;
+  // The server's last recorded liveness (epoch ms), absent before the first
+  // heartbeat on this schema. A restart credits leases with the downtime (#423).
+  aliveAt(): number | undefined;
+  heartbeat(now: number): void;
 }

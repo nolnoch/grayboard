@@ -1,5 +1,6 @@
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { SubscriberError, holderText } from "./wire.js";
+import { ServerUnreachable, SubscriberError, SubscriptionClosed, holderText } from "./wire.js";
+import { NativeAccessExpired } from "./model.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
@@ -11,9 +12,12 @@ const key = "diagnostics:v1";
 const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 const operations = new Set(["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose"]);
-const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response"]);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
+  if (error instanceof ServerUnreachable) return "server_unreachable";
+  if (error instanceof SubscriptionClosed) return "subscription_closed";
+  if (error instanceof NativeAccessExpired) return "native_access_expired";
   if (error instanceof SubscriberError) {
     const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
     if (typeof code === "string" && codes.has(code)) return code;
@@ -22,6 +26,7 @@ export function failureCode(error: unknown): string {
 }
 export function failureMessage(error: unknown): string {
   if (error instanceof DeliveryStopped) return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; explicitly enroll again`;
+  if (error instanceof ServerUnreachable) return "Server unreachable; approval retained, explicitly enroll to retry";
   if (error instanceof SubscriberError) {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;

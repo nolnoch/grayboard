@@ -10,6 +10,17 @@ export type BindingState = { name: string | null; ownership: number | null; unbo
 export class Refusal extends Error {
   constructor(readonly code: "binding" | "auth" | "root" | "identity" | "paused", message: string) { super(message); }
 }
+// The native access token expired. It pauses like any auth refusal, except
+// during a server outage, when native MCP couldn't refresh it either (#423).
+export class NativeAccessExpired extends Refusal {
+  constructor() { super("auth", "Native access expired; reconnect or sign in using OpenCode"); }
+}
+// The SDK wraps errors thrown while connecting (SdkError EraNegotiationFailed
+// {cause}), so a token() expiry during connect arrives nested.
+export function nativeExpiry(error: unknown): NativeAccessExpired | undefined {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if (e instanceof NativeAccessExpired) return e;
+  return undefined;
+}
 export function same(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
