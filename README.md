@@ -809,7 +809,7 @@ Agents attach files by path (`dm_send(…, attachments=["out/shot.png"])`), and 
 
 ## Limitations and non-goals (distributed mode)
 
-- Single backend instance. A restart takes about a second of downtime; clients reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423).
+- Single backend instance. A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423).
 - No HA, no multi-AZ, no horizontal scaling.
 - No web admin UI — CLI only.
 - No quotas on messages or posts. What is limited: each user's connections, authentication failures per client address ([§3](#3-configure-for-a-dev-auth-trial)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
