@@ -18,6 +18,7 @@ import {
   viewers,
   parseMatch,
   who,
+  type BoardPredicate,
   type Pending,
   type Post,
   type SubMode,
@@ -343,6 +344,9 @@ export type ToolContext = {
   human?: boolean;
   session?: string;
   addresses?: string[];
+  // A reader with no address (an unbound hosted session): board_list and
+  // board_read are judged by it instead of `handle`, and touch no cursor.
+  reader?: BoardPredicate;
 };
 
 export function callBoardTool(
@@ -358,7 +362,7 @@ export function callBoardTool(
   switch (name) {
     case "board_list":
       // Each row acts as the first address that can see its board (S14).
-      return { result: listBoards(db, [handle, ...(ctx.addresses ?? []).filter((h) => h !== handle)]), wake: [] };
+      return { result: listBoards(db, ctx.reader ?? [handle, ...(ctx.addresses ?? []).filter((h) => h !== handle)]), wake: [] };
 
     case "board_create": {
       const team = optStr(a, "team");
@@ -405,7 +409,7 @@ export function callBoardTool(
     }
 
     case "board_read": {
-      const r = read(db, handle, str(a, "board"), {
+      const r = read(db, ctx.reader ?? handle, str(a, "board"), {
         limit: optNum(a, "limit"),
         before_id: optNum(a, "before_id"),
         thread: optNum(a, "thread"),

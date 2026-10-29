@@ -105,9 +105,16 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   return client;
 }
 
+// #410: tool reads with no session key judge visibility by the user's
+// principal (own and team boards, never another team's) and change nothing.
 for (const mapped of [true, false]) test(`unbound native resource catalog and snapshots match nonconsuming tools, mapped=${mapped}`, async () => {
   const owner = await connect();
   expect((await owner.callTool({ name: "board_create", arguments: { name: "general", purpose: "visible catalog" } })).isError).not.toBe(true);
+  expect((await owner.callTool({ name: "board_post", arguments: { board: "general", body: "open hello" } })).isError).not.toBe(true);
+  const team = store.repo.teams.create("private", user.user_id);
+  store.repo.teams.addMember(team.id, user.user_id);
+  expect((await owner.callTool({ name: "board_create", arguments: { name: "secret", purpose: "team only", team: "private" } })).isError).not.toBe(true);
+  expect((await owner.callTool({ name: "board_post", arguments: { board: "secret", body: "team hello" } })).isError).not.toBe(true);
   const access = mapped ? token : issueOAuth(store.repo, oauth.resource, "reader@example.com").token;
   const client = new Client({ name: "unbound-reader", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
   clients.push(client);
@@ -115,10 +122,26 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
     requestInit: { headers: { Authorization: `Bearer ${access}` } },
     fetch: (input, init) => hosted.fetch(new Request(input, init)),
   }));
+  const state = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
+  const before = state();
+  const text = (r: { isError?: boolean; content: unknown }) => {
+    expect(r.isError).not.toBe(true);
+    return JSON.parse((r.content as { text: string }[])[0]!.text);
+  };
   const resources = await client.listResources();
   expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
   expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
-  expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+  const listed = text(await client.callTool({ name: "board_list", arguments: {} })) as { name: string; mode: unknown; unread: number }[];
+  const names = listed.map(b => b.name);
+  expect(names).toContain("general");
+  if (mapped) expect(names).toContain("secret");
+  else expect(names).not.toContain("secret");
+  for (const b of listed) expect(b).toMatchObject({ mode: null, unread: 0 });
+  expect(text(await client.callTool({ name: "board_read", arguments: { board: "general" } })).posts.map((p: { body: string }) => p.body)).toEqual(["open hello"]);
+  const secret = await client.callTool({ name: "board_read", arguments: { board: "secret" } });
+  if (mapped) expect(text(secret).posts.map((p: { body: string }) => p.body)).toEqual(["team hello"]);
+  else expect(secret.isError).toBe(true);
+  expect(state()).toEqual(before);
   expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
   expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);
 });

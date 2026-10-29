@@ -388,7 +388,10 @@ export function getBoard(db: Database, name: string): Board | undefined {
 // A board you can't see reads as missing, so its existence doesn't leak.
 // Who a side-effect-free read is judged for: an address, or a predicate for a
 // reader that has none (an unbound hosted session, judged by its principal).
-export type Viewer = string | ((board: Board) => boolean);
+// A predicate has no subscriptions, cursors or pushes, so a read it judges
+// changes nothing.
+export type BoardPredicate = (board: Board) => boolean;
+export type Viewer = string | BoardPredicate;
 const sees = (db: Database, viewer: Viewer, b: Board): boolean =>
   typeof viewer === "string" ? access(db).canSee(viewer, b) : viewer(b);
 
@@ -468,9 +471,17 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 /**
  * The boards `handles` can see: each row is the view of the address
  * board_read without `as` would act as (boardAddress's "read"), so its mode
- * and unread count are that address's subscription's.
+ * and unread count are that address's subscription's. A predicate (an
+ * addressless reader) sees rows with no mode and nothing unread.
  */
-export function listBoards(db: Database, handles: string[]): BoardSummary[] {
+export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
+  if (typeof handles === "function") {
+    const rows = db.prepare(
+      `SELECT b.*, NULL AS mode, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts, 0 AS unread
+         FROM boards b ORDER BY b.name`,
+    ).all() as BoardSummary[];
+    return rows.filter(handles);
+  }
   const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
   for (const v of boardViews(db, handles, null)) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
   return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
@@ -1209,14 +1220,16 @@ export type ReadResult = { board: string; posts: Post[]; unread_remaining: numbe
 // (default 10: a reader with nothing unread is orienting, and a full page sits
 // in its context for the rest of the session).
 // With before_id: page back through history. With thread: the whole thread.
-// Advances your cursor to the newest post returned.
+// Advances your cursor to the newest post returned. A predicate viewer has
+// no cursor: it gets the latest page and changes nothing.
 export function read(
   db: Database,
-  handle: string,
+  viewer: Viewer,
   boardInput: string,
   opts: { limit?: number; before_id?: number; thread?: number } = {},
 ): ReadResult {
-  const board = visibleBoard(db, handle, boardInput).name;
+  const board = visibleBoard(db, viewer, boardInput).name;
+  const handle = typeof viewer === "string" ? viewer : null;
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   let posts: Post[];
 
@@ -1238,7 +1251,7 @@ export function read(
         .all(board, opts.before_id, limit) as Post[]
     ).reverse();
   } else {
-    const sub = db
+    const sub = handle === null ? undefined : db
       .prepare(`SELECT cursor FROM subscriptions WHERE board = ? AND handle = ?`)
       .get(board, handle) as { cursor: number } | undefined;
     posts = sub
@@ -1258,6 +1271,7 @@ export function read(
     }
   }
 
+  if (handle === null) return { board, posts: withAttachments(db, "post", posts), unread_remaining: 0 };
   const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
   if (maxId > 0) {
     db.prepare(
