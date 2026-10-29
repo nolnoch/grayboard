@@ -1,5 +1,5 @@
-// Published grayboard releases, for the upgrade tier: which tag came before
-// this tree, and that release's CLI and server binaries for this machine.
+// Published grayboard releases, for the upgrade tier and the mixed-version
+// tests: which tag came before this tree, and that release's CLI and server binaries for this machine.
 // Binaries are downloaded once into .e2e-cache/releases/<tag>/ and reused;
 // each, cached or fresh, must match the sha256 GitHub lists for the asset, so
 // a re-tagged release or a truncated file is fetched again, never trusted. A
@@ -46,7 +46,7 @@ function listAll(): Promise<Release[]> {
   return listed;
 }
 
-// Every published v1.x release at or above the floor, newest first.
+// Every published release at or above the floor, newest first.
 export async function releases(): Promise<string[]> {
   return (await listAll())
     .filter((x) => !x.draft && !x.prerelease && !newer(FLOOR, x.tag_name))
@@ -59,6 +59,14 @@ export async function releases(): Promise<string[]> {
 export async function latestRelease(): Promise<string> {
   const [tag] = await releases();
   if (!tag) throw new Error(`no release at or above ${FLOOR}`);
+  return tag;
+}
+
+// The newest 1.x release: the pre-#284 protocol and holding model, for the
+// mixed-version tests (a 1.x session or server beside this tree).
+export async function latestV1Release(): Promise<string> {
+  const tag = (await releases()).find((t) => t.startsWith("v1."));
+  if (!tag) throw new Error(`no v1.x release at or above ${FLOOR}`);
   return tag;
 }
 

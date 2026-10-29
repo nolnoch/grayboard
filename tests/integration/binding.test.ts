@@ -10,7 +10,7 @@ import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
-import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { crockford13 } from "../../src/core/session_id.ts";
@@ -214,7 +214,7 @@ test("6: a holder whose event loop is stopped keeps its name", async () => {
 
 let rel: ReleaseBinaries;
 beforeAll(async () => {
-  rel = await releaseBinaries(await latestRelease());
+  rel = await releaseBinaries(await latestV1Release());
 }, 120_000);
 
 test("7: a pre-upgrade session holding a name by socket alone keeps it", async () => {
