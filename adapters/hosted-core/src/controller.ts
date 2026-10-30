@@ -4,7 +4,7 @@ import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, stableID, type Lease } from "./model.js";
 import { SessionRoutes } from "./sessions.js";
 import { end, register } from "./children.js";
-import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Status } from "./diagnostics.js";
+import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Operation, type Status } from "./diagnostics.js";
 export type { Status } from "./diagnostics.js";
 
 export type Wait = (ms: number, signal: AbortSignal) => Promise<void>;
@@ -15,8 +15,9 @@ export type ControllerOptions = {
   // A name every new root binds before approval (OpenCode's plugin options).
   configured?: { name: string; create: boolean };
 };
-// A forwarded native tool call's outcome: the tool's parsed result object, or a failure.
-export type CallResult = { status: "completed"; output: unknown } | { status: "error" };
+// A forwarded native tool call's outcome, as a host reports it to afterCall:
+// the tool's parsed result object, or a failure.
+export type CallOutcome = { status: "completed"; output: unknown } | { status: "error" };
 // `admitted` holds `ownership:bind_gen:item` keys admitted but not yet
 // receipted, across reconnects in this process: a receipt failure goes straight
 // to the receipt on the next read instead of showing the item again. A key
@@ -69,11 +70,11 @@ export class Controller<E extends Enrollment = Enrollment> {
   private get hint() { return this.port.resumeHint; }
   status(): Status { return this.diagnostics.status(); }
   async flushDiagnostics() { await this.diagnostics.flush(); }
-  private set(r: Root<E>, state: string, message: string, operation = "delivery", code?: string) {
+  private set(r: Root<E>, state: string, message: string, operation: Operation = "delivery", code?: string) {
     this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), ...(code ? { code } : {}) });
     r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
   }
-  protected failure(operation: string, error: unknown, r?: Root<E>) {
+  protected failure(operation: Operation, error: unknown, r?: Root<E>) {
     this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...(r ? { sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}) } : {}), code: failureCode(error) });
   }
   protected record(input: Parameters<Diagnostics["record"]>[0]) { this.diagnostics.record(input); }
@@ -423,7 +424,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // Before a native call: a descendant registers under its root first; a root's
   // own bind stops delivery until afterCall reconciles it.
-  async beforeCall(event: { sessionID: string; tool: string }) {
+  async beforeCall(event: { sessionID: string; tool: string }): Promise<void> {
     const path = await this.path(event.sessionID), r = this.roots.get(path.root);
     if (path.root !== event.sessionID) {
       const e = r?.e ?? await this.port.credential.capture(path.root);
@@ -439,7 +440,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // After a native call: a bind result restarts delivery under the new name; an
   // `unbound` result from any tool rebinds the remembered name.
-  async afterCall(event: { sessionID: string; tool: string; result: CallResult }) {
+  async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       if (!r || r.paused || this.drifted || this.stopped) return;
@@ -490,7 +491,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch(error => this.failure("child_end", error, r));
     }
   }
-  backgroundFailure(operation: "event" | "stream" | "restore" | "enroll" | "after" | "hook_dispose" | "rpc_dispose") {
+  // A host's failure outside any call result (the tool proxy's `report`).
+  backgroundFailure(operation: Extract<Operation, "event" | "stream" | "restore" | "enroll" | "after" | "hook_dispose" | "rpc_dispose" | "release_upload">) {
     this.failure(operation, undefined);
   }
   async close() {

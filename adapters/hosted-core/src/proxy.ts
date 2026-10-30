@@ -7,6 +7,8 @@
 import { SdkError, SdkErrorCode, SdkHttpError, UnauthorizedError, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import snapshot from "./native-tools.json" with { type: "json" };
+import type { CallOutcome, Controller } from "./controller.js";
+import type { Operation } from "./diagnostics.js";
 import { AccessExpired, accessExpiry, same } from "./model.js";
 import { InsufficientScope, NativeWire, ServerUnreachable, unreachable, type WireOptions } from "./wire.js";
 import {
@@ -24,13 +26,9 @@ const NativeToolSchema = z.strictObject({
 });
 // One tool as the server lists it, reduced to what a host registers.
 export type NativeTool = z.infer<typeof NativeToolSchema>;
-export type CallOutcome = { status: "completed"; output: unknown } | { status: "error" };
 // The Controller's tool hooks (beforeCall/afterCall): the server's bind,
 // unbind and `unbound` results drive its stop/prepare exactly as in OpenCode.
-export interface CallHooks {
-  beforeCall(call: { sessionID: string; tool: string }): Promise<void>;
-  afterCall(call: { sessionID: string; tool: string; result: CallOutcome }): Promise<void>;
-}
+export type CallHooks = Pick<Controller, "beforeCall" | "afterCall">;
 export type ProxyOptions = {
   // The hosted MCP endpoint (`url`), this harness's session key, client and
   // delivery declaration; NativeWire sends the last two in every `_meta`.
@@ -41,9 +39,10 @@ export type ProxyOptions = {
   // until login; onUnauthorized runs once per 401, then the request is retried.
   auth: AuthProvider;
   hooks?: CallHooks;
-  // A failure the call's result can't carry: an afterCall that threw, or an
-  // upload a failed send couldn't release (it expires on its own).
-  report(operation: "after_call" | "release_upload", error: unknown): void;
+  // A failure the call's result can't carry: an afterCall that threw
+  // (`after`), or an upload a failed send couldn't release (it expires on its
+  // own). Names from the diagnostics allowlist.
+  report(operation: Extract<Operation, "after" | "release_upload">, error: unknown): void;
   // The tool list changed (a new native connection reached another server
   // version): the adapter re-registers.
   onTools?(tools: NativeTool[]): void;
@@ -164,7 +163,7 @@ export class ToolProxy {
       // A bind or unbind changes what the server's instructions say.
       if (name === "bind" || name === "unbind") this.instructionsBySession.delete(sessionID);
       try { await this.options.hooks?.afterCall({ sessionID, tool: name, result: outcome }); }
-      catch (error) { this.options.report("after_call", error); }
+      catch (error) { this.options.report("after", error); }
     }
   }
 
