@@ -28,8 +28,11 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // to the receipt on the next read instead of showing the item again. A key
 // joins as soon as the host accepted the item, before the post-admission renew
 // and guard, so a renew that fails (an outage, a lost lease, this Controller's
-// own stop) never shows it twice. A new lease under another ownership or
-// bind_gen has another key, so it admits the item again.
+// own stop) never shows it twice. An admitted key skips only the admission: the
+// pre-admission renew still proves the current lease first, so a lease that
+// can't renew never receipts (it spends the item's attempt budget instead). A
+// new lease under another ownership or bind_gen has another key, so it admits
+// the item again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
 function sleep(ms: number, signal: AbortSignal) {
@@ -308,9 +311,9 @@ export class Controller<E extends Enrollment = Enrollment> {
                 if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity) throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
-                if (r.admitted.has(key)) { inItem = false; return; }
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
+                if (r.admitted.has(key)) { inItem = false; return; }
                 await this.port.admit(e, item, stableID(e, item.id, lease.identity));
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);

@@ -21,7 +21,7 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
@@ -52,7 +52,10 @@ function runtime(mode: Mode) {
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
       }
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
-      if (name === "delivery_renew" && ++renews === renewFault?.at) { renewFault.then?.(); throw renewFault.error(); }
+      if (name === "delivery_renew") {
+        if (++renews === renewFault?.at) { renewFault.then?.(); throw renewFault.error(); }
+        if (renews >= renewsLostFrom) throw new LeaseUnavailable();
+      }
       if (name === "delivery_receipt") {
         if (failReceipt > 0) { failReceipt--; throw new Error("receipt lost"); }
         batches.set(this.sessionID, (batches.get(this.sessionID) ?? []).filter(item => !(args.ids as string[]).includes(item.id)));
@@ -97,6 +100,8 @@ function runtime(mode: Mode) {
     refreshBusy: (n: number) => { refreshBusy = n; },
     // The nth delivery_renew throws `error` once, after running `then`.
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
+    // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
+    loseRenewsFrom: (at: number) => { renewsLostFrom = at; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
 }
@@ -301,6 +306,24 @@ test.each(modes)("a post-admission renew that loses the lease: the next lease of
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
     expect(r.named("delivery_open")).toHaveLength(2);
   } finally { await r.controller.close(); }
+});
+
+// The real-host expiry case: an admitted key skips only the admission, so a
+// lease that can never renew spends the item's attempt budget and never
+// receipts the admission it couldn't prove.
+test.each(modes)("a lease that can't renew after admission never receipts it and stops at the attempt budget (%s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ wait: async () => {} });
+  try {
+    r.loseRenewsFrom(2);
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", "be", true);
+    await until(() => r.root(c)?.state === "paused", 10_000);
+    expect(r.root(c)?.message).toStartWith("Retry limit reached for direct:1; item remains unreceipted");
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+    expect(r.named("delivery_receipt")).toEqual([]);
+    expect(r.batches.get("R")).toHaveLength(1);
+  } finally { await c.close(); await r.controller.close(); }
 });
 
 test.each(modes)("a lease lost after admission whose next lease has a new bind_gen admits the item again under it (%s)", async mode => {
