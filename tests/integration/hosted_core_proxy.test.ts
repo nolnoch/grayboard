@@ -9,14 +9,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
+import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import { hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type CallOutcome, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
-import { ATTACHMENTS_PARAM, attachRoots } from "../../src/shared/attachments.ts";
+import { ATTACHMENT_LIMITS_CAPABILITY, ATTACHMENTS_PARAM, attachRoots, publishedLimits } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
@@ -294,6 +294,45 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   expect(outside.isError).toBe(true);
   expect(textOf(outside)).toStartWith("error: attachment ");
   expect(sender.reports).toEqual([]);
+});
+
+test("uploads are checked against the server's published caps; a server that publishes none gets the defaults", async () => {
+  await srv.stop();
+  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
+  const alice = issue("alice@example.com");
+  const p = proxy({ token: async () => alice.token });
+  await p.call("bind", { name: "proxy-caps", create: true }, "pi-caps");
+  writeFileSync(join(dir, "big.txt"), "twenty bytes long!!\n");
+  const fetch0 = globalThis.fetch;
+  let uploads = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "POST" && String(input).includes("/mcp/attachments")) uploads++;
+    return fetch0(input, init);
+  }) as typeof fetch;
+  // hosted-core resolves its own copy of the SDK: patch the Client its wire uses.
+  const HostedClient = Object.getPrototypeOf(new NativeWire({ url: `${srv.base}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" } }, { token: async () => undefined }, AbortSignal.abort()).client) as Client;
+  const capabilities = HostedClient.getServerCapabilities;
+  try {
+    // Published: the 16-byte cap refuses the file before any byte leaves the host.
+    const local = await p.call("dm_send", { to: "alice@example.com/proxy-caps", body: "big", attachments: [join(dir, "big.txt")] }, "pi-caps");
+    expect(local).toEqual({ content: [{ type: "text", text: `error: attachment ${join(dir, "big.txt")}: 20B exceeds the 16B limit per file` }], isError: true });
+    expect(uploads).toBe(0);
+    // None published (an older server): the defaults let it through, and the server's own cap refuses the upload.
+    HostedClient.getServerCapabilities = function (this: Client) {
+      const { experimental: _, ...rest } = capabilities.call(this) ?? {};
+      return rest;
+    };
+    await p.connect();
+    const remote = await p.call("dm_send", { to: "alice@example.com/proxy-caps", body: "big", attachments: [join(dir, "big.txt")] }, "pi-caps");
+    expect(remote).toEqual({ content: [{ type: "text", text: "error: file big.txt: 20B exceeds the 16B limit per file" }], isError: true });
+    expect(uploads).toBe(1);
+  } finally {
+    globalThis.fetch = fetch0;
+    HostedClient.getServerCapabilities = capabilities;
+  }
+  expect(srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments").get()!.n).toBe(0);
+  expect(() => publishedLimits({ [ATTACHMENT_LIMITS_CAPABILITY]: { file: 0, total: 32 } })).toThrow(`Invalid ${ATTACHMENT_LIMITS_CAPABILITY} capability from the server`);
+  expect(publishedLimits({})).toBeUndefined();
 });
 
 test("an attachment request refused with 401 runs the credential's onUnauthorized once, then retries", async () => {

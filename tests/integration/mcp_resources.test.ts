@@ -13,6 +13,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-c
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { PROTO } from "../../src/shared/protocol.ts";
+import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
 let app: ReturnType<typeof startServer>;
@@ -79,7 +80,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   const native = await connect(grant.token, version);
   expect(native.client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
   expect(native.client.getServerCapabilities()?.tools?.listChanged).toBe(false);
-  expect(native.client.getServerCapabilities()).not.toHaveProperty("experimental");
+  expect(native.client.getServerCapabilities()?.experimental).toEqual({ [ATTACHMENT_LIMITS_CAPABILITY]: DEFAULT_ATTACHMENT_LIMITS });
   expect((await native.client.listTools()).tools.some(t => t.name.startsWith("delivery_"))).toBe(false);
   await expect(call(native.client, "delivery_open")).rejects.toThrow("not found");
   expect((await native.client.listResourceTemplates()).resourceTemplates).toEqual([]);

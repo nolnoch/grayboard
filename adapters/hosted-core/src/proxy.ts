@@ -10,8 +10,8 @@ import snapshot from "./native-tools.json" with { type: "json" };
 import { AccessExpired, accessExpiry, same } from "./model.js";
 import { InsufficientScope, NativeWire, ServerUnreachable, unreachable, type WireOptions } from "./wire.js";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, downloadAttachment, readAttachmentFiles, saveTarget,
-  sendWithUploads, SendLanded, serverBusDir, type AttachmentTransport,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, downloadAttachment, publishedLimits, readAttachmentFiles, saveTarget,
+  sendWithUploads, SendLanded, serverBusDir, type AttachmentLimits, type AttachmentTransport,
 } from "../../../src/shared/attachments.ts";
 import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
@@ -220,12 +220,20 @@ export class ToolProxy {
     }
   }
 
+  // The server's attachment caps, published as a capability of the shared
+  // connection; a server older than #430 publishes none, and gets the
+  // shared defaults its own config also starts from.
+  private async limits(): Promise<AttachmentLimits> {
+    const wire = await (this.native ?? this.open()).ready;
+    return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
+  }
+
   // Reads and checks the files an agent named (all before any is sent), then
   // uploads them for this session and calls the tool with their ids.
   private async withUploads(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     const { attachments, ...rest } = args;
     try {
-      const files = await readAttachmentFiles(attachments, this.roots, { limits: DEFAULT_ATTACHMENT_LIMITS });
+      const files = await readAttachmentFiles(attachments, this.roots, { limits: await this.limits() });
       return await sendWithUploads(files, this.transport(sessionID), async ids => {
         const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
         if (result.isError) throw new Refused(result);
@@ -245,7 +253,7 @@ export class ToolProxy {
     try {
       const id = checkAttachmentId(args.id);
       const target = await saveTarget(args.dir, this.roots, serverBusDir(this.resource.href), this.options.env);
-      return text(await downloadAttachment(id, target, DEFAULT_ATTACHMENT_LIMITS.file, this.transport(sessionID)));
+      return text(await downloadAttachment(id, target, (await this.limits()).file, this.transport(sessionID)));
     } catch (error) {
       if (this.transportFailure(error)) throw error;
       return failure((error as Error).message);

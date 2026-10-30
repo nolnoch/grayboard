@@ -12,9 +12,22 @@ import { sha256Hex } from "./hash.ts";
 
 export const MAX_ATTACHMENTS = 5;
 // Size caps per file and per message or post. A server sets its own
-// (src/server/config.ts) and tells clients in hello_ok; local mode uses these.
+// (src/server/config.ts) and tells clients in hello_ok and, on the hosted MCP
+// endpoint, as an experimental server capability; local mode uses these.
 export type AttachmentLimits = { file: number; total: number };
 export const DEFAULT_ATTACHMENT_LIMITS: AttachmentLimits = { file: 10 * 1024 * 1024, total: 25 * 1024 * 1024 };
+export const ATTACHMENT_LIMITS_CAPABILITY = "io.github.nolnoch.grayboard/attachments";
+// The caps under ATTACHMENT_LIMITS_CAPABILITY in a server's capabilities;
+// undefined when it publishes none (a server older than #430).
+export function publishedLimits(experimental: Record<string, unknown> | undefined): AttachmentLimits | undefined {
+  if (!experimental || !(ATTACHMENT_LIMITS_CAPABILITY in experimental)) return undefined;
+  const value = experimental[ATTACHMENT_LIMITS_CAPABILITY] as { file?: unknown; total?: unknown } | null;
+  const file = value?.file, total = value?.total;
+  if (typeof file !== "number" || typeof total !== "number" || !Number.isSafeInteger(file) || !Number.isSafeInteger(total) || file <= 0 || file > total) {
+    throw new Error(`Invalid ${ATTACHMENT_LIMITS_CAPABILITY} capability from the server`);
+  }
+  return { file, total };
+}
 // An upload no message or post claimed within this long is dropped.
 export const UNBOUND_TTL_MS = 3_600_000;
 // How many bytes of unsent uploads one user may hold on a server at a time.
