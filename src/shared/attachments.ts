@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, extname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import { CoreError, TooLargeError } from "../core/errors.ts";
+import { sha256Hex } from "./hash.ts";
 
 export const MAX_ATTACHMENTS = 5;
 // Size caps per file and per message or post. A server sets its own
@@ -309,6 +310,86 @@ export async function saveTarget(
 // <id>-<filename>, readable only by this user.
 export function saveAttachment(a: AttachmentInfo, data: Uint8Array, target: string): Promise<string> {
   return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
+}
+
+// The routes a session's attachments travel: server mode's HTTP API
+// (`/api/attachments?as=`, src/plugin/mcp.ts) or a hosted MCP endpoint's
+// (`<resource>/attachments` with X-Grayboard-Session,
+// adapters/hosted-core/src/proxy.ts). Errors are the transport's own.
+export interface AttachmentTransport {
+  // Stores one unsent upload and returns its id.
+  upload(file: AttachmentFile): Promise<number>;
+  // Drops an unsent upload. False when the server holds no unsent upload by
+  // that id (404): the send it was for bound it after all.
+  release(id: number): Promise<boolean>;
+  // The stored bytes and the server's headers (Repr-Digest,
+  // Content-Disposition, Content-Type); `maxBytes` sizes the deadline.
+  download(id: number, maxBytes: number): Promise<{ headers: Headers; data: Uint8Array }>;
+  // A release that failed for any other reason: the upload expires on its own
+  // (UNBOUND_TTL_MS), so this only reports it.
+  unreleased(id: number, error: Error): void;
+}
+
+// Uploads the checked files (readAttachmentFiles) and runs `send` with their
+// ids; the server checks them again and binds them to that dm_send or
+// board_post. If any upload or the send fails, the ones made are released,
+// so a refused send doesn't hold the user's unsent quota.
+export async function sendWithUploads<T>(files: AttachmentFile[], transport: AttachmentTransport, send: (ids: number[]) => Promise<T>): Promise<T> {
+  const ids: number[] = [];
+  let sent = false;
+  try {
+    for (const f of files) ids.push(await transport.upload(f));
+    sent = true;
+    return await send(ids);
+  } catch (e) {
+    const landed = await releaseUploads(transport, ids);
+    // A send binds all its files in one transaction or none: if every one is
+    // bound, the send landed and only its answer was lost.
+    if (sent && ids.length && landed === ids.length) throw new SendLanded(ids, e as Error);
+    throw e;
+  }
+}
+
+// Releases uploads a failed send left unbound. Returns how many the server
+// says are no longer unsent: bound after all (the answer was lost, not the send).
+async function releaseUploads(transport: AttachmentTransport, ids: number[]): Promise<number> {
+  let bound = 0;
+  for (const id of ids) {
+    try {
+      if (!(await transport.release(id))) bound++;
+    } catch (e) {
+      transport.unreleased(id, e as Error);
+    }
+  }
+  return bound;
+}
+
+// A send whose answer was lost, though the server bound its attachments.
+export class SendLanded extends Error {
+  constructor(readonly attachments: number[], cause: Error) {
+    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`);
+  }
+}
+
+// What attachment_get answers: where the file went and what it is.
+export type SavedAttachment = { path: string; filename: string; type: string; size: number; sha256: string };
+
+// attachment_get's download into `target` (from saveTarget). The bytes are
+// checked before anything is saved: they must be the ones the server stored.
+export async function downloadAttachment(id: number, target: string, maxBytes: number, transport: Pick<AttachmentTransport, "download">): Promise<SavedAttachment> {
+  const { headers, data } = await transport.download(id, maxBytes);
+  const sha256 = sha256Hex(data);
+  // A missing digest is a mismatch: every 2.x server sends one.
+  if (digestSha256(headers.get("repr-digest")) !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
+  const info = {
+    id,
+    filename: dispositionFilename(headers.get("content-disposition")) ?? "file",
+    type: headers.get("content-type") ?? "application/octet-stream",
+    size: data.length,
+    sha256,
+  };
+  const path = await saveAttachment(info, data, target);
+  return { path, filename: info.filename, type: info.type, size: info.size, sha256 };
 }
 
 const MAX_NAME_TRIES = 100;
