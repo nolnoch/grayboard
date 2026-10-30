@@ -30,13 +30,13 @@ bun -e 'const p = await Bun.file(process.argv[1]).json(); console.log(JSON.strin
 cd "$package"
 case "${1:-}" in
   strict)
-    # hosted-core, and opencode-v2's generated copy of it (#430).
-    (cd "$root/adapters/hosted-core" && bun install --frozen-lockfile && bun run typecheck && bun run test)
-    (cd "$root" && bun test tests/integration/hosted_core_sync.test.ts)
     bun install --frozen-lockfile
     bun run typecheck
     bun run test --reporter=junit --reporter-outfile="$GRAYBOARD_E2E_RUN_DIR/unit.xml" tests/reload-state.test.ts
     bun run build:package
+    # hosted-core, and opencode-v2's generated copy of it (#430).
+    (cd "$root/adapters/hosted-core" && bun install --frozen-lockfile && bun run typecheck && bun run test)
+    (cd "$root" && bun test tests/integration/hosted_core_sync.test.ts)
     ;;
   git) bun run test:git ;;
   host) bun run test:host ;;

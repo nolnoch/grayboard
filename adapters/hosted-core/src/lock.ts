@@ -26,7 +26,10 @@ export function tryAcquire(path: string): Lock | undefined {
   if (held.has(file)) return undefined;
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA busy_timeout=0");
+    // Not 0: two openers racing BEGIN EXCLUSIVE both take SHARED, and with no
+    // busy wait the one holding PENDING gives up too, so both report BUSY and
+    // neither holds the lock. A short wait lets the loser drop SHARED first.
+    db.exec("PRAGMA busy_timeout=50");
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
