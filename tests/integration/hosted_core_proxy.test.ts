@@ -9,7 +9,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
+import { SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import { hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type CallOutcome, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
@@ -171,6 +171,49 @@ test("each new native connection re-lists the tools; a changed list reaches the 
     await p.connect();
     expect(changed).toEqual([hostTools(snapshotTools()).map(t => t.name).filter(n => n !== "dm_retract")]);
   } finally {
+    NativeWire.prototype.listTools = list;
+    NativeWire.prototype.callTool = call;
+  }
+});
+
+test("a call's own failure leaves the shared connection to the calls in flight on it; a transport failure replaces it", async () => {
+  const { token } = issue();
+  const p = proxy({ token: async () => token });
+  const list = NativeWire.prototype.listTools, call = NativeWire.prototype.callTool, fetch0 = globalThis.fetch;
+  let lists = 0, fail: Error | undefined;
+  NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
+  NativeWire.prototype.callTool = async function (...args) {
+    const error = args[0] === "whoami" ? fail : undefined;
+    if (error) { fail = undefined; throw error; }
+    return call.apply(this, args);
+  };
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  const { promise: held, resolve: release } = Promise.withResolvers<void>();
+  // A board_list request held at the network: in flight on the shared connection.
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (input instanceof Request && input.method === "POST" && (await input.clone().text()).includes(`"name":"board_list"`)) { entered(); await held; }
+    return fetch0(input, init);
+  }) as typeof fetch;
+  try {
+    await p.call("bind", { name: "proxy-flight", create: true }, "pi-root");
+    expect(lists).toBe(1);
+    const inFlight = p.call("board_list", {}, "pi-root");
+    await reached;
+    // A JSON-RPC error (an unknown tool), then a request that timed out.
+    await expect(p.call("no_such_tool", {}, "pi-root")).rejects.toThrow();
+    fail = new ServerUnreachable(new SdkError(SdkErrorCode.RequestTimeout, "Request timed out"));
+    await expect(p.call("whoami", {}, "pi-root")).rejects.toBeInstanceOf(ServerUnreachable);
+    release();
+    expect((await inFlight).isError).toBeFalsy();
+    expect(lists).toBe(1);
+    // A broken transport retires it: the next call opens and lists a new one.
+    fail = new ServerUnreachable(new Error("fixture outage"));
+    await expect(p.call("whoami", {}, "pi-root")).rejects.toBeInstanceOf(ServerUnreachable);
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ name: "proxy-flight" });
+    expect(lists).toBe(2);
+  } finally {
+    release();
+    globalThis.fetch = fetch0;
     NativeWire.prototype.listTools = list;
     NativeWire.prototype.callTool = call;
   }

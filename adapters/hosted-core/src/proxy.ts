@@ -4,7 +4,7 @@
 // local attachments, and each session's instructions. Every `/mcp` request
 // needs a bearer (src/server/mcp.ts), so before login the snapshot is all an
 // adapter can register, and a call returns one error naming the login action.
-import { SdkHttpError, UnauthorizedError, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
+import { SdkError, SdkErrorCode, SdkHttpError, UnauthorizedError, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import snapshot from "./native-tools.json" with { type: "json" };
 import { AccessExpired, accessExpiry, same } from "./model.js";
@@ -95,6 +95,16 @@ export class AttachmentRefused extends Error {
 // and its result returned as is.
 class Refused extends Error {
   constructor(readonly result: CallToolResult) { super("tool call refused"); }
+}
+// The wire classified the failure as the transport's (a closed connection, a
+// network error, a gateway 502-504), not a request that ran out of time on a
+// working connection.
+function broken(error: unknown): boolean {
+  if (!(error instanceof ServerUnreachable)) return false;
+  for (let e: unknown = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) return false;
+  }
+  return true;
 }
 
 export class ToolProxy {
@@ -193,11 +203,18 @@ export class ToolProxy {
     return this.forward(name, args, sessionID);
   }
 
+  // Only a broken transport retires the shared connection, and only while it
+  // is still the current one: a tool or JSON-RPC error, a request timeout, a
+  // 429, a 401 or 403 leaves it to the other calls in flight on it, which
+  // closing it would abort (a committed dm_send would then read as unreachable).
   private async forward(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     const native = this.native ?? this.open();
     const wire = await native.ready;
     try { return await wire.callTool(name, args, sessionID); }
-    catch (error) { this.drop(native); throw error; }
+    catch (error) {
+      if (broken(error)) this.drop(native);
+      throw error;
+    }
   }
 
   // Reads and checks the files an agent named (all before any is sent), then
@@ -322,8 +339,8 @@ export class ToolProxy {
   }
 
   private drop(native: { ready: Promise<NativeWire> } | undefined) {
-    if (!native) return;
-    if (this.native === native) this.native = undefined;
+    if (!native || this.native !== native) return;
+    this.native = undefined;
     void native.ready.then(wire => wire.close(), () => {});
   }
 
