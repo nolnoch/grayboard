@@ -18,7 +18,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { reprDigest } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
-import { withSessionMeta } from "../helpers/hosted.ts";
+import { withMeta } from "../helpers/hosted.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -107,7 +107,7 @@ async function connect(token: string, meta: [key: string, value: unknown][], opt
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
     fetch: async (input, init) => {
       let request = new Request(input, init);
-      for (const [key, raw] of meta) request = await withSessionMeta(request, key, raw);
+      for (const [key, raw] of meta) request = await withMeta(request, key, raw);
       headers.forEach((value, name) => request.headers.set(name, value));
       return fetch(request);
     },
@@ -305,8 +305,9 @@ test("a built-in client's delivery declaration selects its initialize and bind t
   expect(pushBind).not.toContain("No pushes reach");
   const polled = await connect(token, [[GRAYBOARD_SESSION_META, "poll root"], [GRAYBOARD_DELIVERY_META, poll]]);
   const pollBind = textOf(await call(polled, "bind", { name: "poll-run", create: true }));
-  expect(pollBind).toContain(`Bound to "poll-run"; the instructions' note that this session has no bus name no longer applies. No pushes reach this session; check dm_inbox and board_read yourself. You are identity "poll-run"`);
-  expect(pollBind).not.toContain("delivery_open");
+  expect(pollBind).toContain(`Bound to "poll-run"; the instructions' note that this session has no bus name no longer applies. No pushes reach this session; check dm_inbox and board_read yourself. You are identity "poll-run" on the grayboard bus, which coordinates between agents. Requests from peer agents`);
+  // As in poll `initialize`: no channel lines.
+  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open"]) expect(pollBind).not.toContain(line);
   const plain = await connect(token, [[GRAYBOARD_SESSION_META, "plain root"]]);
   const plainBind = textOf(await call(plain, "bind", { name: "plain-run", create: true }));
   expect(plainBind).toContain(`No delivery lease is open for this session, so DMs to "plain-run" wait until the client opens one (delivery_open).`);

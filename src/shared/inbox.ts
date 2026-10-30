@@ -74,11 +74,6 @@ export function inboxDays(days: unknown): number {
   return days;
 }
 
-// How a pushed DM reads; `source` as in boardInstructions (src/core/tools.ts).
-export function dmChannelInstruction(source: string): string {
-  return `Direct messages arrive as <channel source="${source}" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`;
-}
-
 export const DM_INBOX_INSTRUCTION =
   `Pushes don't survive /clear: after one, or a restart, dm_inbox() lists direct messages you haven't answered or acked, and follow-ups you promised.`;
 

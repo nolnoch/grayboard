@@ -45,5 +45,9 @@ export interface OAuthStore {
   revokeToken(tokenHash: string, clientId: string, now: number): void;
   findActiveAccess(tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
   isGrantActive(grantId: string, now: number): boolean;
+  // Once per database (#429): revokes every unrevoked grant, and drops every unredeemed code,
+  // under `clientIds` (the built-ins), audits each grant, then records the cutover so grants
+  // the built-ins issue later survive restarts. Returns the grants revoked; 0 after the first run.
+  revokePreBuiltinGrants(clientIds: readonly string[], now: number): number;
   cleanup(now: number): void;
 }

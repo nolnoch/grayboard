@@ -3,8 +3,7 @@ import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { asSessionId, boundInstructions, describeCandidate, type Candidate } from "../core/bindings.ts";
-import { boardInstructions, ownHumanInstruction } from "../core/tools.ts";
-import { DM_INBOX_INSTRUCTION, dmChannelInstruction } from "../shared/inbox.ts";
+import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
@@ -39,10 +38,10 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
 // `initialize` and bind results describe that delivery with the client's own channel
 // source. Text only: it grants and authorizes nothing, so nothing audits it. Other
 // clients' declarations are never read, so OpenCode's text can't change.
-export type Delivery = { mode: "push" | "poll"; source: string };
+export type DeclaredDelivery = { mode: "push" | "poll"; source: string };
 const DELIVERY_SOURCE = /^[a-z0-9][a-z0-9:._-]{0,63}$/;
 const DELIVERY = z.strictObject({ mode: z.enum(["push", "poll"]), source: z.string().regex(DELIVERY_SOURCE) });
-export function deliveryDeclaration(principal: OAuthPrincipal, meta: unknown): Delivery | undefined {
+export function deliveryDeclaration(principal: OAuthPrincipal, meta: unknown): DeclaredDelivery | undefined {
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_DELIVERY_META in meta)) return undefined;
   const raw = meta[GRAYBOARD_DELIVERY_META];
   const parsed = DELIVERY.safeParse(raw);
@@ -61,11 +60,11 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
 }
 // A bound native session's `initialize` text. Without a push declaration it assumes a
 // polling client, so the channel lines don't apply.
-export function hostedBoundInstruction(info: IdentityInfo, delivery?: Delivery): string {
+export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery): string {
   return [
-    ...(delivery?.mode === "push"
-      ? [`You are "${info.identity_full}" on grayboard.`, dmChannelInstruction(delivery.source), DM_INBOX_INSTRUCTION, ...boardInstructions(delivery.source)]
-      : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, ...(delivery ? [POLL_NOTE] : []), ...boardInstructions("grayboard").slice(1)]),
+    ...(declared?.mode === "push"
+      ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared.source)]
+      : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, ...(declared ? [POLL_NOTE] : []), ...COORDINATION_INSTRUCTIONS]),
     ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
     ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
   ].join(" ");
@@ -344,8 +343,8 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(!root?.name ? { unbound: true, candidates: application.hostedCandidates(p.authed) } : {}) };
       });
     },
-    // `delivery`: the native request's declaration (deliveryDeclaration); text only.
-    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; where?: string }, delivery?: Delivery) {
+    // `declared`: the native request's declaration (deliveryDeclaration); text only.
+    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeIdentityName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
       const name = normalized.name;
@@ -384,10 +383,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         }
         throw error;
       });
-      // A push client opens delivery right after bind and reports it itself if it can't.
-      const note = !delivery ? [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the client opens one (delivery_open).`] : delivery.mode === "poll" ? [POLL_NOTE] : [];
+      // A push client opens delivery right after bind and reports it itself if it can't. A
+      // poll session gets no channel lines, as in its `initialize` text.
+      const note = !declared ? [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
+      const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const response = hostedBindOk(result.name, result.previous, result.moved,
-        general => boundInstructions(result.name, delivery?.source ?? "grayboard", general, () => [], []), note);
+        general => boundInstructions(result.name, source, general, () => [], []), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     async register(p: OAuthPrincipal, context: SessionContext, child: string, via: string[] = []) {

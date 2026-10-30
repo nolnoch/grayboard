@@ -239,6 +239,38 @@ test("an operator client reusing a built-in ID stops the OAuth server from start
   service = makeService();
 });
 
+test("the first start with built-in clients revokes the grants and codes an operator client left under their IDs, once", async () => {
+  const scope = "grayboard:delivery grayboard:tools";
+  // A database from before #429: an operator client named grayboard-pi left a grant and an
+  // unredeemed code, and no cutover is recorded.
+  const old = await redeem(await issue("grayboard-pi", scope)), oldPrincipal = principal(old);
+  const pending = await issue("grayboard-pi", scope);
+  const unrelated = principal(await redeem(await issue()));
+  storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients'");
+  const audit = () => storage.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'oauth.builtin_client_grant_revoked'").all();
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  const revokedLines = () => log.mock.calls.filter(([line]) => String(line).includes("issued under a built-in client ID"));
+  try {
+    service.close();
+    // A refused config changes nothing: the cutover runs only once the clients parse.
+    expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [{ ...registrations[0]!, clientId: "grayboard-pi" }] })).toThrow("reserved for a built-in client");
+    expect([storage.repo.oauth.isGrantActive(oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
+    service = makeService();
+    expect(revokedLines().map(([line]) => line)).toEqual([expect.stringContaining("revoked 1 OAuth grant(s)")]);
+    expect(audit()).toEqual([{ actor: "you@example.com", target: oldPrincipal.grantId, detail: JSON.stringify({ client_id: "grayboard-pi" }) }]);
+    expect(service.isAuthorized(oldPrincipal)).toBe(false);
+    expect((await post("/oauth/token", { grant_type: "refresh_token", client_id: "grayboard-pi", refresh_token: old.refresh_token })).status).toBe(400);
+    expect((await post("/oauth/token", tokenParams(pending))).status).toBe(400);
+    expect(service.isAuthorized(unrelated)).toBe(true);
+    // From then on a grant under a built-in ID is the built-in's: later starts keep it.
+    const fresh = await redeem(await issue("grayboard-omp", scope));
+    for (let i = 0; i < 2; i++) { service.close(); service = makeService(); }
+    expect([revokedLines().length, audit().length]).toEqual([1, 1]);
+    expect(service.isAuthorized(principal(fresh))).toBe(true);
+    expect((await post("/oauth/token", { grant_type: "refresh_token", client_id: "grayboard-omp", refresh_token: fresh.refresh_token })).status).toBe(200);
+  } finally { log.mockRestore(); }
+});
+
 test("preregistered clients retain the explicit manual callback flow", async () => {
   service.close();
   const redirectUri = base + "/oauth/callback/complete";

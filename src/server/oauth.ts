@@ -101,6 +101,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Built-ins first; parseOAuthClients refuses an operator entry that reuses a built-in ID.
   const clients = new Map([...BUILTIN_CLIENTS, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
+  // Before any request, and only once the config parsed: a grant an operator client issued
+  // under a now-built-in ID (before #429) would otherwise act as a built-in's.
+  const revoked = repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now());
+  if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
   const cimd = createCimdResolver({ ...options.cimd, now });
   const resolveClient = async (id: string) => {
     const manual = clients.get(id);

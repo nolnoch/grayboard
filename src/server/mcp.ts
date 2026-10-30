@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { AS_PARAM, boardTools } from "../core/tools.ts";
+import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
@@ -10,7 +10,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedUnboundInstruction, sessionContext, type Delivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedUnboundInstruction, sessionContext, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -27,8 +27,8 @@ const id = z.number().int().positive();
 const ids = z.array(id);
 const attachmentIds = ids.describe("IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.");
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
-// `delivery`: the native request's declared delivery (#429), for text only.
-type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; delivery?: Delivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
+// `declared`: the native request's declared delivery (#429), for text only.
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
 type Legacy = { meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
@@ -110,10 +110,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (exchange) exchange.logged = true;
     console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error) })}`);
   };
-  const logRefusal = (reason: string, exchange: Exchange) => {
+  const logRefusal = (reason: string, exchange: Exchange, detail: Record<string, unknown> = {}) => {
     refusalLogs.sweep();
     if (refusalLogs.size >= 4096 || !refusalLogs.take(exchange.address).ok) return;
-    console.error(`[grayboard] hosted MCP refused: ${JSON.stringify({ reason, address: exchange.address, origin: diagnosticOrigin(exchange.request.headers.get("Origin")), public_origin: trustedOrigin, principal: exchange.principal, identity: exchange.identity, protocol: exchange.protocol })}`);
+    console.error(`[grayboard] hosted MCP refused: ${JSON.stringify({ reason, address: exchange.address, origin: diagnosticOrigin(exchange.request.headers.get("Origin")), public_origin: trustedOrigin, principal: exchange.principal, identity: exchange.identity, protocol: exchange.protocol, ...detail })}`);
   };
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
@@ -143,13 +143,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (principal instanceof Response) return refuse(principal);
     const meta = exchanges.getStore()?.meta;
     const routing = sessionContext(principal, meta);
-    let delivery: Delivery | undefined;
+    let declared: DeclaredDelivery | undefined;
     // Native requests only, before admission: the subscriber role ignores the declaration.
-    try { delivery = role === "native" ? deliveryDeclaration(principal, meta) : undefined; }
+    try { declared = role === "native" ? deliveryDeclaration(principal, meta) : undefined; }
     catch (error) {
       if (!(error instanceof ApplicationError)) throw error;
       const exchange = exchanges.getStore();
-      if (exchange) logRefusal("delivery_declaration", exchange);
+      if (exchange) {
+        exchange.principal = principal.authed.user_id;
+        logRefusal("delivery_declaration", exchange, { client_id: principal.clientId });
+      }
       return refuse(Response.json({ code: error.code, message: error.message }, { status: 400 }));
     }
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
@@ -173,7 +176,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       report(error, "hosted-admission");
       throw error;
     }
-    const context: Context = { request, principal, sessionContext: routing, delivery, role, ...selected, finish() {
+    const context: Context = { request, principal, sessionContext: routing, declared, role, ...selected, finish() {
       if (!contexts.delete(context)) return;
       principals.delete(context.session);
       application.close(context.session);
@@ -286,11 +289,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
-    const server = new McpServer({ name: "grayboard", version: pkg.version }, {
+    const server = new McpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.delivery),
+      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.declared),
     });
     server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });
@@ -582,7 +585,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     return text(await hosted.whoami(context.principal, context.sessionContext));
   });
   server.registerTool("bind", { description: "Take or change this session's name; unknown names require create:true.", inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
-    try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.delivery); }
+    try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { report(e, "bind"); if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code)) refuse(e.code); return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
   });
   for (const tool of boardTools({ teams: true })) {

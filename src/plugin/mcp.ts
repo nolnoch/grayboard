@@ -25,7 +25,7 @@ import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
-import { boardNotification, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { boardNotification, DEFAULT_CHANNEL_SOURCE, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   attachRoots, checkAttachmentId, digestSha256, dispositionFilename, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
@@ -481,7 +481,7 @@ console.error(`[grayboard] server mode (${serverUrl}), session ${client.id}${KEY
 function serverBoundInstructions(name: string, general: boolean, named: string[], others: string[] = []): string[] {
   return boundInstructions(
     name,
-    "grayboard",
+    DEFAULT_CHANNEL_SOURCE,
     general,
     () => [
       ...(hello.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),
@@ -504,7 +504,7 @@ const currentInstructions = (notes: string[] = []): string[] => instructionsNow(
 
 // Built after hello_ok; notify waits for `initialized`, which needs it.
 const server = new Server(
-  { name: "grayboard", version: pkg.version },
+  { name: DEFAULT_CHANNEL_SOURCE, version: pkg.version },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

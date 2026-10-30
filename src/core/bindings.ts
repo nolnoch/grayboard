@@ -3,8 +3,7 @@
 // durable mailbox a session binds to once it knows its task.
 import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
-import { DM_INBOX_INSTRUCTION, dmChannelInstruction } from "../shared/inbox.ts";
-import { boardInstructions, boardTools } from "./tools.ts";
+import { channelInstructions, COORDINATION_INSTRUCTIONS, boardTools } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
@@ -396,22 +395,21 @@ export function launcherNote(launcher: string): string {
 
 /**
  * What a session whose primary is `name` is told: at start, or in a bind or
- * unbind result. `source` is the channel tag's source (boardInstructions).
+ * unbind result. `source` is the channel tag's source (channelInstructions),
+ * or null for a session no pushes reach, which gets no channel lines.
  * `general` is everything not about the name, which a session
  * that has bound already has; `modeGeneral` adds a mode's own general
  * sentences. `others` are the session's other holds (#284 S16): one sentence,
  * only when there are any. `named` goes last: variable length, so a client
  * cut loses it, not the fixed text.
  */
-export function boundInstructions(name: string, source: string, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
+export function boundInstructions(name: string, source: string | null, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
   return [
     `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
     ...(others.length ? [`You also hold ${quoted(others)}; you send as "${name}" unless a call passes as, and a reply goes as the alias its message reached.`] : []),
     ...(general
       ? [
-          dmChannelInstruction(source),
-          DM_INBOX_INSTRUCTION,
-          ...boardInstructions(source),
+          ...(source === null ? COORDINATION_INSTRUCTIONS : channelInstructions(source)),
           ...modeGeneral(),
           `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
         ]

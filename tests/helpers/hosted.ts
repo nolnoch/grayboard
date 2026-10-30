@@ -1,7 +1,7 @@
 import type { Client } from "@modelcontextprotocol/client";
 // `key` is the `_meta` key the connecting client's source mapping reads (#414), or its
 // delivery declaration's (#429), whose value is an object.
-export async function withSessionMeta(request: Request, key: string, value: unknown): Promise<Request> {
+export async function withMeta(request: Request, key: string, value: unknown): Promise<Request> {
   if (request.method !== "POST") return request;
   const body = await request.clone().json() as { params?: Record<string, unknown> };
   body.params = { ...body.params, _meta: { ...(body.params?._meta as Record<string, unknown> | undefined), [key]: value } };

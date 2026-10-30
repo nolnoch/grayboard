@@ -255,7 +255,9 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;
     -- Server-wide scalar state. alive_at: the server's last heartbeat (epoch ms),
-    -- so a restart can credit hosted leases with the downtime (#423).
+    -- so a restart can credit hosted leases with the downtime (#423). builtin_clients:
+    -- when this database first ran with the built-in OAuth clients (#429), which revoked
+    -- older grants under their IDs (revokePreBuiltinGrants).
     CREATE TABLE IF NOT EXISTS server_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS oauth_requests (
       hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, data TEXT NOT NULL
@@ -1191,6 +1193,24 @@ function makeOAuthStore(db: Database): OAuthStore {
       if (!time(now)) return false;
       return !!db.query(`SELECT 1 FROM oauth_grants g JOIN users u ON u.id = g.user_id
         WHERE g.id = ? AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(id, now);
+    },
+    revokePreBuiltinGrants(clientIds, now) {
+      if (!time(now)) throw new RangeError("invalid OAuth cutover time");
+      return db.transaction(() => {
+        if (db.query("SELECT 1 FROM server_state WHERE key = 'builtin_clients'").get()) return 0;
+        const ids = JSON.stringify(clientIds);
+        // An operator client could use these IDs before #429; its grants and codes must not
+        // become a built-in's (write-capable, refreshed with no secret).
+        const grants = db.query<{ id: string }, [string]>(
+          "SELECT id FROM oauth_grants WHERE revoked_at IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))").all(ids);
+        for (const { id } of grants) {
+          revokeGrant(id, now);
+          audit("oauth.builtin_client_grant_revoked", grant(id)!, now);
+        }
+        db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))", [ids]);
+        db.run("INSERT INTO server_state(key, value) VALUES ('builtin_clients', ?)", [now]);
+        return grants.length;
+      }).immediate();
     },
     cleanup(now) {
       if (!time(now)) throw new RangeError("invalid OAuth cleanup time");

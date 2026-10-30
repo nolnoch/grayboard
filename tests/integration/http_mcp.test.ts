@@ -11,7 +11,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { WsClient } from "../support/ws_client.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
-import { bindFixture, withSessionMeta } from "../helpers/hosted.ts";
+import { bindFixture, withMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -54,7 +54,7 @@ async function connect(token: string, identity = "be", version = "2026-07-28", o
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, ...(origin === undefined ? {} : { Origin: origin }) } },
-    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), OPENCODE_SESSION_META, identity)),
+    fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity)),
   }));
   if (bind) await bindFixture(client, identity);
   return client;

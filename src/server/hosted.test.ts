@@ -9,6 +9,7 @@ import { createHostedSessions, deliveryDeclaration, sessionContext } from "./hos
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { boundInstructions } from "../core/bindings.ts";
+import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
@@ -204,20 +205,26 @@ test("only a generic-key client's delivery declaration is read, and strictly", (
   for (const p of [principal, { ...principal, clientId: "plain", sourceKey: null }]) expect(deliveryDeclaration(p, { [GRAYBOARD_DELIVERY_META]: "malformed" })).toBeUndefined();
 });
 
-test("a bind result follows the declared delivery: push has no lease note, poll says to check, absent points at delivery_open", async () => {
+test("a bind result follows the declared delivery: push has no lease note, poll has no channel lines and says to check, absent points at delivery_open", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
-  const expected = (name: string, source: string, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, () => [], [])].join(" ");
+  const expected = (name: string, source: string | null, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, () => [], [])].join(" ");
   const cases = [
     ["push-run", { mode: "push", source: "grayboard-pi" }, "grayboard-pi", []],
-    ["poll-run", { mode: "poll", source: "grayboard-pi" }, "grayboard-pi", ["No pushes reach this session; check dm_inbox and board_read yourself."]],
-    ["absent-run", undefined, "grayboard", [`No delivery lease is open for this session, so DMs to "absent-run" wait until the client opens one (delivery_open).`]],
+    ["poll-run", { mode: "poll", source: "grayboard-pi" }, null, ["No pushes reach this session; check dm_inbox and board_read yourself."]],
+    ["absent-run", undefined, DEFAULT_CHANNEL_SOURCE, [`No delivery lease is open for this session, so DMs to "absent-run" wait until the client opens one (delivery_open).`]],
   ] as const;
-  for (const [name, delivery, source, notes] of cases) {
-    const result = await hosted.bind(generic, sessionContext(generic, { [GRAYBOARD_SESSION_META]: name }), { name, create: true }, delivery);
-    expect(result.content[0]!.text).toBe(expected(name, source, [...notes]));
+  const texts: Record<string, string> = {};
+  for (const [name, declared, source, notes] of cases) {
+    const result = await hosted.bind(generic, sessionContext(generic, { [GRAYBOARD_SESSION_META]: name }), { name, create: true }, declared);
+    texts[name] = result.content[0]!.text;
+    expect(texts[name]).toBe(expected(name, source, [...notes]));
     expect(result.structuredContent.instructions).toEqual(boundInstructions(name, source, true, () => [], []));
   }
-  expect(expected("push-run", "grayboard-pi", [])).toContain(`<channel source="grayboard-pi" message_id="..."`);
+  expect(texts["push-run"]).toContain(`<channel source="grayboard-pi" message_id="..."`);
+  expect(texts["absent-run"]).toContain(`<channel source="grayboard" message_id="..."`);
+  // A poll session's bind result reads as its `initialize` text does: no channel lines.
+  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open"]) expect(texts["poll-run"]).not.toContain(line);
+  for (const line of COORDINATION_INSTRUCTIONS) expect(texts["poll-run"]).toContain(line);
 });
 
 test("unbound context cannot write or implicitly create names", async () => {
