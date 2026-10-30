@@ -1,6 +1,6 @@
 import type { KeyValueStorage } from "./port.js";
 import { ServerUnreachable, SubscriberError, SubscriptionClosed, holderText } from "./wire.js";
-import { AccessExpired, DeliveryHeldElsewhere, ServerOutdated } from "./model.js";
+import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated } from "./model.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
@@ -12,7 +12,7 @@ const key = "diagnostics:v1";
 const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 const operations = new Set(["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose", "login", "refresh", "child_register"]);
-const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere"]);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
   if (error instanceof ServerUnreachable) return "server_unreachable";
@@ -20,6 +20,7 @@ export function failureCode(error: unknown): string {
   if (error instanceof AccessExpired) return error.reason === "expired" ? "native_access_expired" : error.reason;
   if (error instanceof ServerOutdated) return "server_outdated";
   if (error instanceof DeliveryHeldElsewhere) return "delivery_held_elsewhere";
+  if (error instanceof RefreshInProgress) return "refresh_in_progress";
   if (error instanceof SubscriberError) {
     const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
     if (typeof code === "string" && codes.has(code)) return code;
@@ -31,6 +32,7 @@ export function failureMessage(error: unknown, resumeHint: string): string {
   if (error instanceof DeliveryStopped) return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
   if (error instanceof ServerUnreachable) return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere) return error.message;
+  if (error instanceof RefreshInProgress) return `${error.message}; ${resumeHint}`;
   if (error instanceof SubscriberError) {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;

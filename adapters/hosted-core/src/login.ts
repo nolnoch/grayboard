@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { RecordStatus } from "./diagnostics.js";
 import { acquire, LockTimeout, tryAcquire, type Lock } from "./lock.js";
-import { AccessExpired, Refusal, ServerOutdated, type AccessReason } from "./model.js";
+import { AccessExpired, Refusal, RefreshInProgress, ServerOutdated, type AccessReason } from "./model.js";
 import type { Configuration, CredentialPort, Enrollment } from "./port.js";
 import { readJson, sha256, writeJsonAtomic } from "./storage.js";
 import { ServerUnreachable } from "./wire.js";
@@ -38,11 +38,6 @@ export type LoginConfig = {
 // mismatched issuer, a refused code exchange, or another session's sign-in
 // that this one waited on ended without signing in.
 export class LoginFailed extends Error {}
-// Another process holds the refresh lock past the deadline and the access
-// token has expired: retryable, never a takeover.
-export class RefreshInProgress extends Error {
-  constructor(harness: string) { super(`token refresh in progress in another ${harness} process`); }
-}
 
 const Reason = z.enum(["invalid_grant", "refresh_outcome_unknown", "logged_out"]);
 const Store = z.strictObject({

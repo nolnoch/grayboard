@@ -27,6 +27,12 @@ export class ServerOutdated extends Refusal {
 export class DeliveryHeldElsewhere extends Refusal {
   constructor(readonly harness: string) { super("paused", `another ${harness} process holds delivery for this session`); }
 }
+// Another process holds the store's refresh lock while the access token has
+// expired: retryable, never a takeover. The Controller retries it like an
+// outage, without spending its retry budget.
+export class RefreshInProgress extends Error {
+  constructor(readonly harness: string) { super(`token refresh in progress in another ${harness} process`); }
+}
 // The SDK wraps errors thrown while connecting (SdkError EraNegotiationFailed
 // {cause}), so a token() expiry during connect arrives nested.
 export function accessExpiry(error: unknown): AccessExpired | undefined {

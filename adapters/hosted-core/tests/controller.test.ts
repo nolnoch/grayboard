@@ -3,8 +3,8 @@
 // (`approval: null`) and once with a fake approval port.
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
-import { Controller } from "../src/controller.js";
-import { Refusal, same, type Item } from "../src/model.js";
+import { Controller, type ControllerOptions } from "../src/controller.js";
+import { Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
 import { LeaseUnavailable, ServerUnreachable, Wire, type WireOptions } from "../src/wire.js";
@@ -21,15 +21,19 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
-    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string) { wires.push(options); }
-    async connect() {}
+    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); }
+    // Only the run loop's wire has beforeRetry. The SDK wraps a token() failure
+    // during connect in its version-negotiation error.
+    async connect() {
+      if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
+    }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
       calls.push({ sessionID: this.sessionID, name, args });
@@ -81,7 +85,7 @@ function runtime(mode: Mode) {
     credential, approval,
     admit: async (e, item, id) => { admits.push({ sessionID: e.sessionID, id, item: item.id }); },
   };
-  const make = () => new Controller(port, { Transport: FakeWire as unknown as typeof Wire });
+  const make = (options: ControllerOptions = {}) => new Controller(port, { Transport: FakeWire as unknown as typeof Wire, ...options });
   const controller = make();
   // The item a fresh root's first bind of `be` will be issued (ownership 1, generation 1).
   const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" });
@@ -90,6 +94,7 @@ function runtime(mode: Mode) {
     controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named,
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     failReceipt: (n: number) => { failReceipt = n; },
+    refreshBusy: (n: number) => { refreshBusy = n; },
     // The nth delivery_renew throws `error` once, after running `then`.
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
@@ -314,4 +319,19 @@ test.each(modes)("a lease lost after admission whose next lease has a new bind_g
     expect(r.admits[1]!.id).toBe(r.admits[0]!.id);
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
   } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a refresh another process holds is retried like an outage, past the retry budget, and never pauses (%s)", async mode => {
+  const r = runtime(mode);
+  const waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    r.refreshBusy(12);
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", "be", true);
+    await until(() => r.batches.get("R")?.length === 0, 10_000);
+    expect(waits).toEqual([500, 1000, 2000, 4000, ...Array(8).fill(8000)]);
+    expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "refresh_in_progress" } });
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+  } finally { await c.close(); await r.controller.close(); }
 });

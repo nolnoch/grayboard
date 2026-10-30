@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
 import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
-import { AccessExpired, Refusal, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, stableID, type Lease } from "./model.js";
+import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, stableID, type Lease } from "./model.js";
 import { SessionRoutes } from "./sessions.js";
 import { end, register } from "./children.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Status } from "./diagnostics.js";
@@ -34,8 +34,10 @@ function sleep(ms: number, signal: AbortSignal) {
     signal.addEventListener("abort", done, { once: true });
   });
 }
-function insufficient(error: unknown): InsufficientScope | undefined {
-  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if (e instanceof InsufficientScope) return e;
+// The SDK wraps errors thrown while connecting (SdkError EraNegotiationFailed
+// {cause}), so a scope refusal or a busy refresh can arrive nested.
+function causeOf<T>(error: unknown, type: abstract new (...args: never[]) => T): T | undefined {
+  for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) if (e instanceof type) return e;
   return undefined;
 }
 // The admission target's identity when the host keeps no approval key.
@@ -140,9 +142,10 @@ export class Controller<E extends Enrollment = Enrollment> {
     const wire = await this.wire(e, sessionID);
     try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
-  // A 403 insufficient_scope needs a new sign-in exactly like an ended grant.
+  // A 403 insufficient_scope needs a new sign-in exactly like an ended grant;
+  // a refresh another process holds is retried, however deep the SDK wrapped it.
   private expired(error: unknown) {
-    return accessExpiry(error) ?? (insufficient(error) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : error);
+    return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
   }
   private async watch(e: E) {
     this.watches.set(e.sessionID, await this.port.credential.watch(e, () => this.drift(`Grayboard credential changed; ${this.hint}`)));
@@ -246,12 +249,13 @@ export class Controller<E extends Enrollment = Enrollment> {
   private async run(r: Root<E>, e: E, epoch: number, signal: AbortSignal, ready: () => void) {
     // recoveries counts lease losses outside an item (inbox read, renew) since
     // the lease last proved healthy; a loss inside an item spends that item's attempts.
-    // unreachable counts consecutive outage retries (the server down, or the
-    // subscription closed under it): they back off without limit and never
-    // spend failures, since leases don't count server downtime (#423); only a
-    // healthy lease (renew or receipt) resets the backoff. outage is set only
-    // by a failed request: the server also closes the stream when access
-    // expires, and that expiry must still pause.
+    // unreachable counts consecutive outage retries (the server down, the
+    // subscription closed under it, or another process holding the refresh
+    // lock): they back off without limit and never spend failures, since
+    // leases don't count server downtime (#423) and a busy refresh is never
+    // taken over; only a healthy lease (renew or receipt) resets the backoff.
+    // outage is set only by a failed request: the server also closes the
+    // stream when access expires, and that expiry must still pause.
     let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
@@ -327,9 +331,12 @@ export class Controller<E extends Enrollment = Enrollment> {
         const error = this.expired(caught);
         // An access token that expires mid-outage couldn't be refreshed either;
         // wait for the host's credential rather than pausing.
-        if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || (error instanceof AccessExpired && error.reason === "expired" && outage)) {
+        if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || (error instanceof AccessExpired && error.reason === "expired" && outage)) {
           if (error instanceof ServerUnreachable) outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
+          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained"
+            : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained"
+            : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained`
+            : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
