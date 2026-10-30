@@ -481,6 +481,7 @@ console.error(`[grayboard] server mode (${serverUrl}), session ${client.id}${KEY
 function serverBoundInstructions(name: string, general: boolean, named: string[], others: string[] = []): string[] {
   return boundInstructions(
     name,
+    "grayboard",
     general,
     () => [
       ...(hello.teams.length > 0 ? [TEAM_PRIVACY_INSTRUCTION] : []),

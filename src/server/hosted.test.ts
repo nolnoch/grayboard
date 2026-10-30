@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
-import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, sessionContext } from "./hosted.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
-import { GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { boundInstructions } from "../core/bindings.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
@@ -150,8 +151,9 @@ test("the authenticated client selects the source key and harness; nothing else 
       if (p instanceof Response) throw new Error("fixture authorization failed");
       return p;
     };
-    const [broker, opencode, plain, cimd] = ["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json"].map(authenticate);
+    const [broker, opencode, plain, cimd, ...builtins] = ["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json", ...BUILTIN_CLIENT_IDS].map(authenticate);
     expect([broker!.sourceKey, opencode!.sourceKey, plain!.sourceKey, cimd!.sourceKey]).toEqual([GRAYBOARD_SESSION_META, OPENCODE_SESSION_META, null, null]);
+    expect(builtins.map(p => [p.clientId, p.sourceKey])).toEqual(BUILTIN_CLIENT_IDS.map(id => [id, GRAYBOARD_SESSION_META]));
     const both = { [GRAYBOARD_SESSION_META]: "generic", [OPENCODE_SESSION_META]: "opencode" };
     expect(sessionContext(broker!, both)).toMatchObject({ raw: "generic" });
     expect(sessionContext(opencode!, both)).toMatchObject({ raw: "opencode" });
@@ -168,7 +170,54 @@ test("the authenticated client selects the source key and harness; nothing else 
     const child = sessionContext(broker!, { [GRAYBOARD_SESSION_META]: "broker-child" });
     if (!("id" in child)) throw new Error("fixture source mapping");
     expect([harness(brokerRoot.id), harness(child.id), harness(opencodeRoot.id)]).toEqual(["broker", "broker", "opencode"]);
+    // Built-ins (#429): with no operator registration, the generic key binds and each
+    // session carries its harness label, not its client ID.
+    const roots: string[] = [];
+    for (const p of builtins) {
+      expect(sessionContext(p, { [OPENCODE_SESSION_META]: "root" })).toEqual({ missing: `the key _meta["${GRAYBOARD_SESSION_META}"] is missing` });
+      const root = sessionContext(p, both);
+      if (!("id" in root)) throw new Error("fixture source mapping");
+      expect(root.raw).toBe("generic");
+      await hosted.bind(p, root, { name: `${p.clientId}-run`, create: true });
+      roots.push(root.id);
+    }
+    expect(new Set(roots).size).toBe(BUILTIN_CLIENT_IDS.length);
+    expect(roots.map(harness)).toEqual(["pi", "omp", "claude-code"]);
   } finally { oauth.close(); }
+});
+
+test("only a generic-key client's delivery declaration is read, and strictly", () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const declare = (value: unknown) => deliveryDeclaration(generic, { [GRAYBOARD_SESSION_META]: "root", [GRAYBOARD_DELIVERY_META]: value });
+  expect(declare({ mode: "push", source: "grayboard" })).toEqual({ mode: "push", source: "grayboard" });
+  expect(declare({ mode: "poll", source: "0" + "a:._-".repeat(12) + "abc" })).toEqual({ mode: "poll", source: "0" + "a:._-".repeat(12) + "abc" });
+  expect(deliveryDeclaration(generic, { [GRAYBOARD_SESSION_META]: "root" })).toBeUndefined();
+  expect(deliveryDeclaration(generic, undefined)).toBeUndefined();
+  for (const value of [null, "push", [], {}, { mode: "push" }, { source: "grayboard" }, { mode: "stream", source: "grayboard" }, { mode: "PUSH", source: "grayboard" },
+    { mode: "push", source: "" }, { mode: "push", source: "Grayboard" }, { mode: "push", source: "-grayboard" }, { mode: "push", source: "a".repeat(65) }, { mode: "push", source: "gray board" },
+    { mode: "push", source: 'x"y' }, { mode: "push", source: 7 }, { mode: "push", source: "grayboard", extra: true }]) {
+    let refusal: unknown;
+    try { declare(value); } catch (error) { refusal = error; }
+    expect(refusal, JSON.stringify(value)).toMatchObject({ code: "bad_request" });
+  }
+  // OpenCode's and an unmapped client's declarations are never read, even malformed ones.
+  for (const p of [principal, { ...principal, clientId: "plain", sourceKey: null }]) expect(deliveryDeclaration(p, { [GRAYBOARD_DELIVERY_META]: "malformed" })).toBeUndefined();
+});
+
+test("a bind result follows the declared delivery: push has no lease note, poll says to check, absent points at delivery_open", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const expected = (name: string, source: string, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, () => [], [])].join(" ");
+  const cases = [
+    ["push-run", { mode: "push", source: "grayboard-pi" }, "grayboard-pi", []],
+    ["poll-run", { mode: "poll", source: "grayboard-pi" }, "grayboard-pi", ["No pushes reach this session; check dm_inbox and board_read yourself."]],
+    ["absent-run", undefined, "grayboard", [`No delivery lease is open for this session, so DMs to "absent-run" wait until the client opens one (delivery_open).`]],
+  ] as const;
+  for (const [name, delivery, source, notes] of cases) {
+    const result = await hosted.bind(generic, sessionContext(generic, { [GRAYBOARD_SESSION_META]: name }), { name, create: true }, delivery);
+    expect(result.content[0]!.text).toBe(expected(name, source, [...notes]));
+    expect(result.structuredContent.instructions).toEqual(boundInstructions(name, source, true, () => [], []));
+  }
+  expect(expected("push-run", "grayboard-pi", [])).toContain(`<channel source="grayboard-pi" message_id="..."`);
 });
 
 test("unbound context cannot write or implicitly create names", async () => {

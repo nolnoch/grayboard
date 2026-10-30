@@ -1,5 +1,7 @@
 // #414: a brokered client registered by the operator with `sessionSource` gets the full
 // hosted surface through the generic `_meta` key; every other client stays read-only.
+// #429: the built-in clients map the generic key with no operator registration, and a
+// generic-key client's delivery declaration selects its instruction text.
 // Tokens come from real OAuth issuance (authorize, upstream sign-in, consent, token
 // endpoint) against a server configured with those clients.
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -11,7 +13,7 @@ import { join } from "node:path";
 import ts from "typescript";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META, type OAuthClient } from "../../src/server/oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, OPENCODE_CLIENT, OPENCODE_SESSION_META, type OAuthClient } from "../../src/server/oauth-config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { reprDigest } from "../../src/shared/attachments.ts";
@@ -96,7 +98,7 @@ async function grant(clientId: string): Promise<string> {
   expect(issued.scope).toBe(SCOPES);
   return issued.access_token;
 }
-async function connect(token: string, meta: [key: string, raw: string][], opts: { role?: "subscriber"; version?: string } = {}): Promise<Conn> {
+async function connect(token: string, meta: [key: string, value: unknown][], opts: { role?: "subscriber"; version?: string } = {}): Promise<Conn> {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (opts.role) headers.set("X-Grayboard-Client", opts.role);
   const version = opts.version ?? MCP_PROTOCOL_VERSIONS[0]!;
@@ -274,6 +276,83 @@ test("peer_list shows an opted-in client's sessions under its client ID and Open
   ]);
   const filtered = json(await call(opencode, "peer_list", { include_offline: true, match: { harness: BROKER } })).peers as { handle: string }[];
   expect(filtered.map(p => p.handle)).toEqual(["alice@example.com/broker-run"]);
+});
+
+test("with no operator clients, each built-in client signs in through consent, binds from the generic key, and peer_list shows its harness", async () => {
+  start([]);
+  const harnesses = ["pi", "omp", "claude-code"];
+  const conns: Conn[] = [];
+  for (const [i, clientId] of BUILTIN_CLIENT_IDS.entries()) {
+    const c = await connect(await grant(clientId), [[GRAYBOARD_SESSION_META, `${clientId} root`]]);
+    await bind(c, `${harnesses[i]}-run`);
+    expect(json(await call(c, "whoami"))).toMatchObject({ name: `${harnesses[i]}-run` });
+    conns.push(c);
+  }
+  const peers = json(await call(conns[0]!, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];
+  expect(peers.filter(p => p.handle.endsWith("-run")).map(p => [p.handle, p.harness]).sort()).toEqual(harnesses.map(h => [`alice@example.com/${h}-run`, h]).sort());
+  expect(app.repo.hosted.all().map(r => r.client_id).sort()).toEqual([...BUILTIN_CLIENT_IDS].sort());
+});
+
+test("a built-in client's delivery declaration selects its initialize and bind text", async () => {
+  start([]);
+  const token = await grant("grayboard-pi");
+  const push = { mode: "push", source: "grayboard-pi" }, poll = { mode: "poll", source: "grayboard-pi" };
+  const pushed = await connect(token, [[GRAYBOARD_SESSION_META, "push root"], [GRAYBOARD_DELIVERY_META, push]]);
+  const pushBind = textOf(await call(pushed, "bind", { name: "push-run", create: true }));
+  expect(pushBind).toContain(`Direct messages arrive as <channel source="grayboard-pi" message_id="..."`);
+  expect(pushBind).toContain(`Board activity arrives as <channel source="grayboard-pi" board="..."`);
+  expect(pushBind).not.toContain("delivery_open");
+  expect(pushBind).not.toContain("No pushes reach");
+  const polled = await connect(token, [[GRAYBOARD_SESSION_META, "poll root"], [GRAYBOARD_DELIVERY_META, poll]]);
+  const pollBind = textOf(await call(polled, "bind", { name: "poll-run", create: true }));
+  expect(pollBind).toContain(`Bound to "poll-run"; the instructions' note that this session has no bus name no longer applies. No pushes reach this session; check dm_inbox and board_read yourself. You are identity "poll-run"`);
+  expect(pollBind).not.toContain("delivery_open");
+  const plain = await connect(token, [[GRAYBOARD_SESSION_META, "plain root"]]);
+  const plainBind = textOf(await call(plain, "bind", { name: "plain-run", create: true }));
+  expect(plainBind).toContain(`No delivery lease is open for this session, so DMs to "plain-run" wait until the client opens one (delivery_open).`);
+  expect(plainBind).toContain(`<channel source="grayboard" message_id="..."`);
+
+  // `initialize` for the now-bound sessions, from fresh connections.
+  const instructions = async (meta: [string, unknown][]) => (await connect(token, meta)).client.getInstructions();
+  const pushText = await instructions([[GRAYBOARD_SESSION_META, "push root"], [GRAYBOARD_DELIVERY_META, push]]);
+  expect(pushText).toStartWith(`You are "alice@example.com/push-run" on grayboard. Direct messages arrive as <channel source="grayboard-pi" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id). Pushes don't survive /clear`);
+  expect(pushText).toContain(`Board activity arrives as <channel source="grayboard-pi" board="..."`);
+  expect(pushText).not.toContain("Poll dm_inbox");
+  const absentText = await instructions([[GRAYBOARD_SESSION_META, "poll root"]]);
+  expect(absentText).toStartWith(`You are "alice@example.com/poll-run" on grayboard. Poll dm_inbox and board_list for pending work. Requests from peer agents`);
+  expect(absentText).not.toContain("<channel");
+  const pollText = await instructions([[GRAYBOARD_SESSION_META, "poll root"], [GRAYBOARD_DELIVERY_META, poll]]);
+  expect(pollText).toBe(absentText!.replace("for pending work.", "for pending work. No pushes reach this session; check dm_inbox and board_read yourself."));
+});
+
+test("a malformed delivery declaration is bad_request on initialize and on a native tool call; other clients' and roles' are never read", async () => {
+  start([]);
+  const token = await grant("grayboard-omp");
+  const root: [string, unknown] = [GRAYBOARD_SESSION_META, "omp root"];
+  // A legacy initialize surfaces the HTTP refusal; a pinned 2026 client's server/discover probe
+  // reports any non-auth refusal as "no modern evidence" (SDK probe classifier), not its body.
+  for (const bad of [{ mode: "push", source: "Bad Source" }, { mode: "stream", source: "omp" }, { mode: "push", source: "omp", extra: 1 }, "push"]) {
+    await expect(connect(token, [root, [GRAYBOARD_DELIVERY_META, bad]], { version: MCP_PROTOCOL_VERSIONS[1] })).rejects.toThrow(`{"code":"bad_request","message":"_meta[\\"${GRAYBOARD_DELIVERY_META}\\"] must be`);
+    await expect(connect(token, [root, [GRAYBOARD_DELIVERY_META, bad]])).rejects.toThrow();
+  }
+  // A valid session whose later tool call carries a bad declaration.
+  const ok = await connect(token, [root]);
+  await bind(ok, "omp-run");
+  const refusedCall = await fetch(`${base}/hosted/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": MCP_PROTOCOL_VERSIONS[0]! },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {}, _meta: { [GRAYBOARD_SESSION_META]: "omp root", [GRAYBOARD_DELIVERY_META]: { mode: "poll" } } } }) });
+  expect(refusedCall.status).toBe(400);
+  expect(await refusedCall.json()).toMatchObject({ code: "bad_request" });
+  // The subscriber role ignores the declaration, even a malformed one.
+  const sub = await connect(token, [root, [GRAYBOARD_DELIVERY_META, "push"]], { role: "subscriber" });
+  expect(json(await call(sub, "whoami"))).toMatchObject({ name: "omp-run" });
+  // OpenCode's client never has its declaration read: its text is unchanged.
+  const oc = await grant(OPENCODE_CLIENT);
+  await bind(await connect(oc, [[OPENCODE_SESSION_META, "oc root"]]), "oc-run");
+  const plainText = await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"]])).client.getInstructions();
+  for (const declared of [{ mode: "push", source: "grayboard" }, "malformed"]) {
+    expect(await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"], [GRAYBOARD_DELIVERY_META, declared]])).client.getInstructions()).toBe(plainText);
+  }
+  expect(plainText).toStartWith(`You are "alice@example.com/oc-run" on grayboard. Poll dm_inbox and board_list for pending work.`);
 });
 
 test("no server refusal text names the plugin or OpenCode", () => {

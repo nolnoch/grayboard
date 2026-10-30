@@ -308,6 +308,7 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
   const lead = !WRITES_AS && !held.length ? [unboundInstruction(SESSION_ID, unboundCandidates, notes)] : notes;
   return boundInstructions(
     name,
+    "grayboard",
     general,
     () => [
       ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),

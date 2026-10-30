@@ -3,7 +3,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { auth, Client, StreamableHTTPClientTransport, type OAuthClientProvider, type OAuthDiscoveryState, type StoredOAuthTokens } from "@modelcontextprotocol/client";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +12,7 @@ import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
-import type { OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, GRAYBOARD_SESSION_META, type OAuthClient } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
@@ -189,6 +189,54 @@ test("CIMD consent marks the self-declared name unverified, escapes it, and perm
   expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:34567");
   expect((await decide(browser, consent, "approve", "null")).status).toBe(403);
   expect((await decide(browser, consent)).status).toBe(303);
+});
+
+test("each built-in client completes code and refresh on a random loopback port with no operator registration", async () => {
+  service.close(); config = { ...config, oauthClients: [] }; service = makeService();
+  const metadata = await (await fetch(base + "/.well-known/oauth-authorization-server")).json();
+  expect(metadata.grayboard_builtin_clients).toEqual(BUILTIN_CLIENT_IDS);
+  const names = ["Grayboard for pi", "Grayboard for omp", "Grayboard for Claude Code"], grants = new Set<string>();
+  for (const [i, clientId] of BUILTIN_CLIENT_IDS.entries()) for (const host of ["127.0.0.1", "[::1]"]) {
+    const redirectUri = `http://${host}:${randomInt(1024, 65536)}/callback`;
+    const issued = await issue(clientId, "grayboard:delivery grayboard:tools", new Browser(), redirectUri);
+    // Built-ins are in the server's own client map: named, not "Unverified", yet still a local callback.
+    expect(issued.consent.content).toContain(`<h1>Authorize ${names[i]}</h1>`);
+    expect(issued.consent.content).not.toContain("Unverified client");
+    expect(issued.consent.content).toContain(`Redirect: ${redirectUri}`);
+    expect(issued.consent.content).toContain("Local callback: only approve if you started this client.");
+    const tokens = await redeem(issued);
+    expect(tokens.scope).toBe("grayboard:delivery grayboard:tools");
+    const granted = principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
+    expect([granted.clientId, granted.sourceKey]).toEqual([clientId, GRAYBOARD_SESSION_META]);
+    const renewed = await post("/oauth/token", { grant_type: "refresh_token", client_id: clientId, refresh_token: tokens.refresh_token });
+    expect(renewed.status).toBe(200);
+    const next = await renewed.json() as Tokens;
+    expect(next.refresh_token).not.toBe(tokens.refresh_token);
+    expect(principal(next)).toMatchObject({ grantId: granted.grantId, clientId, sourceKey: GRAYBOARD_SESSION_META });
+    grants.add(granted.grantId);
+  }
+  expect(grants.size).toBe(BUILTIN_CLIENT_IDS.length * 2);
+});
+
+test("a built-in client's non-loopback or other-path redirect is refused before a flow is created", async () => {
+  for (const clientId of BUILTIN_CLIENT_IDS) {
+    for (const redirectUri of ["https://client.example/callback", "http://localhost:45678/callback", "http://127.0.0.1:45678/other", "http://[::1]:45678/callback/", "http://127.0.0.1:45678/callback?x=1", base + "/oauth/callback/complete"]) {
+      const response = await fetch(authorization(clientId, undefined, redirectUri).url, { redirect: "manual" });
+      expect(response.status).toBe(400);
+      expect(response.headers.get("location")).toBeNull();
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+  }
+  expect(storage.db.query("SELECT count(*) AS n FROM oauth_requests").get()).toEqual({ n: 0 });
+  expect(exchanges).toBe(0);
+});
+
+test("an operator client reusing a built-in ID stops the OAuth server from starting", () => {
+  service.close();
+  for (const clientId of BUILTIN_CLIENT_IDS) {
+    expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [...registrations, { ...registrations[0]!, clientId }] })).toThrow(`OAuth client ID ${clientId} is reserved for a built-in client`);
+  }
+  service = makeService();
 });
 
 test("preregistered clients retain the explicit manual callback flow", async () => {

@@ -16,18 +16,36 @@ export type OAuthClient = {
 
 // Hosted session source mapping (#414): the `_meta` key that carries a client's raw
 // session source, and the harness its sessions show in peer_list. OpenCode's CIMD client
-// keeps its own key; an operator client maps the generic key only with `sessionSource`;
-// every other client is unmapped (reads only).
+// keeps its own key; the built-in clients and an operator client with `sessionSource` map
+// the generic key; every other client is unmapped (reads only).
 export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
 export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
 export const GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
+// A generic-key client's declared delivery (#429), read beside its session key.
+export const GRAYBOARD_DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
+// Built-in native clients (#429): the hosted adapters ship these IDs as constants, so every
+// server accepts them with no operator registration and no outbound fetch, and none can be
+// disabled per server. Loopback-only redirects keep a consent-phished code on the victim's
+// own machine, the same bound OpenCode's metadata document gives; fixed in code, they are
+// stronger than a fetched document. Operator config can't reuse their IDs.
+const BUILTINS = [
+  { clientId: "grayboard-pi", harness: "pi", name: "Grayboard for pi" },
+  { clientId: "grayboard-omp", harness: "omp", name: "Grayboard for omp" },
+  { clientId: "grayboard-claude-code", harness: "claude-code", name: "Grayboard for Claude Code" },
+] as const;
+const builtinHarness = new Map<string, string>(BUILTINS.map(b => [b.clientId, b.harness]));
+export const BUILTIN_CLIENT_IDS: readonly string[] = BUILTINS.map(b => b.clientId);
+export const BUILTIN_CLIENTS: readonly OAuthClient[] = BUILTINS.map(({ clientId, name }) => ({
+  clientId, name, redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"], scopes: [...OAUTH_SCOPES], tokenEndpointAuthMethod: "none", allowRefresh: true,
+}));
 export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>): string | null {
   if (clientId === OPENCODE_CLIENT) return OPENCODE_SESSION_META;
+  if (builtinHarness.has(clientId)) return GRAYBOARD_SESSION_META;
   return clients.get(clientId)?.sessionSource === true ? GRAYBOARD_SESSION_META : null;
 }
-// Only a mapped client registers sessions; the parser keeps an opted-in ID within
-// SESSION_FACT_MAX, so the label is the exact client ID.
-export const harnessFor = (clientId: string) => clientId === OPENCODE_CLIENT ? "opencode" : clientId;
+// Only a mapped client registers sessions; a built-in shows its harness, and the parser
+// keeps an opted-in operator ID within SESSION_FACT_MAX, so that label is the exact ID.
+export const harnessFor = (clientId: string) => clientId === OPENCODE_CLIENT ? "opencode" : builtinHarness.get(clientId) ?? clientId;
 const httpsId = (id: string) => { try { return new URL(id).protocol === "https:"; } catch { return false; } };
 
 const unsafe = /[\x00-\x20\x7f\\]/;
@@ -91,6 +109,7 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       !["none", "client_secret_basic"].includes(String(v.tokenEndpointAuthMethod)) ||
       (v.allowRefresh !== undefined && typeof v.allowRefresh !== "boolean") ||
       (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
+    if (builtinHarness.has(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
     // https: ID never maps the generic key: a grant consented under a metadata document can't
     // turn write-capable because the operator later registers the same ID.

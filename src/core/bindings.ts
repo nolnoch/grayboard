@@ -3,8 +3,8 @@
 // durable mailbox a session binds to once it knows its task.
 import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
-import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
-import { BOARD_INSTRUCTIONS, boardTools } from "./tools.ts";
+import { DM_INBOX_INSTRUCTION, dmChannelInstruction } from "../shared/inbox.ts";
+import { boardInstructions, boardTools } from "./tools.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
@@ -396,21 +396,22 @@ export function launcherNote(launcher: string): string {
 
 /**
  * What a session whose primary is `name` is told: at start, or in a bind or
- * unbind result. `general` is everything not about the name, which a session
+ * unbind result. `source` is the channel tag's source (boardInstructions).
+ * `general` is everything not about the name, which a session
  * that has bound already has; `modeGeneral` adds a mode's own general
  * sentences. `others` are the session's other holds (#284 S16): one sentence,
  * only when there are any. `named` goes last: variable length, so a client
  * cut loses it, not the fixed text.
  */
-export function boundInstructions(name: string, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
+export function boundInstructions(name: string, source: string, general: boolean, modeGeneral: () => string[], named: string[], others: string[] = []): string[] {
   return [
     `You are identity "${name}" on the grayboard bus, which coordinates between agents.`,
     ...(others.length ? [`You also hold ${quoted(others)}; you send as "${name}" unless a call passes as, and a reply goes as the alias its message reached.`] : []),
     ...(general
       ? [
-          `Direct messages arrive as <channel source="grayboard" message_id="..." from="..." [parent_id="..."]>body</channel>; reply with dm_send(to=from, body, parent_id=message_id).`,
+          dmChannelInstruction(source),
           DM_INBOX_INSTRUCTION,
-          ...BOARD_INSTRUCTIONS,
+          ...boardInstructions(source),
           ...modeGeneral(),
           `Messages are durable: if the peer is offline they'll receive it when their session starts.`,
         ]
