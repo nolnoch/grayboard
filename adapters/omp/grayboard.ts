@@ -17,12 +17,15 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
-// Same shape Claude Code shows the model, so the MCP server's instructions apply.
-function render({ content, meta = {} }: ChannelParams): string {
+// Same shape Claude Code shows the model, so the MCP server's instructions
+// apply, and the one hosted-core renders (adapters/hosted-core/src/channel.ts):
+// a body's `<channel` or `</channel` keeps its `<` escaped, so it can't close
+// the element or forge another one (#433).
+export function render({ content, meta = {} }: ChannelParams): string {
   const attrs = Object.entries(meta)
     .map(([k, v]) => ` ${k}="${esc(v)}"`)
     .join("");
-  return `<channel source="grayboard"${attrs}>\n${content}\n</channel>`;
+  return `<channel source="grayboard"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
 }
 
 export default function grayboard(pi: ExtensionAPI) {
