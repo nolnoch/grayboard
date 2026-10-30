@@ -21,13 +21,11 @@ export class Approval implements ApprovalPort<OpenCodeEnrollment> {
     const session = await this.ctx.session.get({ sessionID });
     return { session, saved: session.metadata?.[METADATA] as Saved };
   }
-  async save(e: OpenCodeEnrollment, approval: OpenCodeEnrollment, enabled: boolean) {
+  async save(e: OpenCodeEnrollment, approval: OpenCodeEnrollment, enabled: boolean, roots: readonly string[]) {
     const { session } = await this.metadata(e.sessionID);
     await this.ctx.session.update({ sessionID: session.id, metadata: { ...session.metadata, [METADATA]: { enabled, enrollment: approval } } });
     await this.ctx.storage.set(`enrollmentHash:${session.id}`, enrollmentHash(approval));
-    const ids = await this.ctx.storage.get("rootSessionIDs");
-    const roots = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
-    if (!roots.includes(session.id)) await this.ctx.storage.set("rootSessionIDs", [...roots, session.id]);
+    await this.ctx.storage.set("rootSessionIDs", [...new Set([...roots, session.id])]);
   }
   async approved(e: OpenCodeEnrollment, approval: OpenCodeEnrollment) {
     const { saved } = await this.metadata(e.sessionID);

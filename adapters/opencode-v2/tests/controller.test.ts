@@ -682,6 +682,22 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
     expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
 });
+
+test("saving an approval prunes the saved roots that restore dropped", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    await r.controller.close();
+    // R ended while OpenCode was down: restore skips it, and the next save drops it.
+    r.nodes.delete("R");
+    restarted = r.restart(); await restarted.restore();
+    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(r.storage.get("rootSessionIDs")).toEqual(["B"]);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
 test("ordinary native unbound result rebinds the durable name once with create:false", async () => {
   const r = runtime();
   try {

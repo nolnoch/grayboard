@@ -32,7 +32,9 @@ export interface CredentialPort<E extends Enrollment> {
 }
 export interface ApprovalPort<E extends Enrollment> {
   key(e: E): string;                                   // OpenCode: enrollmentHash
-  save(e: E, approval: E, enabled: boolean): Promise<void>;
+  // `roots`: every live root's sessionID, `e`'s included. The saved root list
+  // becomes exactly these, so a root restore dropped (ended, or edited) is pruned.
+  save(e: E, approval: E, enabled: boolean, roots: readonly string[]): Promise<void>;
   approved(e: E, approval: E): Promise<boolean>;
   // Restore input, one entry per saved root; `approval: null` is a saved
   // record that no longer verifies (edited), which restore reports and skips.

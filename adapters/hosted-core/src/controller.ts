@@ -115,7 +115,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   private async save(r: Root<E>, enabled: boolean) {
     if (!this.port.approval) return;
     await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled);
+    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
     await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
   }
   private async guard(r: Root<E>, epoch: number, signal: AbortSignal) {
