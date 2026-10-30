@@ -14,6 +14,9 @@ export type ControllerOptions = {
   sink?: DiagnosticSink;
   // A name every new root binds before approval (OpenCode's plugin options).
   configured?: { name: string; create: boolean };
+  // The host's own session-ID shape: restored diagnostics for such IDs skip the
+  // active-root lookup (OpenCode passes `ses_…`).
+  knownRoot?: RegExp;
 };
 // A forwarded native tool call's outcome, as a host reports it to afterCall:
 // the tool's parsed result object, or a failure.
@@ -55,7 +58,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   protected stopped = false;
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
-  private state: Status = { state: "unenrolled", message: "Approve an active root; approval does not bind a name", roots: [] };
+  private state: Status;
   private readonly diagnostics: Diagnostics;
   private readonly place: string;
   private readonly wait: Wait;
@@ -65,7 +68,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.wait = options.wait ?? sleep;
     this.configured = options.configured;
     this.place = port.place();
-    this.diagnostics = new Diagnostics(port.storage, options.sink);
+    const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
+    this.state = { state: "unenrolled", message: idle, roots: [] };
+    this.diagnostics = new Diagnostics(port.storage, options.sink, { idle, ...(options.knownRoot ? { knownRoot: options.knownRoot } : {}) });
   }
   private get hint() { return this.port.resumeHint; }
   status(): Status { return this.diagnostics.status(); }
@@ -181,7 +186,10 @@ export class Controller<E extends Enrollment = Enrollment> {
         });
       }
       await this.prepare(r, !!previous?.paused && !name);
-    } catch (error) { this.set(r, r.paused ? "paused" : "approved", `${r.paused ? "Root approval unavailable" : "Root approval saved"}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error))); }
+    } catch (error) {
+      const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
+      this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+    }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }

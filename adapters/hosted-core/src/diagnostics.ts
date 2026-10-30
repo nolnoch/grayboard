@@ -93,7 +93,11 @@ export class Diagnostics {
   private records = new Map<string, RecordStatus>();
   private pending: Promise<void> = Promise.resolve();
   private failed = false;
-  constructor(private readonly storage: KeyValueStorage, private readonly sink?: DiagnosticSink) {}
+  // `idle` is the status before any root records; `knownRoot` pre-accepts a
+  // restored record whose session ID has the host's own ID shape, skipping
+  // the `acceptRoot` lookup (OpenCode's `ses_…`); without it every restored
+  // root goes through `acceptRoot`.
+  constructor(private readonly storage: KeyValueStorage, private readonly sink?: DiagnosticSink, private readonly options: { idle?: string; knownRoot?: RegExp } = {}) {}
   async restore(acceptRoot?: (id: string) => Promise<boolean>) {
     try {
       const values = await this.storage.get(key);
@@ -104,7 +108,7 @@ export class Diagnostics {
         try {
           const r = project(Object.getOwnPropertyDescriptor(values, String(i))?.value, true);
           if (!r) continue;
-          if (r.sessionID && !/^ses_[a-f0-9]{64}$/.test(r.sessionID) && !(acceptRoot && await acceptRoot(r.sessionID))) continue;
+          if (r.sessionID && !this.options.knownRoot?.test(r.sessionID) && !(acceptRoot && await acceptRoot(r.sessionID))) continue;
           this.records.set(r.sessionID ?? "background", r);
         } catch { continue; }
       }
@@ -156,7 +160,7 @@ export class Diagnostics {
     const live = roots.filter(r => !(r.state === "paused" && r.operation === "session_end"));
     const failed = live.find(r => r.state === "paused" || r.state === "degraded");
     const last = failed ?? live.at(-1) ?? roots.at(-1);
-    return { state: this.failed ? "degraded" : last?.state ?? "unenrolled", message: this.failed ? "Diagnostic persistence unavailable; approval is unchanged" : last?.message ?? "Approve an active root; approval does not bind a name", ...(last?.sessionID ? { sessionID: last.sessionID } : {}), roots };
+    return { state: this.failed ? "degraded" : last?.state ?? "unenrolled", message: this.failed ? "Diagnostic persistence unavailable; approval is unchanged" : last?.message ?? this.options.idle ?? "No active root", ...(last?.sessionID ? { sessionID: last.sessionID } : {}), roots };
   }
   async flush() { await this.pending; return !this.failed; }
 }

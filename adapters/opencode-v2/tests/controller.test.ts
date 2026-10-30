@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { OpenCodeController as Controller } from "../src/lifecycle.js";
+import { OpenCodeController as Controller, OPENCODE_SESSION } from "../src/lifecycle.js";
 import { Controller as CoreController } from "../src/core/controller.js";
 import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
@@ -113,7 +113,7 @@ test("stored diagnostics are closed DTOs and hostile records cannot escape or st
   const hostile = { ...safe, sessionID: "ses_" + "c".repeat(64) };
   Object.defineProperty(hostile, "message", { enumerable: true, get() { getters++; throw new Error(secret); } });
   const values = [hostile, { ...safe, ownership: -1 }, { ...safe, failure: { operation: "session_end", code: "operation_failed", time: 1, exception: secret } }, safe];
-  const d = new Diagnostics({ get: async () => values, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) });
+  const d = new Diagnostics({ get: async () => values, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) }, undefined, { knownRoot: OPENCODE_SESSION });
   await d.restore();
   expect(getters).toBe(0); expect(d.status().roots).toHaveLength(1);
   expect(d.status().roots[0]).toMatchObject({ state: "paused", sessionID, ownership: 1 });

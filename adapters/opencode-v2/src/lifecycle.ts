@@ -13,6 +13,8 @@ import { Grayboard } from "./rpc.js";
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
 type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
+// OpenCode's own root session IDs: restored diagnostics for them skip the root lookup.
+export const OPENCODE_SESSION = /^ses_[a-f0-9]{64}$/;
 
 // The OpenCode host behind the HostPort: its location, plugin storage,
 // session tree, native MCP grant, metadata approval and synthetic admission.
@@ -36,7 +38,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   constructor(readonly ctx: Context, readonly options: Options, Transport?: typeof Wire, wait?: Wait, sink?: DiagnosticSink) {
     const latch = { drift: (_message: string) => {} };
     const binding = new Binding(ctx, options.mcpName, () => latch.drift("Native binding changed; explicitly enroll again"), options.issuer);
-    super(hostPort(ctx, options, binding), { Transport, wait, sink, ...(options.name ? { configured: { name: options.name, create: options.create === true } } : {}) });
+    super(hostPort(ctx, options, binding), { Transport, wait, sink, knownRoot: OPENCODE_SESSION, ...(options.name ? { configured: { name: options.name, create: options.create === true } } : {}) });
     latch.drift = message => this.drift(message);
     this.binding = binding;
   }
