@@ -20,9 +20,10 @@ export type CallResult = { status: "completed"; output: unknown } | { status: "e
 // `admitted` holds `ownership:bind_gen:item` keys admitted but not yet
 // receipted, across reconnects in this process: a receipt failure goes straight
 // to the receipt on the next read instead of showing the item again. A key
-// joins only once the post-admission renew proved the lease that admitted it:
-// an admission whose lease was lost meanwhile is never receipted by a later
-// lease, so it re-enters through the pre-admission renew and its attempt budget.
+// joins as soon as the host accepted the item, before the post-admission renew
+// and guard, so a renew that fails (an outage, a lost lease, this Controller's
+// own stop) never shows it twice. A new lease under another ownership or
+// bind_gen has another key, so it admits the item again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
 function sleep(ms: number, signal: AbortSignal) {
@@ -296,11 +297,11 @@ export class Controller<E extends Enrollment = Enrollment> {
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
                 await this.port.admit(e, item, stableID(e, item.id, lease.identity));
+                r.admitted.add(key);
+                while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
-                r.admitted.add(key);
-                while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 inItem = false;
               }, async ids => {
                 await this.guard(r, epoch, signal);

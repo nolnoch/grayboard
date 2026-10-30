@@ -7,7 +7,7 @@ import { Controller } from "../src/controller.js";
 import { Refusal, same, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
-import { LeaseUnavailable, Wire, type WireOptions } from "../src/wire.js";
+import { LeaseUnavailable, ServerUnreachable, Wire, type WireOptions } from "../src/wire.js";
 
 type Mode = "adapter" | "approval";
 type Row = { name: string | null; ownership: number; generation: number; capability?: string };
@@ -21,7 +21,8 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, loseLeaseAt = 0;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0;
+  let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
@@ -47,7 +48,7 @@ function runtime(mode: Mode) {
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
       }
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
-      if (name === "delivery_renew" && ++renews === loseLeaseAt) throw new LeaseUnavailable();
+      if (name === "delivery_renew" && ++renews === renewFault?.at) { renewFault.then?.(); throw renewFault.error(); }
       if (name === "delivery_receipt") {
         if (failReceipt > 0) { failReceipt--; throw new Error("receipt lost"); }
         batches.set(this.sessionID, (batches.get(this.sessionID) ?? []).filter(item => !(args.ids as string[]).includes(item.id)));
@@ -89,7 +90,8 @@ function runtime(mode: Mode) {
     controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named,
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     failReceipt: (n: number) => { failReceipt = n; },
-    loseLeaseAtRenew: (n: number) => { loseLeaseAt = n; },
+    // The nth delivery_renew throws `error` once, after running `then`.
+    failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
 }
@@ -268,10 +270,43 @@ test.each(modes)("a receipt that fails once leaves the item admitted once and re
   } finally { await r.controller.close(); }
 });
 
-test.each(modes)("an admission whose lease was lost before its post-admission renew is admitted again, never receipted by the next lease (%s)", async mode => {
+// The item's first renew is #2 (#1 is the pre-admission renew): it fails
+// after the host accepted the item.
+test.each(modes)("a post-admission renew that fails once (an outage) shows the item once and receipts it after reconnecting (%s)", async mode => {
   const r = runtime(mode);
   try {
-    r.loseLeaseAtRenew(2);
+    r.failRenewAt(2, () => new ServerUnreachable(new Error("blip")));
+    r.batches.set("R", [r.item("direct:1")]);
+    await r.controller.enroll("R", "be", true);
+    await until(() => r.batches.get("R")?.length === 0, 10_000);
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.named("delivery_open")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a post-admission renew that loses the lease: the next lease of the same bind_gen receipts without admitting again (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    r.failRenewAt(2, () => new LeaseUnavailable());
+    r.batches.set("R", [r.item("direct:1")]);
+    await r.controller.enroll("R", "be", true);
+    await until(() => r.batches.get("R")?.length === 0, 10_000);
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.named("delivery_open")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a lease lost after admission whose next lease has a new bind_gen admits the item again under it (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    // The name was rebound meanwhile: the next lease and its inbox carry bind_gen 2.
+    r.failRenewAt(2, () => new LeaseUnavailable(), () => {
+      const row = r.rows.get("R")!;
+      r.rows.set("R", { name: row.name, ownership: row.ownership, generation: row.generation + 1 });
+      r.batches.set("R", [{ ...r.item("direct:1"), bind_gen: 2 }]);
+    });
     r.batches.set("R", [r.item("direct:1")]);
     await r.controller.enroll("R", "be", true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
