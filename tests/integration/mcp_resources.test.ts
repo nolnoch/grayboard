@@ -10,7 +10,7 @@ import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
-import { bindFixture, withSessionMeta } from "../helpers/hosted.ts";
+import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { PROTO } from "../../src/shared/protocol.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
@@ -45,7 +45,7 @@ async function connect(token: string, version = "2026-07-28", role?: string, ide
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(base + "/mcp"), {
     fetch: async (input, init) => {
-      const request = await withSessionMeta(new Request(input, init), OPENCODE_SESSION_META, identity);
+      const request = await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity);
       headers.forEach((value, key) => request.headers.set(key, value));
       return fetch(request);
     },

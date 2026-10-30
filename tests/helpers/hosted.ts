@@ -1,9 +1,10 @@
 import type { Client } from "@modelcontextprotocol/client";
-// `key` is the `_meta` key the connecting client's source mapping reads (#414).
-export async function withSessionMeta(request: Request, key: string, raw: string): Promise<Request> {
+// `key` is the `_meta` key the connecting client's source mapping reads (#414), or its
+// delivery declaration's (#429), whose value is an object.
+export async function withMeta(request: Request, key: string, value: unknown): Promise<Request> {
   if (request.method !== "POST") return request;
   const body = await request.clone().json() as { params?: Record<string, unknown> };
-  body.params = { ...body.params, _meta: { ...(body.params?._meta as Record<string, unknown> | undefined), [key]: raw } };
+  body.params = { ...body.params, _meta: { ...(body.params?._meta as Record<string, unknown> | undefined), [key]: value } };
   return new Request(request, { body: JSON.stringify(body) });
 }
 export async function bindFixture(client: Client, name: string) {

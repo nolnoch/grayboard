@@ -25,6 +25,7 @@ import {
   humanInstruction,
   callBoardTool,
   isBoardTool,
+  DEFAULT_CHANNEL_SOURCE,
 } from "../core/tools.ts";
 import {
   ackMessage,
@@ -308,6 +309,7 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
   const lead = !WRITES_AS && !held.length ? [unboundInstruction(SESSION_ID, unboundCandidates, notes)] : notes;
   return boundInstructions(
     name,
+    DEFAULT_CHANNEL_SOURCE,
     general,
     () => [
       ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
@@ -327,7 +329,7 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
 let unboundCandidates = !WRITES_AS && !held.length ? await candidateNames(db, SUGGESTED) : [];
 
 const mcp = new Server(
-  { name: "grayboard", version: pkg.version },
+  { name: DEFAULT_CHANNEL_SOURCE, version: pkg.version },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

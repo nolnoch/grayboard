@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { asSessionId, boundInstructions, describeCandidate, type Candidate } from "../core/bindings.ts";
+import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import { harnessFor } from "./oauth-config.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, harnessFor } from "./oauth-config.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -32,6 +34,22 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   return sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
 }
+// A generic-key client's declared delivery (#429): how its sessions receive messages, so
+// `initialize` and bind results describe that delivery with the client's own channel
+// source. Text only: it grants and authorizes nothing, so nothing audits it. Other
+// clients' declarations are never read, so OpenCode's text can't change.
+export type DeclaredDelivery = { mode: "push" | "poll"; source: string };
+const DELIVERY_SOURCE = /^[a-z0-9][a-z0-9:._-]{0,63}$/;
+const DELIVERY = z.strictObject({ mode: z.enum(["push", "poll"]), source: z.string().regex(DELIVERY_SOURCE) });
+export function deliveryDeclaration(principal: OAuthPrincipal, meta: unknown): DeclaredDelivery | undefined {
+  if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_DELIVERY_META in meta)) return undefined;
+  const raw = meta[GRAYBOARD_DELIVERY_META];
+  const parsed = DELIVERY.safeParse(raw);
+  // No fallback: a malformed declaration would otherwise get text for the wrong delivery.
+  if (!parsed.success) throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_DELIVERY_META}"] must be {"mode": "push" | "poll", "source": matching ${DELIVERY_SOURCE.source}}`);
+  return parsed.data;
+}
+const POLL_NOTE = "No pushes reach this session; check dm_inbox and board_read yourself.";
 // A hosted session with no name reads and nothing else (master's model; see
 // UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
 // as its ID (#284 S13).
@@ -39,6 +57,17 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
   const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
   return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+}
+// A bound native session's `initialize` text. Without a push declaration it assumes a
+// polling client, so the channel lines don't apply.
+export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery): string {
+  return [
+    ...(declared?.mode === "push"
+      ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared.source)]
+      : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, ...(declared ? [POLL_NOTE] : []), ...COORDINATION_INSTRUCTIONS]),
+    ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
+    ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
+  ].join(" ");
 }
 // A hosted bind's result: a hosted session holds one name, so a bind
 // replaces it and its claims follow (master's #182 text, kept for hosted).
@@ -314,7 +343,8 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(!root?.name ? { unbound: true, candidates: application.hostedCandidates(p.authed) } : {}) };
       });
     },
-    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; where?: string }) {
+    // `declared`: the native request's declaration (deliveryDeclaration); text only.
+    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeIdentityName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
       const name = normalized.name;
@@ -353,9 +383,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         }
         throw error;
       });
+      // A push client opens delivery right after bind and reports it itself if it can't. A
+      // poll session gets no channel lines, as in its `initialize` text.
+      const note = !declared ? [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
+      const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const response = hostedBindOk(result.name, result.previous, result.moved,
-        general => boundInstructions(result.name, general, () => [], []),
-        [`No delivery lease is open for this session, so DMs to "${result.name}" wait until the client opens one (delivery_open).`]);
+        general => boundInstructions(result.name, source, general, () => [], []), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     async register(p: OAuthPrincipal, context: SessionContext, child: string, via: string[] = []) {

@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { exchangeGoogleCode, hashToken, type AuthedUser } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
-import { matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
@@ -98,8 +98,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const endpoint = (path: string) => issuer + path;
   const metadataPath = "/.well-known/oauth-protected-resource" + prefix + "/mcp";
   const resourceMetadata = base.origin + metadataPath;
-  const clients = new Map(parseOAuthClients(JSON.stringify(config.oauthClients ?? [])).map(c => [c.clientId, c]));
+  // Built-ins first; parseOAuthClients refuses an operator entry that reuses a built-in ID.
+  const clients = new Map([...BUILTIN_CLIENTS, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
+  // Before any request, and only once the config parsed: a grant an operator client issued
+  // under a now-built-in ID (before #429) would otherwise act as a built-in's.
+  const revoked = repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now());
+  if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
   const cimd = createCimdResolver({ ...options.cimd, now });
   const resolveClient = async (id: string) => {
     const manual = clients.get(id);
@@ -251,7 +256,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       authorization_endpoint: endpoint("/oauth/authorize"), token_endpoint: endpoint("/oauth/token"), revocation_endpoint: endpoint("/oauth/revoke"),
       response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], scopes_supported: OAUTH_SCOPES,
       code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
-      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true });
+      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true,
+      // RFC 8414 §2 extension: an adapter tells an older server apart before it opens a browser (#429).
+      grayboard_builtin_clients: BUILTIN_CLIENT_IDS });
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
     const tokenRoute = req.method === "POST" && (path === "/oauth/token" || path === "/oauth/revoke");

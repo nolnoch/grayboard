@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { GRAYBOARD_SESSION_META, matchesRedirect, oauthPublicUrl, OPENCODE_CLIENT, OPENCODE_SESSION_META, parseOAuthClients, sourceKeyFor, validateRedirect, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, GRAYBOARD_SESSION_META, harnessFor, matchesRedirect, oauthPublicUrl, OPENCODE_CLIENT, OPENCODE_SESSION_META, parseOAuthClients, sourceKeyFor, validateRedirect, type OAuthClient } from "./oauth-config.ts";
 const client: OAuthClient = { clientId: "native", name: "Native", redirectUris: ["http://127.0.0.1/callback?fixed=1", "http://[::1]/callback", "https://client.example/callback"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "none" };
 test("client registration is strict, bounded, hash-only, and opt-in for refresh", () => {
   expect(parseOAuthClients(undefined)).toEqual([]);
@@ -29,6 +29,30 @@ test("sessionSource is an operator boolean opt-in, refused on any https: client 
   const clients = parseOAuthClients(JSON.stringify(parseOAuthClients(JSON.stringify([{ ...client, sessionSource: true }, { ...client, clientId: "plain" }, { ...client, clientId: OPENCODE_CLIENT }]))));
   const map = new Map(clients.map(c => [c.clientId, c]));
   expect(["native", "plain", OPENCODE_CLIENT, "unregistered"].map(id => sourceKeyFor(id, map))).toEqual([GRAYBOARD_SESSION_META, null, OPENCODE_SESSION_META, null]);
+});
+test("built-in clients are public loopback clients that map the generic key and label their harness", () => {
+  expect(BUILTIN_CLIENT_IDS).toEqual(["grayboard-pi", "grayboard-omp", "grayboard-claude-code"]);
+  for (const c of BUILTIN_CLIENTS) {
+    expect(c).toMatchObject({ tokenEndpointAuthMethod: "none", allowRefresh: true, scopes: ["grayboard:delivery", "grayboard:tools"], redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"] });
+    expect(c.clientSecretHash).toBeUndefined();
+    // The built-in shape is one the operator parser accepts, so nothing about it is special-cased.
+    expect(parseOAuthClients(JSON.stringify([{ ...c, clientId: `copy-${c.clientId}` }]))[0]).toMatchObject({ ...c, clientId: `copy-${c.clientId}` });
+    for (const uri of ["http://127.0.0.1:49152/callback", "http://[::1]:61000/callback", "http://127.0.0.1/callback"]) expect(matchesRedirect(c, uri)).toBe(true);
+    for (const uri of ["http://localhost:49152/callback", "http://127.0.0.1:49152/other", "http://127.0.0.1:49152/callback?x=1", "https://127.0.0.1:49152/callback", "https://client.example/callback", "http://127.0.0.2:49152/callback"]) expect(matchesRedirect(c, uri)).toBe(false);
+  }
+  // Mapped by code, not by the operator map: an empty map still maps them.
+  expect(BUILTIN_CLIENT_IDS.map(id => sourceKeyFor(id, new Map()))).toEqual([GRAYBOARD_SESSION_META, GRAYBOARD_SESSION_META, GRAYBOARD_SESSION_META]);
+  expect(BUILTIN_CLIENT_IDS.map(harnessFor)).toEqual(["pi", "omp", "claude-code"]);
+  expect([harnessFor(OPENCODE_CLIENT), harnessFor("native")]).toEqual(["opencode", "native"]);
+});
+test("an operator client reusing a built-in ID is refused, so that server doesn't start", () => {
+  for (const clientId of BUILTIN_CLIENT_IDS) {
+    for (const patch of [{}, { sessionSource: true }]) {
+      expect(() => parseOAuthClients(JSON.stringify([{ ...client, clientId, ...patch }]))).toThrow(`OAuth client ID ${clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    }
+  }
+  // Exact IDs only: another spelling is an ordinary operator client.
+  expect(parseOAuthClients(JSON.stringify([{ ...client, clientId: "grayboard-pi-fork" }]))).toHaveLength(1);
 });
 test("redirect matching is exact except a registered loopback HTTP port", () => {
   for (const url of ["http://127.0.0.1:45678/callback?fixed=1", "http://[::1]:45678/callback", "https://client.example/callback"]) expect(matchesRedirect(client, url)).toBe(true);

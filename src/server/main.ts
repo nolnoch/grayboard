@@ -1,6 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { loadConfig } from "./config.ts";
 import { startServer } from "./app.ts";
+import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
 
 // Before loadConfig, which refuses to run without the server's env.
 if (process.argv.includes("--version")) {
@@ -29,7 +30,8 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
-// Write-capable hosted clients are an operator trust decision (#414); say which at every start.
+// Write-capable hosted clients are a trust decision (#414, #429); say which at every start.
 const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
 console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
+console.log(`grayboard server: built-in clients: ${BUILTIN_CLIENT_IDS.join(", ")}`);
 

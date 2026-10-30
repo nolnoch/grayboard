@@ -11,7 +11,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { sessionContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
-import { withSessionMeta } from "../helpers/hosted.ts";
+import { withMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string;
 const clients: Client[] = [];
@@ -35,7 +35,7 @@ async function connect(version: string, token: string, source: string) {
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Client": "subscriber" } },
-    fetch: async (input, init) => fetch(await withSessionMeta(new Request(input, init), OPENCODE_SESSION_META, source)),
+    fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, source)),
   }));
   return client;
 }
