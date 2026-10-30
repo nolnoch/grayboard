@@ -16,6 +16,7 @@ import { AccessExpired, Refusal, RefreshInProgress, ServerOutdated, type AccessR
 import type { Configuration, CredentialPort, Enrollment } from "./port.js";
 import { readJson, sha256, writeJsonAtomic } from "./storage.js";
 import { ServerUnreachable } from "./wire.js";
+import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 
 export const SCOPES = "grayboard:tools grayboard:delivery";
 const FLOW_MS = 10 * 60_000;       // the browser round trip's bound
@@ -52,7 +53,7 @@ const Store = z.strictObject({
   refresh: z.string().optional(),
   pending: z.number().int().optional(), // a refresh request is (or was, if its process died) in flight since this time
   loginRequired: z.strictObject({ reason: Reason }).optional(),
-  revoke: z.array(z.string()).optional(), // refresh tokens still to revoke; the next login or refresh sends them
+  revoke: z.array(z.string()).optional(), // refresh tokens still to revoke; the next login, refresh or logout sends them
 });
 export type GrantStore = z.infer<typeof Store>;
 type Live = GrantStore & { issuer: string; scope: string; access: string; accessExpiresAt: number; refresh: string };
@@ -82,15 +83,35 @@ const TokenResponse = z.object({
 // gateway's or proxy's.
 const OAuthRefusal = z.strictObject({ error: z.string() });
 
-// The request never reached the server: nothing was spent.
+// Failed before the request was sent, so nothing was spent: refused,
+// unresolvable or unroutable, or undici's connect timeout. Anything else, a
+// TLS alert included, may come after the body went out.
 const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
-const tlsCode = /CERT|TLS|SSL|SELF_SIGNED|ISSUER|ALTNAME|HANDSHAKE/;
+function codeOf(e: unknown): string | undefined {
+  const code = e && typeof e === "object" && "code" in e ? e.code : undefined;
+  return typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined;
+}
 function connectFailure(error: unknown): boolean {
-  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
-    const code = (e as { code?: unknown }).code;
-    if (typeof code === "string" && (connectCodes.has(code) || tlsCode.test(code))) return true;
+  for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    const code = codeOf(e);
+    if (code && connectCodes.has(code)) return true;
   }
   return false;
+}
+// Why a request failed, for a diagnostic: a timeout, an errno or TLS code,
+// else the error's class. Never a body, a URL or a token.
+function failureCause(error: unknown, timeoutMs: number): string {
+  for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof Error && e.name === "TimeoutError") return `timeout after ${timeoutMs / 1000}s`;
+    const code = codeOf(e);
+    if (code) return code;
+  }
+  if (error instanceof ServerUnreachable) return "server unreachable";
+  return error instanceof Error ? printable(error.name) : "unknown failure";
+}
+// A response's status and media type, e.g. `HTTP 502 text/html`.
+function httpCause(response: Response): string {
+  return `HTTP ${response.status} ${printable(response.headers.get("content-type")?.split(";")[0]?.trim() || "no content type")}`;
 }
 function refusalOf(response: Response, text: string): string | undefined {
   if (!response.headers.get("content-type")?.includes("application/json")) return undefined;
@@ -106,7 +127,9 @@ export class Login {
   private refreshing?: Promise<string>;
   private signingIn?: Promise<void>;
   constructor(readonly config: LoginConfig) {
-    this.resource = new URL(config.resource).href;
+    const resource = canonicalEndpoint(config.resource);
+    if (!resource) throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
+    this.resource = resource.href;
     this.path = join(config.stateDir, "grants", `${sha256(`${this.resource}\n${config.clientId}`)}.json`);
   }
   private get refreshLock() { return `${this.path}.refresh.lock`; }
@@ -154,18 +177,26 @@ export class Login {
     return this.refreshing;
   }
   private async refreshLocked(stale: string | undefined): Promise<string> {
-    let lock: Lock;
-    try { lock = await acquire(this.refreshLock, { deadlineMs: REFRESH_LOCK_MS }); }
-    catch (error) {
-      if (!(error instanceof LockTimeout)) throw error;
+    // A token still valid serves at once while another process refreshes:
+    // the SDK's request timer is already running. Only an expired (or
+    // rejected) token waits for that refresh.
+    const usable = (s: Live) => s.access !== stale && s.accessExpiresAt > Date.now();
+    let lock = tryAcquire(this.refreshLock);
+    if (!lock) {
       const s = await this.live();
-      if (s.access !== stale && s.accessExpiresAt > Date.now()) return s.access;
-      throw new RefreshInProgress(this.config.harness);
+      if (usable(s)) return s.access;
+      try { lock = await acquire(this.refreshLock, { deadlineMs: REFRESH_LOCK_MS }); }
+      catch (error) {
+        if (!(error instanceof LockTimeout)) throw error;
+        const now = await this.live();
+        if (usable(now)) return now.access;
+        throw new RefreshInProgress(this.config.harness);
+      }
     }
     try {
       const s = await this.live();
       // The previous holder died mid-request: its outcome is unknown.
-      if (s.pending !== undefined) return await this.unknown(s, undefined);
+      if (s.pending !== undefined) return await this.unknown(s, undefined, `pending since ${new Date(s.pending).toISOString()}, holder died`);
       if (stale === undefined ? s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS : s.access !== stale) return s.access;
       // Preflight: an unreachable server spends nothing.
       let meta: ServerMetadata;
@@ -176,15 +207,17 @@ export class Login {
       try {
         response = await fetch(meta.token_endpoint, { ...form({ grant_type: "refresh_token", client_id: this.config.clientId, refresh_token: s.refresh, resource: this.resource }), signal: AbortSignal.timeout(10_000) });
       } catch (error) {
-        if (!connectFailure(error)) return await this.unknown(s, meta);
+        if (!connectFailure(error)) return await this.unknown(s, meta, failureCause(error, 10_000));
         await this.write(s);
         throw new ServerUnreachable(error);
       }
-      try { text = await response.text(); } catch { return await this.unknown(s, meta); }
+      try { text = await response.text(); } catch (error) { return await this.unknown(s, meta, `${httpCause(response)}, body ${failureCause(error, 10_000)}`); }
       if (response.status === 200) {
         let issued: z.infer<typeof TokenResponse>;
-        try { issued = TokenResponse.parse(JSON.parse(text)); } catch { return await this.unknown(s, meta); }
-        await this.write({ ...s, access: issued.access_token, accessExpiresAt: Date.now() + issued.expires_in * 1000, refresh: issued.refresh_token, scope: issued.scope });
+        try { issued = TokenResponse.parse(JSON.parse(text)); } catch { return await this.unknown(s, meta, "200 body invalid"); }
+        const next: Live = { ...s, access: issued.access_token, accessExpiresAt: Date.now() + issued.expires_in * 1000, refresh: issued.refresh_token, scope: issued.scope };
+        await this.write(next);
+        this.revoked("refresh", await this.revokeQueued(next, meta));
         return issued.access_token;
       }
       const refusal = refusalOf(response, text);
@@ -199,39 +232,57 @@ export class Login {
         await this.write(s);
         throw new ServerUnreachable(new Error(`token endpoint answered HTTP ${response.status}`));
       }
-      return await this.unknown(s, meta);
+      return await this.unknown(s, meta, `${httpCause(response)}${refusal ? ` ${printable(refusal)}` : ""}`);
     } finally { lock.release(); }
   }
   // The server may have committed the rotation (it marks the token spent
   // before replying), and any reuse revokes the grant as a replay. So the
   // token is never sent again: it is queued and revoked (audited
-  // `oauth.revoked`), and a new sign-in is required.
-  private async unknown(s: Live, meta: ServerMetadata | undefined): Promise<never> {
+  // `oauth.revoked`), and a new sign-in is required. `cause` is printable
+  // and carries no body or token.
+  private async unknown(s: Live, meta: ServerMetadata | undefined, cause: string): Promise<never> {
     const next = this.signedOut(s, "refresh_outcome_unknown", [...(s.revoke ?? []), s.refresh]);
     await this.write(next);
-    this.config.diagnostic({ state: "paused", message: `Token refresh outcome unknown; its grant is revoked; ${this.config.loginAction}`, operation: "refresh", code: "refresh_outcome_unknown" });
-    try { await this.revokeQueued(next, meta ?? await this.serverMetadata(s.issuer, 5_000)); } catch {}
+    const queued = await this.revokeQueued(next, meta);
+    this.config.diagnostic({ state: "paused", message: `Token refresh outcome unknown (${cause}); grant ${queued === undefined ? "revoked" : `queued (${queued})`}; ${this.config.loginAction}`, operation: "refresh", code: "refresh_outcome_unknown" });
     throw this.expired("refresh_outcome_unknown");
   }
   // Revokes every queued refresh token (revoking a refresh token, spent or
-  // not, revokes its grant); a failure stays queued. Holds the refresh lock.
-  private async revokeQueued(s: GrantStore, meta: ServerMetadata): Promise<void> {
-    if (!s.revoke?.length) return;
-    const remaining = await this.revokeTokens(s.revoke, meta);
+  // not, revokes its grant). Returns undefined once the queue is empty, else
+  // why the rest stays queued for the next login, refresh or logout. Never
+  // throws; holds the refresh lock.
+  private async revokeQueued(s: GrantStore, meta?: ServerMetadata): Promise<string | undefined> {
+    if (!s.revoke?.length) return undefined;
+    if (!meta) {
+      try { meta = s.issuer ? await this.serverMetadata(s.issuer, 5_000) : await this.discover(); }
+      catch (error) { return `metadata ${failureCause(error, s.issuer ? 5_000 : 10_000)}`; }
+    }
+    const { remaining, cause } = await this.revokeTokens(s.revoke, meta);
     const { revoke: _, ...rest } = s;
-    await this.write(remaining.length ? { ...rest, revoke: remaining } : rest);
+    try { await this.write(remaining.length ? { ...rest, revoke: remaining } : rest); }
+    catch (error) { return `store write ${failureCause(error, 0)}`; }
+    return remaining.length ? cause : undefined;
   }
-  // The tokens the server didn't confirm revoked.
-  private async revokeTokens(tokens: string[], meta: ServerMetadata): Promise<string[]> {
+  // A revoke that failed leaves its grant live on the server until the next
+  // login, refresh or logout sends it again; the record says so.
+  private revoked(operation: "login" | "refresh" | "logout", queued: string | undefined) {
+    if (queued === undefined) return;
+    const message = operation === "logout" ? `Signed out; revoking the grant failed and stays queued for the next login (${queued})`
+      : `Revoking a replaced grant failed and stays queued for the next login, refresh or logout (${queued})`;
+    this.config.diagnostic({ state: "degraded", message, operation, code: "revoke_queued" });
+  }
+  // The tokens the server didn't confirm revoked, and why the first failed.
+  private async revokeTokens(tokens: string[], meta: ServerMetadata): Promise<{ remaining: string[]; cause: string }> {
     const remaining: string[] = [];
+    let cause: string | undefined;
     for (const token of tokens) {
       try {
         const response = await fetch(meta.revocation_endpoint, { ...form({ token, token_type_hint: "refresh_token", client_id: this.config.clientId }), signal: AbortSignal.timeout(10_000) });
         await response.body?.cancel();
-        if (response.status !== 200) remaining.push(token);
-      } catch { remaining.push(token); }
+        if (response.status !== 200) { remaining.push(token); cause ??= httpCause(response); }
+      } catch (error) { remaining.push(token); cause ??= failureCause(error, 10_000); }
     }
-    return remaining;
+    return { remaining, cause: cause ?? "none" };
   }
 
   // ---- discovery ----
@@ -247,7 +298,8 @@ export class Login {
   // RFC 8414 metadata for `issuer`, from the resource's origin like every
   // grayboard endpoint (a resource never sends its tokens elsewhere).
   private async serverMetadata(issuer: string, timeoutMs: number): Promise<ServerMetadata> {
-    const at = new URL(issuer), origin = new URL(this.resource).origin;
+    const at = canonicalEndpoint(issuer), origin = new URL(this.resource).origin;
+    if (!at) throw new Error("OAuth issuer must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     if (at.origin !== origin) throw new Error(`OAuth issuer ${issuer} is not on ${origin}`);
     const meta = ServerMetadata.parse(await this.getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
     if (meta.issuer !== issuer) throw new Error(`OAuth metadata names issuer ${meta.issuer}, expected ${issuer}`);
@@ -288,8 +340,12 @@ export class Login {
     }
     try {
       const now = await this.read();
+      // A waiter shares whatever grant the store holds once it gets the lock.
+      if (waited) {
+        if (live(now)) return;
+        throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
+      }
       if (now?.epoch !== before && live(now)) return;
-      if (waited) throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       await this.flow(signal);
     } finally { lock.release(); }
   }
@@ -333,7 +389,8 @@ export class Login {
     let lock: Lock;
     try { lock = await acquire(this.refreshLock, { deadlineMs: REFRESH_LOCK_MS }); }
     catch (error) {
-      await this.revokeTokens([issued.refresh_token], meta);
+      const { remaining, cause } = await this.revokeTokens([issued.refresh_token], meta);
+      if (remaining.length) this.config.diagnostic({ state: "degraded", message: `Sign-in discarded its new grant; revoking it failed (${cause})`, operation: "login", code: "operation_failed" });
       throw error instanceof LockTimeout ? new RefreshInProgress(this.config.harness) : error;
     }
     try {
@@ -342,7 +399,7 @@ export class Login {
       const next: GrantStore = { version: 1, resource: this.resource, clientId: this.config.clientId, epoch: randomBytes(16).toString("base64url"), issuer: meta.issuer, scope: issued.scope,
         access: issued.access_token, accessExpiresAt: Date.now() + issued.expires_in * 1000, refresh: issued.refresh_token, ...(revoke.length ? { revoke } : {}) };
       await this.write(next);
-      await this.revokeQueued(next, meta);
+      this.revoked("login", await this.revokeQueued(next, meta));
     } finally { lock.release(); }
   }
   // The queue a failed revoke left goes out before a new flow starts.
@@ -352,7 +409,7 @@ export class Login {
     let lock: Lock;
     try { lock = await acquire(this.refreshLock, { deadlineMs: REFRESH_LOCK_MS }); }
     catch (error) { if (error instanceof LockTimeout) return; throw error; }
-    try { const current = await this.read(); if (current) await this.revokeQueued(current, meta); }
+    try { const current = await this.read(); if (current) this.revoked("login", await this.revokeQueued(current, meta)); }
     finally { lock.release(); }
   }
   // The loopback redirect target (RFC 8252): 127.0.0.1 on a free port. Only
@@ -391,13 +448,10 @@ export class Login {
     try {
       const s = await this.read();
       const revoke = [...(s?.revoke ?? []), ...(s?.refresh ? [s.refresh] : [])];
-      const next: GrantStore = { version: 1, resource: this.resource, clientId: this.config.clientId, epoch: randomBytes(16).toString("base64url"), loginRequired: { reason: "logged_out" }, ...(revoke.length ? { revoke } : {}) };
+      const next: GrantStore = { version: 1, resource: this.resource, clientId: this.config.clientId, epoch: randomBytes(16).toString("base64url"), ...(s?.issuer ? { issuer: s.issuer } : {}),
+        loginRequired: { reason: "logged_out" }, ...(revoke.length ? { revoke } : {}) };
       await this.write(next);
-      if (revoke.length) {
-        let meta: ServerMetadata | undefined;
-        try { meta = s?.issuer ? await this.serverMetadata(s.issuer, 5_000) : await this.discover(); } catch {}
-        if (meta) await this.revokeQueued(next, meta);
-      }
+      this.revoked("logout", await this.revokeQueued(next));
     } finally { lock.release(); }
   }
 

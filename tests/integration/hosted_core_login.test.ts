@@ -11,8 +11,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AccessExpired, Refusal, ServerOutdated } from "../../adapters/hosted-core/src/model.ts";
-import { Login, type GrantStore, type LoginConfig } from "../../adapters/hosted-core/src/login.ts";
-import { InsufficientScope, NativeWire } from "../../adapters/hosted-core/src/wire.ts";
+import { Login, LoginFailed, type GrantStore, type LoginConfig } from "../../adapters/hosted-core/src/login.ts";
+import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
+import { InsufficientScope, NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import type { RecordStatus } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { startServer } from "../../src/server/app.ts";
@@ -109,6 +110,20 @@ async function seed(options: { scopes?: string[]; access?: string; expiresIn?: n
 const audits = (action: string) => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
 const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ?").get(CLIENT)!.n;
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
+// The client's fetch, with the requests `answer` picks answered here: a
+// Response to return or an Error to throw; undefined sends the request.
+async function withFetch<T>(answer: (url: string, form: URLSearchParams | undefined) => Response | Error | undefined, run: () => Promise<T>): Promise<T> {
+  const fetch0 = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const outcome = answer(input instanceof Request ? input.url : String(input), init?.body instanceof URLSearchParams ? init.body : undefined);
+    if (outcome instanceof Error) throw outcome;
+    return outcome ?? fetch0(input, init);
+  }) as typeof fetch;
+  try { return await run(); } finally { globalThis.fetch = fetch0; }
+}
+const refreshForm = (form: URLSearchParams | undefined) => form?.get("grant_type") === "refresh_token";
+const revokeForm = (form: URLSearchParams | undefined) => !!form && form.get("token_type_hint") === "refresh_token" && !form.has("grant_type");
+const down = () => new Response("down", { status: 503, headers: { "Content-Type": "text/plain" } });
 
 type Line = { started?: number; ok?: unknown; error?: string; message?: string; reason?: string; present?: string; notify?: string; diagnostic?: { code?: string }; done?: true };
 // A login-client process; `next` waits for its next line matching `match`.
@@ -208,6 +223,37 @@ test("a server without the harness's built-in client is ServerOutdated, before a
   expect(l.seen.presented).toEqual([]);
 });
 
+test("a sign-in waiter succeeds whenever the store is live once it holds the lock, and fails only without a live grant", async () => {
+  const { store } = await seed({ expiresIn: 3_600_000 });
+  const l = login();
+  // Another session's sign-in holds the lock; the store already held this
+  // grant when the waiter first read it, so the epoch never changes.
+  let held = tryAcquire(`${l.path}.login.lock`)!;
+  const shared = l.login();
+  await until(() => l.seen.notices.length === 1, 10_000, "waiter notice");
+  held.release();
+  await shared;
+  expect((await l.read())!.epoch).toBe(store.epoch);
+  await writeJsonAtomic(l.path, { version: 1, resource, clientId: CLIENT, epoch: store.epoch, loginRequired: { reason: "logged_out" } } satisfies GrantStore);
+  held = tryAcquire(`${l.path}.login.lock`)!;
+  const failed = l.login();
+  await until(() => l.seen.notices.length === 2, 10_000, "second waiter notice");
+  held.release();
+  await expect(failed).rejects.toBeInstanceOf(LoginFailed);
+  expect(l.seen.presented).toEqual([]);
+  expect(grants()).toBe(1);
+});
+
+test("the resource and the discovered issuer must be canonical HTTPS or loopback HTTP, without credentials, query or fragment", async () => {
+  for (const bad of ["http://grayboard.example.com/mcp", "https://user:pw@grayboard.example.com/mcp", "https://grayboard.example.com/mcp?x=1", "https://grayboard.example.com/mcp#f"])
+    expect(() => login({ resource: bad })).toThrow("Grayboard resource must be canonical HTTPS (or HTTP loopback)");
+  expect(login({ resource: "https://grayboard.example.com/mcp" }).resource).toBe("https://grayboard.example.com/mcp");
+  const l = login();
+  const discovered = withFetch(url => url.includes("/.well-known/oauth-protected-resource") ? Response.json({ resource, authorization_servers: [issuer.replace("http://", "http://user@")] }) : undefined, () => l.login());
+  await expect(discovered).rejects.toThrow("OAuth issuer must be canonical HTTPS (or HTTP loopback)");
+  expect(l.seen.presented).toEqual([]);
+});
+
 // ---- refresh ----
 
 test("two processes refreshing one expired store make exactly one refresh request and both end on the new token", async () => {
@@ -275,6 +321,7 @@ test("a dropped refresh response: login required, one oauth.revoked, no replay, 
   expect(error).toBeInstanceOf(AccessExpired);
   expect((error as AccessExpired).reason).toBe("refresh_outcome_unknown");
   expect(l.seen.diagnostics).toEqual([expect.objectContaining({ operation: "refresh", code: "refresh_outcome_unknown" })]);
+  expect(l.seen.diagnostics[0]!.message).toMatch(/^Token refresh outcome unknown \([^)]+\); grant revoked; run \/grayboard login$/);
   const s = (await l.read())!;
   expect(s.loginRequired).toEqual({ reason: "refresh_outcome_unknown" });
   expect(s.revoke).toBeUndefined();
@@ -297,6 +344,53 @@ test("invalid_grant requires a login, with no retry", async () => {
   expect((await l.read())!.loginRequired).toEqual({ reason: "invalid_grant" });
   await expect(l.token()).rejects.toBeInstanceOf(AccessExpired);
   expect(refreshes).toBe(1);
+});
+
+// The old token would serve only after the 15 s lock wait, past this test's
+// 10 s bound (and the SDK's 10 s request timer).
+test("while another process refreshes, a token that is still valid serves at once", async () => {
+  const { store } = await seed({ expiresIn: 30_000 }); // inside the refresh margin, not expired
+  const l = login();
+  const held = tryAcquire(`${l.path}.refresh.lock`)!;
+  try { expect(await l.token()).toBe(store.access); } finally { held.release(); }
+  expect(refreshes).toBe(0);
+  expect(await l.read()).toEqual(store);
+}, 10_000);
+
+test("a TLS failure once the refresh request may have gone out is an unknown outcome; a refused connection spends nothing", async () => {
+  const { store } = await seed();
+  const l = login();
+  const refused = new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+  await expect(withFetch((_url, form) => refreshForm(form) ? refused : undefined, () => l.token())).rejects.toBeInstanceOf(ServerUnreachable);
+  expect(await l.read()).toEqual(store);
+  const tls = new TypeError("fetch failed", { cause: Object.assign(new Error("tlsv1 alert internal error"), { code: "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR" }) });
+  const error = await withFetch((_url, form) => refreshForm(form) ? tls : undefined, () => l.token()).then(() => undefined, e => e);
+  expect(error).toBeInstanceOf(AccessExpired);
+  expect((error as AccessExpired).reason).toBe("refresh_outcome_unknown");
+  expect(l.seen.diagnostics).toEqual([{ state: "paused", message: "Token refresh outcome unknown (ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR); grant revoked; run /grayboard login", operation: "refresh", code: "refresh_outcome_unknown" }]);
+  expect((await l.read())!).toMatchObject({ loginRequired: { reason: "refresh_outcome_unknown" } });
+  expect(liveGrants()).toBe(0);
+  expect(refreshes).toBe(0);
+});
+
+test("a successful refresh sends the revokes still queued; one the server doesn't confirm stays queued and is recorded", async () => {
+  const other = issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const { store } = await seed();
+  const l = login();
+  await writeJsonAtomic(l.path, { ...store, revoke: [other.refreshToken] } satisfies GrantStore);
+  const first = await withFetch((_url, form) => revokeForm(form) ? down() : undefined, () => l.token());
+  expect(first).not.toBe(store.access);
+  expect((await l.read())!.revoke).toEqual([other.refreshToken]);
+  expect(l.seen.diagnostics).toEqual([{ state: "degraded", message: "Revoking a replaced grant failed and stays queued for the next login, refresh or logout (HTTP 503 text/plain)", operation: "refresh", code: "revoke_queued" }]);
+  expect(liveGrants()).toBe(2);
+  await writeJsonAtomic(l.path, { ...(await l.read())!, accessExpiresAt: Date.now() - 1_000 });
+  const second = await l.token();
+  expect(second).not.toBe(first);
+  expect((await l.read())!.revoke).toBeUndefined();
+  expect(l.seen.diagnostics).toHaveLength(1);
+  expect(refreshes).toBe(2);
+  expect(audits("oauth.revoked")).toBe(1);
+  expect(liveGrants()).toBe(1);
 });
 
 test("a token endpoint that doesn't know the client is ServerOutdated and spends nothing", async () => {
@@ -358,4 +452,27 @@ test("credential port: capture, check, token; logout revokes the grant, drifts e
   expect(audits("oauth.revoked")).toBe(1);
   expect(liveGrants()).toBe(0);
   expect(refreshes).toBe(0);
+});
+
+test("a revoke the server doesn't confirm stays queued and says why: on an unknown refresh outcome and on logout", async () => {
+  await seed();
+  const l = login();
+  // Forwarded, so the server spends the token; the response is lost, and the
+  // revoke that follows is refused.
+  onRefresh = async (_req, _body, res, send) => { await (await send()).arrayBuffer(); res.destroy(); };
+  const error = await withFetch((_url, form) => revokeForm(form) ? down() : undefined, () => l.token()).then(() => undefined, e => e);
+  expect(error).toBeInstanceOf(AccessExpired);
+  expect(l.seen.diagnostics).toEqual([expect.objectContaining({ state: "paused", operation: "refresh", code: "refresh_outcome_unknown" })]);
+  expect(l.seen.diagnostics[0]!.message).toMatch(/^Token refresh outcome unknown \([^)]+\); grant queued \(HTTP 503 text\/plain\); run \/grayboard login$/);
+  expect((await l.read())!.revoke).toHaveLength(1);
+  expect(liveGrants()).toBe(1);
+  await withFetch((_url, form) => revokeForm(form) ? down() : undefined, () => l.logout());
+  expect(l.seen.diagnostics.at(-1)).toEqual({ state: "degraded", message: "Signed out; revoking the grant failed and stays queued for the next login (HTTP 503 text/plain)", operation: "logout", code: "revoke_queued" });
+  expect((await l.read())!.revoke).toHaveLength(1);
+  expect(liveGrants()).toBe(1);
+  await l.logout();
+  expect((await l.read())!.revoke).toBeUndefined();
+  expect(l.seen.diagnostics).toHaveLength(2);
+  expect(liveGrants()).toBe(0);
+  expect(audits("oauth.refresh_replay_revoked")).toBe(0);
 });

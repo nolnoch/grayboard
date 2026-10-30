@@ -14,6 +14,7 @@ import {
   sendWithUploads, SendLanded, serverBusDir, type AttachmentTransport,
 } from "../../../src/shared/attachments.ts";
 import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
+import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 
 const NativeToolSchema = z.strictObject({
   name: z.string().min(1),
@@ -117,9 +118,11 @@ export class ToolProxy {
   private readonly roots: string[];
   private readonly resource: URL;
   constructor(readonly options: ProxyOptions) {
+    const resource = canonicalEndpoint(options.wire.url);
+    if (!resource) throw new Error("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.current = hostTools(snapshotTools());
     this.roots = options.roots ?? attachRoots();
-    this.resource = new URL(options.wire.url);
+    this.resource = resource;
   }
 
   tools(): NativeTool[] { return this.current; }

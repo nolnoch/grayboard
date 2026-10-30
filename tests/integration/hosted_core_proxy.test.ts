@@ -89,6 +89,13 @@ test("before login: the snapshot's tools with local-path attachments, and every 
   await expect(expired.instructions("pi-root")).rejects.toBeInstanceOf(AccessExpired);
 });
 
+test("the MCP URL must be canonical HTTPS or loopback HTTP, without credentials, query or fragment", () => {
+  const wire = { sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-pi", version: "1.0.0" }, delivery: { mode: "push" as const, source: "grayboard-pi" } };
+  for (const url of ["http://grayboard.example.com/mcp", "https://user:pw@grayboard.example.com/mcp", "https://grayboard.example.com/mcp?x=1", "https://grayboard.example.com/mcp#f"])
+    expect(() => proxy({ token: async () => undefined }, { wire: { ...wire, url } })).toThrow("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback)");
+  expect(proxy({ token: async () => undefined }, { wire: { ...wire, url: "https://grayboard.example.com/mcp" } }).tools()).toEqual(hostTools(snapshotTools()));
+});
+
 test("a write tool round trip binds the calling session through _meta; results come back verbatim; hooks wrap each call", async () => {
   const { token, authed } = issue();
   const hooks = recorder();
