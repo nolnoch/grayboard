@@ -51,6 +51,9 @@ try {
   assert.equal(existsSync(join(directory, "dist")), false);
   const files = readdirSync(directory).sort();
   assert.deepEqual(files, ["README.md", "index.js", "package.json", "src", "tui.js"]);
+  // #430: `files` must carry the generated hosted-core copy, or the plugin can't load.
+  assert.deepEqual(readdirSync(join(directory, "src/core")).sort(), readdirSync(join(import.meta.dir, "../src/core")).sort());
+  console.log("INSTALLED_CORE", JSON.stringify(readdirSync(join(directory, "src/core")).sort()));
   const entries = Host.resolve({ name: "grayboard-opencode", directory });
   assert(entries.server?.endsWith("/src/index.ts"));
   assert(entries.tui?.endsWith("/src/tui.ts"));

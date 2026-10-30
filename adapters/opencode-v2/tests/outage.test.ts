@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Wire, ServerUnreachable } from "../src/wire.js";
+import { Wire, ServerUnreachable } from "../src/core/wire.js";
 import { startServer } from "../../../src/server/app.ts";
 import { issueOAuth } from "../../../tests/helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
@@ -17,7 +17,7 @@ test("a server that stops under a live wire surfaces ServerUnreachable on the ne
   try {
     const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
     const url = `http://127.0.0.1:${app.server.port}/mcp`;
-    const wire = new Wire({ type: "remote", url, issuer: "http://127.0.0.1", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, { token: async () => issued.token }, new AbortController().signal, "ses_root");
+    const wire = new Wire({ url, sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: "1.10.0" } }, { token: async () => issued.token }, new AbortController().signal, "ses_root");
     await wire.connect();
     await wire.call("bind", { name: "be", create: true });
     wire.capability = ((await wire.call("delivery_open")) as { capability: string }).capability;
