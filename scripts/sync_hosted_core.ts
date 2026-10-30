@@ -2,9 +2,10 @@
 // V2 imports. OpenCode installs that package from a Git subdirectory
 // (`::path:adapters/opencode-v2`), which can't reach a sibling directory, so it
 // carries a generated copy; tests/integration/hosted_core_sync.test.ts fails
-// when the copy drifts. lock, login, proxy, channel and native-tools.json stay
-// out: dead code there, and proxy imports the repo's src/, outside
-// opencode-v2's `rootDir: src` build.
+// when the copy drifts. lock, login, storage, proxy, channel and
+// native-tools.json stay out: dead code there (OpenCode owns the grant and
+// the storage), and proxy imports the repo's src/, outside opencode-v2's
+// `rootDir: src` build.
 import { readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 

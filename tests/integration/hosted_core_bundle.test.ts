@@ -5,7 +5,8 @@ import { expect, test } from "bun:test";
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "../..");
-const entries = ["src/shared/attachments.ts", "src/core/bindings.ts", "src/core/tools.ts", "src/shared/inbox.ts", "adapters/hosted-core/src/proxy.ts", "adapters/hosted-core/src/channel.ts"];
+const entries = ["src/shared/attachments.ts", "src/core/bindings.ts", "src/core/tools.ts", "src/shared/inbox.ts", "adapters/hosted-core/src/proxy.ts", "adapters/hosted-core/src/channel.ts",
+  "adapters/hosted-core/src/login.ts", "adapters/hosted-core/src/lock.ts", "adapters/hosted-core/src/storage.ts"];
 
 for (const entry of entries) test(`a --target node bundle of ${entry} has no bun:sqlite and no Bun. reference`, async () => {
   const built = await Bun.build({ entrypoints: [resolve(root, entry)], target: "node" });
