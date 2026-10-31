@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { logFields, type RecordStatus } from "./diagnostics.js";
+import { logFields, type RecordStatus } from "./core/diagnostics.js";
 
 export const captureLogger = Effect.gen(function* () {
   const run = Effect.runPromiseWith(yield* Effect.context<never>());

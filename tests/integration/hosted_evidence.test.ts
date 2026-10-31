@@ -78,11 +78,13 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
   const output = mode === "cross-filesystem" ? mkdtempSync("/dev/shm/gb-evidence-public-") : join(root, "public");
   if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
-  for (const dir of ["scripts", "src", "tests/e2e", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
+  for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
   writeFileSync(join(root, "tests/e2e/opencode-config.ts"), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
+  writeFileSync(join(root, "adapters/hosted-core/package.json"), '{"name":"fixture-core","version":"1.0.0"}');
+  writeFileSync(join(root, "tests/integration/hosted_core_sync.test.ts"), 'import { test } from "bun:test"; test("sync", () => {});\n');
   for (const file of ["index.js", "tui.js", "README.md", "src/index.ts"]) writeFileSync(join(root, "adapters/opencode-v2", file), "fixture\n");
   const secrets = ["access-" + crypto.randomUUID(), "refresh-" + crypto.randomUUID(), "lease-" + crypto.randomUUID(), "fake-access-one", "synthetic-json-secret"];
   if (matrixMode) {
@@ -100,6 +102,7 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
 case "$1" in
 install)
  child="$GRAYBOARD_E2E_RUN_DIR/child-repository"
+ [ -e "$child" ] && exit 0
  mkdir "$child" || exit 1
  git -C "$child" init -q || exit 1
  printf 'child fixture\\n' > "$child/sentinel"

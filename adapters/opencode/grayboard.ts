@@ -53,7 +53,9 @@ function render({ content, meta = {} }: ChannelParams): string {
   const attrs = Object.entries(meta)
     .map(([k, v]) => ` ${k}="${esc(v)}"`)
     .join("");
-  return `<channel source="grayboard"${attrs}>\n${content}\n</channel>`;
+  // A body's `<channel` or `</channel` keeps its `<` escaped, so it can't close
+  // the element or forge another one (#433, #435).
+  return `<channel source="grayboard"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
 }
 
 // JSON Schema to zod, for the shapes grayboard's tools use. Anything else

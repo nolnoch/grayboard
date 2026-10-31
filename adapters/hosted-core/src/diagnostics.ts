@@ -1,6 +1,6 @@
-import type { Context } from "@opencode/plugin/promise/plugin";
+import type { KeyValueStorage } from "./port.js";
 import { ServerUnreachable, SubscriberError, SubscriptionClosed, holderText } from "./wire.js";
-import { NativeAccessExpired } from "./model.js";
+import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated } from "./model.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
@@ -11,29 +11,39 @@ export class DeliveryStopped extends Error {
 const key = "diagnostics:v1";
 const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-const operations = new Set(["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "session_end", "pause_save", "child_end", "watch_dispose"]);
-const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired"]);
+// Every operation a record may name; anything else reads as invalid, and a
+// host's own reports (the tool proxy's `report`) take their names from here.
+const OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register"] as const;
+export type Operation = typeof OPERATIONS[number];
+const operations = new Set<string>(OPERATIONS);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
   if (error instanceof ServerUnreachable) return "server_unreachable";
   if (error instanceof SubscriptionClosed) return "subscription_closed";
-  if (error instanceof NativeAccessExpired) return "native_access_expired";
+  if (error instanceof AccessExpired) return error.reason === "expired" ? "native_access_expired" : error.reason;
+  if (error instanceof ServerOutdated) return "server_outdated";
+  if (error instanceof DeliveryHeldElsewhere) return "delivery_held_elsewhere";
+  if (error instanceof RefreshInProgress) return "refresh_in_progress";
   if (error instanceof SubscriberError) {
     const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
     if (typeof code === "string" && codes.has(code)) return code;
   }
   return "operation_failed";
 }
-export function failureMessage(error: unknown): string {
-  if (error instanceof DeliveryStopped) return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; explicitly enroll again`;
-  if (error instanceof ServerUnreachable) return "Server unreachable; approval retained, explicitly enroll to retry";
+// `resumeHint` is the host's way to restart a paused root (HostPort.resumeHint).
+export function failureMessage(error: unknown, resumeHint: string): string {
+  if (error instanceof DeliveryStopped) return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
+  if (error instanceof ServerUnreachable) return `Server unreachable; ${resumeHint}`;
+  if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere) return error.message;
+  if (error instanceof RefreshInProgress) return `${error.message}; ${resumeHint}`;
   if (error instanceof SubscriberError) {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;
     const holder = Object.getOwnPropertyDescriptor(error, "holder")?.value;
     return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "identity_in_use" && holderText(holder) ? `; held by ${holder}` : ""}`;
   }
-  return "Operation failed; approval retained, explicitly enroll to retry";
+  return `Operation failed; ${resumeHint}`;
 }
 
 function data(value: unknown, allowed: readonly string[]): Record<string, unknown> | undefined {
@@ -83,7 +93,11 @@ export class Diagnostics {
   private records = new Map<string, RecordStatus>();
   private pending: Promise<void> = Promise.resolve();
   private failed = false;
-  constructor(private readonly storage: Context["storage"], private readonly sink?: DiagnosticSink) {}
+  // `idle` is the status before any root records; `knownRoot` pre-accepts a
+  // restored record whose session ID has the host's own ID shape, skipping
+  // the `acceptRoot` lookup (OpenCode's `ses_…`); without it every restored
+  // root goes through `acceptRoot`.
+  constructor(private readonly storage: KeyValueStorage, private readonly sink?: DiagnosticSink, private readonly options: { idle?: string; knownRoot?: RegExp } = {}) {}
   async restore(acceptRoot?: (id: string) => Promise<boolean>) {
     try {
       const values = await this.storage.get(key);
@@ -94,7 +108,7 @@ export class Diagnostics {
         try {
           const r = project(Object.getOwnPropertyDescriptor(values, String(i))?.value, true);
           if (!r) continue;
-          if (r.sessionID && !/^ses_[a-f0-9]{64}$/.test(r.sessionID) && !(acceptRoot && await acceptRoot(r.sessionID))) continue;
+          if (r.sessionID && !this.options.knownRoot?.test(r.sessionID) && !(acceptRoot && await acceptRoot(r.sessionID))) continue;
           this.records.set(r.sessionID ?? "background", r);
         } catch { continue; }
       }
@@ -146,7 +160,7 @@ export class Diagnostics {
     const live = roots.filter(r => !(r.state === "paused" && r.operation === "session_end"));
     const failed = live.find(r => r.state === "paused" || r.state === "degraded");
     const last = failed ?? live.at(-1) ?? roots.at(-1);
-    return { state: this.failed ? "degraded" : last?.state ?? "unenrolled", message: this.failed ? "Diagnostic persistence unavailable; approval is unchanged" : last?.message ?? "Approve an active root; approval does not bind a name", ...(last?.sessionID ? { sessionID: last.sessionID } : {}), roots };
+    return { state: this.failed ? "degraded" : last?.state ?? "unenrolled", message: this.failed ? "Diagnostic persistence unavailable; approval is unchanged" : last?.message ?? this.options.idle ?? "No active root", ...(last?.sessionID ? { sessionID: last.sessionID } : {}), roots };
   }
   async flush() { await this.pending; return !this.failed; }
 }

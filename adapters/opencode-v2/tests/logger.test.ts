@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Effect, Logger } from "effect";
 import { captureLogger } from "../src/logger.js";
-import { Diagnostics, logFields, type RecordStatus } from "../src/diagnostics.js";
+import { Diagnostics, logFields, type RecordStatus } from "../src/core/diagnostics.js";
 import type { Context } from "@opencode/plugin/promise/plugin";
 
 const record: RecordStatus = { sessionID: "R", name: "be", ownership: 7, state: "paused", message: "Bearer secret-canary\n at bearer-token.ts", operation: "subscriber", code: "retry_exhausted", time: 123 };

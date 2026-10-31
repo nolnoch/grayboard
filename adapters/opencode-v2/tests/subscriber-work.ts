@@ -30,7 +30,7 @@ export function observeRuns(prototype: object) {
   };
 }
 export async function observeSubscriberWork(directory: string) {
-  const { Controller } = await import(pathToFileURL(join(directory, "src/controller.ts")).href);
+  const { Controller } = await import(pathToFileURL(join(directory, "src/core/controller.ts")).href);
   return observeRuns(Controller.prototype);
 }
 export type SubscriberWork = ReturnType<typeof observeRuns>;

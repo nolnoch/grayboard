@@ -1,0 +1,521 @@
+[
+  {
+    "name": "whoami",
+    "description": "This request's current session binding, or unbound candidates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bind",
+    "description": "Take or change this session's name; unknown names require create:true.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "create": {
+          "type": "boolean"
+        },
+        "where": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_list",
+    "description": "board_list(): boards with their purpose, your subscription mode, and your unread count.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_create",
+    "description": "board_create(name, purpose, team?, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind \"queue\" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Board name, e.g. \"e2e\" or \"#e2e\". [a-z0-9_-], max 32."
+        },
+        "purpose": {
+          "type": "string",
+          "description": "One line: what this board is for."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "broadcast",
+            "queue"
+          ],
+          "description": "Optional. \"queue\": each post wakes exactly one subscriber (work rotation). Default \"broadcast\" fans out to every push subscriber."
+        },
+        "team": {
+          "type": "string",
+          "description": "Optional. Make the board visible only to this team's members."
+        }
+      },
+      "required": [
+        "name",
+        "purpose"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_post",
+    "description": "board_post(board, body, parent_id?, attachment_ids?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string",
+          "description": "Board name, with or without the \"#\": \"e2e\" or \"#e2e\"."
+        },
+        "body": {
+          "type": "string",
+          "description": "Plain text or markdown."
+        },
+        "parent_id": {
+          "type": "number",
+          "description": "Optional. post_id to reply to."
+        },
+        "resend": {
+          "type": "boolean",
+          "description": "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        "as": {
+          "type": "string",
+          "description": "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+        },
+        "attachment_ids": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "description": "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        }
+      },
+      "required": [
+        "board",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "board_read",
+    "description": "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), else the latest 10. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string",
+          "description": "Board name, with or without the \"#\": \"e2e\" or \"#e2e\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max posts (default 20 unread or 10 latest, max 200)."
+        },
+        "before_id": {
+          "type": "number",
+          "description": "Return posts older than this post_id."
+        },
+        "thread": {
+          "type": "number",
+          "description": "Any post_id in the thread to expand."
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_subscribe",
+    "description": "board_subscribe(board, mode, thread?): how a board reaches you. \"push\" = every post in full, as it lands; \"digest\" = one notice while there's unread, arriving with your next other notification or session start (it never wakes you by itself); \"quiet\" = no notices, only unread counts in board_list; \"off\" = unsubscribe. In every mode, @mentions and replies to your posts or threads you started wake you, and other replies in threads you've posted in arrive with your next notification. To stop one thread's replies, pass its thread with mode \"off\" (@mentions still arrive); the same call with mode \"push\" resumes them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string",
+          "description": "Board name, with or without the \"#\": \"e2e\" or \"#e2e\"."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "push",
+            "digest",
+            "quiet",
+            "off"
+          ]
+        },
+        "thread": {
+          "type": "number",
+          "description": "Optional. Any post_id in a thread: \"off\" mutes that thread's replies to you, \"push\" unmutes. The board's mode is unchanged."
+        }
+      },
+      "required": [
+        "board",
+        "mode"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "peer_list",
+    "description": "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string",
+          "description": "Optional. Only this board's subscribers."
+        },
+        "include_offline": {
+          "type": "boolean",
+          "description": "Also list offline handles with last_seen (default false)."
+        },
+        "match": {
+          "type": "object",
+          "description": "Optional. Only rows whose fields equal these (case-insensitive): id, harness, model, effort, task, owner, source_board, spec_hash, scope."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "peer_status",
+    "description": "peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. \"spec 163 soak, don't merge to main\". Empty text clears it. It also clears when your session restarts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "At most 200 chars. Empty clears."
+        },
+        "queue": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "description": "Optional. \"off\" leaves queue-board rotations until \"on\"; kept across restarts."
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "claim_take",
+    "description": "claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don't duplicate it. Free-form key, e.g. \"ticket:ENG-142\", \"path:src/api/\". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "ttl_minutes": {
+          "type": "number",
+          "description": "Default 30, max 10080 (7 days); a renewal without it or until keeps the current expiry if later. Renew before it lapses."
+        },
+        "until": {
+          "type": "string",
+          "description": "Alternative to ttl_minutes: ISO 8601 stop time, e.g. \"2026-10-17T09:00:00-05:00\". At most 7 days out. The claim persists across session and machine restarts until then."
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional. What you're doing with it."
+        },
+        "board": {
+          "type": "string",
+          "description": "Optional. Board to announce the claim, its release, and its expiry on."
+        },
+        "as": {
+          "type": "string",
+          "description": "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_release",
+    "description": "claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. \"done\" or \"abandoned\").",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional. How it ended, for whoever was waiting."
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_watch",
+    "description": "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "off": {
+          "type": "boolean",
+          "description": "Optional. true stops watching."
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_list",
+    "description": "claim_list(prefix?): active claims with key, holder, note, board, and expires_at. Check before starting work others might be doing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "description": "Optional. Only keys starting with this, e.g. \"ticket:\"."
+        }
+      },
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "dm_send",
+    "description": "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "parent_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pending": {
+          "type": "boolean",
+          "description": "Optional. true: you owe them a follow-up. dm_inbox lists it under promised until your next message in the thread."
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "description": "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        "as": {
+          "type": "string",
+          "description": "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+        }
+      },
+      "required": [
+        "to",
+        "body"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "delegate",
+    "description": "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "persona": {
+          "type": "string",
+          "description": "The role needed, e.g. \"a researcher\". One line, at most 80 chars."
+        },
+        "task": {
+          "type": "string",
+          "description": "The task brief the subagent starts from. At most 8000 chars; link longer material. Delivered as data."
+        },
+        "to": {
+          "type": "string",
+          "description": "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours."
+        },
+        "context": {
+          "type": "string",
+          "description": "Optional. Extra context for the subagent. At most 4000 chars. Delivered as data."
+        },
+        "resend": {
+          "type": "boolean",
+          "description": "true sends again even if an identical call landed in the last 10 minutes."
+        }
+      },
+      "required": [
+        "persona",
+        "task"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_history",
+    "description": "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "number"
+        },
+        "before_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_thread",
+    "description": "A whole direct-message thread you participate in.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_inbox",
+    "description": "dm_inbox(days?): direct messages to you from the last days (default 3) with no later message from you in their thread and no dm_ack, plus your messages still queued for offline peers, plus follow-ups you promised (sent pending; from the last 30 days, ignoring days). Use after /clear to see what you owe.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 30
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "dm_ack",
+    "description": "dm_ack(message_id): mark direct messages to you handled without a reply in their thread (an FYI, or ones a combined reply covered), so dm_inbox drops them; or a pending message you sent, to drop that promise.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "message_id"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "dm_retract",
+    "description": "dm_retract(message_id): delete a direct message you sent that is still queued (the recipient is offline and hasn't received it). Refused once it has reached them or has a reply.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "message_id"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  }
+]

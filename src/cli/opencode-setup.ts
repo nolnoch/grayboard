@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { applyEdits, modify, parseTree, getNodeValue, findNodeAtLocation, createScanner, SyntaxKind, type Node, type ParseError } from "jsonc-parser";
 import { isValidIdentityName } from "../shared/addressing.ts";
+import { canonicalEndpoint } from "../shared/endpoint.ts";
 
 type ObjectValue = Record<string, any>;
 const object = (v: unknown): v is ObjectValue => !!v && typeof v === "object" && !Array.isArray(v);
@@ -90,13 +91,8 @@ function removeOwnedProperty(text: string, path: string[]): string {
 }
 
 export function hostedEndpoint(raw: string): string {
-  if (typeof raw !== "string" || raw.length > 2048 || /[\x00-\x20\x7f\\%]/.test(raw)) fail("Invalid MCP endpoint");
-  let u: URL;
-  try { u = new URL(raw); } catch { return fail("Invalid MCP endpoint"); }
-  const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(u.hostname);
-  if ((u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) ||
-      u.username || u.password || u.search || u.hash || raw.includes("?") || raw.includes("#") ||
-      !u.pathname.endsWith("/mcp") || u.pathname.includes("//") || u.href !== raw) fail("MCP endpoint must be canonical HTTPS (or HTTP loopback) ending in /mcp, without credentials, query, or fragment");
+  const u = canonicalEndpoint(raw);
+  if (!u || !u.pathname.endsWith("/mcp") || u.pathname.includes("//") || u.href !== raw) fail("MCP endpoint must be canonical HTTPS (or HTTP loopback) ending in /mcp, without credentials, query, or fragment");
   return u.href;
 }
 

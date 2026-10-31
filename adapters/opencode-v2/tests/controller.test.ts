@@ -2,11 +2,16 @@ import { expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { Controller } from "../src/controller.js";
-import { Diagnostics, failureCode, failureMessage } from "../src/diagnostics.js";
-import { observeEvents } from "../src/events.js";
-import { Wire, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/wire.js";
-import { METADATA, NativeAccessExpired, type Enrollment, type Item } from "../src/model.js";
+import { OpenCodeController as Controller, OPENCODE_SESSION } from "../src/lifecycle.js";
+import { Controller as CoreController } from "../src/core/controller.js";
+import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
+const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
+import { observeEvents } from "../src/core/events.js";
+import { Wire, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
+import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
+import { AccessExpired, type Item } from "../src/core/model.js";
+import { SIGN_IN } from "../src/binding.js";
+class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
 import { fixture } from "./binding.test.js";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
@@ -108,7 +113,7 @@ test("stored diagnostics are closed DTOs and hostile records cannot escape or st
   const hostile = { ...safe, sessionID: "ses_" + "c".repeat(64) };
   Object.defineProperty(hostile, "message", { enumerable: true, get() { getters++; throw new Error(secret); } });
   const values = [hostile, { ...safe, ownership: -1 }, { ...safe, failure: { operation: "session_end", code: "operation_failed", time: 1, exception: secret } }, safe];
-  const d = new Diagnostics({ get: async () => values, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) });
+  const d = new Diagnostics({ get: async () => values, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) }, undefined, { knownRoot: OPENCODE_SESSION });
   await d.restore();
   expect(getters).toBe(0); expect(d.status().roots).toHaveLength(1);
   expect(d.status().roots[0]).toMatchObject({ state: "paused", sessionID, ownership: 1 });
@@ -159,7 +164,7 @@ test("an ended root stays listed but never speaks for the live roots", async () 
 });
 
 test.each([false, true])("expiry failed-continuation barrier joins actual subscriber admission and detects late model work (%j)", async forbidden => {
-  const work = observeRuns(Controller.prototype), gate = new FailedContinuation();
+  const work = observeRuns(CoreController.prototype), gate = new FailedContinuation();
   const admission = barrier(), releaseAdmission = barrier(), model = barrier();
   const waits: number[] = [], models: string[] = [];
   let outage = false, forwarded = false, retired = false;
@@ -677,6 +682,22 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
     expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
 });
+
+test("saving an approval prunes the saved roots that restore dropped", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    await r.controller.close();
+    // R ended while OpenCode was down: restore skips it, and the next save drops it.
+    r.nodes.delete("R");
+    restarted = r.restart(); await restarted.restore();
+    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(r.storage.get("rootSessionIDs")).toEqual(["B"]);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
 test("ordinary native unbound result rebinds the durable name once with create:false", async () => {
   const r = runtime();
   try {
@@ -832,14 +853,17 @@ test("issued stamp mismatch never admits or receipts", async () => {
     expect(r.admissions).toHaveLength(0); expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
   } finally { await r.controller.close(); }
 });
-test("lost receipt reopens safely with the identical root admission ID", async () => {
+// #430: admission is idempotent per (ownership, bind_gen, item): a lost receipt
+// goes straight to the receipt on the next read, never a second admission.
+test("lost receipt reopens and receipts without admitting the item again", async () => {
   const r = runtime();
   try {
     r.bind("R", "be"); r.rejectReceipt();
     r.batches.set("R", [{ id: "direct:1", actionable: false, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
     await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2);
-    expect(r.admissions).toHaveLength(2); expect(r.admissions[0]?.id).toBe(r.admissions[1]?.id);
-    expect(r.admissions.map(a => a.sessionID)).toEqual(["R", "R"]);
+    expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
+    expect(r.calls.filter(c => c.name === "delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]);
+    expect(r.batches.get("R")).toEqual([]);
   } finally { await r.controller.close(); }
 });
 test("outer CodeMode execute and malformed native output never open a lease", async () => {

@@ -28,10 +28,9 @@ import { BindGate } from "../shared/bindgate.ts";
 import { boardNotification, DEFAULT_CHANNEL_SOURCE, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
-  attachRoots, checkAttachmentId, digestSha256, dispositionFilename, readAttachmentFiles, saveAttachment, saveTarget, serverBusDir,
-  type AttachmentLimits,
+  attachRoots, checkAttachmentId, downloadAttachment, readAttachmentFiles, saveTarget, sendWithUploads, SendLanded, serverBusDir,
+  type AttachmentLimits, type AttachmentTransport,
 } from "../shared/attachments.ts";
-import { sha256Hex } from "../shared/hash.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 // Team boards are members-only on the server; this keeps their content from
@@ -650,20 +649,7 @@ async function call(name: string, a: Record<string, unknown>, signal: AbortSigna
       const id = checkAttachmentId(a.id);
       const limits = attachmentLimits();
       const target = await saveTarget(a.dir, ROOTS, serverBusDir(serverUrl));
-      const { res, data } = await api().download(`/api/attachments/${id}?as=${encodeURIComponent(me)}`, limits.file);
-      // Checked before anything is saved: the bytes must be the ones the server stored.
-      const sha256 = sha256Hex(data);
-      // A missing digest is a mismatch: every 2.x server sends one.
-      if (digestSha256(res.headers.get("repr-digest")) !== sha256) throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
-      const info = {
-        id,
-        filename: dispositionFilename(res.headers.get("content-disposition")) ?? "file",
-        type: res.headers.get("content-type") ?? "application/octet-stream",
-        size: data.length,
-        sha256,
-      };
-      const path = await saveAttachment(info, data, target);
-      return text({ path, filename: info.filename, type: info.type, size: info.size, sha256 });
+      return text(await downloadAttachment(id, target, limits.file, attachmentTransport(me)));
     }
     return { ...text(`error: unknown tool: ${name}`), isError: true };
   } catch (e) {
@@ -733,57 +719,38 @@ function attachmentLimits(): AttachmentLimits {
   return client.assertConnected().attachment_limits;
 }
 
-// Reads and checks the files an agent named (all before any is sent), uploads
-// each as `me` (an alias or this session's ID), and runs `send` with their
-// ids; the server checks them again and binds them to that dm_send or
-// board_post. Uploads go only over a live connection, and if any upload or
-// the send fails, the ones made are released, so a refused send doesn't hold
-// the user's unsent quota.
+// The server-mode HTTP API's attachment routes, acting as `me` (an alias or
+// this session's ID).
+const attachmentTransport = (me: string): AttachmentTransport => ({
+  upload: async (f) => {
+    // The upload route's 201 answer (src/server/http.ts attachmentUpload).
+    const stored = (await api().upload(`/api/attachments?as=${encodeURIComponent(me)}&filename=${encodeURIComponent(f.filename)}`, f.data)) as { id: number };
+    return stored.id;
+  },
+  release: async (id) => {
+    try {
+      await api().del(`/api/attachments/${id}?as=${encodeURIComponent(me)}`);
+      return true;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return false;
+      throw e;
+    }
+  },
+  download: async (id, maxBytes) => {
+    const { res, data } = await api().download(`/api/attachments/${id}?as=${encodeURIComponent(me)}`, maxBytes);
+    return { headers: res.headers, data };
+  },
+  unreleased: (id, e) => console.error(`[grayboard] couldn't release upload ${id} (it expires in an hour): ${e.message}`),
+});
+
+// Reads and checks the files an agent named (all before any is sent), then
+// uploads them as `me` and runs `send` with their ids (sendWithUploads).
+// Uploads go only over a live connection.
 async function withUploads<T>(me: string, paths: unknown, send: (ids: number[]) => Promise<T>): Promise<T> {
   if (paths === undefined) return send([]);
   const files = await readAttachmentFiles(paths, ROOTS, { limits: attachmentLimits() });
   client.assertConnected();
-  const ids: number[] = [];
-  let sent = false;
-  try {
-    for (const f of files) {
-      const q = `as=${encodeURIComponent(me)}&filename=${encodeURIComponent(f.filename)}`;
-      ids.push(((await api().upload(`/api/attachments?${q}`, f.data)) as { id: number }).id);
-    }
-    sent = true;
-    return await send(ids);
-  } catch (e) {
-    const landed = await releaseUploads(me, ids);
-    // A send binds all its files in one transaction or none: if every one is
-    // bound, the send landed and only its answer was lost.
-    if (sent && ids.length && landed === ids.length) throw new SendLanded(ids, e as Error);
-    throw e;
-  }
-}
-
-// Releases uploads a failed send left unbound. Returns how many the server
-// says are no longer unsent: bound after all (the answer was lost, not the send).
-async function releaseUploads(me: string, ids: number[]): Promise<number> {
-  let bound = 0;
-  for (const id of ids) {
-    try {
-      await api().del(`/api/attachments/${id}?as=${encodeURIComponent(me)}`);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 404) {
-        bound++;
-        continue;
-      }
-      console.error(`[grayboard] couldn't release upload ${id} (it expires in an hour): ${(e as Error).message}`);
-    }
-  }
-  return bound;
-}
-
-// A send whose answer was lost, though the server bound its attachments.
-class SendLanded extends Error {
-  constructor(readonly attachments: number[], cause: Error) {
-    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`);
-  }
+  return sendWithUploads(files, attachmentTransport(me), send);
 }
 
 // The text a bind or unbind refusal carries: a lost answer may have landed.

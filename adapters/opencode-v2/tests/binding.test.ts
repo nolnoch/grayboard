@@ -27,7 +27,7 @@ export function fixture() {
   return { ctx, binding, config, metadata, reload, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, afterResolve: (callback: () => void) => { afterResolve = callback; } };
 }
 test("native discovery needs no explicit OAuth block or fixed name; exact grant is projected", async () => {
-  const f = fixture(), e = await f.binding.capture();
+  const f = fixture(), e = await f.binding.capture("R");
   expect(e.configuration).toMatchObject({ issuer: f.metadata.issuer, clientID: f.metadata.client.client_id, scope: "grayboard:delivery grayboard:tools" });
   expect(e.configuration).not.toHaveProperty("identity");
   expect(e.configuration).not.toHaveProperty("discovery");
@@ -44,37 +44,37 @@ test("endpoint, account, and exact native grant changes latch without retarget",
     (f: ReturnType<typeof fixture>) => { f.metadata.scope += " extra"; },
     (f: ReturnType<typeof fixture>) => { f.config.oauth = { client_id: "override" }; },
   ]) {
-    const f = fixture(), e = await f.binding.capture(); mutate(f);
+    const f = fixture(), e = await f.binding.capture("R"); mutate(f);
     await expect(f.binding.access(e)).rejects.toThrow("changed"); expect(f.drifts).toBe(1);
   }
 });
 test("post-resolution away-and-back selection is fenced", async () => {
-  const f = fixture(), e = await f.binding.capture();
+  const f = fixture(), e = await f.binding.capture("R");
   f.afterResolve(() => f.select("other"));
   await expect(f.binding.access(e)).rejects.toThrow("changed"); expect(f.drifts).toBe(1);
 });
 test("native expiry and status refuse; no refresh or private secret is read", async () => {
-  const f = fixture(), e = await f.binding.capture(); f.expire();
-  await expect(f.binding.access(e)).rejects.toThrow("expired");
-  const g = fixture(), expected = await g.binding.capture(); g.status("needs_auth");
+  const f = fixture(), e = await f.binding.capture("R"); f.expire();
+  await expect(f.binding.access(e)).rejects.toThrow("Signed out of grayboard in OpenCode; reconnect or sign in using OpenCode");
+  const g = fixture(), expected = await g.binding.capture("R"); g.status("needs_auth");
   await expect(g.binding.access(expected)).rejects.toThrow("authentication");
 });
 test("static authority headers and disabled OAuth never become subscriber authority", async () => {
   for (const key of ["Authorization", "X-Grayboard-Identity", "X-Grayboard-Lease", "X-Grayboard-Client"]) {
     const f = fixture(); f.config.headers[key] = "forbidden";
-    await expect(f.binding.capture()).rejects.toThrow(); expect(f.resolutions).toBe(0);
+    await expect(f.binding.capture("R")).rejects.toThrow(); expect(f.resolutions).toBe(0);
   }
   const f = fixture(); f.config.oauth = false;
-  await expect(f.binding.capture()).rejects.toThrow(); expect(f.resolutions).toBe(0);
+  await expect(f.binding.capture("R")).rejects.toThrow(); expect(f.resolutions).toBe(0);
 });
 test("watch rechecks later synchronous editor changes and fences disposed observers", async () => {
-  const f = fixture(), e = await f.binding.capture();
+  const f = fixture(), e = await f.binding.capture("R");
   const watch = await f.binding.watch(e);
   f.reload();
   f.config.headers["X-Later-Transform"] = "away";
   await Promise.resolve();
   expect(f.drifts).toBeGreaterThan(0);
-  const g = fixture(), saved = await g.binding.capture();
+  const g = fixture(), saved = await g.binding.capture("R");
   const disposed = await g.binding.watch(saved);
   g.reload();
   const disposing = disposed.dispose();
@@ -86,6 +86,6 @@ test("watch rechecks later synchronous editor changes and fences disposed observ
 test("incomplete public OAuth metadata fails closed rather than inventing client or scopes", async () => {
   for (const key of ["issuer", "scope", "client", "serverUrl"] as const) {
     const f = fixture(); delete (f.metadata as Partial<typeof f.metadata>)[key];
-    await expect(f.binding.capture()).rejects.toThrow("projection lacks");
+    await expect(f.binding.capture("R")).rejects.toThrow("projection lacks");
   }
 });

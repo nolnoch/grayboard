@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { Controller } from "../src/controller.js";
-import { Wire, SubscriberError, LeaseUnavailable, ServerUnreachable, subscriberError, unreachable } from "../src/wire.js";
-import { failureMessage } from "../src/diagnostics.js";
-import { METADATA, admitPrefix, enrollmentHash, identityOf, itemsOf, leaseOf, render, stableID, type Enrollment } from "../src/model.js";
+import { OpenCodeController as Controller } from "../src/lifecycle.js";
+import { Wire, SubscriberError, LeaseUnavailable, ServerUnreachable, subscriberError, unreachable } from "../src/core/wire.js";
+import { failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
+import { METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
+import { admitPrefix, identityOf, itemsOf, leaseOf, render, stableID } from "../src/core/model.js";
+const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
+const wireOptions = (url: string) => ({ url, sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: "1.10.0" } });
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
   expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
   expect(subscriberError({ code: "identity_unknown", known: ["_task", "-task", ...Array(254).fill("be")] }, false).known).toEqual(["_task", "-task", "be"]);
@@ -38,7 +41,7 @@ async function retryWire(mode: "success" | "guard" | "abort" | "untyped") {
   const original = globalThis.fetch, abort = new AbortController();
   const requests: { token: string | null; body: string }[] = [];
   let tokens = 0, guards = 0;
-  const wire = new Wire(enrollment.configuration, { token: async () => `native-${++tokens}` }, abort.signal, enrollment.sessionID, async () => { guards++; if (mode === "guard") throw new Error("Observed root drift"); });
+  const wire = new Wire(wireOptions(enrollment.configuration.url), { token: async () => `native-${++tokens}` }, abort.signal, enrollment.sessionID, async () => { guards++; if (mode === "guard") throw new Error("Observed root drift"); });
   wire.client.connect = async transport => {
     await transport.start();
     try { await transport.send({ jsonrpc: "2.0", method: "notifications/test" }); }
@@ -72,7 +75,7 @@ test("HTTP429 retry stops on observed drift or abort and ignores untyped refusal
   }
 });
 test("subscriber errors use structured tool codes and SDK resource data, never human prose or numeric codes", async () => {
-  const wire = new Wire(enrollment.configuration, { token: async () => "native-secret" }, new AbortController().signal, enrollment.sessionID);
+  const wire = new Wire(wireOptions(enrollment.configuration.url), { token: async () => "native-secret" }, new AbortController().signal, enrollment.sessionID);
   for (const code of ["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error"]) {
     wire.client.callTool = async () => ({ isError: true, structuredContent: { code }, content: [{ type: "text", text: "Bearer native-secret\n at secret-token.ts:123" }] });
     try { await wire.call("delivery_renew"); throw new Error("expected refusal"); }
@@ -92,7 +95,7 @@ test("subscriber errors use structured tool codes and SDK resource data, never h
   await expect(wire.read("grayboard://inbox")).rejects.toMatchObject({ message: "transport failure" });
 });
 // #423: an outage must surface as ServerUnreachable so the controller waits it out; anything else keeps its own classification.
-const wireAt = (url: string, signal = new AbortController().signal, token = "native") => new Wire({ ...enrollment.configuration, url }, { token: async () => token }, signal, enrollment.sessionID);
+const wireAt = (url: string, signal = new AbortController().signal, token = "native") => new Wire(wireOptions(url), { token: async () => token }, signal, enrollment.sessionID);
 test("connect to a closed port or a gateway status is an outage; other HTTP refusals are not", async () => {
   await expect(wireAt("http://127.0.0.1:1/mcp").connect()).rejects.toBeInstanceOf(ServerUnreachable);
   for (const status of [502, 503, 504, 404, 500]) {

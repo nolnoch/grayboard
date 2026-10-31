@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { resolveRoot, SessionRoutes, type SessionNode } from "../src/sessions.js";
+import { resolveRoot, SessionRoutes, type SessionNode } from "../src/core/sessions.js";
 
 function fixture() {
   const nodes = new Map<string, SessionNode>();

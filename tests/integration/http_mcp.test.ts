@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
+import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { writeAudit } from "../../src/server/audit.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
@@ -75,7 +76,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(post.inputSchema.properties).toHaveProperty("attachment_ids");
   expect(post.inputSchema.properties).not.toHaveProperty("attachments");
   expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
-  expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
+  // The attachment caps, and never a channel capability: hosted HTTP has no push.
+  expect(client.getServerCapabilities()?.experimental).toEqual({ [ATTACHMENT_LIMITS_CAPABILITY]: DEFAULT_ATTACHMENT_LIMITS });
   expect((await client.callTool({ name: "board_create", arguments: { name: "e2e", purpose: "fixtures" } })).isError).not.toBe(true);
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toMatchObject([{ name: "e2e" }]);
   expect(value(await client.callTool({ name: "dm_inbox", arguments: {} }))).toEqual({ unanswered: [] });
@@ -288,7 +290,7 @@ test("combined shared native grant remains non-owning with read-only resources",
   const client = await connect(await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]));
   expect((await client.listTools()).tools.map(t => t.name)).toContain("board_list");
   expect(client.getServerCapabilities()?.resources).toEqual({ subscribe: true });
-  expect(client.getServerCapabilities()).not.toHaveProperty("experimental");
+  expect(client.getServerCapabilities()?.experimental).toEqual({ [ATTACHMENT_LIMITS_CAPABILITY]: DEFAULT_ATTACHMENT_LIMITS });
   expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
 });
 

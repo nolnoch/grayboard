@@ -6,6 +6,7 @@ import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
+import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
@@ -291,7 +292,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const { role, info } = context;
     const server = new McpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
-      capabilities: { tools: { listChanged: false } },
+      capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
       instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.declared),
     });
