@@ -314,7 +314,7 @@ export class Controller<E extends Enrollment = Enrollment> {
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
                 if (r.admitted.has(key)) { inItem = false; return; }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity));
+                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);

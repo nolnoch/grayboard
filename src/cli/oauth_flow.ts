@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
+import { openBrowser } from "../shared/browser.ts";
 
 function base64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
@@ -15,13 +15,6 @@ function computeCodeChallenge(verifier: string): string {
 
 function generateState(): string {
   return randomBytes(16).toString("hex");
-}
-
-function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open"
-    : process.platform === "win32" ? "start"
-    : "xdg-open";
-  spawn(cmd, [url], { detached: true, stdio: "ignore" }).unref();
 }
 
 export type OAuthResult = {
