@@ -7,7 +7,8 @@
 // pi and omp create the extension runtime anew for every session (startup,
 // /new, /resume, /fork, /reload), so the state here is one session's; what
 // outlives a session (the name a /new carries, the registry of live session
-// files) sits on globalThis under a registered symbol.
+// files, the items a root admitted) sits on globalThis under a registered
+// symbol.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
@@ -23,10 +24,12 @@ import type { Lock } from "../hosted-core/src/lock.ts";
 import { end, register, type Temporary } from "../hosted-core/src/children.ts";
 import { render, wakes } from "../hosted-core/src/channel.ts";
 import { Wire, type WireOptions } from "../hosted-core/src/wire.ts";
-import { failureMessage } from "../hosted-core/src/diagnostics.ts";
+import { failureMessage, type DiagnosticSink } from "../hosted-core/src/diagnostics.ts";
 import { boardNotification, dmNotification } from "../../src/core/tools.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
+import { canonicalEndpoint } from "../../src/shared/endpoint.ts";
+import { describeLocation } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -56,26 +59,39 @@ const SOURCE = "grayboard";
 // epoch changes (a login or logout in any process).
 const DRIFTED = "Grayboard credential changed";
 
-// Cross-session state for one harness in this process.
-type Shared = { carried?: string; live: Map<string, string> };
+// Cross-session state for one harness in this process: the name a /new or
+// /fork carries, the live session files (file → root id), and per root
+// session the stable ids of items it admitted, which a /reload keeps (the
+// lease stays) while the Controller's own admission set doesn't outlive it.
+type Shared = { carried?: string; live: Map<string, string>; admitted: Map<string, Set<string>> };
+const ADMITTED_LIMIT = 256;
 function shared(harness: string): Shared {
   const key = Symbol.for(`io.github.nolnoch.grayboard/${harness}-sessions`);
   // globalThis carries no symbol index; this slot is ours (Symbol.for, namespaced).
   const g = globalThis as unknown as Record<symbol, Shared | undefined>;
-  return g[key] ??= { live: new Map() };
+  const slot = g[key] ??= { live: new Map(), admitted: new Map() };
+  // A /reload after `grayboard update` may find the slot an older bundle made.
+  slot.admitted ??= new Map();
+  return slot;
 }
 
 const Config = z.object({ url: z.string().min(1) });
-// `<stateDir>/config.json {url}`, written by `grayboard setup --server`.
+// `<stateDir>/config.json {url}`, written by `grayboard setup --server`. Login
+// and the tool proxy refuse a URL that isn't canonical; refusing it here
+// instead keeps the extension loading (pi exits at startup when one fails).
 export function readConfig(stateDir: string): { url: string } | { error: string } {
   const unset = "grayboard is not set up for a server; run `grayboard setup --server <url>`";
+  const path = join(stateDir, "config.json");
   let raw: string;
-  try { raw = readFileSync(join(stateDir, "config.json"), "utf8"); }
+  try { raw = readFileSync(path, "utf8"); }
   catch (error) { return { error: error instanceof Error && "code" in error && error.code === "ENOENT" ? unset : `${unset} (${String(error)})` }; }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch {}
   const config = Config.safeParse(parsed);
-  return config.success ? { url: config.data.url } : { error: `${join(stateDir, "config.json")} is invalid; run \`grayboard setup --server <url>\`` };
+  if (!config.success) return { error: `${path} is invalid; run \`grayboard setup --server <url>\`` };
+  // The URL itself stays out of the message: it may carry credentials.
+  if (!canonicalEndpoint(config.data.url)) return { error: `${path} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is` };
+  return { url: config.data.url };
 }
 
 const failure = (message: string): CallToolResult => ({ content: [{ type: "text", text: `error: ${message}` }], isError: true });
@@ -126,6 +142,9 @@ export function createGrayboard(h: Harness): Grayboard {
   const config = readConfig(stateDir);
   const state = shared(h.name);
   const log = (message: string, level: Level = "info") => { if (!closed) h.notify(`grayboard: ${message}`, level); };
+  // The bind's `where` (peer_list, a name refusal's holder text): this
+  // process's checkout, as server mode's `grayboard mcp` sent it.
+  const place = describeLocation(process.cwd()) ?? h.name;
 
   let closed = false;
   let session: SessionInfo | undefined;
@@ -133,12 +152,17 @@ export function createGrayboard(h: Harness): Grayboard {
   let notice: string | undefined;     // shown once, in the next tool result
   let held: string | undefined;       // set while another process holds delivery for this root
   let loginNote: string | undefined;  // the latest sign-in diagnostic
+  let logoutWarnings: string[] | undefined; // a running logout's warnings, which its own line says
   let signedOut = false;              // a start failed for want of a sign-in
   let outAnnounced = false;           // this sign-out was already announced in this session
-  let controller: Controller | undefined, lock: Lock | undefined, storage: FileStorage | undefined, proxy: ToolProxy | undefined;
+  let begun: string | undefined;      // the store epoch this root last (re)started under
+  let carrying: string | undefined;   // a /new or /fork's carried name, until a start takes it
+  let controller: Controller | undefined, lock: Lock | undefined, proxy: ToolProxy | undefined;
   let waiter: AbortController | undefined;
   let watcher: { dispose(): void } | undefined;
-  let registered = false;             // a child registered under its root
+  let registration: Promise<void> | undefined; // a child's register under its root, until it fails
+  let registered = false;             // that register succeeded
+  let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this session's id
   let restarting: Promise<void> | undefined;
 
@@ -149,7 +173,15 @@ export function createGrayboard(h: Harness): Grayboard {
       openBrowser(url, error => log(`couldn't open a browser (${error.message}); open the URL above`, "warning"));
     },
     notify: message => log(message),
-    diagnostic: record => { loginNote = `${record.operation}: ${record.state}${record.code ? ` (${record.code})` : ""}: ${record.message}`; },
+    // A queued revoke or a refresh whose outcome is unknown leaves a grant live
+    // on the server or this session signed out: said at once, not only in
+    // /grayboard status, which a restart forgets.
+    diagnostic: record => {
+      loginNote = `${record.operation}: ${record.state}${record.code ? ` (${record.code})` : ""}: ${record.message}`;
+      if (record.state !== "degraded" && record.state !== "paused") return;
+      if (logoutWarnings) logoutWarnings.push(record.message);
+      else log(record.message, "warning");
+    },
   }) : undefined;
 
   let last: string | undefined;
@@ -171,7 +203,7 @@ export function createGrayboard(h: Harness): Grayboard {
     if (role.kind === "child" && registered && result.isError && await unattributed(proxy, session.id)) {
       // The server refuses an unattributed child's call before running it, so
       // one retry after registering again never repeats a write.
-      registered = false;
+      registered = false; registration = undefined;
       result = await proxy.call(tool, args, session.id);
     }
     const shown = notice;
@@ -187,20 +219,28 @@ export function createGrayboard(h: Harness): Grayboard {
     try { await wire.connect(); return await run(wire); }
     finally { await wire.close().catch(() => {}); }
   };
-  // A child registers under its root before its first call; a failed
-  // registration fails that call and is retried by the next. The server ends
+  // A child registers under its root before its first call or instructions
+  // fetch (the server's instructions for an unregistered session tell it to
+  // bind, which a child can't); a failed registration fails that call and is
+  // retried by the next. Concurrent calls share one register. The server ends
   // the registration with the root's ownership (a lapsed lease the root then
   // rebinds), so a refused call checks whether it still holds.
   const unattributed = async (p: ToolProxy, id: string) => {
     const who = outputOf(await p.call("whoami", {}, id));
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
+  // After shutdown begins none starts: shutdown ends only a register it saw.
+  const enlist = (root: string, child: string): Promise<void> => {
+    if (registration) return registration;
+    if (closed) return Promise.reject(new Error(`the ${h.name} session closed`));
+    attempted = true;
+    const pending: Promise<void> = register(temporary, { root, via: [], child }).then(
+      () => { registered = true; proxy?.forget(child); },
+      error => { if (registration === pending) registration = undefined; throw error; });
+    return registration = pending;
+  };
   const childHooks = (root: string, child: string): CallHooks => ({
-    beforeCall: async () => {
-      if (registered) return;
-      await register(temporary, { root, via: [], child });
-      registered = true;
-    },
+    beforeCall: () => enlist(root, child),
     afterCall: async () => {},
   });
 
@@ -210,17 +250,25 @@ export function createGrayboard(h: Harness): Grayboard {
     harness: h.name, resumeHint: RESUME_HINT, loginAction: LOGIN_ACTION, sessionKey: GRAYBOARD_SESSION_META,
     client: { name: h.clientId, version: h.version }, delivery: { mode: "push", source: SOURCE },
     storage: store,
-    place: () => h.name,
+    place: () => place,
     ancestry: async sessionID => {
       if (sessionID !== id) throw new AncestryError(`Grayboard session ${sessionID} isn't this ${h.name} session's root`);
       return { sessionID, root: id, via: [] };
     },
     credential: login!.credential(),
     approval: null,
-    admit: async (_e, item, _stableID, identity) => {
+    // Idempotent per stableID across this root's runtimes: a /reload keeps
+    // the lease, so the reloaded Controller re-reads an item admitted before
+    // the reload whose receipt hadn't landed, and must not deliver it twice.
+    admit: async (_e, item, stableID, identity) => {
       if (closed) throw new Refusal("paused", `the ${h.name} session closed`);
+      let admitted = state.admitted.get(id);
+      if (!admitted) state.admitted.set(id, admitted = new Set());
+      if (admitted.has(stableID)) return;
       const params = channelParams(item, identity);
       h.deliver(render(params, SOURCE), wakes(item.actionable, params.meta));
+      admitted.add(stableID);
+      if (admitted.size > ADMITTED_LIMIT) admitted.delete(admitted.values().next().value!);
     },
   });
 
@@ -241,22 +289,34 @@ export function createGrayboard(h: Harness): Grayboard {
     catch (error) { if (!accessExpiry(error)) log(`couldn't reach the server: ${(error as Error).message}`, "warning"); }
   };
 
-  const carry = async (id: string) => {
-    if (!storage) return;
-    const remembered = await storage.get(`rememberedName:${id}`).catch(() => undefined);
-    if (remembered && typeof remembered === "object" && "name" in remembered && typeof remembered.name === "string") state.carried = remembered.name;
-  };
-
-  // Starts (or restarts) this root's delivery. `carried` is the outgoing
-  // session's name for a /new or /fork.
-  const begin = async (carried?: string) => {
+  // Starts (or restarts) this root's delivery: under a /new or /fork's carried
+  // name until a start takes it (a carry the server refused or couldn't be
+  // reached for is retried by the next start, /grayboard resume included),
+  // else rebinding the name a resume restores. A name that didn't take is
+  // said in the next tool result; a pause, by the sink.
+  const begin = async () => {
     if (!controller || !session || closed) return;
-    const id = session.id;
+    const id = session.id, carried = carrying;
     try {
+      // Set before the start: the sink weighs a pause its run loop reaches
+      // before resume returns against this epoch.
+      begun = (await login!.read().catch(() => undefined))?.epoch;
+      const expected = carried ?? await controller.carried(id);
       const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
       signedOut = false;
-      if (carried && status.roots.find(r => r.sessionID === id)?.name !== carried)
-        notice = `this session couldn't take the name ${carried} it carried over (${status.message}); it is unbound`;
+      // The Controller's own bind changed what the server's instructions say.
+      proxy?.forget(id);
+      const root = status.roots.find(r => r.sessionID === id);
+      // enroll's and resume's failures record operation "enroll"; a resume
+      // names its root before the rebind, so the name alone proves nothing.
+      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
+      if (carried && bound && carrying === carried) carrying = undefined;
+      if (expected && bound !== expected && root?.state !== "paused") {
+        const now = bound ? `it is bound as ${bound}` : "it is unbound";
+        notice = carried ? `this session couldn't take the name ${carried} it carried over (${root?.message ?? status.message}); ${now}`
+          : `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${now}`;
+        log(notice, "warning");
+      }
     } catch (error) {
       const expired = accessExpiry(error);
       if (!expired) { log(`couldn't start delivery: ${(error as Error).message}`, "error"); return; }
@@ -267,27 +327,54 @@ export function createGrayboard(h: Harness): Grayboard {
   };
   const restart = () => restarting ??= begin().finally(() => { restarting = undefined; });
 
+  // The Controller's records (its DiagnosticSink). A pause or degradation the
+  // run loop reaches on its own (retry budget, identity, lease recovery,
+  // admission limits) is said at once and in the next tool result, not only
+  // in /grayboard status. A credential change is credentialChanged's to say,
+  // whether the Controller's watch paused for it (the drift message) or the
+  // run loop's own check got there first (the store's epoch moved since this
+  // root started); a shutdown's pause is nobody's. A change of state or name
+  // drops the cached instructions: the Controller's own binds (a rebind after
+  // a lapsed lease, after an unbound whoami) never pass through the proxy's
+  // bind result.
+  let lastBinding: string | undefined, lastRecord: string | undefined;
+  const sink: DiagnosticSink = async record => {
+    if (!session || record.sessionID !== session.id) return;
+    const binding = `${record.state}\n${record.name ?? ""}`;
+    if (binding !== lastBinding) { lastBinding = binding; proxy?.forget(session.id); }
+    if (record.state === "active") carrying = undefined;
+    const key = `${record.state}\n${record.message}`;
+    if (key === lastRecord) return;
+    lastRecord = key;
+    if (record.state !== "paused" && record.state !== "degraded" || record.operation === "session_end" || record.message.startsWith(DRIFTED)) return;
+    const epoch = (await login!.read().catch(() => undefined))?.epoch;
+    if (epoch !== begun) return;
+    notice = `delivery ${record.state}: ${record.message}`;
+    log(notice, "warning");
+  };
+
   // The lock is ours: run the Controller and declare push delivery.
-  const own = async (taken: Lock, carried?: string) => {
+  const own = async (taken: Lock) => {
     if (closed || !session) { taken.release(); return; }
     // A held notice nobody saw yet is no longer true.
     lock = taken; if (notice === held) notice = undefined; held = undefined;
-    storage = new FileStorage(sessionPath(stateDir, login!.resource, h.clientId, session.id));
-    controller = new Controller(port(session.id, storage));
+    controller = new Controller(port(session.id, new FileStorage(sessionPath(stateDir, login!.resource, h.clientId, session.id))), { sink });
     await controller.restore().catch(() => {});
+    // The tools-only proxy's calls in flight finish on it: closing it under
+    // them would abort a write the server may have committed.
     const old = proxy;
     proxy = newProxy("push", controller);
-    await old?.close();
+    void old?.retire().catch(() => {});
     void connect();
-    await begin(carried);
+    await begin();
   };
 
-  const startRoot = async (carried?: string) => {
+  const startRoot = async () => {
     const id = session!.id;
     state.live.set(session!.file ?? `id:${id}`, id);
     const path = deliveryPath(stateDir, login!.resource, h.clientId, id);
     const taken = tryDelivery(path);
-    if (taken) return own(taken, carried);
+    if (taken) return own(taken);
     // Tools only until the other process lets go of this session.
     held = new DeliveryHeldElsewhere(h.name).message;
     notice = held;
@@ -316,9 +403,9 @@ export function createGrayboard(h: Harness): Grayboard {
       void connect();
       return;
     }
-    const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
+    carrying = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
-    await startRoot(carried);
+    await startRoot();
   };
 
   // A sign-in or sign-out in any process of this harness (the store's epoch).
@@ -336,22 +423,37 @@ export function createGrayboard(h: Harness): Grayboard {
     outAnnounced = false;
     void connect();
     if (!controller || !session) return;
-    const record = controller.status().roots.find(r => r.sessionID === session!.id);
-    if (signedOut || record?.state === "paused" && record.message.startsWith(DRIFTED)) await restart();
+    // A sign-in here or in another process: the Controller's own watch pauses
+    // this root (now or at its next tick), so it restarts under the new grant
+    // unless it already started under it. A restart already running may have
+    // read the old one.
+    await restarting;
+    const epoch = (await login!.read().catch(() => undefined))?.epoch;
+    if (!signedOut && epoch !== undefined && epoch === begun) return;
+    await restart();
   };
 
   const shutdown = async (reason: ShutdownReason) => {
     if (closed) return;
-    const id = session?.id;
-    if (id && role.kind === "root" && controller && (reason === "new" || reason === "fork")) await carry(id);
+    // From here admit refuses: an item admitted while the carry below reads
+    // storage would land in the session being left, and be receipted there.
     closed = true;
+    const id = session?.id;
+    if (id && role.kind === "root" && controller && (reason === "new" || reason === "fork")) state.carried = await controller.carried(id);
     watcher?.dispose();
     waiter?.abort();
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
     if (id && controller) await controller.shutdown(id, reason === "reload" ? "detach" : "release").catch(() => {});
     if (id && reason !== "reload") {
+      state.admitted.delete(id);
       const ended = (error: unknown) => h.notify(`grayboard: couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`, "warning");
-      if (role.kind === "child" && registered) await end(temporary, { child: id }).catch(ended);
+      // A register still in flight, or one that failed after the server
+      // committed it (a timeout), may have registered this child: it ends
+      // either way, and says so only when the end of a sure one fails.
+      if (role.kind === "child" && attempted) {
+        await registration?.catch(() => {});
+        await end(temporary, { child: id }).catch(registered ? ended : () => {});
+      }
       // An unattributed child is its own unleased root: ending it frees what
       // its calls bound now, not at the server's idle timeout.
       else if (role.kind === "loose" && used) await temporary(id, wire => wire.call("session_end")).catch(ended);
@@ -361,10 +463,15 @@ export function createGrayboard(h: Harness): Grayboard {
     await proxy?.close().catch(() => {});
   };
 
-  // System-prompt section: the server's instructions for this session.
+  // System-prompt section: the server's instructions for this session. A
+  // child registers first: the text an unregistered session gets tells it to
+  // bind, which the server refuses a child.
   const instructions = async (): Promise<string | undefined> => {
     if (!proxy || !session) return undefined;
-    try { return await proxy.instructions(session.id); } catch { return undefined; }
+    try {
+      if (role.kind === "child") await enlist(role.root, session.id);
+      return await proxy.instructions(session.id);
+    } catch { return undefined; }
   };
 
   // ---- /grayboard ----
@@ -399,7 +506,9 @@ export function createGrayboard(h: Harness): Grayboard {
     if ("error" in config) { log(config.error, "warning"); return; }
     try {
       if (verb === "login") {
-        await login!.login();
+        // Its own failure line: resume can't mend a sign-in that didn't happen.
+        try { await login!.login(); }
+        catch (error) { log(`sign-in failed: ${(error as Error).message}; ${LOGIN_ACTION} to try again`, "error"); return; }
         log("signed in");
         await connect();
         if (controller) await restart();
@@ -407,8 +516,17 @@ export function createGrayboard(h: Harness): Grayboard {
         // Before the store changes: this session's own watch sees the new
         // epoch too, and the line below already says it.
         outAnnounced = true;
-        try { await login!.logout(); } catch (error) { outAnnounced = false; throw error; }
-        log(`signed out; every ${h.name} session on this server pauses until ${LOGIN_ACTION}`);
+        const warnings: string[] = logoutWarnings = [];
+        try { await login!.logout(); }
+        catch (error) {
+          outAnnounced = false;
+          log(`sign-out failed: ${(error as Error).message}; run /grayboard logout to try again`, "error");
+          return;
+        } finally { logoutWarnings = undefined; }
+        const pauses = `every ${h.name} session on this server pauses until ${LOGIN_ACTION}`;
+        // A revoke that failed leaves the grant live on the server until it is sent again.
+        if (warnings.length) log(`${warnings.join("; ")}; ${pauses}`, "warning");
+        else log(`signed out; ${pauses}`);
       } else if (verb === "resume") {
         if (!controller || !session) { log(held ?? `only a root session with delivery resumes`, "warning"); return; }
         await restart();

@@ -5,38 +5,48 @@
 // reload detach and quit release, the child rule (runner marker, the
 // in-process registry, fork-is-root), child registration and end under the
 // server's child cap, the delivery-lock loser, and the unattributed runner
-// child.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+// child; and what the #436 audit found: a non-canonical config, restarts
+// after a sign-in elsewhere, a refused rebind or carry, the Controller's own
+// pauses and binds, sign-in and sign-out failures, the bind's place, a reload
+// before a receipt, an item reaching a root mid-/new, and a child shut down
+// mid-registration.
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { createGrayboard, type Grayboard, type Level, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { Controller } from "../../adapters/hosted-core/src/controller.ts";
+import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
+import { FileStorage, sessionPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { describeLocation } from "../../src/shared/identity.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
 const EMAIL = "alice@example.com";
+const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 const HELD = "another pi process holds delivery for this session";
 
-let srv: HostedServer, agentDir: string, user: number;
+let srv: HostedServer, agentDir: string, stateDir: string, user: number, stopped: boolean;
 const instances: Instance[] = [];
 
 beforeEach(async () => {
   srv = hostedServer();
+  stopped = false;
   agentDir = realpathSync(mkdtempSync(join(tmpdir(), "gb-pi-family-")));
-  const stateDir = join(agentDir, "grayboard");
+  stateDir = join(agentDir, "grayboard");
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url: srv.resource }));
   user = (await seedGrant(srv, stateDir, CLIENT, EMAIL)).authed.user_id;
 });
 afterEach(async () => {
   await Promise.all(instances.splice(0).map(i => i.ext.shutdown("quit")));
-  await srv.stop();
+  if (!stopped) await srv.stop();
   rmSync(agentDir, { recursive: true, force: true });
 });
 
@@ -49,7 +59,7 @@ type Instance = {
   tools(): NativeTool[];
   call(tool: string, args?: Record<string, unknown>): Promise<CallToolResult>;
 };
-function instance(marker: Marker = { child: false }): Instance {
+function instance(marker: Marker = { child: false }, onDeliver?: () => void): Instance {
   let tools: NativeTool[] = [];
   let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
@@ -58,7 +68,7 @@ function instance(marker: Marker = { child: false }): Instance {
       name: "pi", clientId: CLIENT, version: "1.0.0", agentDir,
       marker: () => marker,
       register: (list, call) => { tools = list; run = call; },
-      deliver: (content, wake) => { self.deliveries.push({ content, wake }); },
+      deliver: (content, wake) => { self.deliveries.push({ content, wake }); onDeliver?.(); },
       notify: (message, level) => { self.notices.push({ message, level }); },
     }),
     tools: () => tools,
@@ -88,6 +98,48 @@ async function root(id: string, name: string, extra: Partial<SessionInfo> = {}, 
   expect(bound.isError).toBeUndefined();
   await active(i, id, name);
   return i;
+}
+
+// Another pi process on this agentDir (none of this process's extension
+// state): a sign-in writes a new epoch and grant to the shared store, a
+// sign-out revokes and logs the store out.
+const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
+async function loginElsewhere(epoch: string) {
+  const issued = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
+  await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
+    access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
+}
+const logoutElsewhere = () => storeLogin().logout();
+// A session in another pi process, with its own grant and connection.
+function elsewhere(): ToolProxy {
+  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
+  return new ToolProxy({
+    wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },
+    harness: "pi", loginAction: "run /grayboard login", auth: { token: async () => token }, report: () => {},
+  });
+}
+// The root's Controller recorded something at or after `since` (its
+// diagnostics, persisted in the session's state file).
+const recordedSince = async (id: string, since: number) => {
+  const records = await new FileStorage(sessionPath(stateDir, srv.resource, CLIENT, id)).get("diagnostics:v1");
+  return Array.isArray(records) && records.some(r => r.sessionID === id && r.time >= since);
+};
+// Holds the in-process server at test pause `point` until the returned
+// release runs; `hit` resolves once a request reaches it.
+function pauseAt(point: string) {
+  const file = join(agentDir, `release-${point.replaceAll(":", "-")}`);
+  const spy = spyOn(console, "error");
+  process.env.BUS_TEST_PAUSE = point;
+  process.env.BUS_TEST_PAUSE_FILE = file;
+  return {
+    hit: until(() => spy.mock.calls.some(c => String(c[0]).includes(`test pause hit: ${point}`)), 10_000, `pause ${point}`),
+    release: () => {
+      writeFileSync(file, "");
+      delete process.env.BUS_TEST_PAUSE;
+      delete process.env.BUS_TEST_PAUSE_FILE;
+      spy.mockRestore();
+    },
+  };
 }
 
 test("a root binds through its bind tool; a DM arrives once as a waking <channel>, marked human only from the user's own human", async () => {
@@ -124,7 +176,7 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(beta.deliveries).toEqual([]);
 });
 
-test("/new carries the outgoing root's name; a carry refused because another live session holds the name leaves the new session unbound and says so once", async () => {
+test("/new carries the outgoing root's name, bound with this checkout as its place; a carry refused because another live session holds the name leaves the new session unbound, says so once, and /grayboard resume takes it once the name is free", async () => {
   const sender = await root("carry-sender", "sender");
   const first = await root("carry-1", "carrier");
   await first.ext.shutdown("new");
@@ -134,6 +186,8 @@ test("/new carries the outgoing root's name; a carry refused because another liv
   const second = instance();
   await second.ext.start({ id: "carry-2", reason: "new" });
   expect(row("carry-2")).toMatchObject({ name: "carrier", root_session_id: null });
+  // The Controller's bind says where, as server mode's `grayboard mcp` did.
+  expect(srv.app.db.query<{ place: string | null }, [string]>("SELECT place FROM hosted_sessions WHERE session_id = ?").get(hostedId("carry-2"))).toEqual({ place: describeLocation(process.cwd()) });
   await active(second, "carry-2", "carrier");
   await sender.call("dm_send", { to: "carrier", body: "to the carried name" });
   await until(() => second.deliveries.length === 1);
@@ -145,13 +199,9 @@ test("/new carries the outgoing root's name; a carry refused because another liv
   await second.ext.shutdown("new");
   // Between the two sessions a session in another pi process (its own grant
   // and connection, none of this process's extension state) takes the name.
-  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:delivery", "grayboard:tools"], Date.now(), CLIENT);
-  const elsewhere = new ToolProxy({
-    wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },
-    harness: "pi", loginAction: "run /grayboard login", auth: { token: async () => token }, report: () => {},
-  });
-  try { expect((await elsewhere.call("bind", { name: "carrier", create: false }, "carry-thief")).isError).toBeUndefined(); }
-  finally { await elsewhere.close(); }
+  const thief = elsewhere();
+  try { expect((await thief.call("bind", { name: "carrier", create: false }, "carry-thief")).isError).toBeUndefined(); }
+  finally { await thief.close(); }
   const third = instance();
   await third.ext.start({ id: "carry-3", reason: "new" });
   expect(row("carry-3")?.name ?? null).toBeNull();
@@ -160,6 +210,13 @@ test("/new carries the outgoing root's name; a carry refused because another liv
   expect(texts(result)[0]).toMatch(/^grayboard: this session couldn't take the name carrier it carried over \(.*identity_in_use.*\); it is unbound$/);
   expect(payload(result)).toMatchObject({ unbound: true });
   expect(texts(await third.call("whoami"))).toHaveLength(1);
+
+  // The session keeps the carried name, so the resume its notice names takes
+  // it once the holder lets go.
+  srv.app.mcp.sessions.release(hostedId("carry-thief"), "expired");
+  await third.ext.command("resume");
+  await active(third, "carry-3", "carrier");
+  expect(row("carry-3")).toMatchObject({ name: "carrier" });
 });
 
 test("reload detaches, keeping the lease the reloaded instance resumes; quit releases, and a later resume rebinds the remembered name", async () => {
@@ -363,4 +420,190 @@ test("a runner child with no parent session works as an unregistered session, wa
   // The name is free at once, not after the server's idle timeout.
   expect(row("loose-1")).toBeNull();
   await root("loner-next", "loner", {}, false);
+});
+
+test("a config.json URL the extension would refuse leaves it loading: start warns, and every tool call and status name the fix", async () => {
+  const rule = `${join(stateDir, "config.json")} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is`;
+  for (const url of ["http://10.0.0.5:8080/mcp", "https://grayboard.example/mcp?team=1"]) {
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+    const i = instance();
+    await i.ext.start({ id: `noncanonical-${instances.length}`, reason: "startup" });
+    expect(i.notices).toEqual([{ level: "warning", message: `grayboard: ${rule}` }]);
+    const result = await i.call("whoami");
+    expect(result.isError).toBe(true);
+    expect(texts(result)).toEqual([`error: ${rule}`]);
+    expect(await i.ext.status()).toBe(rule);
+  }
+});
+
+test("a sign-in in another pi process restarts this root: one active through a re-login keeps delivering, and one a sign-out paused comes back running", async () => {
+  const sender = await root("relogin-sender", "sender");
+  const a = await root("relogin-a", "racer");
+  const since = Date.now();
+  await loginElsewhere("relogin-1");
+  // The Controller moved on from the old grant: a pause, or the restart's own records.
+  await until(() => recordedSince("relogin-a", since), 10_000, "a record after the re-login");
+  await active(a, "relogin-a", "racer", 10_000);
+  await sender.call("dm_send", { to: "racer", body: "after the re-login" });
+  await until(() => a.deliveries.some(d => d.content.includes("after the re-login")), 10_000, "a DM after the re-login");
+
+  await logoutElsewhere();
+  await until(async () => (await a.ext.status()).includes("  relogin-a (racer): paused, "), 10_000, "paused by the sign-out");
+  await loginElsewhere("relogin-2");
+  // Running again, unbound: a new sign-in never inherits the old grant's name.
+  await until(async () => (await a.ext.status()).includes("  relogin-a: unbound, "), 10_000, "restarted after the sign-in");
+  expect((await a.call("bind", { name: "racer", create: false })).isError).toBeUndefined();
+  await active(a, "relogin-a", "racer");
+}, 60_000);
+
+test("/new after a sign-in that dropped the root's name carries nothing: a remembered name counts only under the sign-in it was bound with", async () => {
+  const a = await root("stale-a", "stalename");
+  await logoutElsewhere();
+  await until(async () => (await a.ext.status()).includes("  stale-a (stalename): paused, "), 10_000, "paused by the sign-out");
+  // The lease lapsed meanwhile, so the name is free to take.
+  srv.app.mcp.sessions.release(hostedId("stale-a"), "expired");
+  await loginElsewhere("stale-relogin");
+  await until(async () => (await a.ext.status()).includes("  stale-a: unbound, "), 10_000, "restarted unbound");
+  await a.ext.shutdown("new");
+  const b = instance();
+  await b.ext.start({ id: "stale-b", reason: "new" });
+  expect(row("stale-b")?.name ?? null).toBeNull();
+  const result = await b.call("whoami");
+  expect(texts(result)).toHaveLength(1);
+  expect(payload(result)).toMatchObject({ unbound: true });
+  expect(b.notices).toEqual([]);
+}, 60_000);
+
+test("a resume whose rebind is refused says so at once and in the next tool result; once the name is free, /grayboard resume rebinds it and the instructions follow", async () => {
+  const first = await root("rebind-s", "rebinder");
+  await first.ext.shutdown("quit");
+  const thief = elsewhere();
+  try { expect((await thief.call("bind", { name: "rebinder", create: false }, "rebind-thief")).isError).toBeUndefined(); }
+  finally { await thief.close(); }
+
+  const again = instance();
+  await again.ext.start({ id: "rebind-s", reason: "resume" });
+  const refused = /^grayboard: this session couldn't take back its name rebinder \(Operation refused \(identity_in_use\).*\); it is unbound$/;
+  expect(again.notices).toEqual([{ level: "warning", message: expect.stringMatching(refused) }]);
+  const result = await again.call("whoami");
+  expect(texts(result)[0]).toMatch(refused);
+  expect(payload(result)).toMatchObject({ unbound: true });
+  expect(await again.ext.instructions()).toStartWith("This session has no bus name yet.");
+
+  // The Controller's own bind drops the cached unbound instructions.
+  srv.app.mcp.sessions.release(hostedId("rebind-thief"), "expired");
+  await again.ext.command("resume");
+  await active(again, "rebind-s", "rebinder");
+  expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);
+});
+
+test("a child's system-prompt instructions are its registered session's, even fetched before its first call", async () => {
+  await root("prompt-root", "prompter");
+  const child = instance({ child: true, root: "prompt-root" });
+  await child.ext.start({ id: "prompt-child", reason: "startup" });
+  expect(await child.ext.instructions()).toStartWith(`You are "${EMAIL}/prompter" on grayboard.`);
+  expect(row("prompt-child")).toMatchObject({ root_session_id: hostedId("prompt-root") });
+  expect((await child.call("whoami")).isError).toBeUndefined();
+});
+
+test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result", async () => {
+  const a = await root("sink-a", "sinker");
+  // The same session bound to another name outside this extension: the run
+  // loop won't deliver under a binding it didn't make.
+  const other = elsewhere();
+  try { expect((await other.call("bind", { name: "switched", create: true }, "sink-a")).isError).toBeUndefined(); }
+  finally { await other.close(); }
+  const paused = "grayboard: delivery paused: Operation failed; run /grayboard resume";
+  await until(() => a.notices.length > 0, 10_000, "a notice");
+  expect(a.notices).toEqual([{ level: "warning", message: paused }]);
+  expect(texts(await a.call("whoami"))[0]).toBe(paused);
+});
+
+test("with the server down, /grayboard logout signs out but warns that its revoke is queued, and a failed /grayboard login names login, not resume", async () => {
+  const a = await root("down-a", "downer");
+  await srv.stop();
+  stopped = true;
+  await a.ext.command("logout");
+  expect(a.notices.at(-1)).toEqual({ level: "warning", message: expect.stringMatching(/^grayboard: Signed out; revoking the grant failed and stays queued for the next login \(.+\); every pi session on this server pauses until run \/grayboard login$/) });
+  await a.ext.command("login");
+  expect(a.notices.at(-1)).toEqual({ level: "error", message: expect.stringMatching(/^grayboard: sign-in failed: .+; run \/grayboard login to try again$/) });
+  expect(a.notices.some(n => n.message.includes("/grayboard resume"))).toBe(false);
+}, 30_000);
+
+test("a /reload between an item's admission and its receipt doesn't deliver it twice: admission is idempotent per item across the reload", async () => {
+  const sender = await root("dup-sender", "sender");
+  let reloaded: Promise<Instance> | undefined;
+  // Reloads inside the first delivery, before its receipt goes out.
+  const before: Instance = instance(undefined, () => {
+    reloaded ??= (async () => {
+      await before.ext.shutdown("reload");
+      const after = instance();
+      await after.ext.start({ id: "dup-1", reason: "reload" });
+      return after;
+    })();
+  });
+  await before.ext.start({ id: "dup-1", reason: "startup" });
+  expect((await before.call("bind", { name: "duper", create: true })).isError).toBeUndefined();
+  await active(before, "dup-1", "duper");
+  await sender.call("dm_send", { to: "duper", body: "first" });
+  const after = await until(() => reloaded, 10_000, "the reload");
+  await active(after, "dup-1", "duper");
+  // Items admit in order: once the second arrives, the first was read again and skipped.
+  await sender.call("dm_send", { to: "duper", body: "second" });
+  await until(() => after.deliveries.some(d => d.content.includes("second")), 10_000, "the second DM");
+  expect(before.deliveries.map(d => d.content.includes("first"))).toEqual([true]);
+  expect(after.deliveries.filter(d => d.content.includes("first"))).toEqual([]);
+});
+
+test("a child shut down while its registration is in flight still ends it, so it never counts toward the root's child cap", async () => {
+  await root("midreg-root", "midreg");
+  const child = instance({ child: true, root: "midreg-root" });
+  await child.ext.start({ id: "midreg-child", reason: "startup" });
+  const pause = pauseAt("hosted:register:before-txn");
+  const call = child.call("whoami").catch(error => error);
+  let down: Promise<void>;
+  try {
+    await pause.hit;
+    down = child.ext.shutdown("quit");
+  } finally { pause.release(); }
+  await down;
+  await call;
+  expect(row("midreg-child")).toBeNull();
+});
+
+test("an item that reaches a root while its /new reads the carried name stays for the new session: the outgoing one neither delivers nor receipts it", async () => {
+  const sender = await root("closing-sender", "sender");
+  const first = await root("closing-1", "closer");
+  const carried = Controller.prototype.carried;
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  const { promise: gate, resolve: open } = Promise.withResolvers<void>();
+  // Holds the outgoing session's carry read: the window where admit used to
+  // still deliver.
+  const spy = spyOn(Controller.prototype, "carried").mockImplementation(async function (this: Controller, id: string) {
+    if (id === "closing-1") { entered(); await gate; }
+    return carried.call(this, id);
+  });
+  let down: Promise<void> | undefined;
+  try {
+    down = first.ext.shutdown("new");
+    await reached;
+    const since = Date.now();
+    await sender.call("dm_send", { to: "closer", body: "sent while closing" });
+    // The run loop took the item to admit: delivered there, or refused there
+    // (a pause the Controller records).
+    const paused = async () => {
+      const records = await new FileStorage(sessionPath(stateDir, srv.resource, CLIENT, "closing-1")).get("diagnostics:v1");
+      return Array.isArray(records) && records.some(r => r.sessionID === "closing-1" && r.state === "paused" && r.time >= since);
+    };
+    await until(async () => first.deliveries.length > 0 || await paused(), 10_000, "the item's admission");
+    expect(first.deliveries).toEqual([]);
+  } finally {
+    open();
+    await down;
+    spy.mockRestore();
+  }
+  const second = instance();
+  await second.ext.start({ id: "closing-2", reason: "new" });
+  await active(second, "closing-2", "closer");
+  await until(() => second.deliveries.some(d => d.content.includes("sent while closing")), 10_000, "the DM in the new session");
 });

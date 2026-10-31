@@ -1,13 +1,14 @@
 // End-to-end with the real pi coding agent: the scenarios in tests/support/pi.ts,
 // on this checkout. binaries.e2e.ts runs the local ones on a release's
-// compiled binary. The hosted ones run the bundle the CLI embeds (server mode).
+// compiled binary. The hosted ones run the bundle the CLI embeds (server mode),
+// starting with the spec's load smoke.
 import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
 import {
-  piHostedCarryScenario, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
+  piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
   piMissingBinaryScenario, piReenabledScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
@@ -27,6 +28,7 @@ test("pi unbound: the session acts as its ID; two binds and an unbind through th
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
 test("pi: a grayboard that stops reading makes the next write fail with EPIPE, which pi survives and reports", () => piStdinClosedScenario(dir), 60_000);
+test("pi hosted load smoke: the embedded bundle loads under Node signed in; session_start sees pi's session id, the MCP client connects, the node:sqlite delivery lock is taken; no grayboard process runs and quit leaves nothing leased", () => piHostedLoadSmoke(dir), 60_000);
 test("pi hosted: signed out it says how to sign in; /grayboard login walks the consent page; bind takes the lease; a DM is one turn whose receipt moves the cursor; files go out with dm_send and come in with attachment_get; no grayboard process runs", () => piHostedScenario(dir), 120_000);
 test("pi hosted: /fork is a new root with its own lease that carries the name, /new carries it, /resume of the first session rebinds its remembered name", () => piHostedCarryScenario(dir), 120_000);
 test("pi hosted: two processes with an expired token refresh it once; /grayboard logout in one pauses both", () => piHostedRefreshLogoutScenario(dir), 120_000);

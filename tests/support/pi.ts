@@ -11,6 +11,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools, ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
+import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" };
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
 import { attachRoots } from "../../src/shared/attachments.ts";
@@ -529,6 +530,40 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
       model.stop();
       await srv.stop();
     }
+  });
+}
+
+// The spec's load smoke for pi (#279; omp's comes with #280): the bundle the
+// CLI's macro emits, loaded by the pinned pi under Node with an isolated HOME
+// and a seeded grant. No load failure and no login notice: it loaded and read
+// the grant. The status's session line carries pi's own id: session_start
+// ran. The root's unbound Controller line only appears after the Controller's
+// whoami round trip: the bundle's @modelcontextprotocol/client Client
+// connected under Node. The delivery lock file exists and no `delivery:` line
+// shows: node:sqlite opened it and BEGIN EXCLUSIVE took it. No grayboard
+// process runs, and quitting leaves nothing leased. The hand-run probe's
+// `ctx.agent?.kind` isn't asserted: pi 1.4.0 has no agent kind and the pi
+// entry never reads it (omp's entry will).
+export function piHostedLoadSmoke(dir: string): Promise<void> {
+  return withHosted(dir, [], async ({ srv, start }) => {
+    await seedGrant(srv, stateDirOf(dir), PI_CLIENT);
+    const pi = start();
+    const { sessionId } = await pi.command({ type: "get_state" });
+    const controller = `\n  ${sessionId}: unbound, Root approved, unbound; bind(name) to take one`;
+    const status = await until(async () => {
+      const s = await statusOf(pi);
+      return s.includes(controller) ? s : undefined;
+    }, 15_000, "the root's Controller line");
+    expect(status).toContain(`\nsign-in: signed in\nsession: ${sessionId} (root)\n`);
+    expect(status).not.toContain("\ndelivery: ");
+    expect(pi.stderr).not.toContain("Failed to load extension");
+    expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
+    expect(pi.notices()).not.toContain(LOGIN_NOTICE);
+    expect(existsSync(deliveryPath(stateDirOf(dir), srv.resource, PI_CLIENT, sessionId))).toBe(true);
+    expect(piRow(srv, sessionId)?.name).toBeNull();
+    expect(grayboardDescendants(pi.pid)).toEqual([]);
+    await pi.quit();
+    await until(() => srv.app.mcp.activeLeases === 0, 10_000, "nothing leased after quit");
   });
 }
 

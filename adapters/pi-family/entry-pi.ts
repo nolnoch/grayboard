@@ -2,10 +2,9 @@
 // --server <url>` bundles this file for Node and installs it as
 // <agentDir>/extensions/grayboard.js; local mode keeps adapters/pi/grayboard.ts.
 // pi's API is imported as types only: the bundle has no runtime pi import.
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { version } from "../../package.json" with { type: "json" };
+import { piAgentDir } from "../../src/shared/pi.ts";
 import { createGrayboard, type Level } from "./extension.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
@@ -21,7 +20,7 @@ export default function grayboard(pi: ExtensionAPI) {
     name: "pi",
     clientId: "grayboard-pi",
     version,
-    agentDir: process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+    agentDir: piAgentDir(),
     // pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 and passes the
     // top-level parent's session id (src/runs/background/subagent-runner.js).
     marker: () => process.env.PI_SUBAGENT_CHILD === "1"

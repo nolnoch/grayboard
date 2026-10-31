@@ -156,8 +156,13 @@ export class Controller<E extends Enrollment = Enrollment> {
   private expired(error: unknown) {
     return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
   }
+  // A check a disposed watch already had in flight drifts nothing: the root it
+  // watched was replaced (a resume or enroll unwatches before the new root),
+  // and the new root's own watch sees any later change.
   private async watch(e: E) {
-    this.watches.set(e.sessionID, await this.port.credential.watch(e, () => this.drift(`Grayboard credential changed; ${this.hint}`)));
+    let live = true;
+    const watch = await this.port.credential.watch(e, () => { if (live) this.drift(`Grayboard credential changed; ${this.hint}`); });
+    this.watches.set(e.sessionID, { dispose: async () => { live = false; await watch.dispose(); } });
   }
   private async unwatch(sessionID: string) {
     if (this.drifted) {
@@ -204,13 +209,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.unwatch(sessionID);
     const previous = this.roots.get(sessionID);
     if (previous) await this.stop(previous);
-    let approval: E;
-    if (this.port.approval) {
-      const saved = (await this.port.approval.saved()).find(s => s.sessionID === sessionID);
-      if (!saved?.approval || !saved.enabled) throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
-      approval = saved.approval;
-      await this.port.credential.check(approval);
-    } else approval = await this.port.credential.capture(sessionID);
+    const approval = await this.approvalFor(sessionID);
     // A new grant (possibly another account) never inherits the old name.
     const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
     const r: Root<E> = { e: { ...approval, ...(name ? { name } : {}) }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set() };
@@ -222,6 +221,25 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
+  // The approval a root of `sessionID` starts under now: its saved, enabled
+  // approval on an approval host, else the current credential.
+  private async approvalFor(sessionID: string): Promise<E> {
+    if (!this.port.approval) return this.port.credential.capture(sessionID);
+    const saved = (await this.port.approval.saved()).find(s => s.sessionID === sessionID);
+    if (!saved?.approval || !saved.enabled) throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
+    await this.port.credential.check(saved.approval);
+    return saved.approval;
+  }
+  // The name a successor of `sessionID` binds (pi's /new and /fork): the name
+  // a resume of it would rebind now (remembered, else its live root's, under
+  // the current approval only), so a name a new sign-in dropped never
+  // carries. Undefined when there is none or it can't be read (signed out).
+  async carried(sessionID: string): Promise<string | undefined> {
+    try {
+      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
+      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
+    } catch { return undefined; }
+  }
   private async prepare(r: Root<E>, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
     await this.temporary(r.e, async wire => {
