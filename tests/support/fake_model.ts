@@ -35,15 +35,18 @@ export function onChannelDm(from: string, reply: (messageId: number, text: strin
   };
 }
 
-const lastUserText = (req: ChatRequest): string => messageText(req.messages.findLast((m) => m.role === "user") ?? { role: "user" });
+// A user message's prompt text: omp prepends a <system-reminder> block to the
+// user's prompt in the same message.
+export const promptText = (m: ChatMessage): string => messageText(m).replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\n?/, "");
+const lastUserText = (req: ChatRequest): string => promptText(req.messages.findLast((m) => m.role === "user") ?? { role: "user" });
 const actedSince = (req: ChatRequest, at: number): boolean => req.messages.slice(at + 1).some((m) => m.role === "assistant");
 
 // A subagent fan-out through omp's `task` tool (#280): when the latest user
 // message matches `trigger`, the parent calls `task` with `n` assignments, each
 // naming its child (`fake-child-<i>`). A child's own conversation, found by its
-// name in the first user message, makes the call `child(i)` scripts, then ends
-// its turn with text once that call has a result.
-export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Reply): Rule[] {
+// name in the first user message, makes the calls `child(i)` scripts, one per
+// assistant message, then ends its turn with text.
+export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Reply[]): Rule[] {
   const name = /\bfake-child-(\d+)\b/;
   const parent: Rule = (req) => {
     const at = req.messages.findLastIndex((m) => m.role === "user");
@@ -52,10 +55,10 @@ export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Rep
     return { tool: "task", args: { context: "fake fan-out", tasks } };
   };
   const children: Rule = (req) => {
-    const first = req.messages.find((m) => m.role === "user");
+    const first = req.messages.find((x) => x.role === "user");
     const m = first && name.exec(messageText(first));
     if (!m) return undefined;
-    return req.messages.some((x) => x.role === "tool") ? { text: `fake-child-${m[1]} done` } : child(Number(m[1]));
+    return child(Number(m[1]))[req.messages.filter((x) => x.role === "assistant").length] ?? { text: `fake-child-${m[1]} done` };
   };
   // Children first: a child's prompt can also match the parent's trigger.
   return [children, parent];

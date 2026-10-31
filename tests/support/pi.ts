@@ -18,7 +18,7 @@ import { attachRoots } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { cleanEnv, localEnv } from "./env.ts";
-import { onChannelDm, messageText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
+import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -41,7 +41,7 @@ function writeModels(agentDir: string, modelPort: number): void {
 }
 
 // One entry of pi's session (get_messages).
-type PiMessage = { role: string; content: unknown; toolName?: string; isError?: boolean };
+export type PiMessage = { role: string; content: unknown; toolName?: string; isError?: boolean };
 
 // ── pi in RPC mode ───────────────────────────────────────────────────────────
 
@@ -454,10 +454,11 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
 
 type HostedRow = { name: string | null; lease_deadline: number | null; ownership_id: number };
 
-const resultText = (m: PiMessage): string => (m.content as { text?: string }[]).map((b) => b.text ?? "").join("\n");
-// The `nth` result of a grayboard tool in pi's session.
-const toolResult = (pi: Pi, tool: string, nth = 0): Promise<PiMessage> =>
-  until(async () => (await pi.messages()).filter((m) => m.role === "toolResult" && m.toolName === `mcp__grayboard__${tool}`)[nth], 30_000, `${tool} result #${nth}`);
+export const resultText = (m: PiMessage): string => (m.content as { text?: string }[]).map((b) => b.text ?? "").join("\n");
+// The `nth` result of the tool named `name` (with its harness prefix) in the session.
+export const toolResultNamed = (pi: Pi, name: string, nth = 0): Promise<PiMessage> =>
+  until(async () => (await pi.messages()).filter((m) => m.role === "toolResult" && m.toolName === name)[nth], 30_000, `${name} result #${nth}`);
+const toolResult = (pi: Pi, tool: string, nth = 0): Promise<PiMessage> => toolResultNamed(pi, `mcp__grayboard__${tool}`, nth);
 // pi finished its run: nothing streaming, nothing queued.
 const idle = (pi: Pi) => until(async () => {
   const s = await pi.command({ type: "get_state" });
@@ -471,14 +472,17 @@ export async function statusOf(pi: Pi): Promise<string> {
   return until(() => pi.notices().slice(before).find((n) => n.startsWith("grayboard: server: ")), 5_000, "/grayboard status");
 }
 
-const piRow = (srv: HostedServer, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
-  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(PI_CLIENT, raw) ?? undefined;
+// The hosted session `client` keeps for the harness session `raw`.
+export const hostedRow = (srv: HostedServer, client: string, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
+  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(client, raw) ?? undefined;
 // `raw`'s hosted session holds `name` and the server's one delivery lease.
-const leasedAs = (srv: HostedServer, raw: string, name: string): boolean => {
-  const row = piRow(srv, raw);
+export const leased = (srv: HostedServer, client: string, raw: string, name: string): boolean => {
+  const row = hostedRow(srv, client, raw);
   return row?.name === name && row.lease_deadline !== null && srv.app.mcp.activeLeases === 1;
 };
-const ownershipEnded = (srv: HostedServer, id: number): boolean =>
+const piRow = (srv: HostedServer, raw: string) => hostedRow(srv, PI_CLIENT, raw);
+const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, PI_CLIENT, raw, name);
+export const ownershipEnded = (srv: HostedServer, id: number): boolean =>
   srv.app.db.query<{ ended_at: number | null }, [number]>("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(id)?.ended_at != null;
 
 // After the user prompt `prompt` (the latest; <channel> deliveries aren't
@@ -486,8 +490,8 @@ const ownershipEnded = (srv: HostedServer, id: number): boolean =>
 // ends the turn.
 export function scripted(prompt: string, steps: Reply[]): Rule {
   return (req) => {
-    const at = req.messages.findLastIndex((m) => m.role === "user" && !messageText(m).startsWith("<channel"));
-    if (at < 0 || messageText(req.messages[at]!) !== prompt) return undefined;
+    const at = req.messages.findLastIndex((m) => m.role === "user" && !promptText(m).startsWith("<channel"));
+    if (at < 0 || promptText(req.messages[at]!) !== prompt) return undefined;
     return steps[req.messages.slice(at + 1).filter((m) => m.role === "assistant").length];
   };
 }

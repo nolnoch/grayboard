@@ -127,6 +127,9 @@ export default function grayboard(pi: ExtensionAPI) {
   pi.on("session_switch", async (event, context) => { await replace(context, event.reason); });
   pi.on("session_branch", async (_event, context) => { await replace(context, "fork"); });
   pi.on("session_shutdown", async () => { await finish("quit"); });
+  // A subagent's run ended: omp keeps it live for its idle TTL, revivable, so
+  // its child slot goes back now rather than at shutdown.
+  pi.on("agent_end", async (_event, context) => { if (context.agent.kind === "sub") await current?.idle(); });
   // The server's instructions tell the model what a <channel> message is;
   // a subagent receives none, so only a main session gets them.
   pi.on("before_agent_start", async (event, context) => {

@@ -83,6 +83,7 @@ export interface Grayboard {
   instructions(): Promise<string | undefined>; // the server's instructions, for the system prompt
   command(args: string): Promise<void>;        // `/grayboard <args>`
   status(): Promise<string>;
+  idle(): Promise<void>;                       // a subagent's run ended: its child slot goes back until its next call
 }
 
 export function createGrayboard(h: Harness): Grayboard {
@@ -109,6 +110,7 @@ export function createGrayboard(h: Harness): Grayboard {
   let waiter: AbortController | undefined;
   let watcher: { dispose(): void } | undefined;
   let registration: Promise<void> | undefined; // a child's register under its root, until it fails
+  let releasing: Promise<void> | undefined;    // an idle child's end, which its next register waits behind
   let registered = false;             // that register succeeded
   let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this session's id
@@ -178,12 +180,13 @@ export function createGrayboard(h: Harness): Grayboard {
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
   // After shutdown begins none starts: shutdown ends only a register it saw.
+  // One after an idle end goes out once that end has landed.
   const enlist = (root: string, via: string[], child: string): Promise<void> => {
     if (registration) return registration;
     if (closed) return Promise.reject(new Error(`the ${h.name} session closed`));
     attempted = true;
-    const pending: Promise<void> = register(temporary, { root, via, child }).then(
-      () => { registered = true; proxy?.forget(child); },
+    const pending: Promise<void> = (releasing ?? Promise.resolve()).then(() => register(temporary, { root, via, child })).then(
+      () => { if (registration === pending) { registered = true; proxy?.forget(child); } },
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
   };
@@ -191,6 +194,24 @@ export function createGrayboard(h: Harness): Grayboard {
     beforeCall: () => enlist(root, via, child),
     afterCall: async () => {},
   });
+  const endFailed = (id: string) => (error: unknown) =>
+    h.notify(`grayboard: couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`, "warning");
+  // omp keeps a finished subagent live (revivable) for its idle TTL, so a
+  // child released only at shutdown would hold a slot long after its run: a
+  // fan-out of 128 within that TTL would fill the root's cap. An idle child
+  // ends now; its next call registers it again.
+  const idle = async (): Promise<void> => {
+    if (closed || role.kind !== "child" || !session || !attempted) return;
+    const id = session.id, pending = registration, sure = registered;
+    registration = undefined; registered = false; attempted = false;
+    const run = (async () => {
+      const committed = sure || (pending ? await pending.then(() => true, () => false) : false);
+      await end(temporary, { child: id }).catch(committed ? endFailed(id) : () => {});
+    })();
+    releasing = run;
+    await run;
+    if (releasing === run) releasing = undefined;
+  };
 
   // ---- roots ----
 
@@ -393,9 +414,11 @@ export function createGrayboard(h: Harness): Grayboard {
     waiter?.abort();
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
     if (id && controller) await controller.shutdown(id, reason === "reload" ? "detach" : "release").catch(() => {});
+    // An idle end still landing finishes first: omp caps shutdown handlers at 2 s.
+    await releasing;
     if (id && reason !== "reload") {
       state.admitted.delete(id);
-      const ended = (error: unknown) => h.notify(`grayboard: couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`, "warning");
+      const ended = endFailed(id);
       // A register still in flight, or one that failed after the server
       // committed it (a timeout), may have registered this child: it ends
       // either way, and says so only when the end of a sure one fails.
@@ -492,5 +515,5 @@ export function createGrayboard(h: Harness): Grayboard {
     }
   };
 
-  return { start, shutdown, instructions, command, status };
+  return { start, shutdown, instructions, command, status, idle };
 }
