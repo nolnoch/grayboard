@@ -1,7 +1,7 @@
 // The one seam between the harness-neutral Controller and a host: OpenCode V2
 // (host-owned grant, human approval) or a harness adapter (pi, omp, Claude
 // Code: adapter-owned grant, every root approved).
-import type { Item } from "./model.js";
+import type { Identity, Item } from "./model.js";
 import type { SessionPath } from "./sessions.js";
 
 export type Configuration = { type: "remote"; url: string; issuer: string; clientID: string; scope: string; configHash: string };
@@ -21,7 +21,9 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   ancestry(sessionID: string): Promise<SessionPath>; // {sessionID, root, via}; throws AncestryError
   credential: CredentialPort<E>;
   approval: ApprovalPort<E> | null; // null = adapter-owned grant: every root of this installation is approved
-  admit(e: E, item: Item, stableID: string): Promise<void>; // idempotent per stableID; resolves once the host accepted the item
+  // Idempotent per stableID; resolves once the host accepted the item. `identity`
+  // is the lease's: an adapter marks its own user's human (`<email>/human`) by it.
+  admit(e: E, item: Item, stableID: string, identity: Identity): Promise<void>;
 }
 export interface CredentialPort<E extends Enrollment> {
   capture(sessionID: string): Promise<E>;            // a fresh enrollment for this root

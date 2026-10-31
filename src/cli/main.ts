@@ -7,10 +7,13 @@ import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource } from "./adapters.ts" with { type: "macro" };
+import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
+import { canonicalEndpoint } from "../shared/endpoint.ts";
+import { piAgentDir } from "../shared/pi.ts";
+import { Login } from "../../adapters/hosted-core/src/login.ts";
 
 function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
@@ -38,7 +41,7 @@ function handleApiError(e: unknown): never {
 
 const OMP_DIR = join(homedir(), ".omp", "agent");
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
-const PI_DIR  = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+const PI_DIR  = piAgentDir();
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
@@ -63,8 +66,91 @@ const PI_CONFIG: HarnessConfig = {
 const ADAPTERS: { path: string; source: string; config?: HarnessConfig }[] = [
   { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
   { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode"), config: OC_CONFIG },
-  { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi"), config: PI_CONFIG },
 ];
+
+// pi has two adapters, one per mode. Local: the child adapter (`.ts`) runs a
+// push-mode `grayboard mcp` and reads its command from the disabled entry.
+// Server: the hosted extension (`.js`, a Node bundle) talks to the server's
+// /mcp itself, holds the delivery lease, and reads only
+// `<agentDir>/grayboard/config.json {url}`; it needs no entry. Installing
+// one variant removes the other.
+const PI_LOCAL  = join(PI_DIR, "extensions", "grayboard.ts");
+const PI_HOSTED = join(PI_DIR, "extensions", "grayboard.js");
+const PI_HOSTED_CONFIG = join(PI_DIR, "grayboard", "config.json");
+
+/** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
+const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
+
+type PiInstall = { adapter: string; notes: string[] };
+/**
+ * Install pi's adapter for the mode: `server` set → the hosted extension;
+ * else the local adapter, with `entry` as the entry's command (or the
+ * existing entry disabled). Leaving a hosted install's server (local mode, or
+ * another server) signs pi out of it first, revoking its grant. Returns the
+ * adapter's path and what else changed. Throws, before any file changes, on
+ * a server URL the hosted extension would refuse or an unparseable mcp.json
+ * or config.json; throws after the entry check if the sign-out does (its
+ * grant store's lock), leaving the install as it was.
+ */
+async function installPi(server: string | undefined, entry?: Entry): Promise<PiInstall> {
+  const notes: string[] = [];
+  let url: string | undefined;
+  if (server) {
+    // The extension refuses to load with any other URL, and pi then exits at
+    // startup. The URL isn't echoed: it may hold credentials.
+    try { url = canonicalEndpoint(hostedMcpUrl(server))?.href; } catch {}
+    if (!url) throw new Error("pi's hosted extension needs a canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment, so nothing was changed for pi");
+  }
+  // The entry next: an unparseable mcp.json throws before any file changes.
+  const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(PI_CONFIG.path, {})[PI_CONFIG.section]?.grayboard;
+  // `?.`: the file may hold JSON null.
+  const old = readConfig<{ url?: unknown }>(PI_HOSTED_CONFIG, {})?.url;
+  if (typeof old === "string" && old !== url) {
+    const note = await signOutPi(old);
+    if (note) notes.push(note);
+  }
+  if (url) {
+    if (dropEntry(PI_CONFIG)) notes.push(`Removed the grayboard entry from ${PI_CONFIG.path} (the hosted extension needs none)`);
+    writeAdapter(PI_HOSTED, adapterBundle("pi"));
+    rmSync(PI_LOCAL, { force: true });
+    writeConfig(PI_HOSTED_CONFIG, { url });
+    notes.push(`Wrote ${PI_HOSTED_CONFIG}`);
+    return { adapter: PI_HOSTED, notes };
+  }
+  // A local adapter reads its command from the entry, so one that's missing
+  // (a server-mode install removed it) is recreated with this binary's.
+  const next = entry ?? (existing ? undefined : mcpCommand());
+  if (putEntry(PI_CONFIG, next)) notes.push(next ? `Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools)` : `Disabled the grayboard entry in ${PI_CONFIG.path} (the adapter serves the tools)`);
+  writeAdapter(PI_LOCAL, adapterSource("pi"));
+  rmSync(PI_HOSTED, { force: true });
+  if (typeof old === "string") {
+    rmSync(PI_HOSTED_CONFIG, { force: true });
+    notes.push(`Removed ${PI_HOSTED_CONFIG}`);
+  }
+  return { adapter: PI_LOCAL, notes };
+}
+
+/**
+ * Sign pi's hosted extension out of `resource`, as its /grayboard logout
+ * does: revoke the grant and bump the store's epoch, so running pi sessions
+ * pause with the login notice. Dropping the extension otherwise leaves its
+ * refresh token on disk, still able to mint access tokens. Returns a note,
+ * or undefined when pi holds nothing for `resource`.
+ */
+async function signOutPi(resource: string): Promise<string | undefined> {
+  let queued: string | undefined;
+  let login: Login;
+  try {
+    login = new Login({ resource, clientId: "grayboard-pi", stateDir: join(PI_DIR, "grayboard"), harness: "pi", loginAction: "run /grayboard login",
+      present: () => {}, notify: () => {}, diagnostic: r => { if (r.code === "revoke_queued") queued = r.message; } });
+  } catch { return undefined; } // not canonical: the extension never loaded with it, so never signed in
+  const s = await login.read();
+  if (!s?.refresh && !s?.revoke?.length) return undefined;
+  await login.logout();
+  if (queued === undefined) return `Signed pi out of ${login.resource} and revoked its grant`;
+  const cause = /\(([^()]*)\)$/.exec(queued)?.[1] ?? queued;
+  return `Signed pi out of ${login.resource}; revoking its grant failed and stays queued for its next login there (${cause})`;
+}
 
 function writeAdapter(path: string, source: string): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -94,6 +180,16 @@ function putEntry(c: HarnessConfig, entry?: Entry): boolean {
   const next = c.disable(base);
   if (JSON.stringify(next) === JSON.stringify(old)) return false;
   cfg[c.section] = { ...cfg[c.section], grayboard: next };
+  writeConfig(c.path, cfg);
+  return true;
+}
+
+/** Delete the harness's grayboard entry; true when the file changed. */
+function dropEntry(c: HarnessConfig): boolean {
+  const cfg = readConfig<Record<string, Record<string, Entry> | undefined>>(c.path, {});
+  if (!cfg[c.section]?.grayboard) return false;
+  const { grayboard: _, ...rest } = cfg[c.section]!;
+  cfg[c.section] = rest;
   writeConfig(c.path, cfg);
   return true;
 }
@@ -637,15 +733,17 @@ program
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${plugin.path}`);
     }
 
-    // 5. pi: its MCP client drops notifications and, for direct tools, the
-    // server's instructions, so like opencode the extension serves the tools,
-    // runs the push side and supplies the instructions.
+    // 5. pi. Local: its MCP client drops notifications and, for direct
+    // tools, the server's instructions, so like opencode the extension serves
+    // the tools, runs the push side and supplies the instructions. Server: the
+    // hosted extension does all of that against the server's /mcp itself.
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
-      try { putEntry(PI_CONFIG, { command, args }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      const ext = ADAPTERS[2]!;
-      writeAdapter(ext.path, ext.source);
-      console.log(`Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools); installed ${ext.path}`);
+      let pi: PiInstall;
+      try { pi = await installPi(server, { command, args }); } catch (e) { console.error((e as Error).message); process.exit(1); }
+      for (const note of pi.notes) console.log(note);
+      console.log(`Installed ${pi.adapter}`);
+      if (server) console.log("Run /grayboard login in pi to sign it in.");
     }
 
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
@@ -689,11 +787,17 @@ program
 program
   .command("refresh-adapters", { hidden: true })
   .description("Rewrite installed omp/opencode/pi push adapters from this binary")
-  .action(() => {
+  .action(async () => {
+    // A symlink means a checkout is installed there on purpose: leave it,
+    // and the entry its version expects.
+    const installed = (path: string) => existsSync(path) && !lstatSync(path).isSymbolicLink();
+    // `update` drops this command's stderr, so failures go to stdout.
+    const failed = (e: unknown) => {
+      console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
+      process.exitCode = 1;
+    };
     for (const a of ADAPTERS) {
-      // A symlink means a checkout is installed there on purpose: leave it,
-      // and the entry its version expects.
-      if (!existsSync(a.path) || lstatSync(a.path).isSymbolicLink()) continue;
+      if (!installed(a.path)) continue;
       if (a.path === ADAPTERS[1]!.path) {
         const guard = opencodeShimGuard(OC_DIR);
         if (guard.skip) {
@@ -704,14 +808,24 @@ program
       writeAdapter(a.path, a.source);
       console.log(`Refreshed ${a.path}`);
       if (!a.config) continue;
-      // `update` drops this command's stderr, so failures go to stdout.
       try {
         if (putEntry(a.config)) console.log(`Disabled the grayboard entry in ${a.config.path} (the adapter serves the tools)`);
-      } catch (e) {
-        console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
-        process.exitCode = 1;
-      }
+      } catch (e) { failed(e); }
     }
+    // pi: where either variant is installed (and neither is a symlink),
+    // install the one the current mode uses.
+    const piPaths = [PI_LOCAL, PI_HOSTED].filter(p => existsSync(p));
+    if (piPaths.length === 0 || piPaths.some(p => lstatSync(p).isSymbolicLink())) return;
+    let server: string | undefined;
+    if (busMode() === "server") {
+      server = process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
+      if (!server) return failed(new Error(`Server mode with no server URL, so pi's adapter wasn't refreshed`));
+    }
+    try {
+      const pi = await installPi(server);
+      console.log(`Refreshed ${pi.adapter}`);
+      for (const note of pi.notes) console.log(note);
+    } catch (e) { failed(e); }
   });
 
 // ── identity ─────────────────────────────────────────────────────────────────

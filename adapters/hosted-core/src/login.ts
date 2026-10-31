@@ -463,18 +463,20 @@ export class Login {
   }
   // Calls `changed` whenever the store's epoch changes (a login or logout in
   // any process); also how an adapter learns that a sign-in elsewhere ended
-  // a root's login pause before it has an enrollment.
+  // a root's login pause before it has an enrollment. Never after dispose(),
+  // even for a read already in flight then.
   watch(changed: () => void, intervalMs = WATCH_MS): { dispose(): void } {
+    let disposed = false;
     let last: Promise<string | undefined> = this.read().then(s => s?.epoch, () => undefined);
     const timer = setInterval(() => {
       last = last.then(async previous => {
         const epoch = await this.read().then(s => s?.epoch, () => previous);
-        if (epoch !== previous) changed();
+        if (epoch !== previous && !disposed) changed();
         return epoch;
       });
     }, intervalMs);
     timer.unref?.();
-    return { dispose: () => clearInterval(timer) };
+    return { dispose: () => { disposed = true; clearInterval(timer); } };
   }
   credential(): CredentialPort<Enrollment> {
     const hash = async () => this.configuration(await this.read())?.configHash;
@@ -488,8 +490,9 @@ export class Login {
       },
       check,
       watch: async (e, drift) => {
-        const watcher = this.watch(() => { void hash().then(h => { if (h !== e.configuration.configHash) drift(); }, () => drift()); });
-        return { dispose: async () => watcher.dispose() };
+        let disposed = false;
+        const watcher = this.watch(() => { void hash().then(h => { if (!disposed && h !== e.configuration.configHash) drift(); }, () => { if (!disposed) drift(); }); });
+        return { dispose: async () => { disposed = true; watcher.dispose(); } };
       },
       token: async e => { await check(e); return this.token(); },
       unauthorized: async (e, token) => { await check(e); await this.unauthorized(token); },

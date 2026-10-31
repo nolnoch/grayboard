@@ -10,7 +10,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource } from "../../src/cli/adapters.ts";
+import { adapterBundle, adapterSource } from "../../src/cli/adapters.ts";
 import { REPO, TARGET } from "../../src/cli/update.ts";
 import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
@@ -101,8 +101,9 @@ function writeOldEntries(exe: string, extraEnv: Record<string, string> = {}): vo
 }
 const CREDENTIALS = () => join(home, ".grayboard", "credentials");
 
-// Every registration setup writes, each naming the installed binary.
-function expectRegistered(): void {
+// Every registration setup writes, each naming the installed binary. With
+// `server`, pi gets the hosted extension and no entry instead.
+function expectRegistered(server?: string): void {
   // A compiled binary's execPath is its resolved path.
   const exe = realpathSync(join(bin, "grayboard"));
   const argv = readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n");
@@ -111,11 +112,18 @@ function expectRegistered(): void {
     { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
   ]);
   expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
-  // Disabled: the opencode and pi adapters serve the tools and read their command here.
+  // Disabled: the opencode and local pi adapters serve the tools and read their command here.
   expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-  expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
-  for (const [harness, path] of Object.entries(ADAPTERS)) {
-    expect(readFileSync(join(home, ...path), "utf8"), harness).toBe(adapterSource(harness as keyof typeof ADAPTERS));
+  const local = server ? ["omp", "opencode"] as const : ["omp", "opencode", "pi"] as const;
+  for (const harness of local) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+  if (server) {
+    expect(existsSync(join(home, ".pi", "agent", "mcp.json")) ? json(".pi", "agent", "mcp.json").mcpServers?.grayboard : undefined).toBeUndefined();
+    expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
+    expect(readFileSync(join(home, ".pi", "agent", "extensions", "grayboard.js"), "utf8")).toBe(adapterBundle("pi"));
+    expect(json(".pi", "agent", "grayboard", "config.json")).toEqual({ url: `${server}/mcp` });
+  } else {
+    expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+    expect(existsSync(join(home, ".pi", "agent", "extensions", "grayboard.js"))).toBe(false);
   }
 }
 
@@ -144,7 +152,7 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   expect(statSync(CREDENTIALS()).mode & 0o777).toBe(0o600);
 
   expect(await expectOk(grayboard("setup", "-y", "--server", srv.base))).toContain(`Signed in to ${srv.base} as you@example.com.`);
-  expectRegistered();
+  expectRegistered(srv.base);
 
   await expectOk(grayboard("logout"));
   // Still there, so `grayboard mcp` stays in server mode and says why it can't start.

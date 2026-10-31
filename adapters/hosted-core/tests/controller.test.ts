@@ -19,7 +19,7 @@ function runtime(mode: Mode) {
   const rows = new Map<string, Row>(), storage = new Map<string, unknown>(), batches = new Map<string, Item[]>();
   const calls: Call[] = [], admits: { sessionID: string; id: string; item: string }[] = [], wires: WireOptions[] = [];
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
-  const watchers = new Set<() => void>();
+  const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
@@ -63,13 +63,18 @@ function runtime(mode: Mode) {
       return { ok: true };
     }
     async read() { return { items: batches.get(this.sessionID) ?? [] }; }
-    async listen() { return { closed: new Promise<void>(() => {}), close: async () => {} }; }
+    // The server closes the stream on its own: a revoked grant closes it at once.
+    async listen() {
+      const { promise: closed, resolve } = Promise.withResolvers<void>();
+      streams.set(this.sessionID, resolve);
+      return { closed, close: async () => {} };
+    }
   }
   const configuration = () => ({ type: "remote" as const, url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "grayboard-pi", scope: "grayboard:delivery grayboard:tools", configHash: `grant-${grant}` });
   const credential: CredentialPort<Enrollment> = {
     capture: async sessionID => ({ version: 2, sessionID, configuration: configuration() }),
     check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
-    watch: async (_e, drift) => { watchers.add(drift); return { dispose: async () => { watchers.delete(drift); } }; },
+    watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => "access",
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
   };
@@ -94,8 +99,10 @@ function runtime(mode: Mode) {
   const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" });
   const named = (name: string) => calls.filter(c => c.name === name);
   return {
-    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named,
+    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts,
     drift: () => { grant++; for (const w of [...watchers]) w(); },
+    // The grant changes before any watch's next tick; the server then closes `id`'s stream.
+    revoke: (id: string) => { grant++; streams.get(id)?.(); },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
     // The nth delivery_renew throws `error` once, after running `then`.
@@ -150,6 +157,34 @@ test.each(modes)("resume rebinds the remembered name with create:false after a r
   } finally { await restarted.close(); }
 });
 
+test.each(modes)("a drift from a watch already disposed (a check in flight when resume replaced the root) pauses nothing (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", "be", true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const stale = r.drifts.at(-1)!;
+    await r.controller.resume("R");
+    await until(() => r.root(r.controller)?.state === "active");
+    stale();
+    expect(r.root(r.controller)).toMatchObject({ state: "active", name: "be" });
+    // The live root's own watch still pauses it.
+    r.drift();
+    expect(r.root(r.controller)).toMatchObject({ state: "paused" });
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("carried() is the name a resume would rebind now: none once the grant changed (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", "be", true);
+    await until(() => r.root(r.controller)?.state === "active");
+    expect(await r.controller.carried("R")).toBe("be");
+    expect(await r.controller.carried("B")).toBeUndefined();
+    r.drift();
+    expect(await r.controller.carried("R")).toBeUndefined();
+  } finally { await r.controller.close(); }
+});
+
 test.each(modes)("pause releases ownership and keeps every root paused (%s)", async mode => {
   const r = runtime(mode);
   try {
@@ -198,6 +233,23 @@ test.each(modes)("credential drift pauses every root until it is resumed (%s)", 
     }
     expect(r.root(r.controller, "B")).toMatchObject({ state: "paused" });
   } finally { await r.controller.close(); }
+});
+
+// The pi logout race: the server closes the stream of a revoked grant at
+// once, so the run loop's own credential check sees the change before any
+// watch ticks. It is the same drift, not one root's generic failure.
+test.each(modes)("a credential change the run loop's check sees before any watch pauses every root as the watch's drift does (%s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ wait: async () => {} });
+  try {
+    await c.enroll("R", "be", true);
+    await c.enroll("B", "fe", true);
+    await until(() => r.root(c, "B")?.state === "active" && r.root(c)?.state === "active");
+    r.revoke("R");
+    await until(() => r.root(c)?.state === "paused");
+    for (const id of ["R", "B"]) expect(r.root(c, id)).toMatchObject({ state: "paused", message: "Grayboard credential changed; run /grayboard resume" });
+    expect(r.storage.get("paused:B")).toBe(true);
+  } finally { await c.close(); await r.controller.close(); }
 });
 
 test.each(modes)("an ended root releases ownership; an ended child ends only its own registration (%s)", async mode => {

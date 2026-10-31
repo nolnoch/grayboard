@@ -21,6 +21,7 @@ import { ATTACHMENT_LIMITS_CAPABILITY, ATTACHMENTS_PARAM, attachRoots, published
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
 let srv: TestServer, dir: string;
@@ -227,7 +228,62 @@ test("a call's own failure leaves the shared connection to the calls in flight o
   }
 });
 
-test("instructions are per session and cached until that session's bind result", async () => {
+test("connect() and retire() leave calls in flight to finish: a new connection takes the new calls, and the one it replaced closes after its last", async () => {
+  const { token } = issue();
+  const p = proxy({ token: async () => token });
+  const list = NativeWire.prototype.listTools, close = NativeWire.prototype.close, fetch0 = globalThis.fetch;
+  let lists = 0, closes = 0;
+  NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
+  NativeWire.prototype.close = async function () { closes++; return close.call(this); };
+  // The next board_list request is held at the network: in flight on its connection.
+  let hold: { entered(): void; held: Promise<void> } | undefined;
+  const holdNext = () => {
+    const reached = Promise.withResolvers<void>(), held = Promise.withResolvers<void>();
+    hold = { entered: reached.resolve, held: held.promise };
+    return { reached: reached.promise, release: held.resolve };
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (hold && input instanceof Request && input.method === "POST" && (await input.clone().text()).includes(`"name":"board_list"`)) {
+      const h = hold;
+      hold = undefined;
+      h.entered();
+      await h.held;
+    }
+    return fetch0(input, init);
+  }) as typeof fetch;
+  const first = holdNext();
+  try {
+    await p.call("bind", { name: "proxy-swap", create: true }, "pi-root");
+    const inFlight = p.call("board_list", {}, "pi-root");
+    await first.reached;
+    // A login's reconnect: a new connection, listed; the old one stays open under its call.
+    await p.connect();
+    expect([lists, closes]).toEqual([2, 0]);
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ name: "proxy-swap" });
+    first.release();
+    expect((await inFlight).isError).toBeFalsy();
+    await until(() => closes === 1, 5_000, "the replaced connection closed");
+
+    // A host replacing the whole proxy retires it: closed once its calls settle.
+    const last = holdNext();
+    const pending = p.call("board_list", {}, "pi-root");
+    await last.reached;
+    // Closing now would abort the held request (the proxy's closing signal),
+    // so its success shows retire() waited for it.
+    const retiring = p.retire();
+    last.release();
+    expect((await pending).isError).toBeFalsy();
+    await retiring;
+    expect(closes).toBe(2);
+  } finally {
+    first.release();
+    globalThis.fetch = fetch0;
+    NativeWire.prototype.listTools = list;
+    NativeWire.prototype.close = close;
+  }
+});
+
+test("instructions are per session and cached until that session's bind result or forget()", async () => {
   const { token } = issue();
   const p = proxy({ token: async () => token });
   const first = p.instructions("pi-root");
@@ -243,6 +299,9 @@ test("instructions are per session and cached until that session's bind result",
   expect(await after).toContain("proxy-inst");
   // Another session's cache is untouched by this one's bind.
   expect(p.instructions("pi-other")).toBe(other);
+  // forget(): a binding the host changed outside this proxy (its Controller's own bind).
+  p.forget("pi-other");
+  expect(p.instructions("pi-other")).not.toBe(other);
 });
 
 test("dm_send with a local file uploads and attaches it; attachment_get saves it after checking the digest", async () => {
