@@ -9,26 +9,23 @@
 // outlives a session (the name a /new carries, the registry of live session
 // files, the items a root admitted) sits on globalThis under a registered
 // symbol.
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
-import { z } from "zod";
 import { Controller, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
 import { AccessExpired, accessExpiry, DeliveryHeldElsewhere, Refusal, type Identity, type Item } from "../hosted-core/src/model.ts";
 import type { HostPort } from "../hosted-core/src/port.ts";
-import { hostTools, outputOf, snapshotTools, ToolProxy, type CallHooks, type NativeTool } from "../hosted-core/src/proxy.ts";
+import { failure, hostTools, outputOf, snapshotTools, ToolProxy, type CallHooks, type NativeTool } from "../hosted-core/src/proxy.ts";
 import { AncestryError } from "../hosted-core/src/sessions.ts";
 import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "../hosted-core/src/storage.ts";
 import type { Lock } from "../hosted-core/src/lock.ts";
 import { end, register, type Temporary } from "../hosted-core/src/children.ts";
-import { render, wakes } from "../hosted-core/src/channel.ts";
+import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
+import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { Wire, type WireOptions } from "../hosted-core/src/wire.ts";
 import { failureMessage, type DiagnosticSink } from "../hosted-core/src/diagnostics.ts";
-import { boardNotification, dmNotification } from "../../src/core/tools.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
-import { canonicalEndpoint } from "../../src/shared/endpoint.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
@@ -75,57 +72,6 @@ function shared(harness: string): Shared {
   return slot;
 }
 
-const Config = z.object({ url: z.string().min(1) });
-// `<stateDir>/config.json {url}`, written by `grayboard setup --server`. Login
-// and the tool proxy refuse a URL that isn't canonical; refusing it here
-// instead keeps the extension loading (pi exits at startup when one fails).
-export function readConfig(stateDir: string): { url: string } | { error: string } {
-  const unset = "grayboard is not set up for a server; run `grayboard setup --server <url>`";
-  const path = join(stateDir, "config.json");
-  let raw: string;
-  try { raw = readFileSync(path, "utf8"); }
-  catch (error) { return { error: error instanceof Error && "code" in error && error.code === "ENOENT" ? unset : `${unset} (${String(error)})` }; }
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch {}
-  const config = Config.safeParse(parsed);
-  if (!config.success) return { error: `${path} is invalid; run \`grayboard setup --server <url>\`` };
-  // The URL itself stays out of the message: it may carry credentials.
-  if (!canonicalEndpoint(config.data.url)) return { error: `${path} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is` };
-  return { url: config.data.url };
-}
-
-const failure = (message: string): CallToolResult => ({ content: [{ type: "text", text: `error: ${message}` }], isError: true });
-
-// The server's inbox event (src/server/application.ts DeliveryEvent), checked
-// for its discriminants and the sender fields read here; the rest is core's
-// own shape, which dmNotification and boardNotification render.
-const InboxEvent = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("direct"), message: z.looseObject({ id: z.number(), sender: z.string(), body: z.string() }) }),
-  z.object({ kind: z.literal("board"), item: z.discriminatedUnion("kind", [
-    z.looseObject({ kind: z.literal("push"), post: z.looseObject({ author: z.string(), body: z.string() }) }),
-    z.looseObject({ kind: z.literal("digest"), board: z.string() }),
-  ]) }),
-]);
-
-// The channel params core builds for an inbox item, with human="true" on
-// what the user's own human (`<email>/human`, the Slack bridge) sent.
-export function channelParams(item: Item, identity: Identity): { content: string; meta: Record<string, string> } {
-  const event = InboxEvent.parse(item.event);
-  const human = `${identity.user.email}/human`;
-  if (event.kind === "direct") {
-    // Validated above for what is read here; the server built the rest as core's DirectMessage.
-    const message = event.message as unknown as Parameters<typeof dmNotification>[0];
-    const params = dmNotification(message, identity.identity_full);
-    if (event.message.sender === human) params.meta.human = "true";
-    return params;
-  }
-  // Same: core's Pending, as the server queued it.
-  const pending = event.item as unknown as Parameters<typeof boardNotification>[0];
-  const params = boardNotification(pending);
-  if (event.item.kind === "push" && event.item.post.author === human) params.meta.human = "true";
-  return params;
-}
-
 type Role = { kind: "root" } | { kind: "child"; root: string } | { kind: "loose" };
 
 // One session's extension runtime, driven by an entry file's event handlers.
@@ -139,7 +85,7 @@ export interface Grayboard {
 
 export function createGrayboard(h: Harness): Grayboard {
   const stateDir = join(h.agentDir, "grayboard");
-  const config = readConfig(stateDir);
+  const config = readHostedConfig(stateDir);
   const state = shared(h.name);
   const log = (message: string, level: Level = "info") => { if (!closed) h.notify(`grayboard: ${message}`, level); };
   // The bind's `where` (peer_list, a name refusal's holder text): this

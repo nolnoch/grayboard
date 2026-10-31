@@ -1,11 +1,12 @@
 // The `<channel>` renderer and the wake rule (#430), over the notifications
 // core builds for the server's inbox items.
 import { expect, test } from "bun:test";
-import { render, wakes } from "../src/channel.ts";
+import { channelParams, render, wakes } from "../src/channel.ts";
+import type { Identity, Item } from "../src/model.ts";
 import { render as piRender } from "../../pi/grayboard.ts";
 import { render as ompRender } from "../../omp/grayboard.ts";
-import { boardNotification, dmNotification } from "../../../src/core/tools.ts";
-import type { Post } from "../../../src/core/boards.ts";
+import { boardNotification, dmNotification } from "../../../src/shared/notifications.ts";
+import type { Post } from "../../../src/shared/notifications.ts";
 
 const post: Post = { id: 7, board: "e2e", author: "you@example.com/fe", body: "ship it", parent_id: 3, created_at: 1700000000000 };
 
@@ -48,4 +49,33 @@ test("the wake rule: actionable items wake; digests and deferred thread replies 
   // The meta decides even when the flag disagrees: a digest or a deferred
   // reply is context only.
   expect([wakes(true, digest.meta), wakes(true, deferred.meta), wakes(false, push.meta), wakes(true)]).toEqual([false, false, false, true]);
+});
+
+// channelParams (#438 item 29): the user's own human, and only theirs, is marked.
+const identity: Identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: "https://bus.example.com", resource: "https://bus.example.com/mcp" };
+const item = (event: unknown): Item => ({ id: "x", actionable: true, event, ownership: 1, bind_gen: 1, name: "be" });
+const directFrom = (sender: string) => item({ kind: "direct", message: { id: 5, sender, recipient: "you@example.com/be", body: "go", parent_id: null, created_at: 1 } });
+
+test("channelParams marks a direct message or board post from the user's own human, and nothing else", () => {
+  expect(channelParams(directFrom("you@example.com/human"), identity).meta.human).toBe("true");
+  expect(channelParams(directFrom("other@example.com/human"), identity).meta.human).toBeUndefined();
+  expect(channelParams(directFrom("you@example.com/fe"), identity).meta.human).toBeUndefined();
+  const own = channelParams(item({ kind: "board", item: { kind: "push", reason: "mention", post: { ...post, author: "you@example.com/human" } } }), identity);
+  expect(own).toEqual({ content: "ship it", meta: { ...boardNotification({ kind: "push", reason: "mention", post }).meta, from: "you@example.com/human", human: "true" } });
+  expect(channelParams(item({ kind: "board", item: { kind: "push", reason: "mention", post } }), identity).meta.human).toBeUndefined();
+  // A digest names its latest author in prose only; it is never marked.
+  const digest = channelParams(item({ kind: "board", item: { kind: "digest", board: "e2e", unread: 1, latest: { ...post, author: "you@example.com/human" } } }), identity);
+  expect(digest.meta).toEqual({ board: "e2e", kind: "digest", unread: "1" });
+});
+
+test("channelParams gives core's own params, with `to` when the mail came to another address", () => {
+  const message = { id: 5, sender: "you@example.com/fe", recipient: "you@example.com/alias", body: "go", parent_id: 2, created_at: 1 };
+  const params = channelParams(item({ kind: "direct", message }), identity);
+  expect(params).toEqual(dmNotification(message, "you@example.com/be"));
+  expect(params.meta.to).toBe("you@example.com/alias");
+});
+
+test("channelParams refuses an event that isn't the server's inbox shape", () => {
+  expect(() => channelParams(item({ kind: "direct", message: { id: "5", sender: "a", body: "b" } }), identity)).toThrow();
+  expect(() => channelParams(item({ kind: "unknown" }), identity)).toThrow();
 });

@@ -10,7 +10,7 @@
 import { randomInt } from "node:crypto";
 
 import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
-import { boardNotification, dmNotification } from "../core/tools.ts";
+import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";

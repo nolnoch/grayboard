@@ -14,6 +14,7 @@ import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from 
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
+import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
 
 function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
@@ -76,7 +77,7 @@ const ADAPTERS: { path: string; source: string; config?: HarnessConfig }[] = [
 // one variant removes the other.
 const PI_LOCAL  = join(PI_DIR, "extensions", "grayboard.ts");
 const PI_HOSTED = join(PI_DIR, "extensions", "grayboard.js");
-const PI_HOSTED_CONFIG = join(PI_DIR, "grayboard", "config.json");
+const PI_HOSTED_CONFIG = hostedConfigPath(join(PI_DIR, "grayboard"));
 
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
@@ -113,7 +114,7 @@ async function installPi(server: string | undefined, entry?: Entry): Promise<PiI
     if (dropEntry(PI_CONFIG)) notes.push(`Removed the grayboard entry from ${PI_CONFIG.path} (the hosted extension needs none)`);
     writeAdapter(PI_HOSTED, adapterBundle("pi"));
     rmSync(PI_LOCAL, { force: true });
-    writeConfig(PI_HOSTED_CONFIG, { url });
+    writeConfig(PI_HOSTED_CONFIG, { url } satisfies HostedConfig);
     notes.push(`Wrote ${PI_HOSTED_CONFIG}`);
     return { adapter: PI_HOSTED, notes };
   }
