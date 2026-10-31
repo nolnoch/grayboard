@@ -399,9 +399,9 @@ test("a logout in one session pauses every session on the agentDir: each other s
   const call = await b.call("whoami");
   expect(call.isError).toBe(true);
   expect(texts(call).join("\n")).toContain("run /grayboard login");
-  // /grayboard resume can't help while signed out, and says why.
+  // /grayboard resume can't help while signed out, and says why, once, though the sign-out was already said.
   await b.ext.command("resume");
-  expect(b.notices.at(-1)).toEqual({ level: "warning", message: signedOut });
+  expect(b.notices).toEqual([{ level: "warning", message: signedOut }, { level: "warning", message: signedOut }]);
 });
 
 test("a runner child with no parent session works as an unregistered session, warns once, and ends its session on quit", async () => {

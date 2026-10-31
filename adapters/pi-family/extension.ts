@@ -153,7 +153,7 @@ export function createGrayboard(h: Harness): Grayboard {
   let held: string | undefined;       // set while another process holds delivery for this root
   let loginNote: string | undefined;  // the latest sign-in diagnostic
   let logoutWarnings: string[] | undefined; // a running logout's warnings, which its own line says
-  let signedOut = false;              // a start failed for want of a sign-in
+  let signedOut: AccessExpired | undefined; // why a start failed for want of a sign-in
   let outAnnounced = false;           // this sign-out was already announced in this session
   let begun: string | undefined;      // the store epoch this root last (re)started under
   let carrying: string | undefined;   // a /new or /fork's carried name, until a start takes it
@@ -303,7 +303,7 @@ export function createGrayboard(h: Harness): Grayboard {
       begun = (await login!.read().catch(() => undefined))?.epoch;
       const expected = carried ?? await controller.carried(id);
       const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
-      signedOut = false;
+      signedOut = undefined;
       // The Controller's own bind changed what the server's instructions say.
       proxy?.forget(id);
       const root = status.roots.find(r => r.sessionID === id);
@@ -320,9 +320,10 @@ export function createGrayboard(h: Harness): Grayboard {
     } catch (error) {
       const expired = accessExpiry(error);
       if (!expired) { log(`couldn't start delivery: ${(error as Error).message}`, "error"); return; }
-      signedOut = true;
-      outAnnounced = true;
-      log(expired.message, "warning");
+      signedOut = expired;
+      // Once per sign-out: a restart racing one finds credentialChanged (or a
+      // logout's own line) already said it.
+      if (!outAnnounced) { outAnnounced = true; log(expired.message, "warning"); }
     }
   };
   const restart = () => restarting ??= begin().finally(() => { restarting = undefined; });
@@ -330,13 +331,13 @@ export function createGrayboard(h: Harness): Grayboard {
   // The Controller's records (its DiagnosticSink). A pause or degradation the
   // run loop reaches on its own (retry budget, identity, lease recovery,
   // admission limits) is said at once and in the next tool result, not only
-  // in /grayboard status. A credential change is credentialChanged's to say,
-  // whether the Controller's watch paused for it (the drift message) or the
-  // run loop's own check got there first (the store's epoch moved since this
-  // root started); a shutdown's pause is nobody's. A change of state or name
-  // drops the cached instructions: the Controller's own binds (a rebind after
-  // a lapsed lease, after an unbound whoami) never pass through the proxy's
-  // bind result.
+  // in /grayboard status. A credential change is credentialChanged's to say:
+  // the Controller pauses for it with the drift message (its watch, or a
+  // guard's check that saw it first), and any other pause after it is skipped
+  // too (the store's epoch moved since this root started); a shutdown's
+  // pause is nobody's. A change of state or name drops the cached
+  // instructions: the Controller's own binds (a rebind after a lapsed lease,
+  // after an unbound whoami) never pass through the proxy's bind result.
   let lastBinding: string | undefined, lastRecord: string | undefined;
   const sink: DiagnosticSink = async record => {
     if (!session || record.sessionID !== session.id) return;
@@ -529,8 +530,10 @@ export function createGrayboard(h: Harness): Grayboard {
         else log(`signed out; ${pauses}`);
       } else if (verb === "resume") {
         if (!controller || !session) { log(held ?? `only a root session with delivery resumes`, "warning"); return; }
+        // An explicit resume always answers: begin says a sign-out only if nothing has yet.
+        const said = outAnnounced;
         await restart();
-        if (signedOut) return; // begin said why
+        if (signedOut) { if (said) log(signedOut.message, "warning"); return; }
         const record = controller.status().roots.find(r => r.sessionID === session!.id);
         log(record ? `${record.state}: ${record.message}` : describe(controller.status(), true));
       } else if (verb === "status") log(await status());
