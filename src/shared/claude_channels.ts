@@ -194,6 +194,16 @@ const LAUNCH: Record<ChannelEntry, string> = {
 /** The launch command that turns channels on for `entry`. */
 export const launchCommand = (entry: ChannelEntry): string => LAUNCH[entry];
 
+/**
+ * Whether this is an interactive Claude Code session: the `cli` entrypoint
+ * (Claude Code sets `sdk-cli` for -p and a non-TTY stdout, and an inherited
+ * host value wins over it) and no -p/--print on its command line.
+ */
+export function interactiveClaude(env: Record<string, string | undefined>, parentCmd: string | null): boolean {
+  const argv = parentCmd?.trim().split(/\s+/) ?? [];
+  return env.CLAUDE_CODE_ENTRYPOINT === "cli" && !argv.some((a) => a === "-p" || a === "--print");
+}
+
 export type ChannelsInput = {
   env: Record<string, string | undefined>;
   /** Claude Code's command line, space-joined, or null if unreadable. */
@@ -209,7 +219,7 @@ export function claudeChannels({ env, parentCmd, entry, files }: ChannelsInput):
   if (provider) return off("provider", `Claude Code shows channels only on Anthropic's own API, and ${provider} is set`);
 
   const argv = parentCmd?.trim().split(/\s+/) ?? null;
-  if (env.CLAUDE_CODE_ENTRYPOINT !== "cli" || argv?.some((a) => a === "-p" || a === "--print")) {
+  if (!interactiveClaude(env, parentCmd)) {
     return off("interactive", "a non-interactive Claude Code session (-p, the SDK or an IDE host) doesn't show channel messages");
   }
 
