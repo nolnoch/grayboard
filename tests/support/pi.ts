@@ -45,7 +45,8 @@ type PiMessage = { role: string; content: unknown; toolName?: string; isError?: 
 
 // ── pi in RPC mode ───────────────────────────────────────────────────────────
 
-class Pi {
+// pi's RPC protocol, which omp speaks too (tests/support/omp.ts).
+export class Pi {
   events: Record<string, any>[] = [];
   stderr = "";
   readonly exited: Promise<number | null>;
@@ -135,13 +136,13 @@ function toolNames(bin?: string): string[] {
   return (JSON.parse(r.stdout.toString()) as { name: string }[]).map((t) => `mcp__grayboard__${t.name}`).sort();
 }
 
-const requestTools = (req: ChatRequest): string[] => (req.tools ?? []).map((t) => t.function.name);
-const systemText = (req: ChatRequest): string =>
+export const requestTools = (req: ChatRequest): string[] => (req.tools ?? []).map((t) => t.function.name);
+export const systemText = (req: ChatRequest): string =>
   req.messages.filter((m) => m.role === "system" || m.role === "developer").map(messageText).join("\n");
 
-// SIGTERM lets pi stop its own children; awaited (SIGKILL after 5 s) so the
-// caller's rmSync doesn't race a pi still writing in dir.
-async function stopAll(procs: ChildProcess[]): Promise<void> {
+// SIGTERM lets the agent stop its own children; awaited (SIGKILL after 5 s) so the
+// caller's rmSync doesn't race an agent still writing in dir.
+export async function stopAll(procs: ChildProcess[]): Promise<void> {
   await Promise.all(procs.map(async (p) => {
     if (p.exitCode !== null || p.signalCode !== null) return;
     const exited = new Promise((r) => p.once("exit", r));
@@ -393,7 +394,7 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
 
 const BUNDLE = adapterBundle("pi");
 const PI_CLIENT = "grayboard-pi";
-const PEER = "bob@example.com/peer";
+export const PEER = "bob@example.com/peer";
 const LOGIN_NOTICE = "grayboard: Signed out of grayboard in pi; run /grayboard login";
 const HELD = "another pi process holds delivery for this session";
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => `mcp__grayboard__${t.name}`).sort();
@@ -428,9 +429,9 @@ function startHostedPi(dir: string, procs: ChildProcess[], { persist = false, se
   return new Pi(proc);
 }
 
-type Peer = { dir: string; reports: string[]; call(tool: string, args?: Record<string, unknown>): Promise<any>; close(): Promise<void> };
+export type Peer = { dir: string; reports: string[]; call(tool: string, args?: Record<string, unknown>): Promise<any>; close(): Promise<void> };
 
-async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
+export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
   const home = join(dir, "peer");
   mkdirSync(home, { recursive: true });
   const { token } = issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
@@ -463,8 +464,8 @@ const idle = (pi: Pi) => until(async () => {
   return !s.isStreaming && s.pendingMessageCount === 0;
 }, 15_000, "pi idle");
 
-// `/grayboard status`, as pi shows it.
-async function statusOf(pi: Pi): Promise<string> {
+// `/grayboard status`, as pi and omp show it.
+export async function statusOf(pi: Pi): Promise<string> {
   const before = pi.notices().length;
   await pi.command({ type: "prompt", message: "/grayboard status" });
   return until(() => pi.notices().slice(before).find((n) => n.startsWith("grayboard: server: ")), 5_000, "/grayboard status");
@@ -480,10 +481,10 @@ const leasedAs = (srv: HostedServer, raw: string, name: string): boolean => {
 const ownershipEnded = (srv: HostedServer, id: number): boolean =>
   srv.app.db.query<{ ended_at: number | null }, [number]>("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(id)?.ended_at != null;
 
-// After the user prompt `prompt` (pi's latest; <channel> deliveries aren't
+// After the user prompt `prompt` (the latest; <channel> deliveries aren't
 // prompts), one step per assistant message; past the last, the default reply
 // ends the turn.
-function scripted(prompt: string, steps: Reply[]): Rule {
+export function scripted(prompt: string, steps: Reply[]): Rule {
   return (req) => {
     const at = req.messages.findLastIndex((m) => m.role === "user" && !messageText(m).startsWith("<channel"));
     if (at < 0 || messageText(req.messages[at]!) !== prompt) return undefined;
@@ -491,17 +492,18 @@ function scripted(prompt: string, steps: Reply[]): Rule {
   };
 }
 
-// The model's side of a peer DM: a file it saves, anything else it answers "pong".
-const answerPeer = onChannelDm(PEER, (id, text) => {
+// The model's side of a peer DM, with the harness's grayboard tool prefix: a
+// file it saves, anything else it answers "pong".
+export const answerPeer = (prefix: string): Rule => onChannelDm(PEER, (id, text) => {
   const file = /attachments="(\d+):/.exec(text);
   return file
-    ? { tool: "mcp__grayboard__attachment_get", args: { id: Number(file[1]) } }
-    : { tool: "mcp__grayboard__dm_send", args: { to: PEER, body: "pong", parent_id: id } };
+    ? { tool: `${prefix}attachment_get`, args: { id: Number(file[1]) } }
+    : { tool: `${prefix}dm_send`, args: { to: PEER, body: "pong", parent_id: id } };
 });
 
-// A DM from the peer to `name` starts a turn in the pi session holding it,
+// A DM from the peer to `name` starts a turn in the session holding it,
 // whose dm_send reply lands in the same thread, sent as `name`. Returns the DM's id.
-async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
+export async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
   const { message_id: id } = await peer.call("dm_send", { to: `alice@example.com/${name}`, body: `ping ${name}` });
   const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
   expect(reply.sender).toBe(`alice@example.com/${name}`);
@@ -516,7 +518,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
   return named(async () => {
     const procs: ChildProcess[] = [];
     const srv = hostedServer();
-    const model = startFakeModel([answerPeer, ...rules]);
+    const model = startFakeModel([answerPeer("mcp__grayboard__"), ...rules]);
     let peer: Peer | undefined;
     try {
       peer = await hostedPeer(srv, dir);

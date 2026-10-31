@@ -4,11 +4,12 @@
 // Controller. An entry file (entry-pi.ts, entry-omp.ts) adapts the harness's
 // events, tool registration and message API to `Harness`.
 //
-// pi and omp create the extension runtime anew for every session (startup,
-// /new, /resume, /fork, /reload), so the state here is one session's; what
-// outlives a session (the name a /new carries, the registry of live session
-// files, the items a root admitted) sits on globalThis under a registered
-// symbol.
+// Each `createGrayboard` is one session's runtime: pi creates the extension
+// anew for every session (startup, /new, /resume, /fork, /reload), and omp's
+// entry creates one per session id on its session_switch and session_branch.
+// What outlives a session (the name a /new carries, the registry of live
+// session files, the items a root admitted) sits on globalThis under a
+// registered symbol.
 import { join } from "node:path";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 import { Controller, type Status } from "../hosted-core/src/controller.ts";
@@ -32,8 +33,9 @@ export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 export type SessionInfo = { id: string; file?: string; parentFile?: string; reason: StartReason };
 // A harness's own subagent marker: not a child, or a child of `root` (absent
-// when the runner gave no parent session, so it can't be attributed).
-export type Marker = { child: false } | { child: true; root?: string };
+// when the runner gave no parent session, so it can't be attributed) through
+// the intermediate subagent sessions `via`, outermost first (audit only).
+export type Marker = { child: false } | { child: true; root?: string; via?: string[] };
 export type Level = "info" | "warning" | "error";
 
 export interface Harness {
@@ -72,7 +74,7 @@ function shared(harness: string): Shared {
   return slot;
 }
 
-type Role = { kind: "root" } | { kind: "child"; root: string } | { kind: "loose" };
+type Role = { kind: "root" } | { kind: "child"; root: string; via: string[] } | { kind: "loose" };
 
 // One session's extension runtime, driven by an entry file's event handlers.
 export interface Grayboard {
@@ -176,17 +178,17 @@ export function createGrayboard(h: Harness): Grayboard {
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
   // After shutdown begins none starts: shutdown ends only a register it saw.
-  const enlist = (root: string, child: string): Promise<void> => {
+  const enlist = (root: string, via: string[], child: string): Promise<void> => {
     if (registration) return registration;
     if (closed) return Promise.reject(new Error(`the ${h.name} session closed`));
     attempted = true;
-    const pending: Promise<void> = register(temporary, { root, via: [], child }).then(
+    const pending: Promise<void> = register(temporary, { root, via, child }).then(
       () => { registered = true; proxy?.forget(child); },
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
   };
-  const childHooks = (root: string, child: string): CallHooks => ({
-    beforeCall: () => enlist(root, child),
+  const childHooks = (root: string, via: string[], child: string): CallHooks => ({
+    beforeCall: () => enlist(root, via, child),
     afterCall: async () => {},
   });
 
@@ -338,15 +340,15 @@ export function createGrayboard(h: Harness): Grayboard {
     if ("error" in config) { log(config.error, "warning"); return; }
     const marker = h.marker();
     const parent = s.parentFile ? state.live.get(s.parentFile) : undefined;
-    role = marker.child ? (marker.root ? { kind: "child", root: marker.root } : { kind: "loose" })
-      : parent ? { kind: "child", root: parent } : { kind: "root" };
+    role = marker.child ? (marker.root ? { kind: "child", root: marker.root, via: marker.via ?? [] } : { kind: "loose" })
+      : parent ? { kind: "child", root: parent, via: [] } : { kind: "root" };
     if (role.kind === "loose") log(`this ${h.name} subagent has no parent session, so its calls go out as an unregistered session`, "warning");
     // Grandchildren of this child map to the same top root.
     if (role.kind === "child") state.live.set(s.file ?? `id:${s.id}`, role.root);
 
     watcher = login!.watch(() => { void credentialChanged(); });
     if (role.kind !== "root") {
-      proxy = newProxy("poll", role.kind === "child" ? childHooks(role.root, s.id) : undefined);
+      proxy = newProxy("poll", role.kind === "child" ? childHooks(role.root, role.via, s.id) : undefined);
       void connect();
       return;
     }
@@ -416,7 +418,7 @@ export function createGrayboard(h: Harness): Grayboard {
   const instructions = async (): Promise<string | undefined> => {
     if (!proxy || !session) return undefined;
     try {
-      if (role.kind === "child") await enlist(role.root, session.id);
+      if (role.kind === "child") await enlist(role.root, role.via, session.id);
       return await proxy.instructions(session.id);
     } catch { return undefined; }
   };
