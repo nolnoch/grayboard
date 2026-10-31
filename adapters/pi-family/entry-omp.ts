@@ -14,7 +14,8 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { version } from "../../package.json" with { type: "json" };
 import { loadMode } from "../hosted-core/src/proxy.ts";
-import { createGrayboard, type Grayboard, type Level, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Level, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { registry, rootOf } from "./omp-ancestry.ts";
 
 // omp's MCP naming (tool-bridge.ts mintMCPToolName): grayboard's tool names
 // are already lowercase snake case, so `mcp__grayboard_<tool>`, as the local
@@ -22,37 +23,26 @@ import { createGrayboard, type Grayboard, type Level, type Marker, type Shutdown
 const SERVER = "grayboard";
 const PREFIX = `mcp__${SERVER}_`;
 
-type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
-
-// Every live session in this process by its omp agent id ("Main",
-// "0-Explore", …): the raw grayboard session id, whether it is a top-level
-// session, and for a subagent its top-level root and the subagent sessions
-// between (outermost first). A subagent whose chain doesn't reach a main
-// session has no root.
-type Agent = { raw: string; main: boolean; root?: string; via: string[] };
-const KEY = Symbol.for("grayboard.omp.agents");
-const agents: Map<string, Agent> = ((globalThis as Record<symbol, unknown>)[KEY] ??= new Map()) as Map<string, Agent>;
-
-function place(agent: ExtensionContext["agent"], raw: string): Agent {
-  if (agent.kind === "main") return { raw, main: true, via: [] };
-  const parent = agent.parentId === undefined ? undefined : agents.get(agent.parentId);
-  if (parent?.main) return { raw, main: false, root: parent.raw, via: [] };
-  if (parent?.root !== undefined) return { raw, main: false, root: parent.root, via: [...parent.via, parent.raw] };
-  return { raw, main: false, via: [] };
-}
-
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
   let current: Grayboard | undefined, currentId: string | undefined;
-  let marker: Marker = { child: false };
-  let agentId: string | undefined;
+  let agent: ExtensionContext["agent"] | undefined;
+  let disposed = false; // session_shutdown ran: no session starts after it
+
+  // Read at each register, so a subagent revived after its main session
+  // moved on (/new) registers under the root that is live now.
+  const marker = (): Marker => {
+    if (!agent || agent.kind === "main") return { child: false };
+    const placed = rootOf(registry, agent.parentId);
+    return placed ? { child: true, ...placed } : { child: true };
+  };
 
   const make = () => createGrayboard({
     name: "omp",
     clientId: "grayboard-omp",
     version,
     agentDir: getAgentDir(),
-    marker: () => marker,
+    marker,
     register: (tools, call) => {
       for (const tool of tools) {
         pi.registerTool({
@@ -66,15 +56,7 @@ export default function grayboard(pi: ExtensionAPI) {
           approval: "write",
           strict: false,
           loadMode: loadMode(tool),
-          async execute(_id, params) {
-            const result = await call(tool.name, params && typeof params === "object" ? Object.fromEntries(Object.entries(params)) : {});
-            const content = result.content.flatMap((block): Content[] =>
-              block.type === "text" ? [{ type: "text", text: block.text }]
-              : block.type === "image" ? [{ type: "image", data: block.data, mimeType: block.mimeType }] : []);
-            if (result.isError && !content.some(block => block.type === "text" && block.text))
-              content.push({ type: "text", text: `MCP tool ${SERVER}/${tool.name} returned an error` });
-            return { content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true } : {}) };
-          },
+          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
         });
       }
     },
@@ -83,7 +65,11 @@ export default function grayboard(pi: ExtensionAPI) {
     // wait, hidden, for the next turn.
     deliver: (content, wake) => pi.sendMessage({ customType: "grayboard", content, display: true },
       wake ? { deliverAs: "aside", triggerTurn: true } : { deliverAs: "nextTurn" }),
+    // Always into omp's log file; on screen too when there is one.
     notify: (message: string, level: Level) => {
+      if (level === "error") pi.logger.error(message);
+      else if (level === "warning") pi.logger.warn(message);
+      else pi.logger.info(message);
       if (ctx?.hasUI) ctx.ui.notify(message, level);
       else console.error(message);
     },
@@ -91,13 +77,10 @@ export default function grayboard(pi: ExtensionAPI) {
 
   const begin = async (context: ExtensionContext, reason: StartReason) => {
     ctx = context;
+    agent = context.agent;
     const id = context.sessionManager.getSessionId();
-    const self = place(context.agent, id);
-    agentId = context.agent.id;
     currentId = id;
-    agents.set(agentId, self);
-    marker = self.main ? { child: false }
-      : self.root === undefined ? { child: true } : { child: true, root: self.root, via: self.via };
+    registry.set(agent.id, { raw: id, main: agent.kind === "main", ...(agent.parentId !== undefined ? { parent: agent.parentId } : {}) });
     const header = context.sessionManager.getHeader();
     const file = context.sessionManager.getSessionFile();
     current = make();
@@ -109,27 +92,30 @@ export default function grayboard(pi: ExtensionAPI) {
   const finish = async (reason: ShutdownReason) => {
     const ending = current;
     current = undefined;
-    // Unless a newer session under this agent id already replaced the entry.
-    if (agentId !== undefined && agents.get(agentId)?.raw === currentId) agents.delete(agentId);
     currentId = undefined;
     await ending?.shutdown(reason);
   };
   // A switch or branch that changed the session id ends the old session and
   // starts the new one; one that kept it (a branch in place) changes nothing.
+  // A shutdown while the old one ends leaves none started.
   const replace = async (context: ExtensionContext, reason: "new" | "resume" | "fork") => {
     ctx = context;
-    if (current && currentId === context.sessionManager.getSessionId()) return;
+    if (disposed || (current && currentId === context.sessionManager.getSessionId())) return;
     await finish(reason);
+    if (disposed) return;
     await begin(context, reason);
   };
 
   pi.on("session_start", async (_event, context) => { await begin(context, "startup"); });
   pi.on("session_switch", async (event, context) => { await replace(context, event.reason); });
   pi.on("session_branch", async (_event, context) => { await replace(context, "fork"); });
-  pi.on("session_shutdown", async () => { await finish("quit"); });
+  pi.on("session_shutdown", async () => { disposed = true; await finish("quit"); });
   // A subagent's run ended: omp keeps it live for its idle TTL, revivable, so
-  // its child slot goes back now rather than at shutdown.
-  pi.on("agent_end", async (_event, context) => { if (context.agent.kind === "sub") await current?.idle(); });
+  // its child slot goes back now rather than at shutdown. Not awaited: the
+  // end waits for calls still running, which must not hold omp's event loop.
+  pi.on("agent_end", async (event, context) => {
+    if (context.agent.kind === "sub" && !event.willContinue) void current?.idle();
+  });
   // The server's instructions tell the model what a <channel> message is;
   // a subagent receives none, so only a main session gets them.
   pi.on("before_agent_start", async (event, context) => {
@@ -137,9 +123,5 @@ export default function grayboard(pi: ExtensionAPI) {
     const text = await current?.instructions();
     return text ? { systemPrompt: [...event.systemPrompt, text] } : undefined;
   });
-  pi.registerCommand("grayboard", {
-    description: "grayboard: login | logout | resume | status",
-    getArgumentCompletions: prefix => ["login", "logout", "resume", "status"].filter(v => v.startsWith(prefix)).map(value => ({ value, label: value })),
-    handler: async (args, context) => { ctx = context; await current?.command(args); },
-  });
+  pi.registerCommand("grayboard", { ...COMMAND, handler: async (args, context) => { ctx = context; await current?.command(args); } });
 }

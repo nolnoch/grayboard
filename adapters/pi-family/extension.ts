@@ -54,6 +54,26 @@ export interface Harness {
 export const LOGIN_ACTION = "run /grayboard login";
 export const RESUME_HINT = "run /grayboard resume";
 const SOURCE = "grayboard";
+
+// A tool's arguments and MCP result as both entries' tools take and return
+// them: text and image blocks, and an error said in text when the server
+// gave none.
+export type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+export const toolArgs = (params: unknown): Record<string, unknown> =>
+  params && typeof params === "object" ? Object.fromEntries(Object.entries(params)) : {};
+export function toolResult(server: string, tool: string, result: CallToolResult) {
+  const content = result.content.flatMap((block): ToolContent[] =>
+    block.type === "text" ? [{ type: "text", text: block.text }]
+    : block.type === "image" ? [{ type: "image", data: block.data, mimeType: block.mimeType }] : []);
+  if (result.isError && !content.some(block => block.type === "text" && block.text))
+    content.push({ type: "text", text: `MCP tool ${server}/${tool} returned an error` });
+  return { content, details: { server, tool }, ...(result.isError ? { isError: true as const } : {}) };
+}
+// `/grayboard`'s registration, the same in both harnesses.
+export const COMMAND = {
+  description: "grayboard: login | logout | resume | status",
+  getArgumentCompletions: (prefix: string) => ["login", "logout", "resume", "status"].filter(v => v.startsWith(prefix)).map(value => ({ value, label: value })),
+};
 // hosted-core's Controller pauses every root with this when the store's
 // epoch changes (a login or logout in any process).
 const DRIFTED = "Grayboard credential changed";
@@ -114,6 +134,7 @@ export function createGrayboard(h: Harness): Grayboard {
   let registered = false;             // that register succeeded
   let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this session's id
+  const inflight = new Set<Promise<CallToolResult>>(); // calls running now, which an idle end lands after
   let restarting: Promise<void> | undefined;
 
   const login = "url" in config ? new Login({
@@ -145,7 +166,14 @@ export function createGrayboard(h: Harness): Grayboard {
 
   // ---- tools ----
 
-  const call = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+    const running = dispatch(tool, args);
+    inflight.add(running);
+    const done = () => { inflight.delete(running); };
+    running.then(done, done);
+    return running;
+  };
+  const dispatch = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);
     used = true;
@@ -179,19 +207,26 @@ export function createGrayboard(h: Harness): Grayboard {
     const who = outputOf(await p.call("whoami", {}, id));
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
+  // A child's root and the subagents between, as the harness says at each
+  // register: omp's main session can change under a live subagent (a /new
+  // while it sits idle), and a revived one registers under the new root.
+  const placement = (fixed: { root: string; via: string[] }) => {
+    const marker = h.marker();
+    return marker.child && marker.root ? { root: marker.root, via: marker.via ?? [] } : fixed;
+  };
   // After shutdown begins none starts: shutdown ends only a register it saw.
   // One after an idle end goes out once that end has landed.
-  const enlist = (root: string, via: string[], child: string): Promise<void> => {
+  const enlist = (fixed: { root: string; via: string[] }, child: string): Promise<void> => {
     if (registration) return registration;
     if (closed) return Promise.reject(new Error(`the ${h.name} session closed`));
     attempted = true;
-    const pending: Promise<void> = (releasing ?? Promise.resolve()).then(() => register(temporary, { root, via, child })).then(
+    const pending: Promise<void> = (releasing ?? Promise.resolve()).then(() => register(temporary, { ...placement(fixed), child })).then(
       () => { if (registration === pending) { registered = true; proxy?.forget(child); } },
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
   };
-  const childHooks = (root: string, via: string[], child: string): CallHooks => ({
-    beforeCall: () => enlist(root, via, child),
+  const childHooks = (fixed: { root: string; via: string[] }, child: string): CallHooks => ({
+    beforeCall: () => enlist(fixed, child),
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
@@ -199,12 +234,14 @@ export function createGrayboard(h: Harness): Grayboard {
   // omp keeps a finished subagent live (revivable) for its idle TTL, so a
   // child released only at shutdown would hold a slot long after its run: a
   // fan-out of 128 within that TTL would fill the root's cap. An idle child
-  // ends now; its next call registers it again.
+  // ends once the calls already running land (omp may start the next run
+  // before this one's agent_end reaches us); its next call registers it again.
   const idle = async (): Promise<void> => {
     if (closed || role.kind !== "child" || !session || !attempted) return;
-    const id = session.id, pending = registration, sure = registered;
+    const id = session.id, pending = registration, sure = registered, running = [...inflight];
     registration = undefined; registered = false; attempted = false;
     const run = (async () => {
+      await Promise.allSettled(running);
       const committed = sure || (pending ? await pending.then(() => true, () => false) : false);
       await end(temporary, { child: id }).catch(committed ? endFailed(id) : () => {});
     })();
@@ -369,7 +406,7 @@ export function createGrayboard(h: Harness): Grayboard {
 
     watcher = login!.watch(() => { void credentialChanged(); });
     if (role.kind !== "root") {
-      proxy = newProxy("poll", role.kind === "child" ? childHooks(role.root, role.via, s.id) : undefined);
+      proxy = newProxy("poll", role.kind === "child" ? childHooks(role, s.id) : undefined);
       void connect();
       return;
     }
@@ -441,7 +478,7 @@ export function createGrayboard(h: Harness): Grayboard {
   const instructions = async (): Promise<string | undefined> => {
     if (!proxy || !session) return undefined;
     try {
-      if (role.kind === "child") await enlist(role.root, role.via, session.id);
+      if (role.kind === "child") await enlist(role, session.id);
       return await proxy.instructions(session.id);
     } catch { return undefined; }
   };
@@ -465,7 +502,7 @@ export function createGrayboard(h: Harness): Grayboard {
     const lines = [
       `server: ${login!.resource}`,
       `sign-in: ${signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`}`,
-      `session: ${session?.id ?? "not started"} (${role.kind === "child" ? `subagent of ${role.root}` : role.kind === "loose" ? "unattributed subagent" : "root"})`,
+      `session: ${session?.id ?? "not started"} (${role.kind === "child" ? `subagent of ${placement(role).root}` : role.kind === "loose" ? "unattributed subagent" : "root"})`,
     ];
     if (held) lines.push(`delivery: ${held}`);
     if (controller) lines.push(describe(controller.status(), signedIn));

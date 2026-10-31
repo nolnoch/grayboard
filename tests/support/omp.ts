@@ -6,6 +6,7 @@
 // and no grayboard MCP entry. omp speaks pi's RPC protocol, so the Pi class
 // and the hosted helpers come from tests/support/pi.ts.
 import { expect } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -16,7 +17,7 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv } from "./env.ts";
 import { messageText, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, hostedPeer, hostedRow, leased, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { answerPeer, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { grayboardDescendants } from "./procs.ts";
 import { ROOT } from "./paths.ts";
 import { until } from "./until.ts";
@@ -35,6 +36,20 @@ const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => PREFIX + t.name).s
 
 const agentDirOf = (dir: string) => join(dir, "omp-agent");
 const stateDirOf = (dir: string) => join(agentDirOf(dir), "grayboard");
+
+// omp creates <agentDir>/agent.db without a transaction, so two omp processes
+// opening a fresh agentDir at once can both run CREATE TABLE settings and one
+// dies ("table settings already exists"). True once the first has created it.
+function ompDbReady(dir: string): boolean {
+  const path = join(agentDirOf(dir), "agent.db");
+  if (!existsSync(path)) return false;
+  try {
+    using db = new Database(path, { readonly: true });
+    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").get() != null;
+  } catch {
+    return false;
+  }
+}
 
 // Written once per scenario, before any omp starts. models.yml and config.yml
 // take JSON (YAML's superset). tools.xdev off exposes the grayboard tools
@@ -303,6 +318,58 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
   });
 }
 
+// omp keeps one extension runtime across /fork, /new and /resume
+// (session_switch), so the entry replaces its session: /fork is a new root
+// with its own lease that carries the name; /new carries it too; /resume of
+// the first session rebinds that session's remembered name. Each time the
+// name receives in the current session and the outgoing one has ended.
+export function ompHostedCarryScenario(dir: string): Promise<void> {
+  return withHosted(dir, [scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-carry", create: true } }])], async ({ srv, peer, start }) => {
+    await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
+    const omp = start({ persist: true });
+    const first = await omp.command({ type: "get_state" }, 30_000);
+    await omp.command({ type: "prompt", message: "bind" });
+    await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 30_000, "first session leased as omp-carry");
+    await pingPong(srv, peer, "omp-carry");
+    await idle(omp);
+    const firstOwnership = ompRow(srv, first.sessionId)!.ownership_id;
+
+    // /fork: the outgoing session ends; the fork binds the name under its own ownership and lease.
+    expect((await omp.command({ type: "fork" })).cancelled).toBe(false);
+    const forked = await omp.command({ type: "get_state" });
+    expect(forked.sessionId).not.toBe(first.sessionId);
+    await until(() => leasedAs(srv, forked.sessionId, "omp-carry"), 15_000, "fork leased as omp-carry");
+    expect(ompRow(srv, first.sessionId)).toBeUndefined();
+    expect(ownershipEnded(srv, firstOwnership)).toBe(true);
+    expect(ompRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
+    await pingPong(srv, peer, "omp-carry");
+    await idle(omp);
+
+    // /new carries it on.
+    const forkOwnership = ompRow(srv, forked.sessionId)!.ownership_id;
+    await omp.command({ type: "new_session" });
+    const fresh = await omp.command({ type: "get_state" });
+    expect([first.sessionId, forked.sessionId]).not.toContain(fresh.sessionId);
+    await until(() => leasedAs(srv, fresh.sessionId, "omp-carry"), 15_000, "new session leased as omp-carry");
+    expect(ompRow(srv, forked.sessionId)).toBeUndefined();
+    expect(ownershipEnded(srv, forkOwnership)).toBe(true);
+    await pingPong(srv, peer, "omp-carry");
+    await idle(omp);
+
+    // /resume of the first session: it rebinds the name it remembers.
+    await omp.command({ type: "switch_session", sessionPath: first.sessionFile });
+    expect((await omp.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
+    await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 15_000, "resumed first session leased as omp-carry");
+    expect(ompRow(srv, fresh.sessionId)).toBeUndefined();
+    await pingPong(srv, peer, "omp-carry");
+    await idle(omp);
+    expect(grayboardDescendants(omp.pid)).toEqual([]);
+    expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+    await omp.quit();
+    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, first.sessionId), 10_000, "released on quit");
+  });
+}
+
 // 130 subagents one at a time (task.maxConcurrency 1), more than the root's
 // 128-child cap: each registers at its first call and is ended when its run
 // does, so every call succeeds and the root never holds more than one child.
@@ -353,7 +420,11 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
       "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
     expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
 
-    const a = start(), b = start();
+    // b starts once a has created omp's agent.db (ompDbReady); the one
+    // rotation must still serve both processes.
+    const a = start();
+    await until(() => ompDbReady(dir), 30_000, "omp agent.db created");
+    const b = start();
     const [sa, sb] = await Promise.all([a.command({ type: "get_state" }, 30_000), b.command({ type: "get_state" }, 30_000)]);
     expect(sa.sessionId).not.toBe(sb.sessionId);
     // Both reached the server on the one rotation.

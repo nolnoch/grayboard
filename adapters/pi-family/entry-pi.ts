@@ -5,14 +5,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { version } from "../../package.json" with { type: "json" };
 import { piAgentDir } from "../../src/shared/pi.ts";
-import { createGrayboard, type Level } from "./extension.ts";
+import { COMMAND, createGrayboard, toolArgs, toolResult, type Level } from "./extension.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const SERVER = "grayboard";
 const PREFIX = `mcp__${SERVER}__`;
-
-type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
@@ -35,15 +33,7 @@ export default function grayboard(pi: ExtensionAPI) {
           // Plain JSON Schema: pi-ai validates by it when the schema isn't TypeBox.
           parameters: { ...tool.inputSchema, properties: tool.inputSchema.properties ?? {} } as never,
           namespace: { name: `mcp__${SERVER}`, aliases: [SERVER] },
-          async execute(_id, params) {
-            const result = await call(tool.name, params && typeof params === "object" ? Object.fromEntries(Object.entries(params)) : {});
-            const content = result.content.flatMap((block): Content[] =>
-              block.type === "text" ? [{ type: "text", text: block.text }]
-              : block.type === "image" ? [{ type: "image", data: block.data, mimeType: block.mimeType }] : []);
-            if (result.isError && !content.some(block => block.type === "text" && block.text))
-              content.push({ type: "text", text: `MCP tool ${SERVER}/${tool.name} returned an error` });
-            return { content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true } : {}) };
-          },
+          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
         });
       }
     },
@@ -72,9 +62,5 @@ export default function grayboard(pi: ExtensionAPI) {
     const text = await ext.instructions();
     if (text) event.systemPromptOptions.sections.grayboard = text;
   });
-  pi.registerCommand("grayboard", {
-    description: "grayboard: login | logout | resume | status",
-    getArgumentCompletions: prefix => ["login", "logout", "resume", "status"].filter(v => v.startsWith(prefix)).map(value => ({ value, label: value })),
-    handler: async (args, context) => { ctx = context; await ext.command(args); },
-  });
+  pi.registerCommand("grayboard", { ...COMMAND, handler: async (args, context) => { ctx = context; await ext.command(args); } });
 }

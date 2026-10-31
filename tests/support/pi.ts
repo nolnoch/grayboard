@@ -539,7 +539,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
   });
 }
 
-// The spec's load smoke for pi (#279; omp's comes with #280): the bundle the
+// The spec's load smoke for pi (#279; omp's: ompHostedScenario): the bundle the
 // CLI's macro emits, loaded by the pinned pi under Node with an isolated HOME
 // and a seeded grant. No load failure and no login notice: it loaded and read
 // the grant. The status's session line carries pi's own id: session_start
@@ -549,7 +549,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
 // shows: node:sqlite opened it and BEGIN EXCLUSIVE took it. No grayboard
 // process runs, and quitting leaves nothing leased. The hand-run probe's
 // `ctx.agent?.kind` isn't asserted: pi 1.4.0 has no agent kind and the pi
-// entry never reads it (omp's entry will).
+// entry never reads it (omp's entry does).
 export function piHostedLoadSmoke(dir: string): Promise<void> {
   return withHosted(dir, [], async ({ srv, start }) => {
     await seedGrant(srv, stateDirOf(dir), PI_CLIENT);

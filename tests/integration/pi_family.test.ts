@@ -9,13 +9,15 @@
 // after a sign-in elsewhere, a refused rebind or carry, the Controller's own
 // pauses and binds, sign-in and sign-out failures, the bind's place, a reload
 // before a receipt, an item reaching a root mid-/new, and a child shut down
-// mid-registration.
+// mid-registration. For omp (#280): an idle child re-registering under the
+// root its marker names now, an idle end behind a running call, and rootOf.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { createGrayboard, type Grayboard, type Level, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
@@ -59,14 +61,15 @@ type Instance = {
   tools(): NativeTool[];
   call(tool: string, args?: Record<string, unknown>): Promise<CallToolResult>;
 };
-function instance(marker: Marker = { child: false }, onDeliver?: () => void): Instance {
+// `marker`, a function, is read live (omp's entry: the root as it is now).
+function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void): Instance {
   let tools: NativeTool[] = [];
   let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
     deliveries: [], notices: [],
     ext: createGrayboard({
       name: "pi", clientId: CLIENT, version: "1.0.0", agentDir,
-      marker: () => marker,
+      marker: typeof marker === "function" ? marker : () => marker,
       register: (list, call) => { tools = list; run = call; },
       deliver: (content, wake) => { self.deliveries.push({ content, wake }); onDeliver?.(); },
       notify: (message, level) => { self.notices.push({ message, level }); },
@@ -606,4 +609,86 @@ test("an item that reaches a root while its /new reads the carried name stays fo
   await second.ext.start({ id: "closing-2", reason: "new" });
   await active(second, "closing-2", "closer");
   await until(() => second.deliveries.some(d => d.content.includes("sent while closing")), 10_000, "the DM in the new session");
+});
+
+// omp (#280): a subagent idle after its run (agent_end) ends its child row;
+// revived after its main session's /new, it registers under the new root.
+test("an idle child ends its registration, and its next call registers it under the root its marker names then", async () => {
+  await root("first-root", "first");
+  let marker: Marker = { child: true, root: "first-root" };
+  const child = instance(() => marker);
+  await child.ext.start({ id: "moving-child", reason: "startup" });
+  expect((await child.call("whoami")).isError).toBeUndefined();
+  expect(row("moving-child")).toMatchObject({ root_session_id: hostedId("first-root") });
+
+  await child.ext.idle();
+  expect(row("moving-child")).toBeNull();
+
+  await root("second-root", "second");
+  marker = { child: true, root: "second-root" };
+  expect(await child.ext.status()).toContain("session: moving-child (subagent of second-root)");
+  expect((await child.call("whoami")).isError).toBeUndefined();
+  expect(row("moving-child")).toMatchObject({ root_session_id: hostedId("second-root") });
+});
+
+// omp may start a subagent's next run before the last one's agent_end
+// reaches the extension: the end waits for the calls already running. The
+// call's request is held on its way out; ended before it reaches the server,
+// the child would be unregistered and the send refused as unbound. The hold
+// lasts until another request naming the child goes out (an end that didn't
+// wait) or, at most, a second: the end that waits sends nothing until the
+// call lands, so only the bound can end the hold, and no event marks
+// "nothing was sent".
+test("an idle end waits for a call already running, which completes under its registration", async () => {
+  await root("busy-root", "busy");
+  const other = await root("busy-other", "other");
+  const child = instance({ child: true, root: "busy-root" });
+  await child.ext.start({ id: "busy-child", reason: "startup" });
+  expect((await child.call("whoami")).isError).toBeUndefined();
+
+  const real = globalThis.fetch;
+  let held: (() => void) | undefined, hit: () => void, early = false;
+  const holding = new Promise<void>(resolve => { hit = resolve; });
+  const spy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = input instanceof Request ? await input.clone().text() : typeof init?.body === "string" ? init.body : "";
+    if (!held && body.includes("sent across the idle")) {
+      await new Promise<void>(resolve => { held = resolve; hit(); });
+    } else if (held && body.includes("busy-child")) {
+      early = true;
+      held();
+    }
+    return real(input, init);
+  }) as typeof fetch);
+  try {
+    const running = child.call("dm_send", { to: "other", body: "sent across the idle" });
+    await holding;
+    const idling = child.ext.idle();
+    await until(() => early, 1_000, "an early end").catch(() => {});
+    expect(early, "the end went out while the call was held").toBe(false);
+    held!();
+    const sent = await running;
+    expect(sent.isError, texts(sent).join("\n")).toBeUndefined();
+    await idling;
+  } finally { spy.mockRestore(); }
+  expect(row("busy-child")).toBeNull();
+  await until(() => other.deliveries.some(d => d.content.includes("sent across the idle")), 10_000, "the DM");
+});
+
+test("rootOf walks parentIds to a main session, naming the subagents between outermost first", () => {
+  const agents = new Map<string, Agent>([
+    ["Main", { raw: "S0", main: true }],
+    ["0-Task", { raw: "S1", main: false, parent: "Main" }],
+    ["0-Task.0-Explore", { raw: "S2", main: false, parent: "0-Task" }],
+    ["Loop-a", { raw: "La", main: false, parent: "Loop-b" }],
+    ["Loop-b", { raw: "Lb", main: false, parent: "Loop-a" }],
+  ]);
+  expect(rootOf(agents, "Main")).toEqual({ root: "S0", via: [] });
+  expect(rootOf(agents, "0-Task")).toEqual({ root: "S0", via: ["S1"] });
+  expect(rootOf(agents, "0-Task.0-Explore")).toEqual({ root: "S0", via: ["S1", "S2"] });
+  expect(rootOf(agents, "gone")).toBeUndefined();
+  expect(rootOf(agents, undefined)).toBeUndefined();
+  expect(rootOf(agents, "Loop-a")).toBeUndefined();
+  // The main session's /new overwrites its entry; its subagents' chains reach the new root.
+  agents.set("Main", { raw: "S0-new", main: true });
+  expect(rootOf(agents, "0-Task.0-Explore")).toEqual({ root: "S0-new", via: ["S1", "S2"] });
 });
