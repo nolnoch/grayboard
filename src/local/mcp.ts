@@ -59,7 +59,7 @@ import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
-import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
+import { channelsOff, channelsOffNotice, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
@@ -168,9 +168,11 @@ if (NAMED && HUMAN !== isHuman(db, SUGGESTED!)) {
   );
   process.exit(1);
 }
-// Claude Code started without a channels flag drops pushes silently; say so.
-const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
-if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
+// A Claude Code session that won't show channel messages drops pushes silently; say so and why.
+const CHANNELS_OFF_REASON = PUSH ? channelsOff(process.env, parentCommandLine()) : null;
+const CHANNELS_OFF = CHANNELS_OFF_REASON !== null;
+const CHANNELS_OFF_NOTICE = CHANNELS_OFF_REASON === null ? null : channelsOffNotice(CHANNELS_OFF_REASON);
+if (CHANNELS_OFF) console.error(`[grayboard] Claude Code channels are off (${CHANNELS_OFF_REASON}): tools only`);
 // Notifications such a session drops would still count as delivered, so it
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
@@ -335,7 +337,7 @@ const mcp = new Server(
       tools: {},
     },
     // Unbound: the session acts as its ID, with a line on binding a name.
-    instructions: [...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []), ...localInstructions(true, startNotes)].join(" "),
+    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...localInstructions(true, startNotes)].join(" "),
   },
 );
 
@@ -369,7 +371,7 @@ let instructionsStale = false;
 const requeued: string[] = [];
 const notices = (): string[] => {
   const out = requeued.splice(0);
-  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
+  if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
   if (missedBindNotice) out.push(missedBindNotice);
   missedBindNotice = null;

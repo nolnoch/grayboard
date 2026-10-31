@@ -246,15 +246,15 @@ test("#284 S2: a DM pushed for an alias and unacked at its unbind reaches its ne
 }, 30_000);
 
 
-// A server-mode child that Claude Code started without a channels flag: its
-// harness runs as `claude`, with CLAUDECODE=1.
+// A server-mode child of an interactive Claude Code started without a channels
+// flag: its harness runs as `claude`, with CLAUDECODE=1.
 async function channelsOffSession(identity: string | null): Promise<Session> {
   const claude = join(srv.dir, "claude");
   if (!existsSync(claude)) symlinkSync(process.execPath, claude);
   const s = await mcpSession({
-    env: serverEnv(srv.dir, srv.base, alice, identity, { CLAUDECODE: "1" }), cwd: srv.dir, args: ["mcp", "--mode", "server"], harness: claude,
+    env: serverEnv(srv.dir, srv.base, alice, identity, { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" }), cwd: srv.dir, args: ["mcp", "--mode", "server"], harness: claude,
   });
-  expect(s.stderr()).toContain("no channels flag: tools only");
+  expect(s.stderr()).toContain("channels are off (the session wasn't started with");
   return s;
 }
 
