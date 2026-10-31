@@ -28,6 +28,26 @@ export function adapterChildren(pid: number, bin?: string): string[] {
     .map((m) => m[4]!);
 }
 
+// Every grayboard process anywhere under `pid` (children, grandchildren, a
+// detached process it spawned): this checkout's CLI, or a `grayboard` binary.
+// A server-mode hosted extension runs none.
+export function grayboardDescendants(pid: number): string[] {
+  const r = Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid=,command="]);
+  const rows = r.stdout.toString().split("\n")
+    .map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+    .filter((m): m is RegExpMatchArray => !!m)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), command: m[3]! }));
+  const found: string[] = [];
+  for (let queue = [pid]; queue.length;) {
+    const parent = queue.shift()!;
+    for (const row of rows.filter((x) => x.ppid === parent)) {
+      queue.push(row.pid);
+      if (row.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(row.command)) found.push(row.command);
+    }
+  }
+  return found;
+}
+
 // SIGKILL `pid` and wait until it's gone: the signal is asynchronous, and a
 // test that starts the next process at once races the dying one.
 export async function sigkill(pid: number): Promise<void> {

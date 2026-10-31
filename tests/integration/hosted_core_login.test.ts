@@ -21,6 +21,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
@@ -150,32 +151,7 @@ function spawn(command: "token" | "login" | "token-loop", arg?: string, clientId
 }
 const outcomes = (lines: Line[]) => lines.filter(l => "ok" in l || "error" in l);
 
-// A browser with a cookie jar that walks the real authorize → (stubbed
-// upstream) → consent → loopback callback round trip.
-async function browse(authorizeUrl: string, decision: "approve" | "deny" = "approve") {
-  const cookies = new Map<string, string>();
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url, { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) { const [k, v] = cookie.split(";")[0]!.split("="); cookies.set(k!, v!); }
-    return res;
-  };
-  const begin = await request(authorizeUrl);
-  expect(begin.status).toBe(303);
-  const google = new URL(begin.headers.get("Location")!);
-  expect(google.host).toBe("accounts.google.com");
-  const callback = await request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
-  expect(callback.status).toBe(303);
-  const page = await (await request(callback.headers.get("Location")!)).text();
-  expect(page).toContain("Authorize Grayboard for pi");
-  const id = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ request: id, csrf, decision }) });
-  expect(decided.status).toBe(303);
-  const loopback = decided.headers.get("Location")!;
-  expect(loopback).toStartWith("http://127.0.0.1:");
-  return (await fetch(loopback)).text();
-}
+const browse = (authorizeUrl: string, decision: "approve" | "deny" = "approve") => browseConsent(issuer, authorizeUrl, "pi", decision);
 
 // ---- login ----
 
