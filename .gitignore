@@ -22,3 +22,6 @@ dist/
 .claude/HANDOFF*.md
 .e2e-cache/
 .e2e-runs/
+
+# The Claude Code plugin ships its bundle: Claude Code runs no build (scripts/build_claude_plugin.ts).
+!/plugins/claude-code/dist/

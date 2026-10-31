@@ -1,0 +1,6 @@
+{
+  "name": "grayboard",
+  "owner": { "name": "nolnoch" },
+  "description": "Grayboard's Claude Code plugin, pinned to a published release.",
+  "plugins": []
+}
