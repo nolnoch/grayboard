@@ -158,11 +158,23 @@ jobs:
     with:
       suite: upgrade-matrix
 
+  # Real Claude Code installs the marketplace entry this release's plugin pin
+  # will write (the tag's commit, from GitHub) and works a DM round trip
+  # (#281), so a broken plugin never gets pinned.
+  claude-hosted:
+    name: Claude Code plugin
+    permissions:
+      contents: read
+      issues: write   # e2e.yml's tracking-issue job asks for it; that job runs only on schedule
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: claude-hosted
+
   # Signs SHA256SUMS with the release key, which only the `release`
   # environment holds: a v* tag run its required reviewer approves (#162).
   release:
     name: Publish release
-    needs: [build, e2e, upgrade-matrix, hosted-network]
+    needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
