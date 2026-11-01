@@ -18,7 +18,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { DeliveryHeldElsewhere, Refusal, type Item } from "../../adapters/hosted-core/src/model.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { RootDelivery, type RootOptions } from "../../adapters/hosted-core/src/root.ts";
-import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { deliveryPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
@@ -132,6 +132,22 @@ test("a root whose delivery another holder has runs tools-only, refuses bind, an
   const result = await b.root.call("whoami");
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([]);
   expect(row("wait-1")).toMatchObject({ name: "holder" });
+}, 30_000);
+
+test("a root in lock error whose resume finds delivery held elsewhere is held, not in error: the error's unseen notice is dropped for the held one", async () => {
+  const path = deliveryPath(stateDir, srv.resource, CLIENT, "relock-1");
+  mkdirSync(path, { recursive: true });
+  const a = rig("relock-1");
+  await a.root.start();
+  expect(a.root.status().error).toStartWith("couldn't take delivery: ");
+  expect(a.root.status().held).toBeUndefined();
+
+  rmSync(path, { recursive: true });
+  await live("relock-1", "holder");
+  await a.root.resume();
+  expect(a.root.status()).toEqual({ held: HELD });
+  const result = await a.root.call("whoami");
+  expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([`grayboard: ${HELD}`]);
 }, 30_000);
 
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {

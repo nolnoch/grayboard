@@ -95,21 +95,32 @@ export class RootDelivery {
     await this.take();
   }
   private async take(): Promise<void> {
+    // resume() runs take() again: an earlier attempt's waiter would keep
+    // polling beside this one's, and could start a second Controller.
+    this.waiter?.abort();
     let taken: Lock | undefined;
     try { taken = tryDelivery(this.path()); }
     catch (error) {
-      // Not BUSY (permissions, I/O): no waiter, whose every try would fail the same way.
+      // Not BUSY (permissions, I/O): no waiter, whose every try would fail
+      // the same way. A definitive answer, so an earlier held claim no longer
+      // stands (and no longer keeps the shutdown from ending what calls bound).
+      this.clearHeld();
       this.failedLock(error);
       this.toolsOnly();
       return;
     }
     if (taken) return this.starting = this.own(taken);
+    // BUSY is definitive too: another process holds delivery, so an earlier
+    // lock error no longer stands.
+    this.clearError();
     this.held = new DeliveryHeldElsewhere(this.client.options.harness).message;
     this.notices.set("held", this.held);
     this.toolsOnly();
     const waiter = this.waiter = new AbortController();
     void waitDelivery(this.path(), waiter.signal).then(
-      next => { this.starting = this.own(next); },
+      next => { if (waiter.signal.aborted) next.release(); else this.starting = this.own(next); },
+      // The wait stopped but the holder may still run: `held` stays, so the
+      // shutdown never ends that process's session.
       error => { if (!waiter.signal.aborted) this.failedLock(error); },
     );
   }
@@ -117,6 +128,15 @@ export class RootDelivery {
     this.error = `couldn't take delivery: ${message(error)}`;
     this.notices.set("start", this.error);
     this.log(this.error, "error");
+  }
+  // A held claim or lock error that no longer stands, with its notice if nobody saw it yet.
+  private clearHeld() {
+    if (this.held && this.notices.get("held") === this.held) this.notices.delete("held");
+    this.held = undefined;
+  }
+  private clearError() {
+    if (this.error && this.notices.get("start") === this.error) this.notices.delete("start");
+    this.error = undefined;
   }
   private toolsOnly() {
     if (this.proxy) return;
@@ -132,10 +152,9 @@ export class RootDelivery {
   private async own(taken: Lock): Promise<void> {
     if (this.closed) { taken.release(); return; }
     this.lock = taken;
-    // A held or lock-error notice nobody saw yet is no longer true.
-    if (this.held && this.notices.get("held") === this.held) this.notices.delete("held");
-    if (this.error && this.notices.get("start") === this.error) this.notices.delete("start");
-    this.held = undefined; this.error = undefined;
+    // A held claim or lock error no longer stands.
+    this.clearHeld();
+    this.clearError();
     try {
       // Read before the Controller exists: a degraded record its restore
       // makes (an unreadable state file) is weighed against this epoch.

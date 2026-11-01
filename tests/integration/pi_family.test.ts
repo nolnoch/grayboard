@@ -805,6 +805,19 @@ test("a root whose delivery lock can't be opened ends the session its calls boun
   expect(row("lockquit-1")).toBeNull();
 });
 
+test("/grayboard resume on a root in lock error says so when another process now holds delivery", async () => {
+  const path = deliveryPath(stateDir, srv.resource, CLIENT, "lockheld-1");
+  mkdirSync(path, { recursive: true });
+  const a = instance();
+  await a.ext.start({ id: "lockheld-1", reason: "startup" });
+  rmSync(path, { recursive: true });
+  await root("lockheld-1", "lockheld");
+  a.notices.length = 0;
+  await a.ext.command("resume");
+  expect(a.notices).toEqual([{ level: "warning", message: `grayboard: ${HELD}` }]);
+  expect(await a.ext.status()).not.toContain("couldn't take delivery");
+});
+
 test("a quit while a reloaded root's start is in flight still releases the lease the reload kept", async () => {
   const before = await root("inflight-1", "inflight");
   await before.ext.shutdown("reload");
