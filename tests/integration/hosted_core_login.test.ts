@@ -18,7 +18,7 @@ import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import type { RecordStatus } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { startServer } from "../../src/server/app.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";

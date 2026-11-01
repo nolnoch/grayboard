@@ -7,7 +7,8 @@ import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE,
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, harnessFor } from "./oauth-config.ts";
+import { harnessFor } from "./oauth-config.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedSession } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";

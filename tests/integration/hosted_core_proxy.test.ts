@@ -16,7 +16,7 @@ import { hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type Nat
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, ATTACHMENTS_PARAM, attachRoots, publishedLimits } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";

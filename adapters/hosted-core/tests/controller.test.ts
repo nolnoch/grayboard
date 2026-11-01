@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { Controller, type ControllerOptions } from "../src/controller.js";
-import { Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
+import { AccessExpired, Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
 import { LeaseUnavailable, ServerUnreachable, Wire, type WireOptions } from "../src/wire.js";
@@ -21,14 +21,17 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
+  // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
+  let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined;
+  const loops: FakeWire[] = [];
   const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
-    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); }
+    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); if (beforeRetry) loops.push(this); }
     // Only the run loop's wire has beforeRetry. The SDK wraps a token() failure
     // during connect in its version-negotiation error.
     async connect() {
@@ -38,7 +41,10 @@ function runtime(mode: Mode) {
     async call(name: string, args: Record<string, unknown> = {}) {
       calls.push({ sessionID: this.sessionID, name, args });
       let row = rows.get(this.sessionID);
-      if (name === "whoami") return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true } : {}) };
+      if (name === "whoami") {
+        if (!this.beforeRetry && prepareHold) await prepareHold;
+        return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true } : {}) };
+      }
       if (name === "bind") {
         if (!args.create && !rows.get(this.sessionID) && args.name !== "be" && args.name !== "fe") throw new Error("identity_unknown");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
@@ -72,7 +78,7 @@ function runtime(mode: Mode) {
   }
   const configuration = () => ({ type: "remote" as const, url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "grayboard-pi", scope: "grayboard:delivery grayboard:tools", configHash: `grant-${grant}` });
   const credential: CredentialPort<Enrollment> = {
-    capture: async sessionID => ({ version: 2, sessionID, configuration: configuration() }),
+    capture: async sessionID => { if (signedOut) throw new AccessExpired("pi", "run /grayboard login"); return { version: 2, sessionID, configuration: configuration() }; },
     check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => "access",
@@ -91,7 +97,7 @@ function runtime(mode: Mode) {
     place: () => "/work",
     ancestry: sessionID => resolveRoot(sessionID, async id => { if (!nodes.has(id)) throw new Error("missing"); return { id, parentID: nodes.get(id), time: {} }; }),
     credential, approval,
-    admit: async (e, item, id) => { admits.push({ sessionID: e.sessionID, id, item: item.id }); },
+    admit: async (e, item, id, _identity, signal) => { admits.push({ sessionID: e.sessionID, id, item: item.id }); await admitHold?.(signal); },
   };
   const make = (options: ControllerOptions = {}) => new Controller(port, { Transport: FakeWire as unknown as typeof Wire, ...options });
   const controller = make();
@@ -99,7 +105,10 @@ function runtime(mode: Mode) {
   const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" });
   const named = (name: string) => calls.filter(c => c.name === name);
   return {
-    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts,
+    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts, loops,
+    // Every prepare's whoami waits on `gate` from now on.
+    holdPrepare: (gate: Promise<void>) => { prepareHold = gate; },
+    holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     // The grant changes before any watch's next tick; the server then closes `id`'s stream.
     revoke: (id: string) => { grant++; streams.get(id)?.(); },
@@ -109,6 +118,8 @@ function runtime(mode: Mode) {
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
     loseRenewsFrom: (at: number) => { renewsLostFrom = at; },
+    // The grant store is logged out: a capture finds no sign-in.
+    signOut: () => { signedOut = true; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
 }
@@ -408,5 +419,135 @@ test.each(modes)("a refresh another process holds is retried like an outage, pas
     expect(waits).toEqual([500, 1000, 2000, 4000, ...Array(8).fill(8000)]);
     expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "refresh_in_progress" } });
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+// #444: the per-session stop before the control queue.
+// An admit that waits until the run loop's signal aborts.
+const heldAdmit = (signals: AbortSignal[]) => (signal: AbortSignal) => {
+  signals.push(signal);
+  const { promise, reject } = Promise.withResolvers<void>();
+  signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  return promise;
+};
+
+test.each(modes)("shutdown aborts the run loop before the control queue; a resume or enroll queued after it refuses (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    const signals: AbortSignal[] = [];
+    r.holdAdmit(heldAdmit(signals));
+    r.batches.set("R", [r.item("direct:1")]);
+    await r.controller.enroll("R", "be", true);
+    await until(() => signals.length === 1);
+    // B's enroll holds the queue in its prepare.
+    const gate = Promise.withResolvers<void>();
+    r.holdPrepare(gate.promise);
+    const blocking = r.controller.enroll("B", "fe", true);
+    await until(() => r.named("whoami").some(c => c.sessionID === "B"));
+    const shutdown = r.controller.shutdown("R", "release");
+    expect(signals[0]!.aborted).toBe(true);
+    // Bun's `expect(p).rejects` settles `p` on the spot, so capture the errors instead.
+    const resumed = r.controller.resume("R").then(() => undefined, (error: Error) => error.message);
+    const enrolled = r.controller.enroll("R", "be").then(() => undefined, (error: Error) => error.message);
+    gate.resolve();
+    await blocking;
+    expect(await shutdown).toBeUndefined();
+    expect(await resumed).toBe("Grayboard is stopping");
+    expect(await enrolled).toBe("Grayboard is stopping");
+    expect(r.rows.has("R")).toBe(false);
+    expect(r.root(r.controller)).toMatchObject({ state: "paused", message: "Session shut down; ownership released" });
+    await until(() => r.root(r.controller, "B")?.state === "active");
+    expect(r.root(r.controller, "B")).toMatchObject({ name: "fe" });
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("an admit receives the run loop's signal; a shutdown's abort releases it and records no pause (%s)", async mode => {
+  const r = runtime(mode);
+  const records: { state: string; operation: string; sessionID?: string }[] = [];
+  const c = r.make({ sink: record => { records.push({ ...record }); } });
+  try {
+    const signals: AbortSignal[] = [];
+    r.holdAdmit(heldAdmit(signals));
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", "be", true);
+    await until(() => signals.length === 1);
+    expect(signals[0]).toBe(r.loops.at(-1)!.signal);
+    await c.shutdown("R", "detach");
+    expect(signals[0]!.aborted).toBe(true);
+    expect(records.filter(x => x.state === "paused" && x.operation !== "session_end")).toEqual([]);
+    expect(r.root(c)).toMatchObject({ state: "paused", message: "Session detached; lease retained for reload" });
+    // Detached: the lease and the item stay for the reload.
+    expect(r.rows.get("R")?.capability).toBeDefined();
+    expect(r.named("delivery_receipt")).toEqual([]);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+test.each(modes)("shutdown with carry returns the root's name read in the queue: a resume in flight ends at its next check without rebinding (%s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", "be", true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  // A restart: the server lost the binding, so the resume would rebind be.
+  r.rows.delete("R");
+  const c = r.make(), binds = r.named("bind").length, whoamis = r.named("whoami").length;
+  try {
+    const gate = Promise.withResolvers<void>();
+    r.holdPrepare(gate.promise);
+    const resumed = c.resume("R");
+    await until(() => r.named("whoami").length > whoamis);
+    const carried = c.shutdown("R", "release", { carry: true });
+    gate.resolve();
+    expect(await carried).toBe("be");
+    await resumed;
+    expect(r.named("bind").slice(binds)).toEqual([]);
+    expect(r.named("delivery_open").filter(x => x.sessionID === "R")).toHaveLength(1);
+    expect(r.named("session_end").map(x => x.sessionID)).toEqual(["R"]);
+    expect(r.root(c)).toMatchObject({ state: "paused", message: "Session shut down; ownership released" });
+  } finally { await c.close(); }
+});
+
+test.each(modes)("shutdown with carry after a completed resume returns the name it rebound (%s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", "be", true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const c = r.make(), binds = r.named("bind").length;
+  try {
+    await c.resume("R");
+    await until(() => r.root(c)?.state === "active");
+    expect(r.named("bind").slice(binds).map(x => x.args)).toEqual([{ name: "be", create: false, where: "/work" }]);
+    expect(await c.shutdown("R", "detach", { carry: true })).toBe("be");
+    expect(r.rows.get("R")?.name).toBe("be");
+  } finally { await c.close(); }
+});
+
+test.each(modes)("a release with no live root (its start never reached the queue) still ends the session (%s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", "be", true);
+  await until(() => r.root(r.controller)?.state === "active");
+  // A /reload: the old runtime detaches and keeps the lease.
+  await r.controller.shutdown("R", "detach");
+  await r.controller.close();
+  expect(r.rows.get("R")?.capability).toBeDefined();
+  const c = r.make();
+  try {
+    expect(await c.shutdown("R", "release")).toBeUndefined();
+    expect(r.named("session_end").map(x => x.sessionID)).toEqual(["R"]);
+    expect(r.rows.has("R")).toBe(false);
+    await expect(c.resume("R")).rejects.toThrow("Grayboard is stopping");
+  } finally { await c.close(); }
+});
+
+test.each(modes)("a release with no live root while signed out records its failed session_end (%s)", async mode => {
+  const r = runtime(mode);
+  const records: { state: string; operation?: string; sessionID?: string }[] = [];
+  const c = r.make({ sink: record => { records.push({ ...record }); } });
+  try {
+    r.signOut();
+    await c.shutdown("R", "release");
+    await until(() => records.some(x => x.operation === "session_end"));
+    expect(records.filter(x => x.operation === "session_end")).toEqual([expect.objectContaining({ state: "degraded", sessionID: "R", message: expect.stringMatching(/^session_end failed \(/) })]);
+    expect(r.named("session_end")).toEqual([]);
   } finally { await c.close(); await r.controller.close(); }
 });
