@@ -99,6 +99,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       void this.port.storage.set(`paused:${r.e.sessionID}`, true).catch(error => this.failure("latch_save", error, r));
     }
   }
+  // The watch's and a guard's drift alike; hosts key on this message (pi's describe).
+  private credentialChanged() { this.drift(`Grayboard credential changed; ${this.hint}`); }
   private async path(sessionID: string) {
     const path = await this.port.ancestry(sessionID);
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
@@ -128,9 +130,18 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private async guard(r: Root<E>, epoch: number, signal: AbortSignal) {
     const e = r.e, key = this.key(e);
-    const check = () => { if (this.port.place() !== this.place || this.stopped || this.drifted || r.paused || signal.aborted || r.epoch !== epoch || this.roots.get(e.sessionID) !== r || this.key(r.e) !== key) throw new Refusal("paused", "Admission target changed"); };
+    const current = () => this.port.place() === this.place && !this.stopped && !this.drifted && !r.paused && !signal.aborted && r.epoch === epoch && this.roots.get(e.sessionID) === r && this.key(r.e) === key;
+    const check = () => { if (!current()) throw new Refusal("paused", "Admission target changed"); };
     check();
-    await this.port.credential.check(e);
+    // The port's check sees a changed credential (Refusal "binding") before the
+    // watch's next tick when the server acts first: a revoked grant closes the
+    // run loop's stream at once. That is the watch's drift, so every root
+    // pauses with its message, not this one alone with a generic failure; a
+    // guard whose root was replaced meanwhile drifts nothing, like a disposed watch.
+    await this.port.credential.check(e).catch(error => {
+      if (error instanceof Refusal && error.code === "binding" && current()) this.credentialChanged();
+      throw error;
+    });
     await this.activeRoot(e.sessionID);
     if (this.port.approval && !await this.port.approval.approved(e, r.approval)) { r.paused = true; throw new Refusal("root", `Root approval changed; ${this.hint}`); }
     check();
@@ -156,8 +167,13 @@ export class Controller<E extends Enrollment = Enrollment> {
   private expired(error: unknown) {
     return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
   }
+  // A check a disposed watch already had in flight drifts nothing: the root it
+  // watched was replaced (a resume or enroll unwatches before the new root),
+  // and the new root's own watch sees any later change.
   private async watch(e: E) {
-    this.watches.set(e.sessionID, await this.port.credential.watch(e, () => this.drift(`Grayboard credential changed; ${this.hint}`)));
+    let live = true;
+    const watch = await this.port.credential.watch(e, () => { if (live) this.credentialChanged(); });
+    this.watches.set(e.sessionID, { dispose: async () => { live = false; await watch.dispose(); } });
   }
   private async unwatch(sessionID: string) {
     if (this.drifted) {
@@ -190,8 +206,9 @@ export class Controller<E extends Enrollment = Enrollment> {
       }
       await this.prepare(r, !!previous?.paused && !name);
     } catch (error) {
+      // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
-      this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -204,13 +221,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.unwatch(sessionID);
     const previous = this.roots.get(sessionID);
     if (previous) await this.stop(previous);
-    let approval: E;
-    if (this.port.approval) {
-      const saved = (await this.port.approval.saved()).find(s => s.sessionID === sessionID);
-      if (!saved?.approval || !saved.enabled) throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
-      approval = saved.approval;
-      await this.port.credential.check(approval);
-    } else approval = await this.port.credential.capture(sessionID);
+    const approval = await this.approvalFor(sessionID);
     // A new grant (possibly another account) never inherits the old name.
     const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
     const r: Root<E> = { e: { ...approval, ...(name ? { name } : {}) }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set() };
@@ -218,10 +229,29 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.watch(r.e);
     this.set(r, "approved", name ? `Resuming ${name}` : "Root approved; bind a name to receive deliveries");
     try { await this.prepare(r, true); }
-    catch (error) { this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
+    catch (error) { if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
+  // The approval a root of `sessionID` starts under now: its saved, enabled
+  // approval on an approval host, else the current credential.
+  private async approvalFor(sessionID: string): Promise<E> {
+    if (!this.port.approval) return this.port.credential.capture(sessionID);
+    const saved = (await this.port.approval.saved()).find(s => s.sessionID === sessionID);
+    if (!saved?.approval || !saved.enabled) throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
+    await this.port.credential.check(saved.approval);
+    return saved.approval;
+  }
+  // The name a successor of `sessionID` binds (pi's /new and /fork): the name
+  // a resume of it would rebind now (remembered, else its live root's, under
+  // the current approval only), so a name a new sign-in dropped never
+  // carries. Undefined when there is none or it can't be read (signed out).
+  async carried(sessionID: string): Promise<string | undefined> {
+    try {
+      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
+      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
+    } catch { return undefined; }
+  }
   private async prepare(r: Root<E>, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
     await this.temporary(r.e, async wire => {
@@ -312,7 +342,7 @@ export class Controller<E extends Enrollment = Enrollment> {
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
                 if (r.admitted.has(key)) { inItem = false; return; }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity));
+                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
@@ -470,7 +500,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every(line => typeof line === "string")) throw new Error("Native bind completion lacked validated output");
         }
         await this.prepare(r, false);
-      } catch (error) { this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
+      } catch (error) { if (!this.drifted) this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
     });
   }
   // A new top-level root binds the configured name; receiving still needs approval where the host keeps one.

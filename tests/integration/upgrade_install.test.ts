@@ -10,7 +10,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource } from "../../src/cli/adapters.ts";
+import { adapterBundle, adapterSource } from "../../src/cli/adapters.ts";
 import { REPO, TARGET } from "../../src/cli/update.ts";
 import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
@@ -56,6 +56,8 @@ beforeEach(() => {
     writeFileSync(p, `#!/bin/sh\necho "${name} $*" >> "${join(dir, "argv.log")}"\n`);
     chmodSync(p, 0o755);
   }
+  // Server mode's Claude Code plugin needs Bun on PATH.
+  symlinkSync(process.execPath, join(dir, "stubs", "bun"));
 });
 
 // Under scripts/e2e.sh each test keeps its temp HOME (less the installed
@@ -101,21 +103,39 @@ function writeOldEntries(exe: string, extraEnv: Record<string, string> = {}): vo
 }
 const CREDENTIALS = () => join(home, ".grayboard", "credentials");
 
-// Every registration setup writes, each naming the installed binary.
-function expectRegistered(): void {
+// Every registration setup writes, each naming the installed binary. With
+// `server`, Claude Code gets the hosted plugin, and omp and pi the hosted
+// extension and its config, with no entries, instead.
+function expectRegistered(server?: string): void {
   // A compiled binary's execPath is its resolved path.
   const exe = realpathSync(join(bin, "grayboard"));
   const argv = readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n");
-  expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
-  expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
-    { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
-  ]);
-  expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
-  // Disabled: the opencode and pi adapters serve the tools and read their command here.
+  if (server) {
+    expect(argv).toEqual([`claude plugin marketplace add ${REPO}`, "claude plugin marketplace update grayboard",
+      `claude plugin install grayboard@grayboard --config server_url=${server}/mcp`, "claude mcp remove --scope user grayboard"]);
+    expect(existsSync(join(home, ".claude", "settings.json"))).toBe(false);
+  } else {
+    expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
+    expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
+      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
+    ]);
+  }
+  // Disabled: the opencode and local pi adapters serve the tools and read their command here.
   expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-  expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
-  for (const [harness, path] of Object.entries(ADAPTERS)) {
-    expect(readFileSync(join(home, ...path), "utf8"), harness).toBe(adapterSource(harness as keyof typeof ADAPTERS));
+  const local = server ? ["opencode"] as const : ["omp", "opencode", "pi"] as const;
+  for (const harness of local) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+  if (server) {
+    for (const [harness, dot] of [["omp", ".omp"], ["pi", ".pi"]] as const) {
+      const entry = existsSync(join(home, dot, "agent", "mcp.json")) ? json(dot, "agent", "mcp.json").mcpServers?.grayboard : undefined;
+      expect(entry, harness).toBeUndefined();
+      expect(existsSync(join(home, ...ADAPTERS[harness])), harness).toBe(false);
+      expect(readFileSync(join(home, dot, "agent", "extensions", "grayboard.js"), "utf8"), harness).toBe(adapterBundle(harness));
+      expect(json(dot, "agent", "grayboard", "config.json"), harness).toEqual({ url: `${server}/mcp` });
+    }
+  } else {
+    expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
+    expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+    for (const dot of [".omp", ".pi"]) expect(existsSync(join(home, dot, "agent", "extensions", "grayboard.js")), dot).toBe(false);
   }
 }
 
@@ -144,7 +164,7 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   expect(statSync(CREDENTIALS()).mode & 0o777).toBe(0o600);
 
   expect(await expectOk(grayboard("setup", "-y", "--server", srv.base))).toContain(`Signed in to ${srv.base} as you@example.com.`);
-  expectRegistered();
+  expectRegistered(srv.base);
 
   await expectOk(grayboard("logout"));
   // Still there, so `grayboard mcp` stays in server mode and says why it can't start.

@@ -468,21 +468,23 @@ test("the reply and recovery tools ask Claude Code to load them upfront", async 
   expect(upfront).toEqual(["bind", "board_post", "claim_list", "dm_ack", "dm_inbox", "dm_send", "dm_thread", "peer_status"]);
 }, 20_000);
 
-test("a Claude Code session started without a channels flag runs tools-only and is warned", async () => {
+test("a Claude Code session whose channels are off runs tools-only and is warned why", async () => {
   // Stand-in for Claude Code: a process named `claude` (bun under another
   // name) that runs grayboard mcp as its child on inherited stdio, with
-  // CLAUDECODE=1 as Claude Code sets. Its own flags come before "::".
+  // CLAUDECODE=1 and the interactive entrypoint as Claude Code sets. Its own
+  // flags come before "::".
   const fake = join(dir, "claude");
   symlinkSync(process.execPath, fake);
   const host = join(dir, "host.ts");
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
 Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
   const claude = async (identity: string, flags: string[]) =>
-    (await localSession(dir, identity, { extra: { CLAUDECODE: "1" }, via: [fake, host, ...flags, "::"] })).c;
+    (await localSession(dir, identity, { extra: { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" }, via: [fake, host, ...flags, "::"] })).c;
   const texts = async (c: Client) => ((await c.callTool({ name: "peer_list", arguments: {} })).content as { text: string }[]).map((t) => t.text);
 
   const off = await claude("be", []);
-  expect(off.getInstructions()).toStartWith("Warning: this Claude Code session was started without");
+  expect(off.getInstructions()).toStartWith("Warning: this Claude Code session is tools-only");
+  expect(off.getInstructions()).toContain("claude --dangerously-load-development-channels server:grayboard");
   expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(true);
   expect((await texts(off)).some((t) => t.startsWith("Warning:"))).toBe(false); // first tool result only
 

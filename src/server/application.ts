@@ -23,7 +23,7 @@ import { authLost, type AuthedUser, type AuthLost } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, cleanPlace, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, idCollisionText, inheritStatus, normalizeBoard, getBoard,
-  type AliasMetaSet, type Board, type CoreDb, type Viewer, type Pending, type PendingRef, type SnapshotOptions, type UnboundPeer,
+  type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -37,6 +37,7 @@ import { onAliasCreated } from "./teams.ts";
 import { mayActIn, principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import { afterCommit } from "../core/sqlite.ts";
+import type { Pending } from "../shared/notifications.ts";
 
 // Every code an operation refuses with is a wire code (src/shared/protocol.ts).
 export type ApplicationCode = ErrorCode;

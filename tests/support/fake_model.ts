@@ -3,9 +3,8 @@
 // first that answers a request decides the reply, else the model says it has
 // nothing to do. Every completion request is recorded, so a test asserts on
 // what the harness sent. Any other route gets a 404 and lands in `unhandled`,
-// so a harness calling a route the fake doesn't serve fails visibly. The
-// Anthropic Messages side (Claude Code) lands with the Claude Code harness
-// tests, after probe P1 measures which routes it calls.
+// so a harness calling a route the fake doesn't serve fails visibly. Claude
+// Code's Anthropic Messages counterpart is fake_anthropic.ts.
 
 export type ChatMessage = { role: string; content?: unknown; tool_calls?: unknown };
 export type ChatRequest = { messages: ChatMessage[]; tools?: { function: { name: string } }[] };
@@ -23,14 +22,45 @@ export const messageText = (m: ChatMessage): string =>
 // Answers the latest grayboard <channel> DM from `from` with a tool call,
 // unless the model already acted after it. A context-only message (a digest)
 // can land after the tool result, mid-turn; that isn't a new DM to answer. A
-// DM delivered twice still gets two replies.
-export function onChannelDm(from: string, reply: (messageId: number) => Reply): Rule {
+// DM delivered twice still gets two replies. `reply` gets the DM's id and the
+// whole rendered message (its meta: attachments, parent_id).
+export function onChannelDm(from: string, reply: (messageId: number, text: string) => Reply): Rule {
   const dm = new RegExp(`<channel source="grayboard" message_id="(\\d+)" from="${RegExp.escape(from)}"`);
   return (req) => {
     const at = req.messages.findLastIndex((m) => dm.test(messageText(m)));
     if (at < 0 || req.messages.slice(at + 1).some((m) => m.role === "assistant")) return undefined;
-    return reply(Number(dm.exec(messageText(req.messages[at]!))![1]));
+    const text = messageText(req.messages[at]!);
+    return reply(Number(dm.exec(text)![1]), text);
   };
+}
+
+// A user message's prompt text: omp prepends a <system-reminder> block to the
+// user's prompt in the same message.
+export const promptText = (m: ChatMessage): string => messageText(m).replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\n?/, "");
+const lastUserText = (req: ChatRequest): string => promptText(req.messages.findLast((m) => m.role === "user") ?? { role: "user" });
+const actedSince = (req: ChatRequest, at: number): boolean => req.messages.slice(at + 1).some((m) => m.role === "assistant");
+
+// A subagent fan-out through omp's `task` tool (#280): when the latest user
+// message matches `trigger`, the parent calls `task` with `n` assignments, each
+// naming its child (`fake-child-<i>`). A child's own conversation, found by its
+// name in the first user message, makes the calls `child(i)` scripts, one per
+// assistant message, then ends its turn with text.
+export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Reply[]): Rule[] {
+  const name = /\bfake-child-(\d+)\b/;
+  const parent: Rule = (req) => {
+    const at = req.messages.findLastIndex((m) => m.role === "user");
+    if (at < 0 || !trigger.test(lastUserText(req)) || actedSince(req, at)) return undefined;
+    const tasks = Array.from({ length: n }, (_, i) => ({ name: `FakeChild${i}`, task: `You are fake-child-${i}.`, solutionSpace: "scripted" }));
+    return { tool: "task", args: { context: "fake fan-out", tasks } };
+  };
+  const children: Rule = (req) => {
+    const first = req.messages.find((x) => x.role === "user");
+    const m = first && name.exec(messageText(first));
+    if (!m) return undefined;
+    return child(Number(m[1]))[req.messages.filter((x) => x.role === "assistant").length] ?? { text: `fake-child-${m[1]} done` };
+  };
+  // Children first: a child's prompt can also match the parent's trigger.
+  return [children, parent];
 }
 
 export type FakeModel = { port: number; requests: Recorded<ChatRequest>[]; unhandled: Recorded<string>[]; stop: () => void };

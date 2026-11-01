@@ -25,3 +25,6 @@ dist/
 .direnv/
 result
 result-*
+
+# The Claude Code plugin ships its bundle: Claude Code runs no build (scripts/build_claude_plugin.ts).
+!/plugins/claude-code/dist/

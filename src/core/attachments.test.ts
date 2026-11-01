@@ -24,7 +24,8 @@ import {
 import { SqliteBlobs } from "../local/blobs.ts";
 import { createBoard, pendingFor, post, prunePosts, read, subscribe } from "./boards.ts";
 import { TooLargeError } from "./errors.ts";
-import { boardNotification, callBoardTool, dmNotification } from "./tools.ts";
+import { callBoardTool } from "./tools.ts";
+import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { initCoreSchema } from "./schema.ts";
 import {
   DEFAULT_ATTACHMENT_LIMITS,

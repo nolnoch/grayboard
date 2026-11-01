@@ -85,7 +85,8 @@ export function outputOf(result: CallToolResult): unknown {
   try { return JSON.parse(only.text); } catch { return only.text; }
 }
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
-const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
+// A tool result that reports `message` as an error, in every hosted adapter.
+export const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
 
 // The attachment routes refused a request with the server's own code and message.
 export class AttachmentRefused extends Error {
@@ -107,12 +108,18 @@ function broken(error: unknown): boolean {
   return true;
 }
 
+// One shared native connection and the forwarded calls in flight on it.
+// `retired`: replaced by a newer one, so it closes once `users` reaches 0.
+type Native = { ready: Promise<NativeWire>; users: number; retired: boolean; closed: boolean };
+
 export class ToolProxy {
   private current: NativeTool[];
   // The shared native connection (no session of its own), opened lazily and
   // replaced after a transport failure, so each reconnect re-lists the tools.
-  private native?: { ready: Promise<NativeWire> };
+  private native?: Native;
   private readonly instructionsBySession = new Map<string, Promise<string | undefined>>();
+  // Every call and instructions fetch not yet settled, for retire().
+  private readonly inflight = new Set<Promise<unknown>>();
   private readonly closing = new AbortController();
   private readonly roots: string[];
   private readonly resource: URL;
@@ -129,9 +136,10 @@ export class ToolProxy {
   // A new native connection, which re-lists the tools: after login, or after
   // a credential change, which may also reach another account's instructions.
   // The server declares tools.listChanged false, so nothing else announces a
-  // new list.
+  // new list. Calls in flight on the old connection finish on it: closing it
+  // under them would abort a write the server may have committed.
   async connect(): Promise<NativeTool[]> {
-    this.drop(this.native);
+    this.release(this.native);
     this.instructionsBySession.clear();
     await this.open().ready;
     return this.current;
@@ -141,7 +149,51 @@ export class ToolProxy {
   // back verbatim (content, structuredContent, isError, _meta); a transport
   // failure throws the wire's classified error. A call that needs a new login
   // (signed out, expired, insufficient scope) returns one error naming it.
-  async call(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  call(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+    return this.track(this.invoke(name, args, sessionID));
+  }
+
+  // The server's instructions for this session (its native initialize
+  // instructions, composed for the declared delivery), cached until a bind or
+  // unbind result for it, forget(sessionID) or a new connection. Rejects with
+  // AccessExpired when only a new login can fetch them.
+  instructions(sessionID: string): Promise<string | undefined> {
+    const cached = this.instructionsBySession.get(sessionID);
+    if (cached) return cached;
+    const fetched = this.track(this.fetchInstructions(sessionID));
+    this.instructionsBySession.set(sessionID, fetched);
+    fetched.catch(() => { if (this.instructionsBySession.get(sessionID) === fetched) this.instructionsBySession.delete(sessionID); });
+    return fetched;
+  }
+
+  // Drops `sessionID`'s cached instructions: its binding changed outside a
+  // bind or unbind result through this proxy (a rebind the host's Controller
+  // made, a child's registration under its root).
+  forget(sessionID: string) { this.instructionsBySession.delete(sessionID); }
+
+  async close() {
+    this.closing.abort();
+    const native = this.native;
+    this.native = undefined;
+    if (native && !native.closed) { native.closed = true; await native.ready.then(wire => wire.close(), () => {}); }
+  }
+
+  // close() once every call and instructions fetch in flight has settled:
+  // for a proxy its host replaced (a tools-only session that took delivery),
+  // whose calls were made before the swap.
+  async retire() {
+    while (this.inflight.size) await Promise.allSettled([...this.inflight]);
+    await this.close();
+  }
+
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.inflight.add(work);
+    const settled = () => { this.inflight.delete(work); };
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async invoke(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     const signedOut = await this.signedOut();
     if (signedOut) return failure(signedOut.message);
     try { await this.options.hooks?.beforeCall({ sessionID, tool: name }); }
@@ -161,30 +213,10 @@ export class ToolProxy {
       throw error;
     } finally {
       // A bind or unbind changes what the server's instructions say.
-      if (name === "bind" || name === "unbind") this.instructionsBySession.delete(sessionID);
+      if (name === "bind" || name === "unbind") this.forget(sessionID);
       try { await this.options.hooks?.afterCall({ sessionID, tool: name, result: outcome }); }
       catch (error) { this.options.report("after", error); }
     }
-  }
-
-  // The server's instructions for this session (its native initialize
-  // instructions, composed for the declared delivery), cached until a bind or
-  // unbind result for it or a new connection. Rejects with AccessExpired when
-  // only a new login can fetch them.
-  instructions(sessionID: string): Promise<string | undefined> {
-    const cached = this.instructionsBySession.get(sessionID);
-    if (cached) return cached;
-    const fetched = this.fetchInstructions(sessionID);
-    this.instructionsBySession.set(sessionID, fetched);
-    fetched.catch(() => { if (this.instructionsBySession.get(sessionID) === fetched) this.instructionsBySession.delete(sessionID); });
-    return fetched;
-  }
-
-  async close() {
-    this.closing.abort();
-    const native = this.native;
-    this.native = undefined;
-    await native?.ready.then(wire => wire.close(), () => {});
   }
 
   private async fetchInstructions(sessionID: string): Promise<string | undefined> {
@@ -205,17 +237,23 @@ export class ToolProxy {
     return this.forward(name, args, sessionID);
   }
 
-  // Only a broken transport retires the shared connection, and only while it
-  // is still the current one: a tool or JSON-RPC error, a request timeout, a
-  // 429, a 401 or 403 leaves it to the other calls in flight on it, which
-  // closing it would abort (a committed dm_send would then read as unreachable).
+  // Only a broken transport closes the shared connection at once, and only
+  // while it is still the current one: a tool or JSON-RPC error, a request
+  // timeout, a 429, a 401 or 403 leaves it to the other calls in flight on it,
+  // which closing it would abort (a committed dm_send would then read as
+  // unreachable). A connection connect() replaced closes after its last call.
   private async forward(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     const native = this.native ?? this.open();
-    const wire = await native.ready;
-    try { return await wire.callTool(name, args, sessionID); }
-    catch (error) {
-      if (broken(error)) this.drop(native);
-      throw error;
+    native.users++;
+    try {
+      const wire = await native.ready;
+      try { return await wire.callTool(name, args, sessionID); }
+      catch (error) {
+        if (broken(error)) this.drop(native);
+        throw error;
+      }
+    } finally {
+      if (--native.users === 0 && native.retired) this.shut(native);
     }
   }
 
@@ -324,8 +362,8 @@ export class ToolProxy {
     return new Error(`grayboard server at ${this.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
   }
 
-  private open(): { ready: Promise<NativeWire> } {
-    const native: { ready: Promise<NativeWire> } = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native) };
+  private open(): Native {
+    const native: Native = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native), users: 0, retired: false, closed: false };
     this.native = native;
     return native;
   }
@@ -348,9 +386,24 @@ export class ToolProxy {
     }
   }
 
-  private drop(native: { ready: Promise<NativeWire> } | undefined) {
-    if (!native || this.native !== native) return;
+  // A broken connection: closed now, with whatever is in flight on it.
+  private drop(native: Native) {
+    if (this.native !== native) return;
     this.native = undefined;
+    this.shut(native);
+  }
+
+  // A replaced connection: no new calls, closed once its calls settle.
+  private release(native: Native | undefined) {
+    if (!native) return;
+    if (this.native === native) this.native = undefined;
+    native.retired = true;
+    if (native.users === 0) this.shut(native);
+  }
+
+  private shut(native: Native) {
+    if (native.closed) return;
+    native.closed = true;
     void native.ready.then(wire => wire.close(), () => {});
   }
 

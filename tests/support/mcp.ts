@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { ClientCapabilities, JSONRPCMessage, JSONRPCRequest } from "@modelcontextprotocol/sdk/types.js";
 import { localEnv } from "./env.ts";
 import { RESTARTED } from "./harness.ts";
 import { CLI } from "./paths.ts";
@@ -21,6 +21,8 @@ export type Session = {
   call: (name: string, args?: Record<string, unknown>) => Promise<any>;
   // The harness stand-in (harness.ts) this session's grayboard runs under.
   harnessPid: number;
+  // The protocol version initialize negotiated.
+  protocol: () => string | undefined;
   // Restart grayboard under the same harness, as `/mcp` reconnect does
   // ("reconnect") or a crash does ("crash"), and handshake with the new
   // process. The returned session replaces this one.
@@ -35,23 +37,41 @@ const open = new Set<Client>();
 // under a launcher (its command and leading args) between the harness and
 // grayboard. `bin` runs a compiled grayboard (a release) instead of the source.
 // `harness` is the executable that runs the stand-in (default: this bun).
+// `entry` is the script bun runs in place of the grayboard CLI (with `args`,
+// default none), such as the Claude Code plugin's server. `client` shapes the
+// Client as a harness would: its capabilities, the handlers it answers
+// requests with, and raw requests it sends before initialize.
+export type ClientShape = {
+  capabilities?: ClientCapabilities;
+  setup?: (c: Client) => void;
+  before?: (exchange: (request: JSONRPCRequest) => Promise<JSONRPCMessage>) => Promise<void>;
+};
 export async function mcpSession(
-  o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[]; bin?: string; harness?: string },
+  o: { env: Record<string, string>; cwd?: string; args?: string[]; via?: string[]; bin?: string; harness?: string; entry?: string; client?: ClientShape },
 ): Promise<Session> {
-  const args = o.args ?? ["mcp"];
-  const cmd = o.bin ? [o.bin, ...args] : [...(o.via ?? [process.execPath]), CLI, ...args];
+  const args = o.args ?? (o.entry ? [] : ["mcp"]);
+  const cmd = o.bin ? [o.bin, ...args] : [...(o.via ?? [process.execPath]), o.entry ?? CLI, ...args];
   const t = new HarnessTransport([o.harness ?? process.execPath, HARNESS, ...cmd], o.env, o.cwd);
-  return handshake(t);
+  return handshake(t, o.client ?? {});
 }
 
-async function handshake(t: HarnessTransport): Promise<Session> {
+async function handshake(t: HarnessTransport, shape: ClientShape): Promise<Session> {
   const pushes: Push[] = [];
-  const c = new Client({ name: "test", version: "0" });
+  const c = new Client({ name: "test", version: "0" }, { capabilities: shape.capabilities ?? {} });
+  shape.setup?.(c);
   let initialized = false;
   c.fallbackNotificationHandler = async (n) => {
     if (initialized && n.method === "notifications/claude/channel") pushes.push(n.params as Push);
   };
   try {
+    if (shape.before) {
+      await t.start();
+      await shape.before((request) => new Promise((ok) => {
+        t.onmessage = (m) => { if ("id" in m && m.id === request.id) ok(m); };
+        void t.send(request);
+      }));
+      t.onmessage = undefined;
+    }
     await c.connect(t);
   } catch (e) {
     throw withStderr(e, t.stderr);
@@ -59,12 +79,12 @@ async function handshake(t: HarnessTransport): Promise<Session> {
   initialized = true;
   open.add(c);
   return {
-    c, pushes, stderr: t.stderr, harnessPid: t.pid,
+    c, pushes, stderr: t.stderr, harnessPid: t.pid, protocol: () => t.protocol,
     call: (name, args) => call(c, name, args).catch((e) => Promise.reject(withStderr(e, t.stderr))),
     restart: async (how) => {
       open.delete(c);
       await t.restart(how === "crash" ? "SIGUSR2" : "SIGUSR1");
-      return handshake(t);
+      return handshake(t, shape);
     },
   };
 }
@@ -81,6 +101,11 @@ class HarnessTransport implements Transport {
   private readonly buf = new ReadBuffer();
   private err = "";
   readonly stderr = () => this.err;
+  protocol?: string;
+
+  setProtocolVersion(version: string): void {
+    this.protocol = version;
+  }
 
   constructor(private readonly cmd: string[], private readonly env: Record<string, string>, private readonly cwd?: string) {}
 

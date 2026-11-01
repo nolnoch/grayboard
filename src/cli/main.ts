@@ -7,10 +7,15 @@ import { runOAuthFlow } from "./oauth_flow.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource } from "./adapters.ts" with { type: "macro" };
+import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
-import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
+import { sessionStartOutput } from "./session_start.ts";
+import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, printable, registerClaudeLocal } from "./claude-setup.ts";
+import { canonicalEndpoint } from "../shared/endpoint.ts";
+import { piAgentDir } from "../shared/pi.ts";
+import { Login } from "../../adapters/hosted-core/src/login.ts";
+import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
 
 function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
@@ -38,33 +43,148 @@ function handleApiError(e: unknown): never {
 
 const OMP_DIR = join(homedir(), ".omp", "agent");
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
-const PI_DIR  = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+const PI_DIR  = piAgentDir();
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
-// The opencode and pi adapters serve grayboard's tools themselves and read
-// their command from the harness's grayboard MCP entry, so that entry is
+// The opencode and local pi adapters serve grayboard's tools themselves and
+// read their command from the harness's grayboard MCP entry, so that entry is
 // kept disabled (else the harness registers the tools twice), with
 // BUS_PUSH=off so a re-enabled one never adds a second delivery owner.
 type Entry = Record<string, unknown>;
-type HarnessConfig = { path: string; section: "mcp" | "mcpServers"; disable: (e: Entry) => Entry };
+// `local`: the entry as local mode keeps it.
+type HarnessConfig = { path: string; section: "mcp" | "mcpServers"; local: (e: Entry) => Entry };
 const pushOff = (e: Entry, key: string) => ({ ...(e[key] as Record<string, string> | undefined), BUS_PUSH: "off" });
 const OC_CONFIG: HarnessConfig = {
   path: join(OC_DIR, "opencode.json"),
   section: "mcp",
-  disable: e => ({ ...e, enabled: false, environment: pushOff(e, "environment") }),
+  local: e => ({ ...e, enabled: false, environment: pushOff(e, "environment") }),
 };
-const PI_CONFIG: HarnessConfig = {
-  path: join(PI_DIR, "mcp.json"),
-  section: "mcpServers",
-  disable: ({ exposure: _, ...e }) => ({ ...e, enabled: false, env: pushOff(e, "env") }),
-};
+const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts"), source: adapterSource("opencode") };
 
-const ADAPTERS: { path: string; source: string; config?: HarnessConfig }[] = [
-  { path: join(OMP_DIR, "extensions", "grayboard.ts"), source: adapterSource("omp") },
-  { path: join(OC_DIR, "plugin", "grayboard.ts"),      source: adapterSource("opencode"), config: OC_CONFIG },
-  { path: join(PI_DIR, "extensions", "grayboard.ts"),  source: adapterSource("pi"), config: PI_CONFIG },
-];
+// pi and omp have two adapters each, one per mode. Server: the hosted
+// extension (`.js`, a bundle of adapters/pi-family) talks to the server's
+// /mcp itself, holds the delivery lease, and reads only
+// `<agentDir>/grayboard/config.json {url}`; it needs no entry. Local: pi's
+// child adapter (`.ts`) runs a push-mode `grayboard mcp` and reads its
+// command from the disabled entry; omp's relay (`.ts`) wakes the session for
+// the grayboard process omp starts from its enabled entry, whose tools omp
+// serves. Installing one variant removes the other.
+type PiFamily = {
+  name: "pi" | "omp";
+  clientId: string;
+  config: HarnessConfig;
+  stateDir: string;
+  local: string;
+  hosted: string;
+  hostedConfig: string;
+  source: string;
+  bundle: string;
+  // The local adapter reads its command from the entry, so a refresh
+  // recreates a missing one; else a refresh leaves a removed entry removed.
+  needsEntry: boolean;
+  registered: (path: string) => string;  // the note for a written local entry
+  reshaped?: (path: string) => string;   // the note for an existing entry `config.local` changed
+};
+const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | "bundle" | "needsEntry" | "registered" | "reshaped"> & { local: (e: Entry) => Entry }): PiFamily => ({
+  name, clientId: `grayboard-${name}`, config: { path: join(dir, "mcp.json"), section: "mcpServers", local: f.local }, stateDir: join(dir, "grayboard"),
+  local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), hostedConfig: hostedConfigPath(join(dir, "grayboard")),
+  source: f.source, bundle: f.bundle, needsEntry: f.needsEntry, registered: f.registered, ...(f.reshaped ? { reshaped: f.reshaped } : {}),
+});
+const PI = piFamily("pi", PI_DIR, {
+  source: adapterSource("pi"), bundle: adapterBundle("pi"), needsEntry: true,
+  local: ({ exposure: _, ...e }) => ({ ...e, enabled: false, env: pushOff(e, "env") }),
+  registered: path => `Registered in ${path} (disabled: the extension serves the tools)`,
+  reshaped: path => `Disabled the grayboard entry in ${path} (the adapter serves the tools)`,
+});
+// omp serves the entry's tools itself (its MCP client keeps notifications),
+// so the local entry stays as written, and a user who moved it (a repo's
+// .mcp.json) keeps it there. The user entry outranks a repo's .mcp.json in
+// omp, so it carries no BUS_IDENTITY; grayboard reads the repo's pin itself.
+const OMP = piFamily("omp", OMP_DIR, {
+  source: adapterSource("omp"), bundle: adapterBundle("omp"), needsEntry: false,
+  local: e => e,
+  registered: path => `Registered in ${path}`,
+});
+
+/** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
+const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
+
+type FamilyInstall = { adapter: string; notes: string[] };
+/**
+ * Install the harness's adapter for the mode: `server` set → the hosted
+ * extension; else the local adapter, with `entry` as the entry's command (or
+ * the existing entry kept in its local shape). Leaving a hosted install's
+ * server (local mode, or another server) signs the harness out of it first,
+ * revoking its grant. Returns the adapter's path and what else changed.
+ * Throws, before any file changes, on a server URL the hosted extension would
+ * refuse or an unparseable mcp.json or config.json; throws after the entry
+ * check if the sign-out does (its grant store's lock), leaving the install
+ * as it was.
+ */
+async function installPiFamily(h: PiFamily, server: string | undefined, entry?: Entry): Promise<FamilyInstall> {
+  const notes: string[] = [];
+  let url: string | undefined;
+  if (server) {
+    // The extension refuses to load with any other URL, and the harness may
+    // then exit at startup. The URL isn't echoed: it may hold credentials.
+    try { url = canonicalEndpoint(hostedMcpUrl(server))?.href; } catch {}
+    if (!url) throw new Error(`${h.name}'s hosted extension needs a canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment, so nothing was changed for ${h.name}`);
+  }
+  // The entry next: an unparseable mcp.json throws before any file changes.
+  const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})[h.config.section]?.grayboard;
+  // `?.`: the file may hold JSON null.
+  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {})?.url;
+  if (typeof old === "string" && old !== url) {
+    const note = await signOutPiFamily(h, old);
+    if (note) notes.push(note);
+  }
+  if (url) {
+    if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
+    writeAdapter(h.hosted, h.bundle);
+    rmSync(h.local, { force: true });
+    writeConfig(h.hostedConfig, { url } satisfies HostedConfig);
+    notes.push(`Wrote ${h.hostedConfig}`);
+    return { adapter: h.hosted, notes };
+  }
+  // pi's local adapter needs the entry, so one that's missing (a server-mode
+  // install removed it, or the user did) is recreated with this binary's
+  // command; omp's is recreated only when leaving a hosted install.
+  const next = entry ?? (existing || !(h.needsEntry || typeof old === "string") ? undefined : mcpCommand());
+  if (putEntry(h.config, next)) {
+    const note = next ? h.registered : h.reshaped;
+    if (note) notes.push(note(h.config.path));
+  }
+  writeAdapter(h.local, h.source);
+  rmSync(h.hosted, { force: true });
+  if (typeof old === "string") {
+    rmSync(h.hostedConfig, { force: true });
+    notes.push(`Removed ${h.hostedConfig}`);
+  }
+  return { adapter: h.local, notes };
+}
+
+/**
+ * Sign the harness's hosted extension out of `resource`, as its /grayboard
+ * logout does: revoke the grant and bump the store's epoch, so running
+ * sessions pause with the login notice. Dropping the extension otherwise
+ * leaves its refresh token on disk, still able to mint access tokens.
+ * Returns a note, or undefined when the harness holds nothing for `resource`.
+ */
+async function signOutPiFamily(h: PiFamily, resource: string): Promise<string | undefined> {
+  let queued: string | undefined;
+  let login: Login;
+  try {
+    login = new Login({ resource, clientId: h.clientId, stateDir: h.stateDir, harness: h.name, loginAction: "run /grayboard login",
+      present: () => {}, notify: () => {}, diagnostic: r => { if (r.code === "revoke_queued") queued = r.message; } });
+  } catch { return undefined; } // not canonical: the extension never loaded with it, so never signed in
+  const s = await login.read();
+  if (!s?.refresh && !s?.revoke?.length) return undefined;
+  await login.logout();
+  if (queued === undefined) return `Signed ${h.name} out of ${login.resource} and revoked its grant`;
+  const cause = /\(([^()]*)\)$/.exec(queued)?.[1] ?? queued;
+  return `Signed ${h.name} out of ${login.resource}; revoking its grant failed and stays queued for its next login there (${cause})`;
+}
 
 function writeAdapter(path: string, source: string): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -85,15 +205,25 @@ function writeConfig(path: string, cfg: object): void {
   writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
 }
 
-/** Write `entry` (or disable the existing one) as the harness's grayboard entry; true when the file changed. */
+/** Write `entry` (or reshape the existing one by `c.local`) as the harness's grayboard entry; true when the file changed. */
 function putEntry(c: HarnessConfig, entry?: Entry): boolean {
   const cfg = readConfig<Record<string, Record<string, Entry> | undefined>>(c.path, {});
   const old = cfg[c.section]?.grayboard;
   const base = entry ?? old;
   if (!base) return false;
-  const next = c.disable(base);
+  const next = c.local(base);
   if (JSON.stringify(next) === JSON.stringify(old)) return false;
   cfg[c.section] = { ...cfg[c.section], grayboard: next };
+  writeConfig(c.path, cfg);
+  return true;
+}
+
+/** Delete the harness's grayboard entry; true when the file changed. */
+function dropEntry(c: HarnessConfig): boolean {
+  const cfg = readConfig<Record<string, Record<string, Entry> | undefined>>(c.path, {});
+  if (!cfg[c.section]?.grayboard) return false;
+  const { grayboard: _, ...rest } = cfg[c.section]!;
+  cfg[c.section] = rest;
   writeConfig(c.path, cfg);
   return true;
 }
@@ -493,8 +623,6 @@ program
     console.log(JSON.stringify(tools));
   });
 
-const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard";
-
 program
   .command("setup-opencode")
   .description("Configure an explicitly selected OpenCode V2 hosted MCP scope; no login or package installation")
@@ -508,7 +636,7 @@ program
   .option("--dry-run", "Validate and report targeted changes without filesystem writes")
   .action((opts: OpenCodeSetupOptions) => {
     try {
-      const result = setupOpenCode(opts, ADAPTERS[1]!.source);
+      const result = setupOpenCode(opts, OC_PLUGIN.source);
       console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
@@ -589,38 +717,45 @@ program
       console.log("Using local mode.");
     }
 
-    // 2. Register with Claude Code, for every project (user scope)
+    // 2. Claude Code, for every project (user scope). Local: the `grayboard
+    // mcp` entry. Server: the hosted plugin, which needs no grayboard process.
     const { command, args } = mcpCommand();
-    const addArgs = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
     const claude = Bun.which("claude");
     if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
-      Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
-      const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
-      if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
-      // Title each session with its handle, so Claude Code's name for it is
-      // the one dm_send takes.
-      const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
-      installSessionStartHook(hook);
-      console.log(`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`);
+      try {
+        const run = claudeCli(claude);
+        const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
+        const notes = server ? installClaudePlugin(run, server) : registerClaudeLocal(run, command, args, hook);
+        for (const note of notes) console.log(note);
+      } catch (e) { console.error(`[grayboard] ${(e as Error).message}`); process.exit(1); }
     } else if (opts.register && !claude) {
-      console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+      let cmds: string[][];
+      try { cmds = server ? pluginCommands(server) : [["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args]]; } catch (e) { console.error(`[grayboard] ${(e as Error).message}`); process.exit(1); }
+      console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  ${printable(cmds)}`);
     }
 
-    // 3. omp: register for every project (it ignores Claude Code's user
-    // registration), and install the push adapter that wakes the session.
-    // The user entry outranks a repo's .mcp.json in omp, so it carries no
-    // BUS_IDENTITY; grayboard reads the repo's pin itself.
+    // 3. omp and 5. pi share one installer (installPiFamily): register for
+    // every project (they ignore Claude Code's user registration) and install
+    // the adapter for the mode. One that fails changed nothing for its
+    // harness; the others still install, and setup exits 1.
+    let failed = false;
+    const installHarness = async (h: PiFamily) => {
+      let r: FamilyInstall;
+      try { r = await installPiFamily(h, server, { command, args }); } catch (e) {
+        console.error((e as Error).message);
+        failed = true;
+        process.exitCode = 1;
+        return;
+      }
+      for (const note of r.notes) console.log(note);
+      console.log(`Installed ${r.adapter}`);
+      if (server) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
+    };
+    // 3. omp. Local: omp's MCP client keeps notifications, so omp serves the
+    // entry's tools and the relay only wakes the session. Server: the hosted
+    // extension against the server's /mcp.
     const omp = !!Bun.which("omp");
-    if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) {
-      const cfgPath = join(OMP_DIR, "mcp.json");
-      let cfg: { mcpServers?: Record<string, unknown> } = {};
-      try { cfg = readConfig(cfgPath, cfg); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      cfg.mcpServers = { ...cfg.mcpServers, grayboard: { command, args } };
-      writeConfig(cfgPath, cfg);
-      const ext = ADAPTERS[0]!;
-      writeAdapter(ext.path, ext.source);
-      console.log(`Registered in ${cfgPath}; installed ${ext.path}`);
-    }
+    if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) await installHarness(OMP);
 
     // 4. opencode: it drops MCP notifications, so the plugin runs one
     // grayboard process, serves its tools and delivers its pushes; the
@@ -632,28 +767,26 @@ program
     if (opts.register && opencode && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      const plugin = ADAPTERS[1]!;
-      writeAdapter(plugin.path, plugin.source);
-      console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${plugin.path}`);
+      writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+      console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);
     }
 
-    // 5. pi: its MCP client drops notifications and, for direct tools, the
-    // server's instructions, so like opencode the extension serves the tools,
-    // runs the push side and supplies the instructions.
+    // 5. pi. Local: its MCP client drops notifications and, for direct
+    // tools, the server's instructions, so like opencode the extension serves
+    // the tools, runs the push side and supplies the instructions. Server: the
+    // hosted extension does all of that against the server's /mcp itself.
     const piCli = !!Bun.which("pi");
-    if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) {
-      try { putEntry(PI_CONFIG, { command, args }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      const ext = ADAPTERS[2]!;
-      writeAdapter(ext.path, ext.source);
-      console.log(`Registered in ${PI_CONFIG.path} (disabled: the extension serves the tools); installed ${ext.path}`);
-    }
+    if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) await installHarness(PI);
 
+    if (failed) return;
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
     console.log(
-      `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
+      `\nDone. Start Claude Code with:\n  ${claudeLaunch(!!server)}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
-      `Each session starts unbound and binds a name with bind once it knows its task; the repo's name (in ~/code/api, "api") is suggested first. ` +
-      `To bind a name at start, set BUS_IDENTITY in the launch command.`,
+      `Each session starts unbound and binds a name with bind once it knows its task.` +
+      // The hosted adapters (Claude Code's plugin, pi's extension) neither
+      // send a suggested name nor read BUS_IDENTITY.
+      (server ? "" : ` The repo's name (in ~/code/api, "api") is suggested first; to bind a name at start, set BUS_IDENTITY in the launch command.`),
     );
   });
 
@@ -689,29 +822,52 @@ program
 program
   .command("refresh-adapters", { hidden: true })
   .description("Rewrite installed omp/opencode/pi push adapters from this binary")
-  .action(() => {
-    for (const a of ADAPTERS) {
-      // A symlink means a checkout is installed there on purpose: leave it,
-      // and the entry its version expects.
-      if (!existsSync(a.path) || lstatSync(a.path).isSymbolicLink()) continue;
-      if (a.path === ADAPTERS[1]!.path) {
-        const guard = opencodeShimGuard(OC_DIR);
-        if (guard.skip) {
-          if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
-          continue;
-        }
-      }
-      writeAdapter(a.path, a.source);
-      console.log(`Refreshed ${a.path}`);
-      if (!a.config) continue;
-      // `update` drops this command's stderr, so failures go to stdout.
-      try {
-        if (putEntry(a.config)) console.log(`Disabled the grayboard entry in ${a.config.path} (the adapter serves the tools)`);
-      } catch (e) {
-        console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
-        process.exitCode = 1;
+  .action(async () => {
+    // A symlink means a checkout is installed there on purpose: leave it,
+    // and the entry its version expects.
+    const installed = (path: string) => existsSync(path) && !lstatSync(path).isSymbolicLink();
+    // `update` drops this command's stderr, so failures go to stdout.
+    const failed = (e: unknown) => {
+      console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
+      process.exitCode = 1;
+    };
+    if (installed(OC_PLUGIN.path)) {
+      const guard = opencodeShimGuard(OC_DIR);
+      if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
+      if (!guard.skip) {
+        writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+        console.log(`Refreshed ${OC_PLUGIN.path}`);
+        try {
+          if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
+        } catch (e) { failed(e); }
       }
     }
+    // omp and pi: where either variant is installed (and neither is a
+    // symlink), install the one the current mode uses.
+    let server: string | undefined;
+    for (const h of [OMP, PI]) {
+      const paths = [h.local, h.hosted].filter(p => existsSync(p));
+      if (paths.length === 0 || paths.some(p => lstatSync(p).isSymbolicLink())) continue;
+      if (busMode() === "server") {
+        server ??= process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
+        if (!server) { failed(new Error(`Server mode with no server URL, so ${h.name}'s adapter wasn't refreshed`)); continue; }
+      }
+      try {
+        const r = await installPiFamily(h, server);
+        console.log(`Refreshed ${r.adapter}`);
+        for (const note of r.notes) console.log(note);
+      } catch (e) { failed(e); }
+    }
+    // Claude Code: a server-mode user still on the user-scope `grayboard mcp`
+    // entry (setup before the plugin) moves to the hosted plugin.
+    try {
+      const claude = Bun.which("claude");
+      if (busMode() === "server" && claude && hasUserEntry()) {
+        server ??= process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
+        if (!server) throw new Error("Server mode with no server URL, so Claude Code wasn't moved to the grayboard plugin");
+        for (const note of installClaudePlugin(claudeCli(claude), server)) console.log(note);
+      }
+    } catch (e) { failed(e); }
   });
 
 // ── identity ─────────────────────────────────────────────────────────────────
