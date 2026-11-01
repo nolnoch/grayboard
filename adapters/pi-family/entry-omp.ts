@@ -13,8 +13,9 @@
 // top-level session through the chain of `ctx.agent.parentId`s.
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { version } from "../../package.json" with { type: "json" };
+import type { Level } from "../hosted-core/src/client.ts";
 import { loadMode } from "../hosted-core/src/proxy.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Level, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
 import { registry, rootOf } from "./omp-ancestry.ts";
 
 // omp's MCP naming (tool-bridge.ts mintMCPToolName): grayboard's tool names

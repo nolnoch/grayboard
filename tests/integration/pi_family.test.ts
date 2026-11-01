@@ -16,8 +16,9 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
-import { createGrayboard, type Grayboard, type Level, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
+import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";

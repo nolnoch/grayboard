@@ -18,7 +18,7 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
 import { end, register } from "../hosted-core/src/children.ts";
-import { failureText, HostedClient, message, type Disposable } from "../hosted-core/src/client.ts";
+import { failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
@@ -35,7 +35,6 @@ export type SessionInfo = { id: string; file?: string; parentFile?: string; reas
 // when the runner gave no parent session, so it can't be attributed) through
 // the intermediate subagent sessions `via`, outermost first (audit only).
 export type Marker = { child: false } | { child: true; root?: string; via?: string[] };
-export type Level = "info" | "warning" | "error";
 
 export interface Harness {
   readonly name: string;     // "pi" | "omp", in messages
