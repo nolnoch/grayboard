@@ -246,10 +246,10 @@ export class RootDelivery {
     }
   }
 
-  // A sign-in (the watch's, or the host's own: pi's /grayboard login, the
-  // plugin's sign-in): the Controller's own watch pauses this root, so it
-  // restarts under the new grant unless it already started under it. One
-  // path, guarded by the store's epoch, so two triggers restart once.
+  // A sign-in through the host's own path (pi's /grayboard login, the
+  // plugin's sign-in): reconnect the proxy under the new grant, then restart
+  // through restartIfChanged, which the watch calls directly. The store's
+  // epoch guards that one path, so two triggers restart once.
   async credentialChanged(): Promise<void> {
     if (this.closed) return;
     try { await this.client.login.token(); }
