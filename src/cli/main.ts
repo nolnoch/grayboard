@@ -783,9 +783,10 @@ program
     console.log(
       `\nDone. Start Claude Code with:\n  ${claudeLaunch(!!server)}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
-      `Each session starts unbound and binds a name with bind once it knows its task; the repo's name (in ~/code/api, "api") is suggested first.` +
-      // The hosted adapters (Claude Code's plugin, pi's extension) don't read BUS_IDENTITY.
-      (server ? "" : ` To bind a name at start, set BUS_IDENTITY in the launch command.`),
+      `Each session starts unbound and binds a name with bind once it knows its task.` +
+      // The hosted adapters (Claude Code's plugin, pi's extension) neither
+      // send a suggested name nor read BUS_IDENTITY.
+      (server ? "" : ` The repo's name (in ~/code/api, "api") is suggested first; to bind a name at start, set BUS_IDENTITY in the launch command.`),
     );
   });
 
