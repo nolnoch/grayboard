@@ -31,7 +31,9 @@ export function claudeCodeBin(): string {
   const bin = join(dir, "node_modules", ".bin", "claude");
   if (!existsSync(bin)) {
     mkdirSync(dir, { recursive: true });
-    const r = Bun.spawnSync(["npm", "install", "--prefix", dir, "--no-save", "--no-package-lock", "--no-audit", "--no-fund", `@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}`], { stdout: "pipe", stderr: "pipe" });
+    // cleanEnv(): the package's postinstall (it places the native binary) runs
+    // without CI's GitHub token.
+    const r = Bun.spawnSync(["npm", "install", "--prefix", dir, "--no-save", "--no-package-lock", "--no-audit", "--no-fund", `@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}`], { stdout: "pipe", stderr: "pipe", env: cleanEnv() });
     if (r.exitCode !== 0) throw new Error(`npm install @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} failed: ${r.stderr.toString()}`);
   }
   const v = Bun.spawnSync([bin, "--version"], { stdout: "pipe", stderr: "pipe" });

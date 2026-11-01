@@ -203,9 +203,14 @@ test("-p: no lease, no delivery lock, no sign-in prompt; a signed-out call names
   // Tools list before any sign-in.
   expect((await signedOut.c.listTools()).tools.map(t => t.name)).toContain("bind");
   expect(signedOut.c.getInstructions()).toStartWith("Warning: this Claude Code session is tools-only");
+  // -p's reason has no launch remedy: none is prescribed.
+  expect(signedOut.c.getInstructions()).not.toContain("--dangerously-load-development-channels");
   const refused = await texts(signedOut, "whoami");
   expect(refused.error).toBe(true);
   expect(refused.texts.join("\n")).toContain(LOGIN_ELSEWHERE);
+  // The off notice rides the first tool result, once.
+  expect(refused.texts[0]).toStartWith("grayboard: Warning: this Claude Code session is tools-only");
+  expect((await texts(signedOut, "whoami")).texts.join("\n")).not.toContain("tools-only");
   await Bun.sleep(300);
   expect(signedOut.elicits).toEqual([]);
   await stopSession(signedOut.c);

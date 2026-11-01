@@ -68,7 +68,10 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
   const from = marketplace(mp);
   let tty: ReturnType<typeof claudeTty> | undefined;
   try {
-    claudeCli(bin, h, ["plugin", "validate", mp]);
+    // --strict on the plugin and on a marketplace with its entry (2.1.316
+    // refuses the repo's empty pre-pin marketplace under --strict).
+    claudeCli(bin, h, ["plugin", "validate", "--strict", join(ROOT, "plugins/claude-code")]);
+    claudeCli(bin, h, ["plugin", "validate", "--strict", mp]);
     claudeCli(bin, h, ["plugin", "marketplace", "add", mp]);
     claudeCli(bin, h, ["plugin", "install", CLAUDE_PLUGIN, "--config", `server_url=${srv.resource}`]);
     await seedGrant(srv, join(h.config, "plugins/data/grayboard-grayboard"), "grayboard-claude-code");

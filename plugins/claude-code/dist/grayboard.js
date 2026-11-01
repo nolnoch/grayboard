@@ -36809,6 +36809,7 @@ function createPlugin(o) {
   const verdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
+  let offPending = offNotice !== undefined;
   const place = describeLocation(o.cwd) ?? HARNESS;
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
@@ -37085,8 +37086,9 @@ ${record.message}`;
     } catch (error) {
       result = failure2(failureMessage(error, RESUME_HINT));
     }
-    const shown = [notice, restarted].filter((n) => !!n);
+    const shown = [offPending ? offNotice : undefined, notice, restarted].filter((n) => !!n);
     notice = undefined;
+    offPending = false;
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
   };
   const serve = (instructions) => {
@@ -37107,7 +37109,7 @@ ${record.message}`;
   const instructions = async () => {
     if ("error" in config)
       return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
-    const lead = offNotice ? `${offNotice} Start Claude Code with \`${launchCommand(ENTRY)}\` for pushes.` : undefined;
+    const lead = offNotice;
     let body;
     try {
       const text = await Promise.race([

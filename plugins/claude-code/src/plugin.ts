@@ -29,7 +29,7 @@ import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
 import { Wire, type WireOptions } from "../../../adapters/hosted-core/src/wire.ts";
 import { failureMessage, type DiagnosticSink } from "../../../adapters/hosted-core/src/diagnostics.ts";
 import { GRAYBOARD_SESSION_META } from "../../../src/server/oauth-config.ts";
-import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, launchCommand, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
+import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { describeLocation } from "../../../src/shared/identity.ts";
@@ -86,7 +86,10 @@ export function createPlugin(o: PluginOptions): Plugin {
   // Unknown counts as off: a push Claude Code doesn't show would be receipted and lost.
   const verdict: ChannelsVerdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
+  // The reason carries its remedy where there is one; the instructions, the
+  // first tool result and stderr each say it once, as the local servers do.
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
+  let offPending = offNotice !== undefined;
   const place = describeLocation(o.cwd) ?? HARNESS;
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
@@ -333,8 +336,9 @@ export function createPlugin(o: PluginOptions): Plugin {
     let result: CallToolResult;
     try { result = await proxy.call(name, args, config.id); }
     catch (error) { result = failure(failureMessage(error, RESUME_HINT)); }
-    const shown = [notice, restarted].filter((n): n is string => !!n);
+    const shown = [offPending ? offNotice : undefined, notice, restarted].filter((n): n is string => !!n);
     notice = undefined;
+    offPending = false;
     return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
   };
 
@@ -361,7 +365,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   // the declared delivery; Claude Code reads instructions only at initialize.
   const instructions = async (): Promise<string> => {
     if ("error" in config) return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
-    const lead = offNotice ? `${offNotice} Start Claude Code with \`${launchCommand(ENTRY)}\` for pushes.` : undefined;
+    const lead = offNotice;
     let body: string;
     try {
       const text = await Promise.race([
