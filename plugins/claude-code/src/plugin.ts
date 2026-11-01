@@ -29,7 +29,7 @@ import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
 import { Wire, type WireOptions } from "../../../adapters/hosted-core/src/wire.ts";
 import { failureMessage, type DiagnosticSink } from "../../../adapters/hosted-core/src/diagnostics.ts";
 import { GRAYBOARD_SESSION_META } from "../../../src/server/oauth-config.ts";
-import { claudeChannels, interactiveClaude, launchCommand, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
+import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, launchCommand, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { describeLocation } from "../../../src/shared/identity.ts";
@@ -39,7 +39,7 @@ export const HARNESS = "Claude Code";
 export const CLIENT_ID = "grayboard-claude-code";
 // The channel's source as Claude Code names a plugin's server: plugin:<plugin>:<server>.
 export const SOURCE = "plugin:grayboard:grayboard";
-export const ENTRY = "plugin:grayboard@grayboard";
+export const ENTRY = `plugin:${CLAUDE_PLUGIN}` as const;
 export const RESUME_HINT = "call any grayboard tool to retry";
 // How each kind of session signs in, for AccessExpired and the instructions.
 export const LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any grayboard tool call offers it again)";

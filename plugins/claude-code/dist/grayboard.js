@@ -32600,6 +32600,7 @@ ${config.clientId}`)}.json`);
 import { readdirSync, readFileSync } from "fs";
 import { homedir, userInfo } from "os";
 import { join as join3 } from "path";
+var CLAUDE_PLUGIN = "grayboard@grayboard";
 function hostFiles() {
   return {
     platform: process.platform,
@@ -36763,7 +36764,7 @@ var BUILTIN_CLIENTS = BUILTINS.map(({ clientId, name }) => ({
 var HARNESS = "Claude Code";
 var CLIENT_ID = "grayboard-claude-code";
 var SOURCE = "plugin:grayboard:grayboard";
-var ENTRY = "plugin:grayboard@grayboard";
+var ENTRY = `plugin:${CLAUDE_PLUGIN}`;
 var RESUME_HINT = "call any grayboard tool to retry";
 var LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any grayboard tool call offers it again)";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";

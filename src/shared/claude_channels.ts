@@ -16,6 +16,9 @@ import { join } from "node:path";
 
 export type ChannelEntry = "server:grayboard" | "plugin:grayboard@grayboard";
 
+/** The hosted plugin's id in Claude Code: `<plugin>@<marketplace>`. */
+export const CLAUDE_PLUGIN = "grayboard@grayboard";
+
 /** The check that turned channels off, in evaluation order. */
 export type ChannelCheck = "provider" | "interactive" | "feature" | "org" | "policy" | "session" | "allowlist";
 
