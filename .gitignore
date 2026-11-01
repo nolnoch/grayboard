@@ -22,3 +22,6 @@ dist/
 .claude/HANDOFF*.md
 .e2e-cache/
 .e2e-runs/
+.direnv/
+result
+result-*
