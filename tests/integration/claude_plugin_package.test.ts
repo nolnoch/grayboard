@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { BUNDLE, bundle } from "../../scripts/build_claude_plugin.ts";
+import { pinMarketplace, SHA_RE, TAG_RE } from "../../scripts/pin_claude_plugin.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const ROOT = resolve(import.meta.dir, "../..");
@@ -34,13 +35,31 @@ test("the manifest carries package.json's version and runs the bundle with bun, 
   expect(skill).toContain('!`bun "${CLAUDE_PLUGIN_ROOT}/dist/grayboard.js" logout --data "${CLAUDE_PLUGIN_DATA}"`');
 });
 
-test("the marketplace's grayboard entry, once the release job pins one, names a release tag's commit in this repo's plugin directory", () => {
-  expect(marketplace.name).toBe("grayboard");
-  for (const entry of marketplace.plugins) {
+const expectPinned = (doc: { name: string; plugins: { name: string; source: unknown }[] }) => {
+  expect(doc.name).toBe("grayboard");
+  for (const entry of doc.plugins) {
     expect(entry.name).toBe("grayboard");
-    expect(entry.source).toEqual({ source: "git-subdir", url: "https://github.com/nolnoch/grayboard.git", path: "plugins/claude-code", ref: expect.stringMatching(/^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/), sha: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    expect(entry.source).toEqual({ source: "git-subdir", url: "https://github.com/nolnoch/grayboard.git", path: "plugins/claude-code", ref: expect.stringMatching(TAG_RE), sha: expect.stringMatching(SHA_RE) });
   }
-  expect(marketplace.plugins.length).toBeLessThanOrEqual(1);
+  expect(doc.plugins.length).toBeLessThanOrEqual(1);
+};
+
+test("the marketplace's grayboard entry, once the release job pins one, names a release tag's commit in this repo's plugin directory", () => {
+  expectPinned(marketplace);
+});
+
+test("the release job's pin writes that entry, replacing any earlier pin, and refuses a malformed tag or commit", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const first = pinMarketplace(marketplace, "v2.3.0", sha);
+  expectPinned(first);
+  expect(first.plugins).toHaveLength(1);
+  const next = pinMarketplace(first, "v2.4.0-rc1", sha.replace("0", "f"));
+  expectPinned(next);
+  expect(next.plugins).toEqual([{ name: "grayboard", source: expect.objectContaining({ ref: "v2.4.0-rc1" }) }]);
+  // Everything else in the file is kept.
+  expect({ ...next, plugins: [] }).toEqual({ ...marketplace, plugins: [] });
+  expect(() => pinMarketplace(marketplace, "2.3.0", sha)).toThrow("isn't a release tag");
+  expect(() => pinMarketplace(marketplace, "v2.3.0", sha.slice(1))).toThrow("isn't a full 40-hex commit");
 });
 
 test("the bundle runs under bun: logout on an empty data dir has nothing to sign out of", () => {

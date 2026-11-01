@@ -268,3 +268,68 @@ jobs:
     with:
       suite: hosted-network
       public_revision: ${{ github.sha }}
+
+  # Pins the Claude Code plugin's marketplace entry to this release (#281),
+  # only once the release is immutable: its tag can then never move (a failed
+  # run re-creates tags only before publish). The job pushes the pin to a
+  # branch and the maintainer opens the PR (AGENTS.md §Releasing step 5): the
+  # repo doesn't let Actions open PRs, and a PR or push made with GITHUB_TOKEN
+  # starts no workflow, so its required checks would never run.
+  plugin-pin:
+    name: Pin the Claude Code plugin
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write          # pushes the pin branch
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+
+      - name: Wait until the release is immutable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          for _ in $(seq 1 30); do
+            [ "$(gh release view "$TAG" --json isImmutable --jq .isImmutable)" = true ] && { echo "$TAG is immutable"; exit 0; }
+            sleep 10
+          done
+          echo "::error::$TAG isn't immutable after 5 minutes, so its tag could still move; the plugin isn't pinned"
+          exit 1
+
+      # The tag's commit, checked against the commit this run built from.
+      - name: Write the pin
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          [ "$sha" = "$GITHUB_SHA" ] || { echo "::error::${TAG} is ${sha}, not this run's ${GITHUB_SHA}"; exit 1; }
+          bun scripts/pin_claude_plugin.ts "$TAG" "$sha"
+          git diff --stat
+
+      - name: Push the pin branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          branch="plugin-pin/${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -m "chore(#281): pin the Claude Code plugin to ${TAG}" -- .claude-plugin/marketplace.json
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.extraheader="AUTHORIZATION: basic ${auth}" push origin "HEAD:refs/heads/${branch}"
+          {
+            echo "### Claude Code plugin pin for ${TAG}"
+            echo "Open the pin PR, then merge it with a merge commit once its checks pass:"
+            echo '```'
+            echo "gh pr create -R ${GITHUB_REPOSITORY} --base master --head ${branch} --title \"chore(#281): pin the Claude Code plugin to ${TAG}\" --body \"Pins .claude-plugin/marketplace.json to ${TAG} (${GITHUB_SHA}).\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
