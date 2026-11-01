@@ -14188,8 +14188,9 @@ var package_default = {
   },
   devDependencies: {
     "@earendil-works/pi-coding-agent": "1.4.0",
-    "@opencode-ai/plugin": "1.19.4",
     "@modelcontextprotocol/client": "2.4.0",
+    "@oh-my-pi/pi-coding-agent": "18.14.0",
+    "@opencode-ai/plugin": "1.19.4",
     "@types/bun": "latest",
     typescript: "^5.0.0"
   }
