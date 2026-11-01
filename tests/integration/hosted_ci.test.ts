@@ -25,7 +25,7 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   expect(hosted).not.toContain("secrets: inherit");
   for (const workflow of ["test", "release"]) expect(read(`.github/workflows/${workflow}.yml`)).toContain("uses: ./.github/workflows/hosted.yml");
   expect(read(".github/workflows/release.yml")).toContain("needs: [test, hosted]");
-  expect(read(".github/workflows/release.yml")).toContain("needs: [build, e2e, upgrade-matrix, hosted-network]");
+  expect(read(".github/workflows/release.yml")).toContain("needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted]");
   expect(read(".github/workflows/test.yml")).toContain("RestartBogus=1");
 });
 
@@ -54,7 +54,7 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
   expect(release.on.push.tags).toEqual(["v*"]);
   expect(release.permissions).toEqual({ contents: "read" });
   expect(release.jobs.build.needs).toEqual(["test", "hosted"]);
-  expect(release.jobs.release.needs).toEqual(["build", "e2e", "upgrade-matrix", "hosted-network"]);
+  expect(release.jobs.release.needs).toEqual(["build", "e2e", "upgrade-matrix", "hosted-network", "claude-hosted"]);
   expect(release.jobs.release.environment).toBe("release");
   expect(release.jobs.release.permissions).toEqual({ contents: "write", "id-token": "write", attestations: "write", "artifact-metadata": "write" });
   for (const name of ["Sign SHA256SUMS", "Remove the signing key", "Verify the signature against assets/release-keys", "Attest build provenance"]) {
@@ -79,9 +79,9 @@ test("outside-network hosted suites run only nightly, explicitly, or across the 
   const nightly = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;
   expect(Object.keys(nightly.on)).toEqual(["schedule", "workflow_dispatch", "workflow_call"]);
   const expression = nightly.jobs.e2e.strategy.matrix.suite;
-  expect(expression).toContain('github.event_name == \'schedule\' && \'["upgrade-matrix","hosted-live","hosted-public"]\'');
+  expect(expression).toContain('github.event_name == \'schedule\' && \'["upgrade-matrix","claude-hosted","hosted-live","hosted-public"]\'');
   expect(expression).toContain('inputs.suite == \'hosted-network\' && \'["hosted-live","hosted-public"]\'');
-  expect(nightly.jobs["tracking-issue"].strategy.matrix.suite).toEqual(["upgrade-matrix", "hosted-live", "hosted-public"]);
+  expect(nightly.jobs["tracking-issue"].strategy.matrix.suite).toEqual(["upgrade-matrix", "claude-hosted", "hosted-live", "hosted-public"]);
   const steps = nightly.jobs.e2e.steps;
   const resolve = steps.find((s: any) => s.id === "public");
   expect(resolve.if).toBe("matrix.suite == 'hosted-public'");
