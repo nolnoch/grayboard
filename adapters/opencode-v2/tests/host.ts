@@ -356,7 +356,7 @@ try {
     assert.equal((session.metadata?.["grayboard.enrollment"] as { enabled?: unknown } | undefined)?.enabled, false, "B approval remains disabled");
   };
   await wait(() => app.mcp.activeLeases, n => n === 1, "pause resume remembered name");
-  assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === "r4" && c.args.create === false));
+  for (const name of ["be", "r1", "r2", "r3", "r4"]) assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === `you@example.com/${name}` && c.args.create === false), `resume rebinds ${name} by address (#451)`);
   const board = createBoard(app.db, "you@example.com/r4", "fixture", "Fixture board"); subscribe(app.db, "you@example.com/r4", board.name, "digest");
   const beforeDigest = modelCalls; post(app.db, "you@example.com/sim", board.name, "Idle digest"); app.application.boardsChanged([board.name]);
   await wait(() => host!.session.inbox.list({ sessionID: a.id }), xs => xs.length >= 1, "digest durable idle admission"); assert.equal(modelCalls, beforeDigest);
