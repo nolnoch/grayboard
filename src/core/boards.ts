@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
-import type { AttachmentInfo } from "../shared/attachments.ts";
+import type { Pending, Post } from "../shared/notifications.ts";
 import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
 import { CoreError } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
@@ -44,27 +44,11 @@ export type Board = {
   created_at: number;
   kind?: string;
 };
-export type Post = {
-  id: number;
-  board: string;
-  author: string;
-  body: string;
-  parent_id: number | null;
-  created_at: number;
-  // An announcement's TTL; null (or absent, from older peers) otherwise.
-  expires_at?: number | null;
-  // Present on reads and pushes when the post carries files.
-  attachments?: AttachmentInfo[];
-};
 
 // A post's columns as readers see them. author_id (#284) is the writing
 // session's provenance, kept in the database and left out of reads and pushes.
 const POST_COLS = `id, board, author, body, parent_id, created_at, expires_at`;
 const P_POST_COLS = `p.id, p.board, p.author, p.body, p.parent_id, p.created_at, p.expires_at`;
-
-export type Pending =
-  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
-  | { kind: "digest"; board: string; unread: number; latest: Post };
 
 // Enough to acknowledge a Pending item after it crossed a wire.
 export type PendingRef =

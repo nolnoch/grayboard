@@ -18,7 +18,7 @@ import { attachRoots } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { cleanEnv, localEnv } from "./env.ts";
-import { onChannelDm, messageText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
+import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -41,11 +41,12 @@ function writeModels(agentDir: string, modelPort: number): void {
 }
 
 // One entry of pi's session (get_messages).
-type PiMessage = { role: string; content: unknown; toolName?: string; isError?: boolean };
+export type PiMessage = { role: string; content: unknown; toolName?: string; isError?: boolean };
 
 // ── pi in RPC mode ───────────────────────────────────────────────────────────
 
-class Pi {
+// pi's RPC protocol, which omp speaks too (tests/support/omp.ts).
+export class Pi {
   events: Record<string, any>[] = [];
   stderr = "";
   readonly exited: Promise<number | null>;
@@ -135,13 +136,13 @@ function toolNames(bin?: string): string[] {
   return (JSON.parse(r.stdout.toString()) as { name: string }[]).map((t) => `mcp__grayboard__${t.name}`).sort();
 }
 
-const requestTools = (req: ChatRequest): string[] => (req.tools ?? []).map((t) => t.function.name);
-const systemText = (req: ChatRequest): string =>
+export const requestTools = (req: ChatRequest): string[] => (req.tools ?? []).map((t) => t.function.name);
+export const systemText = (req: ChatRequest): string =>
   req.messages.filter((m) => m.role === "system" || m.role === "developer").map(messageText).join("\n");
 
-// SIGTERM lets pi stop its own children; awaited (SIGKILL after 5 s) so the
-// caller's rmSync doesn't race a pi still writing in dir.
-async function stopAll(procs: ChildProcess[]): Promise<void> {
+// SIGTERM lets the agent stop its own children; awaited (SIGKILL after 5 s) so the
+// caller's rmSync doesn't race an agent still writing in dir.
+export async function stopAll(procs: ChildProcess[]): Promise<void> {
   await Promise.all(procs.map(async (p) => {
     if (p.exitCode !== null || p.signalCode !== null) return;
     const exited = new Promise((r) => p.once("exit", r));
@@ -393,7 +394,7 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
 
 const BUNDLE = adapterBundle("pi");
 const PI_CLIENT = "grayboard-pi";
-const PEER = "bob@example.com/peer";
+export const PEER = "bob@example.com/peer";
 const LOGIN_NOTICE = "grayboard: Signed out of grayboard in pi; run /grayboard login";
 const HELD = "another pi process holds delivery for this session";
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => `mcp__grayboard__${t.name}`).sort();
@@ -428,9 +429,9 @@ function startHostedPi(dir: string, procs: ChildProcess[], { persist = false, se
   return new Pi(proc);
 }
 
-type Peer = { dir: string; reports: string[]; call(tool: string, args?: Record<string, unknown>): Promise<any>; close(): Promise<void> };
+export type Peer = { dir: string; reports: string[]; call(tool: string, args?: Record<string, unknown>): Promise<any>; close(): Promise<void> };
 
-async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
+export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
   const home = join(dir, "peer");
   mkdirSync(home, { recursive: true });
   const { token } = issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
@@ -453,55 +454,60 @@ async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
 
 type HostedRow = { name: string | null; lease_deadline: number | null; ownership_id: number };
 
-const resultText = (m: PiMessage): string => (m.content as { text?: string }[]).map((b) => b.text ?? "").join("\n");
-// The `nth` result of a grayboard tool in pi's session.
-const toolResult = (pi: Pi, tool: string, nth = 0): Promise<PiMessage> =>
-  until(async () => (await pi.messages()).filter((m) => m.role === "toolResult" && m.toolName === `mcp__grayboard__${tool}`)[nth], 30_000, `${tool} result #${nth}`);
+export const resultText = (m: PiMessage): string => (m.content as { text?: string }[]).map((b) => b.text ?? "").join("\n");
+// The `nth` result of the tool named `name` (with its harness prefix) in the session.
+export const toolResultNamed = (pi: Pi, name: string, nth = 0): Promise<PiMessage> =>
+  until(async () => (await pi.messages()).filter((m) => m.role === "toolResult" && m.toolName === name)[nth], 30_000, `${name} result #${nth}`);
+const toolResult = (pi: Pi, tool: string, nth = 0): Promise<PiMessage> => toolResultNamed(pi, `mcp__grayboard__${tool}`, nth);
 // pi finished its run: nothing streaming, nothing queued.
 const idle = (pi: Pi) => until(async () => {
   const s = await pi.command({ type: "get_state" });
   return !s.isStreaming && s.pendingMessageCount === 0;
 }, 15_000, "pi idle");
 
-// `/grayboard status`, as pi shows it.
-async function statusOf(pi: Pi): Promise<string> {
+// `/grayboard status`, as pi and omp show it.
+export async function statusOf(pi: Pi): Promise<string> {
   const before = pi.notices().length;
   await pi.command({ type: "prompt", message: "/grayboard status" });
   return until(() => pi.notices().slice(before).find((n) => n.startsWith("grayboard: server: ")), 5_000, "/grayboard status");
 }
 
-const piRow = (srv: HostedServer, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
-  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(PI_CLIENT, raw) ?? undefined;
+// The hosted session `client` keeps for the harness session `raw`.
+export const hostedRow = (srv: HostedServer, client: string, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
+  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(client, raw) ?? undefined;
 // `raw`'s hosted session holds `name` and the server's one delivery lease.
-const leasedAs = (srv: HostedServer, raw: string, name: string): boolean => {
-  const row = piRow(srv, raw);
+export const leased = (srv: HostedServer, client: string, raw: string, name: string): boolean => {
+  const row = hostedRow(srv, client, raw);
   return row?.name === name && row.lease_deadline !== null && srv.app.mcp.activeLeases === 1;
 };
-const ownershipEnded = (srv: HostedServer, id: number): boolean =>
+const piRow = (srv: HostedServer, raw: string) => hostedRow(srv, PI_CLIENT, raw);
+const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, PI_CLIENT, raw, name);
+export const ownershipEnded = (srv: HostedServer, id: number): boolean =>
   srv.app.db.query<{ ended_at: number | null }, [number]>("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(id)?.ended_at != null;
 
-// After the user prompt `prompt` (pi's latest; <channel> deliveries aren't
+// After the user prompt `prompt` (the latest; <channel> deliveries aren't
 // prompts), one step per assistant message; past the last, the default reply
 // ends the turn.
-function scripted(prompt: string, steps: Reply[]): Rule {
+export function scripted(prompt: string, steps: Reply[]): Rule {
   return (req) => {
-    const at = req.messages.findLastIndex((m) => m.role === "user" && !messageText(m).startsWith("<channel"));
-    if (at < 0 || messageText(req.messages[at]!) !== prompt) return undefined;
+    const at = req.messages.findLastIndex((m) => m.role === "user" && !promptText(m).startsWith("<channel"));
+    if (at < 0 || promptText(req.messages[at]!) !== prompt) return undefined;
     return steps[req.messages.slice(at + 1).filter((m) => m.role === "assistant").length];
   };
 }
 
-// The model's side of a peer DM: a file it saves, anything else it answers "pong".
-const answerPeer = onChannelDm(PEER, (id, text) => {
+// The model's side of a peer DM, with the harness's grayboard tool prefix: a
+// file it saves, anything else it answers "pong".
+export const answerPeer = (prefix: string): Rule => onChannelDm(PEER, (id, text) => {
   const file = /attachments="(\d+):/.exec(text);
   return file
-    ? { tool: "mcp__grayboard__attachment_get", args: { id: Number(file[1]) } }
-    : { tool: "mcp__grayboard__dm_send", args: { to: PEER, body: "pong", parent_id: id } };
+    ? { tool: `${prefix}attachment_get`, args: { id: Number(file[1]) } }
+    : { tool: `${prefix}dm_send`, args: { to: PEER, body: "pong", parent_id: id } };
 });
 
-// A DM from the peer to `name` starts a turn in the pi session holding it,
+// A DM from the peer to `name` starts a turn in the session holding it,
 // whose dm_send reply lands in the same thread, sent as `name`. Returns the DM's id.
-async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
+export async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
   const { message_id: id } = await peer.call("dm_send", { to: `alice@example.com/${name}`, body: `ping ${name}` });
   const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
   expect(reply.sender).toBe(`alice@example.com/${name}`);
@@ -516,7 +522,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
   return named(async () => {
     const procs: ChildProcess[] = [];
     const srv = hostedServer();
-    const model = startFakeModel([answerPeer, ...rules]);
+    const model = startFakeModel([answerPeer("mcp__grayboard__"), ...rules]);
     let peer: Peer | undefined;
     try {
       peer = await hostedPeer(srv, dir);
@@ -533,7 +539,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
   });
 }
 
-// The spec's load smoke for pi (#279; omp's comes with #280): the bundle the
+// The spec's load smoke for pi (#279; omp's: ompHostedScenario): the bundle the
 // CLI's macro emits, loaded by the pinned pi under Node with an isolated HOME
 // and a seeded grant. No load failure and no login notice: it loaded and read
 // the grant. The status's session line carries pi's own id: session_start
@@ -543,7 +549,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
 // shows: node:sqlite opened it and BEGIN EXCLUSIVE took it. No grayboard
 // process runs, and quitting leaves nothing leased. The hand-run probe's
 // `ctx.agent?.kind` isn't asserted: pi 1.4.0 has no agent kind and the pi
-// entry never reads it (omp's entry will).
+// entry never reads it (omp's entry does).
 export function piHostedLoadSmoke(dir: string): Promise<void> {
   return withHosted(dir, [], async ({ srv, start }) => {
     await seedGrant(srv, stateDirOf(dir), PI_CLIENT);

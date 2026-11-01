@@ -1,4 +1,5 @@
-import type { Pending, PendingRef } from "../core/boards.ts";
+import type { PendingRef } from "../core/boards.ts";
+import type { Pending } from "./notifications.ts";
 import type { InboxItem, PromiseItem } from "./inbox.ts";
 import type { AttachmentInfo, AttachmentLimits } from "./attachments.ts";
 import { SESSION_KEY, asSessionId } from "../core/bindings.ts";

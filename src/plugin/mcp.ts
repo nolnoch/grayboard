@@ -25,7 +25,8 @@ import { sockDir } from "../shared/sockdir.ts";
 import { LateCancels } from "../shared/latecancel.ts";
 import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
-import { boardNotification, DEFAULT_CHANNEL_SOURCE, dmNotification, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { DEFAULT_CHANNEL_SOURCE, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
+import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   attachRoots, checkAttachmentId, downloadAttachment, readAttachmentFiles, saveTarget, sendWithUploads, SendLanded, serverBusDir,

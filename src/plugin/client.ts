@@ -1,5 +1,6 @@
 import { PROTO, type ServerMessage, type ClientMessage, type AliasLost, type ErrorMessage, type HelloOk, type Message, type AckRequest, type BoardAckRequest } from "../shared/protocol.ts";
-import { refOf, type Pending } from "../core/boards.ts";
+import { refOf } from "../core/boards.ts";
+import type { Pending } from "../shared/notifications.ts";
 import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { HTTP_TIMEOUT_MS, describeFetchError } from "../shared/http.ts";

@@ -85,7 +85,8 @@ export function outputOf(result: CallToolResult): unknown {
   try { return JSON.parse(only.text); } catch { return only.text; }
 }
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
-const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
+// A tool result that reports `message` as an error, in every hosted adapter.
+export const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
 
 // The attachment routes refused a request with the server's own code and message.
 export class AttachmentRefused extends Error {

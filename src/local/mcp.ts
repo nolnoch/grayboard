@@ -7,7 +7,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type Pending, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, logBinding, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
@@ -20,8 +21,6 @@ import { canReadAttachment, getAttachment, sweepBlobs } from "../core/attachment
 import {
   announcementsInstruction,
   claimsInstruction,
-  boardNotification,
-  dmNotification,
   humanInstruction,
   callBoardTool,
   isBoardTool,

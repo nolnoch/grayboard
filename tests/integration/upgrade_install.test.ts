@@ -102,7 +102,8 @@ function writeOldEntries(exe: string, extraEnv: Record<string, string> = {}): vo
 const CREDENTIALS = () => join(home, ".grayboard", "credentials");
 
 // Every registration setup writes, each naming the installed binary. With
-// `server`, pi gets the hosted extension and no entry instead.
+// `server`, omp and pi get the hosted extension, its config and no entry
+// instead.
 function expectRegistered(server?: string): void {
   // A compiled binary's execPath is its resolved path.
   const exe = realpathSync(join(bin, "grayboard"));
@@ -111,19 +112,22 @@ function expectRegistered(server?: string): void {
   expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
     { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
   ]);
-  expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
   // Disabled: the opencode and local pi adapters serve the tools and read their command here.
   expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-  const local = server ? ["omp", "opencode"] as const : ["omp", "opencode", "pi"] as const;
+  const local = server ? ["opencode"] as const : ["omp", "opencode", "pi"] as const;
   for (const harness of local) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
   if (server) {
-    expect(existsSync(join(home, ".pi", "agent", "mcp.json")) ? json(".pi", "agent", "mcp.json").mcpServers?.grayboard : undefined).toBeUndefined();
-    expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
-    expect(readFileSync(join(home, ".pi", "agent", "extensions", "grayboard.js"), "utf8")).toBe(adapterBundle("pi"));
-    expect(json(".pi", "agent", "grayboard", "config.json")).toEqual({ url: `${server}/mcp` });
+    for (const [harness, dot] of [["omp", ".omp"], ["pi", ".pi"]] as const) {
+      const entry = existsSync(join(home, dot, "agent", "mcp.json")) ? json(dot, "agent", "mcp.json").mcpServers?.grayboard : undefined;
+      expect(entry, harness).toBeUndefined();
+      expect(existsSync(join(home, ...ADAPTERS[harness])), harness).toBe(false);
+      expect(readFileSync(join(home, dot, "agent", "extensions", "grayboard.js"), "utf8"), harness).toBe(adapterBundle(harness));
+      expect(json(dot, "agent", "grayboard", "config.json"), harness).toEqual({ url: `${server}/mcp` });
+    }
   } else {
+    expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
     expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
-    expect(existsSync(join(home, ".pi", "agent", "extensions", "grayboard.js"))).toBe(false);
+    for (const dot of [".omp", ".pi"]) expect(existsSync(join(home, dot, "agent", "extensions", "grayboard.js")), dot).toBe(false);
   }
 }
 
