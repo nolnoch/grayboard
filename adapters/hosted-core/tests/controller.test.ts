@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { Controller, type ControllerOptions } from "../src/controller.js";
-import { Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
+import { AccessExpired, Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
 import { LeaseUnavailable, ServerUnreachable, Wire, type WireOptions } from "../src/wire.js";
@@ -21,7 +21,7 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined;
@@ -78,7 +78,7 @@ function runtime(mode: Mode) {
   }
   const configuration = () => ({ type: "remote" as const, url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "grayboard-pi", scope: "grayboard:delivery grayboard:tools", configHash: `grant-${grant}` });
   const credential: CredentialPort<Enrollment> = {
-    capture: async sessionID => ({ version: 2, sessionID, configuration: configuration() }),
+    capture: async sessionID => { if (signedOut) throw new AccessExpired("pi", "run /grayboard login"); return { version: 2, sessionID, configuration: configuration() }; },
     check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => "access",
@@ -118,6 +118,8 @@ function runtime(mode: Mode) {
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
     loseRenewsFrom: (at: number) => { renewsLostFrom = at; },
+    // The grant store is logged out: a capture finds no sign-in.
+    signOut: () => { signedOut = true; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
 }
@@ -535,4 +537,17 @@ test.each(modes)("a release with no live root (its start never reached the queue
     expect(r.rows.has("R")).toBe(false);
     await expect(c.resume("R")).rejects.toThrow("Grayboard is stopping");
   } finally { await c.close(); }
+});
+
+test.each(modes)("a release with no live root while signed out records its failed session_end (%s)", async mode => {
+  const r = runtime(mode);
+  const records: { state: string; operation?: string; sessionID?: string }[] = [];
+  const c = r.make({ sink: record => { records.push({ ...record }); } });
+  try {
+    r.signOut();
+    await c.shutdown("R", "release");
+    await until(() => records.some(x => x.operation === "session_end"));
+    expect(records.filter(x => x.operation === "session_end")).toEqual([expect.objectContaining({ state: "degraded", sessionID: "R", message: expect.stringMatching(/^session_end failed \(/) })]);
+    expect(r.named("session_end")).toEqual([]);
+  } finally { await c.close(); await r.controller.close(); }
 });

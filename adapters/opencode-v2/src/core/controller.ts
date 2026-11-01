@@ -445,7 +445,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   // landed is visible and no admit can land during the read. A "release" with
   // no live root (its start never reached the queue, as a /reload's resume in
   // flight) still ends the session, freeing a lease an earlier runtime kept;
-  // signed out, there is no grant to end it with.
+  // one that fails, a sign-out included, is recorded: the lease then stays
+  // until it lapses.
   shutdown(sessionID: string, mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string | undefined> {
     this.ending.add(sessionID);
     this.roots.get(sessionID)?.abort?.abort();
@@ -469,7 +470,6 @@ export class Controller<E extends Enrollment = Enrollment> {
       const e = await this.port.credential.capture(sessionID);
       await this.temporary(e, wire => wire.call("session_end"));
     } catch (error) {
-      if (accessExpiry(error)) return;
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
