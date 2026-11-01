@@ -304,9 +304,15 @@ export class RootDelivery {
   // the call. The notices go first, each as its own text block.
   async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>): Promise<CallToolResult> {
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
-    // The process holding delivery owns this session's binding: a tools-only one rebinding it would fight the holder.
-    if (this.held && (tool === "bind" || tool === "unbind")) return failure(`${this.held}; bind and unbind work from the process that holds delivery`);
+    // The process holding delivery owns this session's binding: a tools-only
+    // one rebinding it would fight the holder. Checked again after `before`,
+    // whose retry of a lock error (the plugin's unpause) can find it held.
+    const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
+    const early = refused();
+    if (early) return early;
     const after = before ? await before() : undefined;
+    const late = refused();
+    if (late) return late;
     this.used = true;
     const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
     const shown = [...SLOTS.map(slot => this.notices.get(slot)), after].filter((n): n is string => !!n);

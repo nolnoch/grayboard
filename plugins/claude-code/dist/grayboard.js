@@ -36939,9 +36939,14 @@ ${record.message}`;
   async call(tool, args, before) {
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
-    if (this.held && (tool === "bind" || tool === "unbind"))
-      return failure2(`${this.held}; bind and unbind work from the process that holds delivery`);
+    const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
+    const early = refused();
+    if (early)
+      return early;
     const after = before ? await before() : undefined;
+    const late = refused();
+    if (late)
+      return late;
     this.used = true;
     const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
     const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);

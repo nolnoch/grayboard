@@ -150,6 +150,20 @@ test("a root in lock error whose resume finds delivery held elsewhere is held, n
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([`grayboard: ${HELD}`]);
 }, 30_000);
 
+test("a bind whose `before` retries a lock error and finds delivery held elsewhere is refused: the holder keeps its name", async () => {
+  const path = deliveryPath(stateDir, srv.resource, CLIENT, "bindrace-1");
+  mkdirSync(path, { recursive: true });
+  const b = rig("bindrace-1");
+  await b.root.start();
+  expect(b.root.status().error).toStartWith("couldn't take delivery: ");
+  rmSync(path, { recursive: true });
+  await live("bindrace-1", "holder");
+  // The plugin's before(): unpause retries the lock error.
+  const result = await b.root.call("bind", { name: "intruder", create: true }, async () => { await b.root.resume(); return undefined; });
+  expect(texts(result)).toEqual([`error: ${HELD}; bind and unbind work from the process that holds delivery`]);
+  expect(row("bindrace-1")).toMatchObject({ name: "holder" });
+}, 30_000);
+
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {
   const first = await live("carry-1", "carrier");
   const carried = await first.root.shutdown("release", { carry: true });
