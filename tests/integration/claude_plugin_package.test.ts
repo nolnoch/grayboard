@@ -17,8 +17,13 @@ const PLUGIN = join(ROOT, "plugins/claude-code");
 const manifest = JSON.parse(readFileSync(join(PLUGIN, ".claude-plugin/plugin.json"), "utf8"));
 const marketplace = JSON.parse(readFileSync(join(ROOT, ".claude-plugin/marketplace.json"), "utf8"));
 
-test("the committed bundle is a fresh build of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", () => {
-  expect(readFileSync(BUNDLE, "utf8") === bundle()).toBe(true);
+// The build resolves hosted-core's dependencies from the root install, so the
+// bundle is the same whether or not hosted-core's own gate has installed
+// adapters/hosted-core/node_modules, and carries one copy of each package.
+test("the committed bundle is a fresh build of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", async () => {
+  const fresh = await bundle();
+  expect(fresh.includes("// adapters/hosted-core/node_modules/")).toBe(false);
+  expect(readFileSync(BUNDLE, "utf8") === fresh).toBe(true);
 }, 60_000);
 
 test("the manifest carries package.json's version and runs the bundle with bun, with the server URL from userConfig", () => {
