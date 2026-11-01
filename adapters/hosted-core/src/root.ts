@@ -69,6 +69,7 @@ export class RootDelivery {
   private readonly notices = new Map<Slot, string>();
   private lastBinding: string | undefined;
   private lastRecord: string | undefined;
+  private storeUnreadable = false;       // the sign-in store's read failure was said
 
   constructor(private readonly client: HostedClient, private readonly o: RootOptions) {
     this.carrying = o.carried;
@@ -80,7 +81,15 @@ export class RootDelivery {
     if (!this.done) this.client.options.log(text, level);
   }
   private path() { return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID); }
-  private async epoch() { return (await this.client.login.read().catch(() => undefined))?.epoch; }
+  // An unreadable store leaves the epoch unknown, so the sink may take a
+  // later pause for a credential change and drop it: said once per root.
+  private async epoch() {
+    try { return (await this.client.login.read())?.epoch; }
+    catch (error) {
+      if (!this.storeUnreadable) { this.storeUnreadable = true; this.log(`couldn't read the sign-in store: ${message(error)}`, "warning"); }
+      return undefined;
+    }
+  }
 
   // Takes this session's delivery, or runs tools-only while another process
   // holds it (and takes over when it exits), or tools-only for good when the

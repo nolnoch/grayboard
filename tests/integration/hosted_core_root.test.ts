@@ -254,6 +254,16 @@ test("a thrown call's own message in its error result has its control and bidi c
   expect(text!.length).toBeLessThan(400);
 });
 
+test("a sign-in store the root can't read for its epoch is said once, however many starts read it", async () => {
+  const read = spyOn(Login.prototype, "read").mockRejectedValue(new Error("store unreadable"));
+  try {
+    const a = rig("epoch-1");
+    await a.root.start();
+    await a.root.resume();
+    expect(a.logs.filter(l => l.message.startsWith("couldn't read the sign-in store"))).toEqual([{ level: "warning", message: "couldn't read the sign-in store: store unreadable" }]);
+  } finally { read.mockRestore(); }
+});
+
 test("a shutdown while a start's push connection is still connecting releases the lease first, then closes the connection that start built", async () => {
   await (await live("first-1", "first")).root.shutdown("detach");
   expect(row("first-1")!.lease_deadline).not.toBeNull();

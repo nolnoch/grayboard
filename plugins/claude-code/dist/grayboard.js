@@ -36695,6 +36695,7 @@ class RootDelivery {
   notices = new Map;
   lastBinding;
   lastRecord;
+  storeUnreadable = false;
   constructor(client, o) {
     this.client = client;
     this.o = o;
@@ -36708,9 +36709,15 @@ class RootDelivery {
     return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID);
   }
   async epoch() {
-    return (await this.client.login.read().catch(() => {
+    try {
+      return (await this.client.login.read())?.epoch;
+    } catch (error) {
+      if (!this.storeUnreadable) {
+        this.storeUnreadable = true;
+        this.log(`couldn't read the sign-in store: ${message(error)}`, "warning");
+      }
       return;
-    }))?.epoch;
+    }
   }
   async start() {
     if (this.closed || this.watcher)
