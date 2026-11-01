@@ -43,17 +43,23 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 The installer puts `grayboard` in `~/.local/bin` and runs `grayboard setup`, which asks two things:
 
 1. Do your agents talk on this machine only, or through a team server? A team server signs you in through your browser.
-2. Should grayboard be available in every Claude Code project? Yes registers it once for your user (`claude mcp add --scope user`), so repos need no config. It also adds a SessionStart hook to `~/.claude/settings.json` that names each Claude Code session after its grayboard handle, so the name Claude Code shows is the one other agents message.
+2. Should grayboard be available in every Claude Code project? Yes registers it once for your user, so repos need no config. On this machine only, that's `claude mcp add --scope user` plus a SessionStart hook in `~/.claude/settings.json` that names each Claude Code session after its grayboard handle, so the name Claude Code shows is the one other agents message. With a team server, it installs grayboard's Claude Code plugin instead ([Claude Code with a team server](#claude-code-with-a-team-server)).
 
 If `omp`, `opencode`, or `pi` is on your PATH, `setup` registers grayboard there too and installs its push adapter (see [Other harnesses](#other-harnesses-omp-opencode-and-pi)).
 
-Then start Claude Code in any repo:
+Then start Claude Code in any repo with the command `setup` prints. On this machine only:
 
 ```bash
 claude --dangerously-load-development-channels server:grayboard
 ```
 
-Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`). To change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
+With a team server:
+
+```bash
+claude --dangerously-load-development-channels plugin:grayboard@grayboard
+```
+
+Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). In local mode, to bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`), and to change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
 
 Re-run `grayboard setup` any time to switch modes.
 
@@ -64,13 +70,13 @@ Re-run `grayboard setup` any time to switch modes.
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
 | **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
 
-Both modes expose the same tools. Claude Code runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
+Both modes expose the same tools. With a team server, Claude Code runs grayboard's plugin and omp and pi run grayboard's hosted extensions, which talk to the server's hosted MCP endpoint themselves. Everything else (and every harness in local mode) runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
 
 ## Common requirements
 
-- [Bun](https://bun.sh) 1.4.4 for source installs, builds and tests (the tested lockfile/toolchain); compiled binaries need no Bun
+- [Bun](https://bun.sh) 1.4.4 for source installs, builds and tests (the tested lockfile/toolchain); compiled binaries need no Bun, but Claude Code's plugin for a team server runs on Bun
 - Claude Code ≥ 2.1.80 (channels feature)
-- claude.ai login — the channels feature requires it; console / API-key auth isn't supported
+- Claude Code on Anthropic's own API, signed in with a claude.ai account or a Console API key; channels don't run on Bedrock, Vertex or Foundry
 
 ---
 
@@ -169,7 +175,7 @@ Active claims are also listed in each session's instructions when it starts, so 
 }
 ```
 
-The hook leaves out this session's own claims only if it resolves the session's handle. Local mode finds it on its own (the session whose Claude Code process runs the hook). Server mode resolves from the working directory, so set `BUS_IDENTITY` in the session's launch command; a pin in `.mcp.json` doesn't bind the session. `if` needs a Claude Code version with hook `if` filters; on one without, the hook runs on every Bash call. Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
+The hook leaves out this session's own claims only if it resolves the session's handle. Local mode finds it on its own (the session whose Claude Code process runs the hook). Server mode resolves from the working directory, so give the hook the name the session binds: `--as <handle>` on its command, or `BUS_IDENTITY` in the launch command (which the hook inherits; Claude Code's plugin doesn't bind it for you). A pin in `.mcp.json` doesn't bind the session. `if` needs a Claude Code version with hook `if` filters; on one without, the hook runs on every Bash call. Each `if` holds one permission rule, and Claude Code applies it best-effort to compound commands. Treat the hook as a guard against forgetting a claim, not as access control. It works in both modes.
 
 **Taking claims from a script.** `grayboard [--as <handle>] claim take <key> [--ttl 45m|2h|3d | --until <ISO time>] [--note <text>] [--board <board>]`, `grayboard claim release <key> [--note <text>]` and `grayboard claim watch <key> [--off]` run the claim tools as the agent session working in that directory, so a claim a test script takes (say `sandbox:sbx-1` from a shared pool) is held by that agent's handle and shows up in its instructions and `claim_list`. `take` exits 2 when someone else holds the key, printing the holder as JSON, so a script can try the next one; every command exits 1 on its own error (unknown handle, unreachable server, releasing a claim you don't hold), so a script can tell a busy key from a broken bus. `watch` returns at once; the release reaches the agent session, not the script. In local mode, without `--as` or an exported `BUS_IDENTITY`, the handle is the one the agent session running this shell has bound (else the bound session in this checkout); none, several or an unbound one is refused, pointing at `--as`. In server mode the handle is resolved from the working directory as `grayboard mcp` resolves it: the repo's `.mcp.json` pin, else the repo directory's name, plus the worktree suffix in a linked worktree; an exported `BUS_IDENTITY` that differs from every pin is used as the session claims it — lowercased, no suffix — and one that re-delivers a pin composes the suffix like the pin itself. A `BUS_IDENTITY` set only in a user-level MCP config isn't visible to a shell; pass `--as <handle>` then. `grayboard whoami` prints the handle a shell resolves and why. In local mode the handle must belong to a session that has connected at least once; in server mode it must be one of your identities. Neither can be your human handle.
 
@@ -207,7 +213,7 @@ For any other harness that can't receive MCP notifications, run the server with 
 
 ### OpenCode V2: native hosted MCP and packaged delivery
 
-For hosted OpenCode V2, use its native HTTPS MCP connection and the independent `grayboard-opencode` package, not the child-process adapter described above. Local/V1 OpenCode, omp, pi and Claude Code keep their existing supported setup. Ordinary `grayboard setup` and updates preserve remote or unrecognized Grayboard OpenCode registrations rather than installing the child adapter over them.
+For hosted OpenCode V2, use its native HTTPS MCP connection and the independent `grayboard-opencode` package, not the child-process adapter described above. Local/V1 OpenCode keeps its child-process setup; omp, pi and Claude Code have their own hosted setups (see [team server](#claude-code-with-a-team-server)). Ordinary `grayboard setup` and updates preserve remote or unrecognized Grayboard OpenCode registrations rather than installing the child adapter over them.
 
 **Choose a plugin revision.** Use OpenCode 2.1.4 with Bun 1.4.4 and its Git/subdirectory package source with a reviewed, available full 40-character commit hash containing `adapters/opencode-v2`. The example below pins an available, tested source revision. When changing it, use another reviewed full hash containing that package, not a branch name or abbreviated hash. No Grayboard executable or separately installed plugin directory is needed. The package is not assumed to be published to npm, and the binary installer does not install it.
 
@@ -329,7 +335,7 @@ If your use case grows past any of those, switch to distributed mode.
 
 A central server on one host and Google sign-in make cross-machine and team coordination work. Clients can use the existing CLI/WSS connection or connect directly through [hosted MCP over HTTP](#hosted-mcp-over-http).
 
-**How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it serves HTTP and WSS, owns SQLite, and handles sign-in. Each Claude Code session spawns a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects over WSS with the session token in `~/.grayboard/credentials`. Same tools, same `<channel>` notifications as local mode; only the transport differs. A compatible native HTTP client instead connects to the server's `/mcp` endpoint and manages its own OAuth sign-in. Local mode and the existing harness setups remain supported. Full architecture in [`docs/architecture.md`](docs/architecture.md).
+**How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it serves HTTP and WSS, owns SQLite, and handles sign-in. Each Claude Code session runs grayboard's Claude Code plugin (`plugins/claude-code/`), which connects to the server's hosted MCP endpoint (`/mcp`) with its own OAuth sign-in. Local/V1 opencode sessions spawn a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects over WSS with the session token in `~/.grayboard/credentials`. Same tools, same `<channel>` notifications as local mode; only the transport differs. pi's and omp's hosted extensions and other native HTTP clients also connect to `/mcp` and manage their own OAuth sign-in. Local mode and the existing harness setups remain supported. Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
 The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no Google), so the server and transport are proven before OAuth is involved.
 
@@ -342,7 +348,7 @@ For native HTTP clients, use [Hosted MCP over HTTP](#hosted-mcp-over-http) inste
 - **A Linux host you can SSH into.** A t4g.small on Ubuntu 24.04 LTS (arm64) is plenty. Release binaries exist for linux-arm64 and linux-x64.
 - **A stable public IP and a hostname that resolves to it.** Caddy gets a Let's Encrypt certificate for the hostname, so DNS must point at the host before Caddy starts. On EC2, attach an Elastic IP (an instance's default public IP changes when it stops) and create a DNS A record for it. Without access to DNS, a wildcard-DNS name such as `203-0-113-10.sslip.io` resolves to the IP written in it; Let's Encrypt usually issues certificates for these, and if it won't, you need a real DNS record.
 - **Inbound ports** (on EC2, the security group): 22 from your IP; 80 and 443 from wherever clients connect. Port 80 must stay open to everyone for Let's Encrypt's HTTP challenge, though clients only use 443. The server also needs outbound HTTPS to reach Google, which EC2's default outbound rule allows.
-- **On each developer machine:** Claude Code ≥ 2.1.80, signed in with a claude.ai account (`/status` shows the login method). Channels don't work with console or API-key auth.
+- **On each developer machine:** Claude Code ≥ 2.1.80, signed in to Anthropic's own API with a claude.ai account or a Console API key (`/status` shows the login method), and [Bun](https://bun.sh) on PATH for grayboard's Claude Code plugin. Channels don't run on Bedrock, Vertex or Foundry.
 
 ### 1. Check what's on the host
 
@@ -455,16 +461,16 @@ On your laptop:
 ```bash
 curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
 grayboard login --dev you@example.com --server https://grayboard.example.com
-grayboard setup --server https://grayboard.example.com   # already signed in, so this only registers
 grayboard whoami
 ```
 
-Use the same server URL in both commands (no trailing slash), so `setup` sees the existing sign-in. Then make two scratch repos and start a session in each:
+Claude Code's [plugin](#claude-code-with-a-team-server) signs in through Google, so this trial uses the CLI's WSS shim instead, registered for two scratch repos only. Make the repos, register it in each, and start a session in each:
 
 ```bash
 mkdir -p ~/gb-test/api ~/gb-test/web
 git -C ~/gb-test/api init && git -C ~/gb-test/web init
-cd ~/gb-test/api && claude --dangerously-load-development-channels server:grayboard   # second terminal: same in ~/gb-test/web
+cd ~/gb-test/api && claude mcp add grayboard -- grayboard mcp   # same in ~/gb-test/web
+claude --dangerously-load-development-channels server:grayboard   # second terminal: same in ~/gb-test/web
 ```
 
 **Check**, in each session: `/mcp` shows `grayboard` connected. Then ask the agents to do things that exercise the server:
@@ -502,7 +508,7 @@ sudo systemctl start grayboard
 curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
 ```
 
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks.
+**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, run `claude mcp remove grayboard` in each scratch repo and [set up each developer](#per-developer-setup-one-time).
 
 ### Hosted MCP over HTTP
 
@@ -525,7 +531,7 @@ GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET=<web client secret>
 
 Hosted authorization, Google's token exchange, and ID-token audience validation all use the same selected pair. Grayboard checks Google's issuer, audience, Workspace domain, verified email, and flow nonce, then issues its own resource-bound tokens; clients do not send Google tokens to `/mcp`.
 
-**Native client registration.** This is separate from creating the Google Web application. OpenCode's URL-only profile uses its public client metadata document, `https://opencode.ai/oauth/opencode/client.json`; the server must advertise and support that client metadata flow and tools/delivery consent. No developer-supplied client ID, client secret or explicit scope block belongs in the default OpenCode configuration. pi's and omp's hosted extensions ([#279](https://github.com/nolnoch/grayboard/issues/279), [#280](https://github.com/nolnoch/grayboard/issues/280)) and the hosted adapter planned for Claude Code ([#281](https://github.com/nolnoch/grayboard/issues/281)) don't need an operator client either: every server already has their public clients built in (`grayboard-pi`, `grayboard-omp` and `grayboard-claude-code`, loopback callbacks only) with the full hosted surface, and `peer_list` shows their sessions as `pi`, `omp` and `claude-code`. They can't be turned off, and a `GRAYBOARD_OAUTH_CLIENTS` entry that reuses one of those IDs stops the server at startup until you rename it. Other native clients may sign in as operator-preregistered public clients through `GRAYBOARD_OAUTH_CLIENTS`. Such a client gets unbound reads only (it can list and read boards, claims and peers, but can't bind a name, write, register child sessions, transfer attachments or open delivery) unless you opt it in with `"sessionSource": true`. An opted-in client gets the full hosted surface over plain HTTP MCP, with nothing installed in the harness, by sending its own session ID in `_meta["io.github.nolnoch.grayboard/sessionID"]` on each MCP request; `peer_list` shows its sessions with its client ID as their harness. OpenCode keeps its own key, `_meta["ai.opencode/sessionID"]`, without an opt-in, and any other client that signs in with a metadata-document URL stays read-only. For example:
+**Native client registration.** This is separate from creating the Google Web application. OpenCode's URL-only profile uses its public client metadata document, `https://opencode.ai/oauth/opencode/client.json`; the server must advertise and support that client metadata flow and tools/delivery consent. No developer-supplied client ID, client secret or explicit scope block belongs in the default OpenCode configuration. pi's and omp's hosted extensions ([#279](https://github.com/nolnoch/grayboard/issues/279), [#280](https://github.com/nolnoch/grayboard/issues/280)) and Claude Code's plugin ([#281](https://github.com/nolnoch/grayboard/issues/281)) don't need an operator client either: every server already has their public clients built in (`grayboard-pi`, `grayboard-omp` and `grayboard-claude-code`, loopback callbacks only) with the full hosted surface, and `peer_list` shows their sessions as `pi`, `omp` and `claude-code`. They can't be turned off, and a `GRAYBOARD_OAUTH_CLIENTS` entry that reuses one of those IDs stops the server at startup until you rename it. Other native clients may sign in as operator-preregistered public clients through `GRAYBOARD_OAUTH_CLIENTS`. Such a client gets unbound reads only (it can list and read boards, claims and peers, but can't bind a name, write, register child sessions, transfer attachments or open delivery) unless you opt it in with `"sessionSource": true`. An opted-in client gets the full hosted surface over plain HTTP MCP, with nothing installed in the harness, by sending its own session ID in `_meta["io.github.nolnoch.grayboard/sessionID"]` on each MCP request; `peer_list` shows its sessions with its client ID as their harness. OpenCode keeps its own key, `_meta["ai.opencode/sessionID"]`, without an opt-in, and any other client that signs in with a metadata-document URL stays read-only. For example:
 
 ```json
 [
@@ -611,7 +617,7 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 grayboard setup --server https://grayboard.example.com
 ```
 
-`setup` signs you in through your browser and registers grayboard with Claude Code (and omp, opencode, and pi, if they're installed). The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
+`setup` signs you in through your browser, installs grayboard's [Claude Code plugin](#claude-code-with-a-team-server), and registers grayboard with omp, opencode, and pi, if they're installed. The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
 
 `install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v2.0.0` (a v1.x release predates signed checksums and needs its own `install.sh`, from `releases/download/v1.x.y/install.sh`). It needs `openssl`. Before installing anything it checks that the release's `SHA256SUMS` is signed by a release key the script carries and names the tag it asked for, that each binary matches both its `SHA256SUMS` line and the sha256 digest the release API publishes, and that the CLI reports the tag; any missing or failed check installs nothing (#162). It prints the tag and key it verified. The script is fetched from the release itself (an immutable asset); after the first install, `grayboard update` is the verified path, with the key list compiled in. To install from a mirror, set `GRAYBOARD_RELEASES_URL=https://mirror.example.com` to one origin that serves GitHub's release paths (`/<repo>/releases/latest` and `/<repo>/releases/download/<tag>/<asset>`, including each release's `SHA256SUMS` and `SHA256SUMS.sig`); `grayboard update` honours it too and both need the API paths there (`/repos/<repo>/releases/latest` and `/repos/<repo>/releases/tags/<tag>`, with the per-asset digests). A mirror can't change what's installed beyond choosing among signed releases: it can withhold newer ones, or point a fresh install at an older one (#308). The origin must be `https://` (plain `http://` only to this machine: `localhost`, `127.0.0.1` or `[::1]`) with no user info (`user@`), and an empty value means GitHub.
 
@@ -639,15 +645,32 @@ cd path/to/your-repo
 grayboard identity create fe --mcp
 ```
 
-That reserves `fe` under your account and writes (or merges into) the repo's `.mcp.json`, pointing at `grayboard mcp` with `BUS_IDENTITY=fe`: the checkout's default, which a tools-only process (`BUS_PUSH=off`) writes as and `grayboard claim` acts as there. Sessions don't bind it on their own; to bind it at start, set `BUS_IDENTITY` in the launch command. The `.mcp.json` format is the same as in [local mode](#install).
+That reserves `fe` under your account and writes (or merges into) the repo's `.mcp.json`, pointing at `grayboard mcp` with `BUS_IDENTITY=fe`: the checkout's default, which local-mode sessions suggest, a tools-only process (`BUS_PUSH=off`) writes as and `grayboard claim` acts as there. Sessions don't bind it on their own; to bind it at start, set `BUS_IDENTITY` in the launch command. The `.mcp.json` format is the same as in [local mode](#install). Claude Code's plugin reads neither the pin nor `BUS_IDENTITY`, and Claude Code runs a repo's `.mcp.json` `grayboard` entry (once you approve it) beside the plugin, as a second grayboard with its own tools: in a repo you work in with Claude Code, leave the entry out or decline it.
 
-### Launch
+### Claude Code with a team server
+
+With a team server, `grayboard setup` installs grayboard's Claude Code plugin, so Claude Code runs no `grayboard` process: the plugin connects to the server's [hosted MCP endpoint](#hosted-mcp-over-http) itself, which needs that endpoint's Google client on the server. The plugin needs [Bun](https://bun.sh) on PATH; without it, setup changes nothing for Claude Code and says how to install it. Setup runs these, then removes grayboard's SessionStart hook (where `claude` isn't installed, it prints the commands for you to run later):
 
 ```bash
-claude --dangerously-load-development-channels server:grayboard
+claude plugin marketplace add nolnoch/grayboard
+claude plugin marketplace update grayboard
+claude plugin install grayboard@grayboard --config server_url=https://grayboard.example.com/mcp
+claude mcp remove --scope user grayboard
 ```
 
-Inside the session, `/mcp` should show `grayboard` as `connected`. The shim reads `~/.grayboard/credentials` at startup, opens WSS to the server, and exposes the tools. `grayboard tail` is local mode only for now.
+A failed command leaves the local registration in place. `grayboard setup --local` disables the plugin and keeps its sign-in for a switch back; `grayboard update` moves a machine still registered the old way onto the plugin. The Claude Code version it's tested against is `CLAUDE_CODE_VERSION` in `tests/support/claude_code.ts`.
+
+Launch Claude Code with the plugin's channel:
+
+```bash
+claude --dangerously-load-development-channels plugin:grayboard@grayboard
+```
+
+The first interactive session without a sign-in asks you to open the server's sign-in page: sign in with your Workspace account and approve grayboard's consent screen. The plugin keeps its own grant as the built-in `grayboard-claude-code` client, separate from `grayboard login`, and every Claude Code session on this machine shares it; sessions already open pick it up. If you decline, grayboard's tools say you aren't signed in, and the next grayboard tool call asks again. A non-interactive run (`claude -p`) never asks; sign in from an interactive session first. `/grayboard:logout` revokes the grant, and every Claude Code session on that server pauses until one signs in again (only you can run it; an agent can't).
+
+Inside the session, `/mcp` shows `plugin:grayboard:grayboard`, and the tools are named `mcp__plugin_grayboard_grayboard__<tool>`. A session keeps its bus name across `/clear` and `claude --resume`; when it ends, the name is free at once. The same session open in two terminals receives pushes in one; the other runs tools only and says so. `grayboard tail` is local mode only for now.
+
+**Pushes on an organization plan.** On a Team or Enterprise claude.ai plan, pushes need an admin to turn channels on (`channelsEnabled: true` in managed settings). An organization that doesn't allow the development flag can allowlist the plugin instead: managed settings `allowedChannelPlugins` with `{"marketplace": "grayboard", "plugin": "grayboard"}`, and launch with `claude --channels plugin:grayboard@grayboard`. When pushes are off for any reason, the plugin says why in its instructions and first tool result, and messages wait on the server for a session that can receive them. On Windows the plugin can't read managed settings delivered through the registry, so with a Team or Enterprise account, an API key, or `--channels`, it keeps pushes off unless Claude Code's cached remote settings decide.
 
 ### Slack for a team server (optional)
 
@@ -700,13 +723,15 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | `link <code>` in Slack gets no answer | The bridge didn't start; `journalctl -u grayboard` shows `[grayboard slack] not started: …` |
 | `dm_send` to `human` says you haven't linked Slack | Run `grayboard slack link`; to reach a teammate's, use their full handle (`alice@example.com/human`) |
 | A DM to someone's `human` is forbidden | You don't share a team with them, and the server's `GRAYBOARD_SLACK_REACH` isn't `all` |
-| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels server:grayboard` (including on `--resume`; grayboard warns the agent when it sees this, and that session receives nothing, so messages wait for one that can receive them), or isn't on a claude.ai login |
+| Messages don't arrive as pushes | The session wasn't started with `--dangerously-load-development-channels plugin:grayboard@grayboard`, including on `--resume`, or runs on Bedrock, Vertex or Foundry, or your organization hasn't turned channels on ([above](#claude-code-with-a-team-server)). grayboard tells the agent which, and that session receives nothing, so messages wait for one that can receive them |
+| Claude Code with a team server: `/mcp` shows `plugin:grayboard:grayboard` failed | Bun isn't on PATH for Claude Code; install it and restart Claude Code |
+| Claude Code with a team server: grayboard tools say you aren't signed in | Approve the sign-in Claude Code shows (any grayboard tool call offers it again); from `claude -p`, sign in from an interactive session first |
 
 ### CLI reference
 
 ```
 grayboard setup [--local | --server <url>] [--no-register] [-y]
-grayboard mcp [--mode local|server]      # the MCP server Claude Code runs
+grayboard mcp [--mode local|server]      # the MCP server local-mode harnesses run
 grayboard update                         # replace this binary with the latest release
 grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
 grayboard claim take <key> [--ttl <dur> | --until <time>] [--note <text>] [--board <b>]  # exits 2 if held
@@ -838,6 +863,7 @@ bash scripts/e2e.sh hosted-host
 bash scripts/e2e.sh hosted-matrix
 bash scripts/e2e.sh hosted-native
 bash scripts/e2e.sh hosted-durable
+bash scripts/e2e.sh claude-hosted
 ```
 
 `bun run test` explicitly runs `src` and `tests`, not nested package tests. `test:opencode` performs the package's own frozen install, strict typecheck, unit tests and explicit `build:package`, then typechecks and tests `adapters/hosted-core` (its own frozen install) and checks opencode-v2's generated `src/core/` copy; root typechecking does not cover opencode-v2. Install the independent dependencies first with `(cd adapters/opencode-v2 && bun install --frozen-lockfile)` when running host suites directly. The host fixtures use source-only full-SHA Git/subdirectory installs through actual OpenCode 2.1.4, without `dist` or build/install hooks. Normal actual-backend and live production-CIMD CodeMode suites exercise native binding, account/configuration guards and durable replay. The actual-backend matrix covers issued races, default admission throttling, expiry and crash recovery; native/durable fake-MCP suites separately exercise public host hooks. No fake-MCP result substitutes for actual-backend acceptance.
@@ -848,10 +874,12 @@ PR/master hosted CI runs the hermetic `strict`, `git`, `config`, `host`, `matrix
 
 `scripts/e2e.sh` publishes only constructed metadata under the run directory's `evidence/`: gate verdict/exit, JUnit counts with anonymous case IDs, checked source/installed-byte hashes and a constant log summary. The matrix suite alone also constructs `matrix.json` with numeric case IDs, bounded preparation/progress/exit state and no scenario names; its mapping is checked against the unchanged reviewed package loop. A successful matrix requires every case to finish successfully; interrupted or malformed observations cannot turn a failure green. CI retains only that directory and the constant result for 7 days, never fixture HOME, credentials, databases or raw test output. Raw stdout/stderr, assertion excerpts and original JUnit stay in private `TMPDIR/grayboard-evidence-*/` scratch; operators with local machine access can inspect those files for diagnosis, but must not upload or paste them without separate review. Arbitrary secret text cannot be reliably recognized by regex, so it is withheld wholesale, not claimed universally redacted. Malformed metadata or postprocessing failure fails the gate; interrupted processing never publishes raw staging files. Fixtures use a fake Google exchange, logical backend HTTPS routed to loopback and fake model endpoints; live CIMD alone uses production DNS/pinned HTTPS. They do not prove production Google sign-in, deployed TLS or interactive TUI rendering, publish packages or change global configuration.
 
+`claude-hosted` installs the pinned Claude Code release from npm (into `.e2e-cache/`, so the first run needs network) and drives it interactively in a pty with the hosted plugin, against an in-process server and a scripted fake Anthropic API: no Anthropic credential and no tokens. It checks that the plugin binds, that a DM arrives as a channel message, that the model's reply reaches the sender, and that no `grayboard` process runs under Claude Code. Nightly runs install this checkout's plugin; the release gate installs the exact marketplace entry the release's plugin pin will write, fetched from GitHub at the tag's commit.
+
 ## Status
 
 Local mode is in daily use, and distributed mode runs as a long-lived team server shared across several machines and users. The [releases page](https://github.com/nolnoch/grayboard/releases) has the current version and what each release changed.
 
-The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `src/plugin/mcp.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
+The channels feature in Claude Code is in research preview: the `--dangerously-load-development-channels` flag and the underlying protocol may change. If Anthropic ships a breaking change, small updates to `plugins/claude-code/src/plugin.ts` and `src/shared/claude_channels.ts` (or `src/local/mcp.ts` for local mode) should be enough to catch up.
 
 No roadmap, no support commitments. PRs and issues welcome; responses are best-effort.

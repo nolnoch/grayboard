@@ -38,16 +38,36 @@ export function claudeSettingsPath(env = process.env): string {
 // already set, and a session that moved into a worktree would be retitled
 // with a handle its running server doesn't hold.
 export function installSessionStartHook(command: string, path = claudeSettingsPath()): void {
+  const { cfg, kept } = withoutOurs(path);
+  cfg.hooks = { ...cfg.hooks, SessionStart: [...kept, { matcher: "startup|resume|fork", hooks: [{ type: "command", command, timeout: 10 }] }] };
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+}
+
+// Remove the hook, leaving every other hook and setting as it was; true when
+// the file changed. Server mode's plugin binds no name at start, and the hook
+// would run the grayboard binary in a session that otherwise needs none.
+export function removeSessionStartHook(path = claudeSettingsPath()): boolean {
+  const { cfg, kept, found } = withoutOurs(path);
+  if (!found) return false;
+  const { SessionStart: _, ...rest } = cfg.hooks!;
+  cfg.hooks = kept.length ? { ...rest, SessionStart: kept } : rest;
+  if (!Object.keys(cfg.hooks).length) delete cfg.hooks;
+  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+  return true;
+}
+
+function withoutOurs(path: string): { cfg: Settings; kept: HookEntry[]; found: boolean } {
   let cfg: Settings = {};
   if (existsSync(path)) {
     try { cfg = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
       throw new Error(`can't parse ${path}: ${(e as Error).message}`);
     }
   }
-  const kept = (cfg.hooks?.SessionStart ?? [])
+  const all = cfg.hooks?.SessionStart ?? [];
+  const found = all.some((m) => m.hooks.some((h) => OURS.test(h.command)));
+  const kept = all
     .map((m) => ({ ...m, hooks: m.hooks.filter((h) => !OURS.test(h.command)) }))
     .filter((m) => m.hooks.length > 0);
-  cfg.hooks = { ...cfg.hooks, SessionStart: [...kept, { matcher: "startup|resume|fork", hooks: [{ type: "command", command, timeout: 10 }] }] };
-  mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+  return { cfg, kept, found };
 }

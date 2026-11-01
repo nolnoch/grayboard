@@ -56,6 +56,8 @@ beforeEach(() => {
     writeFileSync(p, `#!/bin/sh\necho "${name} $*" >> "${join(dir, "argv.log")}"\n`);
     chmodSync(p, 0o755);
   }
+  // Server mode's Claude Code plugin needs Bun on PATH.
+  symlinkSync(process.execPath, join(dir, "stubs", "bun"));
 });
 
 // Under scripts/e2e.sh each test keeps its temp HOME (less the installed
@@ -102,16 +104,22 @@ function writeOldEntries(exe: string, extraEnv: Record<string, string> = {}): vo
 const CREDENTIALS = () => join(home, ".grayboard", "credentials");
 
 // Every registration setup writes, each naming the installed binary. With
-// `server`, omp and pi get the hosted extension, its config and no entry
-// instead.
+// `server`, Claude Code gets the hosted plugin, and omp and pi the hosted
+// extension and its config, with no entries, instead.
 function expectRegistered(server?: string): void {
   // A compiled binary's execPath is its resolved path.
   const exe = realpathSync(join(bin, "grayboard"));
   const argv = readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n");
-  expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
-  expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
-    { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
-  ]);
+  if (server) {
+    expect(argv).toEqual([`claude plugin marketplace add ${REPO}`, "claude plugin marketplace update grayboard",
+      `claude plugin install grayboard@grayboard --config server_url=${server}/mcp`, "claude mcp remove --scope user grayboard"]);
+    expect(existsSync(join(home, ".claude", "settings.json"))).toBe(false);
+  } else {
+    expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
+    expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
+      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
+    ]);
+  }
   // Disabled: the opencode and local pi adapters serve the tools and read their command here.
   expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
   const local = server ? ["opencode"] as const : ["omp", "opencode", "pi"] as const;

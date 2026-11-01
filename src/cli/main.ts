@@ -10,7 +10,8 @@ import pkg from "../../package.json" with { type: "json" };
 import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
-import { claudeSettingsPath, installSessionStartHook, sessionStartOutput } from "./session_start.ts";
+import { sessionStartOutput } from "./session_start.ts";
+import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, printable, registerClaudeLocal } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -622,8 +623,6 @@ program
     console.log(JSON.stringify(tools));
   });
 
-const CHANNELS_FLAG = "--dangerously-load-development-channels server:grayboard";
-
 program
   .command("setup-opencode")
   .description("Configure an explicitly selected OpenCode V2 hosted MCP scope; no login or package installation")
@@ -718,21 +717,21 @@ program
       console.log("Using local mode.");
     }
 
-    // 2. Register with Claude Code, for every project (user scope)
+    // 2. Claude Code, for every project (user scope). Local: the `grayboard
+    // mcp` entry. Server: the hosted plugin, which needs no grayboard process.
     const { command, args } = mcpCommand();
-    const addArgs = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
     const claude = Bun.which("claude");
     if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
-      Bun.spawnSync([claude, "mcp", "remove", "--scope", "user", "grayboard"], { stdout: "ignore", stderr: "ignore" });
-      const r = Bun.spawnSync([claude, ...addArgs], { stdout: "inherit", stderr: "inherit" });
-      if (r.exitCode !== 0) process.exit(r.exitCode ?? 1);
-      // Title each session with its handle, so Claude Code's name for it is
-      // the one dm_send takes.
-      const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
-      installSessionStartHook(hook);
-      console.log(`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`);
+      try {
+        const run = claudeCli(claude);
+        const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
+        const notes = server ? installClaudePlugin(run, server) : registerClaudeLocal(run, command, args, hook);
+        for (const note of notes) console.log(note);
+      } catch (e) { console.error(`[grayboard] ${(e as Error).message}`); process.exit(1); }
     } else if (opts.register && !claude) {
-      console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  claude ${addArgs.map(a => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+      let cmds: string[][];
+      try { cmds = server ? pluginCommands(server) : [["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args]]; } catch (e) { console.error(`[grayboard] ${(e as Error).message}`); process.exit(1); }
+      console.log(`\nClaude Code's \`claude\` command wasn't found. Once it's installed, run:\n  ${printable(cmds)}`);
     }
 
     // 3. omp and 5. pi share one installer (installPiFamily): register for
@@ -782,10 +781,12 @@ program
     if (failed) return;
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
     console.log(
-      `\nDone. Start Claude Code with:\n  claude ${CHANNELS_FLAG}\n` +
+      `\nDone. Start Claude Code with:\n  ${claudeLaunch(!!server)}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
-      `Each session starts unbound and binds a name with bind once it knows its task; the repo's name (in ~/code/api, "api") is suggested first. ` +
-      `To bind a name at start, set BUS_IDENTITY in the launch command.`,
+      `Each session starts unbound and binds a name with bind once it knows its task.` +
+      // The hosted adapters (Claude Code's plugin, pi's extension) neither
+      // send a suggested name nor read BUS_IDENTITY.
+      (server ? "" : ` The repo's name (in ~/code/api, "api") is suggested first; to bind a name at start, set BUS_IDENTITY in the launch command.`),
     );
   });
 
@@ -857,6 +858,16 @@ program
         for (const note of r.notes) console.log(note);
       } catch (e) { failed(e); }
     }
+    // Claude Code: a server-mode user still on the user-scope `grayboard mcp`
+    // entry (setup before the plugin) moves to the hosted plugin.
+    try {
+      const claude = Bun.which("claude");
+      if (busMode() === "server" && claude && hasUserEntry()) {
+        server ??= process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
+        if (!server) throw new Error("Server mode with no server URL, so Claude Code wasn't moved to the grayboard plugin");
+        for (const note of installClaudePlugin(claudeCli(claude), server)) console.log(note);
+      }
+    } catch (e) { failed(e); }
   });
 
 // ── identity ─────────────────────────────────────────────────────────────────

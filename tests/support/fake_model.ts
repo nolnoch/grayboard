@@ -3,9 +3,8 @@
 // first that answers a request decides the reply, else the model says it has
 // nothing to do. Every completion request is recorded, so a test asserts on
 // what the harness sent. Any other route gets a 404 and lands in `unhandled`,
-// so a harness calling a route the fake doesn't serve fails visibly. The
-// Anthropic Messages side (Claude Code) lands with the Claude Code harness
-// tests, after probe P1 measures which routes it calls.
+// so a harness calling a route the fake doesn't serve fails visibly. Claude
+// Code's Anthropic Messages counterpart is fake_anthropic.ts.
 
 export type ChatMessage = { role: string; content?: unknown; tool_calls?: unknown };
 export type ChatRequest = { messages: ChatMessage[]; tools?: { function: { name: string } }[] };

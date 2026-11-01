@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["bun"]
   },
-  "include": ["src/**/*.ts", "adapters/pi/**/*.ts", "adapters/pi-family/**/*.ts", "adapters/omp/**/*.ts", "adapters/opencode/**/*.ts", "adapters/hosted-core/src/**/*.ts"]
+  "include": ["src/**/*.ts", "adapters/pi/**/*.ts", "adapters/pi-family/**/*.ts", "adapters/omp/**/*.ts", "adapters/opencode/**/*.ts", "adapters/hosted-core/src/**/*.ts", "plugins/claude-code/src/**/*.ts"]
 }

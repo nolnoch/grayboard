@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installSessionStartHook, sessionStartOutput } from "./session_start.ts";
+import { installSessionStartHook, removeSessionStartHook, sessionStartOutput } from "./session_start.ts";
 
 const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
 
@@ -53,6 +53,21 @@ test("install replaces its own hook and keeps everyone else's", () => {
     other,
     { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/usr/local/bin/grayboard session-start", timeout: 10 }] },
   ]);
+});
+
+test("remove drops only its own hook and reports whether it was there", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-ss-")), "settings.json");
+  const other = { matcher: "clear|compact", hooks: [{ type: "command", command: "~/.claude/hooks/other.sh" }] };
+  writeFileSync(path, JSON.stringify({ model: "x", hooks: { SessionStart: [other], Stop: [] } }));
+  installSessionStartHook("/usr/local/bin/grayboard session-start", path);
+  expect(removeSessionStartHook(path)).toBe(true);
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ model: "x", hooks: { SessionStart: [other], Stop: [] } });
+  expect(removeSessionStartHook(path)).toBe(false);
+  // Ours alone: the emptied hooks object goes too.
+  writeFileSync(path, JSON.stringify({ model: "x" }));
+  installSessionStartHook("grayboard session-start", path);
+  expect(removeSessionStartHook(path)).toBe(true);
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ model: "x" });
 });
 
 test("install creates the settings file when there is none", () => {

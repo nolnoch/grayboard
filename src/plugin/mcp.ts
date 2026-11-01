@@ -27,7 +27,7 @@ import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { DEFAULT_CHANNEL_SOURCE, isBoardTool, ownHumanInstruction } from "../core/tools.ts";
 import { boardNotification, dmNotification } from "../shared/notifications.ts";
-import { CHANNELS_OFF_NOTICE, channelsOff, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
+import { channelsOff, channelsOffNotice, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
 import {
   attachRoots, checkAttachmentId, downloadAttachment, readAttachmentFiles, saveTarget, sendWithUploads, SendLanded, serverBusDir,
   type AttachmentLimits, type AttachmentTransport,
@@ -107,9 +107,11 @@ if (!resolved.ok && (EXPLICIT || !PUSH)) fatal(new Error(resolved.error));
 const SUGGESTED = resolved.ok ? resolved.name : null;
 // What a tools-only process writes as; it holds nothing.
 const WRITES_AS = PUSH ? null : SUGGESTED!;
-// Claude Code started without a channels flag drops pushes silently; say so.
-const CHANNELS_OFF = PUSH && channelsOff(process.env, parentCommandLine());
-if (CHANNELS_OFF) console.error("[grayboard] this Claude Code session has no channels flag: tools only");
+// A Claude Code session that won't show channel messages drops pushes silently; say so and why.
+const CHANNELS_OFF_REASON = PUSH ? channelsOff(process.env, parentCommandLine()) : null;
+const CHANNELS_OFF = CHANNELS_OFF_REASON !== null;
+const CHANNELS_OFF_NOTICE = CHANNELS_OFF_REASON === null ? null : channelsOffNotice(CHANNELS_OFF_REASON);
+if (CHANNELS_OFF) console.error(`[grayboard] Claude Code channels are off (${CHANNELS_OFF_REASON}): tools only`);
 // Notifications such a session drops would still count as delivered, so it
 // gets no pushes, as BUS_PUSH=off does, and what's pending waits (#71). It
 // still holds its name, as in local mode (decision 9): its hello says hold
@@ -510,7 +512,7 @@ const server = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: [...(CHANNELS_OFF ? [CHANNELS_OFF_NOTICE] : []), ...currentInstructions(startNotes)].join(" "),
+    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...currentInstructions(startNotes)].join(" "),
   },
 );
 
@@ -533,7 +535,7 @@ let channelsNoticePending = CHANNELS_OFF;
 const requeued: string[] = [];
 const notices = (): string[] => {
   const out = requeued.splice(0);
-  if (channelsNoticePending) out.push(CHANNELS_OFF_NOTICE);
+  if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
   if (nameNotice) out.push(nameNotice);
   nameNotice = null;

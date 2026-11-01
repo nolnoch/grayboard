@@ -1,0 +1,21 @@
+{
+  "name": "grayboard",
+  "version": "2.2.0",
+  "description": "Grayboard for Claude Code on a grayboard server: the bus's tools, with direct messages and board posts pushed into the session as channel messages.",
+  "author": { "name": "nolnoch" },
+  "homepage": "https://github.com/nolnoch/grayboard",
+  "repository": "https://github.com/nolnoch/grayboard",
+  "license": "MIT",
+  "keywords": ["grayboard", "channel", "mcp", "coordination"],
+  "mcpServers": {
+    "grayboard": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/grayboard.js"],
+      "env": { "GRAYBOARD_SERVER_URL": "${user_config.server_url}" }
+    }
+  },
+  "userConfig": {
+    "server_url": { "type": "string", "title": "grayboard server MCP URL", "description": "The grayboard server's MCP endpoint, such as https://grayboard.example.com/mcp.", "required": true }
+  },
+  "channels": [{ "server": "grayboard", "displayName": "Grayboard" }]
+}

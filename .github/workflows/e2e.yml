@@ -11,7 +11,7 @@ on:
       suite:
         description: "Suite to run"
         type: choice
-        options: [upgrade-matrix, hosted-live, hosted-public, hosted-network]
+        options: [upgrade-matrix, claude-hosted, hosted-live, hosted-public, hosted-network]
         default: upgrade-matrix
   workflow_call:
     inputs:
@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix","hosted-live","hosted-public"]' || inputs.suite == 'hosted-network' && '["hosted-live","hosted-public"]' || format('["{0}"]', inputs.suite)) }}
+        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix","claude-hosted","hosted-live","hosted-public"]' || inputs.suite == 'hosted-network' && '["hosted-live","hosted-public"]' || format('["{0}"]', inputs.suite)) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +77,10 @@ jobs:
           GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/e2e-run
           SUITE: ${{ matrix.suite }}
           GRAYBOARD_PUBLIC_REVISION: ${{ steps.public.outputs.revision }}
+          # claude-hosted from a release tag installs the plugin pin that tag
+          # gets (tests/e2e/claude_hosted.e2e.ts); elsewhere this tree's plugin.
+          GRAYBOARD_E2E_TAG: ${{ matrix.suite == 'claude-hosted' && github.ref_type == 'tag' && github.ref_name || '' }}
+          GRAYBOARD_E2E_SHA: ${{ matrix.suite == 'claude-hosted' && github.ref_type == 'tag' && github.sha || '' }}
         run: scripts/e2e.sh "$SUITE"
 
       - name: Upload run dir
@@ -103,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ["upgrade-matrix", "hosted-live", "hosted-public"]   # the schedule's suites, as in e2e's matrix
+        suite: ["upgrade-matrix", "claude-hosted", "hosted-live", "hosted-public"]   # the schedule's suites, as in e2e's matrix
     permissions:
       issues: write
     steps:

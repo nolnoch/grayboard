@@ -1,5 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
+import { type ClaudeFiles, claudeChannels, hostFiles } from "./claude_channels.ts";
 
 type Tool = { name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } };
 
@@ -49,21 +50,24 @@ export function updateNotice(): () => string | null {
   };
 }
 
-export const CHANNELS_OFF_NOTICE =
-  "Warning: this Claude Code session was started without --dangerously-load-development-channels, so it's tools-only: grayboard can't push messages or board posts to it, and peers see it as offline. Tell the user to restart the session with `claude --dangerously-load-development-channels server:grayboard` (add --resume to keep this conversation); what's pending arrives then. Until then, check dm_inbox and board_read yourself.";
+/** The warning a tools-only Claude Code session gets, naming why its channels are off. */
+export function channelsOffNotice(reason: string): string {
+  return `Warning: this Claude Code session is tools-only: grayboard can't push messages or board posts to it, because ${reason}, and peers see it as offline. Tell the user; what's pending arrives once a session with channels on holds this name. Until then, check dm_inbox and board_read yourself.`;
+}
 
 /**
- * True when the MCP client is a Claude Code session started without a
- * channels flag: Claude Code then drops channel notifications silently. Claude
- * Code sets CLAUDECODE=1 for the servers it starts, but that's inherited by
- * anything it launches, so the parent must also be `claude` itself. Unknown
- * (no parent command line) counts as not off.
+ * Why Claude Code won't show this local-mode server's channel notifications
+ * (the shared rule, `claudeChannels`), or null when it will or can't tell.
+ * Only a child of Claude Code itself is checked: CLAUDECODE=1 is inherited by
+ * anything Claude Code launches, so the parent must also be `claude`. Unknown
+ * (no parent command line, or an unreadable policy) counts as on.
  */
-export function channelsOff(env: Record<string, string | undefined>, parentCmd: string | null): boolean {
-  if (env.CLAUDECODE !== "1" || !parentCmd) return false;
+export function channelsOff(env: Record<string, string | undefined>, parentCmd: string | null, files: ClaudeFiles = hostFiles()): string | null {
+  if (env.CLAUDECODE !== "1" || !parentCmd) return null;
   const argv0 = parentCmd.trim().split(/\s+/)[0] ?? "";
-  if (basename(argv0) !== "claude") return false;
-  return !/(^|\s)--(channels|dangerously-load-development-channels)(=|\s|$)/.test(parentCmd);
+  if (basename(argv0) !== "claude") return null;
+  const v = claudeChannels({ env, parentCmd, entry: "server:grayboard", files });
+  return v.state === "off" ? v.reason : null;
 }
 
 /** The parent process's command line, space-joined, or null if unreadable. */
