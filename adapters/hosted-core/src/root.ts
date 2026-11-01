@@ -258,6 +258,8 @@ export class RootDelivery {
       if (!accessExpiry(error)) this.log(`couldn't read the sign-in: ${message(error)}`, "warning");
       return;
     }
+    // A shutdown during the token read closed the proxy: never reopen it.
+    if (this.closed) return;
     if (this.proxy) await this.client.connect(this.proxy);
     await this.restartIfChanged();
   }

@@ -819,6 +819,17 @@ test("/grayboard resume on a root in lock error says so when another process now
   expect(await a.ext.status()).not.toContain("couldn't take delivery");
 });
 
+test("a held root or a child shut down before its first connect finishes doesn't say it couldn't reach the server", async () => {
+  await root("earlyquit-1", "earlyquit");
+  const held = instance();
+  await held.ext.start({ id: "earlyquit-1", reason: "startup" });
+  await held.ext.shutdown("new");
+  const child = instance({ child: true, root: "earlyquit-1" });
+  await child.ext.start({ id: "earlyquit-child", reason: "startup" });
+  await child.ext.shutdown("quit");
+  expect([...held.notices, ...child.notices].filter(n => n.message.includes("couldn't reach the server"))).toEqual([]);
+});
+
 test("a quit while a reloaded root's start is in flight still releases the lease the reload kept", async () => {
   const before = await root("inflight-1", "inflight");
   await before.ext.shutdown("reload");

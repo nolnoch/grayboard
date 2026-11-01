@@ -116,10 +116,12 @@ export class HostedClient {
   }
 
   // A fresh native connection, which re-lists the server's tools. Signed out
-  // is the tools' own error to say; anything else is said here.
+  // is the tools' own error to say; anything else is said here, unless the
+  // proxy was closed or retired meanwhile (both drop it from `proxies`): that
+  // abort was ours (a shutdown, /new or /reload before the connect finished).
   async connect(proxy: ToolProxy): Promise<void> {
     try { await proxy.connect(); }
-    catch (error) { if (!accessExpiry(error)) this.options.log(`couldn't reach the server: ${message(error)}`, "warning"); }
+    catch (error) { if (this.proxies.has(proxy) && !accessExpiry(error)) this.options.log(`couldn't reach the server: ${message(error)}`, "warning"); }
   }
 
   // The one tool-call error wrapper: a call that throws (a beforeCall

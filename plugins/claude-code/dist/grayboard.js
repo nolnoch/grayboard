@@ -35904,7 +35904,7 @@ class HostedClient {
     try {
       await proxy.connect();
     } catch (error) {
-      if (!accessExpiry(error))
+      if (this.proxies.has(proxy) && !accessExpiry(error))
         this.options.log(`couldn't reach the server: ${message(error)}`, "warning");
     }
   }
@@ -36893,6 +36893,8 @@ class RootDelivery {
         this.log(`couldn't read the sign-in: ${message(error)}`, "warning");
       return;
     }
+    if (this.closed)
+      return;
     if (this.proxy)
       await this.client.connect(this.proxy);
     await this.restartIfChanged();

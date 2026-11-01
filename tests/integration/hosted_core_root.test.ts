@@ -164,6 +164,19 @@ test("a bind whose `before` retries a lock error and finds delivery held elsewhe
   expect(row("bindrace-1")).toMatchObject({ name: "holder" });
 }, 30_000);
 
+test("a held root shut down while its tools-only connect is in flight doesn't say it couldn't reach the server, and a sign-in racing a shutdown never reopens the closed connection", async () => {
+  const a = await live("earlyquit-1", "holder");
+  const b = rig("earlyquit-1");
+  await b.root.start();
+  expect(b.root.status().held).toBe(HELD);
+  await b.root.shutdown("release");
+  const changing = a.root.credentialChanged();
+  await a.root.shutdown("release");
+  await changing;
+  expect([...a.logs, ...b.logs].filter(l => l.message.startsWith("couldn't reach the server"))).toEqual([]);
+  expect(row("earlyquit-1")).toBeNull();
+}, 30_000);
+
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {
   const first = await live("carry-1", "carrier");
   const carried = await first.root.shutdown("release", { carry: true });
