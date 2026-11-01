@@ -6,6 +6,8 @@ import { SessionRoutes } from "./sessions.js";
 import { end, register } from "./children.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Operation, type Status } from "./diagnostics.js";
 export type { Status } from "./diagnostics.js";
+// Every root's pause message after a credential change (a login or logout in any process) starts with this.
+export const DRIFTED = "Grayboard credential changed";
 
 export type Wait = (ms: number, signal: AbortSignal) => Promise<void>;
 export type ControllerOptions = {
@@ -59,6 +61,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   protected roots = new Map<string, Root<E>>();
   private watches = new Map<string, { dispose(): Promise<void> }>();
   protected stopped = false;
+  // Sessions a shutdown has begun for: treated like `stopped`, per session,
+  // since one Controller may run several roots (OpenCode V2).
+  private readonly ending = new Set<string>();
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -99,8 +104,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       void this.port.storage.set(`paused:${r.e.sessionID}`, true).catch(error => this.failure("latch_save", error, r));
     }
   }
-  // The watch's and a guard's drift alike; hosts key on this message (pi's describe).
-  private credentialChanged() { this.drift(`Grayboard credential changed; ${this.hint}`); }
+  // The watch's and a guard's drift alike; hosts key on DRIFTED (pi's describe, a root's sink).
+  private credentialChanged() { this.drift(`${DRIFTED}; ${this.hint}`); }
   private async path(sessionID: string) {
     const path = await this.port.ancestry(sessionID);
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
@@ -130,7 +135,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private async guard(r: Root<E>, epoch: number, signal: AbortSignal) {
     const e = r.e, key = this.key(e);
-    const current = () => this.port.place() === this.place && !this.stopped && !this.drifted && !r.paused && !signal.aborted && r.epoch === epoch && this.roots.get(e.sessionID) === r && this.key(r.e) === key;
+    const current = () => this.port.place() === this.place && !this.stopped && !this.ending.has(e.sessionID) && !this.drifted && !r.paused && !signal.aborted && r.epoch === epoch && this.roots.get(e.sessionID) === r && this.key(r.e) === key;
     const check = () => { if (!current()) throw new Refusal("paused", "Admission target changed"); };
     check();
     // The port's check sees a changed credential (Refusal "binding") before the
@@ -183,7 +188,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.watches.get(sessionID)?.dispose(); this.watches.delete(sessionID);
   }
   async enroll(sessionID: string, name?: string, create = false) { return this.serial(async () => {
-    if (this.stopped) throw new Refusal("paused", "Grayboard is stopping");
+    if (this.stopped || this.ending.has(sessionID)) throw new Refusal("paused", "Grayboard is stopping");
     await this.activeRoot(sessionID);
     await this.unwatch(sessionID);
     const previous = this.roots.get(sessionID);
@@ -216,7 +221,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Start a root without a human enrollment: its remembered name rebinds with
   // create:false. An approval host needs that root's saved, enabled approval.
   async resume(sessionID: string) { return this.serial(async () => {
-    if (this.stopped) throw new Refusal("paused", "Grayboard is stopping");
+    if (this.stopped || this.ending.has(sessionID)) throw new Refusal("paused", "Grayboard is stopping");
     await this.activeRoot(sessionID);
     await this.unwatch(sessionID);
     const previous = this.roots.get(sessionID);
@@ -254,6 +259,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private async prepare(r: Root<E>, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
+    // A shutdown that began while this start waited (on the approval, the
+    // watch) refuses it before it connects.
+    if (this.stopped || this.ending.has(r.e.sessionID)) throw new Refusal("paused", "Grayboard is stopping");
     await this.temporary(r.e, async wire => {
       await this.guard(r, epoch, signal);
       let current = bindingOf(await wire.call("whoami"));
@@ -278,7 +286,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     });
   }
   private start(r: Root<E>) {
-    if (r.task || r.paused || this.stopped) return;
+    if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID)) return;
     const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController();
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
@@ -342,7 +350,7 @@ export class Controller<E extends Enrollment = Enrollment> {
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
                 if (r.admitted.has(key)) { inItem = false; return; }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity);
+                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
@@ -427,15 +435,42 @@ export class Controller<E extends Enrollment = Enrollment> {
   }); }
   // Stop one root for good: "release" ends its ownership (frees the name);
   // "detach" keeps the lease for an in-process reload that reopens within its TTL.
-  async shutdown(sessionID: string, mode: "release" | "detach") { return this.serial(async () => {
-    const r = this.roots.get(sessionID);
-    if (!r) return;
-    r.paused = true; await this.stop(r);
-    await this.watches.get(sessionID)?.dispose().catch(error => this.failure("watch_dispose", error, r)); this.watches.delete(sessionID);
-    if (mode === "release") await this.release(r).catch(error => this.failure("session_end", error, r));
-    this.set(r, "paused", mode === "release" ? "Session shut down; ownership released" : "Session detached; lease retained for reload", "session_end");
-    this.roots.delete(sessionID);
-  }); }
+  // Before entering the queue it marks the session ending and aborts its run
+  // loop, so the release isn't queued behind a start in flight: that start
+  // refuses at its next check (guard, start, enroll, resume), costing at most
+  // the request it is already in. With `carry`, the name a successor binds is
+  // read in the queue after the stop and before the release, so a rebind that
+  // landed is visible and no admit can land during the read. A "release" with
+  // no live root (its start never reached the queue, as a /reload's resume in
+  // flight) still ends the session, freeing a lease an earlier runtime kept;
+  // signed out, there is no grant to end it with.
+  shutdown(sessionID: string, mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string | undefined> {
+    this.ending.add(sessionID);
+    this.roots.get(sessionID)?.abort?.abort();
+    return this.serial(async () => {
+      const r = this.roots.get(sessionID);
+      if (r) { r.paused = true; await this.stop(r); }
+      const carried = o.carry ? await this.carried(sessionID) : undefined;
+      if (!r) {
+        if (mode === "release") await this.endUnowned(sessionID);
+        return carried;
+      }
+      await this.watches.get(sessionID)?.dispose().catch(error => this.failure("watch_dispose", error, r)); this.watches.delete(sessionID);
+      if (mode === "release") await this.release(r).catch(error => this.failure("session_end", error, r));
+      this.set(r, "paused", mode === "release" ? "Session shut down; ownership released" : "Session detached; lease retained for reload", "session_end");
+      this.roots.delete(sessionID);
+      return carried;
+    });
+  }
+  private async endUnowned(sessionID: string) {
+    try {
+      const e = await this.port.credential.capture(sessionID);
+      await this.temporary(e, wire => wire.call("session_end"));
+    } catch (error) {
+      if (accessExpiry(error)) return;
+      this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
+    }
+  }
   async restore() {
     await this.diagnostics.restore(async id => { await this.activeRoot(id); return true; });
     if (!this.port.approval) return;
