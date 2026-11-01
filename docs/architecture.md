@@ -13,7 +13,7 @@ companions: boards.md (core semantics both modes share), slack-bridge.md (the lo
 flowchart LR
   subgraph session["agent session (Claude Code, omp, opencode, pi)"]
     mcp["grayboard mcp<br/>stdio MCP server"]
-    hosted["hosted adapter (adapters/hosted-core/)<br/>Claude Code plugin, pi extension"]
+    hosted["hosted adapter (adapters/hosted-core/)<br/>Claude Code plugin, pi and omp extensions"]
   end
   hosted -->|"server mode: HTTPS /mcp, OAuth grant"| server
   mcp -->|"local mode: direct SQLite + Unix-socket pokes"| localdb[("~/.claude-bus/bus.db")]
@@ -24,7 +24,7 @@ flowchart LR
   caddy["Caddy (TLS)"] -.->|reverse proxy| server
 ```
 
-- The CLI binary is the retained stdio/local/WSS client entry; hosted OpenCode V2 connects directly through native HTTP MCP and an in-process delivery supplement, without a Grayboard executable or subprocess. So do the hosted adapters in server mode: Claude Code's plugin (`plugins/claude-code/`, a stdio MCP server Claude Code runs under Bun) and pi's extension run hosted-core in a process the harness starts. `grayboard mcp` loads `src/plugin/mcp.ts` (server mode) or `src/local/mcp.ts` (local mode); `grayboard-server` is the second binary.
+- The CLI binary is the retained stdio/local/WSS client entry; hosted OpenCode V2 connects directly through native HTTP MCP and an in-process delivery supplement, without a Grayboard executable or subprocess. So do the hosted adapters in server mode: Claude Code's plugin (`plugins/claude-code/`, a stdio MCP server Claude Code runs under Bun) and pi's and omp's extensions run hosted-core in a process the harness starts. `grayboard mcp` loads `src/plugin/mcp.ts` (server mode) or `src/local/mcp.ts` (local mode); `grayboard-server` is the second binary.
 - **Mode selection** (`busMode`, `src/cli/api.ts`): server mode if `GRAYBOARD_TOKEN` is set or the credentials file exists, else local. `--mode local|server` overrides, e.g. per repo in `.mcp.json`. An *empty* credentials file means signed out: server mode fails with "signed out" rather than silently becoming local (why logout truncates instead of deleting).
 - **Local mode is a peer, not a fallback.** Same-machine live push needs no managed server process; Unix sockets are the right primitive. It is excluded from the server's migration seam (§7).
 - Identity: a session binds at start only an explicit `BUS_IDENTITY` (one that differs from every repo pin; no worktree suffix, lowercased and validated as at bind, #181; on a server it may carry a scope, `eng/build`, which the server judges at bind); otherwise it starts unbound and binds with `bind` (#182). The pin, else the repo directory name, plus a worktree suffix, is only the first candidate (`src/shared/identity.ts`). See `boards.md` §3.
