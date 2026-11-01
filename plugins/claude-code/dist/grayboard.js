@@ -32639,6 +32639,17 @@ var THIRD_PARTY = [
   "CLAUDE_CODE_USE_MANTLE"
 ];
 var truthy = (v) => /^(1|true|yes|on)$/i.test(v?.trim() ?? "");
+function flagSource(env) {
+  const telemetry = ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY"].find((k) => env[k]) ?? (truthy(env.DO_NOT_TRACK) ? "DO_NOT_TRACK" : undefined);
+  const oauth = env.CLAUDE_CODE_CUSTOM_OAUTH_URL !== undefined ? "CLAUDE_CODE_CUSTOM_OAUTH_URL" : undefined;
+  if (env.DISABLE_GROWTHBOOK)
+    return { source: "none", cause: "DISABLE_GROWTHBOOK", cacheable: false };
+  if (!telemetry && !oauth)
+    return { source: "live" };
+  if (telemetry && env.CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF)
+    return { source: "cache" };
+  return { source: "none", cause: telemetry ?? oauth, cacheable: telemetry !== undefined };
+}
 var isObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function parse4(text) {
   if (text === null)
@@ -32748,8 +32759,14 @@ function claudeChannels({ env, parentCmd, entry, files }) {
   const configDir = env.CLAUDE_CONFIG_DIR || join3(files.home, ".claude");
   const global = parse4(files.read(join3(env.CLAUDE_CONFIG_DIR || files.home, ".claude.json")));
   const features = isObject2(global?.cachedGrowthBookFeatures) ? global.cachedGrowthBookFeatures : {};
-  if (features.tengu_harbor === false)
+  const flags = flagSource(env);
+  if (flags.source === "none") {
+    const remedy = flags.cacheable ? "; set CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1 to use the cached ones" : "";
+    return off("feature", `${flags.cause} turns off Claude Code's feature flags, and channels are off without them${remedy}`);
+  }
+  if (flags.source === "cache" ? features.tengu_harbor !== true : features.tengu_harbor === false) {
     return off("feature", "channels aren't currently available to this Claude Code account");
+  }
   const limits = parse4(files.read(join3(configDir, "policy-limits.json")));
   const restriction = isObject2(limits?.restrictions) ? limits.restrictions.allow_channels : undefined;
   const taints = Array.isArray(limits?.compliance_taints) ? limits.compliance_taints : [];

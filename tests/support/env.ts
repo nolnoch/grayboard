@@ -8,9 +8,13 @@ import { join } from "node:path";
 // which the test process uses to list releases and no child needs (they
 // include old release binaries, install.sh and pi's npm dependencies). And
 // what Claude Code exports to its children, which the channel rule reads
-// (src/shared/claude_channels.ts): a test sets those itself.
+// (src/shared/claude_channels.ts), telemetry switches among them: a test sets
+// those itself.
 const INHERITED = /^(BUS|GRAYBOARD|SLACK|CLAUDE_CODE)_/;
-const DROPPED = ["CLAUDE_CONFIG_DIR", "CLAUDECODE", "ANTHROPIC_API_KEY", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "GITHUB_TOKEN", "GH_TOKEN"];
+const DROPPED = [
+  "CLAUDE_CONFIG_DIR", "CLAUDECODE", "ANTHROPIC_API_KEY", "DISABLE_TELEMETRY", "DO_NOT_TRACK", "DISABLE_GROWTHBOOK",
+  "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "GITHUB_TOKEN", "GH_TOKEN",
+];
 
 // This process's env without those, plus `extra`.
 export function cleanEnv(extra: Record<string, string> = {}): Record<string, string> {

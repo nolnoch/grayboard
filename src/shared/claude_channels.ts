@@ -82,6 +82,26 @@ const THIRD_PARTY = [
 
 const truthy = (v: string | undefined): boolean => /^(1|true|yes|on)$/i.test(v?.trim() ?? "");
 
+/**
+ * Where Claude Code reads its feature flags (`tengu_harbor` among them). The
+ * GrowthBook client runs unless DISABLE_GROWTHBOOK, a telemetry switch or a
+ * custom OAuth URL is set (any non-empty value; DO_NOT_TRACK parses as a
+ * boolean). With it off, every flag takes its default unless
+ * CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF lets a telemetry switch read
+ * the `.claude.json` cache. Not read: an API-gateway sign-in, which also turns
+ * the client off and lives only in Claude Code's memory.
+ */
+function flagSource(env: Record<string, string | undefined>):
+  { source: "live" | "cache" } | { source: "none"; cause: string; cacheable: boolean } {
+  const telemetry = ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY"].find((k) => env[k]) ??
+    (truthy(env.DO_NOT_TRACK) ? "DO_NOT_TRACK" : undefined);
+  const oauth = env.CLAUDE_CODE_CUSTOM_OAUTH_URL !== undefined ? "CLAUDE_CODE_CUSTOM_OAUTH_URL" : undefined;
+  if (env.DISABLE_GROWTHBOOK) return { source: "none", cause: "DISABLE_GROWTHBOOK", cacheable: false };
+  if (!telemetry && !oauth) return { source: "live" };
+  if (telemetry && env.CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF) return { source: "cache" };
+  return { source: "none", cause: telemetry ?? oauth!, cacheable: telemetry !== undefined };
+}
+
 type Json = Record<string, unknown>;
 const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -229,7 +249,15 @@ export function claudeChannels({ env, parentCmd, entry, files }: ChannelsInput):
   const configDir = env.CLAUDE_CONFIG_DIR || join(files.home, ".claude");
   const global = parse(files.read(join(env.CLAUDE_CONFIG_DIR || files.home, ".claude.json")));
   const features = isObject(global?.cachedGrowthBookFeatures) ? global.cachedGrowthBookFeatures : {};
-  if (features.tengu_harbor === false) return off("feature", "channels aren't currently available to this Claude Code account");
+  const flags = flagSource(env);
+  if (flags.source === "none") {
+    const remedy = flags.cacheable ? "; set CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1 to use the cached ones" : "";
+    return off("feature", `${flags.cause} turns off Claude Code's feature flags, and channels are off without them${remedy}`);
+  }
+  // A live session fetches a flag the cache lacks; one reading only the cache gets the default, false.
+  if (flags.source === "cache" ? features.tengu_harbor !== true : features.tengu_harbor === false) {
+    return off("feature", "channels aren't currently available to this Claude Code account");
+  }
 
   const limits = parse(files.read(join(configDir, "policy-limits.json")));
   const restriction = isObject(limits?.restrictions) ? limits.restrictions.allow_channels : undefined;

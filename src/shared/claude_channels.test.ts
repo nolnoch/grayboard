@@ -101,6 +101,31 @@ describe("claudeChannels", () => {
     expect(state(cmd, { files: limits("not json") })).toBe("on");
   });
 
+  test("feature flags off: telemetry switches, DISABLE_GROWTHBOOK and a custom OAuth URL", () => {
+    const cmd = `claude ${DEV} ${PLUGIN}`;
+    const cached = globalConfig({ cachedGrowthBookFeatures: { tengu_harbor: true } });
+    const reason = (env: Record<string, string>, files = cached) => {
+      const v = verdict(cmd, { env: { ...CLI, ...env }, files });
+      return v.state === "off" ? `${v.check}: ${v.reason}` : v.state;
+    };
+    // Each switch turns the flags off even with tengu_harbor cached true.
+    expect(reason({ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" })).toStartWith("feature: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC turns off");
+    expect(reason({ DISABLE_TELEMETRY: "0" })).toStartWith("feature: DISABLE_TELEMETRY"); // any non-empty value
+    expect(reason({ DO_NOT_TRACK: "true" })).toStartWith("feature: DO_NOT_TRACK");
+    expect(reason({ DO_NOT_TRACK: "0" })).toBe("on"); // parsed as a boolean
+    expect(reason({ CLAUDE_CODE_CUSTOM_OAUTH_URL: "" })).toStartWith("feature: CLAUDE_CODE_CUSTOM_OAUTH_URL");
+    expect(reason({ DISABLE_GROWTHBOOK: "1", CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF: "1" })).toStartWith("feature: DISABLE_GROWTHBOOK");
+    expect(reason({ DISABLE_TELEMETRY: "1" })).toContain("CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF=1");
+    expect(reason({ CLAUDE_CODE_CUSTOM_OAUTH_URL: "https://x" })).not.toContain("CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF");
+    // The disk-cache switch reads the cache under a telemetry switch only, and needs tengu_harbor there.
+    const disk = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF: "1" };
+    expect(reason(disk)).toBe("on");
+    expect(reason(disk, globalConfig({}))).toStartWith("feature: channels aren't");
+    expect(reason({ CLAUDE_CODE_CUSTOM_OAUTH_URL: "https://x", CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF: "1" })).toStartWith("feature: CLAUDE_CODE_CUSTOM_OAUTH_URL");
+    // A live session with no cache is left to the other checks.
+    expect(reason({}, globalConfig({}))).toBe("on");
+  });
+
   test("CLAUDE_CONFIG_DIR moves .claude.json and the cached policy files", () => {
     const cmd = `claude ${DEV} ${PLUGIN}`;
     const env = { ...CLI, CLAUDE_CONFIG_DIR: "/cfg" };
