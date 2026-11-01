@@ -131,7 +131,7 @@ test("only a push or hold hello consumes a bridge death notice, never a tools-on
   const tools = await application.selectIdentity(alice, "be", delivery(sink()), { push: false });
   // #284 port: a hosted unbound session gets no notices; a WSS unbound
   // session is a push session, so it would drain it (as next does below).
-  const unbound = application.hostedSession(alice, "hosted-unbound", null, null, delivery(sink()));
+  const unbound = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery(sink()));
   const human = await application.attachHuman(alice, delivery(sink()));
   for (const info of [tools.info, unbound.info]) expect(info.notices ?? []).toEqual([]);
   expect(human.ok.notices ?? []).toEqual([]);
@@ -261,9 +261,9 @@ test("unbound hosted reads never use the human address and still list and read b
   const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
-  const unregistered = application.hostedSession(alice, "id:0000000000000", null, null, delivery(sink())).session;
+  const unregistered = application.hostedSession(alice, "id:0000000000000", [], null, null, delivery(sink())).session;
   application.hostedRegister(alice, "id:1111111111111", "opencode");
-  const registered = application.hostedSession(alice, "id:1111111111111", null, null, delivery(sink())).session;
+  const registered = application.hostedSession(alice, "id:1111111111111", [], null, null, delivery(sink())).session;
   for (const session of [unregistered, registered]) {
     expect(application.boardCatalog(session).boards.map(b => b.name)).toContain("e2e");
     expect(application.boardCatalog(session).boards.map(b => b.name)).not.toContain("secret");
@@ -280,7 +280,7 @@ test("unbound hosted reads never use the human address and still list and read b
 });
 
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
-  const { session, info } = application.hostedSession(alice, "hosted-unbound", null, null, delivery(sink()));
+  const { session, info } = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery(sink()));
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
   expect(store.repo.aliases.listForScope("person", alice.user_email)).toEqual([]);
@@ -327,7 +327,7 @@ test("hold sessions block binding and candidates without push or online presence
   const owner = (await application.selectIdentity(alice, "held", delivery(out), { push: false, hold: true, session_key: "hold-secret", where: "checkout" })).session;
   application.call(owner, "peer_status", { text: "working" });
   const tools = (await application.selectIdentity(alice, "held", delivery(sink()), { push: false })).session;
-  const observer = application.hostedSession(alice, "hosted-observer", null, null, delivery(sink())).session;
+  const observer = application.hostedSession(alice, "hosted-observer", [], null, null, delivery(sink())).session;
   expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false, status: "working" }]);
   expect(tools.toolsOnly).toBe(true);
   expect(tools.holds).toEqual([]);

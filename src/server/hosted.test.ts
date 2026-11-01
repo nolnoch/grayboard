@@ -8,8 +8,8 @@ import { openDatabase } from "./db.ts";
 import { createHostedSessions, deliveryDeclaration, sessionContext } from "./hosted.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
-import { boundInstructions } from "../core/bindings.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { aliasUser, boundInstructions } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
@@ -45,7 +45,7 @@ test("one reconciliation invalidates listeners once, not once per root", async (
   try {
     database.repo.hosted.atomic(() => {});
     expect(invalidations).toBe(1);
-    expect(database.repo.hosted.all().filter(row => row.name)).toHaveLength(4);
+    expect(application.holdsByOwner().size).toBe(4);
   } finally { unlisten(); }
 });
 
@@ -242,7 +242,16 @@ test("two contexts execute tools under distinct bound identities", async () => {
   expect(identities).toEqual(["you@example.com/fe", "you@example.com/be"]);
 });
 
-test("rebind retains ownership and children but fences old delivery", async () => {
+test("a hosted bind refused for a live holder leaves its refused binding row (the row survives the rolled-back transaction)", async () => {
+  await hosted.bind(principal, context("one"), { name: "fe", create: true });
+  await delivery.open(principal, context("one"));
+  await expect(hosted.bind(principal, context("two"), { name: "fe" })).rejects.toHaveProperty("code", "alias_held");
+  const two = context("two");
+  if (!("id" in two)) throw new Error("fixture has no mapped source");
+  expect(database.db.prepare("SELECT name, event FROM binding_events WHERE session_id = ? AND event = 'refused'").all(two.id)).toEqual([{ name: "you@example.com/fe", event: "refused" }]);
+});
+
+test("a second bind adds a hold, keeps ownership, children and the first hold's claims, and fences old delivery", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.register(principal, context("root"), "child");
   const before = await hosted.whoami(principal, context("root"));
@@ -256,8 +265,8 @@ test("rebind retains ownership and children but fences old delivery", async () =
   expect(database.db.prepare("SELECT status, status_at FROM ids WHERE id = ?").get(root.id)).toEqual({ status: "reviewing", status_at: now });
   expect(database.db.prepare("SELECT queue_off FROM aliases WHERE address = ?").get("you@example.com/fe")).toEqual({ queue_off: 1 });
   expect(database.db.prepare("SELECT queue_off FROM aliases WHERE address = ?").get("you@example.com/be")).toEqual({ queue_off: null });
-  expect(listClaims(database.db)).toMatchObject([{ key: "ticket:ENG-142", holder: "you@example.com/be" }]);
-  expect(await hosted.whoami(principal, context("child"))).toMatchObject({ name: "be", ownership: before.ownership, child: true });
+  expect(listClaims(database.db)).toMatchObject([{ key: "ticket:ENG-142", holder: "you@example.com/fe" }]);
+  expect(await hosted.whoami(principal, context("child"))).toMatchObject({ primary: "you@example.com/fe", held: ["you@example.com/fe", "you@example.com/be"], ownership: before.ownership, child: true });
   await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");
   expect(delivery.activeLeaseCount).toBe(0);
 });
@@ -268,7 +277,7 @@ test("children cannot bind or own delivery, and child end leaves root", async ()
   await expect(hosted.bind(principal, context("child"), { name: "be", create: true })).rejects.toHaveProperty("code", "child_session");
   await expect(delivery.open(principal, context("child"))).rejects.toHaveProperty("code", "child_session");
   await hosted.end(principal, context("child"));
-  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("name", "fe");
+  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("primary", "you@example.com/fe");
   expect(await hosted.whoami(principal, context("child"))).toHaveProperty("unbound", true);
 });
 
@@ -285,13 +294,13 @@ test("registration rejects invalid ownership graphs without moving an existing c
   const rootContext = context("root");
   if (!("id" in rootContext)) throw new Error("fixture context missing");
   await expect(hosted.end(principal, context("child"), rootContext.id)).rejects.toHaveProperty("code", "child_session");
-  expect(await hosted.whoami(principal, context("child"))).toMatchObject({ name: "fe", child: true });
+  expect(await hosted.whoami(principal, context("child"))).toMatchObject({ primary: "you@example.com/fe", child: true });
   const foreign = database.repo.users.upsertByEmail("peer@example.com", null);
   const outsider = { ...principal, authed: { user_id: foreign.id, user_email: foreign.email, session_id: 0 } };
   const outsiderContext = sessionContext(outsider, { [OPENCODE_SESSION_META]: "root" });
   expect(await hosted.whoami(outsider, outsiderContext)).toHaveProperty("unbound", true);
   await hosted.bind(outsider, outsiderContext, { name: "fe", create: true });
-  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("name", "fe");
+  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("primary", "you@example.com/fe");
   const wrongClient = { ...principal, clientId: "https://other.example/client.json", sourceKey: null };
   await expect(hosted.bind(wrongClient, sessionContext(wrongClient, { [OPENCODE_SESSION_META]: "root" }), { name: "fe" })).rejects.toHaveProperty("code", "unbound");
 });
@@ -353,7 +362,7 @@ test("pending holds the reader gate while rebind waits; stale receipt cannot mov
     binding = hosted.bind(principal, context("root"), { name: "be", create: true }).then(value => { finished = true; return value; });
     await Promise.resolve(); await Promise.resolve();
     expect(finished).toBe(false);
-    expect((await database.repo.hosted.all()).find(row => row.name)?.name).toBe("fe");
+    expect([...application.holdsByOwner().values()].flat().map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["fe"]);
   });
   await binding;
   expect(issued).toHaveLength(1);
@@ -371,17 +380,16 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
   expect(wrote).toBe(false);
 });
 
-test("bind publishes its new holder before the after-commit pause and old-mailbox DMs stay queued", async () => {
+test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const sender = (await application.selectIdentity(tokenSession(application.repo, principal.authed), "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     application.send(sender, "you@example.com/fe", "not for be");
-    expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
-    expect(application.hostedHolder("you@example.com/be")).toBeDefined();
+    expect(application.hostedHolder("you@example.com/fe")).toBeDefined();
+    expect(application.hostedHolder("you@example.com/be")).toBe(application.hostedHolder("you@example.com/fe"));
   });
   const lease = await delivery.open(principal, context("root"));
-  expect(await delivery.pending(principal, context("root"), lease.capability)).toEqual([]);
-  expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(0);
+  expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);
 });
 
 test("WSS contender releases a never-leased hosted owner only after the idle window", async () => {
@@ -393,4 +401,107 @@ test("WSS contender releases a never-leased hosted owner only after the idle win
   expect(acquired.session.identityFull).toBe("you@example.com/fe");
   expect(database.repo.hosted.all()).toEqual([]);
   application.close(acquired.session);
+});
+
+test("a hosted root holds several names: bind adds, unbind releases one and promotes the oldest, the last leaves it owning but unbound (#451)", async () => {
+  const at = (name: string) => `you@example.com/${name}`;
+  for (const name of ["fe", "be", "ce"]) await hosted.bind(principal, context("root"), { name, create: true });
+  const first = await hosted.whoami(principal, context("root"));
+  expect(first).toMatchObject({ held: [at("fe"), at("be"), at("ce")], primary: at("fe") });
+  // A repeated bind of a held name adds nothing and doesn't bump the generation.
+  expect(await hosted.bind(principal, context("root"), { name: "be" })).toMatchObject({ content: [{ text: 'already bound to "be"' }] });
+  const rootId = (context("root") as { id: string }).id, gen = database.repo.hosted.get(rootId)!.bind_gen;
+  await hosted.bind(principal, context("root"), { name: "be", where: "laptop" });
+  expect(database.repo.hosted.get(rootId)).toMatchObject({ place: "laptop", bind_gen: gen });
+  const released = await hosted.unbind(principal, context("root"), { name: "fe" });
+  expect(released.content[0]!.text).toContain('Released "fe"');
+  expect(released.content[0]!.text).toContain('You now send as "be"');
+  expect(await hosted.whoami(principal, context("root"))).toMatchObject({ held: [at("be"), at("ce")], primary: at("be"), ownership: first.ownership });
+  expect(await hosted.unbind(principal, context("root"), { name: "fe" })).toMatchObject({ content: [{ text: 'not holding "fe"' }] });
+  await hosted.unbind(principal, context("root"), { name: "be" });
+  await hosted.unbind(principal, context("root"), { name: "ce" });
+  expect(application.holdsByOwner().size).toBe(0);
+  const unbound = await hosted.whoami(principal, context("root"));
+  expect(unbound).toMatchObject({ held: [], ownership: first.ownership });
+  await expect(hosted.run(principal, context("root"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
+  // The released names' mail still queues for their next holder.
+  expect(database.repo.aliases.find(at("fe"))).toBeDefined();
+});
+
+const at = (name: string) => `you@example.com/${name}`;
+test("ending a hosted root releases every hold in one transaction and audits each release (#451)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  expect(application.holdsByOwner().size).toBe(1);
+  await hosted.end(principal, context("root"));
+  expect(application.holdsByOwner().size).toBe(0);
+  expect(database.repo.hosted.all()).toEqual([]);
+  expect(database.db.query("SELECT count(*) AS n FROM alias_holds").get()).toEqual({ n: 0 });
+  // Another session can take either name at once.
+  await hosted.bind(principal, context("other"), { name: "be", create: false });
+  expect(await hosted.whoami(principal, context("other"))).toMatchObject({ primary: at("be") });
+});
+
+test("a generic-key poll root's writes_as is recorded, makes it tools-only, and a different later declaration is refused (#451)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const meta = (as: string) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: as });
+  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  const first = await hosted.whoami(generic, meta("fe"));
+  expect(first).toMatchObject({ held: [], writes_as: "you@example.com/fe" });
+  expect(database.repo.hosted.all().map(r => r.writes_as)).toEqual(["you@example.com/fe"]);
+  await expect(hosted.whoami(generic, meta("be"))).rejects.toHaveProperty("code", "id_collision");
+  // A plain principal's declaration is never read.
+  expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_WRITES_AS_META]: "fe" })).not.toHaveProperty("writesAs");
+});
+
+test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "fe" });
+  const id = (meta as { id: string }).id;
+  await hosted.whoami(generic, meta);
+  const used = () => database.db.prepare("SELECT writes_as FROM ids WHERE id = ?").get(id);
+  expect(used()).toEqual({ writes_as: "you@example.com/fe" });
+  expect(aliasUser(database.db, "you@example.com/fe")).toBe(id);
+  await hosted.end(generic, meta);
+  expect(used()).toEqual({ writes_as: null });
+  expect(aliasUser(database.db, "you@example.com/fe")).toBeNull();
+  await hosted.whoami(generic, meta);
+  expect(used()).toEqual({ writes_as: "you@example.com/fe" });
+  expect(aliasUser(database.db, "you@example.com/fe")).toBe(id);
+});
+
+test("revoking one hosted hold releases only it, bumps the generation and closes the lease; the next whoami shows what is left (#451)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
+  const lease = await delivery.open(principal, context("root"));
+  const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  const after = database.repo.hosted.get(before.session_id)!;
+  expect(after.bind_gen).toBeGreaterThan(before.bind_gen);
+  expect(after.ownership_id).toBe(before.ownership_id);
+  expect(delivery.activeLeaseCount).toBe(0); // closed by the revocation itself, before any hosted request could notice
+  expect(await hosted.whoami(principal, context("root"))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe", ownership: before.ownership_id });
+  expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'alias.revoked'").get()).toEqual({ n: 1 });
+  await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");
+});
+
+test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const id = (raw: string) => (context(raw) as { id: string }).id;
+  await hosted.bind(principal, context("revoked"), { name: "ops/lead", create: true });
+  await delivery.open(principal, context("revoked"));
+  await hosted.bind(principal, context("unbound"), { name: "fe", create: true });
+  await delivery.open(principal, context("unbound"));
+  await hosted.unbind(principal, context("unbound"), { name: "fe" });
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  expect(delivery.activeLeaseCount).toBe(0);
+  for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(id(raw))).toMatchObject({ lease_deadline: null });
+  now += 300_000; // past any lease, short of the idle window
+  hosted.sweep();
+  for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(id(raw))).toBeDefined();
 });

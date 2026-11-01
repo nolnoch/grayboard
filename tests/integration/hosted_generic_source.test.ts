@@ -160,13 +160,13 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: an opted-in opera
   const root = "run 42/agent ✓", meta: [string, string][] = [[GRAYBOARD_SESSION_META, root]];
   const native = await connect(token, meta, { version });
   await bind(native, "broker-run");
-  expect(json(await call(native, "whoami"))).toMatchObject({ name: "broker-run" });
+  expect(json(await call(native, "whoami"))).toMatchObject({ primary: "alice@example.com/broker-run" });
 
   const sub = await connect(token, meta, { version, role: "subscriber" });
   const registered = json(await call(sub, "session_register", { child: "run 42/subagent" }));
   expect(registered).toMatchObject({ message: "registered" });
   const child = await connect(token, [[GRAYBOARD_SESSION_META, "run 42/subagent"]], { version });
-  expect(json(await call(child, "whoami"))).toMatchObject({ name: "broker-run", child: true, root: registered.root });
+  expect(json(await call(child, "whoami"))).toMatchObject({ primary: "alice@example.com/broker-run", child: true, root: registered.root });
 
   const lease = json(await call(sub, "delivery_open"));
   expect(lease.identity.identity_full).toBe("alice@example.com/broker-run");
@@ -208,12 +208,12 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await stop();
   start([operator(BROKER, false)]);
   // The bound root keeps its name; its client's requests are unmapped from now on.
-  expect(app.repo.hosted.all().filter(r => r.name === "owner").map(r => r.client_id)).toEqual([BROKER]);
+  expect(app.repo.hosted.all().filter(r => app.application.hostedHolds(r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
   const tokens = { kept, fresh: await grant(BROKER), cimd: await grant(CIMD_CLIENT) };
   for (const [label, token] of Object.entries(tokens)) {
     const meta: [string, string][] = [[GRAYBOARD_SESSION_META, "owner"], [OPENCODE_SESSION_META, "owner"]];
     const native = await connect(token, meta), sub = await connect(token, meta, { role: "subscriber" });
-    expect(json(await call(native, "whoami")), label).toMatchObject({ name: null, unbound: true });
+    expect(json(await call(native, "whoami")), label).toMatchObject({ primary: null, held: [], unbound: true });
     expect(json(await call(native, "board_list")).map((b: { name: string }) => b.name), label).toContain("brokered");
     expect(json(await call(native, "board_read", { board: "brokered" })).posts.map((p: { body: string }) => p.body), label).toEqual(["readable"]);
     expect(refused(await call(native, "bind", { name: "owner" })), label).toBe("unbound");
@@ -244,7 +244,7 @@ test("OpenCode maps only its own key and an opted-in client only the generic key
     const both = await connect(token, [[own, `root ${own}`], [other, "ignored"]]);
     await bind(both, own === OPENCODE_SESSION_META ? "oc-run" : "broker-run");
     const alone = await connect(token, [[own, `root ${own}`]]);
-    expect(json(await call(alone, "whoami"))).toMatchObject({ name: own === OPENCODE_SESSION_META ? "oc-run" : "broker-run" });
+    expect(json(await call(alone, "whoami"))).toMatchObject({ primary: `alice@example.com/${own === OPENCODE_SESSION_META ? "oc-run" : "broker-run"}` });
   }
   expect(app.repo.aliases.find("alice@example.com/wrong-key")).toBeUndefined();
   expect(app.repo.hosted.all().map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
@@ -258,8 +258,8 @@ test("one raw source under two clients of one user is two hosted sessions", asyn
   const second = await connect(await grant(BROKER_TWO), [[GRAYBOARD_SESSION_META, "shared"]]);
   await bind(first, "first");
   await bind(second, "second");
-  expect(json(await call(first, "whoami"))).toMatchObject({ name: "first" });
-  expect(json(await call(second, "whoami"))).toMatchObject({ name: "second" });
+  expect(json(await call(first, "whoami"))).toMatchObject({ primary: "alice@example.com/first" });
+  expect(json(await call(second, "whoami"))).toMatchObject({ primary: "alice@example.com/second" });
   const rows = app.repo.hosted.all().filter(r => r.source_session_id === "shared");
   expect(rows.map(r => r.client_id).sort()).toEqual([BROKER, BROKER_TWO].sort());
   expect(new Set(rows.map(r => r.session_id)).size).toBe(2);
@@ -286,7 +286,7 @@ test("with no operator clients, each built-in client signs in through consent, b
   for (const [i, clientId] of BUILTIN_CLIENT_IDS.entries()) {
     const c = await connect(await grant(clientId), [[GRAYBOARD_SESSION_META, `${clientId} root`]]);
     await bind(c, `${harnesses[i]}-run`);
-    expect(json(await call(c, "whoami"))).toMatchObject({ name: `${harnesses[i]}-run` });
+    expect(json(await call(c, "whoami"))).toMatchObject({ primary: `alice@example.com/${harnesses[i]}-run` });
     conns.push(c);
   }
   const peers = json(await call(conns[0]!, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];
@@ -346,7 +346,7 @@ test("a malformed delivery declaration is bad_request on initialize and on a nat
   expect(await refusedCall.json()).toMatchObject({ code: "bad_request" });
   // The subscriber role ignores the declaration, even a malformed one.
   const sub = await connect(token, [root, [GRAYBOARD_DELIVERY_META, "push"]], { role: "subscriber" });
-  expect(json(await call(sub, "whoami"))).toMatchObject({ name: "omp-run" });
+  expect(json(await call(sub, "whoami"))).toMatchObject({ primary: "alice@example.com/omp-run" });
   // OpenCode's client never has its declaration read: its text is unchanged.
   const oc = await grant(OPENCODE_CLIENT);
   await bind(await connect(oc, [[OPENCODE_SESSION_META, "oc root"]]), "oc-run");

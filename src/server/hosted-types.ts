@@ -1,6 +1,6 @@
 export type HostedSession = {
   session_id: string; ownership_id: number; user_id: number; client_id: string; grant_id: string;
-  source_session_id: string; name: string | null; bind_gen: number; root_session_id: string | null;
+  source_session_id: string; writes_as: string | null; bind_gen: number; root_session_id: string | null;
   place: string | null; lease_deadline: number | null; created_at: number; last_seen_at: number;
 };
 export type HostedEnd = "idle" | "closed" | "revoked" | "disabled" | "expired";

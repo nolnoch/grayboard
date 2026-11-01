@@ -9,12 +9,13 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 
 export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
-export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; name: string };
+// `address`: the alias a direct item was sent to, which the client checks against its hold set (#451); a DM to the session's own ID and a board item have none (canReceiveBoard checks boards).
+export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; address?: string };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
 export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number };
 type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
 type Lease = {
-  principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number; name: string;
+  principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number;
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
@@ -22,8 +23,8 @@ class StaleCapability extends ApplicationError {
   constructor() { super("not_found", "no live delivery lease for this session; it was closed (expired or changed). Open a new one."); }
 }
 function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
-  const stamp = { ownership: lease.ownership, bind_gen: lease.generation, name: lease.name };
-  if (event.kind === "direct") return { id: `direct:${event.message.id}`, actionable: true, event, ...stamp };
+  const stamp = { ownership: lease.ownership, bind_gen: lease.generation };
+  if (event.kind === "direct") return { id: `direct:${event.message.id}`, actionable: true, event, ...stamp, ...(event.message.recipient === lease.sessionId ? {} : { address: event.message.recipient }) };
   const item = event.item;
   return { id: item.kind === "push" ? `push:${item.post.id}` : `digest:${item.board}:${item.latest.id}`, actionable: item.kind === "push" && !item.deferred, event, ...stamp };
 }
@@ -47,7 +48,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   }
   function matches(lease: Lease, row?: HostedSession) {
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
-      row.grant_id === lease.principal.grantId && row.name === lease.name && row.lease_deadline !== null && row.lease_deadline > now();
+      row.grant_id === lease.principal.grantId && row.lease_deadline !== null && row.lease_deadline > now();
   }
   const unlisten = hosted.listen(() => {
     for (const lease of [...leases.values()]) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
@@ -74,7 +75,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
-        if (!row.name) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
+        if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         previous = [...leases.values()].find(l => l.sessionId === row.session_id);
         if (previous && matches(previous, row)) return previous;
         if (leases.size >= 256 || [...leases.values()].filter(l => l.principal.authed.user_id === p.authed.user_id).length >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
@@ -87,13 +88,13 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (previous) finish(previous);
         const { row, expiresAt } = result;
         let lease!: Lease;
-        const selected = application.hostedSession(p.authed, row.session_id, row.name, row.place, {
+        const selected = application.hostedSession(p.authed, row.session_id, application.hostedHolds(row.session_id), null, row.place, {
           deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           probe: async () => true,
           closed() { if (lease) finish(lease); },
         }, false, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
-          ownership: row.ownership_id, generation: row.bind_gen, name: row.name!, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
+          ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
         leases.set(lease.capability, lease);
         return opened(lease, true, hooks);
       });
@@ -146,7 +147,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
           const records = ids.map(id => lease.issued.get(id) ?? lease.acknowledged.get(id) ?? stale(p, context, capability));
           for (const r of records) {
-            if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || r.item.name !== row.name) stale(p, context, capability);
+            if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || (r.item.address !== undefined && !lease.session.addresses.includes(r.item.address))) stale(p, context, capability);
             if (r.item.event.kind === "board" && !application.canReceiveBoard(lease.session, r.item.event.item.kind === "push" ? r.item.event.item.post.board : r.item.event.item.board)) stale(p, context, capability);
           }
           const direct = records.filter(r => !r.acked && r.item.event.kind === "direct");

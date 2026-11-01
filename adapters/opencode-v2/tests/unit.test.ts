@@ -21,22 +21,22 @@ test("typed unknown-name suggestions are bounded validated account names, not ar
 });
 test("an in-use refusal carries a bounded plain-text holder; other codes and unsafe text drop it", () => {
   const holder = "the hosted session ses_other, in /work/app, last seen 3s ago";
-  const error = subscriberError({ code: "identity_in_use", holder }, false);
+  const error = subscriberError({ code: "alias_held", holder }, false);
   expect(error.holder).toBe(holder);
-  expect(failureMessage(error)).toBe(`Operation refused (identity_in_use); held by ${holder}`);
-  expect(subscriberError({ code: "identity_in_use", holder: `the hosted session x, in /${"d".repeat(1024)}, last seen 0s ago` }, false).holder).toBeDefined();
+  expect(failureMessage(error)).toBe(`Operation refused (alias_held); held by ${holder}`);
+  expect(subscriberError({ code: "alias_held", holder: `the hosted session x, in /${"d".repeat(1024)}, last seen 0s ago` }, false).holder).toBeDefined();
   for (const unsafe of ["", "x".repeat(2049), "held\nby", "held\u009bby", "held‮by", "held⁧by", 42, ["held"]]) {
-    const refused = subscriberError({ code: "identity_in_use", holder: unsafe }, false);
+    const refused = subscriberError({ code: "alias_held", holder: unsafe }, false);
     expect(refused.holder).toBeUndefined();
-    expect(failureMessage(refused)).toBe("Operation refused (identity_in_use)");
+    expect(failureMessage(refused)).toBe("Operation refused (alias_held)");
   }
   expect(subscriberError({ code: "identity_unknown", holder }, false).holder).toBeUndefined();
   expect(subscriberError({ code: "not_found", holder }, true).holder).toBeUndefined();
   expect(failureMessage(Object.assign(new SubscriberError("identity_unknown"), { holder }))).toBe("Operation refused (identity_unknown)");
-  expect(failureMessage(Object.assign(new SubscriberError("identity_in_use"), { holder: "held‮by" }))).toBe("Operation refused (identity_in_use)");
+  expect(failureMessage(Object.assign(new SubscriberError("alias_held"), { holder: "held‮by" }))).toBe("Operation refused (alias_held)");
 });
-export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", name: "be" };
-export const identity = { user: { email: "you@example.com" }, identity: "be", identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };
+export const enrollment: Enrollment = { version: 2, sessionID: "ses_root", mcpName: "grayboard", configuration: { type: "remote", url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "opencode", scope: "grayboard:delivery grayboard:tools", configHash: "config" }, integrationID: "native", connectionID: "selected", held: ["you@example.com/be"] };
+export const identity = { user: { email: "you@example.com" }, identity_full: "you@example.com/be", issuer: enrollment.configuration.issuer, resource: enrollment.configuration.url };
 async function retryWire(mode: "success" | "guard" | "abort" | "untyped") {
   const original = globalThis.fetch, abort = new AbortController();
   const requests: { token: string | null; body: string }[] = [];
@@ -76,7 +76,7 @@ test("HTTP429 retry stops on observed drift or abort and ignores untyped refusal
 });
 test("subscriber errors use structured tool codes and SDK resource data, never human prose or numeric codes", async () => {
   const wire = new Wire(wireOptions(enrollment.configuration.url), { token: async () => "native-secret" }, new AbortController().signal, enrollment.sessionID);
-  for (const code of ["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error"]) {
+  for (const code of ["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error"]) {
     wire.client.callTool = async () => ({ isError: true, structuredContent: { code }, content: [{ type: "text", text: "Bearer native-secret\n at secret-token.ts:123" }] });
     try { await wire.call("delivery_renew"); throw new Error("expected refusal"); }
     catch (error) {
@@ -120,7 +120,7 @@ test("SDK timeouts and closed connections are outages; an abort of the wire's ow
 test("enrollment fingerprint pins all logical fields independently of key order", () => {
   const hash = enrollmentHash(enrollment);
   expect(enrollmentHash({ ...enrollment, configuration: Object.fromEntries(Object.entries(enrollment.configuration).reverse()) as typeof enrollment.configuration })).toBe(hash);
-  for (const changed of [{ ...enrollment, sessionID: "other" }, { ...enrollment, name: "fe" }, { ...enrollment, connectionID: "other" }, { ...enrollment, configuration: { ...enrollment.configuration, clientID: "other" } }]) expect(enrollmentHash(changed)).not.toBe(hash);
+  for (const changed of [{ ...enrollment, sessionID: "other" }, { ...enrollment, held: ["you@example.com/fe"] }, { ...enrollment, connectionID: "other" }, { ...enrollment, configuration: { ...enrollment.configuration, clientID: "other" } }]) expect(enrollmentHash(changed)).not.toBe(hash);
 });
 test("edited root metadata cannot manufacture restored approval", async () => {
   const stored: Record<string, unknown> = { rootSessionIDs: [enrollment.sessionID], [`enrollmentHash:${enrollment.sessionID}`]: enrollmentHash(enrollment) };
@@ -132,13 +132,13 @@ test("edited root metadata cannot manufacture restored approval", async () => {
   expect(checked).toBe(false);
   expect(controller.status()).toMatchObject({ state: "paused", sessionID: enrollment.sessionID, message: "Saved enrollment invalid; explicitly enroll again" });
 });
-export const items = [{ id: "direct:1", actionable: true, event: { body: "untrusted" }, ownership: 1, bind_gen: 1, name: "be" }, { id: "direct:2", actionable: false, event: {}, ownership: 1, bind_gen: 1, name: "be" }];
+export const items = [{ id: "direct:1", actionable: true, event: { body: "untrusted" }, ownership: 1, bind_gen: 1, address: "you@example.com/be" }, { id: "direct:2", actionable: false, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }];
 test("stable admission IDs pin principal/name/root but survive new capability/generation", () => {
-  const id = stableID(enrollment, "direct:1", identity);
+  const id = stableID(enrollment, items[0]!, identity);
   expect(id).toMatch(/^msg_[a-f0-9]{64}$/);
-  expect(stableID({ ...enrollment, connectionID: "new" }, "direct:1", identity)).toBe(id);
-  expect(stableID({ ...enrollment, sessionID: "other" }, "direct:1", identity)).not.toBe(id);
-  expect(stableID(enrollment, "direct:1", { ...identity, user: { email: "other@example.com" } })).not.toBe(id);
+  expect(stableID({ ...enrollment, connectionID: "new" }, items[0]!, identity)).toBe(id);
+  expect(stableID({ ...enrollment, sessionID: "other" }, items[0]!, identity)).not.toBe(id);
+  expect(stableID(enrollment, items[0]!, { ...identity, user: { email: "other@example.com" } })).not.toBe(id);
 });
 test("admission failure stops prefix with no receipt", async () => {
   const receipts: string[] = [];
@@ -147,15 +147,15 @@ test("admission failure stops prefix with no receipt", async () => {
 });
 test("receipt failure replays the same durable ID before later items", async () => {
   const admitted: string[] = [], receipts: string[] = [];
-  await expect(admitPrefix(items, async i => { admitted.push(stableID(enrollment, i.id, identity)); }, async () => { throw new Error("lost response"); })).rejects.toThrow();
-  await admitPrefix(items, async i => { admitted.push(stableID(enrollment, i.id, identity)); }, async ids => { receipts.push(...ids); });
+  await expect(admitPrefix(items, async i => { admitted.push(stableID(enrollment, i, identity)); }, async () => { throw new Error("lost response"); })).rejects.toThrow();
+  await admitPrefix(items, async i => { admitted.push(stableID(enrollment, i, identity)); }, async ids => { receipts.push(...ids); });
   expect(admitted[0]).toBe(admitted[1]); expect(receipts).toEqual(["direct:1", "direct:2"]);
 });
 test("lease projection and issued batches require ownership, generation, name and authenticated principal", () => {
   const lease = { capability: "a".repeat(43), identity: { user_email: identity.user.email, identity_full: identity.identity_full }, ownership: 1, bind_gen: 1, expiresAt: Date.now() + 30_000 };
   expect(leaseOf(lease, enrollment).ownership).toBe(1);
   expect(() => leaseOf({ ...lease, bind_gen: 0 }, enrollment)).toThrow();
-  expect(() => leaseOf({ ...lease, identity: { user_email: "other@example.com", identity_full: identity.identity_full } }, enrollment)).toThrow();
+  expect(() => leaseOf({ ...lease, identity: { user_email: identity.user.email, identity_full: "you@example.com/fe" } }, enrollment)).toThrow();
   expect(itemsOf({ items })).toEqual(items);
   expect(() => itemsOf({ items: [{ id: "missing", actionable: true, event: {} }] })).toThrow();
   expect(() => itemsOf({ items: Array(101).fill(items[0]) })).toThrow();

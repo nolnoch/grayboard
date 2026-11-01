@@ -11,7 +11,7 @@ import { bounded, drainSessions } from "./reload-state.ts";
 type Host = FixtureHost;
 type Input = NativeInput;
 type Admission = NativeAdmission;
-export type Batch = { id: string; actionable: boolean; event: { text: string }; ownership: number; bind_gen: number; name: string };
+export type Batch = { id: string; actionable: boolean; event: { text: string }; ownership: number; bind_gen: number; address: string };
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 export class DurableFixture {
   readonly scenario = process.env.GRAYBOARD_DURABLE_CASE ?? "";
@@ -50,7 +50,7 @@ async function until(read: () => boolean | Promise<boolean>, label: string) {
   for (let n = 0; n < 160; n++) { if (await read()) return; await Bun.sleep(50); }
   throw new Error("Durable wait expired: " + label);
 }
-export async function durableCases(f: DurableFixture, host: Host, ctx: Context, rpc: { enroll(input: { sessionID: string; name?: string }, options: { location: { directory: string } }): Promise<unknown>; pause(input: {}, options: { location: { directory: string } }): Promise<unknown>; status(input: {}, options: { location: { directory: string } }): Promise<unknown> }, location: { directory: string }, state: (id: string) => { name: string | null; ownership: number | null; gen: number; capability?: string }, subscriberWork: SubscriberWork) {
+export async function durableCases(f: DurableFixture, host: Host, ctx: Context, rpc: { enroll(input: { sessionID: string; name?: string }, options: { location: { directory: string } }): Promise<unknown>; pause(input: {}, options: { location: { directory: string } }): Promise<unknown>; status(input: {}, options: { location: { directory: string } }): Promise<unknown> }, location: { directory: string }, state: (id: string) => { held: string[]; ownership: number | null; gen: number; capability?: string }, subscriberWork: SubscriberWork) {
   const replay = f.scenario === "reload";
   if (replay && f.phase === "reload") {
     const saved = await Bun.file(join(f.root, "durable.json")).json();
@@ -87,7 +87,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
   const root = await create("Durable root"), other = await create("Untouched root"), child = await create("Untouched child", root);
   await rpc.enroll({ sessionID: root, name: "durable" }, { location });
   await until(() => !!state(root).capability, "initial lease");
-  const batch = (session: string, id: string, actionable: boolean): Batch => ({ id, actionable, event: { text: "IMMUTABLE ORIGINAL " + id }, ownership: state(session).ownership!, bind_gen: state(session).gen, name: state(session).name! });
+  const batch = (session: string, id: string, actionable: boolean): Batch => ({ id, actionable, event: { text: "IMMUTABLE ORIGINAL " + id }, ownership: state(session).ownership!, bind_gen: state(session).gen, address: "you@example.com/" + state(session).held[0]! });
   if (replay) {
     try {
     const action = await create("Durable action");

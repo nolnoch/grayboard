@@ -192,9 +192,7 @@ export type ErrorCode =
   // a send or mention named an ID that receives nothing (a tools-only session)
   | "no_delivery"
   // Hosted MCP only (src/server/hosted.ts), never on the WSS wire: a hosted
-  // bind refused because another session holds the name, a hosted call that
-  // needs a bound name, and the hosted child-session registration refusals.
-  | "identity_in_use"
+  // call that needs a bound name, and the hosted child-session registration refusals.
   | "unbound"
   | "child_session"
   | "invalid_registration"

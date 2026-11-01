@@ -15,14 +15,14 @@ export const holderText = (value: unknown): value is string => typeof value === 
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
-const domainCodes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
+const domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
 export function subscriberError(value: unknown, leaseOperation: boolean): SubscriberError {
   const code = (value as { code?: unknown } | undefined)?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
   const suggestions = (value as { known?: unknown } | undefined)?.known;
   const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 256 && suggestions.every(name => typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
   const holder = (value as { holder?: unknown } | undefined)?.holder;
-  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "identity_in_use" && holderText(holder) ? holder : undefined);
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "alias_held" && holderText(holder) ? holder : undefined);
 }
 // The server refused the connection's first request (server/discover or
 // initialize) with an HTTP status the SDK would report only as a failed

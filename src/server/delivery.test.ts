@@ -55,6 +55,16 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
 });
 
+test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  const root = context(bob);
+  if (!("id" in root)) throw new Error("fixture has no mapped source");
+  application.send(sender, root.id, "by id");
+  send("by alias");
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  expect(items.map(item => item.address)).toEqual([undefined, "bob@example.com/fe"]);
+});
+
 test("delivery hook diagnostics never inspect forged stack messages or causes", async () => {
   const log = spyOn(console, "error").mockImplementation(() => {});
   const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
@@ -201,13 +211,13 @@ test("explicit release ends ownership and closes all children", async () => {
 test("cross WSS/hosted holders share one exclusion path", async () => {
   await expect(application.selectIdentity(tokenSession(application.repo, bob.authed), "fe", sink)).rejects.toHaveProperty("code", "alias_held"); // #284: a WSS bind's refusal (was identity_in_use)
   const wss = (await application.selectIdentity(tokenSession(application.repo, bob.authed), "be", sink)).session;
-  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
+  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
   application.close(wss);
   // #284 S4: a closed WSS session holds its aliases through its grace; the sweep ends it.
-  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
+  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
   application.sweepSessions(Date.now() + GRACE_MS + SWEEP_MS);
   await hosted.bind(bob, context(bob), { name: "be" });
-  expect(await hosted.whoami(bob, context(bob))).toHaveProperty("name", "be");
+  expect(await hosted.whoami(bob, context(bob))).toHaveProperty("held", ["bob@example.com/fe", "bob@example.com/be"]);
 });
 
 test("disable immediately closes held ownership and invalidates capability", async () => {

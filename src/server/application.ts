@@ -32,7 +32,7 @@ import { assertDeliverableId, endSession, Undeliverable } from "../core/session_
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
-import { claimExpiryTimer, listClaims, moveClaims } from "../core/claims.ts";
+import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
 import { mayActIn, principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
@@ -371,6 +371,9 @@ function describeHolder(hub: Hub, id: string): string {
   const place = idRow(hub.db, id)?.place;
   const until = hub.grace.get(id);
   const grace = until === undefined ? "" : `; disconnected at ${new Date(until - GRACE_MS).toISOString()}, ends by ${new Date(until).toISOString()}`;
+  // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
+  const hosted = hub.repo.hosted.get(id);
+  if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
   return `the session ${id}${place ? `, in ${place}` : ""}${grace}`;
 }
 
@@ -489,13 +492,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const id = session.sessionId;
     if (session.transport === "hosted") {
       for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
-      if (hub.hostedHolders.get(id) === session) {
-        hub.hostedHolders.delete(id);
-        for (const a of session.holds) {
-          dropHold(db, a, id);
-          touchAlias(db, a);
-        }
-      }
+      // alias_holds is the hosted hold set's only truth (#451): a close is a rebuild
+      // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
+      if (hub.hostedHolders.get(id) === session) hub.hostedHolders.delete(id);
       if (session.writerId) touchId(db, session.writerId);
       return;
     }
@@ -621,26 +620,40 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // hold is released, and a live one is told (alias_lost) and sends as its
   // primary from here. A tools-only session writes only as its writes_as,
   // so it has nothing left to be: its session ends, and its reconnect's
-  // hello is refused. A hosted session's hold is released in the database
-  // only (#408); hosted binds only the user's own scope, so none is revoked
-  // today.
+  // hello is refused. A hosted root's hold is released in the database (#408)
+  // and its generation bumped (#451): the live holder is rebuilt and its lease
+  // closed, and the next request or whoami tells the session what it lost.
   function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): void {
     if (!uses.length) return;
     const ended: string[] = [];
     for (const u of uses) {
       const { reason } = u;
       const s = hub.holders.get(u.id);
+      const hosted = repo.hosted.owned(u.id);
       if (!u.held) {
         writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
         if (s) terminate(s, new ApplicationError("forbidden", `this connection wrote as "${u.address}", and ${reason}`));
-        ended.push(u.id);
+        // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
+        if (hosted) repo.hosted.atomic(() => repo.hosted.end(u.id, "revoked", now()));
+        else ended.push(u.id);
         continue;
       }
-      repo.atomic(() => {
+      // A hosted root's change goes through the hosted store's transaction, whose commit tells the hosted
+      // service and delivery to close the lease now, not at its next renewal.
+      const revoke = () => {
         dropHold(db, u.address, u.id);
         logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
         writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
-      });
+        if (hosted) {
+          const row = repo.hosted.get(u.id);
+          if (row) {
+            // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
+            repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(db, u.id).length ? row.lease_deadline : null });
+            if (row.lease_deadline !== null) writeAudit(repo, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
+          }
+        }
+      };
+      if (hosted) repo.hosted.atomic(revoke); else repo.atomic(revoke);
       if (!s || !s.holds.includes(u.address)) continue;
       setHolds(hub, s, s.holds.filter((a) => a !== u.address));
       s.sink.aliasLost?.(u.address, reason);
@@ -829,11 +842,28 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
   // already holds answers ok and applies only `meta`; the others stay held,
   // and the primary changes only when the session held nothing.
+  // A WSS holder of the alias, or a hosted one, answers a probe before the bind decides
+  // (#402); bindNow is the rest, synchronous, which a hosted bind needs inside its
+  // transaction (hosted.ts clears a stale hosted contender itself first, so any hosted
+  // holder bindNow sees is live).
   async function bind(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
-    valid(session);
+    valid(session, true);
+    const target = bindTarget(hub, session.authed, m.alias);
+    const holder = "error" in target ? null : holderOf(db, target.address);
+    const hosted = holder === null ? undefined : hub.hostedHolders.get(holder);
+    if (hosted && hosted.sessionId !== session.sessionId) {
+      const responding = await hosted.sink.probe(hub.probeMs).catch(() => false);
+      valid(session, true);
+      if (!responding && hub.hostedHolders.get(hosted.sessionId) === hosted) close(hosted);
+    }
+    return bindNow(session, m);
+  }
+  // `refused`: where a refusal's binding row goes when the caller's transaction will roll it back with the throw
+  // (a hosted bind runs inside one); it writes the row after the rollback.
+  function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, refused?: (address: string, detail: string) => void): BindResult {
+    valid(session, true);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
-    if (session.transport === "hosted") fail("bad_request", "a hosted session binds through its own bind tool");
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
     const id = session.sessionId;
     // Lazy creation is here, not in the limited hello: an unlimited create loop
@@ -843,12 +873,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
-      if (target.address) logBinding(db, id, target.address, "refused", target.error);
+      if (target.address) (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(target.address, target.error);
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
-      logBinding(db, id, address, "refused", detail);
+      (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(address, detail);
       return fail(code, message, extra);
     };
     let meta: AliasMetaSet | undefined;
@@ -875,18 +905,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
     }
-    // Another session's hold is never taken over, live or in its grace. A
-    // hosted holder is probed as master's hello did (#402): one idle past the
-    // hosted window ends, and frees the alias; a live one refuses the bind.
-    let holder = holderOf(db, address);
-    const hosted = holder === null ? undefined : hub.hostedHolders.get(holder);
-    if (hosted) {
-      const responding = await hosted.sink.probe(hub.probeMs).catch(() => false);
-      valid(session);
-      if (!responding && hub.hostedHolders.get(hosted.sessionId) === hosted) close(hosted);
-      holder = holderOf(db, address);
-      if (session.holds.includes(address)) return { alias: address, held: [...session.holds] };
-    }
+    // Another session's hold is never taken over, live or in its grace. A hosted
+    // holder was probed by bind (#402), or cleared by the hosted service: one idle
+    // past the hosted window ended and freed the alias; a live one refuses the bind.
+    const holder = holderOf(db, address);
     if (holder !== null && holder !== id) {
       const who = describeHolder(hub, holder);
       // A holder in its grace frees the alias by the sweep after it ends,
@@ -927,9 +949,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // leaves this session (setHolds), so that holder is pushed it. An alias
   // the session doesn't hold answers ok with released: false.
   function unbind(session: ApplicationSession, alias: string): UnbindResult {
-    valid(session);
+    valid(session, true);
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
-    if (session.transport === "hosted") fail("bad_request", "a hosted session binds through its own bind tool");
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
     const id = session.sessionId;
     const p = addressParts(alias);
@@ -966,83 +987,81 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const s of [...hub.hostedHolders.values(), ...hub.holders.values()]) if (s.active && s.holds.includes(full)) return s;
       return undefined;
     },
-    // Who holds `full`, live or in its grace, for a hosted bind's refusal;
-    // null when nobody does.
-    aliasHolder(full: string): { id: string; who: string } | null {
-      const id = holderOf(db, full);
-      if (id === null) return null;
-      const live = hub.holders.get(id) ?? hub.hostedHolders.get(id);
-      return { id, who: live && !hub.grace.has(id) ? `the live session ${id}${live.place ? `, in ${live.place}` : ""}` : describeHolder(hub, id) };
-    },
     admitHosted,
     hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
-    hostedSession(authed: AuthedUser, id: string, name: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
+    // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
+    hostedHolds(id: string): string[] { return holdsOf(db, id); },
+    // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing, as a WSS
+    // tools-only connection. Otherwise the session holds `holds`, reads as them and its
+    // ID, and writes as the oldest; none held reads and nothing else (readOnly).
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
       session.place = place;
-      session.readOnly = name === null;
-      const full = name === null ? null : `${authed.user_email}/${name}`;
-      // A hosted session holds one name (its bind tool's), reads as it and
-      // its ID, and writes as the name; multi-alias, unbind and `as` on
-      // hosted aren't designed (#407).
-      session.holds = full ? [full] : [];
-      session.primary = full ?? id;
-      session.addresses = full ? [full, id] : [id];
-      if (full && idRow(db, id)?.principal === authed.user_email) session.writerId = id;
-      hub.sessions.add(session);
-      if (hold && full) {
-        holdAlias(db, full, id);
-        hub.hostedHolders.set(id, session);
+      session.readOnly = holds.length === 0 && writesAs === null;
+      session.toolsOnly = writesAs !== null;
+      if (writesAs !== null) {
+        session.primary = writesAs;
+        session.addresses = [writesAs];
+      } else {
+        session.holds = holds;
+        session.primary = primaryOf(holds, id);
+        session.addresses = [...holds, id];
       }
-      if (push && full) for (const a of session.addresses) hub.registry.set(a, session);
+      if (!session.readOnly && idRow(db, id)?.principal === authed.user_email) session.writerId = id;
+      hub.sessions.add(session);
+      if (hold && holds.length) hub.hostedHolders.set(id, session);
+      if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
-        ...(name === null ? { candidates: candidates(hub, authed) } : {}),
+        ...(session.readOnly ? { candidates: candidates(hub, authed) } : {}),
       };
       return { session, info };
     },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
-    hostedRegister(authed: AuthedUser, id: string, harness: string) {
+    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) fail("id_collision", idCollisionText(id, "is another principal's session"));
-      if (!prior) registerId(db, { id, principal: authed.user_email, harness, launcher: false });
-      else touchId(db, id);
-    },
-    hostedBind(authed: AuthedUser, id: string, name: string, previous: string | null, place: string | null, create: boolean) {
-      const full = `${authed.user_email}/${name}`;
-      if (!repo.aliases.find(full) && !create) {
-        const known = closestNames(name, repo.aliases.listForScope("person", authed.user_email).map(i => i.name).filter(n => n !== HUMAN_NAME));
-        const message = unknownNameError(name, known);
-        logBinding(db, id, full, "refused", message);
-        fail("identity_unknown", message, { known });
+      // A tools-only root is registered as WSS's is (A4): aliasUser, aliasUses and
+      // undeliverableId read ids.writes_as, so a send to its ID is pointed at the alias.
+      if (!prior) registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }) });
+      else {
+        touchId(db, id);
+        // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
+        if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
       }
-      if (!repo.aliases.find(full)) {
-        repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
-        writeAudit(repo, "alias.created", authed.user_email, full, { session: id });
-        onAliasCreated(db, repo, authed.user_id, full);
-      }
-      let moved: string[] = [];
-      let notMoved: string | undefined;
-      if (previous) {
-        const from = `${authed.user_email}/${previous}`;
-        // Claims move only from a name this session holds (master's
-        // lastBoundBy, as the hold the hosted store keeps).
-        if (holderOf(db, from) === id) moved = moveClaims(db, from, full).map(c => c.key);
-        else notMoved = `claims not moved: this session doesn't hold "${previous}"`;
-        logBinding(db, id, from, "released", `rebound to ${full}`);
-        logBinding(db, id, full, "moved", [from, notMoved].filter(Boolean).join("; "));
-        dropHold(db, from, id);
-      } else logBinding(db, id, full, "bound");
-      touchAlias(db, full);
-      holdAlias(db, full, id);
-      setPlace(db, id, place);
-      setLauncher(db, id, false);
-      writeAudit(repo, "handle.launcher_set", authed.user_email, full, { on: false });
-      return { moved, notMoved };
     },
-    hostedRefused(id: string, full: string, detail: string) { logBinding(db, id, full, "refused", detail); },
+    // A tools-only declaration's alias, resolved and checked the way a WSS hello's writes_as
+    // is: a name the principal may act in, never one another user's session uses (S7, S8);
+    // it shares the alias with a holder, as WSS. create: the first request makes the alias
+    // lazily, as hello does.
+    hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false): string {
+      const target = bindTarget(hub, authed, raw);
+      if ("error" in target) return fail(target.code, target.error);
+      const other = aliasUser(db, target.address, authed.user_email);
+      if (other) return fail("alias_held", aliasHeldText(target.address, `another user's session ${other}`, "write as another name"));
+      if (create) createLazily(hub, authed, target, id);
+      return target.address;
+    },
+    // The address a bind of `alias` would take, or undefined when bind will refuse it
+    // (bindNow says why): the hosted service clears a stale contender for it first.
+    bindAddress(authed: AuthedUser, alias: string): string | undefined {
+      const target = bindTarget(hub, authed, alias);
+      return "error" in target ? undefined : target.address;
+    },
+    aliasHolderId(address: string): string | null { return holderOf(db, address); },
+    // Every session's holds, oldest first, for the hosted sweep and reconcile.
+    holdsByOwner(): Map<string, string[]> {
+      const byOwner = new Map<string, string[]>();
+      for (const r of db.prepare(`SELECT id, address FROM alias_holds ORDER BY bound_at, address`).all() as { id: string; address: string }[]) {
+        const list = byOwner.get(r.id);
+        if (list) list.push(r.address); else byOwner.set(r.id, [r.address]);
+      }
+      return byOwner;
+    },
+    hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     hello,
     // Hello then bind, as a WSS client does: a test convenience composing the
     // real operations. name undefined: an unbound session, acting as its ID.
@@ -1073,6 +1092,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
     bind,
+    bindNow,
+    hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
     unbind,
     end,
     close,

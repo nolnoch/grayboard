@@ -73,7 +73,7 @@ function rig(id: string, o: Partial<Pick<RootOptions, "carried" | "admit">> = {}
 
 const texts = (result: CallToolResult) => result.content.flatMap(block => block.type === "text" ? [block.text] : []);
 const record = (r: Rig) => r.root.status().controller?.roots.find(x => x.sessionID === r.id);
-const active = (r: Rig, name: string) => until(() => record(r)?.state === "active" && record(r)?.name === name, 10_000, `${r.id} active as ${name}`);
+const active = (r: Rig, name: string) => until(() => record(r)?.state === "active" && record(r)?.held?.[0] === `${EMAIL}/${name}`, 10_000, `${r.id} active as ${name}`);
 async function live(id: string, name: string) {
   const r = rig(id);
   await r.root.start();
@@ -84,7 +84,13 @@ async function live(id: string, name: string) {
 }
 
 type Row = { name: string | null; lease_deadline: number | null };
-const row = (raw: string) => srv.app.db.query<Row, [string]>("SELECT name, lease_deadline FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user, CLIENT, raw));
+// A hosted root's holds are alias_holds rows (#451); `name` is its primary (oldest) hold.
+const row = (raw: string): Row | null => {
+  const id = hostedSessionId(user, CLIENT, raw);
+  const r = srv.app.db.query<{ lease_deadline: number | null }, [string]>("SELECT lease_deadline FROM hosted_sessions WHERE session_id = ?").get(id);
+  const hold = srv.app.db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").get(id);
+  return r && { lease_deadline: r.lease_deadline, name: hold ? hold.address.slice(hold.address.lastIndexOf("/") + 1) : null };
+};
 
 // Another pi process on this state dir: a sign-in writes a new epoch and
 // grant to the shared store; a sign-out revokes and logs the store out.
@@ -180,7 +186,7 @@ test("a held root shut down while its tools-only connect is in flight doesn't sa
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {
   const first = await live("carry-1", "carrier");
   const carried = await first.root.shutdown("release", { carry: true });
-  expect(carried).toBe("carrier");
+  expect(carried).toEqual([`${EMAIL}/carrier`]);
   const taker = rig("carry-2", { carried });
   await taker.root.start();
   await active(taker, "carrier");
@@ -189,9 +195,9 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   expect(row("carry-2")).toMatchObject({ name: "carrier" });
 
   await live("taken-1", "taken");
-  const refused = rig("taken-2", { carried: "taken" });
+  const refused = rig("taken-2", { carried: [`${EMAIL}/taken`] });
   await refused.root.start();
-  const said = /^this session couldn't take the name taken it carried over \(.*identity_in_use.*\); it is unbound$/;
+  const said = /^this session couldn't take the name alice@example\.com\/taken it carried over \(.*alias_held.*\); it is unbound$/;
   expect(refused.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
   const next = texts(await refused.root.call("whoami"));
   expect(next[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
@@ -233,7 +239,7 @@ test("admit gets the run loop's signal; once it aborts, the host's admit is neve
   expect(signals[0]!.aborted).toBe(true);
 
   if (!(port && typeof port === "object" && "admit" in port && typeof port.admit === "function")) throw new Error("the Controller's port has no admit");
-  const item: Item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "admitter" };
+  const item: Item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: `${EMAIL}/admitter` };
   const refused: unknown = await port.admit(undefined, item, "stable", undefined, AbortSignal.abort()).then(() => undefined, (error: unknown) => error);
   expect(refused).toBeInstanceOf(Refusal);
   expect(refused).toMatchObject({ code: "paused", message: "the pi session closed" });

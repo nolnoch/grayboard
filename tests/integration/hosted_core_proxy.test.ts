@@ -64,7 +64,7 @@ const textOf = (result: CallToolResult) => {
 };
 const tool = (tools: NativeTool[], name: string) => tools.find(t => t.name === name)!;
 const hostedRow = (raw: string, user: number) => srv.app.db.query<{ name: string | null; source_session_id: string; client_id: string }, [string]>(
-  "SELECT name, source_session_id, client_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user, CLIENT, raw));
+  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, source_session_id, client_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user, CLIENT, raw));
 
 test("before login: the snapshot's tools with local-path attachments, and every call returns one error naming the login action", async () => {
   const hooks = recorder();
@@ -120,20 +120,20 @@ test("a write tool round trip binds the calling session through _meta; results c
   expect(textOf(bound)).toStartWith(`Bound to "proxy-run"`);
   // The server's own record: the session named in `_meta`, under the pi client.
   expect(hostedRow("pi-root", authed.user_id)).toEqual({ name: "proxy-run", source_session_id: "pi-root", client_id: CLIENT });
-  expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ name: "proxy-run" });
+  expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-run" });
   // The shared connection routes per call: another session is still unbound.
   expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-other")))).toMatchObject({ unbound: true });
   expect(hostedRow("pi-other", authed.user_id)?.name ?? null).toBeNull();
   // A refusal comes back as the server wrote it, and afterCall sees an error.
   const taken = await p.call("bind", { name: "proxy-run", create: true }, "pi-other");
   expect(taken.isError).toBe(true);
-  expect(JSON.parse(textOf(taken))).toMatchObject({ code: "identity_in_use" });
+  expect(JSON.parse(textOf(taken))).toMatchObject({ code: "alias_held" });
 
   expect(hooks.calls).toEqual([
     { phase: "before", sessionID: "pi-root", tool: "bind" },
     { phase: "after", sessionID: "pi-root", tool: "bind", result: { status: "completed", output } },
     { phase: "before", sessionID: "pi-root", tool: "whoami" },
-    { phase: "after", sessionID: "pi-root", tool: "whoami", result: { status: "completed", output: expect.objectContaining({ name: "proxy-run" }) } },
+    { phase: "after", sessionID: "pi-root", tool: "whoami", result: { status: "completed", output: expect.objectContaining({ primary: expect.stringMatching(/\/proxy-run$/) }) } },
     { phase: "before", sessionID: "pi-other", tool: "whoami" },
     { phase: "after", sessionID: "pi-other", tool: "whoami", result: { status: "completed", output: expect.objectContaining({ unbound: true }) } },
     { phase: "before", sessionID: "pi-other", tool: "bind" },
@@ -218,7 +218,7 @@ test("a call's own failure leaves the shared connection to the calls in flight o
     // A broken transport retires it: the next call opens and lists a new one.
     fail = new ServerUnreachable(new Error("fixture outage"));
     await expect(p.call("whoami", {}, "pi-root")).rejects.toBeInstanceOf(ServerUnreachable);
-    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ name: "proxy-flight" });
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-flight" });
     expect(lists).toBe(2);
   } finally {
     release();
@@ -259,7 +259,7 @@ test("connect() and retire() leave calls in flight to finish: a new connection t
     // A login's reconnect: a new connection, listed; the old one stays open under its call.
     await p.connect();
     expect([lists, closes]).toEqual([2, 0]);
-    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ name: "proxy-swap" });
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-swap" });
     first.release();
     expect((await inFlight).isError).toBeFalsy();
     await until(() => closes === 1, 5_000, "the replaced connection closed");
