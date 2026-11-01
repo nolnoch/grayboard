@@ -1,4 +1,5 @@
 import { SESSION_FACT_MAX } from "../shared/protocol.ts";
+import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 
 export const OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"] as const;
 
@@ -17,12 +18,10 @@ export type OAuthClient = {
 // Hosted session source mapping (#414): the `_meta` key that carries a client's raw
 // session source, and the harness its sessions show in peer_list. OpenCode's CIMD client
 // keeps its own key; the built-in clients and an operator client with `sessionSource` map
-// the generic key; every other client is unmapped (reads only).
+// the generic key (GRAYBOARD_SESSION_META, src/shared/session_meta.ts); every other
+// client is unmapped (reads only).
 export const OPENCODE_CLIENT = "https://opencode.ai/oauth/opencode/client.json";
 export const OPENCODE_SESSION_META = "ai.opencode/sessionID";
-export const GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
-// A generic-key client's declared delivery (#429), read beside its session key.
-export const GRAYBOARD_DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 // Built-in native clients (#429): the hosted adapters ship these IDs as constants, so every
 // server accepts them with no operator registration and no outbound fetch, and none can be
 // disabled per server. Loopback-only redirects keep a consent-phished code on the victim's

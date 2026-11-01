@@ -23,7 +23,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath, FileStorage, sessionPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
@@ -574,37 +574,37 @@ test("a child shut down while its registration is in flight still ends it, so it
   expect(row("midreg-child")).toBeNull();
 });
 
-test("an item that reaches a root while its /new reads the carried name stays for the new session: the outgoing one neither delivers nor receipts it", async () => {
+test("an item sent while a root's /new reads the carried name stays for the new session: the run loop stopped before the read, so the outgoing one neither delivers nor receipts it", async () => {
   const sender = await root("closing-sender", "sender");
   const first = await root("closing-1", "closer");
   const carried = Controller.prototype.carried;
   const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
   const { promise: gate, resolve: open } = Promise.withResolvers<void>();
-  // Holds the outgoing session's carry read: the window where admit used to
-  // still deliver.
+  // Holds the outgoing session's carry read, which the Controller makes in its
+  // queue after stopping the root's run loop (#444): no admit can land in it.
+  let running: boolean | undefined;
   const spy = spyOn(Controller.prototype, "carried").mockImplementation(async function (this: Controller, id: string) {
-    if (id === "closing-1") { entered(); await gate; }
+    if (id === "closing-1") {
+      // The root's run loop task is private; read only to prove it ended before the read.
+      const roots: unknown = Reflect.get(this, "roots");
+      running = roots instanceof Map ? !!roots.get(id)?.task : undefined;
+      entered();
+      await gate;
+    }
     return carried.call(this, id);
   });
   let down: Promise<void> | undefined;
   try {
     down = first.ext.shutdown("new");
     await reached;
-    const since = Date.now();
+    expect(running).toBe(false);
     await sender.call("dm_send", { to: "closer", body: "sent while closing" });
-    // The run loop took the item to admit: delivered there, or refused there
-    // (a pause the Controller records).
-    const paused = async () => {
-      const records = await new FileStorage(sessionPath(stateDir, srv.resource, CLIENT, "closing-1")).get("diagnostics:v1");
-      return Array.isArray(records) && records.some(r => r.sessionID === "closing-1" && r.state === "paused" && r.time >= since);
-    };
-    await until(async () => first.deliveries.length > 0 || await paused(), 10_000, "the item's admission");
-    expect(first.deliveries).toEqual([]);
   } finally {
     open();
     await down;
     spy.mockRestore();
   }
+  expect(first.deliveries).toEqual([]);
   const second = instance();
   await second.ext.start({ id: "closing-2", reason: "new" });
   await active(second, "closing-2", "closer");
@@ -814,14 +814,20 @@ test("a tools-only root (delivery held elsewhere) refuses bind and unbind: the h
   expect(row("held-bind")).toMatchObject({ name: "holder" });
 });
 
-test("an unreadable session state file before the first start is said once", async () => {
+test("an unreadable session state file before the first start is said, each failure once", async () => {
   const path = sessionPath(stateDir, srv.resource, CLIENT, "corrupt-1");
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, "not json");
   const a = instance();
   await a.ext.start({ id: "corrupt-1", reason: "startup" });
   await until(() => a.notices.length > 0, 10_000, "a notice");
-  // The start's later records come and go; the unreadable file is said once.
   await a.ext.shutdown("quit");
-  expect(a.notices.filter(n => n.message.includes("Diagnostic"))).toEqual([{ level: "warning", message: expect.stringMatching(/^grayboard: delivery degraded: Diagnostic (restore|persistence) unavailable/) }]);
+  // The restore couldn't read the file; the save of its own record couldn't
+  // either (FileStorage.set reads before it writes); the start's storage read
+  // failed on it too. Each is said once, whatever the epoch.
+  expect(a.notices.map(n => `${n.level} ${n.message}`).sort()).toEqual([
+    "error grayboard: couldn't start delivery: JSON Parse error: Unexpected identifier \"not\"",
+    "warning grayboard: delivery degraded: Diagnostic persistence unavailable; approval is unchanged",
+    "warning grayboard: delivery degraded: Diagnostic restore unavailable; approval is unchanged",
+  ]);
 });

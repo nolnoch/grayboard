@@ -26,7 +26,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";

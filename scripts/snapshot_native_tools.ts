@@ -9,7 +9,7 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { nativeTool, type NativeTool } from "../adapters/hosted-core/src/proxy.ts";
 import { NativeWire } from "../adapters/hosted-core/src/wire.ts";
-import { GRAYBOARD_SESSION_META } from "../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../src/shared/session_meta.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { TestServer } from "../tests/support/server.ts";
 

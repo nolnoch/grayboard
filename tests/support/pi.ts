@@ -13,7 +13,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools, ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" };
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { attachRoots } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
