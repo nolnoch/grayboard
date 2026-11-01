@@ -336,7 +336,7 @@ test("a logout elsewhere is said once on stderr; the next tool result says it to
   expect(count(s.stderr(), said)).toBe(1);
 }, 30_000);
 
-test("a delivery lock that can't be opened (not BUSY) is said, and the session isn't told another process holds delivery", async () => {
+test("a delivery lock that can't be opened (not BUSY) is said, and the session isn't told another process holds delivery; EOF ends the session its calls bound", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   mkdirSync(deliveryPath(data, srv.resource, CLIENT_ID, "sess-lockfail"), { recursive: true });
   const s = await plugin("sess-lockfail");
@@ -346,6 +346,8 @@ test("a delivery lock that can't be opened (not BUSY) is said, and the session i
   expect(bound.error).toBe(false);
   expect(bound.texts.join("\n")).not.toContain(HELD);
   expect(row("sess-lockfail")?.name).toBe("lockfail");
+  await stopSession(s.c);
+  expect(row("sess-lockfail")).toBeNull();
 }, 30_000);
 
 // In-process: the client end of the transport never initializes, so the item

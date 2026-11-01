@@ -795,6 +795,16 @@ test("a delivery lock that can't be opened (not BUSY) is said; the root runs too
   await active(a, "lockfail-1", "lockfail");
 });
 
+test("a root whose delivery lock can't be opened ends the session its calls bound on quit", async () => {
+  mkdirSync(deliveryPath(stateDir, srv.resource, CLIENT, "lockquit-1"), { recursive: true });
+  const a = instance();
+  await a.ext.start({ id: "lockquit-1", reason: "startup" });
+  expect((await a.call("bind", { name: "lockquit", create: true })).isError).toBeUndefined();
+  expect(row("lockquit-1")).toMatchObject({ name: "lockquit" });
+  await a.ext.shutdown("quit");
+  expect(row("lockquit-1")).toBeNull();
+});
+
 test("a quit while a reloaded root's start is in flight still releases the lease the reload kept", async () => {
   const before = await root("inflight-1", "inflight");
   await before.ext.shutdown("reload");

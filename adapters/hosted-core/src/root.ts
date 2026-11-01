@@ -338,12 +338,12 @@ export class RootDelivery {
     if (this.controller) {
       carried = await this.controller.shutdown(id, mode, o).catch(error => { this.log(`couldn't release delivery: ${message(error)}`, "warning"); return undefined; });
     }
-    // No Controller: a tools-only session ends what its calls bound, and a
-    // start that took the lock but hasn't built its Controller ends the
-    // session (a lease an earlier runtime kept). Never while another process
-    // holds this session's delivery: that would end its session.
-    else if (mode === "release" && (this.lock || (!this.o.push && this.used))) await this.client.endSession(id);
-    // Flushes the diagnostics, so the shutdown's own records are said before it returns.
+    // No Controller: a session whose calls bound it outside a lease (tools-only
+    // by choice, or a delivery lock that couldn't be opened) ends what they
+    // bound, and a start that took the lock but hasn't built its Controller
+    // ends the session (a lease an earlier runtime kept). Never while another
+    // process holds this session's delivery: that would end its session.
+    else if (mode === "release" && (this.lock || (this.used && !this.held))) await this.client.endSession(id);
     await this.controller?.close().catch(error => this.log(`couldn't stop delivery: ${message(error)}`, "warning"));
     this.lock?.release();
     await this.starting;
