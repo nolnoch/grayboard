@@ -106,9 +106,16 @@ export async function realRace(f: {
     else await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
     await drainSessions(join(process.env.GRAYBOARD_GIT_TEST_ROOT!, "host.sqlite"), sessionID => host.session.wait({ sessionID }));
     await Bun.sleep(700); // Supplemental only, after producer retirement and global SDK drain.
-    assert.deepEqual(g.inputs[0], original); assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
-    assert.equal(f.receipts(), beforeReceipts, "No stale receipt attempt");
-    assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
+    assert.deepEqual(g.inputs[0], original); // Enrolling another name adds a hold (#451), so the original's address stays held and its unreceipted item is replayed under the new lease with the same stable id; every other scenario ends the identity and admits nothing more.
+    if (scenario === "enrollment") assert(g.inputs.every(i => i.id === original.id), "Only the original message is admitted again, never a distinct one"); else assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
+    if (scenario === "enrollment") {
+      // The replayed item is acknowledged once by the new lease; the original lease never receipts.
+      await until(() => app.repo.cursors.directFor("you@example.com/race") === message.id, "replayed original acknowledged under the new lease");
+      assert.equal(f.receipts(), beforeReceipts + 1, "Exactly one receipt, from the replay");
+    } else {
+      assert.equal(f.receipts(), beforeReceipts, "No stale receipt attempt");
+      assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
+    }
     assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);
     assert.equal((await host.session.context({ sessionID: other })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 0);
     assert(!g.models.includes(other)); assert(!g.models.includes(child));

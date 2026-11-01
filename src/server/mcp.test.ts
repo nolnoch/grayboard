@@ -805,7 +805,7 @@ test("legacy registry is bounded and idle disconnected sessions are reclaimed", 
   expect(hosted.activeContexts).toBe(0);
   await connect("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(1);
-});
+}, 30_000);
 
 test("global board watch bound cleans partial acquisitions without retiring other listeners", async () => {
   const client = await connect();

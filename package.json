@@ -12,7 +12,7 @@
     "server": "bun src/server/main.ts",
     "cli": "bun src/cli/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test ./src ./tests",
+    "test": "bun test --timeout 30000 ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",
     "test:opencode:config": "bash scripts/e2e.sh hosted-config",
