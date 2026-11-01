@@ -46,7 +46,8 @@ afterAll(() => {
 // A marketplace named grayboard in `mp` whose one entry is the plugin under test.
 function marketplace(mp: string): string {
   mkdirSync(join(mp, ".claude-plugin"), { recursive: true });
-  const doc = { name: "grayboard", owner: { name: "grayboard e2e" }, plugins: [] as unknown[] };
+  // A description: 2.1.316's validate --strict refuses a marketplace without one.
+  const doc = { name: "grayboard", owner: { name: "grayboard e2e" }, description: "Grayboard's Claude Code plugin under test.", plugins: [] as unknown[] };
   if (TAG) {
     writeFileSync(join(mp, ".claude-plugin/marketplace.json"), JSON.stringify(pinMarketplace(doc, TAG, SHA!)));
     return `${TAG} (${SHA})`;

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, GRAYBOARD_SESSION_META, harnessFor, matchesRedirect, oauthPublicUrl, OPENCODE_CLIENT, OPENCODE_SESSION_META, parseOAuthClients, sourceKeyFor, validateRedirect, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, harnessFor, matchesRedirect, oauthPublicUrl, OPENCODE_CLIENT, OPENCODE_SESSION_META, parseOAuthClients, sourceKeyFor, validateRedirect, type OAuthClient } from "./oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 const client: OAuthClient = { clientId: "native", name: "Native", redirectUris: ["http://127.0.0.1/callback?fixed=1", "http://[::1]/callback", "https://client.example/callback"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "none" };
 test("client registration is strict, bounded, hash-only, and opt-in for refresh", () => {
   expect(parseOAuthClients(undefined)).toEqual([]);

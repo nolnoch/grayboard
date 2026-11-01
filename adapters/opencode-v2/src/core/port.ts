@@ -25,7 +25,9 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   approval: ApprovalPort<E> | null; // null = adapter-owned grant: every root of this installation is approved
   // Idempotent per stableID; resolves once the host accepted the item. `identity`
   // is the lease's: an adapter marks its own user's human (`<email>/human`) by it.
-  admit(e: E, item: Item, stableID: string, identity: Identity): Promise<void>;
+  // `signal` is the run loop's: a host whose admit waits (Claude Code's
+  // `initialized`) races it, so a stop releases the wait without a pause.
+  admit(e: E, item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
 }
 export interface CredentialPort<E extends Enrollment> {
   capture(sessionID: string): Promise<E>;            // a fresh enrollment for this root

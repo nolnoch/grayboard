@@ -1,31 +1,30 @@
 // The hosted grayboard extension shared by pi (#279) and omp (#280): an
 // adapter-owned grant (hosted-core Login), the server's tools proxied with the
-// raw session id in `_meta`, and the delivery lease held by hosted-core's
-// Controller. An entry file (entry-pi.ts, entry-omp.ts) adapts the harness's
-// events, tool registration and message API to `Harness`.
+// raw session id in `_meta` (hosted-core's HostedClient), and a root's
+// delivery lease held by hosted-core's RootDelivery. An entry file
+// (entry-pi.ts, entry-omp.ts) adapts the harness's events, tool registration
+// and message API to `Harness`.
 //
 // Each `createGrayboard` is one session's runtime: pi creates the extension
 // anew for every session (startup, /new, /resume, /fork, /reload), and omp's
 // entry creates one per session id on its session_switch and session_branch.
 // What outlives a session (the name a /new carries, the registry of live
 // session files, the items a root admitted) sits on globalThis under a
-// registered symbol.
+// registered symbol. A root's delivery is RootDelivery's; this keeps the
+// session's role (root, subagent child, unattributed subagent), a child's
+// registration under its root, the system prompt's instructions and
+// `/grayboard`.
 import { join } from "node:path";
-import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
-import { Controller, type Status } from "../hosted-core/src/controller.ts";
-import { Login } from "../hosted-core/src/login.ts";
-import { AccessExpired, accessExpiry, DeliveryHeldElsewhere, Refusal, type Identity, type Item } from "../hosted-core/src/model.ts";
-import type { HostPort } from "../hosted-core/src/port.ts";
-import { failure, hostTools, outputOf, snapshotTools, ToolProxy, type CallHooks, type NativeTool } from "../hosted-core/src/proxy.ts";
-import { AncestryError } from "../hosted-core/src/sessions.ts";
-import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "../hosted-core/src/storage.ts";
-import type { Lock } from "../hosted-core/src/lock.ts";
-import { end, register, type Temporary } from "../hosted-core/src/children.ts";
+import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
+import { end, register } from "../hosted-core/src/children.ts";
+import { failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
-import { Wire, type WireOptions } from "../hosted-core/src/wire.ts";
-import { failureMessage, type DiagnosticSink } from "../hosted-core/src/diagnostics.ts";
-import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
+import { Login } from "../hosted-core/src/login.ts";
+import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
+import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 
@@ -36,7 +35,6 @@ export type SessionInfo = { id: string; file?: string; parentFile?: string; reas
 // when the runner gave no parent session, so it can't be attributed) through
 // the intermediate subagent sessions `via`, outermost first (audit only).
 export type Marker = { child: false } | { child: true; root?: string; via?: string[] };
-export type Level = "info" | "warning" | "error";
 
 export interface Harness {
   readonly name: string;     // "pi" | "omp", in messages
@@ -53,6 +51,8 @@ export interface Harness {
 
 export const LOGIN_ACTION = "run /grayboard login";
 export const RESUME_HINT = "run /grayboard resume";
+// A tool call that failed: the call itself is what to retry.
+const RETRY_HINT = "call the tool again";
 const SOURCE = "grayboard";
 
 // A tool's arguments and MCP result as both entries' tools take and return
@@ -74,9 +74,6 @@ export const COMMAND = {
   description: "grayboard: login | logout | resume | status",
   getArgumentCompletions: (prefix: string) => ["login", "logout", "resume", "status"].filter(v => v.startsWith(prefix)).map(value => ({ value, label: value })),
 };
-// hosted-core's Controller pauses every root with this when the store's
-// epoch changes (a login or logout in any process).
-const DRIFTED = "Grayboard credential changed";
 
 // Cross-session state for one harness in this process: the name a /new or
 // /fork carries, the live session files (file → root id), and per root
@@ -110,32 +107,28 @@ export function createGrayboard(h: Harness): Grayboard {
   const stateDir = join(h.agentDir, "grayboard");
   const config = readHostedConfig(stateDir);
   const state = shared(h.name);
-  const log = (message: string, level: Level = "info") => { if (!closed) h.notify(`grayboard: ${message}`, level); };
+  // Said until this session's shutdown finishes, so its own records (a
+  // release that failed) land inside the harness's shutdown handler.
+  const log = (message: string, level: Level = "info") => { if (!done) h.notify(`grayboard: ${message}`, level); };
   // The bind's `where` (peer_list, a name refusal's holder text): this
   // process's checkout, as server mode's `grayboard mcp` sent it.
   const place = describeLocation(process.cwd()) ?? h.name;
 
-  let closed = false;
+  let closed = false;                 // shutdown began
+  let done = false;                   // shutdown finished
   let session: SessionInfo | undefined;
   let role: Role = { kind: "root" };
-  let notice: string | undefined;     // shown once, in the next tool result
-  let held: string | undefined;       // set while another process holds delivery for this root
   let loginNote: string | undefined;  // the latest sign-in diagnostic
   let logoutWarnings: string[] | undefined; // a running logout's warnings, which its own line says
-  let signedOut: AccessExpired | undefined; // why a start failed for want of a sign-in
-  let outAnnounced = false;           // this sign-out was already announced in this session
-  let begun: string | undefined;      // the store epoch this root last (re)started under
-  let carrying: string | undefined;   // a /new or /fork's carried name, until a start takes it
-  let controller: Controller | undefined, lock: Lock | undefined, proxy: ToolProxy | undefined;
-  let waiter: AbortController | undefined;
-  let watcher: { dispose(): void } | undefined;
+  let root: RootDelivery | undefined; // a root session's delivery
+  let proxy: ToolProxy | undefined;   // a child's or unattributed session's connection
+  let watcher: Disposable | undefined; // its credential watch
   let registration: Promise<void> | undefined; // a child's register under its root, until it fails
   let releasing: Promise<void> | undefined;    // an idle child's end, which its next register waits behind
   let registered = false;             // that register succeeded
   let attempted = false;              // a register went out (a timed-out one may have committed)
-  let used = false;                   // a call went out under this session's id
+  let used = false;                   // a call went out under this (non-root) session's id
   const inflight = new Set<Promise<CallToolResult>>(); // calls running now, which an idle end lands after
-  let restarting: Promise<void> | undefined;
 
   const login = "url" in config ? new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
@@ -155,48 +148,43 @@ export function createGrayboard(h: Harness): Grayboard {
     },
   }) : undefined;
 
-  let last: string | undefined;
-  const auth: AuthProvider = {
-    token: async () => (last = await login!.token()),
-    onUnauthorized: async () => login!.unauthorized(last ?? ""),
-  };
-  const wireOptions = (mode: "push" | "poll"): WireOptions => ({
-    url: login!.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: h.clientId, version: h.version }, delivery: { mode, source: SOURCE },
-  });
+  const client = login ? new HostedClient({
+    harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
+    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, log,
+  }) : undefined;
 
   // ---- tools ----
 
   const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     const running = dispatch(tool, args);
     inflight.add(running);
-    const done = () => { inflight.delete(running); };
-    running.then(done, done);
+    const settled = () => { inflight.delete(running); };
+    running.then(settled, settled);
     return running;
   };
   const dispatch = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
+    if (root) return root.call(tool, args);
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);
     used = true;
-    let result = await proxy.call(tool, args, session.id);
-    if (role.kind === "child" && registered && result.isError && await unattributed(proxy, session.id)) {
-      // The server refuses an unattributed child's call before running it, so
-      // one retry after registering again never repeats a write.
+    const p = proxy;
+    return client!.call({ call: (name, a, id) => attributed(p, name, a, id) }, tool, args, session.id);
+  };
+  // The server refuses an unattributed child's call before running it, so
+  // one retry after registering again never repeats a write. The client's
+  // error wrapper sits outside it: a converted failure never probes.
+  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string): Promise<CallToolResult> => {
+    let result = await p.call(tool, args, id);
+    if (role.kind === "child" && registered && result.isError && await unattributed(p, id)) {
       registered = false; registration = undefined;
-      result = await proxy.call(tool, args, session.id);
+      result = await p.call(tool, args, id);
     }
-    const shown = notice;
-    notice = undefined;
-    return shown ? { ...result, content: [{ type: "text", text: `grayboard: ${shown}` }, ...result.content] } : result;
+    return result;
   };
   h.register(hostTools(snapshotTools()), call);
 
   // ---- children ----
 
-  const temporary: Temporary = async (sessionID, run) => {
-    const wire = new Wire(wireOptions("poll"), auth, AbortSignal.timeout(10_000), sessionID);
-    try { await wire.connect(); return await run(wire); }
-    finally { await wire.close().catch(() => {}); }
-  };
   // A child registers under its root before its first call or instructions
   // fetch (the server's instructions for an unregistered session tell it to
   // bind, which a child can't); a failed registration fails that call and is
@@ -220,7 +208,7 @@ export function createGrayboard(h: Harness): Grayboard {
     if (registration) return registration;
     if (closed) return Promise.reject(new Error(`the ${h.name} session closed`));
     attempted = true;
-    const pending: Promise<void> = (releasing ?? Promise.resolve()).then(() => register(temporary, { ...placement(fixed), child })).then(
+    const pending: Promise<void> = (releasing ?? Promise.resolve()).then(() => register(client!.temporary, { ...placement(fixed), child })).then(
       () => { if (registration === pending) { registered = true; proxy?.forget(child); } },
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
@@ -230,7 +218,7 @@ export function createGrayboard(h: Harness): Grayboard {
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
-    h.notify(`grayboard: couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`, "warning");
+    log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
   // omp keeps a finished subagent live (revivable) for its idle TTL, so a
   // child released only at shutdown would hold a slot long after its run: a
   // fan-out of 128 within that TTL would fill the root's cap. An idle child
@@ -243,157 +231,24 @@ export function createGrayboard(h: Harness): Grayboard {
     const run = (async () => {
       await Promise.allSettled(running);
       const committed = sure || (pending ? await pending.then(() => true, () => false) : false);
-      await end(temporary, { child: id }).catch(committed ? endFailed(id) : () => {});
+      await end(client!.temporary, { child: id }).catch(committed ? endFailed(id) : () => {});
     })();
     releasing = run;
     await run;
     if (releasing === run) releasing = undefined;
   };
 
-  // ---- roots ----
-
-  const port = (id: string, store: FileStorage): HostPort => ({
-    harness: h.name, resumeHint: RESUME_HINT, loginAction: LOGIN_ACTION, sessionKey: GRAYBOARD_SESSION_META,
-    client: { name: h.clientId, version: h.version }, delivery: { mode: "push", source: SOURCE },
-    storage: store,
-    place: () => place,
-    ancestry: async sessionID => {
-      if (sessionID !== id) throw new AncestryError(`Grayboard session ${sessionID} isn't this ${h.name} session's root`);
-      return { sessionID, root: id, via: [] };
-    },
-    credential: login!.credential(),
-    approval: null,
-    // Idempotent per stableID across this root's runtimes: a /reload keeps
-    // the lease, so the reloaded Controller re-reads an item admitted before
-    // the reload whose receipt hadn't landed, and must not deliver it twice.
-    admit: async (_e, item, stableID, identity) => {
-      if (closed) throw new Refusal("paused", `the ${h.name} session closed`);
-      let admitted = state.admitted.get(id);
-      if (!admitted) state.admitted.set(id, admitted = new Set());
-      if (admitted.has(stableID)) return;
-      const params = channelParams(item, identity);
-      h.deliver(render(params, SOURCE), wakes(item.actionable, params.meta));
-      admitted.add(stableID);
-      if (admitted.size > ADMITTED_LIMIT) admitted.delete(admitted.values().next().value!);
-    },
-  });
-
-  const newProxy = (mode: "push" | "poll", hooks?: CallHooks) => new ToolProxy({
-    wire: wireOptions(mode), harness: h.name, loginAction: LOGIN_ACTION, auth,
-    ...(hooks ? { hooks } : {}),
-    report: (operation, error) => {
-      if (operation === "after") controller?.backgroundFailure("after");
-      log(`${operation} failed: ${(error as Error)?.message ?? String(error)}`, "warning");
-    },
-    onTools: tools => { if (!closed) h.register(tools, call); },
-  });
-
-  // A live grant re-lists the server's tools on a fresh connection.
-  const connect = async () => {
-    if (!proxy) return;
-    try { await proxy.connect(); }
-    catch (error) { if (!accessExpiry(error)) log(`couldn't reach the server: ${(error as Error).message}`, "warning"); }
-  };
-
-  // Starts (or restarts) this root's delivery: under a /new or /fork's carried
-  // name until a start takes it (a carry the server refused or couldn't be
-  // reached for is retried by the next start, /grayboard resume included),
-  // else rebinding the name a resume restores. A name that didn't take is
-  // said in the next tool result; a pause, by the sink.
-  const begin = async () => {
-    if (!controller || !session || closed) return;
-    const id = session.id, carried = carrying;
-    try {
-      // Set before the start: the sink weighs a pause its run loop reaches
-      // before resume returns against this epoch.
-      begun = (await login!.read().catch(() => undefined))?.epoch;
-      const expected = carried ?? await controller.carried(id);
-      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
-      signedOut = undefined;
-      // The Controller's own bind changed what the server's instructions say.
-      proxy?.forget(id);
-      const root = status.roots.find(r => r.sessionID === id);
-      // enroll's and resume's failures record operation "enroll"; a resume
-      // names its root before the rebind, so the name alone proves nothing.
-      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
-      if (carried && bound && carrying === carried) carrying = undefined;
-      if (expected && bound !== expected && root?.state !== "paused") {
-        const now = bound ? `it is bound as ${bound}` : "it is unbound";
-        notice = carried ? `this session couldn't take the name ${carried} it carried over (${root?.message ?? status.message}); ${now}`
-          : `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${now}`;
-        log(notice, "warning");
-      }
-    } catch (error) {
-      const expired = accessExpiry(error);
-      if (!expired) { log(`couldn't start delivery: ${(error as Error).message}`, "error"); return; }
-      signedOut = expired;
-      // Once per sign-out: a restart racing one finds credentialChanged (or a
-      // logout's own line) already said it.
-      if (!outAnnounced) { outAnnounced = true; log(expired.message, "warning"); }
-    }
-  };
-  const restart = () => restarting ??= begin().finally(() => { restarting = undefined; });
-
-  // The Controller's records (its DiagnosticSink). A pause or degradation the
-  // run loop reaches on its own (retry budget, identity, lease recovery,
-  // admission limits) is said at once and in the next tool result, not only
-  // in /grayboard status. A credential change is credentialChanged's to say:
-  // the Controller pauses for it with the drift message (its watch, or a
-  // guard's check that saw it first), and any other pause after it is skipped
-  // too (the store's epoch moved since this root started); a shutdown's
-  // pause is nobody's. A change of state or name drops the cached
-  // instructions: the Controller's own binds (a rebind after a lapsed lease,
-  // after an unbound whoami) never pass through the proxy's bind result.
-  let lastBinding: string | undefined, lastRecord: string | undefined;
-  const sink: DiagnosticSink = async record => {
-    if (!session || record.sessionID !== session.id) return;
-    const binding = `${record.state}\n${record.name ?? ""}`;
-    if (binding !== lastBinding) { lastBinding = binding; proxy?.forget(session.id); }
-    if (record.state === "active") carrying = undefined;
-    const key = `${record.state}\n${record.message}`;
-    if (key === lastRecord) return;
-    lastRecord = key;
-    if (record.state !== "paused" && record.state !== "degraded" || record.operation === "session_end" || record.message.startsWith(DRIFTED)) return;
-    const epoch = (await login!.read().catch(() => undefined))?.epoch;
-    if (epoch !== begun) return;
-    notice = `delivery ${record.state}: ${record.message}`;
-    log(notice, "warning");
-  };
-
-  // The lock is ours: run the Controller and declare push delivery.
-  const own = async (taken: Lock) => {
-    if (closed || !session) { taken.release(); return; }
-    // A held notice nobody saw yet is no longer true.
-    lock = taken; if (notice === held) notice = undefined; held = undefined;
-    controller = new Controller(port(session.id, new FileStorage(sessionPath(stateDir, login!.resource, h.clientId, session.id))), { sink });
-    await controller.restore().catch(() => {});
-    // The tools-only proxy's calls in flight finish on it: closing it under
-    // them would abort a write the server may have committed.
-    const old = proxy;
-    proxy = newProxy("push", controller);
-    void old?.retire().catch(() => {});
-    void connect();
-    await begin();
-  };
-
-  const startRoot = async () => {
-    const id = session!.id;
-    state.live.set(session!.file ?? `id:${id}`, id);
-    const path = deliveryPath(stateDir, login!.resource, h.clientId, id);
-    const taken = tryDelivery(path);
-    if (taken) return own(taken);
-    // Tools only until the other process lets go of this session.
-    held = new DeliveryHeldElsewhere(h.name).message;
-    notice = held;
-    proxy = newProxy("poll");
-    void connect();
-    waiter = new AbortController();
-    void waitDelivery(path, waiter.signal).then(next => own(next), () => {});
-  };
-
   // ---- lifecycle ----
 
   const start = async (s: SessionInfo) => {
+    // A runtime starts once. pi's RPC mode emits session_start twice for a
+    // /new or /fork's session (its runtime rebinds the extensions, then the
+    // new_session/fork command rebinds them again): a second root here would
+    // find its own lock held and the first one's lease would never be released.
+    if (session) {
+      if (session.id !== s.id) log(`ignored a start for session ${s.id}: this runtime already runs session ${session.id}`, "warning");
+      return;
+    }
     session = s;
     if ("error" in config) { log(config.error, "warning"); return; }
     const marker = h.marker();
@@ -401,83 +256,77 @@ export function createGrayboard(h: Harness): Grayboard {
     role = marker.child ? (marker.root ? { kind: "child", root: marker.root, via: marker.via ?? [] } : { kind: "loose" })
       : parent ? { kind: "child", root: parent, via: [] } : { kind: "root" };
     if (role.kind === "loose") log(`this ${h.name} subagent has no parent session, so its calls go out as an unregistered session`, "warning");
-    // Grandchildren of this child map to the same top root.
-    if (role.kind === "child") state.live.set(s.file ?? `id:${s.id}`, role.root);
-
-    watcher = login!.watch(() => { void credentialChanged(); });
     if (role.kind !== "root") {
-      proxy = newProxy("poll", role.kind === "child" ? childHooks(role, s.id) : undefined);
-      void connect();
+      // Grandchildren of this child map to the same top root.
+      if (role.kind === "child") state.live.set(s.file ?? `id:${s.id}`, role.root);
+      watcher = client!.watch();
+      proxy = client!.proxy("poll", { ...(role.kind === "child" ? { hooks: childHooks(role, s.id) } : {}), onTools: tools => { if (!closed) h.register(tools, call); } });
+      void client!.connect(proxy);
       return;
     }
-    carrying = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
+    state.live.set(s.file ?? `id:${s.id}`, s.id);
+    const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
-    await startRoot();
-  };
-
-  // A sign-in or sign-out in any process of this harness (the store's epoch).
-  const credentialChanged = async () => {
-    if (closed) return;
-    try { await login!.token(); }
-    catch (error) {
-      // Signed out here or elsewhere: the Controller's own watch pauses the
-      // root; every session says why once, not only the one that logged out.
-      const expired = accessExpiry(error);
-      if (!expired) log(`couldn't read the sign-in: ${(error as Error)?.message ?? String(error)}`, "warning");
-      else if (!outAnnounced) { outAnnounced = true; log(expired.message, "warning"); }
-      return;
-    }
-    outAnnounced = false;
-    void connect();
-    if (!controller || !session) return;
-    // A sign-in here or in another process: the Controller's own watch pauses
-    // this root (now or at its next tick), so it restarts under the new grant
-    // unless it already started under it. A restart already running may have
-    // read the old one.
-    await restarting;
-    const epoch = (await login!.read().catch(() => undefined))?.epoch;
-    if (!signedOut && epoch !== undefined && epoch === begun) return;
-    await restart();
+    const id = s.id;
+    root = new RootDelivery(client!, {
+      sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}),
+      // Idempotent per stableID across this root's runtimes: a /reload keeps
+      // the lease, so the reloaded Controller re-reads an item admitted before
+      // the reload whose receipt hadn't landed, and must not deliver it twice.
+      admit: async (item, stableID, identity) => {
+        let admitted = state.admitted.get(id);
+        if (!admitted) state.admitted.set(id, admitted = new Set());
+        if (admitted.has(stableID)) return;
+        const params = channelParams(item, identity);
+        h.deliver(render(params, SOURCE), wakes(item.actionable, params.meta));
+        admitted.add(stableID);
+        if (admitted.size > ADMITTED_LIMIT) admitted.delete(admitted.values().next().value!);
+      },
+      onTools: tools => h.register(tools, call),
+    });
+    await root.start();
   };
 
   const shutdown = async (reason: ShutdownReason) => {
     if (closed) return;
-    // From here admit refuses: an item admitted while the carry below reads
-    // storage would land in the session being left, and be receipted there.
     closed = true;
     const id = session?.id;
-    if (id && role.kind === "root" && controller && (reason === "new" || reason === "fork")) state.carried = await controller.carried(id);
-    watcher?.dispose();
-    waiter?.abort();
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
-    if (id && controller) await controller.shutdown(id, reason === "reload" ? "detach" : "release").catch(() => {});
-    // An idle end still landing finishes first: omp caps shutdown handlers at 2 s.
-    await releasing;
-    if (id && reason !== "reload") {
-      state.admitted.delete(id);
-      const ended = endFailed(id);
-      // A register still in flight, or one that failed after the server
-      // committed it (a timeout), may have registered this child: it ends
-      // either way, and says so only when the end of a sure one fails.
-      if (role.kind === "child" && attempted) {
-        await registration?.catch(() => {});
-        await end(temporary, { child: id }).catch(registered ? ended : () => {});
+    if (root) {
+      const carry = reason === "new" || reason === "fork";
+      const carried = await root.shutdown(reason === "reload" ? "detach" : "release", { carry });
+      if (carry) state.carried = carried;
+    } else {
+      watcher?.dispose();
+      // An idle end still landing finishes first: omp caps shutdown handlers
+      // at 2 s (omp 18.14.0 extensibility/extensions/runner.ts:151-160).
+      await releasing;
+      if (id && reason !== "reload") {
+        // A register still in flight, or one that failed after the server
+        // committed it (a timeout), may have registered this child: it ends
+        // either way, and says so only when the end of a sure one fails.
+        if (role.kind === "child" && attempted) {
+          await registration?.catch(() => {});
+          await end(client!.temporary, { child: id }).catch(registered ? endFailed(id) : () => {});
+        }
+        // An unattributed child is its own unleased root: ending it frees what
+        // its calls bound now, not at the server's idle timeout.
+        else if (role.kind === "loose" && used) await client!.endSession(id);
       }
-      // An unattributed child is its own unleased root: ending it frees what
-      // its calls bound now, not at the server's idle timeout.
-      else if (role.kind === "loose" && used) await temporary(id, wire => wire.call("session_end")).catch(ended);
+      if (proxy) await client!.close(proxy);
     }
-    await controller?.close().catch(() => {});
-    lock?.release();
-    await proxy?.close().catch(() => {});
+    if (id && reason !== "reload") state.admitted.delete(id);
+    done = true;
   };
 
   // System-prompt section: the server's instructions for this session. A
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
   const instructions = async (): Promise<string | undefined> => {
-    if (!proxy || !session) return undefined;
+    if (!session) return undefined;
     try {
+      if (root) return await root.instructions();
+      if (!proxy) return undefined;
       if (role.kind === "child") await enlist(role, session.id);
       return await proxy.instructions(session.id);
     } catch { return undefined; }
@@ -504,8 +353,10 @@ export function createGrayboard(h: Harness): Grayboard {
       `sign-in: ${signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`}`,
       `session: ${session?.id ?? "not started"} (${role.kind === "child" ? `subagent of ${placement(role).root}` : role.kind === "loose" ? "unattributed subagent" : "root"})`,
     ];
-    if (held) lines.push(`delivery: ${held}`);
-    if (controller) lines.push(describe(controller.status(), signedIn));
+    const delivery = root?.status();
+    if (delivery?.held) lines.push(`delivery: ${delivery.held}`);
+    if (delivery?.error) lines.push(`delivery: ${delivery.error}`);
+    if (delivery?.controller) lines.push(describe(delivery.controller, signedIn));
     if (loginNote) lines.push(`last sign-in event: ${loginNote}`);
     return lines.join("\n");
   };
@@ -517,19 +368,20 @@ export function createGrayboard(h: Harness): Grayboard {
       if (verb === "login") {
         // Its own failure line: resume can't mend a sign-in that didn't happen.
         try { await login!.login(); }
-        catch (error) { log(`sign-in failed: ${(error as Error).message}; ${LOGIN_ACTION} to try again`, "error"); return; }
+        catch (error) { log(`sign-in failed: ${message(error)}; ${LOGIN_ACTION} to try again`, "error"); return; }
         log("signed in");
-        await connect();
-        if (controller) await restart();
+        // The watch's restart and this one are one epoch-guarded path.
+        if (root) await root.credentialChanged();
+        else if (proxy) await client!.connect(proxy);
       } else if (verb === "logout") {
         // Before the store changes: this session's own watch sees the new
         // epoch too, and the line below already says it.
-        outAnnounced = true;
+        client!.markAnnounced();
         const warnings: string[] = logoutWarnings = [];
         try { await login!.logout(); }
         catch (error) {
-          outAnnounced = false;
-          log(`sign-out failed: ${(error as Error).message}; run /grayboard logout to try again`, "error");
+          client!.markAnnounced(false);
+          log(`sign-out failed: ${message(error)}; run /grayboard logout to try again`, "error");
           return;
         } finally { logoutWarnings = undefined; }
         const pauses = `every ${h.name} session on this server pauses until ${LOGIN_ACTION}`;
@@ -537,18 +389,23 @@ export function createGrayboard(h: Harness): Grayboard {
         if (warnings.length) log(`${warnings.join("; ")}; ${pauses}`, "warning");
         else log(`signed out; ${pauses}`);
       } else if (verb === "resume") {
-        if (!controller || !session) { log(held ?? `only a root session with delivery resumes`, "warning"); return; }
-        // An explicit resume always answers: begin says a sign-out only if nothing has yet.
-        const said = outAnnounced;
-        await restart();
-        if (signedOut) { if (said) log(signedOut.message, "warning"); return; }
-        const record = controller.status().roots.find(r => r.sessionID === session!.id);
-        log(record ? `${record.state}: ${record.message}` : describe(controller.status(), true));
+        if (!root || !session) { log("only a root session with delivery resumes", "warning"); return; }
+        // An explicit resume always answers: a start says a sign-out only if nothing has yet.
+        const said = client!.announced;
+        await root.resume();
+        const delivery = root.status();
+        if (delivery.signedOut) { if (said) log(delivery.signedOut.message, "warning"); return; }
+        // A lock that still can't be taken was said by the retry.
+        if (delivery.error) return;
+        if (delivery.held) { log(delivery.held, "warning"); return; }
+        if (!delivery.controller) { log("delivery isn't running in this session", "warning"); return; }
+        const record = delivery.controller.roots.find(r => r.sessionID === session!.id);
+        log(record ? `${record.state}: ${record.message}` : describe(delivery.controller, true));
       } else if (verb === "status") log(await status());
       else log(`unknown subcommand ${verb}; use login, logout, resume or status`, "warning");
     } catch (error) {
       const expired = accessExpiry(error);
-      log(expired ? expired.message : error instanceof AccessExpired || error instanceof Refusal ? error.message : failureMessage(error, RESUME_HINT) + ` (${(error as Error).message})`, "error");
+      log(expired ? expired.message : error instanceof AccessExpired || error instanceof Refusal ? error.message : failureText(error, RESUME_HINT), "error");
     }
   };
 

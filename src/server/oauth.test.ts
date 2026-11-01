@@ -12,7 +12,8 @@ import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
-import { BUILTIN_CLIENT_IDS, GRAYBOARD_SESSION_META, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, type OAuthClient } from "./oauth-config.ts";
+import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 

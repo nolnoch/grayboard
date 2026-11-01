@@ -34259,39 +34259,465 @@ class Server extends Protocol2 {
   }
 }
 
-// adapters/hosted-core/src/controller.ts
+// src/shared/attachments.ts
+import { createHash as createHash5, randomUUID } from "crypto";
+import { constants, realpathSync } from "fs";
+import { link, mkdir as mkdir3, open as open3, rm as rm2, writeFile } from "fs/promises";
+import { homedir as homedir2 } from "os";
+import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse6, relative, resolve as resolve2, sep } from "path";
+
+// src/core/errors.ts
+class CoreError extends Error {
+}
+
+class TooLargeError extends CoreError {
+}
+
+// src/shared/hash.ts
 import { createHash as createHash4 } from "crypto";
+var sha256Hex = (data) => createHash4("sha256").update(data).digest("hex");
 
-// adapters/hosted-core/src/sessions.ts
-class AncestryError extends Error {
+// src/shared/attachments.ts
+var MAX_ATTACHMENTS = 5;
+var DEFAULT_ATTACHMENT_LIMITS = { file: 10 * 1024 * 1024, total: 25 * 1024 * 1024 };
+var ATTACHMENT_LIMITS_CAPABILITY = "io.github.nolnoch.grayboard/attachments";
+function publishedLimits(experimental) {
+  if (!experimental || !(ATTACHMENT_LIMITS_CAPABILITY in experimental))
+    return;
+  const value = experimental[ATTACHMENT_LIMITS_CAPABILITY];
+  const file = value?.file, total = value?.total;
+  if (typeof file !== "number" || typeof total !== "number" || !Number.isSafeInteger(file) || !Number.isSafeInteger(total) || file <= 0 || file > total) {
+    throw new Error(`Invalid ${ATTACHMENT_LIMITS_CAPABILITY} capability from the server`);
+  }
+  return { file, total };
 }
-class SessionRoutes {
-  paths = new Map;
-  ended = new Set;
-  remember(path) {
-    if (this.ended.has(path.sessionID) || this.ended.has(path.root))
-      throw new AncestryError("Grayboard session ended during ancestry lookup");
-    const previous = this.paths.get(path.sessionID);
-    if (previous && previous.root !== path.root)
-      throw new AncestryError("Grayboard session ancestry changed");
-    this.paths.set(path.sessionID, { ...path, via: [...path.via] });
+var DEFAULT_ATTACHMENT_USER_QUOTA = 1024 * 1024 * 1024;
+var MAX_FILENAME_BYTES = 200;
+function sanitizeFilename(name) {
+  const base = name.split(/[\\/]/).pop() ?? "";
+  const chars = [...base.replace(/[\u0000-\u001f\u007f"';<>|:*?]|\p{Cf}/gu, "_").trim()];
+  while (new TextEncoder().encode(chars.join("")).length > MAX_FILENAME_BYTES)
+    chars.pop();
+  const out = chars.join("");
+  if (!out || out === "." || out === "..")
+    return "file";
+  return out;
+}
+var TEXT_TYPES = {
+  ".md": "text/markdown",
+  ".markdown": "text/markdown",
+  ".json": "application/json",
+  ".csv": "text/csv"
+};
+var startsWith = (d, sig, at = 0) => sig.every((b, i) => d[at + i] === b);
+var ascii = (s) => [...s].map((c) => c.charCodeAt(0));
+function sniffType(data, filename) {
+  if (startsWith(data, [137, 80, 78, 71, 13, 10, 26, 10]))
+    return "image/png";
+  if (startsWith(data, [255, 216, 255]))
+    return "image/jpeg";
+  if (startsWith(data, ascii("GIF87a")) || startsWith(data, ascii("GIF89a")))
+    return "image/gif";
+  if (startsWith(data, ascii("RIFF")) && startsWith(data, ascii("WEBP"), 8))
+    return "image/webp";
+  if (startsWith(data, ascii("%PDF-")))
+    return "application/pdf";
+  if (data.includes(0))
+    return null;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(data);
+  } catch {
+    return null;
   }
-  end(sessionID) {
-    if (this.ended.has(sessionID))
-      return;
-    this.ended.add(sessionID);
-    const path = this.paths.get(sessionID);
-    this.paths.delete(sessionID);
-    return path ? { ...path, via: [...path.via] } : undefined;
+  return TEXT_TYPES[extname(filename).toLowerCase()] ?? "text/plain";
+}
+var SECRET_NAME = /^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?|credentials(\..*)?|kubeconfig(\..*)?|service[-_]?account.*\.json|authkey_.*\.p8|.*\.tfvars(\.json)?|.*\.tfstate(\.backup)?)$|\.(pem|key|p8|p12|pfx|jks|keystore|ppk|kdbx|ovpn)$/i;
+var SECRET_CONTENT = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|PuTTY-User-Key-File-\d|aws_secret_access_key\s*=/;
+var TYPE_EXTENSIONS = {
+  "image/png": [".png"],
+  "image/jpeg": [".jpg", ".jpeg"],
+  "image/gif": [".gif"],
+  "image/webp": [".webp"],
+  "application/pdf": [".pdf"]
+};
+var RENDERED_TEXT = new Set([
+  ".html",
+  ".htm",
+  ".xhtml",
+  ".mhtml",
+  ".svg",
+  ".xml",
+  ".url",
+  ".webloc",
+  ".inetloc",
+  ".desktop",
+  ".hta",
+  ".lnk",
+  ".scf"
+]);
+function typedName(name, type) {
+  const ext = extname(name).toLowerCase();
+  const allowed = TYPE_EXTENSIONS[type];
+  if (allowed)
+    return allowed.includes(ext) ? name : `${name}${allowed[0]}`;
+  return RENDERED_TEXT.has(ext) ? `${name}.txt` : name;
+}
+function checkFile(label, rawName, data) {
+  const name = sanitizeFilename(rawName);
+  if (name.startsWith("."))
+    throw new CoreError(`${label}: dotfiles aren't attachable`);
+  if (SECRET_NAME.test(name))
+    throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
+  if (data.length === 0)
+    throw new CoreError(`${label}: empty file`);
+  const type = sniffType(data, name);
+  if (!type)
+    throw new CoreError(`${label}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
+  if (SECRET_CONTENT.test(new TextDecoder("latin1").decode(data))) {
+    throw new CoreError(`${label}: holds private key or secret key material; not attachable`);
   }
+  return { filename: typedName(name, type), type, data };
 }
 
-// adapters/hosted-core/src/children.ts
-async function register2(temporary, path) {
-  await temporary(path.root, (wire) => wire.call("session_register", { child: path.child, ...path.via.length ? { via: path.via } : {} }));
+class SizeTally {
+  limits;
+  total = 0;
+  constructor(limits, count) {
+    this.limits = limits;
+    if (count > MAX_ATTACHMENTS)
+      throw new CoreError(`at most ${MAX_ATTACHMENTS} attachments per message`);
+  }
+  add(label, size) {
+    if (size > this.limits.file)
+      throw new TooLargeError(`${label}: ${formatSize(size)} exceeds the ${formatSize(this.limits.file)} limit per file`);
+    this.total += size;
+    if (this.total > this.limits.total)
+      throw new TooLargeError(`attachments exceed ${formatSize(this.limits.total)} in all`);
+  }
 }
-async function end(temporary, path) {
-  await temporary(path.child, (wire) => wire.call("session_end"));
+function attachRoots(env = process.env, cwd = process.cwd()) {
+  const out = new Set;
+  const add = (r) => {
+    try {
+      out.add(realpathSync(resolve2(cwd, r)));
+    } catch {}
+  };
+  add(cwd);
+  for (const broad of [homedir2(), parse6(resolve2(cwd)).root]) {
+    try {
+      out.delete(realpathSync(broad));
+    } catch {}
+  }
+  for (const r of (env.BUS_ATTACH_ROOTS ?? "").split(delimiter).filter(Boolean))
+    add(r);
+  return [...out];
+}
+var ROOTS_HINT = "its working directory unless that's the home directory, and BUS_ATTACH_ROOTS";
+function under(real, roots) {
+  for (const root of roots) {
+    const rel = relative(root, real);
+    if (rel && !rel.startsWith("..") && !isAbsolute(rel))
+      return rel.split(sep);
+  }
+  return null;
+}
+function checkSaveDir(dir, roots, cwd = process.cwd()) {
+  let real;
+  try {
+    real = realpathSync(resolve2(cwd, dir));
+  } catch {
+    throw new CoreError(`dir ${dir} doesn't exist`);
+  }
+  if (roots.includes(real))
+    return real;
+  const rel = under(real, roots);
+  if (!rel)
+    throw new CoreError(`dir ${dir} is outside the directories this session may write to (${ROOTS_HINT})`);
+  if (rel.some((c) => c.startsWith(".")))
+    throw new CoreError(`dir ${dir}: saving into dot directories isn't allowed`);
+  return real;
+}
+async function readAttachmentFiles(paths, roots, opts = {}) {
+  const cwd = opts.cwd ?? process.cwd();
+  if (!Array.isArray(paths) || !paths.every((p) => typeof p === "string" && p)) {
+    throw new CoreError("attachments must be a list of file paths");
+  }
+  const tally = new SizeTally(opts.limits ?? DEFAULT_ATTACHMENT_LIMITS, paths.length);
+  const out = [];
+  for (const p of paths) {
+    const label = `attachment ${p}`;
+    let real;
+    try {
+      real = realpathSync(resolve2(cwd, p));
+    } catch {
+      throw new CoreError(`${label}: no such file`);
+    }
+    const rel = under(real, roots);
+    if (!rel)
+      throw new CoreError(`${label}: outside the directories this session may attach from (${ROOTS_HINT})`);
+    if (rel.some((c) => c.startsWith(".")))
+      throw new CoreError(`${label}: dotfiles and files in dot directories aren't attachable`);
+    if (SECRET_NAME.test(basename(real)))
+      throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
+    const data = await readChecked(real, label, tally);
+    out.push(checkFile(label, p.split(/[\\/]/).pop() ?? basename(real), data));
+  }
+  return out;
+}
+async function readChecked(real, label, tally) {
+  let fh;
+  try {
+    fh = await open3(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch (e) {
+    throw new CoreError(`${label}: can't be opened (${e.code ?? "error"})`);
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile())
+      throw new CoreError(`${label}: not a regular file`);
+    if (st.size === 0)
+      throw new CoreError(`${label}: empty file`);
+    tally.add(label, st.size);
+    const buf = new Uint8Array(st.size + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const { bytesRead } = await fh.read(buf, n, buf.length - n, n);
+      if (bytesRead === 0)
+        break;
+      n += bytesRead;
+    }
+    if (n !== st.size)
+      throw new CoreError(`${label}: changed while being read`);
+    return buf.subarray(0, n);
+  } finally {
+    await fh.close();
+  }
+}
+function formatSize(n) {
+  if (n < 1024)
+    return `${n}B`;
+  if (n < 1024 * 1024)
+    return `${Math.round(n / 1024)}KB`;
+  return `${(n / (1024 * 1024)).toFixed(1).replace(/\.0$/, "")}MB`;
+}
+function formatAttachmentsMeta(list) {
+  return list.map((a) => `${a.id}:${a.filename} ${a.type} ${formatSize(a.size)} sha256:${a.sha256}`).join("; ");
+}
+function checkAttachmentId(id) {
+  if (!Number.isSafeInteger(id) || id < 1)
+    throw new CoreError("id must be an attachment id");
+  return id;
+}
+async function saveTarget(dir, roots, bus, env = process.env) {
+  if (dir !== undefined && typeof dir !== "string")
+    throw new CoreError("dir must be a string");
+  if (dir !== undefined)
+    return checkSaveDir(dir, roots);
+  const target = join4(attachmentsDir(env), bus);
+  await mkdir3(target, { recursive: true, mode: 448 });
+  return target;
+}
+function saveAttachment(a, data, target) {
+  return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
+}
+async function sendWithUploads(files, transport, send) {
+  const ids = [];
+  let sent = false;
+  try {
+    for (const f of files)
+      ids.push(await transport.upload(f));
+    sent = true;
+    return await send(ids);
+  } catch (e) {
+    const landed = await releaseUploads(transport, ids);
+    if (sent && ids.length && landed === ids.length)
+      throw new SendLanded(ids, e);
+    throw e;
+  }
+}
+async function releaseUploads(transport, ids) {
+  let bound = 0;
+  for (const id of ids) {
+    try {
+      if (!await transport.release(id))
+        bound++;
+    } catch (e) {
+      transport.unreleased(id, e);
+    }
+  }
+  return bound;
+}
+
+class SendLanded extends Error {
+  attachments;
+  constructor(attachments, cause) {
+    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`);
+    this.attachments = attachments;
+  }
+}
+async function downloadAttachment(id, target, maxBytes, transport) {
+  const { headers, data } = await transport.download(id, maxBytes);
+  const sha256 = sha256Hex(data);
+  if (digestSha256(headers.get("repr-digest")) !== sha256)
+    throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
+  const info = {
+    id,
+    filename: dispositionFilename(headers.get("content-disposition")) ?? "file",
+    type: headers.get("content-type") ?? "application/octet-stream",
+    size: data.length,
+    sha256
+  };
+  const path = await saveAttachment(info, data, target);
+  return { path, filename: info.filename, type: info.type, size: info.size, sha256 };
+}
+var MAX_NAME_TRIES = 100;
+async function writeNew(dir, name, data) {
+  const tmp = join4(dir, `.grayboard-${randomUUID()}.tmp`);
+  await writeFile(tmp, data, { mode: 384, flag: "wx" });
+  try {
+    const ext = extname(name);
+    const stem = name.slice(0, name.length - ext.length);
+    for (let n = 1;n <= MAX_NAME_TRIES; n++) {
+      const path = join4(dir, n === 1 ? name : `${stem}-${n}${ext}`);
+      try {
+        await link(tmp, path);
+        return path;
+      } catch (e) {
+        if (e.code !== "EEXIST")
+          throw e;
+      }
+      if (await isOwnCopy(path, data))
+        return path;
+    }
+    throw new CoreError(`can't save ${name} in ${dir}: ${MAX_NAME_TRIES} files by that name already exist`);
+  } finally {
+    await rm2(tmp, { force: true });
+  }
+}
+async function isOwnCopy(path, data) {
+  let fh;
+  try {
+    fh = await open3(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile() || st.uid !== process.getuid?.() || st.size !== data.length)
+      return false;
+    return Buffer.from(await fh.readFile()).equals(data);
+  } finally {
+    await fh.close();
+  }
+}
+var serverBusDir = (serverUrl) => new URL(serverUrl).host.replace(/[^A-Za-z0-9.-]/g, "_");
+var ATTACHMENTS_PARAM = {
+  type: "array",
+  items: { type: "string" },
+  description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
+};
+var ATTACHMENT_GET_TOOL = {
+  name: "attachment_get",
+  description: "attachment_get(id, dir?): save a file attached to a message or post you can read (ids are in its attachments) and return the saved path.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "number", description: "The attachment id." },
+      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or BUS_ATTACH_ROOTS. Default: this bus's folder under $GRAYBOARD_ATTACHMENTS_DIR (~/.grayboard/attachments)." }
+    },
+    required: ["id"]
+  }
+};
+function digestSha256(header) {
+  const m = /(?:^|,)\s*sha-256=:([A-Za-z0-9+/]+=*):/.exec(header ?? "");
+  return m ? Buffer.from(m[1], "base64").toString("hex") : null;
+}
+function dispositionFilename(header) {
+  const m = /filename\*=UTF-8''([^;]+)/.exec(header ?? "");
+  if (!m)
+    return null;
+  try {
+    return sanitizeFilename(decodeURIComponent(m[1]));
+  } catch {
+    return null;
+  }
+}
+function attachmentsDir(env = process.env) {
+  return env.GRAYBOARD_ATTACHMENTS_DIR ?? join4(homedir2(), ".grayboard", "attachments");
+}
+
+// src/shared/notifications.ts
+function addFiles(meta, list) {
+  if (!list?.length)
+    return;
+  meta.attachments = formatAttachmentsMeta(list);
+  meta.files_tool = "attachment_get(id, dir?) saves one; ids lead each item";
+}
+function dmNotification(msg, primary) {
+  const meta = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary)
+    meta.to = msg.recipient;
+  if (msg.parent_id !== null)
+    meta.parent_id = String(msg.parent_id);
+  if (msg.kind)
+    meta.kind = msg.kind;
+  addFiles(meta, msg.attachments);
+  return { content: msg.body, meta };
+}
+function boardNotification(item) {
+  if (item.kind === "push") {
+    const p = item.post;
+    const meta = {
+      board: p.board,
+      post_id: String(p.id),
+      from: p.author,
+      reason: item.reason,
+      created_at: String(p.created_at)
+    };
+    if (p.parent_id !== null)
+      meta.parent_id = String(p.parent_id);
+    addFiles(meta, p.attachments);
+    if (item.deferred)
+      meta.deferred = "true";
+    return { content: p.body, meta };
+  }
+  const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
+  return {
+    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
+    meta: { board: item.board, kind: "digest", unread: String(item.unread) }
+  };
+}
+
+// src/shared/addressing.ts
+var MAX_IDENTITY_LENGTH = 32;
+var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
+var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
+var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
+var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
+var HUMAN_NAME = "human";
+var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
+
+// adapters/hosted-core/src/channel.ts
+var InboxEvent = discriminatedUnion("kind", [
+  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
+  object({ kind: literal("board"), item: discriminatedUnion("kind", [
+    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
+    looseObject({ kind: literal("digest"), board: string2() })
+  ]) })
+]);
+function channelParams(item, identity) {
+  const event = InboxEvent.parse(item.event);
+  const human = `${identity.user.email}/${HUMAN_NAME}`;
+  if (event.kind === "direct") {
+    const params = dmNotification(event.message, identity.identity_full);
+    if (event.message.sender === human)
+      params.meta.human = "true";
+    return params;
+  }
+  const params = boardNotification(event.item);
+  if (event.item.kind === "push" && event.item.post.author === human)
+    params.meta.human = "true";
+  return params;
 }
 
 // adapters/hosted-core/src/diagnostics.ts
@@ -34482,657 +34908,6 @@ class Diagnostics {
   async flush() {
     await this.pending;
     return !this.failed;
-  }
-}
-
-// adapters/hosted-core/src/controller.ts
-var ADMITTED_LIMIT = 100;
-function sleep5(ms, signal) {
-  return new Promise((resolve) => {
-    if (signal.aborted)
-      return resolve();
-    const done = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal.addEventListener("abort", done, { once: true });
-  });
-}
-function causeOf(error, type) {
-  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++)
-    if (e instanceof type)
-      return e;
-  return;
-}
-function fingerprint(e) {
-  const c = e.configuration;
-  return createHash4("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.name])).digest("hex");
-}
-
-class Controller {
-  port;
-  routes = new SessionRoutes;
-  Transport;
-  roots = new Map;
-  watches = new Map;
-  stopped = false;
-  drifted = false;
-  controls = Promise.resolve();
-  state;
-  diagnostics;
-  place;
-  wait;
-  configured;
-  constructor(port, options = {}) {
-    this.port = port;
-    this.Transport = options.Transport ?? Wire;
-    this.wait = options.wait ?? sleep5;
-    this.configured = options.configured;
-    this.place = port.place();
-    const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
-    this.state = { state: "unenrolled", message: idle, roots: [] };
-    this.diagnostics = new Diagnostics(port.storage, options.sink, { idle, ...options.knownRoot ? { knownRoot: options.knownRoot } : {} });
-  }
-  get hint() {
-    return this.port.resumeHint;
-  }
-  status() {
-    return this.diagnostics.status();
-  }
-  async flushDiagnostics() {
-    await this.diagnostics.flush();
-  }
-  set(r, state, message, operation = "delivery", code) {
-    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {}, ...code ? { code } : {} });
-    r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
-  }
-  failure(operation, error, r) {
-    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...r ? { sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {} } : {}, code: failureCode(error) });
-  }
-  record(input) {
-    this.diagnostics.record(input);
-  }
-  serial(call) {
-    const result = this.controls.then(call, call);
-    this.controls = result.catch(() => {});
-    return result;
-  }
-  drift(message) {
-    this.drifted = true;
-    for (const r of this.roots.values()) {
-      r.paused = true;
-      r.epoch++;
-      r.abort?.abort();
-      this.set(r, "paused", message);
-      this.port.storage.set(`paused:${r.e.sessionID}`, true).catch((error) => this.failure("latch_save", error, r));
-    }
-  }
-  credentialChanged() {
-    this.drift(`Grayboard credential changed; ${this.hint}`);
-  }
-  async path(sessionID) {
-    const path = await this.port.ancestry(sessionID);
-    this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
-    for (const [index, id] of path.via.entries())
-      this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
-    this.routes.remember(path);
-    return path;
-  }
-  async activeRoot(sessionID) {
-    const path = await this.path(sessionID);
-    if (path.root !== sessionID)
-      throw new Refusal("root", "An active top-level root is required");
-  }
-  approvalKey(e) {
-    return this.port.approval ? this.port.approval.key(e) : e.configuration.configHash;
-  }
-  key(e) {
-    return this.port.approval ? this.port.approval.key(e) : fingerprint(e);
-  }
-  async remembered(sessionID, approval) {
-    const remembered = await this.port.storage.get(`rememberedName:${sessionID}`);
-    const name = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "name")?.value : undefined;
-    const key = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "approval")?.value : undefined;
-    return key === this.approvalKey(approval) && typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name) ? name : undefined;
-  }
-  async save(r, enabled) {
-    if (!this.port.approval)
-      return;
-    await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
-    await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
-  }
-  async guard(r, epoch, signal) {
-    const e = r.e, key = this.key(e);
-    const current = () => this.port.place() === this.place && !this.stopped && !this.drifted && !r.paused && !signal.aborted && r.epoch === epoch && this.roots.get(e.sessionID) === r && this.key(r.e) === key;
-    const check = () => {
-      if (!current())
-        throw new Refusal("paused", "Admission target changed");
-    };
-    check();
-    await this.port.credential.check(e).catch((error) => {
-      if (error instanceof Refusal && error.code === "binding" && current())
-        this.credentialChanged();
-      throw error;
-    });
-    await this.activeRoot(e.sessionID);
-    if (this.port.approval && !await this.port.approval.approved(e, r.approval)) {
-      r.paused = true;
-      throw new Refusal("root", `Root approval changed; ${this.hint}`);
-    }
-    check();
-  }
-  wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {} };
-  }
-  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
-    let current;
-    const wire = new this.Transport(this.wireOptions(e), {
-      token: async () => current = await this.port.credential.token(e),
-      onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? "")
-    }, signal, sessionID, beforeRetry);
-    await wire.connect();
-    return wire;
-  }
-  async temporary(e, call, sessionID = e.sessionID) {
-    const wire = await this.wire(e, sessionID);
-    try {
-      return await call(wire);
-    } finally {
-      await wire.close().catch((error) => this.failure("wire_close", error));
-    }
-  }
-  expired(error) {
-    return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
-  }
-  async watch(e) {
-    let live = true;
-    const watch = await this.port.credential.watch(e, () => {
-      if (live)
-        this.credentialChanged();
-    });
-    this.watches.set(e.sessionID, { dispose: async () => {
-      live = false;
-      await watch.dispose();
-    } });
-  }
-  async unwatch(sessionID) {
-    if (this.drifted) {
-      for (const watch of this.watches.values())
-        await watch.dispose();
-      this.watches.clear();
-    }
-    await this.watches.get(sessionID)?.dispose();
-    this.watches.delete(sessionID);
-  }
-  async enroll(sessionID, name, create = false) {
-    return this.serial(async () => {
-      if (this.stopped)
-        throw new Refusal("paused", "Grayboard is stopping");
-      await this.activeRoot(sessionID);
-      await this.unwatch(sessionID);
-      const previous = this.roots.get(sessionID);
-      if (previous)
-        await this.stop(previous);
-      const captured = await this.port.credential.capture(sessionID);
-      const e = { ...captured, ...previous?.e.name ? { name: previous.e.name } : {} };
-      const r = { e, approval: structuredClone(e), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
-      this.roots.set(sessionID, r);
-      this.drifted = false;
-      await this.save(r, true);
-      await this.watch(e);
-      this.set(r, "approved", "Root approved; bind a name to receive deliveries");
-      try {
-        if (name) {
-          const epoch = r.epoch, signal = new AbortController().signal;
-          await this.temporary(e, async (w) => {
-            await this.guard(r, epoch, signal);
-            await w.call("bind", { name, create, where: this.port.place() });
-            await this.guard(r, epoch, signal);
-          });
-        }
-        await this.prepare(r, !!previous?.paused && !name);
-      } catch (error) {
-        const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
-        if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
-      }
-      await this.diagnostics.flush();
-      return { ...r.status, roots: this.status().roots };
-    });
-  }
-  async resume(sessionID) {
-    return this.serial(async () => {
-      if (this.stopped)
-        throw new Refusal("paused", "Grayboard is stopping");
-      await this.activeRoot(sessionID);
-      await this.unwatch(sessionID);
-      const previous = this.roots.get(sessionID);
-      if (previous)
-        await this.stop(previous);
-      const approval = await this.approvalFor(sessionID);
-      const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
-      const r = { e: { ...approval, ...name ? { name } : {} }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
-      this.roots.set(sessionID, r);
-      this.drifted = false;
-      await this.watch(r.e);
-      this.set(r, "approved", name ? `Resuming ${name}` : "Root approved; bind a name to receive deliveries");
-      try {
-        await this.prepare(r, true);
-      } catch (error) {
-        if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error)));
-      }
-      await this.diagnostics.flush();
-      return { ...r.status, roots: this.status().roots };
-    });
-  }
-  async approvalFor(sessionID) {
-    if (!this.port.approval)
-      return this.port.credential.capture(sessionID);
-    const saved = (await this.port.approval.saved()).find((s) => s.sessionID === sessionID);
-    if (!saved?.approval || !saved.enabled)
-      throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
-    await this.port.credential.check(saved.approval);
-    return saved.approval;
-  }
-  async carried(sessionID) {
-    try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
-    } catch {
-      return;
-    }
-  }
-  async prepare(r, resume = false, waitForStart = false) {
-    const epoch = r.epoch, signal = new AbortController().signal;
-    await this.temporary(r.e, async (wire) => {
-      await this.guard(r, epoch, signal);
-      let current = bindingOf(await wire.call("whoami"));
-      await this.guard(r, epoch, signal);
-      if (!current.name && r.e.name && resume) {
-        await wire.call("bind", { name: r.e.name, create: false, where: this.port.place() });
-        await this.guard(r, epoch, signal);
-        current = bindingOf(await wire.call("whoami"));
-        await this.guard(r, epoch, signal);
-      }
-      if (r.epoch !== epoch || r.paused || this.stopped)
-        return;
-      if (!current.name) {
-        this.set(r, "unbound", "Root approved, unbound; bind(name) to take one");
-        return;
-      }
-      await this.guard(r, epoch, signal);
-      r.e = { ...r.e, name: current.name };
-      await this.port.storage.set(`rememberedName:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), name: current.name });
-      await this.guard(r, epoch, signal);
-      if (r.epoch === epoch && !r.paused && !this.stopped) {
-        this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
-        const started = this.start(r);
-        if (waitForStart)
-          await started;
-      }
-    });
-  }
-  start(r) {
-    if (r.task || r.paused || this.stopped)
-      return;
-    const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController;
-    let ready;
-    const started = new Promise((resolve) => {
-      ready = resolve;
-    });
-    r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
-      const error = this.expired(caught);
-      if (!abort.signal.aborted) {
-        r.paused = true;
-        this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
-      }
-    }).finally(ready);
-    return started;
-  }
-  async run(r, e, epoch, signal, ready) {
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
-    let pendingItem;
-    const attempts = new Map;
-    while (!signal.aborted && failures < 8) {
-      let wire;
-      try {
-        await this.guard(r, epoch, signal);
-        wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
-        await this.guard(r, epoch, signal);
-        const current = bindingOf(await wire.call("whoami"));
-        outage = false;
-        await this.guard(r, epoch, signal);
-        if (!current.name) {
-          r.lease = undefined;
-          await wire.call("bind", { name: e.name, create: false, where: this.port.place() });
-          await this.guard(r, epoch, signal);
-        } else if (current.name !== e.name)
-          throw new Refusal("identity", `Root binding changed without a native completion; ${this.hint}`);
-        const lease = leaseOf(await wire.call("delivery_open"), e);
-        await this.guard(r, epoch, signal);
-        r.lease = lease;
-        wire.capability = lease.capability;
-        this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
-        ready();
-        let dirty = true, wake, closed = false;
-        wire.client.setNotificationHandler("notifications/resources/updated", () => {
-          dirty = true;
-          wake?.();
-        });
-        const subscription = await wire.listen();
-        subscription.closed.then(() => {
-          closed = true;
-          wake?.();
-        }, () => {
-          closed = true;
-          wake?.();
-        });
-        let renewal = Date.now() + 1e4;
-        try {
-          while (!signal.aborted) {
-            if (dirty) {
-              dirty = false;
-              const items = itemsOf(await wire.read("grayboard://inbox"));
-              await admitPrefix(items, async (item) => {
-                inItem = true;
-                pendingItem = /^(direct|push):[1-9][0-9]*$/.test(item.id) ? item.id : `item#${createHash4("sha256").update(item.id).digest("hex").slice(0, 12)}`;
-                const count = (attempts.get(item.id) ?? 0) + 1;
-                if (count > 8)
-                  throw new DeliveryStopped(pendingItem);
-                attempts.set(item.id, count);
-                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity)
-                  throw new Refusal("identity", "Issued batch does not match the immutable lease");
-                await this.guard(r, epoch, signal);
-                const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
-                await wire.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) {
-                  inItem = false;
-                  return;
-                }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity);
-                r.admitted.add(key);
-                while (r.admitted.size > ADMITTED_LIMIT)
-                  r.admitted.delete(r.admitted.values().next().value);
-                await this.guard(r, epoch, signal);
-                await wire.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
-              }, async (ids) => {
-                await this.guard(r, epoch, signal);
-                await wire.call("delivery_receipt", { ids });
-                for (const id of ids) {
-                  attempts.delete(id);
-                  r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`);
-                }
-                failures = 0;
-                throttles = 0;
-                recoveries = 0;
-                unreachable = 0;
-                pendingItem = undefined;
-              });
-              if (items.length === 100)
-                dirty = true;
-            }
-            if (closed)
-              throw new SubscriptionClosed;
-            if (Date.now() >= renewal) {
-              await this.guard(r, epoch, signal);
-              await wire.call("delivery_renew");
-              renewal = Date.now() + 1e4;
-              dirty = true;
-              recoveries = 0;
-              unreachable = 0;
-            }
-            if (dirty)
-              continue;
-            const timer = new AbortController;
-            await Promise.race([sleep5(1000, AbortSignal.any([signal, timer.signal])), new Promise((resolve) => {
-              wake = resolve;
-            })]);
-            wake = undefined;
-            timer.abort();
-          }
-        } finally {
-          await subscription.close().catch((error) => this.failure("subscription_close", error, r));
-        }
-      } catch (caught) {
-        if (signal.aborted)
-          break;
-        const error = this.expired(caught);
-        if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || error instanceof AccessExpired && error.reason === "expired" && outage) {
-          if (error instanceof ServerUnreachable)
-            outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
-          ready();
-          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
-          continue;
-        }
-        if (error instanceof Refusal || error instanceof DeliveryStopped)
-          throw error;
-        if (error instanceof LeaseUnavailable) {
-          r.lease = undefined;
-          if (!inItem && ++recoveries > 3)
-            throw new Refusal("paused", `Lease recovery limit reached; ${this.hint}`);
-        } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code))
-          throw error;
-        else {
-          failures++;
-          if (error instanceof SubscriberError && error.code === "receipt_capacity") {
-            await this.guard(r, epoch, signal);
-            if (!wire || !r.lease)
-              throw new Refusal("paused", "Capacity recovery requires the current lease");
-            await wire.call("delivery_release");
-            r.lease = undefined;
-            await this.guard(r, epoch, signal);
-          }
-        }
-        this.set(r, "retrying", `Revalidating the approved root before reopening delivery (${failureCode(error)})`, "reopen", failureCode(error));
-        ready();
-        if (wire?.admissionRetryAfterMs) {
-          if (++throttles > 8)
-            throw new Error(`Admission retry limit reached; ${this.hint}`);
-          await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
-        } else
-          await this.wait(Math.min(8000, 250 * 2 ** failures), signal);
-      } finally {
-        inItem = false;
-        await wire?.close().catch((error) => this.failure("wire_close", error, r));
-      }
-    }
-    if (failures >= 8)
-      throw new DeliveryStopped(pendingItem);
-  }
-  async stop(r) {
-    r.epoch++;
-    r.abort?.abort();
-    await r.task;
-    r.task = undefined;
-    r.abort = undefined;
-  }
-  async release(r) {
-    const lease = r.lease;
-    r.lease = undefined;
-    await this.temporary(r.e, async (wire) => {
-      if (lease) {
-        wire.capability = lease.capability;
-        await wire.call("delivery_release").catch((error) => this.failure("delivery_release", error, r));
-      }
-      await wire.call("session_end");
-    });
-  }
-  async pause(message = `Ownership ended; ${this.hint}`) {
-    return this.serial(async () => {
-      for (const r of this.roots.values()) {
-        r.paused = true;
-        await this.stop(r);
-        await this.release(r).catch((error) => this.failure("session_end", error, r));
-        await this.save(r, false).catch((error) => this.failure("pause_save", error, r));
-        this.set(r, "paused", message);
-      }
-      return this.status();
-    });
-  }
-  async shutdown(sessionID, mode) {
-    return this.serial(async () => {
-      const r = this.roots.get(sessionID);
-      if (!r)
-        return;
-      r.paused = true;
-      await this.stop(r);
-      await this.watches.get(sessionID)?.dispose().catch((error) => this.failure("watch_dispose", error, r));
-      this.watches.delete(sessionID);
-      if (mode === "release")
-        await this.release(r).catch((error) => this.failure("session_end", error, r));
-      this.set(r, "paused", mode === "release" ? "Session shut down; ownership released" : "Session detached; lease retained for reload", "session_end");
-      this.roots.delete(sessionID);
-    });
-  }
-  async restore() {
-    await this.diagnostics.restore(async (id) => {
-      await this.activeRoot(id);
-      return true;
-    });
-    if (!this.port.approval)
-      return;
-    for (const saved of await this.port.approval.saved()) {
-      const id = saved.sessionID;
-      if (this.stopped)
-        continue;
-      try {
-        try {
-          await this.activeRoot(id);
-        } catch {
-          continue;
-        }
-        if (!saved.approval)
-          throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
-        const e = saved.approval;
-        const previous = this.status().roots.find((record) => record.sessionID === id);
-        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused";
-        const name = await this.remembered(id, e);
-        const r = { e: { ...e, ...name ? { name } : {} }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set };
-        this.roots.set(id, r);
-        if (paused) {
-          this.set(r, "paused", `Saved approval paused; ${this.hint}`);
-          continue;
-        }
-        await this.port.credential.check(e);
-        await this.watch(e);
-        await this.prepare(r, true, true);
-      } catch {
-        const r = this.roots.get(id);
-        if (r) {
-          r.paused = true;
-          await this.stop(r);
-          this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
-        } else
-          this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
-      }
-    }
-  }
-  async beforeCall(event) {
-    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
-    if (path.root !== event.sessionID) {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await register2((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID }).catch((error) => {
-        this.failure("child_register", error, r);
-        throw error;
-      });
-      this.routes.remember(path);
-    }
-    if (event.tool === "bind" && path.root === event.sessionID)
-      await this.serial(async () => {
-        const current = this.roots.get(path.root);
-        if (current) {
-          this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind");
-          await this.stop(current);
-        } else
-          this.diagnostics.record({ state: "rebinding", sessionID: path.root, message: this.port.approval ? "Native bind pending; receiving requires approval" : "Native bind pending", operation: "before_bind" });
-      });
-  }
-  async afterCall(event) {
-    return this.serial(async () => {
-      const r = this.roots.get(event.sessionID);
-      if (!r || r.paused || this.drifted || this.stopped)
-        return;
-      try {
-        if (event.tool !== "bind") {
-          const output = event.result.status === "completed" ? event.result.output : undefined;
-          if (output?.unbound === true && r.e.name) {
-            await this.stop(r);
-            r.lease = undefined;
-            await this.prepare(r, true);
-          }
-          return;
-        }
-        await this.stop(r);
-        if (event.result.status === "completed") {
-          const output = event.result.output;
-          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every((line) => typeof line === "string"))
-            throw new Error("Native bind completion lacked validated output");
-        }
-        await this.prepare(r, false);
-      } catch (error) {
-        if (!this.drifted)
-          this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
-      }
-    });
-  }
-  async configuredBind(sessionID) {
-    if (this.stopped || !this.configured)
-      return;
-    const path = await this.path(sessionID);
-    if (path.root !== sessionID)
-      return;
-    try {
-      const e = await this.port.credential.capture(sessionID);
-      await this.temporary(e, (w) => w.call("bind", { name: this.configured.name, create: this.configured.create, where: this.port.place() }));
-      this.diagnostics.record({ state: "unenrolled", sessionID, message: this.port.approval ? "Configured binding completed; receiving still requires human approval" : "Configured binding completed", operation: "configured_bind" });
-    } catch (error) {
-      this.diagnostics.record({ state: "unbound", sessionID, message: failureMessage(this.expired(error), this.hint), operation: "configured_bind", code: failureCode(this.expired(error)) });
-    }
-  }
-  async ended(sessionID) {
-    if (this.stopped)
-      return;
-    const path = this.routes.end(sessionID);
-    if (!path)
-      return;
-    const r = this.roots.get(path.root);
-    if (sessionID === path.root && r) {
-      r.paused = true;
-      r.epoch++;
-      r.abort?.abort();
-      await this.serial(async () => {
-        await this.stop(r);
-        await this.release(r).catch((error) => this.failure("session_end", error, r));
-        await this.port.storage.set(`paused:${sessionID}`, true);
-        this.set(r, "paused", "Root ended; ownership released", "session_end");
-      });
-    } else {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
-    }
-  }
-  backgroundFailure(operation) {
-    this.failure(operation, undefined);
-  }
-  async close() {
-    this.stopped = true;
-    for (const r of this.roots.values())
-      r.abort?.abort();
-    await this.controls;
-    for (const r of this.roots.values())
-      await this.stop(r);
-    for (const watch of this.watches.values())
-      await watch.dispose().catch((error) => this.failure("watch_dispose", error));
-    this.watches.clear();
-    await this.diagnostics.flush();
   }
 }
 
@@ -35659,393 +35434,6 @@ var native_tools_default = [
   }
 ];
 
-// src/shared/attachments.ts
-import { createHash as createHash6, randomUUID } from "crypto";
-import { constants, realpathSync } from "fs";
-import { link, mkdir as mkdir3, open as open3, rm as rm2, writeFile } from "fs/promises";
-import { homedir as homedir2 } from "os";
-import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse6, relative, resolve as resolve2, sep } from "path";
-
-// src/core/errors.ts
-class CoreError extends Error {
-}
-
-class TooLargeError extends CoreError {
-}
-
-// src/shared/hash.ts
-import { createHash as createHash5 } from "crypto";
-var sha256Hex = (data) => createHash5("sha256").update(data).digest("hex");
-
-// src/shared/attachments.ts
-var MAX_ATTACHMENTS = 5;
-var DEFAULT_ATTACHMENT_LIMITS = { file: 10 * 1024 * 1024, total: 25 * 1024 * 1024 };
-var ATTACHMENT_LIMITS_CAPABILITY = "io.github.nolnoch.grayboard/attachments";
-function publishedLimits(experimental) {
-  if (!experimental || !(ATTACHMENT_LIMITS_CAPABILITY in experimental))
-    return;
-  const value = experimental[ATTACHMENT_LIMITS_CAPABILITY];
-  const file = value?.file, total = value?.total;
-  if (typeof file !== "number" || typeof total !== "number" || !Number.isSafeInteger(file) || !Number.isSafeInteger(total) || file <= 0 || file > total) {
-    throw new Error(`Invalid ${ATTACHMENT_LIMITS_CAPABILITY} capability from the server`);
-  }
-  return { file, total };
-}
-var DEFAULT_ATTACHMENT_USER_QUOTA = 1024 * 1024 * 1024;
-var MAX_FILENAME_BYTES = 200;
-function sanitizeFilename(name) {
-  const base = name.split(/[\\/]/).pop() ?? "";
-  const chars = [...base.replace(/[\u0000-\u001f\u007f"';<>|:*?]|\p{Cf}/gu, "_").trim()];
-  while (new TextEncoder().encode(chars.join("")).length > MAX_FILENAME_BYTES)
-    chars.pop();
-  const out = chars.join("");
-  if (!out || out === "." || out === "..")
-    return "file";
-  return out;
-}
-var TEXT_TYPES = {
-  ".md": "text/markdown",
-  ".markdown": "text/markdown",
-  ".json": "application/json",
-  ".csv": "text/csv"
-};
-var startsWith = (d, sig, at = 0) => sig.every((b, i) => d[at + i] === b);
-var ascii = (s) => [...s].map((c) => c.charCodeAt(0));
-function sniffType(data, filename) {
-  if (startsWith(data, [137, 80, 78, 71, 13, 10, 26, 10]))
-    return "image/png";
-  if (startsWith(data, [255, 216, 255]))
-    return "image/jpeg";
-  if (startsWith(data, ascii("GIF87a")) || startsWith(data, ascii("GIF89a")))
-    return "image/gif";
-  if (startsWith(data, ascii("RIFF")) && startsWith(data, ascii("WEBP"), 8))
-    return "image/webp";
-  if (startsWith(data, ascii("%PDF-")))
-    return "application/pdf";
-  if (data.includes(0))
-    return null;
-  try {
-    new TextDecoder("utf-8", { fatal: true }).decode(data);
-  } catch {
-    return null;
-  }
-  return TEXT_TYPES[extname(filename).toLowerCase()] ?? "text/plain";
-}
-var SECRET_NAME = /^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?|credentials(\..*)?|kubeconfig(\..*)?|service[-_]?account.*\.json|authkey_.*\.p8|.*\.tfvars(\.json)?|.*\.tfstate(\.backup)?)$|\.(pem|key|p8|p12|pfx|jks|keystore|ppk|kdbx|ovpn)$/i;
-var SECRET_CONTENT = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|PuTTY-User-Key-File-\d|aws_secret_access_key\s*=/;
-var TYPE_EXTENSIONS = {
-  "image/png": [".png"],
-  "image/jpeg": [".jpg", ".jpeg"],
-  "image/gif": [".gif"],
-  "image/webp": [".webp"],
-  "application/pdf": [".pdf"]
-};
-var RENDERED_TEXT = new Set([
-  ".html",
-  ".htm",
-  ".xhtml",
-  ".mhtml",
-  ".svg",
-  ".xml",
-  ".url",
-  ".webloc",
-  ".inetloc",
-  ".desktop",
-  ".hta",
-  ".lnk",
-  ".scf"
-]);
-function typedName(name, type) {
-  const ext = extname(name).toLowerCase();
-  const allowed = TYPE_EXTENSIONS[type];
-  if (allowed)
-    return allowed.includes(ext) ? name : `${name}${allowed[0]}`;
-  return RENDERED_TEXT.has(ext) ? `${name}.txt` : name;
-}
-function checkFile(label, rawName, data) {
-  const name = sanitizeFilename(rawName);
-  if (name.startsWith("."))
-    throw new CoreError(`${label}: dotfiles aren't attachable`);
-  if (SECRET_NAME.test(name))
-    throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
-  if (data.length === 0)
-    throw new CoreError(`${label}: empty file`);
-  const type = sniffType(data, name);
-  if (!type)
-    throw new CoreError(`${label}: not an image (PNG, JPEG, GIF, WebP), a PDF, or UTF-8 text`);
-  if (SECRET_CONTENT.test(new TextDecoder("latin1").decode(data))) {
-    throw new CoreError(`${label}: holds private key or secret key material; not attachable`);
-  }
-  return { filename: typedName(name, type), type, data };
-}
-
-class SizeTally {
-  limits;
-  total = 0;
-  constructor(limits, count) {
-    this.limits = limits;
-    if (count > MAX_ATTACHMENTS)
-      throw new CoreError(`at most ${MAX_ATTACHMENTS} attachments per message`);
-  }
-  add(label, size) {
-    if (size > this.limits.file)
-      throw new TooLargeError(`${label}: ${formatSize(size)} exceeds the ${formatSize(this.limits.file)} limit per file`);
-    this.total += size;
-    if (this.total > this.limits.total)
-      throw new TooLargeError(`attachments exceed ${formatSize(this.limits.total)} in all`);
-  }
-}
-function attachRoots(env = process.env, cwd = process.cwd()) {
-  const out = new Set;
-  const add = (r) => {
-    try {
-      out.add(realpathSync(resolve2(cwd, r)));
-    } catch {}
-  };
-  add(cwd);
-  for (const broad of [homedir2(), parse6(resolve2(cwd)).root]) {
-    try {
-      out.delete(realpathSync(broad));
-    } catch {}
-  }
-  for (const r of (env.BUS_ATTACH_ROOTS ?? "").split(delimiter).filter(Boolean))
-    add(r);
-  return [...out];
-}
-var ROOTS_HINT = "its working directory unless that's the home directory, and BUS_ATTACH_ROOTS";
-function under(real, roots) {
-  for (const root of roots) {
-    const rel = relative(root, real);
-    if (rel && !rel.startsWith("..") && !isAbsolute(rel))
-      return rel.split(sep);
-  }
-  return null;
-}
-function checkSaveDir(dir, roots, cwd = process.cwd()) {
-  let real;
-  try {
-    real = realpathSync(resolve2(cwd, dir));
-  } catch {
-    throw new CoreError(`dir ${dir} doesn't exist`);
-  }
-  if (roots.includes(real))
-    return real;
-  const rel = under(real, roots);
-  if (!rel)
-    throw new CoreError(`dir ${dir} is outside the directories this session may write to (${ROOTS_HINT})`);
-  if (rel.some((c) => c.startsWith(".")))
-    throw new CoreError(`dir ${dir}: saving into dot directories isn't allowed`);
-  return real;
-}
-async function readAttachmentFiles(paths, roots, opts = {}) {
-  const cwd = opts.cwd ?? process.cwd();
-  if (!Array.isArray(paths) || !paths.every((p) => typeof p === "string" && p)) {
-    throw new CoreError("attachments must be a list of file paths");
-  }
-  const tally = new SizeTally(opts.limits ?? DEFAULT_ATTACHMENT_LIMITS, paths.length);
-  const out = [];
-  for (const p of paths) {
-    const label = `attachment ${p}`;
-    let real;
-    try {
-      real = realpathSync(resolve2(cwd, p));
-    } catch {
-      throw new CoreError(`${label}: no such file`);
-    }
-    const rel = under(real, roots);
-    if (!rel)
-      throw new CoreError(`${label}: outside the directories this session may attach from (${ROOTS_HINT})`);
-    if (rel.some((c) => c.startsWith(".")))
-      throw new CoreError(`${label}: dotfiles and files in dot directories aren't attachable`);
-    if (SECRET_NAME.test(basename(real)))
-      throw new CoreError(`${label}: looks like a key or credentials file; not attachable`);
-    const data = await readChecked(real, label, tally);
-    out.push(checkFile(label, p.split(/[\\/]/).pop() ?? basename(real), data));
-  }
-  return out;
-}
-async function readChecked(real, label, tally) {
-  let fh;
-  try {
-    fh = await open3(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-  } catch (e) {
-    throw new CoreError(`${label}: can't be opened (${e.code ?? "error"})`);
-  }
-  try {
-    const st = await fh.stat();
-    if (!st.isFile())
-      throw new CoreError(`${label}: not a regular file`);
-    if (st.size === 0)
-      throw new CoreError(`${label}: empty file`);
-    tally.add(label, st.size);
-    const buf = new Uint8Array(st.size + 1);
-    let n = 0;
-    while (n < buf.length) {
-      const { bytesRead } = await fh.read(buf, n, buf.length - n, n);
-      if (bytesRead === 0)
-        break;
-      n += bytesRead;
-    }
-    if (n !== st.size)
-      throw new CoreError(`${label}: changed while being read`);
-    return buf.subarray(0, n);
-  } finally {
-    await fh.close();
-  }
-}
-function formatSize(n) {
-  if (n < 1024)
-    return `${n}B`;
-  if (n < 1024 * 1024)
-    return `${Math.round(n / 1024)}KB`;
-  return `${(n / (1024 * 1024)).toFixed(1).replace(/\.0$/, "")}MB`;
-}
-function formatAttachmentsMeta(list) {
-  return list.map((a) => `${a.id}:${a.filename} ${a.type} ${formatSize(a.size)} sha256:${a.sha256}`).join("; ");
-}
-function checkAttachmentId(id) {
-  if (!Number.isSafeInteger(id) || id < 1)
-    throw new CoreError("id must be an attachment id");
-  return id;
-}
-async function saveTarget(dir, roots, bus, env = process.env) {
-  if (dir !== undefined && typeof dir !== "string")
-    throw new CoreError("dir must be a string");
-  if (dir !== undefined)
-    return checkSaveDir(dir, roots);
-  const target = join4(attachmentsDir(env), bus);
-  await mkdir3(target, { recursive: true, mode: 448 });
-  return target;
-}
-function saveAttachment(a, data, target) {
-  return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
-}
-async function sendWithUploads(files, transport, send) {
-  const ids = [];
-  let sent = false;
-  try {
-    for (const f of files)
-      ids.push(await transport.upload(f));
-    sent = true;
-    return await send(ids);
-  } catch (e) {
-    const landed = await releaseUploads(transport, ids);
-    if (sent && ids.length && landed === ids.length)
-      throw new SendLanded(ids, e);
-    throw e;
-  }
-}
-async function releaseUploads(transport, ids) {
-  let bound = 0;
-  for (const id of ids) {
-    try {
-      if (!await transport.release(id))
-        bound++;
-    } catch (e) {
-      transport.unreleased(id, e);
-    }
-  }
-  return bound;
-}
-
-class SendLanded extends Error {
-  attachments;
-  constructor(attachments, cause) {
-    super(`sent, but the server's answer was lost (${cause.message}); its attachments (${attachments.join(", ")}) are bound to it. It landed, so there's nothing to send again; dm_history or board_read shows it.`);
-    this.attachments = attachments;
-  }
-}
-async function downloadAttachment(id, target, maxBytes, transport) {
-  const { headers, data } = await transport.download(id, maxBytes);
-  const sha256 = sha256Hex(data);
-  if (digestSha256(headers.get("repr-digest")) !== sha256)
-    throw new Error(`attachment ${id}: the bytes received don't match the server's sha256`);
-  const info = {
-    id,
-    filename: dispositionFilename(headers.get("content-disposition")) ?? "file",
-    type: headers.get("content-type") ?? "application/octet-stream",
-    size: data.length,
-    sha256
-  };
-  const path = await saveAttachment(info, data, target);
-  return { path, filename: info.filename, type: info.type, size: info.size, sha256 };
-}
-var MAX_NAME_TRIES = 100;
-async function writeNew(dir, name, data) {
-  const tmp = join4(dir, `.grayboard-${randomUUID()}.tmp`);
-  await writeFile(tmp, data, { mode: 384, flag: "wx" });
-  try {
-    const ext = extname(name);
-    const stem = name.slice(0, name.length - ext.length);
-    for (let n = 1;n <= MAX_NAME_TRIES; n++) {
-      const path = join4(dir, n === 1 ? name : `${stem}-${n}${ext}`);
-      try {
-        await link(tmp, path);
-        return path;
-      } catch (e) {
-        if (e.code !== "EEXIST")
-          throw e;
-      }
-      if (await isOwnCopy(path, data))
-        return path;
-    }
-    throw new CoreError(`can't save ${name} in ${dir}: ${MAX_NAME_TRIES} files by that name already exist`);
-  } finally {
-    await rm2(tmp, { force: true });
-  }
-}
-async function isOwnCopy(path, data) {
-  let fh;
-  try {
-    fh = await open3(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch {
-    return false;
-  }
-  try {
-    const st = await fh.stat();
-    if (!st.isFile() || st.uid !== process.getuid?.() || st.size !== data.length)
-      return false;
-    return Buffer.from(await fh.readFile()).equals(data);
-  } finally {
-    await fh.close();
-  }
-}
-var serverBusDir = (serverUrl) => new URL(serverUrl).host.replace(/[^A-Za-z0-9.-]/g, "_");
-var ATTACHMENTS_PARAM = {
-  type: "array",
-  items: { type: "string" },
-  description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
-};
-var ATTACHMENT_GET_TOOL = {
-  name: "attachment_get",
-  description: "attachment_get(id, dir?): save a file attached to a message or post you can read (ids are in its attachments) and return the saved path.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      id: { type: "number", description: "The attachment id." },
-      dir: { type: "string", description: "Optional. Directory to save into, under your working directory or BUS_ATTACH_ROOTS. Default: this bus's folder under $GRAYBOARD_ATTACHMENTS_DIR (~/.grayboard/attachments)." }
-    },
-    required: ["id"]
-  }
-};
-function digestSha256(header) {
-  const m = /(?:^|,)\s*sha-256=:([A-Za-z0-9+/]+=*):/.exec(header ?? "");
-  return m ? Buffer.from(m[1], "base64").toString("hex") : null;
-}
-function dispositionFilename(header) {
-  const m = /filename\*=UTF-8''([^;]+)/.exec(header ?? "");
-  if (!m)
-    return null;
-  try {
-    return sanitizeFilename(decodeURIComponent(m[1]));
-  } catch {
-    return null;
-  }
-}
-function attachmentsDir(env = process.env) {
-  return env.GRAYBOARD_ATTACHMENTS_DIR ?? join4(homedir2(), ".grayboard", "attachments");
-}
-
 // src/shared/http.ts
 var HTTP_TIMEOUT_MS = 30000;
 function transferTimeoutMs(bytes) {
@@ -36434,78 +35822,1193 @@ class ToolProxy {
   }
 }
 
-// src/shared/notifications.ts
-function addFiles(meta, list) {
-  if (!list?.length)
-    return;
-  meta.attachments = formatAttachmentsMeta(list);
-  meta.files_tool = "attachment_get(id, dir?) saves one; ids lead each item";
+// src/shared/session_meta.ts
+var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
+
+// adapters/hosted-core/src/client.ts
+var message = (error) => error?.message ?? String(error);
+var DETAIL_MAX = 300;
+function failureText(error, hint) {
+  const text = failureMessage(error, hint);
+  if (!(error instanceof SubscriberError) && text !== failureMessage(undefined, hint))
+    return text;
+  const detail = message(error).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
+  return `${text} (${detail.length > DETAIL_MAX ? `${detail.slice(0, DETAIL_MAX)}\u2026` : detail})`;
 }
-function dmNotification(msg, primary) {
-  const meta = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
-  if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary)
-    meta.to = msg.recipient;
-  if (msg.parent_id !== null)
-    meta.parent_id = String(msg.parent_id);
-  if (msg.kind)
-    meta.kind = msg.kind;
-  addFiles(meta, msg.attachments);
-  return { content: msg.body, meta };
-}
-function boardNotification(item) {
-  if (item.kind === "push") {
-    const p = item.post;
-    const meta = {
-      board: p.board,
-      post_id: String(p.id),
-      from: p.author,
-      reason: item.reason,
-      created_at: String(p.created_at)
+
+class HostedClient {
+  options;
+  auth;
+  last;
+  proxies = new Set;
+  listeners = new Set;
+  outAnnounced = false;
+  constructor(options) {
+    this.options = options;
+    const login = options.login;
+    this.auth = {
+      token: async () => this.last = await login.token(),
+      onUnauthorized: async () => login.unauthorized(this.last ?? "")
     };
-    if (p.parent_id !== null)
-      meta.parent_id = String(p.parent_id);
-    addFiles(meta, p.attachments);
-    if (item.deferred)
-      meta.deferred = "true";
-    return { content: p.body, meta };
   }
-  const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
-  return {
-    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
-    meta: { board: item.board, kind: "digest", unread: String(item.unread) }
+  get login() {
+    return this.options.login;
+  }
+  wireOptions(mode) {
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source } };
+  }
+  temporary = async (sessionID, run) => {
+    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
+    try {
+      await wire.connect();
+      return await run(wire);
+    } finally {
+      await wire.close().catch(() => {});
+    }
   };
+  async endSession(id) {
+    try {
+      await this.temporary(id, (wire) => wire.call("session_end"));
+    } catch (error) {
+      this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+    }
+  }
+  proxy(mode, o) {
+    const proxy = new ToolProxy({
+      wire: this.wireOptions(mode),
+      harness: this.options.harness,
+      loginAction: this.options.loginAction,
+      auth: this.auth,
+      ...this.options.roots ? { roots: this.options.roots } : {},
+      ...this.options.env ? { env: this.options.env } : {},
+      ...o.hooks ? { hooks: o.hooks } : {},
+      report: (operation, error) => {
+        if (operation === "after")
+          o.onAfterFailure?.();
+        this.options.log(`${operation} failed: ${message(error)}`, "warning");
+      },
+      onTools: (tools) => o.onTools(tools)
+    });
+    this.proxies.add(proxy);
+    return proxy;
+  }
+  async retire(proxy) {
+    this.proxies.delete(proxy);
+    await proxy.retire().catch((error) => this.options.log(`couldn't close a replaced connection: ${message(error)}`, "warning"));
+  }
+  async close(proxy) {
+    this.proxies.delete(proxy);
+    await proxy.close().catch((error) => this.options.log(`couldn't close the connection: ${message(error)}`, "warning"));
+  }
+  async connect(proxy) {
+    try {
+      await proxy.connect();
+    } catch (error) {
+      if (this.proxies.has(proxy) && !accessExpiry(error))
+        this.options.log(`couldn't reach the server: ${message(error)}`, "warning");
+    }
+  }
+  async call(proxy, tool, args, sessionID) {
+    try {
+      return await proxy.call(tool, args, sessionID);
+    } catch (error) {
+      return failure2(failureText(error, this.options.retryHint));
+    }
+  }
+  watch() {
+    return this.login.watch(() => {
+      this.changed();
+    });
+  }
+  async changed() {
+    try {
+      await this.login.token();
+    } catch (error) {
+      const expired = accessExpiry(error);
+      if (!expired) {
+        this.options.log(`couldn't read the sign-in: ${message(error)}`, "warning");
+        return;
+      }
+      if (!this.outAnnounced) {
+        this.outAnnounced = true;
+        this.options.log(expired.message, "warning");
+      }
+      for (const fn of [...this.listeners])
+        fn(false);
+      return;
+    }
+    this.outAnnounced = false;
+    for (const proxy of [...this.proxies])
+      this.connect(proxy);
+    for (const fn of [...this.listeners])
+      fn(true);
+  }
+  onChange(fn) {
+    this.listeners.add(fn);
+    return { dispose: () => {
+      this.listeners.delete(fn);
+    } };
+  }
+  get announced() {
+    return this.outAnnounced;
+  }
+  markAnnounced(announced = true) {
+    this.outAnnounced = announced;
+  }
 }
 
-// src/shared/addressing.ts
-var MAX_IDENTITY_LENGTH = 32;
-var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
-var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
-var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
-var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
-var HUMAN_NAME = "human";
-var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
+// adapters/hosted-core/src/controller.ts
+import { createHash as createHash6 } from "crypto";
 
-// adapters/hosted-core/src/channel.ts
-var InboxEvent = discriminatedUnion("kind", [
-  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
-  object({ kind: literal("board"), item: discriminatedUnion("kind", [
-    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
-    looseObject({ kind: literal("digest"), board: string2() })
-  ]) })
-]);
-function channelParams(item, identity) {
-  const event = InboxEvent.parse(item.event);
-  const human = `${identity.user.email}/${HUMAN_NAME}`;
-  if (event.kind === "direct") {
-    const params = dmNotification(event.message, identity.identity_full);
-    if (event.message.sender === human)
-      params.meta.human = "true";
-    return params;
+// adapters/hosted-core/src/sessions.ts
+class AncestryError extends Error {
+}
+class SessionRoutes {
+  paths = new Map;
+  ended = new Set;
+  remember(path) {
+    if (this.ended.has(path.sessionID) || this.ended.has(path.root))
+      throw new AncestryError("Grayboard session ended during ancestry lookup");
+    const previous = this.paths.get(path.sessionID);
+    if (previous && previous.root !== path.root)
+      throw new AncestryError("Grayboard session ancestry changed");
+    this.paths.set(path.sessionID, { ...path, via: [...path.via] });
   }
-  const params = boardNotification(event.item);
-  if (event.item.kind === "push" && event.item.post.author === human)
-    params.meta.human = "true";
-  return params;
+  end(sessionID) {
+    if (this.ended.has(sessionID))
+      return;
+    this.ended.add(sessionID);
+    const path = this.paths.get(sessionID);
+    this.paths.delete(sessionID);
+    return path ? { ...path, via: [...path.via] } : undefined;
+  }
+}
+
+// adapters/hosted-core/src/children.ts
+async function register2(temporary, path) {
+  await temporary(path.root, (wire) => wire.call("session_register", { child: path.child, ...path.via.length ? { via: path.via } : {} }));
+}
+async function end(temporary, path) {
+  await temporary(path.child, (wire) => wire.call("session_end"));
+}
+
+// adapters/hosted-core/src/controller.ts
+var DRIFTED = "Grayboard credential changed";
+var ADMITTED_LIMIT = 100;
+function sleep5(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted)
+      return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+function causeOf(error, type) {
+  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++)
+    if (e instanceof type)
+      return e;
+  return;
+}
+function fingerprint(e) {
+  const c = e.configuration;
+  return createHash6("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.name])).digest("hex");
+}
+
+class Controller {
+  port;
+  routes = new SessionRoutes;
+  Transport;
+  roots = new Map;
+  watches = new Map;
+  stopped = false;
+  ending = new Set;
+  drifted = false;
+  controls = Promise.resolve();
+  state;
+  diagnostics;
+  place;
+  wait;
+  configured;
+  constructor(port, options = {}) {
+    this.port = port;
+    this.Transport = options.Transport ?? Wire;
+    this.wait = options.wait ?? sleep5;
+    this.configured = options.configured;
+    this.place = port.place();
+    const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
+    this.state = { state: "unenrolled", message: idle, roots: [] };
+    this.diagnostics = new Diagnostics(port.storage, options.sink, { idle, ...options.knownRoot ? { knownRoot: options.knownRoot } : {} });
+  }
+  get hint() {
+    return this.port.resumeHint;
+  }
+  status() {
+    return this.diagnostics.status();
+  }
+  async flushDiagnostics() {
+    await this.diagnostics.flush();
+  }
+  set(r, state, message, operation = "delivery", code) {
+    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {}, ...code ? { code } : {} });
+    r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
+  }
+  failure(operation, error, r) {
+    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...r ? { sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {} } : {}, code: failureCode(error) });
+  }
+  record(input) {
+    this.diagnostics.record(input);
+  }
+  serial(call) {
+    const result = this.controls.then(call, call);
+    this.controls = result.catch(() => {});
+    return result;
+  }
+  drift(message) {
+    this.drifted = true;
+    for (const r of this.roots.values()) {
+      r.paused = true;
+      r.epoch++;
+      r.abort?.abort();
+      this.set(r, "paused", message);
+      this.port.storage.set(`paused:${r.e.sessionID}`, true).catch((error) => this.failure("latch_save", error, r));
+    }
+  }
+  credentialChanged() {
+    this.drift(`${DRIFTED}; ${this.hint}`);
+  }
+  async path(sessionID) {
+    const path = await this.port.ancestry(sessionID);
+    this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
+    for (const [index, id] of path.via.entries())
+      this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
+    this.routes.remember(path);
+    return path;
+  }
+  async activeRoot(sessionID) {
+    const path = await this.path(sessionID);
+    if (path.root !== sessionID)
+      throw new Refusal("root", "An active top-level root is required");
+  }
+  approvalKey(e) {
+    return this.port.approval ? this.port.approval.key(e) : e.configuration.configHash;
+  }
+  key(e) {
+    return this.port.approval ? this.port.approval.key(e) : fingerprint(e);
+  }
+  async remembered(sessionID, approval) {
+    const remembered = await this.port.storage.get(`rememberedName:${sessionID}`);
+    const name = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "name")?.value : undefined;
+    const key = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "approval")?.value : undefined;
+    return key === this.approvalKey(approval) && typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name) ? name : undefined;
+  }
+  async save(r, enabled) {
+    if (!this.port.approval)
+      return;
+    await this.activeRoot(r.e.sessionID);
+    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
+    await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
+  }
+  async guard(r, epoch, signal) {
+    const e = r.e, key = this.key(e);
+    const current = () => this.port.place() === this.place && !this.stopped && !this.ending.has(e.sessionID) && !this.drifted && !r.paused && !signal.aborted && r.epoch === epoch && this.roots.get(e.sessionID) === r && this.key(r.e) === key;
+    const check = () => {
+      if (!current())
+        throw new Refusal("paused", "Admission target changed");
+    };
+    check();
+    await this.port.credential.check(e).catch((error) => {
+      if (error instanceof Refusal && error.code === "binding" && current())
+        this.credentialChanged();
+      throw error;
+    });
+    await this.activeRoot(e.sessionID);
+    if (this.port.approval && !await this.port.approval.approved(e, r.approval)) {
+      r.paused = true;
+      throw new Refusal("root", `Root approval changed; ${this.hint}`);
+    }
+    check();
+  }
+  wireOptions(e) {
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {} };
+  }
+  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
+    let current;
+    const wire = new this.Transport(this.wireOptions(e), {
+      token: async () => current = await this.port.credential.token(e),
+      onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? "")
+    }, signal, sessionID, beforeRetry);
+    await wire.connect();
+    return wire;
+  }
+  async temporary(e, call, sessionID = e.sessionID) {
+    const wire = await this.wire(e, sessionID);
+    try {
+      return await call(wire);
+    } finally {
+      await wire.close().catch((error) => this.failure("wire_close", error));
+    }
+  }
+  expired(error) {
+    return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
+  }
+  async watch(e) {
+    let live = true;
+    const watch = await this.port.credential.watch(e, () => {
+      if (live)
+        this.credentialChanged();
+    });
+    this.watches.set(e.sessionID, { dispose: async () => {
+      live = false;
+      await watch.dispose();
+    } });
+  }
+  async unwatch(sessionID) {
+    if (this.drifted) {
+      for (const watch of this.watches.values())
+        await watch.dispose();
+      this.watches.clear();
+    }
+    await this.watches.get(sessionID)?.dispose();
+    this.watches.delete(sessionID);
+  }
+  async enroll(sessionID, name, create = false) {
+    return this.serial(async () => {
+      if (this.stopped || this.ending.has(sessionID))
+        throw new Refusal("paused", "Grayboard is stopping");
+      await this.activeRoot(sessionID);
+      await this.unwatch(sessionID);
+      const previous = this.roots.get(sessionID);
+      if (previous)
+        await this.stop(previous);
+      const captured = await this.port.credential.capture(sessionID);
+      const e = { ...captured, ...previous?.e.name ? { name: previous.e.name } : {} };
+      const r = { e, approval: structuredClone(e), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
+      this.roots.set(sessionID, r);
+      this.drifted = false;
+      await this.save(r, true);
+      await this.watch(e);
+      this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+      try {
+        if (name) {
+          const epoch = r.epoch, signal = new AbortController().signal;
+          await this.temporary(e, async (w) => {
+            await this.guard(r, epoch, signal);
+            await w.call("bind", { name, create, where: this.port.place() });
+            await this.guard(r, epoch, signal);
+          });
+        }
+        await this.prepare(r, !!previous?.paused && !name);
+      } catch (error) {
+        const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
+        if (!this.drifted)
+          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+      }
+      await this.diagnostics.flush();
+      return { ...r.status, roots: this.status().roots };
+    });
+  }
+  async resume(sessionID) {
+    return this.serial(async () => {
+      if (this.stopped || this.ending.has(sessionID))
+        throw new Refusal("paused", "Grayboard is stopping");
+      await this.activeRoot(sessionID);
+      await this.unwatch(sessionID);
+      const previous = this.roots.get(sessionID);
+      if (previous)
+        await this.stop(previous);
+      const approval = await this.approvalFor(sessionID);
+      const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
+      const r = { e: { ...approval, ...name ? { name } : {} }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
+      this.roots.set(sessionID, r);
+      this.drifted = false;
+      await this.watch(r.e);
+      this.set(r, "approved", name ? `Resuming ${name}` : "Root approved; bind a name to receive deliveries");
+      try {
+        await this.prepare(r, true);
+      } catch (error) {
+        if (!this.drifted)
+          this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error)));
+      }
+      await this.diagnostics.flush();
+      return { ...r.status, roots: this.status().roots };
+    });
+  }
+  async approvalFor(sessionID) {
+    if (!this.port.approval)
+      return this.port.credential.capture(sessionID);
+    const saved = (await this.port.approval.saved()).find((s) => s.sessionID === sessionID);
+    if (!saved?.approval || !saved.enabled)
+      throw new Refusal("root", `No saved approval for this root; ${this.hint}`);
+    await this.port.credential.check(saved.approval);
+    return saved.approval;
+  }
+  async carried(sessionID) {
+    try {
+      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
+      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
+    } catch {
+      return;
+    }
+  }
+  async prepare(r, resume = false, waitForStart = false) {
+    const epoch = r.epoch, signal = new AbortController().signal;
+    if (this.stopped || this.ending.has(r.e.sessionID))
+      throw new Refusal("paused", "Grayboard is stopping");
+    await this.temporary(r.e, async (wire) => {
+      await this.guard(r, epoch, signal);
+      let current = bindingOf(await wire.call("whoami"));
+      await this.guard(r, epoch, signal);
+      if (!current.name && r.e.name && resume) {
+        await wire.call("bind", { name: r.e.name, create: false, where: this.port.place() });
+        await this.guard(r, epoch, signal);
+        current = bindingOf(await wire.call("whoami"));
+        await this.guard(r, epoch, signal);
+      }
+      if (r.epoch !== epoch || r.paused || this.stopped)
+        return;
+      if (!current.name) {
+        this.set(r, "unbound", "Root approved, unbound; bind(name) to take one");
+        return;
+      }
+      await this.guard(r, epoch, signal);
+      r.e = { ...r.e, name: current.name };
+      await this.port.storage.set(`rememberedName:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), name: current.name });
+      await this.guard(r, epoch, signal);
+      if (r.epoch === epoch && !r.paused && !this.stopped) {
+        this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
+        const started = this.start(r);
+        if (waitForStart)
+          await started;
+      }
+    });
+  }
+  start(r) {
+    if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID))
+      return;
+    const epoch = r.epoch, e = structuredClone(r.e), abort = r.abort = new AbortController;
+    let ready;
+    const started = new Promise((resolve) => {
+      ready = resolve;
+    });
+    r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
+      const error = this.expired(caught);
+      if (!abort.signal.aborted) {
+        r.paused = true;
+        this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
+      }
+    }).finally(ready);
+    return started;
+  }
+  async run(r, e, epoch, signal, ready) {
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    let pendingItem;
+    const attempts = new Map;
+    while (!signal.aborted && failures < 8) {
+      let wire;
+      try {
+        await this.guard(r, epoch, signal);
+        wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
+        await this.guard(r, epoch, signal);
+        const current = bindingOf(await wire.call("whoami"));
+        outage = false;
+        await this.guard(r, epoch, signal);
+        if (!current.name) {
+          r.lease = undefined;
+          await wire.call("bind", { name: e.name, create: false, where: this.port.place() });
+          await this.guard(r, epoch, signal);
+        } else if (current.name !== e.name)
+          throw new Refusal("identity", `Root binding changed without a native completion; ${this.hint}`);
+        const lease = leaseOf(await wire.call("delivery_open"), e);
+        await this.guard(r, epoch, signal);
+        r.lease = lease;
+        wire.capability = lease.capability;
+        this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
+        ready();
+        let dirty = true, wake, closed = false;
+        wire.client.setNotificationHandler("notifications/resources/updated", () => {
+          dirty = true;
+          wake?.();
+        });
+        const subscription = await wire.listen();
+        subscription.closed.then(() => {
+          closed = true;
+          wake?.();
+        }, () => {
+          closed = true;
+          wake?.();
+        });
+        let renewal = Date.now() + 1e4;
+        try {
+          while (!signal.aborted) {
+            if (dirty) {
+              dirty = false;
+              const items = itemsOf(await wire.read("grayboard://inbox"));
+              await admitPrefix(items, async (item) => {
+                inItem = true;
+                pendingItem = /^(direct|push):[1-9][0-9]*$/.test(item.id) ? item.id : `item#${createHash6("sha256").update(item.id).digest("hex").slice(0, 12)}`;
+                const count = (attempts.get(item.id) ?? 0) + 1;
+                if (count > 8)
+                  throw new DeliveryStopped(pendingItem);
+                attempts.set(item.id, count);
+                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity)
+                  throw new Refusal("identity", "Issued batch does not match the immutable lease");
+                await this.guard(r, epoch, signal);
+                const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
+                await wire.call("delivery_renew");
+                await this.guard(r, epoch, signal);
+                if (r.admitted.has(key)) {
+                  inItem = false;
+                  return;
+                }
+                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity, signal);
+                r.admitted.add(key);
+                while (r.admitted.size > ADMITTED_LIMIT)
+                  r.admitted.delete(r.admitted.values().next().value);
+                await this.guard(r, epoch, signal);
+                await wire.call("delivery_renew");
+                await this.guard(r, epoch, signal);
+                inItem = false;
+              }, async (ids) => {
+                await this.guard(r, epoch, signal);
+                await wire.call("delivery_receipt", { ids });
+                for (const id of ids) {
+                  attempts.delete(id);
+                  r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`);
+                }
+                failures = 0;
+                throttles = 0;
+                recoveries = 0;
+                unreachable = 0;
+                pendingItem = undefined;
+              });
+              if (items.length === 100)
+                dirty = true;
+            }
+            if (closed)
+              throw new SubscriptionClosed;
+            if (Date.now() >= renewal) {
+              await this.guard(r, epoch, signal);
+              await wire.call("delivery_renew");
+              renewal = Date.now() + 1e4;
+              dirty = true;
+              recoveries = 0;
+              unreachable = 0;
+            }
+            if (dirty)
+              continue;
+            const timer = new AbortController;
+            await Promise.race([sleep5(1000, AbortSignal.any([signal, timer.signal])), new Promise((resolve) => {
+              wake = resolve;
+            })]);
+            wake = undefined;
+            timer.abort();
+          }
+        } finally {
+          await subscription.close().catch((error) => this.failure("subscription_close", error, r));
+        }
+      } catch (caught) {
+        if (signal.aborted)
+          break;
+        const error = this.expired(caught);
+        if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || error instanceof AccessExpired && error.reason === "expired" && outage) {
+          if (error instanceof ServerUnreachable)
+            outage = true;
+          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
+          ready();
+          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          continue;
+        }
+        if (error instanceof Refusal || error instanceof DeliveryStopped)
+          throw error;
+        if (error instanceof LeaseUnavailable) {
+          r.lease = undefined;
+          if (!inItem && ++recoveries > 3)
+            throw new Refusal("paused", `Lease recovery limit reached; ${this.hint}`);
+        } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code))
+          throw error;
+        else {
+          failures++;
+          if (error instanceof SubscriberError && error.code === "receipt_capacity") {
+            await this.guard(r, epoch, signal);
+            if (!wire || !r.lease)
+              throw new Refusal("paused", "Capacity recovery requires the current lease");
+            await wire.call("delivery_release");
+            r.lease = undefined;
+            await this.guard(r, epoch, signal);
+          }
+        }
+        this.set(r, "retrying", `Revalidating the approved root before reopening delivery (${failureCode(error)})`, "reopen", failureCode(error));
+        ready();
+        if (wire?.admissionRetryAfterMs) {
+          if (++throttles > 8)
+            throw new Error(`Admission retry limit reached; ${this.hint}`);
+          await this.wait(Math.max(wire.admissionRetryAfterMs, Math.min(8000, 500 * 2 ** throttles)), signal);
+        } else
+          await this.wait(Math.min(8000, 250 * 2 ** failures), signal);
+      } finally {
+        inItem = false;
+        await wire?.close().catch((error) => this.failure("wire_close", error, r));
+      }
+    }
+    if (failures >= 8)
+      throw new DeliveryStopped(pendingItem);
+  }
+  async stop(r) {
+    r.epoch++;
+    r.abort?.abort();
+    await r.task;
+    r.task = undefined;
+    r.abort = undefined;
+  }
+  async release(r) {
+    const lease = r.lease;
+    r.lease = undefined;
+    await this.temporary(r.e, async (wire) => {
+      if (lease) {
+        wire.capability = lease.capability;
+        await wire.call("delivery_release").catch((error) => this.failure("delivery_release", error, r));
+      }
+      await wire.call("session_end");
+    });
+  }
+  async pause(message = `Ownership ended; ${this.hint}`) {
+    return this.serial(async () => {
+      for (const r of this.roots.values()) {
+        r.paused = true;
+        await this.stop(r);
+        await this.release(r).catch((error) => this.failure("session_end", error, r));
+        await this.save(r, false).catch((error) => this.failure("pause_save", error, r));
+        this.set(r, "paused", message);
+      }
+      return this.status();
+    });
+  }
+  shutdown(sessionID, mode, o = {}) {
+    this.ending.add(sessionID);
+    this.roots.get(sessionID)?.abort?.abort();
+    return this.serial(async () => {
+      const r = this.roots.get(sessionID);
+      if (r) {
+        r.paused = true;
+        await this.stop(r);
+      }
+      const carried = o.carry ? await this.carried(sessionID) : undefined;
+      if (!r) {
+        if (mode === "release")
+          await this.endUnowned(sessionID);
+        return carried;
+      }
+      await this.watches.get(sessionID)?.dispose().catch((error) => this.failure("watch_dispose", error, r));
+      this.watches.delete(sessionID);
+      if (mode === "release")
+        await this.release(r).catch((error) => this.failure("session_end", error, r));
+      this.set(r, "paused", mode === "release" ? "Session shut down; ownership released" : "Session detached; lease retained for reload", "session_end");
+      this.roots.delete(sessionID);
+      return carried;
+    });
+  }
+  async endUnowned(sessionID) {
+    try {
+      const e = await this.port.credential.capture(sessionID);
+      await this.temporary(e, (wire) => wire.call("session_end"));
+    } catch (error) {
+      this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
+    }
+  }
+  async restore() {
+    await this.diagnostics.restore(async (id) => {
+      await this.activeRoot(id);
+      return true;
+    });
+    if (!this.port.approval)
+      return;
+    for (const saved of await this.port.approval.saved()) {
+      const id = saved.sessionID;
+      if (this.stopped)
+        continue;
+      try {
+        try {
+          await this.activeRoot(id);
+        } catch {
+          continue;
+        }
+        if (!saved.approval)
+          throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
+        const e = saved.approval;
+        const previous = this.status().roots.find((record) => record.sessionID === id);
+        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused";
+        const name = await this.remembered(id, e);
+        const r = { e: { ...e, ...name ? { name } : {} }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set };
+        this.roots.set(id, r);
+        if (paused) {
+          this.set(r, "paused", `Saved approval paused; ${this.hint}`);
+          continue;
+        }
+        await this.port.credential.check(e);
+        await this.watch(e);
+        await this.prepare(r, true, true);
+      } catch {
+        const r = this.roots.get(id);
+        if (r) {
+          r.paused = true;
+          await this.stop(r);
+          this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+        } else
+          this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
+      }
+    }
+  }
+  async beforeCall(event) {
+    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
+    if (path.root !== event.sessionID) {
+      const e = r?.e ?? await this.port.credential.capture(path.root);
+      await register2((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID }).catch((error) => {
+        this.failure("child_register", error, r);
+        throw error;
+      });
+      this.routes.remember(path);
+    }
+    if (event.tool === "bind" && path.root === event.sessionID)
+      await this.serial(async () => {
+        const current = this.roots.get(path.root);
+        if (current) {
+          this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind");
+          await this.stop(current);
+        } else
+          this.diagnostics.record({ state: "rebinding", sessionID: path.root, message: this.port.approval ? "Native bind pending; receiving requires approval" : "Native bind pending", operation: "before_bind" });
+      });
+  }
+  async afterCall(event) {
+    return this.serial(async () => {
+      const r = this.roots.get(event.sessionID);
+      if (!r || r.paused || this.drifted || this.stopped)
+        return;
+      try {
+        if (event.tool !== "bind") {
+          const output = event.result.status === "completed" ? event.result.output : undefined;
+          if (output?.unbound === true && r.e.name) {
+            await this.stop(r);
+            r.lease = undefined;
+            await this.prepare(r, true);
+          }
+          return;
+        }
+        await this.stop(r);
+        if (event.result.status === "completed") {
+          const output = event.result.output;
+          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every((line) => typeof line === "string"))
+            throw new Error("Native bind completion lacked validated output");
+        }
+        await this.prepare(r, false);
+      } catch (error) {
+        if (!this.drifted)
+          this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
+      }
+    });
+  }
+  async configuredBind(sessionID) {
+    if (this.stopped || !this.configured)
+      return;
+    const path = await this.path(sessionID);
+    if (path.root !== sessionID)
+      return;
+    try {
+      const e = await this.port.credential.capture(sessionID);
+      await this.temporary(e, (w) => w.call("bind", { name: this.configured.name, create: this.configured.create, where: this.port.place() }));
+      this.diagnostics.record({ state: "unenrolled", sessionID, message: this.port.approval ? "Configured binding completed; receiving still requires human approval" : "Configured binding completed", operation: "configured_bind" });
+    } catch (error) {
+      this.diagnostics.record({ state: "unbound", sessionID, message: failureMessage(this.expired(error), this.hint), operation: "configured_bind", code: failureCode(this.expired(error)) });
+    }
+  }
+  async ended(sessionID) {
+    if (this.stopped)
+      return;
+    const path = this.routes.end(sessionID);
+    if (!path)
+      return;
+    const r = this.roots.get(path.root);
+    if (sessionID === path.root && r) {
+      r.paused = true;
+      r.epoch++;
+      r.abort?.abort();
+      await this.serial(async () => {
+        await this.stop(r);
+        await this.release(r).catch((error) => this.failure("session_end", error, r));
+        await this.port.storage.set(`paused:${sessionID}`, true);
+        this.set(r, "paused", "Root ended; ownership released", "session_end");
+      });
+    } else {
+      const e = r?.e ?? await this.port.credential.capture(path.root);
+      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
+    }
+  }
+  backgroundFailure(operation) {
+    this.failure(operation, undefined);
+  }
+  async close() {
+    this.stopped = true;
+    for (const r of this.roots.values())
+      r.abort?.abort();
+    await this.controls;
+    for (const r of this.roots.values())
+      await this.stop(r);
+    for (const watch of this.watches.values())
+      await watch.dispose().catch((error) => this.failure("watch_dispose", error));
+    this.watches.clear();
+    await this.diagnostics.flush();
+  }
+}
+
+// adapters/hosted-core/src/root.ts
+class NotStarted extends Error {
+  constructor() {
+    super("starting");
+  }
+}
+var SLOTS = ["held", "start", "sink", "first", "last"];
+
+class RootDelivery {
+  client;
+  o;
+  closed = false;
+  done = false;
+  shutting;
+  controller;
+  lock;
+  proxy;
+  waiter;
+  watcher;
+  subscription;
+  held;
+  error;
+  signedOut;
+  begun;
+  carrying;
+  starting;
+  restarting;
+  used = false;
+  notices = new Map;
+  lastBinding;
+  lastRecord;
+  storeUnreadable = false;
+  constructor(client, o) {
+    this.client = client;
+    this.o = o;
+    this.carrying = o.carried;
+  }
+  log(text, level) {
+    if (!this.done)
+      this.client.options.log(text, level);
+  }
+  path() {
+    return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID);
+  }
+  async epoch() {
+    try {
+      return (await this.client.login.read())?.epoch;
+    } catch (error) {
+      if (!this.storeUnreadable) {
+        this.storeUnreadable = true;
+        this.log(`couldn't read the sign-in store: ${message(error)}`, "warning");
+      }
+      return;
+    }
+  }
+  async start() {
+    if (this.closed || this.watcher)
+      return;
+    this.watcher = this.client.watch();
+    this.subscription = this.client.onChange((signedIn) => {
+      if (signedIn)
+        this.restartIfChanged();
+    });
+    if (!this.o.push) {
+      this.toolsOnly();
+      return;
+    }
+    await this.take();
+  }
+  async take() {
+    this.waiter?.abort();
+    let taken;
+    try {
+      taken = tryDelivery(this.path());
+    } catch (error) {
+      this.clearHeld();
+      this.failedLock(error);
+      this.toolsOnly();
+      return;
+    }
+    if (taken)
+      return this.starting = this.own(taken);
+    this.clearError();
+    this.held = new DeliveryHeldElsewhere(this.client.options.harness).message;
+    this.notices.set("held", this.held);
+    this.toolsOnly();
+    const waiter = this.waiter = new AbortController;
+    waitDelivery(this.path(), waiter.signal).then((next) => {
+      if (waiter.signal.aborted)
+        next.release();
+      else
+        this.starting = this.own(next);
+    }, (error) => {
+      if (!waiter.signal.aborted)
+        this.failedLock(error);
+    });
+  }
+  failedLock(error) {
+    this.error = `couldn't take delivery: ${message(error)}`;
+    this.notices.set("start", this.error);
+    this.log(this.error, "error");
+  }
+  clearHeld() {
+    if (this.held && this.notices.get("held") === this.held)
+      this.notices.delete("held");
+    this.held = undefined;
+  }
+  clearError() {
+    if (this.error && this.notices.get("start") === this.error)
+      this.notices.delete("start");
+    this.error = undefined;
+  }
+  toolsOnly() {
+    if (this.proxy)
+      return;
+    this.proxy = this.client.proxy("poll", { onTools: (tools) => this.listed(tools) });
+    this.client.connect(this.proxy);
+  }
+  listed(tools) {
+    if (!this.closed)
+      this.o.onTools(tools);
+  }
+  async own(taken) {
+    if (this.closed) {
+      taken.release();
+      return;
+    }
+    this.lock = taken;
+    this.clearHeld();
+    this.clearError();
+    try {
+      this.begun = await this.epoch();
+      if (this.closed)
+        return;
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      await controller.restore();
+      if (this.closed)
+        return;
+      const proxy = this.client.proxy("push", { hooks: controller, onTools: (tools) => this.listed(tools), onAfterFailure: () => controller.backgroundFailure("after") });
+      const old = this.proxy;
+      this.proxy = proxy;
+      if (old)
+        this.client.retire(old);
+      await this.client.connect(proxy);
+      if (this.closed)
+        return;
+      await this.restart();
+    } catch (error) {
+      this.log(`couldn't start delivery: ${message(error)}`, "error");
+    }
+  }
+  port() {
+    const c = this.client.options, id = this.o.sessionID, wire = this.client.wireOptions("push");
+    return {
+      harness: c.harness,
+      resumeHint: c.resumeHint,
+      loginAction: c.loginAction,
+      sessionKey: wire.sessionKey,
+      client: wire.client,
+      delivery: wire.delivery,
+      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
+      place: this.o.place,
+      ancestry: async (sessionID) => {
+        if (sessionID !== id)
+          throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
+        return { sessionID, root: id, via: [] };
+      },
+      credential: this.client.login.credential(),
+      approval: null,
+      admit: async (_e, item, stableID, identity, signal) => {
+        if (signal.aborted)
+          throw new Refusal("paused", `the ${c.harness} session closed`);
+        await this.o.admit(item, stableID, identity, signal);
+      }
+    };
+  }
+  restart() {
+    return this.restarting ??= this.begin().finally(() => {
+      this.restarting = undefined;
+    });
+  }
+  async begin() {
+    const controller = this.controller;
+    if (!controller || this.closed)
+      return;
+    const id = this.o.sessionID, carried = this.carrying;
+    try {
+      this.begun = await this.epoch();
+      const expected = carried ?? await controller.carried(id);
+      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
+      if (this.closed)
+        return;
+      this.signedOut = undefined;
+      this.proxy?.forget(id);
+      const root = status.roots.find((r) => r.sessionID === id);
+      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
+      if (carried && bound && this.carrying === carried)
+        this.carrying = undefined;
+      if (expected && bound !== expected && root?.state !== "paused") {
+        const now = bound ? `it is bound as ${bound}` : "it is unbound";
+        const text = carried ? `this session couldn't take the name ${carried} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${now}`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      }
+    } catch (error) {
+      if (this.closed)
+        return;
+      const expired = accessExpiry(error);
+      if (!expired) {
+        this.log(`couldn't start delivery: ${message(error)}`, "error");
+        return;
+      }
+      this.signedOut = expired;
+      if (!this.client.announced) {
+        this.client.markAnnounced();
+        this.log(expired.message, "warning");
+      }
+    }
+  }
+  async credentialChanged() {
+    if (this.closed)
+      return;
+    try {
+      await this.client.login.token();
+    } catch (error) {
+      if (!accessExpiry(error))
+        this.log(`couldn't read the sign-in: ${message(error)}`, "warning");
+      return;
+    }
+    if (this.closed)
+      return;
+    if (this.proxy)
+      await this.client.connect(this.proxy);
+    await this.restartIfChanged();
+  }
+  async restartIfChanged() {
+    if (this.closed || !this.controller)
+      return;
+    await this.restarting;
+    const epoch = await this.epoch();
+    if (!this.signedOut && epoch !== undefined && epoch === this.begun)
+      return;
+    await this.restart();
+  }
+  sink = async (record) => {
+    const id = this.o.sessionID;
+    if (record.sessionID !== undefined && record.sessionID !== id)
+      return;
+    const binding = `${record.state}
+${record.name ?? ""}`;
+    if (binding !== this.lastBinding) {
+      this.lastBinding = binding;
+      this.proxy?.forget(id);
+    }
+    if (record.state === "active")
+      this.carrying = undefined;
+    const key = `${record.state}
+${record.message}`;
+    if (key === this.lastRecord)
+      return;
+    this.lastRecord = key;
+    if (record.state !== "paused" && record.state !== "degraded")
+      return;
+    if (record.state === "paused" && record.operation === "session_end")
+      return;
+    if (record.message.startsWith(DRIFTED))
+      return;
+    const release = record.state === "degraded" && (record.operation === "session_end" || record.operation === "delivery_release");
+    if (!release && await this.epoch() !== this.begun)
+      return;
+    const text = `delivery ${record.state}: ${record.message}`;
+    this.notices.set("sink", text);
+    this.log(text, "warning");
+  };
+  async call(tool, args, before) {
+    if (!this.proxy)
+      return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
+    const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
+    const early = refused();
+    if (early)
+      return early;
+    const after = before ? await before() : undefined;
+    const late = refused();
+    if (late)
+      return late;
+    this.used = true;
+    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
+    const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);
+    this.notices.clear();
+    return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
+  }
+  tools() {
+    return this.proxy?.tools() ?? hostTools(snapshotTools());
+  }
+  async instructions() {
+    if (!this.proxy)
+      throw new NotStarted;
+    return this.proxy.instructions(this.o.sessionID);
+  }
+  async resume() {
+    if (this.closed)
+      return;
+    if (this.error && !this.lock) {
+      await this.take();
+      return;
+    }
+    await this.restart();
+  }
+  status() {
+    return {
+      ...this.held ? { held: this.held } : {},
+      ...this.error ? { error: this.error } : {},
+      ...this.signedOut ? { signedOut: this.signedOut } : {},
+      ...this.controller ? { controller: this.controller.status() } : {}
+    };
+  }
+  noticeOnce(text, position) {
+    this.notices.set(position, text);
+  }
+  shutdown(mode, o = {}) {
+    return this.shutting ??= this.stop(mode, o);
+  }
+  async stop(mode, o) {
+    this.closed = true;
+    this.watcher?.dispose();
+    this.subscription?.dispose();
+    this.waiter?.abort();
+    const id = this.o.sessionID;
+    let carried;
+    if (this.controller) {
+      carried = await this.controller.shutdown(id, mode, o).catch((error) => {
+        this.log(`couldn't release delivery: ${message(error)}`, "warning");
+        return;
+      });
+    } else if (mode === "release" && (this.lock || this.used && !this.held))
+      await this.client.endSession(id);
+    await this.controller?.close().catch((error) => this.log(`couldn't stop delivery: ${message(error)}`, "warning"));
+    this.lock?.release();
+    await this.starting;
+    await this.restarting;
+    if (this.proxy)
+      await this.client.close(this.proxy);
+    this.done = true;
+    return carried;
+  }
 }
 
 // src/shared/identity.ts
@@ -36559,225 +37062,6 @@ function describeLocation(cwd) {
   }
 }
 
-// src/core/attachments.ts
-var held2 = new Map;
-
-// src/core/claims.ts
-var MAX_TTL_MIN = 7 * 24 * 60;
-
-// src/core/session_id.ts
-var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
-var SESSION_ID_PATTERN = `id:[${CROCKFORD}]{13}`;
-var SESSION_ID = new RegExp(`^${SESSION_ID_PATTERN}$`);
-
-// src/core/boards.ts
-var MAX_BODY_BYTES = 64 * 1024;
-var MENTION_RE = new RegExp(`(?:^|[^\\w@])@(${SESSION_ID_PATTERN}(?![0-9a-z])|[a-z0-9._%+-]+(?:@[a-z0-9.-]+\\.[a-z]{2,})?(?:\\/[a-z0-9_-]{1,32})?)`, "gi");
-var policies = new WeakMap;
-var QUEUE_CLAIM_TTL_MS = 30 * 60000;
-
-// src/shared/dedup.ts
-var WRITE_DEDUP_WINDOW_MS = 10 * 60000;
-var WRITE_DEDUP_WINDOW_TEXT = `${WRITE_DEDUP_WINDOW_MS / 60000} minutes`;
-
-// src/shared/inbox.ts
-var INBOX_DAYS = 3;
-var MAX_INBOX_DAYS = 30;
-var PROMISE_DAYS = MAX_INBOX_DAYS;
-var DM_INBOX_TOOL = {
-  name: "dm_inbox",
-  _meta: { "anthropic/alwaysLoad": true },
-  description: `dm_inbox(days?): direct messages to you from the last days (default ${INBOX_DAYS}) with no later message from you in their thread and no dm_ack, plus your messages still queued for offline peers, plus follow-ups you promised (sent pending; from the last ${PROMISE_DAYS} days, ignoring days). Use after /clear to see what you owe.`,
-  inputSchema: {
-    type: "object",
-    properties: { days: { type: "number", description: `Look back this many days (default ${INBOX_DAYS}, max ${MAX_INBOX_DAYS}).` } }
-  }
-};
-
-// src/core/tools.ts
-var BOARD = { type: "string", description: 'Board name, with or without the "#": "e2e" or "#e2e".' };
-var RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
-var AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
-function boardTools(opts) {
-  return [
-    {
-      name: "board_list",
-      description: "board_list(): boards with their purpose, your subscription mode, and your unread count.",
-      inputSchema: { type: "object", properties: {} }
-    },
-    {
-      name: "board_create",
-      description: `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: 'Board name, e.g. "e2e" or "#e2e". [a-z0-9_-], max 32.' },
-          purpose: { type: "string", description: "One line: what this board is for." },
-          kind: {
-            type: "string",
-            enum: ["broadcast", "queue"],
-            description: 'Optional. "queue": each post wakes exactly one subscriber (work rotation). Default "broadcast" fans out to every push subscriber.'
-          },
-          ...opts.teams ? {
-            team: {
-              type: "string",
-              description: "Optional. Make the board visible only to this team's members."
-            }
-          } : {}
-        },
-        required: ["name", "purpose"]
-      }
-    },
-    {
-      name: "board_post",
-      _meta: { "anthropic/alwaysLoad": true },
-      description: "board_post(board, body, parent_id?, attachments?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          board: BOARD,
-          body: { type: "string", description: "Plain text or markdown." },
-          parent_id: { type: "number", description: "Optional. post_id to reply to." },
-          attachments: ATTACHMENTS_PARAM,
-          resend: RESEND_PARAM,
-          as: AS_PARAM
-        },
-        required: ["board", "body"]
-      }
-    },
-    {
-      name: "board_read",
-      description: "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), else the latest 10. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          board: BOARD,
-          limit: { type: "number", description: "Max posts (default 20 unread or 10 latest, max 200)." },
-          before_id: { type: "number", description: "Return posts older than this post_id." },
-          thread: { type: "number", description: "Any post_id in the thread to expand." }
-        },
-        required: ["board"]
-      }
-    },
-    {
-      name: "board_subscribe",
-      description: `board_subscribe(board, mode, thread?): how a board reaches you. "push" = every post in full, as it lands; "digest" = one notice while there's unread, arriving with your next other notification or session start (it never wakes you by itself); "quiet" = no notices, only unread counts in board_list; "off" = unsubscribe. In every mode, @mentions and replies to your posts or threads you started wake you, and other replies in threads you've posted in arrive with your next notification. To stop one thread's replies, pass its thread with mode "off" (@mentions still arrive); the same call with mode "push" resumes them.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          board: BOARD,
-          mode: { type: "string", enum: ["push", "digest", "quiet", "off"] },
-          thread: {
-            type: "number",
-            description: `Optional. Any post_id in a thread: "off" mutes that thread's replies to you, "push" unmutes. The board's mode is unchanged.`
-          }
-        },
-        required: ["board", "mode"]
-      }
-    },
-    {
-      name: "peer_list",
-      description: "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          board: { type: "string", description: "Optional. Only this board's subscribers." },
-          include_offline: { type: "boolean", description: "Also list offline handles with last_seen (default false)." },
-          match: {
-            type: "object",
-            description: "Optional. Only rows whose fields equal these (case-insensitive): id, harness, model, effort, task, owner, source_board, spec_hash, scope."
-          }
-        }
-      }
-    },
-    {
-      name: "peer_status",
-      _meta: { "anthropic/alwaysLoad": true },
-      description: `peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don't merge to main". Empty text clears it. It also clears when your session restarts.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          text: { type: "string", description: "At most 200 chars. Empty clears." },
-          queue: { type: "string", enum: ["on", "off"], description: 'Optional. "off" leaves queue-board rotations until "on"; kept across restarts.' }
-        },
-        required: ["text"]
-      }
-    },
-    {
-      name: "claim_take",
-      description: `claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don't duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          key: { type: "string" },
-          ttl_minutes: { type: "number", description: "Default 30, max 10080 (7 days); a renewal without it or until keeps the current expiry if later. Renew before it lapses." },
-          until: {
-            type: "string",
-            description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.'
-          },
-          note: { type: "string", description: "Optional. What you're doing with it." },
-          board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on." },
-          as: AS_PARAM
-        },
-        required: ["key"]
-      }
-    },
-    {
-      name: "claim_release",
-      description: `claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. "done" or "abandoned").`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          key: { type: "string" },
-          note: { type: "string", description: "Optional. How it ended, for whoever was waiting." }
-        },
-        required: ["key"]
-      }
-    },
-    {
-      name: "claim_watch",
-      description: "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          key: { type: "string" },
-          off: { type: "boolean", description: "Optional. true stops watching." }
-        },
-        required: ["key"]
-      }
-    },
-    {
-      name: "claim_list",
-      _meta: { "anthropic/alwaysLoad": true },
-      description: "claim_list(prefix?): active claims with key, holder, note, board, and expires_at. Check before starting work others might be doing.",
-      inputSchema: {
-        type: "object",
-        properties: { prefix: { type: "string", description: 'Optional. Only keys starting with this, e.g. "ticket:".' } }
-      }
-    }
-  ];
-}
-var NAMES = new Set(boardTools({ teams: true }).map((t) => t.name));
-
-// src/server/oauth-config.ts
-var OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"];
-var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
-var BUILTINS = [
-  { clientId: "grayboard-pi", harness: "pi", name: "Grayboard for pi" },
-  { clientId: "grayboard-omp", harness: "omp", name: "Grayboard for omp" },
-  { clientId: "grayboard-claude-code", harness: "claude-code", name: "Grayboard for Claude Code" }
-];
-var builtinHarness = new Map(BUILTINS.map((b) => [b.clientId, b.harness]));
-var BUILTIN_CLIENT_IDS = BUILTINS.map((b) => b.clientId);
-var BUILTIN_CLIENTS = BUILTINS.map(({ clientId, name }) => ({
-  clientId,
-  name,
-  redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"],
-  scopes: [...OAUTH_SCOPES],
-  tokenEndpointAuthMethod: "none",
-  allowRefresh: true
-}));
-
 // plugins/claude-code/src/plugin.ts
 var HARNESS = "Claude Code";
 var CLIENT_ID = "grayboard-claude-code";
@@ -36788,7 +37072,6 @@ var LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any gr
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
 var FLOW_MS2 = 10 * 60000;
-var DRIFTED = "Grayboard credential changed";
 function pluginConfig(env) {
   const { CLAUDE_CODE_SESSION_ID: id, CLAUDE_PLUGIN_DATA: dataDir } = env, url = env.GRAYBOARD_SERVER_URL?.trim();
   if (!id)
@@ -36809,33 +37092,15 @@ function createPlugin(o) {
   const verdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
-  let offPending = offNotice !== undefined;
   const place = describeLocation(o.cwd) ?? HARNESS;
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
   const say = (message) => o.log(`[grayboard] ${message}`);
   let closed = false;
   let initialized = false;
-  let markInitialized;
-  const ready = new Promise((r) => {
-    markInitialized = r;
-  });
-  let markClosed;
-  const closing = new Promise((r) => {
-    markClosed = r;
-  });
-  let notice;
-  let held;
-  let signedOut;
-  let begun;
-  let used = false;
-  let controller, lock, proxy;
-  let waiter;
-  let watcher;
-  let restarting;
+  const { promise: ready, resolve: markInitialized } = Promise.withResolvers();
   let signingIn;
   let server;
-  const tools = () => proxy?.tools() ?? hostTools(snapshotTools());
   const listChanged = () => {
     if (initialized && !closed)
       server?.sendToolListChanged().catch(() => {});
@@ -36849,8 +37114,9 @@ function createPlugin(o) {
     present: async (url) => {
       const abort = signingIn?.abort.signal;
       if (!server.getClientCapabilities()?.elicitation?.url) {
-        notice = `open ${url} to sign in to grayboard`;
-        say(notice);
+        const text = `open ${url} to sign in to grayboard`;
+        root?.noticeOnce(text, "last");
+        say(text);
         return;
       }
       const elicitationId = randomUUID2();
@@ -36863,23 +37129,60 @@ function createPlugin(o) {
     diagnostic: (record) => {
       if (record.state !== "degraded" && record.state !== "paused")
         return;
-      notice = record.message;
+      root?.noticeOnce(record.message, "last");
       say(record.message);
     }
   });
   let complete;
+  const client = login && new HostedClient({
+    harness: HARNESS,
+    clientId: CLIENT_ID,
+    version: o.version,
+    login,
+    source: SOURCE,
+    loginAction,
+    resumeHint: RESUME_HINT,
+    retryHint: RESUME_HINT,
+    roots,
+    env: o.env,
+    log: (message) => say(message)
+  });
+  const initializedOr = (signal) => {
+    signal.throwIfAborted();
+    const { promise: aborted, reject } = Promise.withResolvers();
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    return Promise.race([ready, aborted]).finally(() => signal.removeEventListener("abort", abort));
+  };
+  const root = client && !("error" in config) ? new RootDelivery(client, {
+    sessionID: config.id,
+    stateDir: config.dataDir,
+    place: () => place,
+    push,
+    admit: async (item, _stableID, identity, signal) => {
+      if (!initialized)
+        await initializedOr(signal);
+      await server.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
+    },
+    onTools: () => listChanged()
+  }) : undefined;
+  if (offNotice)
+    root?.noticeOnce(offNotice, "first");
+  const changes = client?.onChange((signedIn) => {
+    if (signedIn)
+      signingIn?.abort.abort();
+  });
   const signIn = () => {
-    if (!login || !interactive || closed || signingIn || !initialized)
+    if (!login || !root || !interactive || closed || signingIn || !initialized)
       return;
     const abort = new AbortController;
     const done = login.login(abort.signal).then(async () => {
       await complete?.();
       say("signed in");
-      await credentialChanged();
+      await root.credentialChanged();
     }, (error) => {
-      const message = error instanceof LoginFailed || error instanceof Refusal ? error.message : error?.message ?? String(error);
       if (!abort.signal.aborted)
-        say(`sign-in failed: ${message}`);
+        say(`sign-in failed: ${message(error)}`);
     }).finally(() => {
       complete = undefined;
       if (signingIn?.done === done)
@@ -36887,227 +37190,46 @@ function createPlugin(o) {
     });
     signingIn = { abort, done };
   };
-  let last;
-  const auth = {
-    token: async () => last = await login.token(),
-    onUnauthorized: async () => login.unauthorized(last ?? "")
-  };
-  const wireOptions = (mode) => ({
-    url: login.resource,
-    sessionKey: GRAYBOARD_SESSION_META,
-    client: { name: CLIENT_ID, version: o.version },
-    delivery: { mode, source: SOURCE }
-  });
-  const port = (id, store) => ({
-    harness: HARNESS,
-    resumeHint: RESUME_HINT,
-    loginAction,
-    sessionKey: GRAYBOARD_SESSION_META,
-    client: { name: CLIENT_ID, version: o.version },
-    delivery: { mode: "push", source: SOURCE },
-    storage: store,
-    place: () => place,
-    ancestry: async (sessionID) => {
-      if (sessionID !== id)
-        throw new AncestryError(`Grayboard session ${sessionID} isn't this Claude Code session`);
-      return { sessionID, root: id, via: [] };
-    },
-    credential: login.credential(),
-    approval: null,
-    admit: async (_e, item, _stableID, identity) => {
-      await Promise.race([ready, closing]);
-      if (closed)
-        throw new Refusal("paused", "the Claude Code session closed");
-      await server.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
-    }
-  });
-  const newProxy = (mode) => new ToolProxy({
-    wire: wireOptions(mode),
-    harness: HARNESS,
-    loginAction,
-    auth,
-    roots,
-    env: o.env,
-    ...mode === "push" && controller ? { hooks: controller } : {},
-    report: (operation, error) => {
-      if (operation === "after")
-        controller?.backgroundFailure("after");
-      say(`${operation} failed: ${error?.message ?? String(error)}`);
-    },
-    onTools: () => listChanged()
-  });
-  const connect = async () => {
-    if (!proxy)
-      return;
-    try {
-      await proxy.connect();
-    } catch (error) {
-      if (!accessExpiry(error))
-        say(`couldn't reach the server: ${error.message}`);
-    }
-  };
-  const begin = async () => {
-    if (!controller || "error" in config || closed)
-      return;
-    const id = config.id;
-    try {
-      begun = (await login.read().catch(() => {
-        return;
-      }))?.epoch;
-      const expected = await controller.carried(id);
-      const status = await controller.resume(id);
-      signedOut = undefined;
-      proxy?.forget(id);
-      const root = status.roots.find((r) => r.sessionID === id);
-      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
-      if (expected && bound !== expected && root?.state !== "paused") {
-        notice = `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${bound ? `it is bound as ${bound}` : "it is unbound"}`;
-        say(notice);
-      }
-    } catch (error) {
-      const expired = accessExpiry(error);
-      if (!expired) {
-        say(`couldn't start delivery: ${error.message}`);
-        return;
-      }
-      signedOut = expired;
-    }
-  };
-  const restart = () => restarting ??= begin().finally(() => {
-    restarting = undefined;
-  });
-  let lastBinding, lastRecord;
-  const sink = async (record) => {
-    if ("error" in config || record.sessionID !== config.id)
-      return;
-    const binding = `${record.state}
-${record.name ?? ""}`;
-    if (binding !== lastBinding) {
-      lastBinding = binding;
-      proxy?.forget(config.id);
-    }
-    const key = `${record.state}
-${record.message}`;
-    if (key === lastRecord)
-      return;
-    lastRecord = key;
-    if (record.state !== "paused" && record.state !== "degraded" || record.operation === "session_end" || record.message.startsWith(DRIFTED))
-      return;
-    const epoch = (await login.read().catch(() => {
-      return;
-    }))?.epoch;
-    if (epoch !== begun)
-      return;
-    notice = `delivery ${record.state}: ${record.message}`;
-    say(notice);
-  };
-  const own = async (taken) => {
-    if (closed || "error" in config) {
-      taken.release();
-      return;
-    }
-    lock = taken;
-    if (notice === held)
-      notice = undefined;
-    held = undefined;
-    controller = new Controller(port(config.id, new FileStorage(sessionPath(config.dataDir, login.resource, CLIENT_ID, config.id))), { sink });
-    await controller.restore().catch((error) => say(`couldn't restore delivery state: ${error?.message ?? String(error)}`));
-    const old = proxy;
-    proxy = newProxy("push");
-    old?.retire().catch(() => {});
-    connect();
-    await restart();
-  };
-  const start = async () => {
-    if ("error" in config)
-      return;
-    watcher = login.watch(() => {
-      credentialChanged();
-    });
-    if (!push) {
-      proxy = newProxy("poll");
-      connect();
-      return;
-    }
-    const path = deliveryPath(config.dataDir, login.resource, CLIENT_ID, config.id);
-    let taken;
-    try {
-      taken = tryDelivery(path);
-    } catch (error) {
-      say(`couldn't take delivery: ${error?.message ?? String(error)}`);
-    }
-    if (taken)
-      return own(taken).catch((error) => say(`couldn't start delivery: ${error?.message ?? String(error)}`));
-    held = new DeliveryHeldElsewhere(HARNESS).message;
-    notice = held;
-    proxy = newProxy("poll");
-    connect();
-    waiter = new AbortController;
-    waitDelivery(path, waiter.signal).then((next) => own(next).catch((error) => say(`couldn't start delivery: ${error?.message ?? String(error)}`)), () => {});
-  };
-  const credentialChanged = async () => {
-    if (closed)
-      return;
-    try {
-      await login.token();
-    } catch (error) {
-      const expired = accessExpiry(error);
-      if (!expired)
-        say(`couldn't read the sign-in: ${error?.message ?? String(error)}`);
-      return;
-    }
-    signingIn?.abort.abort();
-    connect();
-    if (!controller)
-      return;
-    await restarting;
-    const epoch = (await login.read().catch(() => {
-      return;
-    }))?.epoch;
-    if (!signedOut && epoch !== undefined && epoch === begun)
-      return;
-    await restart();
-  };
   const unpause = async () => {
-    if (!controller || "error" in config)
+    if (!root || "error" in config)
       return;
-    const root = controller.status().roots.find((r) => r.sessionID === config.id);
-    if (root?.state !== "paused" || signedOut)
+    const before = root.status();
+    if (before.signedOut)
       return;
-    const why = root.message;
-    await restart();
-    const now = controller.status().roots.find((r) => r.sessionID === config.id);
-    return `delivery was paused (${why}); restarted: ${now ? `${now.state}${now.state === "active" ? "" : `, ${now.message}`}` : "not running"}`;
+    const state = () => {
+      const now = root.status();
+      if (now.held)
+        return "another process holds delivery";
+      const record = now.controller?.roots.find((r) => r.sessionID === config.id);
+      return record ? `${record.state}${record.state === "active" ? "" : `, ${record.message}`}` : "not running";
+    };
+    if (before.error) {
+      await root.resume();
+      return root.status().error ? undefined : `delivery couldn't start (${before.error}); retried: ${state()}`;
+    }
+    const paused = before.controller?.roots.find((r) => r.sessionID === config.id);
+    if (paused?.state !== "paused")
+      return;
+    await root.resume();
+    return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
-  const call = async (name, args) => {
-    if ("error" in config)
-      return failure2(config.error);
-    if (!proxy)
-      return failure2("the grayboard plugin hasn't started yet");
-    if (held && (name === "bind" || name === "unbind"))
-      return failure2(`${held}; bind and unbind work from the process that holds delivery`);
-    let signed = true;
+  const before = async () => {
     try {
       await login.token();
     } catch (error) {
       if (accessExpiry(error)) {
-        signed = false;
         signIn();
+        return;
       }
     }
-    const restarted = signed ? await unpause() : undefined;
-    used = true;
-    let result;
-    try {
-      result = await proxy.call(name, args, config.id);
-    } catch (error) {
-      result = failure2(failureMessage(error, RESUME_HINT));
-    }
-    const shown = [offPending ? offNotice : undefined, notice, restarted].filter((n) => !!n);
-    notice = undefined;
-    offPending = false;
-    return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
+    return unpause();
   };
+  const call = async (name, args) => {
+    if ("error" in config)
+      return failure2(config.error);
+    return root.call(name, args, before);
+  };
+  const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
     const s = new Server({ name: "grayboard", version: o.version }, { capabilities: { experimental: { "claude/channel": {} }, tools: { listChanged: true } }, instructions });
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
@@ -37123,30 +37245,32 @@ ${record.message}`;
     };
     return s;
   };
+  const after = (ms) => {
+    const { promise, resolve } = Promise.withResolvers();
+    setTimeout(resolve, ms).unref?.();
+    return promise;
+  };
   const instructions = async () => {
     if ("error" in config)
       return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
-    const lead = offNotice;
     let body;
     try {
-      if (!proxy)
-        throw new Error("starting");
-      const text = await Promise.race([
-        proxy.instructions(config.id),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), INSTRUCTIONS_MS).unref?.())
-      ]);
+      const text = await Promise.race([root.instructions(), after(INSTRUCTIONS_MS).then(() => {
+        throw new Error("timeout");
+      })]);
       body = text ?? "";
     } catch (error) {
       const expired = accessExpiry(error);
-      body = !proxy ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting." : expired ? `Grayboard (${login.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.` : `Warning: the grayboard server at ${new URL(login.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
+      body = error instanceof NotStarted ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting." : expired ? `Grayboard (${login.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.` : `Warning: the grayboard server at ${new URL(login.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
-    return [lead, held ? `Warning: ${held}; this session is tools-only until it exits.` : undefined, body].filter(Boolean).join(`
+    const { held, error } = root.status();
+    const warning = held ? `Warning: ${held}; this session is tools-only until it exits.` : error ? `Warning: grayboard delivery couldn't start (${error}); this session is tools-only, and each grayboard tool call retries it.` : undefined;
+    return [offNotice, warning, body].filter(Boolean).join(`
 
 `);
   };
   const connectTransport = async (transport) => {
-    const deadline = new Promise((r) => setTimeout(r, INSTRUCTIONS_MS).unref?.());
-    await Promise.race([start(), deadline]);
+    await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
     server = serve(await instructions());
     if (offNotice)
       say(offNotice);
@@ -37156,31 +37280,9 @@ ${record.message}`;
     if (closed)
       return;
     closed = true;
-    markClosed();
-    watcher?.dispose();
-    waiter?.abort();
+    changes?.dispose();
     signingIn?.abort.abort();
-    if (!("error" in config)) {
-      const id = config.id;
-      await restarting?.catch(() => {});
-      if (controller)
-        await controller.shutdown(id, "release").catch((error) => say(`couldn't release delivery: ${error?.message ?? String(error)}`));
-      else if (used && !held && login) {
-        const wire = new Wire(wireOptions("poll"), auth, AbortSignal.timeout(5000), id);
-        try {
-          await wire.connect();
-          await wire.call("session_end");
-        } catch (error) {
-          if (!accessExpiry(error))
-            say(`couldn't end session ${id} on the server: ${error?.message ?? String(error)}`);
-        } finally {
-          await wire.close().catch(() => {});
-        }
-      }
-    }
-    await controller?.close().catch(() => {});
-    lock?.release();
-    await proxy?.close().catch(() => {});
+    await root?.shutdown("release");
     await server?.close().catch(() => {});
   };
   return { connect: connectTransport, shutdown };

@@ -3,8 +3,9 @@
 // It signs in as the built-in client `grayboard-claude-code` with its own
 // grant (stored in CLAUDE_PLUGIN_DATA, shared by every session on this
 // machine), forwards the server's tools with CLAUDE_CODE_SESSION_ID in
-// `_meta`, and holds the session's delivery lease only when Claude Code will
-// show its channel notifications (the shared rule, src/shared/claude_channels.ts).
+// `_meta` (hosted-core's HostedClient), and holds the session's delivery
+// lease (hosted-core's RootDelivery) only when Claude Code will show its
+// channel notifications (the shared rule, src/shared/claude_channels.ts).
 //
 // Claude Code runs one plugin process per session, and its subagents and
 // in-process work call through it, so they act as the root. The process
@@ -16,19 +17,13 @@ import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult as ServerResult, type Tool as ListedTool } from "@modelcontextprotocol/sdk/types.js";
-import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
-import { Controller } from "../../../adapters/hosted-core/src/controller.ts";
-import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
-import { AccessExpired, accessExpiry, DeliveryHeldElsewhere, Refusal } from "../../../adapters/hosted-core/src/model.ts";
-import type { HostPort } from "../../../adapters/hosted-core/src/port.ts";
-import { failure, hostTools, snapshotTools, ToolProxy, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
-import { AncestryError } from "../../../adapters/hosted-core/src/sessions.ts";
-import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "../../../adapters/hosted-core/src/storage.ts";
-import type { Lock } from "../../../adapters/hosted-core/src/lock.ts";
+import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
-import { Wire, type WireOptions } from "../../../adapters/hosted-core/src/wire.ts";
-import { failureMessage, type DiagnosticSink } from "../../../adapters/hosted-core/src/diagnostics.ts";
-import { GRAYBOARD_SESSION_META } from "../../../src/server/oauth-config.ts";
+import { HostedClient, message } from "../../../adapters/hosted-core/src/client.ts";
+import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
+import { accessExpiry } from "../../../adapters/hosted-core/src/model.ts";
+import { failure, hostTools, snapshotTools, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
+import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
@@ -46,9 +41,6 @@ export const LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code show
 export const LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 const INSTRUCTIONS_MS = 5_000;
 const FLOW_MS = 10 * 60_000;
-// hosted-core's Controller pauses every root with this when the store's
-// epoch changes (a login or logout in any process).
-const DRIFTED = "Grayboard credential changed";
 
 export type PluginOptions = {
   env: Record<string, string | undefined>;
@@ -78,7 +70,6 @@ export function pluginConfig(env: Record<string, string | undefined>): Config {
   if (!canonicalEndpoint(url)) return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
-
 export function createPlugin(o: PluginOptions): Plugin {
   const config = pluginConfig(o.env);
   const interactive = interactiveClaude(o.env, o.parentCmd);
@@ -89,7 +80,6 @@ export function createPlugin(o: PluginOptions): Plugin {
   // The reason carries its remedy where there is one; the instructions, the
   // first tool result and stderr each say it once, as the local servers do.
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
-  let offPending = offNotice !== undefined;
   const place = describeLocation(o.cwd) ?? HARNESS;
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
@@ -98,19 +88,7 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   let closed = false;
   let initialized = false;
-  let markInitialized!: () => void;
-  const ready = new Promise<void>(r => { markInitialized = r; });
-  let markClosed!: () => void;
-  const closing = new Promise<void>(r => { markClosed = r; });
-  let notice: string | undefined;        // shown once, at the head of the next tool result
-  let held: string | undefined;          // set while another process holds delivery for this session
-  let signedOut: AccessExpired | undefined; // why the last start failed for want of a sign-in
-  let begun: string | undefined;         // the store epoch this root last (re)started under
-  let used = false;                      // a call went out under this session's id
-  let controller: Controller | undefined, lock: Lock | undefined, proxy: ToolProxy | undefined;
-  let waiter: AbortController | undefined;
-  let watcher: { dispose(): void } | undefined;
-  let restarting: Promise<void> | undefined;
+  const { promise: ready, resolve: markInitialized } = Promise.withResolvers<void>();
   let signingIn: { abort: AbortController; done: Promise<void> } | undefined;
 
   // Made by connect(), once its initialize instructions are known: the 1.x
@@ -118,7 +96,6 @@ export function createPlugin(o: PluginOptions): Plugin {
   // below that uses it runs after initialize.
   let server: Server | undefined;
 
-  const tools = (): NativeTool[] => proxy?.tools() ?? hostTools(snapshotTools());
   const listChanged = () => { if (initialized && !closed) void server?.sendToolListChanged().catch(() => {}); };
 
   // ---- sign-in ----
@@ -132,8 +109,9 @@ export function createPlugin(o: PluginOptions): Plugin {
       if (!server!.getClientCapabilities()?.elicitation?.url) {
         // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation):
         // the next tool result carries the URL instead.
-        notice = `open ${url} to sign in to grayboard`;
-        say(notice);
+        const text = `open ${url} to sign in to grayboard`;
+        root?.noticeOnce(text, "last");
+        say(text);
         return;
       }
       const elicitationId = randomUUID();
@@ -147,213 +125,100 @@ export function createPlugin(o: PluginOptions): Plugin {
     notify: message => say(message),
     diagnostic: record => {
       if (record.state !== "degraded" && record.state !== "paused") return;
-      notice = record.message;
+      root?.noticeOnce(record.message, "last");
       say(record.message);
     },
   });
   let complete: (() => Promise<void>) | undefined;
 
+  const client = login && new HostedClient({
+    harness: HARNESS, clientId: CLIENT_ID, version: o.version, login, source: SOURCE,
+    loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, log: message => say(message),
+  });
+
+  // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.
+  const initializedOr = (signal: AbortSignal): Promise<void> => {
+    signal.throwIfAborted();
+    const { promise: aborted, reject } = Promise.withResolvers<void>();
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    return Promise.race([ready, aborted]).finally(() => signal.removeEventListener("abort", abort));
+  };
+
+  const root = client && !("error" in config) ? new RootDelivery(client, {
+    sessionID: config.id, stateDir: config.dataDir, place: () => place, push,
+    // Claude Code drops a notification sent before `initialized`; the
+    // Controller receipts only after this resolves, and its admission set
+    // keeps a failed receipt from showing an item twice. A stop (the run
+    // loop's signal) releases the wait without a pause.
+    admit: async (item, _stableID, identity, signal) => {
+      if (!initialized) await initializedOr(signal);
+      await server!.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
+    },
+    onTools: () => listChanged(),
+  }) : undefined;
+  if (offNotice) root?.noticeOnce(offNotice, "first");
+  // Another process's sign-in landed: this one's prompt is moot.
+  const changes = client?.onChange(signedIn => { if (signedIn) signingIn?.abort.abort(); });
+
   // At most one sign-in in this process; hosted-core's login lock keeps it to
   // one across processes (a waiter shares the winner's grant). Never under
   // -p or the SDK: the process may exit before the browser returns.
   const signIn = () => {
-    if (!login || !interactive || closed || signingIn || !initialized) return;
+    if (!login || !root || !interactive || closed || signingIn || !initialized) return;
     const abort = new AbortController();
     const done = login.login(abort.signal).then(
       async () => {
         await complete?.();
         say("signed in");
-        await credentialChanged();
+        await root.credentialChanged();
       },
-      error => {
-        const message = error instanceof LoginFailed || error instanceof Refusal ? error.message : (error as Error)?.message ?? String(error);
-        if (!abort.signal.aborted) say(`sign-in failed: ${message}`);
-      },
+      error => { if (!abort.signal.aborted) say(`sign-in failed: ${message(error)}`); },
     ).finally(() => { complete = undefined; if (signingIn?.done === done) signingIn = undefined; });
     signingIn = { abort, done };
   };
 
-  let last: string | undefined;
-  const auth: AuthProvider = {
-    token: async () => (last = await login!.token()),
-    onUnauthorized: async () => login!.unauthorized(last ?? ""),
-  };
-  const wireOptions = (mode: "push" | "poll"): WireOptions => ({
-    url: login!.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT_ID, version: o.version }, delivery: { mode, source: SOURCE },
-  });
-
-  // ---- delivery ----
-
-  const port = (id: string, store: FileStorage): HostPort => ({
-    harness: HARNESS, resumeHint: RESUME_HINT, loginAction, sessionKey: GRAYBOARD_SESSION_META,
-    client: { name: CLIENT_ID, version: o.version }, delivery: { mode: "push", source: SOURCE },
-    storage: store,
-    place: () => place,
-    ancestry: async sessionID => {
-      if (sessionID !== id) throw new AncestryError(`Grayboard session ${sessionID} isn't this Claude Code session`);
-      return { sessionID, root: id, via: [] };
-    },
-    credential: login!.credential(),
-    approval: null,
-    // Claude Code drops a notification sent before `initialized`; the
-    // Controller receipts only after this resolves, and its admission set
-    // keeps a failed receipt from showing an item twice.
-    admit: async (_e, item, _stableID, identity) => {
-      // A session that closes before `initialized` must not strand the receipt.
-      await Promise.race([ready, closing]);
-      if (closed) throw new Refusal("paused", "the Claude Code session closed");
-      await server!.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
-    },
-  });
-
-  const newProxy = (mode: "push" | "poll") => new ToolProxy({
-    wire: wireOptions(mode), harness: HARNESS, loginAction, auth, roots, env: o.env,
-    ...(mode === "push" && controller ? { hooks: controller } : {}),
-    report: (operation, error) => {
-      if (operation === "after") controller?.backgroundFailure("after");
-      say(`${operation} failed: ${(error as Error)?.message ?? String(error)}`);
-    },
-    onTools: () => listChanged(),
-  });
-
-  const connect = async () => {
-    if (!proxy) return;
-    try { await proxy.connect(); }
-    catch (error) { if (!accessExpiry(error)) say(`couldn't reach the server: ${(error as Error).message}`); }
-  };
-
-  // (Re)starts this session's delivery, rebinding the name it last held. A
-  // name that didn't take back is said in the next tool result.
-  const begin = async () => {
-    if (!controller || "error" in config || closed) return;
-    const id = config.id;
-    try {
-      begun = (await login!.read().catch(() => undefined))?.epoch;
-      const expected = await controller.carried(id);
-      const status = await controller.resume(id);
-      signedOut = undefined;
-      proxy?.forget(id);
-      const root = status.roots.find(r => r.sessionID === id);
-      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
-      if (expected && bound !== expected && root?.state !== "paused") {
-        notice = `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${bound ? `it is bound as ${bound}` : "it is unbound"}`;
-        say(notice);
-      }
-    } catch (error) {
-      const expired = accessExpiry(error);
-      if (!expired) { say(`couldn't start delivery: ${(error as Error).message}`); return; }
-      signedOut = expired;
-    }
-  };
-  const restart = () => restarting ??= begin().finally(() => { restarting = undefined; });
-
-  // The Controller's records. A pause or degradation its run loop reaches on
-  // its own is said in the next tool result; a credential change is
-  // credentialChanged's (the drift message), and a shutdown's pause nobody's.
-  let lastBinding: string | undefined, lastRecord: string | undefined;
-  const sink: DiagnosticSink = async record => {
-    if ("error" in config || record.sessionID !== config.id) return;
-    const binding = `${record.state}\n${record.name ?? ""}`;
-    if (binding !== lastBinding) { lastBinding = binding; proxy?.forget(config.id); }
-    const key = `${record.state}\n${record.message}`;
-    if (key === lastRecord) return;
-    lastRecord = key;
-    if (record.state !== "paused" && record.state !== "degraded" || record.operation === "session_end" || record.message.startsWith(DRIFTED)) return;
-    const epoch = (await login!.read().catch(() => undefined))?.epoch;
-    if (epoch !== begun) return;
-    notice = `delivery ${record.state}: ${record.message}`;
-    say(notice);
-  };
-
-  // The lock is ours: run the Controller and declare push delivery.
-  const own = async (taken: Lock) => {
-    if (closed || "error" in config) { taken.release(); return; }
-    lock = taken; if (notice === held) notice = undefined; held = undefined;
-    controller = new Controller(port(config.id, new FileStorage(sessionPath(config.dataDir, login!.resource, CLIENT_ID, config.id))), { sink });
-    await controller.restore().catch(error => say(`couldn't restore delivery state: ${(error as Error)?.message ?? String(error)}`));
-    // The tools-only proxy's calls in flight finish on it.
-    const old = proxy;
-    proxy = newProxy("push");
-    void old?.retire().catch(() => {});
-    void connect();
-    await restart();
-  };
-
-  // Delivery for this session id, unless another process (`claude --resume
-  // <id>` in a second terminal) holds it: tools only until that one exits.
-  const start = async () => {
-    if ("error" in config) return;
-    watcher = login!.watch(() => { void credentialChanged(); });
-    if (!push) { proxy = newProxy("poll"); void connect(); return; }
-    const path = deliveryPath(config.dataDir, login!.resource, CLIENT_ID, config.id);
-    let taken: Lock | undefined;
-    try { taken = tryDelivery(path); }
-    catch (error) { say(`couldn't take delivery: ${(error as Error)?.message ?? String(error)}`); }
-    if (taken) return own(taken).catch(error => say(`couldn't start delivery: ${(error as Error)?.message ?? String(error)}`));
-    held = new DeliveryHeldElsewhere(HARNESS).message;
-    notice = held;
-    proxy = newProxy("poll");
-    void connect();
-    waiter = new AbortController();
-    void waitDelivery(path, waiter.signal).then(
-      next => own(next).catch(error => say(`couldn't start delivery: ${(error as Error)?.message ?? String(error)}`)),
-      () => {},
-    );
-  };
-
-  // A sign-in or sign-out in any process (the store's epoch).
-  const credentialChanged = async () => {
-    if (closed) return;
-    try { await login!.token(); }
-    catch (error) {
-      const expired = accessExpiry(error);
-      if (!expired) say(`couldn't read the sign-in: ${(error as Error)?.message ?? String(error)}`);
-      return;
-    }
-    // Another process's sign-in landed first: this one's prompt is moot.
-    signingIn?.abort.abort();
-    void connect();
-    if (!controller) return;
-    await restarting;
-    const epoch = (await login!.read().catch(() => undefined))?.epoch;
-    if (!signedOut && epoch !== undefined && epoch === begun) return;
-    await restart();
-  };
-
   // ---- tools ----
 
-  // A root paused for anything but a sign-out restarts on the next call;
-  // the result says why it had paused, then how the restart went.
+  // Before each call, unless signed out: a root paused for anything but a
+  // sign-out restarts, and a delivery lock that couldn't be taken is tried
+  // again (Claude Code has no resume command); the result says why, then how
+  // it went. A lock retry that fails again says so itself (the root's own
+  // notice), so nothing is added for it.
   const unpause = async (): Promise<string | undefined> => {
-    if (!controller || "error" in config) return undefined;
-    const root = controller.status().roots.find(r => r.sessionID === config.id);
-    if (root?.state !== "paused" || signedOut) return undefined;
-    const why = root.message;
-    await restart();
-    const now = controller.status().roots.find(r => r.sessionID === config.id);
-    return `delivery was paused (${why}); restarted: ${now ? `${now.state}${now.state === "active" ? "" : `, ${now.message}`}` : "not running"}`;
+    if (!root || "error" in config) return undefined;
+    const before = root.status();
+    if (before.signedOut) return undefined;
+    const state = () => {
+      const now = root.status();
+      if (now.held) return "another process holds delivery";
+      const record = now.controller?.roots.find(r => r.sessionID === config.id);
+      return record ? `${record.state}${record.state === "active" ? "" : `, ${record.message}`}` : "not running";
+    };
+    if (before.error) {
+      await root.resume();
+      return root.status().error ? undefined : `delivery couldn't start (${before.error}); retried: ${state()}`;
+    }
+    const paused = before.controller?.roots.find(r => r.sessionID === config.id);
+    if (paused?.state !== "paused") return undefined;
+    await root.resume();
+    return `delivery was paused (${paused.message}); restarted: ${state()}`;
+  };
+  // Before each call: only a missing or expired sign-in offers one; a
+  // transient failure (5xx, a refresh in progress) goes to the call, which
+  // reports it.
+  const before = async (): Promise<string | undefined> => {
+    try { await login!.token(); }
+    catch (error) { if (accessExpiry(error)) { signIn(); return undefined; } }
+    return unpause();
   };
 
   const call = async (name: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
-    if (!proxy) return failure("the grayboard plugin hasn't started yet");
-    // The process holding delivery owns this session's binding; a tools-only one rebinding it would fight the holder.
-    if (held && (name === "bind" || name === "unbind")) return failure(`${held}; bind and unbind work from the process that holds delivery`);
-    // Only a missing or expired sign-in offers one; a transient failure
-    // (5xx, a refresh in progress) goes to the call, which reports it.
-    let signed = true;
-    try { await login!.token(); }
-    catch (error) { if (accessExpiry(error)) { signed = false; signIn(); } }
-    const restarted = signed ? await unpause() : undefined;
-    used = true;
-    let result: CallToolResult;
-    try { result = await proxy.call(name, args, config.id); }
-    catch (error) { result = failure(failureMessage(error, RESUME_HINT)); }
-    const shown = [offPending ? offNotice : undefined, notice, restarted].filter((n): n is string => !!n);
-    notice = undefined;
-    offPending = false;
-    return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
+    return root!.call(name, args, before);
   };
+
+  const tools = (): NativeTool[] => root?.tools() ?? hostTools(snapshotTools());
 
   const serve = (instructions: string): Server => {
     const s = new Server(
@@ -374,64 +239,53 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   // ---- instructions ----
 
+  // A timer that never keeps the process alive.
+  const after = (ms: number) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms).unref?.();
+    return promise;
+  };
+
   // The server's own initialize instructions for this session, as written for
   // the declared delivery; Claude Code reads instructions only at initialize.
   const instructions = async (): Promise<string> => {
     if ("error" in config) return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
-    const lead = offNotice;
     let body: string;
     try {
-      if (!proxy) throw new Error("starting");
-      const text = await Promise.race([
-        proxy.instructions(config.id),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), INSTRUCTIONS_MS).unref?.()),
-      ]);
+      const text = await Promise.race([root!.instructions(), after(INSTRUCTIONS_MS).then(() => { throw new Error("timeout"); })]);
       body = text ?? "";
     } catch (error) {
       const expired = accessExpiry(error);
-      body = !proxy
+      body = error instanceof NotStarted
         ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting."
         : expired
         ? `Grayboard (${login!.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.`
         : `Warning: the grayboard server at ${new URL(login!.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
-    return [lead, held ? `Warning: ${held}; this session is tools-only until it exits.` : undefined, body].filter(Boolean).join("\n\n");
+    const { held, error } = root!.status();
+    const warning = held ? `Warning: ${held}; this session is tools-only until it exits.`
+      : error ? `Warning: grayboard delivery couldn't start (${error}); this session is tools-only, and each grayboard tool call retries it.`
+      : undefined;
+    return [offNotice, warning, body].filter(Boolean).join("\n\n");
   };
 
   const connectTransport = async (transport: Transport) => {
-    // Delivery starts (and rebinds) first, so the instructions say the bound name.
-    const deadline = new Promise<void>(r => setTimeout(r, INSTRUCTIONS_MS).unref?.());
-    await Promise.race([start(), deadline]);
+    // Delivery starts (and rebinds) first, so the instructions say the bound
+    // name; start() never rejects, so the race is safe.
+    await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
     server = serve(await instructions());
     if (offNotice) say(offNotice);
     await server.connect(transport);
   };
 
+  // The lease's release (RootDelivery's shutdown order) goes first: Claude
+  // Code kills a stdio server 500 ms after it asks it to stop.
   const shutdown = async () => {
     if (closed) return;
     closed = true;
-    markClosed();
-    watcher?.dispose();
-    waiter?.abort();
+    changes?.dispose();
     signingIn?.abort.abort();
-    if (!("error" in config)) {
-      const id = config.id;
-      // The lease's release frees the name now, not at the idle sweep.
-      // A start or restart in flight finishes (and sees `closed`) before the lease is released.
-      await restarting?.catch(() => {});
-      if (controller) await controller.shutdown(id, "release").catch(error => say(`couldn't release delivery: ${(error as Error)?.message ?? String(error)}`));
-      // Channels off: no lease, so end the session the calls bound. Never
-      // while another process holds this session's delivery: that would end its session.
-      else if (used && !held && login) {
-        const wire = new Wire(wireOptions("poll"), auth, AbortSignal.timeout(5_000), id);
-        try { await wire.connect(); await wire.call("session_end"); }
-        catch (error) { if (!accessExpiry(error)) say(`couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`); }
-        finally { await wire.close().catch(() => {}); }
-      }
-    }
-    await controller?.close().catch(() => {});
-    lock?.release();
-    await proxy?.close().catch(() => {});
+    await root?.shutdown("release");
     await server?.close().catch(() => {});
   };
 
