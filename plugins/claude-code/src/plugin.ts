@@ -19,9 +19,9 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult as ServerResult, type Tool as ListedTool } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
-import { HostedClient } from "../../../adapters/hosted-core/src/client.ts";
+import { HostedClient, message } from "../../../adapters/hosted-core/src/client.ts";
 import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
-import { accessExpiry, Refusal } from "../../../adapters/hosted-core/src/model.ts";
+import { accessExpiry } from "../../../adapters/hosted-core/src/model.ts";
 import { failure, hostTools, snapshotTools, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
@@ -173,10 +173,7 @@ export function createPlugin(o: PluginOptions): Plugin {
         say("signed in");
         await root.credentialChanged();
       },
-      error => {
-        const message = error instanceof LoginFailed || error instanceof Refusal ? error.message : (error as Error)?.message ?? String(error);
-        if (!abort.signal.aborted) say(`sign-in failed: ${message}`);
-      },
+      error => { if (!abort.signal.aborted) say(`sign-in failed: ${message(error)}`); },
     ).finally(() => { complete = undefined; if (signingIn?.done === done) signingIn = undefined; });
     signingIn = { abort, done };
   };

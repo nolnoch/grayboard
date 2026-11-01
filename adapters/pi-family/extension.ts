@@ -18,10 +18,9 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
 import { end, register } from "../hosted-core/src/children.ts";
-import { HostedClient, type Disposable } from "../hosted-core/src/client.ts";
+import { failureText, HostedClient, message, type Disposable } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
-import { failureMessage } from "../hosted-core/src/diagnostics.ts";
 import { Login } from "../hosted-core/src/login.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
 import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
@@ -220,7 +219,7 @@ export function createGrayboard(h: Harness): Grayboard {
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
-    log(`couldn't end session ${id} on the server: ${(error as Error)?.message ?? String(error)}`, "warning");
+    log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
   // omp keeps a finished subagent live (revivable) for its idle TTL, so a
   // child released only at shutdown would hold a slot long after its run: a
   // fan-out of 128 within that TTL would fill the root's cap. An idle child
@@ -369,7 +368,7 @@ export function createGrayboard(h: Harness): Grayboard {
       if (verb === "login") {
         // Its own failure line: resume can't mend a sign-in that didn't happen.
         try { await login!.login(); }
-        catch (error) { log(`sign-in failed: ${(error as Error).message}; ${LOGIN_ACTION} to try again`, "error"); return; }
+        catch (error) { log(`sign-in failed: ${message(error)}; ${LOGIN_ACTION} to try again`, "error"); return; }
         log("signed in");
         // The watch's restart and this one are one epoch-guarded path.
         if (root) await root.credentialChanged();
@@ -382,7 +381,7 @@ export function createGrayboard(h: Harness): Grayboard {
         try { await login!.logout(); }
         catch (error) {
           client!.markAnnounced(false);
-          log(`sign-out failed: ${(error as Error).message}; run /grayboard logout to try again`, "error");
+          log(`sign-out failed: ${message(error)}; run /grayboard logout to try again`, "error");
           return;
         } finally { logoutWarnings = undefined; }
         const pauses = `every ${h.name} session on this server pauses until ${LOGIN_ACTION}`;
@@ -406,7 +405,7 @@ export function createGrayboard(h: Harness): Grayboard {
       else log(`unknown subcommand ${verb}; use login, logout, resume or status`, "warning");
     } catch (error) {
       const expired = accessExpiry(error);
-      log(expired ? expired.message : error instanceof AccessExpired || error instanceof Refusal ? error.message : failureMessage(error, RESUME_HINT) + ` (${(error as Error).message})`, "error");
+      log(expired ? expired.message : error instanceof AccessExpired || error instanceof Refusal ? error.message : failureText(error, RESUME_HINT), "error");
     }
   };
 

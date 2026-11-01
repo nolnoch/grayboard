@@ -35827,6 +35827,14 @@ var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
+var DETAIL_MAX = 300;
+function failureText(error, hint) {
+  const text = failureMessage(error, hint);
+  if (!(error instanceof SubscriberError) && text !== failureMessage(undefined, hint))
+    return text;
+  const detail = message(error).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
+  return `${text} (${detail.length > DETAIL_MAX ? `${detail.slice(0, DETAIL_MAX)}\u2026` : detail})`;
+}
 
 class HostedClient {
   options;
@@ -35904,9 +35912,7 @@ class HostedClient {
     try {
       return await proxy.call(tool, args, sessionID);
     } catch (error) {
-      const text = failureMessage(error, this.options.retryHint);
-      const vague = error instanceof SubscriberError || text === failureMessage(undefined, this.options.retryHint);
-      return failure2(vague ? `${text} (${message(error)})` : text);
+      return failure2(failureText(error, this.options.retryHint));
     }
   }
   watch() {
@@ -36511,8 +36517,6 @@ class Controller {
       const e = await this.port.credential.capture(sessionID);
       await this.temporary(e, (wire) => wire.call("session_end"));
     } catch (error) {
-      if (accessExpiry(error))
-        return;
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
@@ -36667,7 +36671,6 @@ class NotStarted extends Error {
   }
 }
 var SLOTS = ["held", "start", "sink", "first", "last"];
-var message2 = (error) => error?.message ?? String(error);
 
 class RootDelivery {
   client;
@@ -36752,7 +36755,7 @@ class RootDelivery {
     });
   }
   failedLock(error) {
-    this.error = `couldn't take delivery: ${message2(error)}`;
+    this.error = `couldn't take delivery: ${message(error)}`;
     this.notices.set("start", this.error);
     this.log(this.error, "error");
   }
@@ -36802,7 +36805,7 @@ class RootDelivery {
         return;
       await this.restart();
     } catch (error) {
-      this.log(`couldn't start delivery: ${message2(error)}`, "error");
+      this.log(`couldn't start delivery: ${message(error)}`, "error");
     }
   }
   port() {
@@ -36863,7 +36866,7 @@ class RootDelivery {
         return;
       const expired = accessExpiry(error);
       if (!expired) {
-        this.log(`couldn't start delivery: ${message2(error)}`, "error");
+        this.log(`couldn't start delivery: ${message(error)}`, "error");
         return;
       }
       this.signedOut = expired;
@@ -36880,7 +36883,7 @@ class RootDelivery {
       await this.client.login.token();
     } catch (error) {
       if (!accessExpiry(error))
-        this.log(`couldn't read the sign-in: ${message2(error)}`, "warning");
+        this.log(`couldn't read the sign-in: ${message(error)}`, "warning");
       return;
     }
     if (this.proxy)
@@ -36978,12 +36981,12 @@ ${record.message}`;
     let carried;
     if (this.controller) {
       carried = await this.controller.shutdown(id, mode, o).catch((error) => {
-        this.log(`couldn't release delivery: ${message2(error)}`, "warning");
+        this.log(`couldn't release delivery: ${message(error)}`, "warning");
         return;
       });
     } else if (mode === "release" && (this.lock || this.used && !this.held))
       await this.client.endSession(id);
-    await this.controller?.close().catch((error) => this.log(`couldn't stop delivery: ${message2(error)}`, "warning"));
+    await this.controller?.close().catch((error) => this.log(`couldn't stop delivery: ${message(error)}`, "warning"));
     this.lock?.release();
     await this.starting;
     await this.restarting;
@@ -37164,9 +37167,8 @@ function createPlugin(o) {
       say("signed in");
       await root.credentialChanged();
     }, (error) => {
-      const message = error instanceof LoginFailed || error instanceof Refusal ? error.message : error?.message ?? String(error);
       if (!abort.signal.aborted)
-        say(`sign-in failed: ${message}`);
+        say(`sign-in failed: ${message(error)}`);
     }).finally(() => {
       complete = undefined;
       if (signingIn?.done === done)

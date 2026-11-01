@@ -243,6 +243,17 @@ test("a child's calls go through HostedClient.call: a refused register and a JSO
   expect(logs).toEqual([]);
 });
 
+test("a thrown call's own message in its error result has its control and bidi characters replaced and is capped", async () => {
+  const c = client([]);
+  const result = await c.call({ call: async () => { throw new Error(`\x1b[31mrefused\u202e\x07${"x".repeat(4096)}`); } }, "whoami", {}, "child-1");
+  expect(result.isError).toBe(true);
+  const [text] = texts(result);
+  expect(text).toStartWith("error: Operation failed; call the tool again ( [31mrefused  xxx");
+  expect(text).not.toMatch(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/);
+  expect(text).toEndWith("x…)");
+  expect(text!.length).toBeLessThan(400);
+});
+
 test("a shutdown while a start's push connection is still connecting releases the lease first, then closes the connection that start built", async () => {
   await (await live("first-1", "first")).root.shutdown("detach");
   expect(row("first-1")!.lease_deadline).not.toBeNull();

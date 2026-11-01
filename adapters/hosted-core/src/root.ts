@@ -10,7 +10,7 @@
 // Not vendored to OpenCode V2 (scripts/sync_hosted_core.ts): it imports
 // login, storage and proxy, which OpenCode doesn't carry.
 import type { CallToolResult } from "@modelcontextprotocol/client";
-import type { Disposable, HostedClient } from "./client.js";
+import { message, type Disposable, type HostedClient } from "./client.js";
 import { Controller, DRIFTED, type Status } from "./controller.js";
 import type { DiagnosticSink } from "./diagnostics.js";
 import type { Lock } from "./lock.js";
@@ -47,8 +47,6 @@ export class NotStarted extends Error {
 // never shown. "first" and "last" are the host's (noticeOnce).
 const SLOTS = ["held", "start", "sink", "first", "last"] as const;
 type Slot = typeof SLOTS[number];
-
-const message = (error: unknown) => (error as Error)?.message ?? String(error);
 
 export class RootDelivery {
   private closed = false;          // shutdown began: nothing new starts

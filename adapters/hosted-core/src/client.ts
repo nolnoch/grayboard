@@ -35,7 +35,21 @@ export type HostedClientOptions = {
   log(message: string, level: Level): void;
 };
 
-const message = (error: unknown) => (error as Error)?.message ?? String(error);
+export const message = (error: unknown) => (error as Error)?.message ?? String(error);
+
+// A failed call's text: failureMessage's, and where that names no cause (its
+// refusal and generic text) the error's own message, the only detail there
+// is (a JSON-RPC error, a refused connect's HTTP body). That message is the
+// server's or the network's free text, shown to the model and the user, so
+// control and bidi characters (wire.ts's holderText class) become spaces and
+// it is capped.
+const DETAIL_MAX = 300;
+export function failureText(error: unknown, hint: string): string {
+  const text = failureMessage(error, hint);
+  if (!(error instanceof SubscriberError) && text !== failureMessage(undefined, hint)) return text;
+  const detail = message(error).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
+  return `${text} (${detail.length > DETAIL_MAX ? `${detail.slice(0, DETAIL_MAX)}…` : detail})`;
+}
 
 export class HostedClient {
   readonly auth: AuthProvider;
@@ -110,18 +124,12 @@ export class HostedClient {
 
   // The one tool-call error wrapper: a call that throws (a beforeCall
   // refusal, the transport, a JSON-RPC error) comes back as an error result
-  // with the retry hint. Where failureMessage names no cause (its refusal and
-  // generic text), the error's own message follows: a JSON-RPC error or a
-  // refused connect's HTTP body is the only detail there is. `proxy` is any
-  // call (pi's child wraps its unattributed retry, so a converted failure
-  // never triggers that retry's whoami probe).
+  // with the retry hint and failureText's detail. `proxy` is any call (pi's
+  // child wraps its unattributed retry, so a converted failure never
+  // triggers that retry's whoami probe).
   async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     try { return await proxy.call(tool, args, sessionID); }
-    catch (error) {
-      const text = failureMessage(error, this.options.retryHint);
-      const vague = error instanceof SubscriberError || text === failureMessage(undefined, this.options.retryHint);
-      return failure(vague ? `${text} (${message(error)})` : text);
-    }
+    catch (error) { return failure(failureText(error, this.options.retryHint)); }
   }
 
   // One Login.watch per session: a change of the grant store's epoch (a
