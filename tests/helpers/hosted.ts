@@ -11,7 +11,7 @@ export async function bindFixture(client: Client, name: string) {
   const state = await client.callTool({ name: "whoami", arguments: {} });
   const content = state.content?.[0];
   if (content?.type !== "text") throw new Error("missing whoami content");
-  if (JSON.parse(content.text).name) return;
+  if (JSON.parse(content.text).held?.length) return;
   const bound = await client.callTool({ name: "bind", arguments: { name, create: true } });
-  if (bound.isError && !JSON.stringify(bound).includes("already in use")) throw new Error(JSON.stringify(bound));
+  if (bound.isError && !JSON.stringify(bound).includes("alias_held")) throw new Error(JSON.stringify(bound));
 }

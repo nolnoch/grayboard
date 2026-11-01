@@ -85,7 +85,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   await expect(call(native.client, "delivery_open")).rejects.toThrow("not found");
   expect((await native.client.listResourceTemplates()).resourceTemplates).toEqual([]);
   const who = value(await call(native.client, "whoami"));
-  expect(who).toMatchObject({ name: "be" });
+  expect(who).toMatchObject({ primary: "alice@example.com/be" });
   const identity = { identity_full: "alice@example.com/be" };
   await expect(read(native.client, "grayboard://identity")).rejects.toThrow();
   value(await call(native.client, "board_create", { name: "e2e", purpose: "fixtures" }));
@@ -105,7 +105,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   const sub = await connect(grant.token, version, "subscriber");
   expect((await sub.client.listResources()).resources.map(r => r.uri)).toEqual(["grayboard://inbox"]);
   expect(value(await call(sub.client, "whoami"))).toEqual(who);
-  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["whoami", "bind", "session_register", "session_end", "delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
+  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["whoami", "bind", "unbind", "session_register", "session_end", "delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
   await expect(call(sub.client, "dm_send", { to: "be", body: "not exposed" })).rejects.toThrow("not found");
   await expect(read(sub.client, "grayboard://boards/e2e")).rejects.toThrow();
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
@@ -284,7 +284,7 @@ test("fresh access of the same grant continues a lease; revoked access and repla
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
   sub.headers.set("Authorization", `Bearer ${token}`);
   expect(value(await call(sub.client, "delivery_renew")).capability).toBe(lease.capability);
-  expect(value(await call(sub.client, "whoami"))).toMatchObject({ name: "be" });
+  expect(value(await call(sub.client, "whoami"))).toMatchObject({ primary: "alice@example.com/be" });
   sub.headers.set("Authorization", `Bearer ${issue().token}`);
   expect((await call(sub.client, "delivery_release")).isError).toBe(true);
   sub.headers.set("Authorization", `Bearer ${token}`);
