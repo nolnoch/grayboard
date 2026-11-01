@@ -243,6 +243,14 @@ export function createGrayboard(h: Harness): Grayboard {
   // ---- lifecycle ----
 
   const start = async (s: SessionInfo) => {
+    // A runtime starts once. pi's RPC mode emits session_start twice for a
+    // /new or /fork's session (its runtime rebinds the extensions, then the
+    // new_session/fork command rebinds them again): a second root here would
+    // find its own lock held and the first one's lease would never be released.
+    if (session) {
+      if (session.id !== s.id) log(`ignored a start for session ${s.id}: this runtime already runs session ${session.id}`, "warning");
+      return;
+    }
     session = s;
     if ("error" in config) { log(config.error, "warning"); return; }
     const marker = h.marker();

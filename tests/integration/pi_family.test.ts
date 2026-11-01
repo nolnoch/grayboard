@@ -331,6 +331,25 @@ test("a session whose parent file is a live root's is that root's child, and so 
   expect(row("fork-1")).toMatchObject({ name: "forker", root_session_id: null });
 });
 
+// pi's RPC mode emits session_start twice for a /new or /fork's session
+// (pi 1.4.0: AgentSessionRuntime.newSession rebinds the extensions, then the
+// new_session command rebinds them again).
+test("a second session_start for the same session is ignored: one root takes the carried name, and its shutdown releases it and carries it on", async () => {
+  const first = await root("dup-1", "dupper");
+  await first.ext.shutdown("new");
+  const second = instance();
+  await second.ext.start({ id: "dup-2", reason: "new" });
+  await second.ext.start({ id: "dup-2", reason: "new" });
+  await active(second, "dup-2", "dupper");
+  expect(await second.ext.status()).not.toContain("holds delivery");
+  await second.ext.shutdown("new");
+  expect(row("dup-2")).toBeNull();
+  const third = instance();
+  await third.ext.start({ id: "dup-3", reason: "new" });
+  await active(third, "dup-3", "dupper");
+  await third.ext.shutdown("quit");
+});
+
 test("130 sequential children under one root each register and end, so the root never reaches the server's 128-child cap", async () => {
   await root("cap-root", "capped");
   for (let n = 0; n < 130; n++) {
