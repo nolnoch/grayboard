@@ -23,10 +23,15 @@ async function logout(args: string[]): Promise<number> {
   try { names = readdirSync(join(dataDir, "grants")).filter(n => /^[0-9a-f]{64}\.json$/.test(n)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
   const servers = new Set<string>();
+  const unreadable: string[] = [];
   for (const name of names) {
-    const store = await readJson(join(dataDir, "grants", name)).catch(() => undefined) as { resource?: unknown; clientId?: unknown } | undefined;
+    // An unreadable grant file is a failure, not "not signed in": the user would believe they were signed out.
+    let store: { resource?: unknown; clientId?: unknown } | undefined;
+    try { store = await readJson(join(dataDir, "grants", name)) as typeof store; }
+    catch (error) { unreadable.push(`${name}: ${(error as Error).message}`); continue; }
     if (typeof store?.resource === "string" && store.clientId === CLIENT_ID) servers.add(store.resource);
   }
+  if (unreadable.length) { log(`grayboard logout: couldn't read ${unreadable.join("; ")}; nothing was signed out`); return 1; }
   if (!servers.size) { console.log("Not signed in to grayboard; nothing to sign out of."); return 0; }
   let failed = false;
   for (const resource of servers) {

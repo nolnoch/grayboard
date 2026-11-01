@@ -100,6 +100,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   let initialized = false;
   let markInitialized!: () => void;
   const ready = new Promise<void>(r => { markInitialized = r; });
+  let markClosed!: () => void;
+  const closing = new Promise<void>(r => { markClosed = r; });
   let notice: string | undefined;        // shown once, at the head of the next tool result
   let held: string | undefined;          // set while another process holds delivery for this session
   let signedOut: AccessExpired | undefined; // why the last start failed for want of a sign-in
@@ -197,7 +199,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     // Controller receipts only after this resolves, and its admission set
     // keeps a failed receipt from showing an item twice.
     admit: async (_e, item, _stableID, identity) => {
-      await ready;
+      // A session that closes before `initialized` must not strand the receipt.
+      await Promise.race([ready, closing]);
       if (closed) throw new Refusal("paused", "the Claude Code session closed");
       await server!.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
     },
@@ -267,13 +270,13 @@ export function createPlugin(o: PluginOptions): Plugin {
     if (closed || "error" in config) { taken.release(); return; }
     lock = taken; if (notice === held) notice = undefined; held = undefined;
     controller = new Controller(port(config.id, new FileStorage(sessionPath(config.dataDir, login!.resource, CLIENT_ID, config.id))), { sink });
-    await controller.restore().catch(() => {});
+    await controller.restore().catch(error => say(`couldn't restore delivery state: ${(error as Error)?.message ?? String(error)}`));
     // The tools-only proxy's calls in flight finish on it.
     const old = proxy;
     proxy = newProxy("push");
     void old?.retire().catch(() => {});
     void connect();
-    await begin();
+    await restart();
   };
 
   // Delivery for this session id, unless another process (`claude --resume
@@ -283,14 +286,19 @@ export function createPlugin(o: PluginOptions): Plugin {
     watcher = login!.watch(() => { void credentialChanged(); });
     if (!push) { proxy = newProxy("poll"); void connect(); return; }
     const path = deliveryPath(config.dataDir, login!.resource, CLIENT_ID, config.id);
-    const taken = tryDelivery(path);
-    if (taken) return own(taken);
+    let taken: Lock | undefined;
+    try { taken = tryDelivery(path); }
+    catch (error) { say(`couldn't take delivery: ${(error as Error)?.message ?? String(error)}`); }
+    if (taken) return own(taken).catch(error => say(`couldn't start delivery: ${(error as Error)?.message ?? String(error)}`));
     held = new DeliveryHeldElsewhere(HARNESS).message;
     notice = held;
     proxy = newProxy("poll");
     void connect();
     waiter = new AbortController();
-    void waitDelivery(path, waiter.signal).then(next => own(next), () => {});
+    void waitDelivery(path, waiter.signal).then(
+      next => own(next).catch(error => say(`couldn't start delivery: ${(error as Error)?.message ?? String(error)}`)),
+      () => {},
+    );
   };
 
   // A sign-in or sign-out in any process (the store's epoch).
@@ -329,8 +337,13 @@ export function createPlugin(o: PluginOptions): Plugin {
   const call = async (name: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
     if (!proxy) return failure("the grayboard plugin hasn't started yet");
-    const signed = await login!.token().then(() => true, () => false);
-    if (!signed) signIn();
+    // The process holding delivery owns this session's binding; a tools-only one rebinding it would fight the holder.
+    if (held && (name === "bind" || name === "unbind")) return failure(`${held}; bind and unbind work from the process that holds delivery`);
+    // Only a missing or expired sign-in offers one; a transient failure
+    // (5xx, a refresh in progress) goes to the call, which reports it.
+    let signed = true;
+    try { await login!.token(); }
+    catch (error) { if (accessExpiry(error)) { signed = false; signIn(); } }
     const restarted = signed ? await unpause() : undefined;
     used = true;
     let result: CallToolResult;
@@ -368,14 +381,17 @@ export function createPlugin(o: PluginOptions): Plugin {
     const lead = offNotice;
     let body: string;
     try {
+      if (!proxy) throw new Error("starting");
       const text = await Promise.race([
-        proxy!.instructions(config.id),
+        proxy.instructions(config.id),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), INSTRUCTIONS_MS).unref?.()),
       ]);
       body = text ?? "";
     } catch (error) {
       const expired = accessExpiry(error);
-      body = expired
+      body = !proxy
+        ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting."
+        : expired
         ? `Grayboard (${login!.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.`
         : `Warning: the grayboard server at ${new URL(login!.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
@@ -394,12 +410,15 @@ export function createPlugin(o: PluginOptions): Plugin {
   const shutdown = async () => {
     if (closed) return;
     closed = true;
+    markClosed();
     watcher?.dispose();
     waiter?.abort();
     signingIn?.abort.abort();
     if (!("error" in config)) {
       const id = config.id;
       // The lease's release frees the name now, not at the idle sweep.
+      // A start or restart in flight finishes (and sees `closed`) before the lease is released.
+      await restarting?.catch(() => {});
       if (controller) await controller.shutdown(id, "release").catch(error => say(`couldn't release delivery: ${(error as Error)?.message ?? String(error)}`));
       // Channels off: no lease, so end the session the calls bound. Never
       // while another process holds this session's delivery: that would end its session.

@@ -188,6 +188,10 @@ test("a second process on the same session id runs tools-only and says why, then
   const r = await texts(second, "whoami");
   expect(r.texts[0]).toBe(`grayboard: ${HELD}`);
   expect((await texts(second, "whoami")).texts[0]).not.toStartWith("grayboard:");
+  // A tools-only process must not rebind the session the holder owns.
+  const refused = await texts(second, "unbind", {});
+  expect(refused.texts.join("\n")).toContain("work from the process that holds delivery");
+  expect(row("sess-same")?.name).toBe("same");
 
   const other = await plugin("sess-other");
   await texts(other, "bind", { name: "other", create: true });

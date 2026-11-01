@@ -61,7 +61,7 @@ export function hostFiles(): ClaudeFiles {
     },
     plist: (p) => {
       try {
-        const r = Bun.spawnSync(["plutil", "-convert", "json", "-o", "-", p], { stderr: "ignore" });
+        const r = Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", p], { stderr: "ignore" });
         return r.exitCode === 0 ? r.stdout.toString() : null;
       } catch {
         return null;

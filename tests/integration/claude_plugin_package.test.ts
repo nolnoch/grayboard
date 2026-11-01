@@ -5,7 +5,7 @@
 // manifest's changes, so a version that lagged package.json would strand
 // every user on an old bundle.
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { BUNDLE, bundle } from "../../scripts/build_claude_plugin.ts";
@@ -75,5 +75,17 @@ test("the bundle runs under bun: logout on an empty data dir has nothing to sign
     expect(r.stdout.toString()).toBe("Not signed in to grayboard; nothing to sign out of.\n");
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(data, "grants"))).toBe(false);
+  } finally { rmSync(data, { recursive: true, force: true }); }
+});
+
+test("logout with an unreadable grant file fails instead of claiming nothing to sign out of", () => {
+  const data = mkdtempSync(join(tmpdir(), "gb-claude-bundle-"));
+  try {
+    mkdirSync(join(data, "grants"));
+    writeFileSync(join(data, "grants", `${"a".repeat(64)}.json`), "{not json");
+    const r = Bun.spawnSync([process.execPath, BUNDLE, "logout", "--data", data], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    expect(r.stderr.toString()).toContain("couldn't read");
+    expect(r.stdout.toString()).toBe("");
+    expect(r.exitCode).toBe(1);
   } finally { rmSync(data, { recursive: true, force: true }); }
 });

@@ -32623,7 +32623,7 @@ function hostFiles() {
     },
     plist: (p) => {
       try {
-        const r = Bun.spawnSync(["plutil", "-convert", "json", "-o", "-", p], { stderr: "ignore" });
+        const r = Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", p], { stderr: "ignore" });
         return r.exitCode === 0 ? r.stdout.toString() : null;
       } catch {
         return null;
@@ -36820,6 +36820,10 @@ function createPlugin(o) {
   const ready = new Promise((r) => {
     markInitialized = r;
   });
+  let markClosed;
+  const closing = new Promise((r) => {
+    markClosed = r;
+  });
   let notice;
   let held;
   let signedOut;
@@ -36911,7 +36915,7 @@ function createPlugin(o) {
     credential: login.credential(),
     approval: null,
     admit: async (_e, item, _stableID, identity) => {
-      await ready;
+      await Promise.race([ready, closing]);
       if (closed)
         throw new Refusal("paused", "the Claude Code session closed");
       await server.notification({ method: "notifications/claude/channel", params: channelParams(item, identity) });
@@ -37007,12 +37011,12 @@ ${record.message}`;
       notice = undefined;
     held = undefined;
     controller = new Controller(port(config.id, new FileStorage(sessionPath(config.dataDir, login.resource, CLIENT_ID, config.id))), { sink });
-    await controller.restore().catch(() => {});
+    await controller.restore().catch((error) => say(`couldn't restore delivery state: ${error?.message ?? String(error)}`));
     const old = proxy;
     proxy = newProxy("push");
     old?.retire().catch(() => {});
     connect();
-    await begin();
+    await restart();
   };
   const start = async () => {
     if ("error" in config)
@@ -37026,15 +37030,20 @@ ${record.message}`;
       return;
     }
     const path = deliveryPath(config.dataDir, login.resource, CLIENT_ID, config.id);
-    const taken = tryDelivery(path);
+    let taken;
+    try {
+      taken = tryDelivery(path);
+    } catch (error) {
+      say(`couldn't take delivery: ${error?.message ?? String(error)}`);
+    }
     if (taken)
-      return own(taken);
+      return own(taken).catch((error) => say(`couldn't start delivery: ${error?.message ?? String(error)}`));
     held = new DeliveryHeldElsewhere(HARNESS).message;
     notice = held;
     proxy = newProxy("poll");
     connect();
     waiter = new AbortController;
-    waitDelivery(path, waiter.signal).then((next) => own(next), () => {});
+    waitDelivery(path, waiter.signal).then((next) => own(next).catch((error) => say(`couldn't start delivery: ${error?.message ?? String(error)}`)), () => {});
   };
   const credentialChanged = async () => {
     if (closed)
@@ -37075,9 +37084,17 @@ ${record.message}`;
       return failure2(config.error);
     if (!proxy)
       return failure2("the grayboard plugin hasn't started yet");
-    const signed = await login.token().then(() => true, () => false);
-    if (!signed)
-      signIn();
+    if (held && (name === "bind" || name === "unbind"))
+      return failure2(`${held}; bind and unbind work from the process that holds delivery`);
+    let signed = true;
+    try {
+      await login.token();
+    } catch (error) {
+      if (accessExpiry(error)) {
+        signed = false;
+        signIn();
+      }
+    }
     const restarted = signed ? await unpause() : undefined;
     used = true;
     let result;
@@ -37112,6 +37129,8 @@ ${record.message}`;
     const lead = offNotice;
     let body;
     try {
+      if (!proxy)
+        throw new Error("starting");
       const text = await Promise.race([
         proxy.instructions(config.id),
         new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), INSTRUCTIONS_MS).unref?.())
@@ -37119,7 +37138,7 @@ ${record.message}`;
       body = text ?? "";
     } catch (error) {
       const expired = accessExpiry(error);
-      body = expired ? `Grayboard (${login.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.` : `Warning: the grayboard server at ${new URL(login.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
+      body = !proxy ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting." : expired ? `Grayboard (${login.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.` : `Warning: the grayboard server at ${new URL(login.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
     return [lead, held ? `Warning: ${held}; this session is tools-only until it exits.` : undefined, body].filter(Boolean).join(`
 
@@ -37137,11 +37156,13 @@ ${record.message}`;
     if (closed)
       return;
     closed = true;
+    markClosed();
     watcher?.dispose();
     waiter?.abort();
     signingIn?.abort.abort();
     if (!("error" in config)) {
       const id = config.id;
+      await restarting?.catch(() => {});
       if (controller)
         await controller.shutdown(id, "release").catch((error) => say(`couldn't release delivery: ${error?.message ?? String(error)}`));
       else if (used && !held && login) {
@@ -37186,12 +37207,21 @@ async function logout(args) {
     names = [];
   }
   const servers = new Set;
+  const unreadable = [];
   for (const name of names) {
-    const store = await readJson(join6(dataDir, "grants", name)).catch(() => {
-      return;
-    });
+    let store;
+    try {
+      store = await readJson(join6(dataDir, "grants", name));
+    } catch (error) {
+      unreadable.push(`${name}: ${error.message}`);
+      continue;
+    }
     if (typeof store?.resource === "string" && store.clientId === CLIENT_ID)
       servers.add(store.resource);
+  }
+  if (unreadable.length) {
+    log(`grayboard logout: couldn't read ${unreadable.join("; ")}; nothing was signed out`);
+    return 1;
   }
   if (!servers.size) {
     console.log("Not signed in to grayboard; nothing to sign out of.");

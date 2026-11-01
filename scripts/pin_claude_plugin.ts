@@ -7,11 +7,12 @@
 // opens as a PR (AGENTS.md §Releasing step 5).
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { RELEASE_TAG } from "../src/shared/release_verify.ts";
 
 export const MARKETPLACE = join(resolve(import.meta.dir, ".."), ".claude-plugin/marketplace.json");
 export const PLUGIN_GIT_URL = "https://github.com/nolnoch/grayboard.git";
 export const PLUGIN_PATH = "plugins/claude-code";
-export const TAG_RE = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/;
+export const TAG_RE = RELEASE_TAG;
 export const SHA_RE = /^[0-9a-f]{40}$/;
 
 type Marketplace = { name: string; plugins: unknown[]; [k: string]: unknown };

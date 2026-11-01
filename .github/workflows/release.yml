@@ -337,6 +337,7 @@ jobs:
           git switch -c "$branch"
           git commit -m "chore(#281): pin the Claude Code plugin to ${TAG}" -- .claude-plugin/marketplace.json
           auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
           git -c http.extraheader="AUTHORIZATION: basic ${auth}" push origin "HEAD:refs/heads/${branch}"
           {
             echo "### Claude Code plugin pin for ${TAG}"
