@@ -14,14 +14,14 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { createGrayboard, type Grayboard, type Level, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
-import { FileStorage, sessionPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { deliveryPath, FileStorage, sessionPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
@@ -691,4 +691,137 @@ test("rootOf walks parentIds to a main session, naming the subagents between out
   // The main session's /new overwrites its entry; its subagents' chains reach the new root.
   agents.set("Main", { raw: "S0-new", main: true });
   expect(rootOf(agents, "0-Task.0-Explore")).toEqual({ root: "S0-new", via: ["S1", "S2"] });
+});
+
+// #444: the drift between the pi/omp and Claude Code copies of the hosted
+// session shell, each resolved once in hosted-core's client.ts and root.ts.
+
+test("a tool call that throws (an unknown tool's JSON-RPC error) comes back as an error result with the retry and the server's message", async () => {
+  const a = await root("throw-a", "thrower");
+  const result = await a.call("no_such_tool");
+  expect(result.isError).toBe(true);
+  expect(texts(result)).toEqual([expect.stringMatching(/^error: Operation failed; call the tool again \(.+no_such_tool.*\)$/)]);
+});
+
+test("a lease release that fails at shutdown is said once: the server down, then quit", async () => {
+  const a = await root("downquit-a", "downquit");
+  await srv.stop();
+  stopped = true;
+  const before = a.notices.length;
+  await a.ext.shutdown("quit");
+  expect(a.notices.slice(before)).toEqual([{ level: "warning", message: expect.stringMatching(/^grayboard: delivery degraded: session_end failed \(server_unreachable\)/) }]);
+});
+
+test("a lease release that fails at shutdown is said once: a logout elsewhere, then quit", async () => {
+  const a = await root("outquit-a", "outquit");
+  await logoutElsewhere();
+  await until(async () => (await a.ext.status()).includes("  outquit-a (outquit): paused, "), 10_000, "paused by the sign-out");
+  await until(() => a.notices.length > 0, 10_000, "the sign-out said");
+  const before = a.notices.length;
+  await a.ext.shutdown("quit");
+  expect(a.notices.slice(before)).toEqual([{ level: "warning", message: expect.stringMatching(/^grayboard: delivery degraded: session_end failed/) }]);
+});
+
+test("a sign-in elsewhere while a root's start is in flight waits for that start: resume is never entered beside it", async () => {
+  const resume = Controller.prototype.resume, watch = Login.prototype.watch;
+  let entered = 0;
+  const { promise: gate, resolve: open } = Promise.withResolvers<void>();
+  const resumeSpy = spyOn(Controller.prototype, "resume").mockImplementation(async function (this: Controller, id: string) {
+    entered++;
+    await gate;
+    return resume.call(this, id);
+  });
+  // The session's own watch is the first one made (the Controller's comes with its first resume).
+  const changed: (() => void)[] = [];
+  const watchSpy = spyOn(Login.prototype, "watch").mockImplementation(function (this: Login, fn: () => void, ms?: number) {
+    changed.push(fn);
+    return watch.call(this, fn, ms);
+  });
+  const token = spyOn(Login.prototype, "token");
+  try {
+    const a = instance();
+    const started = a.ext.start({ id: "overlap-1", reason: "startup" });
+    await until(() => entered === 1, 10_000, "the start's resume");
+    await loginElsewhere("overlap-relogin");
+    const calls = token.mock.calls.length;
+    changed[0]!();
+    await until(() => token.mock.calls.length > calls, 10_000, "the credential change's token read");
+    // A second resume would follow within a few file reads; none comes while the first is held.
+    await until(() => entered > 1, 2_000).catch(() => {});
+    expect(entered).toBe(1);
+    open();
+    await started;
+  } finally {
+    open();
+    resumeSpy.mockRestore();
+    watchSpy.mockRestore();
+    token.mockRestore();
+  }
+});
+
+test("a delivery lock that can't be opened (not BUSY) is said; the root runs tools-only without a held claim, and /grayboard resume retries it", async () => {
+  const path = deliveryPath(stateDir, srv.resource, CLIENT, "lockfail-1");
+  mkdirSync(path, { recursive: true });
+  const a = instance();
+  await a.ext.start({ id: "lockfail-1", reason: "startup" });
+  expect(a.notices).toEqual([{ level: "error", message: expect.stringMatching(/^grayboard: couldn't take delivery: /) }]);
+  const status = await a.ext.status();
+  expect(status).toContain("delivery: couldn't take delivery: ");
+  expect(status).not.toContain(HELD);
+  const bound = await a.call("bind", { name: "lockfail", create: true });
+  expect(bound.isError).toBeUndefined();
+  expect(texts(bound).join("\n")).not.toContain(HELD);
+  rmSync(path, { recursive: true });
+  await a.ext.command("resume");
+  await active(a, "lockfail-1", "lockfail");
+});
+
+test("a quit while a reloaded root's start is in flight still releases the lease the reload kept", async () => {
+  const before = await root("inflight-1", "inflight");
+  await before.ext.shutdown("reload");
+  expect(row("inflight-1")!.lease_deadline).not.toBeNull();
+  const resume = Controller.prototype.resume;
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  const { promise: gate, resolve: open } = Promise.withResolvers<void>();
+  const spy = spyOn(Controller.prototype, "resume").mockImplementation(async function (this: Controller, id: string) {
+    if (id === "inflight-1") { entered(); await gate; }
+    return resume.call(this, id);
+  });
+  try {
+    const after = instance();
+    const started = after.ext.start({ id: "inflight-1", reason: "reload" });
+    await reached;
+    const down = after.ext.shutdown("quit");
+    open();
+    await down;
+    await started;
+  } finally {
+    open();
+    spy.mockRestore();
+  }
+  expect(row("inflight-1")).toBeNull();
+});
+
+test("a tools-only root (delivery held elsewhere) refuses bind and unbind: the holder owns the binding", async () => {
+  await root("held-bind", "holder");
+  const second = instance();
+  await second.ext.start({ id: "held-bind", reason: "resume" });
+  for (const [tool, args] of [["bind", { name: "intruder", create: true }], ["unbind", {}]] as const) {
+    const refused = await second.call(tool, args);
+    expect(refused.isError).toBe(true);
+    expect(texts(refused).at(-1)).toBe(`error: ${HELD}; bind and unbind work from the process that holds delivery`);
+  }
+  expect(row("held-bind")).toMatchObject({ name: "holder" });
+});
+
+test("an unreadable session state file before the first start is said once", async () => {
+  const path = sessionPath(stateDir, srv.resource, CLIENT, "corrupt-1");
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "not json");
+  const a = instance();
+  await a.ext.start({ id: "corrupt-1", reason: "startup" });
+  await until(() => a.notices.length > 0, 10_000, "a notice");
+  // The start's later records come and go; the unreadable file is said once.
+  await a.ext.shutdown("quit");
+  expect(a.notices.filter(n => n.message.includes("Diagnostic"))).toEqual([{ level: "warning", message: expect.stringMatching(/^grayboard: delivery degraded: Diagnostic (restore|persistence) unavailable/) }]);
 });

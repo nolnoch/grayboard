@@ -13,15 +13,22 @@
 // elicitation, single-flight within and across processes, re-offered after a
 // decline, and the URL in a tool result when the client can't elicit; the
 // pre-2026-07-28 protocol; release on EOF with a lease, session_end without.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import { Controller } from "../../adapters/hosted-core/src/controller.ts";
+import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
+import { Login } from "../../adapters/hosted-core/src/login.ts";
+import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { CLIENT_ID, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
+import { GRAYBOARD_SESSION_META } from "../../src/server/oauth-config.ts";
+import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
@@ -284,4 +291,105 @@ test("a client without URL elicitation gets the sign-in URL in its next tool res
   await until(() => s.stderr().includes("to sign in to grayboard"), 10_000, "the sign-in URL");
   const r = await texts(s, "whoami");
   expect(r.texts[0]).toMatch(new RegExp(`^grayboard: open ${srv.issuer.replace(/[.]/g, "\\.")}/\\S+ to sign in to grayboard$`));
+}, 30_000);
+
+// #444: the drift between the pi/omp and Claude Code copies of the hosted
+// session shell, each resolved once in hosted-core's client.ts and root.ts.
+
+const count = (text: string, part: string) => text.split(part).length - 1;
+// Another process's logout of this data dir's grant store.
+const logoutElsewhere = () => new Login({ resource: srv.resource, clientId: CLIENT_ID, stateDir: data, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} }).logout();
+
+test("a lease release that fails at shutdown is said once on stderr: the server down, then EOF", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const s = await plugin("sess-downquit");
+  await texts(s, "bind", { name: "downquit", create: true });
+  await until(() => row("sess-downquit")?.lease_deadline != null, 10_000, "the lease");
+  await srv.stop();
+  stopped = true;
+  await stopSession(s.c);
+  expect(count(s.stderr(), "session_end failed (server_unreachable)")).toBe(1);
+}, 30_000);
+
+test("a lease release that fails at shutdown is said once on stderr: a logout elsewhere, then EOF", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const s = await plugin("sess-outquit");
+  await texts(s, "bind", { name: "outquit", create: true });
+  await until(() => row("sess-outquit")?.lease_deadline != null, 10_000, "the lease");
+  await logoutElsewhere();
+  await stopSession(s.c);
+  expect(count(s.stderr(), "session_end failed")).toBe(1);
+}, 30_000);
+
+test("a logout elsewhere is said once on stderr; the next tool result says it too", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const s = await plugin("sess-signout", { answer: async () => "decline" });
+  expect((await texts(s, "whoami")).error).toBe(false);
+  await logoutElsewhere();
+  const said = "Signed out of grayboard in Claude Code";
+  await until(() => s.stderr().includes(said), 10_000, "the sign-out on stderr");
+  const r = await texts(s, "whoami");
+  expect(r.error).toBe(true);
+  expect(r.texts.join("\n")).toContain(said);
+  // The call offered a sign-in, declined: an event later than any sign-out line.
+  await until(() => s.stderr().includes("sign-in failed: sign-in declined"), 10_000, "the declined sign-in");
+  expect(count(s.stderr(), said)).toBe(1);
+}, 30_000);
+
+test("a delivery lock that can't be opened (not BUSY) is said, and the session isn't told another process holds delivery", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  mkdirSync(deliveryPath(data, srv.resource, CLIENT_ID, "sess-lockfail"), { recursive: true });
+  const s = await plugin("sess-lockfail");
+  expect(s.stderr()).toContain("couldn't take delivery: ");
+  expect(s.c.getInstructions()).not.toContain(HELD);
+  const bound = await texts(s, "bind", { name: "lockfail", create: true });
+  expect(bound.error).toBe(false);
+  expect(bound.texts.join("\n")).not.toContain(HELD);
+  expect(row("sess-lockfail")?.name).toBe("lockfail");
+}, 30_000);
+
+// In-process: the client end of the transport never initializes, so the item
+// the run loop takes waits in admit until the shutdown.
+test("a shutdown while an admit waits for `initialized` records no pause", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:delivery", "grayboard:tools"], Date.now(), CLIENT_ID);
+  const proxy = new ToolProxy({
+    wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT_ID, version: "1.0.0" }, delivery: { mode: "poll", source: SOURCE } },
+    harness: "Claude Code", loginAction: "log in", auth: { token: async () => token }, report: () => {},
+  });
+  try {
+    expect((await proxy.call("bind", { name: "waiter", create: true }, "sess-wait")).isError).toBeFalsy();
+    expect((await proxy.call("bind", { name: "wait-sender", create: true }, "sess-wait-sender")).isError).toBeFalsy();
+    expect((await proxy.call("dm_send", { to: "waiter", body: "waits for initialized" }, "sess-wait-sender")).isError).toBeFalsy();
+  } finally { await proxy.close(); }
+
+  const { promise: reached, resolve: admitting } = Promise.withResolvers<void>();
+  const restore = Controller.prototype.restore;
+  const restoreSpy = spyOn(Controller.prototype, "restore").mockImplementation(async function (this: Controller) {
+    const port = this.port as { admit: (...args: never[]) => Promise<void> };
+    const admit = port.admit;
+    port.admit = (...args: never[]) => { admitting(); return admit(...args); };
+    return restore.call(this);
+  });
+  const records: { state: string; operation: string; message: string }[] = [];
+  const record = Diagnostics.prototype.record;
+  const recordSpy = spyOn(Diagnostics.prototype, "record").mockImplementation(function (this: Diagnostics, input) {
+    records.push({ state: input.state, operation: input.operation, message: input.message });
+    return record.call(this, input);
+  });
+  const p = createPlugin({
+    env: { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "sess-wait", CLAUDE_PLUGIN_DATA: data, GRAYBOARD_SERVER_URL: srv.resource, HOME: join(dir, "home") },
+    parentCmd: `claude ${FLAG.join(" ")}`,
+    files: { platform: "linux", home: join(dir, "home"), user: "test", read: () => null, list: () => [], plist: () => null },
+    version: "1.0.0", cwd: join(dir, "work"), log: () => {},
+  });
+  try {
+    await p.connect(InMemoryTransport.createLinkedPair()[1]);
+    await reached;
+    await p.shutdown();
+  } finally {
+    restoreSpy.mockRestore();
+    recordSpy.mockRestore();
+  }
+  expect(records.filter(r => r.state === "paused" && r.operation === "subscriber")).toEqual([]);
 }, 30_000);
