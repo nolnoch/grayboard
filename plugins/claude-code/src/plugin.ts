@@ -183,16 +183,29 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   // ---- tools ----
 
-  // A root paused for anything but a sign-out restarts on the next call;
-  // the result says why it had paused, then how the restart went.
+  // Before each call, unless signed out: a root paused for anything but a
+  // sign-out restarts, and a delivery lock that couldn't be taken is tried
+  // again (Claude Code has no resume command); the result says why, then how
+  // it went. A lock retry that fails again says so itself (the root's own
+  // notice), so nothing is added for it.
   const unpause = async (): Promise<string | undefined> => {
     if (!root || "error" in config) return undefined;
     const before = root.status();
+    if (before.signedOut) return undefined;
+    const state = () => {
+      const now = root.status();
+      if (now.held) return "another process holds delivery";
+      const record = now.controller?.roots.find(r => r.sessionID === config.id);
+      return record ? `${record.state}${record.state === "active" ? "" : `, ${record.message}`}` : "not running";
+    };
+    if (before.error) {
+      await root.resume();
+      return root.status().error ? undefined : `delivery couldn't start (${before.error}); retried: ${state()}`;
+    }
     const paused = before.controller?.roots.find(r => r.sessionID === config.id);
-    if (paused?.state !== "paused" || before.signedOut) return undefined;
+    if (paused?.state !== "paused") return undefined;
     await root.resume();
-    const now = root.status().controller?.roots.find(r => r.sessionID === config.id);
-    return `delivery was paused (${paused.message}); restarted: ${now ? `${now.state}${now.state === "active" ? "" : `, ${now.message}`}` : "not running"}`;
+    return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
   // Before each call: only a missing or expired sign-in offers one; a
   // transient failure (5xx, a refresh in progress) goes to the call, which
@@ -252,8 +265,11 @@ export function createPlugin(o: PluginOptions): Plugin {
         ? `Grayboard (${login!.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.`
         : `Warning: the grayboard server at ${new URL(login!.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
-    const held = root!.status().held;
-    return [offNotice, held ? `Warning: ${held}; this session is tools-only until it exits.` : undefined, body].filter(Boolean).join("\n\n");
+    const { held, error } = root!.status();
+    const warning = held ? `Warning: ${held}; this session is tools-only until it exits.`
+      : error ? `Warning: grayboard delivery couldn't start (${error}); this session is tools-only, and each grayboard tool call retries it.`
+      : undefined;
+    return [offNotice, warning, body].filter(Boolean).join("\n\n");
   };
 
   const connectTransport = async (transport: Transport) => {

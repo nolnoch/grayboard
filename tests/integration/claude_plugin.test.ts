@@ -350,6 +350,20 @@ test("a delivery lock that can't be opened (not BUSY) is said, and the session i
   expect(row("sess-lockfail")).toBeNull();
 }, 30_000);
 
+test("a delivery lock that couldn't be opened is retried by the next tool call: the instructions say so, and once the obstacle is gone the call's result says delivery started and a bind takes the lease", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const path = deliveryPath(data, srv.resource, CLIENT_ID, "sess-relock");
+  mkdirSync(path, { recursive: true });
+  const s = await plugin("sess-relock");
+  expect(s.c.getInstructions()).toContain("Warning: grayboard delivery couldn't start (couldn't take delivery: ");
+  rmSync(path, { recursive: true });
+  const r = await texts(s, "whoami");
+  expect(r.error).toBe(false);
+  expect(r.texts[0]).toMatch(/^grayboard: delivery couldn't start \(couldn't take delivery: .*\); retried: /);
+  expect((await texts(s, "bind", { name: "relock", create: true })).error).toBe(false);
+  await until(() => row("sess-relock")?.lease_deadline != null, 10_000, "the lease");
+}, 30_000);
+
 // In-process: the client end of the transport never initializes, so the item
 // the run loop takes waits in admit until the shutdown.
 test("a shutdown while an admit waits for `initialized` records no pause", async () => {

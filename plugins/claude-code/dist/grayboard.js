@@ -36724,22 +36724,28 @@ class RootDelivery {
     await this.take();
   }
   async take() {
+    this.waiter?.abort();
     let taken;
     try {
       taken = tryDelivery(this.path());
     } catch (error) {
+      this.clearHeld();
       this.failedLock(error);
       this.toolsOnly();
       return;
     }
     if (taken)
       return this.starting = this.own(taken);
+    this.clearError();
     this.held = new DeliveryHeldElsewhere(this.client.options.harness).message;
     this.notices.set("held", this.held);
     this.toolsOnly();
     const waiter = this.waiter = new AbortController;
     waitDelivery(this.path(), waiter.signal).then((next) => {
-      this.starting = this.own(next);
+      if (waiter.signal.aborted)
+        next.release();
+      else
+        this.starting = this.own(next);
     }, (error) => {
       if (!waiter.signal.aborted)
         this.failedLock(error);
@@ -36749,6 +36755,16 @@ class RootDelivery {
     this.error = `couldn't take delivery: ${message2(error)}`;
     this.notices.set("start", this.error);
     this.log(this.error, "error");
+  }
+  clearHeld() {
+    if (this.held && this.notices.get("held") === this.held)
+      this.notices.delete("held");
+    this.held = undefined;
+  }
+  clearError() {
+    if (this.error && this.notices.get("start") === this.error)
+      this.notices.delete("start");
+    this.error = undefined;
   }
   toolsOnly() {
     if (this.proxy)
@@ -36766,12 +36782,8 @@ class RootDelivery {
       return;
     }
     this.lock = taken;
-    if (this.held && this.notices.get("held") === this.held)
-      this.notices.delete("held");
-    if (this.error && this.notices.get("start") === this.error)
-      this.notices.delete("start");
-    this.held = undefined;
-    this.error = undefined;
+    this.clearHeld();
+    this.clearError();
     try {
       this.begun = await this.epoch();
       if (this.closed)
@@ -36969,7 +36981,7 @@ ${record.message}`;
         this.log(`couldn't release delivery: ${message2(error)}`, "warning");
         return;
       });
-    } else if (mode === "release" && (this.lock || !this.o.push && this.used))
+    } else if (mode === "release" && (this.lock || this.used && !this.held))
       await this.client.endSession(id);
     await this.controller?.close().catch((error) => this.log(`couldn't stop delivery: ${message2(error)}`, "warning"));
     this.lock?.release();
@@ -37166,12 +37178,24 @@ function createPlugin(o) {
     if (!root || "error" in config)
       return;
     const before = root.status();
+    if (before.signedOut)
+      return;
+    const state = () => {
+      const now = root.status();
+      if (now.held)
+        return "another process holds delivery";
+      const record = now.controller?.roots.find((r) => r.sessionID === config.id);
+      return record ? `${record.state}${record.state === "active" ? "" : `, ${record.message}`}` : "not running";
+    };
+    if (before.error) {
+      await root.resume();
+      return root.status().error ? undefined : `delivery couldn't start (${before.error}); retried: ${state()}`;
+    }
     const paused = before.controller?.roots.find((r) => r.sessionID === config.id);
-    if (paused?.state !== "paused" || before.signedOut)
+    if (paused?.state !== "paused")
       return;
     await root.resume();
-    const now = root.status().controller?.roots.find((r) => r.sessionID === config.id);
-    return `delivery was paused (${paused.message}); restarted: ${now ? `${now.state}${now.state === "active" ? "" : `, ${now.message}`}` : "not running"}`;
+    return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
   const before = async () => {
     try {
@@ -37223,8 +37247,9 @@ function createPlugin(o) {
       const expired = accessExpiry(error);
       body = error instanceof NotStarted ? "Grayboard is still starting, so these instructions are incomplete; its tools work once it is up. Bind a name with bind before posting." : expired ? `Grayboard (${login.resource}) is signed out in Claude Code: ${loginAction}. Until then its tools return a sign-in error.` : `Warning: the grayboard server at ${new URL(login.resource).origin} couldn't be reached at startup, so these instructions are incomplete; its tools retry on every call. Bind a name with bind before posting.`;
     }
-    const held = root.status().held;
-    return [offNotice, held ? `Warning: ${held}; this session is tools-only until it exits.` : undefined, body].filter(Boolean).join(`
+    const { held, error } = root.status();
+    const warning = held ? `Warning: ${held}; this session is tools-only until it exits.` : error ? `Warning: grayboard delivery couldn't start (${error}); this session is tools-only, and each grayboard tool call retries it.` : undefined;
+    return [offNotice, warning, body].filter(Boolean).join(`
 
 `);
   };
