@@ -1,10 +1,15 @@
-// #284 S13 over real WebSockets: @scope/name is exact, a bare @name is the
-// author's own scope's first and then the board's one roster match, an
-// ambiguous bare name refuses the post with the candidates, and @id: names
-// the session whatever it's bound to.
+// #284 S13: @scope/name is exact, a bare @name is the author's own scope's
+// first and then the board's one roster match, an ambiguous bare name
+// refuses the post with the candidates, and @id: names the session whatever
+// it's bound to. Person-scope names are hosted MCP sessions (#282); a team
+// alias and an unbound session are application sessions, as hosted can be
+// neither yet.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import type { ReadResult } from "../../src/core/boards.ts";
+import type { BoardPostResult } from "../../src/core/tools.ts";
+import type { AppSession } from "../support/app_session.ts";
+import { board } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
-import type { Any, WsClient } from "../support/ws_client.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -13,7 +18,8 @@ let alice: string;
 let bob: string;
 
 beforeEach(async () => {
-  srv = new TestServer();
+  // Inbox polling spends hosted requests.
+  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login(A);
   bob = await srv.login(B);
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
@@ -21,63 +27,67 @@ beforeEach(async () => {
 });
 afterEach(() => srv.stop());
 
-const mentioned = (body: string) => (m: Any) => m.type === "board_push" && m.item.reason === "mention" && m.item.post.body === body;
+const mentioned = (body: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.body === body);
 
-async function connect(token: string, identity: string | null): Promise<WsClient> {
-  const c = srv.client(token, identity);
-  expect((await c.connect()).type).toBe("hello_ok");
-  return c;
+// An application session: a hosted session holds one person-scope name, so
+// it can't hold the team alias eng/deploy, and with no name it receives
+// nothing, so it can't be the unbound session an @id: reaches (#451).
+async function connect(token: string, identity: string | null): Promise<AppSession> {
+  const s = srv.appSession(token, identity);
+  await s.connect();
+  return s;
 }
 
+// hosted twin: #451 (deploy, a team alias)
 test("@scope/name is exact; a bare name is the author's own scope's first, else the board's one match", async () => {
-  const abe = await connect(alice, "be");
-  const aqa = await connect(alice, "qa");
-  const bqa = await connect(bob, "qa");
+  const abe = await srv.hosted(A, "be");
+  const aqa = await srv.hosted(A, "qa");
+  const bqa = await srv.hosted(B, "qa");
   const deploy = await connect(bob, "eng/deploy");
-  expect((await abe.call("board_create", { name: "e2e", purpose: "fixtures" })).type).toBe("call_ok");
+  await abe.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // Exact: another person's alias, and a team's.
   let body = `@${B}/qa @eng/deploy exact`;
-  expect((await abe.call("board_post", { board: "e2e", body })).result.notified.sort()).toEqual([B + "/qa", "eng/deploy"]);
+  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).notified.sort()).toEqual([B + "/qa", "eng/deploy"]);
   await bqa.next(mentioned(body));
   await deploy.next(mentioned(body));
   await aqa.none(mentioned(body));
 
   // The email-local-part shorthand is gone: bob/qa names principal bob.
   body = "@bob/qa shorthand";
-  expect((await abe.call("board_post", { board: "e2e", body })).result.unresolved).toEqual(["bob/qa"]);
+  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).unresolved).toEqual(["bob/qa"]);
   await bqa.none(mentioned(body));
 
   // Bare: alice's own qa, not bob's.
   body = "@qa own scope";
-  expect((await abe.call("board_post", { board: "e2e", body })).result.notified).toEqual([`${A}/qa`]);
+  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual([`${A}/qa`]);
   await aqa.next(mentioned(body));
   await bqa.none(mentioned(body));
 
   // Bare with no own match: the one alias of that name on the roster.
   body = "@deploy roster";
-  expect((await abe.call("board_post", { board: "e2e", body })).result.notified).toEqual(["eng/deploy"]);
+  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual(["eng/deploy"]);
   await deploy.next(mentioned(body));
 });
 
+// hosted twin: #451 (deploy, a team alias; the unbound session an @id: reaches)
 test("an ambiguous bare name refuses the post with its candidates; an @id: reaches the session", async () => {
-  const aqa = await connect(alice, "qa");
-  const bqa = await connect(bob, "qa");
+  const aqa = await srv.hosted(A, "qa");
+  const bqa = await srv.hosted(B, "qa");
   const deploy = await connect(bob, "eng/deploy");
   const unbound = await connect(alice, null);
-  expect((await deploy.call("board_create", { name: "e2e", purpose: "fixtures" })).type).toBe("call_ok");
+  await deploy.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // eng has no qa of its own, and two people's are on the roster.
-  expect(await deploy.call("board_post", { board: "e2e", body: "@qa which" })).toMatchObject({
-    type: "error",
+  await expect(deploy.call("board_post", { board: "e2e", body: "@qa which" })).rejects.toMatchObject({
     code: "bad_request",
     message: `@qa matches ${A}/qa, ${B}/qa; name one`,
   });
-  expect((await deploy.call("board_read", { board: "e2e" })).result.posts).toEqual([]);
-  await aqa.none((m) => m.type === "board_push");
-  await bqa.none((m) => m.type === "board_push");
+  expect((await deploy.call<ReadResult>("board_read", { board: "e2e" })).posts).toEqual([]);
+  await aqa.none(board());
+  await bqa.none(board());
 
   const body = `@${unbound.id.toUpperCase()} by id`;
-  expect((await deploy.call("board_post", { board: "e2e", body })).result.notified).toEqual([unbound.id]);
+  expect((await deploy.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual([unbound.id]);
   await unbound.next(mentioned(body));
 });
