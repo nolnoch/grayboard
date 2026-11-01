@@ -298,7 +298,8 @@ export function createGrayboard(h: Harness): Grayboard {
       if (carry) state.carried = carried;
     } else {
       watcher?.dispose();
-      // An idle end still landing finishes first: omp caps shutdown handlers at 2 s.
+      // An idle end still landing finishes first: omp caps shutdown handlers
+      // at 2 s (omp 18.14.0 extensibility/extensions/runner.ts:151-160).
       await releasing;
       if (id && reason !== "reload") {
         // A register still in flight, or one that failed after the server
