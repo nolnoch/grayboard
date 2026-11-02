@@ -21,7 +21,7 @@ import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 
 // The launchers on the roster: aliases whose session opted in (BUS_LAUNCHER=1,
-// or the hello's launcher flag); offline ones by the session that last held
+// or a stored launcher flag); offline ones by the session that last held
 // them, as peer_list shows. Humans can't spawn — a bridge holds their
 // identity — and viewers have no aliases row.
 const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}

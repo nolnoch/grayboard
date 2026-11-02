@@ -99,7 +99,6 @@ test("tools-only calls neither own nor drain deliveries nor reset the owner's st
   await expect(connect(alice, "be")).rejects.toMatchObject({ code: "alias_held" });
 });
 
-// The hello's notices are gone with the hello (#282); owedBridgeNotice has no caller left.
 test("bind budget is per user and spent before an alias is created or a hold taken", async () => {
   application.stopExpiry();
   application = createApplication(store.repo, store.db, { helloLimit: { burst: 1, perSec: 0.01 } });
@@ -155,7 +154,6 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
 
 test("hosted Slack has no dependency on the transitional wire adapter", async () => {
   const source = await Bun.file(new URL("./slack.ts", import.meta.url)).text();
-  expect(source).not.toContain("./ws.ts");
   expect(source).not.toContain("shared/protocol");
   expect(source).not.toContain("JSON.parse");
   expect(source).not.toContain("HumanConn");

@@ -302,7 +302,7 @@ function sessionsSeen(db: CoreDb, handles: string[]): Map<string, { last_seen: n
   return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
-// What a bind or a tools-only hello's writes_as names (#284 S9): a bare name
+// What a bind or a tools-only declaration's writes_as names (#284 S9): a bare name
 // in the caller's own person scope, or scope/name in a scope the caller may
 // act in (mayActIn). Never `human`: canSend treats any */human as a human.
 // A refusal carries the address when the input parsed as one, so the
@@ -629,7 +629,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
     const id = session.sessionId;
-    // Lazy creation is here, not in the limited hello: an unlimited create loop
+    // Lazy creation is here, after the bind limit: an unlimited create loop
     // would mint aliases without bound. Taken before the held check, so a
     // re-bind loop spends it too.
     const t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias });
@@ -771,11 +771,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return { session, info };
     },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
-    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null) {
+    // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
+    // (`hostedCollided`, written after the rollback); without it the row is written here.
+    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
-        writeAudit(repo, "id.collision", authed.user_email, id, { why });
+        if (collided) collided(why); else writeAudit(repo, "id.collision", authed.user_email, id, { why });
         fail("id_collision", idCollisionText(id, why));
       }
       // A tools-only root's writes_as is registered here (A4): aliasUser, aliasUses and
@@ -795,16 +797,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // A tools-only declaration's alias, resolved and checked: a name the
     // principal may act in, never one another user's session uses (S7, S8); it may share the
     // alias with a holder. create: the first request makes the alias lazily.
-    hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false): string {
+    // `refused`: as `collided` above, for the refused binding row (`hostedRefused`).
+    hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void): string {
+      const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(db, id, address, "refused", detail); };
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
-        if (target.address) logBinding(db, id, target.address, "refused", target.error);
+        if (target.address) note(target.address, target.error);
         return fail(target.code, target.error);
       }
       const other = aliasUser(db, target.address, authed.user_email);
       if (other) {
         const why = `another user's session ${other}`;
-        logBinding(db, id, target.address, "refused", why);
+        note(target.address, why);
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) createLazily(hub, authed, target, id);
@@ -832,6 +836,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     bind,
     bindNow,
     hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
+    hostedCollided(authed: AuthedUser, id: string, why: string) { writeAudit(repo, "id.collision", authed.user_email, id, { why }); },
     unbind,
     close,
     revalidateSession: valid,

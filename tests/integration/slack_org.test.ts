@@ -418,6 +418,20 @@ test("a fatal bridge stop tells the owner on their next bind, once", async () =>
   expect(bridgeNotices[0]).toContain("link_disabled");
 });
 
+test("a hosted bind carries the owed bridge notice in its answer, once", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
+
+  const first = await hosted("alice@example.com", null);
+  const answer = JSON.stringify(await first.bind("be"));
+  expect(answer).toContain("your Slack bridge stopped at ");
+  expect(answer).toContain("link_disabled");
+  // The row that marks it delivered is the one the answer carried.
+  expect(JSON.stringify(await (await hosted("alice@example.com", null)).bind("fe"))).not.toContain("your Slack bridge stopped");
+});
+
 test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
   const alice = await login("alice@example.com");
   await link(alice);

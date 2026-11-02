@@ -454,6 +454,14 @@ test("a generic-key poll root's writes_as is recorded, makes it tools-only, and 
   expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_WRITES_AS_META]: "fe" })).not.toHaveProperty("writesAs");
 });
 
+test("a refused writes_as declaration through the hosted gate keeps its refused row after the transaction rolls back (#452)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-human", [GRAYBOARD_WRITES_AS_META]: "human" });
+  await expect(hosted.whoami(generic, ctx)).rejects.toHaveProperty("code", "forbidden");
+  expect(database.repo.hosted.all()).toEqual([]);
+  expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
+});
+
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "fe" });

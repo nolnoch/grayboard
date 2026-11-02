@@ -484,15 +484,11 @@ claimCmd
 
 // ── human (local mode) ───────────────────────────────────────────────────────
 
-// Server mode has no announcements or human board create yet (#24); --mode local reaches the local
-// bus on a machine signed in to a server, as for the bridge.
+// These commands act on the local bus whether or not the machine is signed in to a server, as
+// `grayboard mcp` does (#282 A1); on a server, your human is `grayboard slack link`.
 function requireLocalBus(mode: string | undefined): void {
   if (mode !== undefined && mode !== "local") {
     console.error(`[grayboard] --mode must be local, not "${mode}"`);
-    process.exit(1);
-  }
-  if (mode === undefined && busMode() === "server") {
-    console.error("[grayboard] these commands are local-mode only for now (#24; on a server, your human is grayboard slack link); --mode local uses this machine's local bus");
     process.exit(1);
   }
 }
@@ -918,6 +914,12 @@ identityCmd
       return;
     }
 
+    // Before anything is reserved: the entry `--mcp` writes runs `grayboard mcp`, which joins this machine's
+    // local bus, so on a server it would name a session that never reaches the team.
+    if (mcpPath) {
+      console.error("--mcp writes a `grayboard mcp` entry, which joins this machine's local bus (#282). On a server a session binds its name through the hosted plugin (`grayboard setup`).");
+      process.exit(1);
+    }
     let res: { name: string; created_at: number };
     try {
       res = await makeClient().post("/api/identities", { name }) as typeof res;
@@ -928,8 +930,6 @@ identityCmd
     } else {
       console.log(`Created identity '${res!.name}'`);
     }
-
-    if (mcpPath) writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
   });
 
 identityCmd

@@ -241,7 +241,7 @@ export function initCoreSchema(db: Database): void {
   for (const col of ["model", "effort"]) {
     if (!idCols.has(col)) db.exec(`ALTER TABLE ids ADD COLUMN ${col} TEXT`);
   }
-  // token_session: the server's token session (sessions.id) the ID last said
+  // token_session: unused since #282 (nothing writes or reads it; the column stays, schema changes are additive). It held the server's token session (sessions.id) the ID last said
   // hello under (#351), so a logout ends the token's IDs in their grace too,
   // which have no connection to find them by. Server-only; null locally.
   if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);

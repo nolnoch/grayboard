@@ -15,7 +15,7 @@ import { SlackBridge } from "./slack.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
-  // Tests skip the nightly retention timer and heartbeat.
+  // Tests skip the nightly retention timer and the revalidate timer.
   background?: boolean;
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
