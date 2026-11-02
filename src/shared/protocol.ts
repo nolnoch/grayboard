@@ -194,6 +194,7 @@ export type ErrorCode =
   // Hosted MCP only (src/server/hosted.ts), never on the WSS wire: a hosted
   // call that needs a bound name, and the hosted child-session registration refusals.
   | "unbound"
+  | "upgrade_required"
   | "child_session"
   | "invalid_registration"
   | "root_is_child"
@@ -205,6 +206,10 @@ export type ErrorCode =
 export const PROTO = 2;
 /** What a hello without it is told: a 1.x client against a 2.x server. */
 export const PROTO_REFUSAL = "this grayboard server is 2.x; update the CLI (`grayboard update`)";
+// What a pre-removal `grayboard mcp --mode server` is told (#282). A 410 on the
+// upgrade is invisible to every release (Bun's WebSocket exposes no status or
+// body for a non-101), so the upgrade is accepted and the hello answered.
+export const UPGRADE_REFUSAL = "this grayboard server no longer serves `grayboard mcp` over WebSocket; update the CLI (`grayboard update`) and use the hosted MCP entry";
 /** A self-reported session fact (harness, model, effort) is stored as at most this many characters. */
 export const SESSION_FACT_MAX = 64;
 

@@ -4,6 +4,7 @@ import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, 
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
+import { UPGRADE_REFUSAL } from "../shared/protocol.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -586,20 +587,29 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
+// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+function refuseServerMode(mode: string | undefined): void {
+  if (mode === "server") {
+    console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
+    process.exit(1);
+  }
+  if (mode !== undefined && mode !== "local") {
+    console.error(`[grayboard] --mode must be local, not "${mode}"`);
+    process.exit(1);
+  }
+}
+
+// Local on every machine: a signed-in user's local entries keep working, and a
+// distributed bus is reached through the hosted MCP entry (#282).
 program
   .command("mcp")
-  .description("Run the MCP server for Claude Code: server mode when signed in, local otherwise")
-  .option("--mode <mode>", "Force local or server mode, e.g. for one repo")
+  .description("Run the local-bus MCP server")
+  .option("--mode <mode>", "local (the only mode; server is served by the hosted MCP entry)")
   .action(async (opts: { mode?: string }) => {
-    const mode = opts.mode ?? busMode();
-    if (mode !== "local" && mode !== "server") {
-      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
-      process.exit(1);
-    }
+    refuseServerMode(opts.mode);
     // stdout is the MCP transport from here on; log to stderr only.
     try {
-      if (mode === "server") await import("../plugin/mcp.ts");
-      else await import("../local/mcp.ts");
+      await import("../local/mcp.ts");
     } catch (e) {
       console.error(`[grayboard] ${(e as Error).message}`);
       process.exit(1);
@@ -608,19 +618,14 @@ program
 
 // The adapters that serve grayboard's tools themselves (pi, opencode; #182
 // decision 13) register them from this list at load. It's what `mcp` would
-// serve in the same mode, and printing it opens no bus and no connection.
+// serve, and printing it opens no bus and no connection.
 program
   .command("tools", { hidden: true })
   .description("Print the tools `grayboard mcp` serves, as JSON")
-  .option("--mode <mode>", "Force local or server mode, as for mcp")
+  .option("--mode <mode>", "local, as for mcp")
   .action(async (opts: { mode?: string }) => {
-    const mode = opts.mode ?? busMode();
-    if (mode !== "local" && mode !== "server") {
-      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
-      process.exit(1);
-    }
-    const tools = mode === "server" ? (await import("../plugin/tools.ts")).SERVER_TOOLS : (await import("../local/tools.ts")).LOCAL_TOOLS;
-    console.log(JSON.stringify(tools));
+    refuseServerMode(opts.mode);
+    console.log(JSON.stringify((await import("../local/tools.ts")).LOCAL_TOOLS));
   });
 
 program

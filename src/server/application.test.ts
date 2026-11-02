@@ -6,7 +6,6 @@ import { GRACE_MS, createApplication, type DeliveryEvent, type DeliverySink } fr
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
-import { createWsHandlers, type Conn } from "./ws.ts";
 import { tokenSession } from "../../tests/support/token_session.ts";
 import { until } from "../../tests/support/until.ts";
 
@@ -414,26 +413,4 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
   expect(store.db.query("SELECT id FROM alias_holds WHERE address = ?").get(first.identityFull)).toEqual({ id: first.sessionId });
   await expect(application.selectIdentity(bob, "other", delivery(sink()), { session_key: "first-session" })).rejects.toMatchObject({ code: "id_collision" });
   expect(store.repo.aliases.find(`${bob.user_email}/other`)).toBeUndefined();
-});
-
-test("WSS transport attribution is server-owned even if hello carries an extra field", async () => {
-  const frames: Record<string, unknown>[] = [];
-  const conn: Conn = {
-    data: { authed: alice, ready: false },
-    readyState: 1,
-    send: raw => { frames.push(JSON.parse(raw)); },
-    close() {},
-  };
-  const { handlers } = createWsHandlers(application);
-  handlers.message(conn, JSON.stringify({ type: "hello", req_id: "h", proto: 2, session_key: "f".repeat(64), transport: "hosted" }));
-  await until(() => frames.find(f => f.req_id === "h"));
-  expect(frames[0]?.type).toBe("hello_ok");
-  handlers.message(conn, JSON.stringify({ type: "bind", req_id: "bind", alias: "be" }));
-  await until(() => frames.find(f => f.req_id === "bind"));
-  expect(frames.find(f => f.req_id === "bind")?.type).toBe("bind_ok");
-  for (const req_id of ["a", "b"]) handlers.message(conn, JSON.stringify({ type: "send", req_id, recipient: "be", body: "same write" }));
-  const replay = store.db.query("SELECT detail FROM access_log WHERE action = 'request.replayed'").get() as { detail: string };
-  expect(JSON.parse(replay.detail)).toMatchObject({ transport: "wss", tool: "dm_send" });
-  expect(frames.find(f => f.req_id === "b")).toMatchObject({ type: "send_ok", replayed: { ref: { kind: "message" } } });
-  handlers.close(conn);
 });
