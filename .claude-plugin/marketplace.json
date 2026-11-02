@@ -1,6 +1,19 @@
 {
   "name": "grayboard",
-  "owner": { "name": "nolnoch" },
+  "owner": {
+    "name": "nolnoch"
+  },
   "description": "Grayboard's Claude Code plugin, pinned to a published release.",
-  "plugins": []
+  "plugins": [
+    {
+      "name": "grayboard",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/nolnoch/grayboard.git",
+        "path": "plugins/claude-code",
+        "ref": "v2.3.0",
+        "sha": "a193dcc5202c8df9649629b011d61ff2b25a5f2d"
+      }
+    }
+  ]
 }
