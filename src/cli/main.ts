@@ -766,10 +766,15 @@ program
     // grayboard process, serves its tools and delivers its pushes; the
     // entry, disabled, is the plugin's config. opencode merges opencode.json
     // and opencode.jsonc, so this leaves a commented .jsonc alone.
+    // A team server is reached only through opencode's hosted MCP entry (#282): the
+    // `grayboard mcp` entry this step writes would run the local bus, so server mode skips it.
     const opencode = !!Bun.which("opencode");
-    const ocGuard = opts.register && opencode ? opencodeShimGuard(OC_DIR) : { skip: false };
+    if (opts.register && opencode && server) {
+      console.log(`opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server.replace(/\/+$/, "")}/mcp --config <opencode config file> --revision <full git sha>`);
+    }
+    const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);

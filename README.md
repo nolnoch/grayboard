@@ -68,9 +68,9 @@ Re-run `grayboard setup` any time to switch modes.
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/` + `src/plugin/`) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; WSS push to clients |
+| **Distributed** (`src/server/`, hosted MCP) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; hosted MCP delivery to clients |
 
-Both modes expose the same tools. With a team server, Claude Code runs grayboard's plugin and omp and pi run grayboard's hosted extensions, which talk to the server's hosted MCP endpoint themselves. Everything else (and every harness in local mode) runs `grayboard mcp`, which uses distributed mode if you're signed in to a server (a `~/.grayboard/credentials` file exists) and local mode otherwise. After `grayboard logout` it fails with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch. To pin one repo to a mode regardless (say, local repos on a machine that's also signed in to a server), use `"args": ["mcp", "--mode", "local"]` in its `.mcp.json`.
+Both modes expose the same tools. With a team server, Claude Code runs grayboard's plugin, omp and pi run grayboard's hosted extensions, and OpenCode V2 and other native clients connect directly: all talk to the server's hosted MCP endpoint themselves. `grayboard mcp` is local mode only, so a machine signed in to a server keeps its local entries working; a `--mode server` run is refused with a message to use the hosted entry. After `grayboard logout` the CLI's server commands fail with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch.
 
 ## Common requirements
 
@@ -116,7 +116,7 @@ To configure one repo instead of registering for every project, drop a `.mcp.jso
 }
 ```
 
-With an installed binary, the command is `/home/you/.local/bin/grayboard` with args `["mcp", "--mode", "local"]`. `--mode` is optional; it keeps the repo local even if you later sign in to a server. `BUS_IDENTITY` is optional: with it, the session binds that name at start; without it, the session starts unbound and suggests the repo's name. A `BUS_IDENTITY` written by `grayboard identity create --mcp` is a pin, which the session only suggests first; set `BUS_IDENTITY` in the launch command to bind at start. Don't set `BUS_IDENTITY` in the user-level registration: every session would compete for one name.
+With an installed binary, the command is `/home/you/.local/bin/grayboard` with args `["mcp", "--mode", "local"]`. `--mode` is optional: `grayboard mcp` is always local mode, even on a machine signed in to a server. `BUS_IDENTITY` is optional: with it, the session binds that name at start; without it, the session starts unbound and suggests the repo's name. A `BUS_IDENTITY` written by `grayboard identity create --mcp` is a pin, which the session only suggests first; set `BUS_IDENTITY` in the launch command to bind at start. Don't set `BUS_IDENTITY` in the user-level registration: every session would compete for one name.
 </details>
 
 ### Launch
@@ -333,13 +333,13 @@ If your use case grows past any of those, switch to distributed mode.
 
 ## Distributed mode
 
-A central server on one host and Google sign-in make cross-machine and team coordination work. Clients can use the existing CLI/WSS connection or connect directly through [hosted MCP over HTTP](#hosted-mcp-over-http).
+A central server on one host and Google sign-in make cross-machine and team coordination work. Agents connect through [hosted MCP over HTTP](#hosted-mcp-over-http); the CLI manages the server over HTTP.
 
-**How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it serves HTTP and WSS, owns SQLite, and handles sign-in. Each Claude Code session runs grayboard's Claude Code plugin (`plugins/claude-code/`), which connects to the server's hosted MCP endpoint (`/mcp`) with its own OAuth sign-in. Local/V1 opencode sessions spawn a thin MCP shim (`grayboard mcp`, code in `src/plugin/`) that connects over WSS with the session token in `~/.grayboard/credentials`. Same tools, same `<channel>` notifications as local mode; only the transport differs. pi's and omp's hosted extensions and other native HTTP clients also connect to `/mcp` and manage their own OAuth sign-in. Local mode and the existing harness setups remain supported. Full architecture in [`docs/architecture.md`](docs/architecture.md).
+**How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it serves HTTP, owns SQLite, and handles sign-in. Each Claude Code session runs grayboard's Claude Code plugin (`plugins/claude-code/`), which connects to the server's hosted MCP endpoint (`/mcp`) with its own OAuth sign-in. pi's and omp's hosted extensions, OpenCode V2 and other native HTTP clients also connect to `/mcp` and manage their own OAuth sign-in. Same tools, same `<channel>` notifications as local mode; only the transport differs. Local mode and the existing harness setups remain supported. A `grayboard mcp --mode server` session from an older client is refused with a message to update and use the hosted MCP entry. Full architecture in [`docs/architecture.md`](docs/architecture.md).
 
 The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no Google), so the server and transport are proven before OAuth is involved.
 
-For native HTTP clients, use [Hosted MCP over HTTP](#hosted-mcp-over-http) instead of the CLI/WSS client setup below. Sign-in alone never binds a mailbox. A client without a supported session-context mapping can use unbound read tools but cannot bind or write; static identity headers are not a substitute.
+Agents connect through [Hosted MCP over HTTP](#hosted-mcp-over-http); the steps below use the CLI only to sign in and to check the server. Sign-in alone never binds a mailbox. A client without a supported session-context mapping can use unbound read tools but cannot bind or write; static identity headers are not a substitute.
 
 ### Before you start
 
@@ -464,22 +464,14 @@ grayboard login --dev you@example.com --server https://grayboard.example.com
 grayboard whoami
 ```
 
-Claude Code's [plugin](#claude-code-with-a-team-server) signs in through Google, so this trial uses the CLI's WSS shim instead, registered for two scratch repos only. Make the repos, register it in each, and start a session in each:
+Agents reach the server through [hosted MCP](#hosted-mcp-over-http), which signs in through Google, so the agent messaging trial comes after step 6. This one proves the server, dev auth and the CLI's HTTP routes:
 
 ```bash
-mkdir -p ~/gb-test/api ~/gb-test/web
-git -C ~/gb-test/api init && git -C ~/gb-test/web init
-cd ~/gb-test/api && claude mcp add grayboard -- grayboard mcp   # same in ~/gb-test/web
-claude --dangerously-load-development-channels server:grayboard   # second terminal: same in ~/gb-test/web
+grayboard team create trial
+grayboard team list
 ```
 
-**Check**, in each session: `/mcp` shows `grayboard` connected. Then ask the agents to do things that exercise the server:
-
-- In `api`: "list grayboard peers", which should show `api` and `web` online. Then "send web a DM saying hello"; it arrives in `web` without `web` doing anything.
-- In `web`: "create a board #trial, take the claim `ticket:1` on it, and post that you're on it, mentioning @api". `api` is woken by the mention.
-- Quit `web`, have `api` DM it again (the reply says `delivered_now: false`), restart `web`: the message arrives on connect.
-
-The same checks across two machines, or with a teammate's account, prove the rest; a teammate's identities appear as `them@example.com/<name>`.
+**Check:** `whoami` shows your user and teams, and `team list` shows `trial`. The same checks from a second machine, or with a teammate's account, prove the rest; a teammate's identities appear as `them@example.com/<name>`.
 
 ### 6. Switch to Google sign-in
 
@@ -508,7 +500,7 @@ sudo systemctl start grayboard
 curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
 ```
 
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Running sessions keep retrying after the restart and pick up the new token on their next reconnect; if one still shows a sign-in error, reconnect it (`/mcp` → grayboard → reconnect). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, run `claude mcp remove grayboard` in each scratch repo and [set up each developer](#per-developer-setup-one-time).
+**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, [set up each developer](#per-developer-setup-one-time).
 
 ### Hosted MCP over HTTP
 
@@ -617,7 +609,7 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 grayboard setup --server https://grayboard.example.com
 ```
 
-`setup` signs you in through your browser, installs grayboard's [Claude Code plugin](#claude-code-with-a-team-server), and registers grayboard with omp, opencode, and pi, if they're installed. The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
+`setup` signs you in through your browser, installs grayboard's [Claude Code plugin](#claude-code-with-a-team-server), and registers grayboard with omp and pi, if they're installed (OpenCode joins a team server through [OpenCode V2](#opencode-v2-native-hosted-mcp-and-packaged-delivery)). The CLI gets the OAuth client ID and org domain from the server's public `/api/auth/config`, so there's no per-developer OAuth setup. The server URL is remembered in `~/.grayboard/credentials`; `export GRAYBOARD_SERVER=https://grayboard.example.com` in your shell profile spares you `--server` after a logout.
 
 `install.sh` puts the `grayboard` binary for your platform in `~/.local/bin`. Override the destination with `INSTALL_DIR=`, or pin a version with `GRAYBOARD_VERSION=v2.0.0` (a v1.x release predates signed checksums and needs its own `install.sh`, from `releases/download/v1.x.y/install.sh`). It needs `openssl`. Before installing anything it checks that the release's `SHA256SUMS` is signed by a release key the script carries and names the tag it asked for, that each binary matches both its `SHA256SUMS` line and the sha256 digest the release API publishes, and that the CLI reports the tag; any missing or failed check installs nothing (#162). It prints the tag and key it verified. The script is fetched from the release itself (an immutable asset); after the first install, `grayboard update` is the verified path, with the key list compiled in. To install from a mirror, set `GRAYBOARD_RELEASES_URL=https://mirror.example.com` to one origin that serves GitHub's release paths (`/<repo>/releases/latest` and `/<repo>/releases/download/<tag>/<asset>`, including each release's `SHA256SUMS` and `SHA256SUMS.sig`); `grayboard update` honours it too and both need the API paths there (`/repos/<repo>/releases/latest` and `/repos/<repo>/releases/tags/<tag>`, with the per-asset digests). A mirror can't change what's installed beyond choosing among signed releases: it can withhold newer ones, or point a fresh install at an older one (#308). The origin must be `https://` (plain `http://` only to this machine: `localhost`, `127.0.0.1` or `[::1]`) with no user info (`user@`), and an empty value means GitHub.
 
@@ -713,9 +705,10 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 | `grayboard admin …` returns 403 | Your email isn't in the server's `GRAYBOARD_ADMINS`, or it's unset; edit `/etc/grayboard/env` and restart |
 | `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); a member runs `grayboard team add <team> <your email>` |
 | `team add` says the email has never signed in | That person runs `grayboard login` once, then a member adds them |
-| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is in use by the session id:…` | Another session holds that name (the message names it, and when it ends if it's disconnected); see [below](#one-live-session-per-identity) |
+| A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is in use by the session id:…` | Another session holds that name (the message names it); see [below](#one-live-session-per-identity) |
 | `bind` says `you can't act as "<team>/<name>"` | You aren't a member of that team; bind a name in your own scope, or ask a member to add you |
-| `Error (unauthenticated): your sign-in isn't valid on …`, or grayboard fails in `/mcp` with the same message | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
+| A session fails with "this grayboard server no longer serves `grayboard mcp` over WebSocket" | The entry is an older `grayboard mcp --mode server`; run `grayboard update`, which moves Claude Code onto the plugin, or `grayboard setup --server <url>` |
+| `Error (unauthenticated): your sign-in isn't valid on …` | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
 | pi: tools work but messages never arrive | The extension isn't installed (`~/.pi/agent/extensions/grayboard.ts`, or `grayboard.js` with a team server; rerun `grayboard setup`), or pi was started with `--no-extensions` |
 | pi with a team server: grayboard tools fail, or `/grayboard status` says signed out | Run `/grayboard login` in pi; it keeps its own grant, separate from `grayboard login` |
 | Tools fail with "signed out" | You ran `grayboard logout`; sign in again, or `grayboard setup --local` |
@@ -731,7 +724,7 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 
 ```
 grayboard setup [--local | --server <url>] [--no-register] [-y]
-grayboard mcp [--mode local|server]      # the MCP server local-mode harnesses run
+grayboard mcp [--mode local]             # the MCP server local-mode harnesses run
 grayboard update                         # replace this binary with the latest release
 grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
 grayboard claim take <key> [--ttl <dur> | --until <time>] [--note <text>] [--board <b>]  # exits 2 if held
@@ -794,7 +787,7 @@ Claims are org-wide: anyone signed in sees the key, holder, and note.
 
 ### One live session per identity
 
-A name another session holds is never taken over: the bind is refused, naming the holder's ID and where it runs (a session binding at start from `BUS_IDENTITY` starts unbound instead). A session whose connection drops (a network drop, a laptop sleep, a server restart) keeps its ID, its name and its queued mail for 30 seconds, and a reconnect in that window resumes it. After that the session ends: direct messages to its ID that it never read bounce back to their senders, the claims it took as its ID are released, and its name is free. Until then a refusal says when the holder disconnected and when it ends, and a restarted grayboard process taking back its own name binds it by itself once it's free.
+A name another session holds is never taken over: the bind is refused, naming the holder's ID and where it runs (a session binding at start from `BUS_IDENTITY` starts unbound instead). A team-server session's name stays held across a reconnect, `/clear` and `claude --resume`, and is freed when the session ends or its delivery lease runs out; a session that never opened delivery and has sat idle past its window loses the name to the next session that binds it. A local session's name is free when its process ends.
 
 ---
 
@@ -842,9 +835,9 @@ Agents attach files by path (`dm_send(…, attachments=["out/shot.png"])`), and 
 - Single backend instance. A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423).
 - No HA, no multi-AZ, no horizontal scaling.
 - No web admin UI — CLI only.
-- No quotas on messages or posts. What is limited: each user's connections, authentication failures per client address ([§3](#3-configure-for-a-dev-auth-trial)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
+- No quotas on messages or posts. What is limited: each user's binds, authentication failures per client address ([§3](#3-configure-for-a-dev-auth-trial)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
 - No defense against intra-company abuse — treated as an acceptable-use matter.
-- Retained CLI/WS sessions never auto-expire; rotation is by explicit logout or admin revocation. Hosted OAuth access tokens last an hour, refresh tokens 30 days of disuse, and a grant at most 90 days; native clients refresh and reauthorize on their own.
+- CLI tokens never auto-expire; rotation is by explicit logout or admin revocation. Hosted OAuth access tokens last an hour, refresh tokens 30 days of disuse, and a grant at most 90 days; native clients refresh and reauthorize on their own.
 
 The repository facade in `src/server/db.ts` is the seam for moving to Postgres; see [`docs/architecture.md`](docs/architecture.md).
 

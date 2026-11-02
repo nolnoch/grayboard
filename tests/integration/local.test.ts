@@ -134,11 +134,11 @@ test("grayboard mcp: local mode when signed out, named after the repo", async ()
   expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
 }, 20_000);
 
-test("grayboard mcp: a signed-out credentials file fails instead of falling back to local", async () => {
+// `mcp` is the local bus on every machine (#282): a signed-out file doesn't stop it.
+test("grayboard mcp: a signed-out credentials file still serves the local bus", async () => {
   writeFileSync(join(dir, "credentials"), "");
-  const r = await runCli(["mcp"], { cwd: dir, env: busEnv("be") });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("signed out");
+  const be = await start("be");
+  expect((await call(be, "peer_list")).you).toBe("be");
 }, 20_000);
 
 test("grayboard mcp --mode local overrides a signed-in credentials file", async () => {
