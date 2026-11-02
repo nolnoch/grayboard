@@ -12,7 +12,7 @@ import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { sessionStartOutput } from "./session_start.ts";
-import { claudeCli, claudeLaunch, hasProjectEntry, hasUserEntry, installClaudePlugin, pluginCommands, printable, refreshClaudePlugin, registerClaudeLocal } from "./claude-setup.ts";
+import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, printable, projectEntryWarnings, refreshClaudePlugin, registerClaudeLocal } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -814,7 +814,7 @@ program
     // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
     // command; `setup` reinstalls adapters there.
     const refresh = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "inherit" });
-    if (refresh.exitCode !== 0) console.log("If you use omp, opencode, or pi, run `grayboard setup` to refresh their adapters.");
+    if (refresh.exitCode !== 0) console.log("Some adapters weren't refreshed (above); after fixing that, run `grayboard setup`.");
   });
 
 program
@@ -827,7 +827,7 @@ program
 
 program
   .command("refresh-adapters", { hidden: true })
-  .description("Rewrite installed omp/opencode/pi push adapters from this binary")
+  .description("Rewrite installed omp/opencode/pi push adapters from this binary and update an enabled Claude Code plugin")
   .action(async () => {
     // A symlink means a checkout is installed there on purpose: leave it,
     // and the entry its version expects.
@@ -876,8 +876,11 @@ program
         } else {
           for (const note of refreshClaudePlugin(claudeCli(claude))) console.log(note);
         }
-        if (hasProjectEntry(process.cwd())) console.log(`[grayboard] ${join(process.cwd(), ".mcp.json")} has a grayboard entry, which runs a second grayboard beside the plugin; remove it`);
       }
+    } catch (e) { failed(e); }
+    // Beside the plugin, a project's grayboard entry runs a second grayboard. Checked even when the update above failed.
+    try {
+      if (busMode() === "server" && Bun.which("claude") && pluginEnabled()) for (const w of projectEntryWarnings(process.cwd())) console.log(`[grayboard] ${w}`);
     } catch (e) { failed(e); }
   });
 
