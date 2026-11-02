@@ -81,6 +81,8 @@ test("who: live sessions are online; a closed one is offline with last_seen; tea
   await api(alice, "POST", "/api/teams/eng/add", { email: B });
 
   await srv.hosted(A, "be");
+  // A hosted name's last_seen is its session's last request, so it's bounded by the session's life.
+  const before = Date.now();
   const a2 = await srv.hosted(A, "be-stream");
   const b = await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "sim");
@@ -89,14 +91,15 @@ test("who: live sessions are online; a closed one is offline with last_seen; tea
   expect(online.you).toBe(`${C}/sim`);
   expect(online.peers.map((p) => p.handle)).toEqual([`${A}/be`, `${A}/be-stream`, `${B}/fe`, `${C}/sim`]);
 
-  const before = Date.now();
   await a2.close();
+  const closed = Date.now();
   const after = await c.call<WhoResult>("peer_list");
   expect(after.offline_hidden).toBe(1);
   const all = await c.call<WhoResult>("peer_list", { include_offline: true });
   const gone = all.peers.find((p) => p.handle === `${A}/be-stream`)!;
   expect(gone.online).toBe(false);
   expect(gone.last_seen).toBeGreaterThanOrEqual(before);
+  expect(gone.last_seen).toBeLessThanOrEqual(closed);
 
   const team = await b.call<WhoResult>("peer_list", { board: "eng", include_offline: true });
   expect(team.peers.map((p) => [p.handle, p.online])).toEqual([

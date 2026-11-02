@@ -553,7 +553,7 @@ test("a bridge that failed to start issues no codes", async () => {
     expect(r.status).toBe(404);
     expect(r.body.message).toMatch(/isn't running/);
   } finally {
-    down.stop();
+    await down.stop();
   }
 }, 30_000);
 
@@ -566,7 +566,7 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
     const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
     expect(rows.n).toBe(0);
   } finally {
-    down.stop();
+    await down.stop();
   }
 }, 30_000);
 
