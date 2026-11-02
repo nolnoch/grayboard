@@ -245,7 +245,8 @@ try {
     await wait(() => receiptAttempts, n => n >= receipts + 2, "both receipts lost after real acceptance");
     await host.session.wait({ sessionID: action.id });
     assert(!raceGate.models.includes(digest.id)); assert(raceGate.models.includes(action.id));
-    assert.equal((await host.session.inbox.list({ sessionID: digest.id })).length, 1);
+    // The digest's durable idle admission lands independently of the receipts, so wait for it as the durable-idle scenario does (line ~362).
+    assert.equal((await wait(() => host!.session.inbox.list({ sessionID: digest.id }), xs => xs.length >= 1, "digest durable idle admission")).length, 1);
     assert.equal(app.repo.cursors.directFor("you@example.com/action"), 0);
     const digestInput = admissions.find(i => i.sessionID === digest.id)!, input = admissions.find(i => i.sessionID === action.id)!;
     assert(input && digestInput);
