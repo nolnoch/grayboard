@@ -298,6 +298,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const root = row ? rootOf(row) : undefined;
         if (!(root && named(root)) && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         const selected = snapshot(p, row);
+        // Refusal audits the call produced, written once the transaction has unwound (#452).
+        const late: (() => void)[] = [];
+        selected.session.afterRollback = w => { late.push(w); };
         try {
           await testPauseAsync("hosted:tool:in-gate");
           return store.atomic(() => {
@@ -307,6 +310,11 @@ export function createHostedSessions(application: Application, options: { now?: 
             if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as });
             return value;
           });
+        } catch (error) {
+          for (const write of late) {
+            try { write(); } catch (failure) { console.error(`hosted ${tool}: refusal audit not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
+          }
+          throw error;
         } finally { application.close(selected.session); }
       });
     },

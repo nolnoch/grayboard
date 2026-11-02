@@ -167,7 +167,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   const signIn = () => {
     if (!login || !root || !interactive || closed || signingIn || !initialized) return;
     const abort = new AbortController();
-    const done = login.login(abort.signal).then(
+    const done = login.login(abort.signal, true).then(
       async () => {
         await complete?.();
         say("signed in");

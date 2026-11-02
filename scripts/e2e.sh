@@ -54,11 +54,11 @@ verdict() {
 case "$suite" in
   hosted-*)
     export GRAYBOARD_E2E_RUN_DIR="$run"
-    # The child stream and raw JUnit stay private; only constructed metadata is public.
+    # The child's output streams to the job log and lands in evidence/diagnostics.log; the fixture HOME and auth store stay in scratch.
     if bun scripts/hosted-evidence.ts "${suite#hosted-}" "$run"; then
       verdict 'passed'
     else
-      verdict 'failed (safe evidence summary in the run dir; raw diagnostics private)'
+      verdict 'failed (output in evidence/diagnostics.log)'
     fi
     ;;
   upgrade-matrix)

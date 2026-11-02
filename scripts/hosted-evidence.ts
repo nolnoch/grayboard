@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { matrixObservation } from "./hosted-matrix.ts";
@@ -17,7 +17,7 @@ type Counts = { tests: number; failures: number; skipped: number };
 type Element = { name: string; attributes: Map<string, string>; counts: Counts; outcomes: number; properties: Set<string>; metadata: number };
 
 // Bounded Bun JUnit subset, not a general XML parser: no DTD, PI, CDATA or namespaces.
-function junitCounts(raw: string): Counts {
+export function junitCounts(raw: string): Counts {
   const invalid: () => never = () => { throw new Error("Unsupported or invalid JUnit"); };
   if (raw.length > 8 * 1024 * 1024) invalid();
   const validCodePoint = (n: number) => n === 9 || n === 10 || n === 13 || (n >= 32 && n <= 0xd7ff) || (n >= 0xe000 && n <= 0xfffd) || (n >= 0x10000 && n <= 0x10ffff);
@@ -102,14 +102,6 @@ function junitCounts(raw: string): Counts {
   return result;
 }
 
-export function junit(raw: string | undefined, failed: boolean): string {
-  let { tests, failures, skipped } = raw === undefined ? { tests: 1, failures: failed ? 1 : 0, skipped: 0 } : junitCounts(raw);
-  if (failed && failures === 0) { tests++; failures++; }
-  // Names, messages, paths, excerpts and expected/received values are never copied.
-  const cases = Array.from({ length: tests }, (_, i) => `<testcase name="case-${i + 1}">${i < failures ? '<failure message="Private diagnostics withheld"/>' : i < failures + skipped ? "<skipped/>" : ""}</testcase>`).join("\n");
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites tests="${tests}" failures="${failures}" skipped="${skipped}"><testsuite name="hosted-gate" tests="${tests}" failures="${failures}" skipped="${skipped}">\n${cases}\n</testsuite></testsuites>\n`;
-}
-
 export function provenance(value: any, checkout = root, suite = "strict") {
   if (!suites.includes(suite) || value?.bun !== "1.4.4" || typeof value.installed !== "boolean" || typeof value.publicInstalled !== "boolean") throw new Error("Invalid provenance");
   const tracked = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: checkout, env: repositoryGitEnv() });
@@ -160,47 +152,51 @@ async function main() {
   if (!suite || !suites.includes(suite) || !destination) throw new Error("Invalid invocation");
   const output = resolve(destination, "evidence");
   if (existsSync(output)) throw new Error("Evidence destination occupied");
-  const privateRoot = mkdtempSync(join(tmpdir(), "grayboard-evidence-"));
-  const raw = join(privateRoot, "raw");
+  const scratch = mkdtempSync(join(tmpdir(), "grayboard-evidence-"));
+  const raw = join(scratch, "raw");
   mkdirSync(raw, { mode: 0o700 });
-  const log = Bun.file(join(privateRoot, "diagnostics.log"));
-  const child = Bun.spawn(["bash", join(root, "scripts/hosted-e2e.sh"), suite], { cwd: root, env: { ...process.env, GRAYBOARD_E2E_RUN_DIR: raw, GRAYBOARD_EVIDENCE_PRIVATE: "1" }, stdout: log, stderr: log });
+  const logPath = join(scratch, "diagnostics.log");
+  writeFileSync(logPath, "");
+  // The child's output goes to this process's stdout as it arrives (the CI log) and to diagnostics.log.
+  // The fixture HOME, auth store and databases stay in hosted-e2e.sh's scratch and are never copied.
+  const child = Bun.spawn(["bash", "-c", 'exec bash "$@" 2>&1', "hosted-e2e", join(root, "scripts/hosted-e2e.sh"), suite], { cwd: root, env: { ...process.env, GRAYBOARD_E2E_RUN_DIR: raw, GRAYBOARD_EVIDENCE_PRIVATE: "1" }, stdout: "pipe" });
+  for await (const chunk of child.stdout) { process.stdout.write(chunk); appendFileSync(logPath, chunk); }
   const runtimeExit = await child.exited;
-  // Only constructed evidence is staged here; atomic rename requires the destination's filesystem.
+  // Staged beside the destination: the atomic rename requires its filesystem.
   mkdirSync(resolve(destination), { recursive: true });
-  const safe = mkdtempSync(join(resolve(destination), ".hosted-evidence-"));
-  let exit = runtimeExit, processed = false;
-  let xml = junit(undefined, true);
-  let matrix: ReturnType<typeof matrixObservation> | { phase: "invalid"; state: "failed" } = { phase: "invalid", state: "failed" };
+  const staged = mkdtempSync(join(resolve(destination), ".hosted-evidence-"));
+  let exit = runtimeExit, processed = false, problem = "";
+  let matrix: ReturnType<typeof matrixObservation> | { phase: "invalid"; state: "failed" } | undefined = suite === "matrix" ? { phase: "invalid", state: "failed" } : undefined;
   try {
     if (suite === "matrix") matrix = matrixObservation(readJUnit(join(raw, "matrix.jsonl"), 8192), runtimeExit);
     const data = provenance(JSON.parse(readFileSync(join(raw, "provenance.json"), "utf8")), root, suite);
     if (data.mismatches.length) exit = 1;
     if (suite === "strict" && runtimeExit === 0 && !existsSync(join(raw, "unit.xml"))) throw new Error("Missing JUnit");
-    xml = junit(existsSync(join(raw, "unit.xml")) ? readJUnit(join(raw, "unit.xml")) : undefined, exit !== 0);
-    if (/failures="[1-9]/.test(xml)) exit = 1;
+    if (existsSync(join(raw, "unit.xml")) && junitCounts(readJUnit(join(raw, "unit.xml"))).failures > 0) exit = 1;
     const revision = readFileSync(join(raw, "source-revision"), "utf8").trim();
     if (!hex(revision, 40)) throw new Error("Invalid revision");
-    writeFileSync(join(safe, "provenance.json"), JSON.stringify(data, null, 2) + "\n");
-    writeFileSync(join(safe, "source-revision"), revision + "\n");
-    writeFileSync(join(safe, "source-status"), readFileSync(join(raw, "source-status"), "utf8").length ? "modified\n" : "clean\n");
+    cpSync(raw, staged, { recursive: true });
+    writeFileSync(join(staged, "provenance.json"), JSON.stringify(data, null, 2) + "\n");
+    writeFileSync(join(staged, "source-revision"), revision + "\n");
+    writeFileSync(join(staged, "source-status"), readFileSync(join(raw, "source-status"), "utf8").length ? "modified\n" : "clean\n");
     processed = true;
-  } catch {
+  } catch (error) {
     exit = 1;
-    xml = junit(undefined, true);
+    problem = error instanceof Error ? error.message : String(error);
+    console.error(`Hosted ${suite}: evidence check failed: ${problem}`);
+    cpSync(raw, staged, { recursive: true });
   }
-  const summary = { suite, runtimeExit, exit, evidenceProcessed: processed, diagnostics: "withheld; private TMPDIR/grayboard-evidence-* only" };
-  if (suite === "matrix") writeFileSync(join(safe, "matrix.json"), JSON.stringify(matrix, null, 2) + "\n");
-  writeFileSync(join(safe, "unit.xml"), xml);
-  writeFileSync(join(safe, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
-  writeFileSync(join(safe, "hosted.log"), `Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}; raw diagnostics withheld\n`);
-  writeFileSync(join(safe, "exit"), `exit=${exit}\n`);
-  writeFileSync(join(safe, "result"), exit === 0 ? "passed\n" : "failed\n");
-  renameSync(safe, output);
-  console.log(`Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}; private diagnostics withheld`);
+  const summary = { suite, runtimeExit, exit, evidenceProcessed: processed, ...(problem ? { problem } : {}) };
+  if (matrix) writeFileSync(join(staged, "matrix.json"), JSON.stringify(matrix, null, 2) + "\n");
+  cpSync(logPath, join(staged, "diagnostics.log"));
+  writeFileSync(join(staged, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
+  writeFileSync(join(staged, "exit"), `exit=${exit}\n`);
+  writeFileSync(join(staged, "result"), exit === 0 ? "passed\n" : "failed\n");
+  renameSync(staged, output);
+  console.log(`Hosted ${suite}: ${exit === 0 ? "passed" : "failed"}`);
   process.exitCode = exit === 0 ? 0 : 1;
 }
 
 if (import.meta.main) {
-  try { await main(); } catch { console.error("Hosted evidence failed; private diagnostics withheld"); process.exitCode = 1; }
+  try { await main(); } catch (error) { console.error(`Hosted evidence failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
 }

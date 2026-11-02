@@ -39,7 +39,7 @@ jobs:
           SUITE: ${{ matrix.suite }}
         run: bash scripts/e2e.sh "hosted-$SUITE"
 
-      - name: Upload allowlisted evidence only
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

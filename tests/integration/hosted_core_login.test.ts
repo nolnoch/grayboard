@@ -220,6 +220,22 @@ test("a sign-in waiter succeeds whenever the store is live once it holds the loc
   expect(grants()).toBe(1);
 });
 
+test("an automatic sign-in that finds a live grant under the lock runs no flow; an explicit login still does", async () => {
+  // The grant landed before this process read the store, as when two processes
+  // signed out together and the other finished first: the epoch never changes
+  // between this call's read and its lock, so only ifSignedOut can tell.
+  const { store } = await seed({ expiresIn: 3_600_000 });
+  let flows = 0;
+  const l = login({ present: async url => { flows++; await browse(url); } });
+  await l.login(undefined, true);
+  expect(flows).toBe(0);
+  expect((await l.read())!.epoch).toBe(store.epoch);
+  expect(grants()).toBe(1);
+  await l.login();
+  expect(flows).toBe(1);
+  expect(grants()).toBe(2);
+});
+
 test("the resource and the discovered issuer must be canonical HTTPS or loopback HTTP, without credentials, query or fragment", async () => {
   for (const bad of ["http://grayboard.example.com/mcp", "https://user:pw@grayboard.example.com/mcp", "https://grayboard.example.com/mcp?x=1", "https://grayboard.example.com/mcp#f"])
     expect(() => login({ resource: bad })).toThrow("Grayboard resource must be canonical HTTPS (or HTTP loopback)");
