@@ -218,10 +218,30 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
 
 // A self-reported session fact (harness, model, effort; #284 S12) as stored:
 // one line of at most SESSION_FACT_MAX characters, since peer_list puts it in
-// other agents' prompts. Empty is none.
-function cleanFact(v: string | null | undefined): string | null {
-  return v ? oneLine(v).slice(0, SESSION_FACT_MAX) || null : null;
+// other agents' prompts, with the bidi and format characters that could
+// reorder what follows it (the class hosted-core's `shownText` refuses) dropped
+// too: a hosted client sends it over the network (#364). Empty is none.
+export function cleanFact(v: string | null | undefined): string | null {
+  return v ? oneLine(v).replace(/[\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, SESSION_FACT_MAX).trim() || null : null;
 }
+
+/**
+ * Set a session's model and effort to the latest it reported (#364): only a
+ * field the caller names, `undefined` leaving the stored one alone. Returns the
+ * before and after of what changed, or null when nothing did (no write).
+ */
+export function setIdFacts(db: Database, id: string, facts: { model?: string | null; effort?: string | null }): { before: IdSessionFacts; after: IdSessionFacts } | null {
+  const row = db.prepare(`SELECT model, effort FROM ids WHERE id = ?`).get(id) as IdSessionFacts | null;
+  if (!row) return null;
+  const after = {
+    model: facts.model === undefined ? row.model : cleanFact(facts.model),
+    effort: facts.effort === undefined ? row.effort : cleanFact(facts.effort),
+  };
+  if (after.model === row.model && after.effort === row.effort) return null;
+  db.prepare(`UPDATE ids SET model = ?, effort = ? WHERE id = ?`).run(after.model, after.effort, id);
+  return { before: row, after };
+}
+export type IdSessionFacts = { model: string | null; effort: string | null };
 
 /** A session used the bus: its last_seen moves. */
 export function touchId(db: Database, id: string, now = Date.now()): void {

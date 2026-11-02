@@ -9,12 +9,14 @@ import { HUMAN_NAME } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { harnessFor } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
-export type SessionContext = { id: string; raw: string; writesAs?: string } | { missing: string };
+// `facts`: the model and effort the request reports (#364); present only, never a clearing.
+export type SessionFacts = { model?: string; effort?: string };
+export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
   for (const value of [String(user), client, raw]) {
@@ -34,12 +36,27 @@ export function sourceContext(principal: OAuthPrincipal, raw: unknown): SessionC
 }
 export function sessionContext(principal: OAuthPrincipal, meta: unknown): SessionContext {
   const key = principal.sourceKey;
-  const context = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
+  const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
+  if (!("id" in base)) return base;
+  const context = { ...base, ...sessionFacts(meta) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
-  if (!("id" in context) || principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
+  if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_WRITES_AS_META];
   if (typeof raw !== "string" || !raw.length || raw.length > 128) throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_WRITES_AS_META}"] must be an alias name`);
   return { ...context, writesAs: raw };
+}
+// The model and effort a request reports (#364), any client's: display facts that grant nothing. A value that isn't
+// a string is a client bug, refused like a malformed delivery declaration; one too long is cut when stored (`cleanFact`).
+function sessionFacts(meta: unknown): { facts?: SessionFacts } {
+  if (!meta || typeof meta !== "object") return {};
+  const facts: SessionFacts = {};
+  for (const [key, field] of [[GRAYBOARD_MODEL_META, "model"], [GRAYBOARD_EFFORT_META, "effort"]] as const) {
+    if (!(key in meta)) continue;
+    const raw = (meta as Record<string, unknown>)[key];
+    if (typeof raw !== "string") throw new ApplicationError("bad_request", `_meta["${key}"] must be a string`);
+    if (raw.length) facts[field] = raw;
+  }
+  return Object.keys(facts).length ? { facts } : {};
 }
 // A generic-key client's declared delivery (#429): how its sessions receive messages, so
 // `initialize` and bind results describe that delivery with the client's own channel
@@ -138,7 +155,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)));
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -146,6 +163,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, false, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
+    // The latest model and effort a request reports (#364); a write only on a change.
+    if (row && context.facts) application.hostedFacts(p.authed, row.session_id, context.facts);
     return row;
   }
   function rootOf(row: HostedSession): HostedSession {

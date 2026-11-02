@@ -232,9 +232,9 @@ export function initCoreSchema(db: Database): void {
   // audited id.reused rather than registering silently. Unkeyed IDs are
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
-  // Metadata (#284 S12). An ID's model and effort are what its launch
-  // reported (BUS_MODEL, BUS_EFFORT; the former hello), display facts that end
-  // with the session. An alias's task, owner, source_board, spec_hash and
+  // Metadata (#284 S12). An ID's model and effort are what it reported:
+  // at launch in local mode (BUS_MODEL, BUS_EFFORT), the latest on its requests
+  // when hosted (#364), display facts that end with the session. An alias's task, owner, source_board, spec_hash and
   // description are one-line labels its binder sets (`bind(…, meta)`), never
   // a reference or task state (decision 12). When it was bound is
   // binding_events' record, not a column.
