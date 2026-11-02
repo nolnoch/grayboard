@@ -741,17 +741,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return undefined;
     },
     admitHosted,
-    hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
+    // `suggested`: the name the session's checkout suggested (#443), offered first while free.
+    hostedCandidates(authed: AuthedUser, suggested: string | null) { return candidates(hub, authed, suggested); },
     // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
     hostedHolds(id: string): string[] { return holdsOf(db, id); },
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
     // Otherwise the session holds `holds`, reads as them and its
-    // ID, and writes as the oldest; none held reads and nothing else (readOnly).
-    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
+    // ID, and writes as the oldest; none held reads and nothing else (readOnly). `row`: the hosted root's
+    // place and suggested name (#443), null with no row.
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
-      session.place = place;
+      session.place = row?.place ?? null;
       session.readOnly = holds.length === 0 && writesAs === null;
       session.toolsOnly = writesAs !== null;
       if (writesAs !== null) {
@@ -769,7 +771,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
-        ...(session.readOnly ? { candidates: candidates(hub, authed) } : {}),
+        ...(session.readOnly ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
       return { session, info };
     },
@@ -1026,7 +1028,7 @@ function seer(repo: Repo, session: ApplicationSession): (board: Board) => boolea
 }
 
 // A hosted unbound session's candidates: the user's own names nobody holds.
-function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Candidate[] {
+function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null): Candidate[] {
   const { repo, db } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
   const free = (n: string) => n !== HUMAN_NAME && holderOf(db, full(n)) === null;
@@ -1035,8 +1037,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
   const seen = sessionsSeen(db, names.map(full));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
-  const s = suggestedInput?.toLowerCase();
-  const suggested = s !== undefined && free(s) ? s : null;
+  const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;
   return orderCandidates(
     names.map((n) => ({
       name: n, queued: queued.get(full(n)) ?? 0, claims: claims.get(full(n)) ?? 0,
