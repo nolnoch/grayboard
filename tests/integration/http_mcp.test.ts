@@ -7,9 +7,10 @@ import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { writeAudit } from "../../src/server/audit.ts";
+import { verifySessionToken } from "../../src/server/auth.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { WsClient } from "../support/ws_client.ts";
+import { AppSession, type AppSessionOptions } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
@@ -19,7 +20,7 @@ let base: string;
 let blobDir: string;
 let clock: number | undefined;
 const clients: Client[] = [];
-const wsClients: WsClient[] = [];
+const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
@@ -29,7 +30,7 @@ beforeEach(() => {
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
-  for (const client of wsClients.splice(0)) client.close();
+  for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
   app.db.close();
@@ -46,6 +47,16 @@ async function legacyLogin(email = "alice@example.com") {
     if (!app.repo.aliases.find(`${user.email}/${name}`)) app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: name }, user.email);
   }
   return token;
+}
+// An application session (#282) signed in with a session token, as a WSS
+// upgrade resolves it: the launcher and the hello owner the hosted MCP has no
+// form of yet (#451).
+function appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+  const authed = verifySessionToken(token, app.repo, app.touches);
+  if (!authed) throw new Error("appSession: the token doesn't authenticate");
+  const s = new AppSession(app.application, authed, identity, opts);
+  appSessions.push(s);
+  return s;
 }
 async function connect(token: string, identity = "be", version = "2026-07-28", origin?: string, bind = true) {
   const client = new Client({ name: "http-test", version: "1" }, {
@@ -84,11 +95,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
+// hosted twin: #451 (the launcher)
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
   const token = await login();
-  const launcher = new WsClient(base, await legacyLogin(), "allowed", { hello: { launcher: true } });
-  wsClients.push(launcher);
-  expect((await launcher.connect()).type).toBe("hello_ok");
+  await appSession(await legacyLogin(), "allowed", { hello: { launcher: true } }).connect();
   const client = await connect(token, "be", version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("delegate");
   const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));
@@ -99,7 +109,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation u
   expect((value(await client.callTool({ name: "peer_list", arguments: {} })).peers as { handle: string; launcher?: boolean }[]).find(p => p.handle === "alice@example.com/be")?.launcher).toBeUndefined();
 });
 
-for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning WS hello`, async () => {
+// hosted twin: #451 (hello notices)
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning hello`, async () => {
   const token = await login();
   const legacy = await legacyLogin();
   const client = await connect(token, "be", version, undefined, false);
@@ -117,18 +128,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP r
   await connect(token, "be", version, undefined, false);
   expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
 
-  const owner = new WsClient(base, legacy, "be");
-  wsClients.push(owner);
-  const hello = await owner.connect();
-  expect(hello.type).toBe("hello_ok");
+  const hello = await appSession(legacy, "be").connect();
   expect(hello.notices).toEqual([notice]);
   const notified = app.repo.audit.last("bridge.notified", target);
   expect(notified).toBeDefined();
 
-  const next = new WsClient(base, legacy, "allowed");
-  wsClients.push(next);
-  const again = await next.connect();
-  expect(again.type).toBe("hello_ok");
+  const again = await appSession(legacy, "allowed").connect();
   expect(again.notices ?? []).toEqual([]);
   expect(app.repo.audit.last("bridge.notified", target)).toEqual(notified);
 });
@@ -309,6 +314,16 @@ test("live access, family, disable and admin revocation never reuse a cached pri
   }
 });
 
+test("old session remains accepted on retained API but not new MCP", async () => {
+  const token = await legacyLogin();
+  const headers = { Authorization: `Bearer ${token}` };
+  expect((await fetch(`${base}/api/auth/config`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/api/identities`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } })).status).toBe(401);
+});
+
+// The same, and a WSS upgrade with that token opens a socket: the WSS half
+// goes with ws.ts (#282 PR 2); the HTTP halves are the test above.
 test("old session remains accepted on retained API and WS but not new MCP", async () => {
   const token = await legacyLogin();
   const headers = { Authorization: `Bearer ${token}` };

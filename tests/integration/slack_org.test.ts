@@ -1,13 +1,19 @@
 // The org Slack bridge (src/server/slack.ts) end to end: an in-memory server
-// with a fake Slack, and agents as server-mode `grayboard mcp` children.
-// Linking, the human identity's round trip, who may reach it, and unlinking.
+// with a fake Slack, and agents as hosted MCP sessions (#282). Linking, the
+// human identity's round trip, who may reach it, and unlinking. The notice a
+// bridge death owes its owner rides a hello's answer: application sessions.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import type { ReadResult } from "../../src/core/boards.ts";
+import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
+import type { SendResult } from "../../src/shared/protocol.ts";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { FakeSlack } from "./fake_slack.ts";
+import { direct } from "../support/events.ts";
+import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
@@ -17,8 +23,9 @@ const ALICE_SLACK = "U0ALICE";
 let srv: TestServer;
 let slack: FakeSlack;
 
+// Inbox polling spends hosted requests.
 const serve = (apiUrl: string) =>
-  new TestServer({ admins: ["root@example.com"], slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl } });
+  new TestServer({ admins: ["root@example.com"], slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl }, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 
 beforeEach(async () => {
   slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
@@ -28,14 +35,18 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeSessions();
-  srv.stop();
+  await srv.stop();
   slack.stop();
 });
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 
+// A server-mode `grayboard mcp` child: only the plugin-client tests use it,
+// deleted with src/plugin (#282 PR 2).
 const session = (token: string, identity: string) => srv.session(token, identity);
+// An agent: a hosted MCP session of `email`'s, bound to `identity`.
+const hosted = (email: string, identity: string) => srv.hosted(email, identity);
 
 function tsOf(post: Record<string, any>): string {
   const ts = slack.postTs.get(post);
@@ -52,6 +63,7 @@ async function link(token: string): Promise<void> {
   await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 }
 
+// PR 2: deleted with src/plugin (its human="true" marking, src/plugin/mcp.ts:179); the server half is the hosted test after it.
 test("link, then an agent's DM to human is a Slack thread whose reply comes back marked human", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -77,6 +89,32 @@ test("link, then an agent's DM to human is a Slack thread whose reply comes back
   expect(post.thread_ts).toBe(tsOf(top));
 }, 30_000);
 
+test("link, then a hosted agent's DM to human is a Slack thread whose reply comes back from the human", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const me = await api(alice, "GET", "/api/whoami");
+  expect(me.body.identities).toContain("human");
+
+  const be = await hosted("alice@example.com", "be");
+  expect(await be.instructionsNow()).toContain('"human"');
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "Return 204 or []?" });
+  expect(q.delivered_now).toBe(true);
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("204")));
+  expect(top).toMatchObject({ channel: DM, username: "be", markdown_text: "**be** Return 204 or []?" });
+  expect(top.thread_ts).toBeUndefined();
+
+  const { envelope } = slack.say("[] please", { thread_ts: tsOf(top) });
+  const got = (await be.next(direct((m) => m.body === "[] please"), 5000)).event.message;
+  expect(got).toMatchObject({ sender: "alice@example.com/human", parent_id: q.message_id });
+  await until(() => slack.acks.includes(envelope));
+
+  const follow = await be.call<SendResult>("dm_send", { to: "human", body: "done", parent_id: got.id });
+  expect(follow.delivered_now).toBe(true);
+  const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
+  expect(post.thread_ts).toBe(tsOf(top));
+}, 30_000);
+
+// PR 2: deleted with src/plugin (its path uploads, attachments meta text and attachment_get saving to a dir); the server half is the hosted test after it.
 test("attachments cross the org bridge both ways, and the audit log says where they went", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -118,19 +156,57 @@ test("attachments cross the org bridge both ways, and the audit log says where t
   expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
 }, 30_000);
 
+test("attachments cross the org bridge both ways for a hosted session, and the audit log says where they went", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]);
+  const upload = await be.upload("shot.png", png);
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "look", attachment_ids: [upload] });
+  const s = await until(() => slack.shares()[0]);
+  expect(s).toMatchObject({ channel_id: DM, blocks: [{ type: "markdown", text: "**be** look" }] });
+  // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
+  expect(s.username).toBeUndefined();
+  expect(s.thread_ts).toBeUndefined();
+  expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
+
+  // The relay maps the thread once files.info shows the share's ts, which lags the upload.
+  await until(() => srv.app.db.prepare(`SELECT 1 FROM slack_threads WHERE thread_ts = ?`).get(s.ts));
+  slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
+  const got = (await be.next(direct((m) => m.body === "here"), 5000)).event.message;
+  expect(got).toMatchObject({ sender: "alice@example.com/human", parent_id: q.message_id });
+  expect(got.attachments).toEqual([{ id: expect.any(Number), filename: "reply.md", type: "text/markdown", size: 3, sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }]);
+  const id = got.attachments![0]!.id;
+  expect(new TextDecoder().decode(await be.download(id))).toBe("ok\n");
+
+  const audit = (action: string) =>
+    srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
+  const sent = await until(() => audit("attachment.sent_to_slack")[0]);
+  expect(sent.actor).toBe("alice@example.com");
+  const sha256 = createHash("sha256").update(png).digest("hex");
+  expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
+  // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
+  const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  expect(bound).toEqual([
+    { target: `attachment:${q.attachments![0]!.id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
+    { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: got.id, recipient: "alice@example.com/be" },
+  ]);
+  const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
+  expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
+}, 30_000);
+
 test("a file Slack refuses goes back to its sender, and the text carries the warning", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = await session(alice, "be");
+  const be = await hosted("alice@example.com", "be");
   slack.refuseUploads = "file_type_not_allowed";
-  const tmp = mkdtempSync(join(srv.dir, "attach-"));
-  writeFileSync(join(tmp, "shot.png"), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]));
-  const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
+  const upload = await be.upload("shot.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]));
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "look", attachment_ids: [upload] });
   const top = await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("**be** look")));
   expect(top.markdown_text).toBe("**be** look\n\n⚠️ not delivered to Slack: shot.png: file_type_not_allowed");
-  const back = await until(() => be.pushes.find((p) => p.meta.from === "alice@example.com/human"));
-  expect(back.meta.parent_id).toBe(String(q.message_id));
-  expect(back.content).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
+  const back = (await be.next(direct((m) => m.sender === "alice@example.com/human"), 5000)).event.message;
+  expect(back.parent_id).toBe(q.message_id);
+  expect(back.body).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
   const refused = await until(() => srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'attachment.slack_refused'`).get() as { actor: string; target: string; detail: string } | null);
   expect(refused.actor).toBe("alice@example.com");
   expect(JSON.parse(refused.detail)).toMatchObject({ identity: "alice@example.com/human", channel: DM, filename: "shot.png", reason: "file_type_not_allowed", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
@@ -153,7 +229,7 @@ test("files on a Slack message the bus refuses are released, not left holding th
 test("a post Slack refuses is retried and lands once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = await session(alice, "be");
+  const be = await hosted("alice@example.com", "be");
   slack.failPosts = 1;
   await be.call("dm_send", { to: "human", body: "flaky" });
   // The relay retries after 5s; the refused attempt is in posts() but got no ts.
@@ -166,7 +242,7 @@ test("a post Slack refuses is retried and lands once", async () => {
 
 test("only the bridge may hold human: no session binds it", async () => {
   const alice = await login("alice@example.com");
-  expect(await srv.client(alice, "human").connect()).toMatchObject({ type: "error", code: "forbidden" });
+  await expect(srv.appSession(alice, "human").connect()).rejects.toMatchObject({ code: "forbidden" });
   // And not over HTTP either.
   expect((await api(alice, "POST", "/api/identities", { name: "human" })).status).toBe(400);
 }, 30_000);
@@ -174,9 +250,8 @@ test("only the bridge may hold human: no session binds it", async () => {
 test("unexpected bridge bus failures log once and reply generically; expected refusals retain their message", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = srv.client(alice, "be");
-  expect((await be.connect()).type).toBe("hello_ok");
-  expect(await be.request({ type: "send", recipient: "human", body: "diagnostic fixture" })).toMatchObject({ type: "send_ok" });
+  const be = await hosted("alice@example.com", "be");
+  expect(await be.call<SendResult>("dm_send", { to: "human", body: "diagnostic fixture" })).toMatchObject({ message_id: expect.any(Number) });
   const top = await until(() => slack.posts().find(p => p.markdown_text === "**be** diagnostic fixture"));
   const original = srv.app.application.send;
   const logs = spyOn(console, "error").mockImplementation(() => {});
@@ -221,24 +296,24 @@ test("another user's agents reach a human only as teammates", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   await link(alice);
-  const fe = await session(bob, "fe");
+  const fe = await hosted("bob@example.com", "fe");
   // bob hasn't linked, so his sessions pay nothing for the human sentence.
-  expect(fe.c.getInstructions()).not.toContain('dm_send(to="human")');
+  expect(await fe.instructionsNow()).not.toContain('dm_send(to="human")');
 
   await expect(fe.call("dm_send", { to: "alice@example.com/human", body: "hi" })).rejects.toThrow(/reachable only by their teammates/);
   // A bare "human" is your own, and bob hasn't linked.
   await expect(fe.call("dm_send", { to: "human", body: "hi" })).rejects.toThrow(/hasn't linked Slack/);
   await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
-  const blocked = await fe.call("board_post", { board: "e2e", body: "@alice@example.com/human look" });
+  const blocked = await fe.call<BoardPostResult>("board_post", { board: "e2e", body: "@alice@example.com/human look" });
   expect(blocked.unresolved).toEqual(["alice@example.com/human"]);
 
   expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
 
-  expect((await fe.call("dm_send", { to: "alice@example.com/human", body: "hi alice" })).delivered_now).toBe(true);
+  expect((await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "hi alice" })).delivered_now).toBe(true);
   const dm = await until(() => slack.posts().find((p) => p.markdown_text?.endsWith("hi alice")));
   expect(dm.username).toBe("bob@example.com/fe");
-  const ok = await fe.call("board_post", { board: "e2e", body: "@alice@example.com/human look again" });
+  const ok = await fe.call<BoardPostResult>("board_post", { board: "e2e", body: "@alice@example.com/human look again" });
   expect(ok.unresolved ?? []).toEqual([]);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("look again")));
   expect(slack.posts().some((p) => p.markdown_text?.endsWith("@alice@example.com/human look"))).toBe(false);
@@ -247,7 +322,7 @@ test("another user's agents reach a human only as teammates", async () => {
 test("unlink in Slack removes the human; the HTTP unlink then has nothing to remove", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = await session(alice, "be");
+  const be = await hosted("alice@example.com", "be");
 
   slack.say("unlink");
   await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from `alice@example.com`")));
@@ -262,20 +337,13 @@ test("unlink in Slack removes the human; the HTTP unlink then has nothing to rem
 
   // Relinking works and starts fresh.
   await link(alice);
-  expect((await be.call("dm_send", { to: "human", body: "back" })).delivered_now).toBe(true);
+  expect((await be.call<SendResult>("dm_send", { to: "human", body: "back" })).delivered_now).toBe(true);
   await until(() => slack.posts().find((p) => p.markdown_text === "**be** back"));
 }, 30_000);
 
 // The id of the post on #e2e with this body, once it's there.
-async function postId(s: Awaited<ReturnType<typeof session>>, body: string): Promise<number> {
-  const end = Date.now() + 5000;
-  for (;;) {
-    const r = await s.call("board_read", { board: "e2e" });
-    const p = (r.posts as { id: number; body: string }[]).find((p) => p.body === body);
-    if (p) return p.id;
-    if (Date.now() > end) throw new Error("timed out waiting");
-    await Bun.sleep(50);
-  }
+function postId(s: HostedSession, body: string): Promise<number> {
+  return until(async () => (await s.call<ReadResult>("board_read", { board: "e2e" })).posts.find((p) => p.body === body)?.id);
 }
 
 const posted = (text: string) => slack.posts().some((p) => p.markdown_text?.includes(text));
@@ -284,7 +352,7 @@ test("a thread reply reaches a human only as a DM could", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
   await link(alice);
-  const fe = await session(bob, "fe");
+  const fe = await hosted("bob@example.com", "fe");
   await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
   slack.say("#e2e which fixture?");
   const root = await postId(fe, "which fixture?");
@@ -303,7 +371,7 @@ test("a thread reply reaches a human only as a DM could", async () => {
 test("thread replies while unlinked don't flood in at relink", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = await session(alice, "be");
+  const be = await hosted("alice@example.com", "be");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   slack.say("#e2e which fixture?");
   const root = await postId(be, "which fixture?");
@@ -320,8 +388,8 @@ test("thread replies while unlinked don't flood in at relink", async () => {
 test("relinking from another Slack account starts new threads there", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const be = await session(alice, "be");
-  const q = await be.call("dm_send", { to: "human", body: "first" });
+  const be = await hosted("alice@example.com", "be");
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "first" });
   await until(() => posted("first"));
 
   const r = await api(alice, "POST", "/api/slack/link");
@@ -339,7 +407,7 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   // A teammate's agent, since disabling alice also closes her own agents' connections.
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
-  const fe = await session(bob, "fe");
+  const fe = await hosted("bob@example.com", "fe");
   expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
   expect(await fe.call("dm_send", { to: "alice@example.com/human", body: "while disabled" })).toMatchObject({ delivered_now: false });
   await Bun.sleep(500);
@@ -348,29 +416,28 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   await until(() => posted("while disabled"));
 }, 30_000);
 
+// hosted twin: #451 (a hello's notices)
 test("a fatal bridge stop tells the owner on their next hello, once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
   await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
 
-  const { WsClient } = await import("../support/ws_client.ts");
-  const be = new WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
-  const bridgeNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  const hello = await srv.appSession(alice, "be").connect();
+  const bridgeNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
   expect(bridgeNotices).toHaveLength(1);
   expect(bridgeNotices[0]).toContain("your Slack bridge stopped at ");
   expect(bridgeNotices[0]).toContain("link_disabled");
 });
 
+// hosted twin: #451 (a hello's notices)
 test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   const { claim } = await import("../../src/core/claims.ts");
   claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
   srv.app.slack.stop({ fatal: true, detail: "first fatal" });
-  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
-  const notices = ((await be.connect()).notices as string[] | undefined) ?? [];
+  const notices = (await srv.appSession(alice, "be").connect()).notices ?? [];
   const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
   const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
   expect(bridge).toBeGreaterThanOrEqual(0);
@@ -378,13 +445,13 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
   expect(bridge).toBeLessThan(claims);
 });
 
+// hosted twin: #451 (a hello's notices)
 test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop({ fatal: true, detail: "first fatal" });
-  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
-  const first = await be.connect();
-  expect(((first.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+  const first = await srv.appSession(alice, "be").connect();
+  expect((first.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 
   // A second bridge instance (the server-restart analog) re-attaches the same
   // user and dies fatally again inside the dedup window: the death records,
@@ -397,14 +464,14 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   await second.start();
   second.stop({ fatal: true, detail: "second fatal" });
 
-  const fe = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "fe");
-  const hello = await fe.connect();
-  const againNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  const hello = await srv.appSession(alice, "fe").connect();
+  const againNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
   expect(againNotices).toHaveLength(0);
   const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
   expect(count.n).toBe(2);
 });
 
+// hosted twin: #451 (a hello's notices)
 test("a bridge that fails at boot tells its linked users, via the durable links", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -422,13 +489,12 @@ test("a bridge that fails at boot tells its linked users, via the durable links"
   expect(row).toBeDefined();
   expect(JSON.parse(row!.detail!)).toMatchObject({ reason: expect.stringMatching(/not started/) });
 
-  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
-  expect(((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+  const hello = await srv.appSession(alice, "be").connect();
+  expect((hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 });
 
 // A restart inside the dedup window must not lose an armed-but-undelivered
-// notice: the dedup counts notices delivered, not deaths recorded.
+// notice: the dedup counts notices delivered, not deaths recorded. hosted twin: #451 (a hello's notices)
 test("an armed but undelivered notice survives a restart inside the dedup window", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -446,14 +512,13 @@ test("an armed but undelivered notice survives a restart inside the dedup window
   await second.start();
   second.stop({ fatal: true, detail: "token revoked again" });
 
-  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
-  const bridgeNotices = ((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  const hello = await srv.appSession(alice, "be").connect();
+  const bridgeNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
   expect(bridgeNotices).toHaveLength(1);
   expect(bridgeNotices[0]).toContain("token revoked again");
 });
 
-// Trusted human attachment must not consume the owner's notice.
+// Trusted human attachment must not consume the owner's notice. hosted twin: #451 (a hello's notices)
 test("the bridge's own human hello doesn't drain the owner's notice", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
@@ -466,19 +531,17 @@ test("the bridge's own human hello doesn't drain the owner's notice", async () =
   });
   await second.start();
 
-  const be = new (await import("../support/ws_client.ts")).WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
-  expect(((hello.notices as string[] | undefined) ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+  const hello = await srv.appSession(alice, "be").connect();
+  expect((hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 });
 
+// hosted twin: #451 (a hello's notices)
 test("a deliberate bridge teardown stays silent (no audit row, no notice)", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop();
-  const { WsClient } = await import("../support/ws_client.ts");
-  const be = new WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
-  expect((hello.notices as string[] | undefined) ?? []).toHaveLength(0);
+  const hello = await srv.appSession(alice, "be").connect();
+  expect(hello.notices ?? []).toHaveLength(0);
   expect(srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human")).toBeUndefined();
 });
 
@@ -490,7 +553,7 @@ test("a bridge that failed to start issues no codes", async () => {
     expect(r.status).toBe(404);
     expect(r.body.message).toMatch(/isn't running/);
   } finally {
-    down.stop();
+    await down.stop();
   }
 }, 30_000);
 
@@ -503,16 +566,17 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
     const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
     expect(rows.n).toBe(0);
   } finally {
-    down.stop();
+    await down.stop();
   }
 }, 30_000);
 
+// A hello's answer says so; a hosted session's instructions, built from the
+// same fact, drop the human sentence.
 test("helloOk.human.linked is false while the bridge is down", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop({ fatal: true, detail: "recheck" });
-  const { WsClient } = await import("../support/ws_client.ts");
-  const be = new WsClient(srv.base, alice, "be");
-  const hello = await be.connect();
+  const hello = await srv.appSession(alice, "be").connect();
   expect(hello.human?.linked).toBe(false);
+  expect(await (await hosted("alice@example.com", "fe")).instructionsNow()).not.toContain('dm_send(to="human")');
 });
