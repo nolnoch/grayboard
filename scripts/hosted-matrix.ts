@@ -57,5 +57,5 @@ if (import.meta.main) {
   try {
     const bytes = readFileSync(process.argv[2]!);
     if (new Bun.CryptoHasher("sha256").update(bytes).digest("hex") !== matrixLoopSHA) throw new Error("Unknown matrix loop");
-  } catch { console.error("Matrix loop not reviewed; private diagnostics withheld"); process.exitCode = 1; }
+  } catch (error) { console.error(`Matrix loop not reviewed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
 }
