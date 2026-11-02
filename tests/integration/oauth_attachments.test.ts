@@ -128,8 +128,6 @@ test("old API remains session-only and OAuth cannot become admin or WS credentia
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   }
-  const ws = await fetch(`${base}/`, { headers: { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13", Authorization: `Bearer ${alice.token}` } });
-  expect(ws.status).toBe(401);
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
   await connect(alice.token, "2026-07-28");
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);

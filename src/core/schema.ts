@@ -233,7 +233,7 @@ export function initCoreSchema(db: Database): void {
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
   // Metadata (#284 S12). An ID's model and effort are what its launch
-  // reported (BUS_MODEL, BUS_EFFORT; the WSS hello), display facts that end
+  // reported (BUS_MODEL, BUS_EFFORT; the former hello), display facts that end
   // with the session. An alias's task, owner, source_board, spec_hash and
   // description are one-line labels its binder sets (`bind(…, meta)`), never
   // a reference or task state (decision 12). When it was bound is
@@ -241,7 +241,7 @@ export function initCoreSchema(db: Database): void {
   for (const col of ["model", "effort"]) {
     if (!idCols.has(col)) db.exec(`ALTER TABLE ids ADD COLUMN ${col} TEXT`);
   }
-  // token_session: the server's token session (sessions.id) the ID last said
+  // token_session: unused since #282 (nothing writes or reads it; the column stays, schema changes are additive). It held the server's token session (sessions.id) the ID last said
   // hello under (#351), so a logout ends the token's IDs in their grace too,
   // which have no connection to find them by. Server-only; null locally.
   if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);

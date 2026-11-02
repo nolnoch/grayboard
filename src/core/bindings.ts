@@ -496,8 +496,8 @@ export function unbindMissed(name: string, why: string, result: string): string 
 }
 
 /**
- * The notice for holds the server took (alias_lost: an access revocation), in
- * both modes: each loss, then what the session sends as now. Names as the agent
+ * The notice for holds the server took (alias_lost: an access revocation):
+ * each loss, then what the session sends as now. Names as the agent
  * sees them. `primary`: its primary now, or null, when `none` says what it is;
  * `moved`: a lost hold was its primary.
  */

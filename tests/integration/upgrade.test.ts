@@ -360,6 +360,28 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 }, 60_000);
 
+// #282: this tree's server no longer serves `grayboard mcp --mode server` over WebSocket. A 2.x release's
+// process learns that at its first frame and exits with the refusal inside 2 s; a 1.x one is refused the
+// same way but may only time out (older than 1.10.0 never reads the answer), so for it the contract is that
+// no session is registered.
+test(`server: ${FROM}'s \`mcp --mode server\` is refused by this tree's server`, async () => {
+  label = "refusal";
+  srv = new TestServer({ dbPath: join(dir, "grayboard.db") });
+  const token = await srv.login("alice@example.com");
+  const run = (timeoutMs: number) =>
+    runCli(["mcp", "--mode", "server"], { bin: rel.cli, cwd: dir, env: serverEnv(dir, srv!.base, token, "be"), holdStdin: true, timeoutMs });
+  if (FROM.startsWith("v1.")) {
+    await run(15_000).catch(() => undefined);
+  } else {
+    const started = Date.now();
+    const r = await run(2_000);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toContain("no longer serves `grayboard mcp` over WebSocket");
+  }
+  expect((srv.app.db.prepare(`SELECT COUNT(*) AS n FROM ids`).get() as { n: number }).n).toBe(0);
+}, 30_000);
+
 test(`local: a bus ${FROM} wrote opens and reads back`, async () => {
   label = "local";
   const bus = join(dir, "bus");

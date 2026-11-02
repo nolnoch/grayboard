@@ -2,9 +2,9 @@
 // `grayboard mcp` child, on the drivers that outlive it (#282): hosted MCP
 // sessions for tool, DM and delivery semantics, an application session for
 // a multi-alias `as` (#451), and the CLI over /api with sessions seeded by
-// those drivers. Plugin-client behaviour (its frames, reconnects, file paths
-// and presentation) stays in plugin.test.ts until PR 2 deletes it with the
-// client; .claude/tmp/gb282-dispositions/plugin.test.ts.md maps each test.
+// those drivers. The plugin client and its test are deleted (#282 PR 2): what
+// they checked of the plugin itself (frames, reconnects, file paths and
+// presentation) has no live surface to compare, so it isn't here.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -39,7 +39,7 @@ function cli(dir: string) {
 
 // The instructions' active-claims sentence is application-level only: a
 // hosted bind or initialize composes none yet (hosted.ts boundInstructions'
-// empty notices); hub.test.ts's hello_ok notices test covers it.
+// empty notices); hub.test.ts's bind notices test covers it.
 test("a DM and a post queued while a name was free reach its next session at bind", async () => {
   const be = await srv.hosted(A, "be");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
@@ -231,8 +231,8 @@ test("a send or post the server refuses binds none of its uploads; releasing the
 });
 
 // hosted twin: #451 (a second alias, `as`), #460 (resend). The plugin
-// refuses a lost write's repeat once its holds changed (src/plugin/mcp.ts);
-// the server's half is how it matches a repeat: by session, sender and
+// refused a lost write's repeat once its holds changed (the deleted plugin
+// client's rule); the server's half is how it matches a repeat: by session, sender and
 // arguments, so a bind that leaves the sender alone still replays, a repeat
 // under another sender is another write, and resend writes again.
 test("a repeat after the session's holds changed replays while its sender is unchanged; another sender or resend writes again", async () => {

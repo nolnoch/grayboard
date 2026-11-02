@@ -63,7 +63,6 @@ export function nativeTool(tool: Tool): NativeTool {
 }
 export const snapshotTools = (): NativeTool[] => z.array(NativeToolSchema).parse(snapshot);
 
-// The local tool server mode serves too (src/plugin/tools.ts).
 const ATTACHMENT_GET = NativeToolSchema.parse(ATTACHMENT_GET_TOOL);
 // The tools a host registers: dm_send and board_post take local file paths
 // (`attachments`) where the server takes uploaded ids, plus a local

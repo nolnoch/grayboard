@@ -50,7 +50,7 @@ flowchart TD
 |---|---|
 | Commands, gotchas, release runbook, repo rules, hooks | `AGENTS.md` |
 | How docs work | `docs/CONTRACT.md` |
-| Process model, mode selection; the distributed server: auth and sessions, WS protocol, HTTP access rules, server access policy, build and deploy | `docs/architecture.md` |
+| Process model, mode selection; the distributed server: auth and sessions, application sessions and operations, HTTP access rules, server access policy, build and deploy | `docs/architecture.md` |
 | The shared core: boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence; local-mode wakeup; harness adapters and push ownership; delegation (launchers, delegate); tool-surface rules; refused features | `docs/boards.md` |
 | The Slack bridges (local and org) and human handles | `docs/slack-bridge.md` |
 | Unbuilt designs, parked until a trigger | `docs/future/<name>.md` |
@@ -74,7 +74,7 @@ Placement: server-only mechanics → `architecture.md`; anything both modes shar
 ## 6. Conventions
 
 - Markdown is soft-wrapped: one line per paragraph or bullet.
-- Code pointers are repo-relative (`src/server/ws.ts`), optionally `file:line` or `file:function`.
+- Code pointers are repo-relative (`src/server/app.ts`), optionally `file:line` or `file:function`.
 - Every Tier-2 doc opens with a `doc-meta` fence immediately after the H1, so an agent can triage it with one grep (`grep -A6 doc-meta docs/*.md docs/future/*.md 2>/dev/null`; `docs/future/` may be empty, so absent). Keys are fixed; values are terse:
 
   ````

@@ -11,10 +11,10 @@ export function credentialsPath(env = process.env): string {
 }
 
 /**
- * Which bus `grayboard mcp` joins. Signed in to a server (a credentials file
- * exists) → server mode; otherwise local. A signed-out credentials file still
- * counts as server mode, so the MCP server fails with "run grayboard login"
- * instead of quietly moving you to a different bus.
+ * Whether this machine is signed in to a server (a credentials file exists), which the server-mode
+ * commands (`claim`, `claims`, `team`…) use. A signed-out credentials file still counts as server
+ * mode, so they fail with "run grayboard login" instead of quietly moving you to a different bus.
+ * `grayboard mcp` ignores it and is always local (#282).
  */
 export function busMode(env = process.env): "local" | "server" {
   if (env.GRAYBOARD_TOKEN) return "server";

@@ -58,8 +58,8 @@ export function deliveryDeclaration(principal: OAuthPrincipal, meta: unknown): D
 }
 const POLL_NOTE = "No pushes reach this session; check dm_inbox and board_read yourself.";
 // A hosted session with no name reads and nothing else (master's model; see
-// UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
-// as its ID (#284 S13).
+// UNBOUND_READS): its instructions say so, unlike the removed WSS session's, which
+// acted as its ID (#284 S13).
 export function hostedUnboundInstruction(candidates: Candidate[], notes: string[] = []): string {
   const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
@@ -125,23 +125,25 @@ export function createHostedSessions(application: Application, options: { now?: 
   function authorized(p: OAuthPrincipal) {
     if (stopped || !options.isAuthorized(p)) throw new ApplicationError("unauthenticated", "unauthenticated");
   }
-  function rowFor(p: OAuthPrincipal, context: SessionContext, create = true): HostedSession | undefined {
+  // `later`: audit writes for a refusal, run by the caller after its transaction rolls back (the throw takes
+  // a row written inside it, #452).
+  function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true): HostedSession | undefined {
     if (!("id" in context)) return undefined;
     let row = store.get(context.id);
     if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
     if (!row && create) {
       admit(p.authed.user_id);
       const t = now();
-      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true);
+      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs);
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)));
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
-      // its shape is refused on every request, as WSS's re-attach is (#451 A4).
-      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs);
+      // its shape is refused on every request (#451 A4).
+      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, false, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
     return row;
@@ -247,7 +249,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         authorized(p);
         sweep();
-        const row = store.atomic(() => { const r = rowFor(p, context)!; touch(r); return r; });
+        const later: Array<() => void> = [];
+        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later)!; touch(r); return r; }); } catch (e) { for (const w of later) w(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         return fn(row);
       });
@@ -439,11 +442,13 @@ export function createHostedSessions(application: Application, options: { now?: 
       // A push client opens delivery right after bind and reports it itself if it can't. A
       // poll session gets no channel lines, as in its `initialize` text.
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), name = short(result.ok.alias);
-      if (!result.added) return { content: [{ type: "text" as const, text: `already bound to "${name}"` }], structuredContent: { name, instructions: [], ownership: result.ownership } };
+      // A notice the bind consumed (the bridge's death, once) rides the answer, even one for a hold already held.
+      const notices = result.ok.notices ?? [];
+      if (!result.added) return { content: [{ type: "text" as const, text: [`already bound to "${name}"`, ...notices].join(" ") }], structuredContent: { name, instructions: notices, ownership: result.ownership } };
       const note = !declared ? [`No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       // The general part rides the text on a root's first hold: a hosted root has had no bind to carry it before.
-      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => [], [], held.slice(1)), note);
+      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => [], notices, held.slice(1)), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
@@ -486,10 +491,11 @@ export function createHostedSessions(application: Application, options: { now?: 
       const locked = async (index: number): Promise<unknown> => {
         if (index < ids.length) return gate(ids[index]!).bind(() => locked(index + 1));
         await testPauseAsync("hosted:register:before-txn");
-        return store.atomic(() => {
+        const later: Array<() => void> = [];
+        try { return store.atomic(() => {
           authorized(p);
           testPause("hosted:register:in-txn");
-          const root = rowFor(p, context)!;
+          const root = rowFor(p, context, later)!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
           if (before) fence(p, before, before);
           const existing = store.get(childId);
@@ -510,7 +516,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
-        });
+        }); } catch (e) { for (const w of later) w(); throw e; }
       };
       const result = await locked(0);
       reconcile();

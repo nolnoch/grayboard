@@ -262,10 +262,10 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // A root's holds as its user writes them, for a status line.
   private names(e: E) { return (e.held ?? []).map(display).join(", "); }
-  // A whoami's holds the server took (#453), each reported once, for the status line it sets.
+  // A whoami's holds the server took (#453), for the status line it sets.
   private lostNote(current: BindingState) { return current.alias_lost?.length ? ` (lost ${current.alias_lost.map(l => `${display(l.alias)}: ${l.reason}`).join("; ")})` : ""; }
   // Drops the holds a whoami says the server took (#453) from those the root expects, durably, so neither the
-  // run loop nor a resume binds them again and the rest keep receiving, as on WSS. Any other change still pauses.
+  // run loop nor a resume binds them again and the rest keep receiving. Any other change still pauses.
   // The server reports them until the next delivery_open, so a repeat is a no-op; one held again isn't lost.
   private async dropLost(r: Root<E>, current: BindingState) {
     const lost = new Set(current.alias_lost?.map(l => l.alias).filter(address => !current.held.includes(address)));

@@ -67,7 +67,7 @@ describe("dedupWrite", () => {
 
   const SENDER = "a@example.com/be";
   const call = (over: Partial<DedupCall> = {}): DedupCall => ({
-    tool: "dm_send", session: "s1", sender: SENDER, actor: "a@example.com", transport: "wss",
+    tool: "dm_send", session: "s1", sender: SENDER, actor: "a@example.com", transport: "bridge",
     args: { to: "b@example.com/fe", body: "hi" }, resend: false, ...over,
   });
   const send = (body = "hi") => () => {
@@ -97,7 +97,7 @@ describe("dedupWrite", () => {
     expect(row).toMatchObject({ target: SENDER, actor: "a@example.com" });
     expect(JSON.parse(row!.detail)).toEqual({
       tool: "dm_send", fp: fingerprint("dm_send", "s1", SENDER, call().args), ref_kind: "message", ref_id: id,
-      first_at: new Date(1_000).toISOString(), transport: "wss", session: "s1",
+      first_at: new Date(1_000).toISOString(), transport: "bridge", session: "s1",
     });
   });
 

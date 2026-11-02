@@ -1,12 +1,12 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession, type AppEvent } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
-import { createApplication, type DeliveryEvent } from "./application.ts";
+import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { sessionContext } from "./hosted.ts";
@@ -22,8 +22,8 @@ let oauth: ReturnType<typeof createOAuthServer>;
 let mcp: ReturnType<typeof createHostedMcp>;
 let principal: OAuthPrincipal;
 let token: string;
-let recipient: Awaited<ReturnType<typeof application.selectIdentity>>;
-let events: DeliveryEvent[];
+let recipient: AppSession;
+let events: AppEvent[];
 function context() {
   const routing = sessionContext(principal, { [OPENCODE_SESSION_META]: "root" });
   if (!("id" in routing)) throw new Error("fixture source mapping");
@@ -43,8 +43,11 @@ beforeEach(async () => {
   if (authenticated instanceof Response) throw new Error("fixture authentication");
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
-  events = [];
-  recipient = await application.selectIdentity(tokenSession(application.repo, principal.authed), "launcher", { deliver(event) { events.push(event); }, closed() {}, probe: async () => true }, { push: true, launcher: true });
+  recipient = new AppSession(application, principal.authed, "launcher");
+  await recipient.connect();
+  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
+  database.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(recipient.id);
+  events = recipient.events;
 });
 afterEach(async () => {
   await mcp.close(); oauth.close(); application.stopExpiry(); database.db.close();

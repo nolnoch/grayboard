@@ -37,23 +37,22 @@ const caseInsensitive = (() => {
   return found;
 })();
 
-const BEYOND = "beyond the published client and protocol (src/plugin/client.ts, src/shared/protocol.ts)";
+const BEYOND = "beyond the published hosted client (adapters/hosted-core/src/client.ts)";
 
 const BASE = {
-  "src/plugin/client.ts": "export const client = 1;\n",
-  "src/shared/protocol.ts": "export type Frame = {};\n",
+  "adapters/hosted-core/src/client.ts": "export const client = 1;\nexport type Frame = {};\n",
   "src/core/boards.ts": "export const boards = 1;\n",
   "tests/support/until.ts": "export const until = 1;\n",
 };
 
 describe("isolationViolations", () => {
-  test("the published client and protocol, module-internal files, packages, and tests/support from tests pass", () => {
+  test("the published hosted client, module-internal files, packages, and tests/support from tests pass", () => {
     tree({
       ...BASE,
-      "adapters/factory/bus.ts": 'import { client } from "../../src/plugin/client.ts";\nimport type { Frame } from "../../src/shared/protocol.ts";\nimport ts from "typescript";\n',
+      "adapters/factory/bus.ts": 'import { client } from "../hosted-core/src/client.ts";\nimport type { Frame } from "../hosted-core/src/client.ts";\nimport ts from "typescript";\n',
       "adapters/factory/main.ts": 'import "./bus.ts";\n',
       // Bun resolves these to the published files.
-      "adapters/factory/ext.ts": 'import { client } from "../../src/plugin/client";\nimport type { Frame } from "../../src/shared/protocol.js";\n',
+      "adapters/factory/ext.ts": 'import { client } from "../hosted-core/src/client";\nimport type { Frame } from "../hosted-core/src/client.js";\n',
       "adapters/factory/view.jsx": 'import "./main.ts";\n',
       "adapters/factory/bus.test.ts": 'import { until } from "../../tests/support/until.ts";\n',
       // Text that only looks like an import.
@@ -84,7 +83,7 @@ describe("isolationViolations", () => {
     for (const [form, code] of Object.entries(forms)) {
       const dir = tree({ ...BASE, "adapters/factory/x.ts": `${code}\n` });
       expect(isolationViolations(dir), form).toEqual([
-        "adapters/factory/x.ts: imports src/core/boards.ts, beyond the published client and protocol (src/plugin/client.ts, src/shared/protocol.ts)",
+        "adapters/factory/x.ts: imports src/core/boards.ts, beyond the published hosted client (adapters/hosted-core/src/client.ts)",
       ]);
       rmSync(dir, { recursive: true, force: true });
     }
@@ -99,8 +98,8 @@ describe("isolationViolations", () => {
       "adapters/factory/c.ts": 'import x from "../../../elsewhere.ts";\n',
     });
     expect(isolationViolations(root!)).toEqual([
-      "adapters/factory/a.ts: imports tests/support/until.ts, beyond the published client and protocol (src/plugin/client.ts, src/shared/protocol.ts)",
-      "adapters/factory/b.ts: imports adapters/pi/grayboard.ts, beyond the published client and protocol (src/plugin/client.ts, src/shared/protocol.ts)",
+      "adapters/factory/a.ts: imports tests/support/until.ts, beyond the published hosted client (adapters/hosted-core/src/client.ts)",
+      "adapters/factory/b.ts: imports adapters/pi/grayboard.ts, beyond the published hosted client (adapters/hosted-core/src/client.ts)",
       "adapters/factory/c.ts: imports ../../../elsewhere.ts, outside the repo",
     ]);
   });
@@ -111,7 +110,7 @@ describe("isolationViolations", () => {
     mkdirSync(join(root!, "adapters/factory"), { recursive: true });
     writeFileSync(join(root!, "adapters/factory/x.ts"), `import "${join(root!, "src/core/boards.ts")}";\n`);
     expect(isolationViolations(root!)).toEqual([
-      "adapters/factory/x.ts: imports src/core/boards.ts, beyond the published client and protocol (src/plugin/client.ts, src/shared/protocol.ts)",
+      "adapters/factory/x.ts: imports src/core/boards.ts, beyond the published hosted client (adapters/hosted-core/src/client.ts)",
     ]);
   });
 
@@ -148,6 +147,17 @@ describe("isolationViolations", () => {
     expect(isolationViolations(root!)).toEqual([
       "src/cli/main.ts: src/ imports the factory module (../../adapters/factory/main.ts)",
       "src/core/delegation.ts: src/ imports the factory module (../../adapters/factory/main.ts)",
+    ]);
+  });
+
+  test("the hosted client importing the factory module is caught too", () => {
+    tree({
+      ...BASE,
+      "adapters/factory/main.ts": "export const factory = 1;\n",
+      "adapters/hosted-core/src/client.ts": 'import "../../factory/main.ts";\n',
+    });
+    expect(isolationViolations(root!)).toEqual([
+      "adapters/hosted-core/src/client.ts: adapters/hosted-core/src/ imports the factory module (../../factory/main.ts)",
     ]);
   });
 
