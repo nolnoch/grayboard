@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Binding } from "../src/binding.js";
+import { AccessExpired, Refusal } from "../src/core/model.js";
 
 export function fixture() {
   const config: { type: "remote"; url: string; headers: Record<string, string>; oauth?: false | { client_id?: string; scope?: string } } = { type: "remote", url: "https://grayboard.example.com/mcp", headers: {} };
@@ -8,6 +9,7 @@ export function fixture() {
   let status: string | undefined;
   const metadata = { serverUrl: config.url, issuer: "https://grayboard.example.com", scope: "grayboard:tools grayboard:delivery", client: { client_id: "https://opencode.ai/oauth/opencode/client.json", get client_secret(): never { throw new Error("Client secret must never be read"); } } };
   let afterResolve = () => {};
+  const storage = new Map<string, unknown>();
   const observers = new Set<(editor: { get(name: string): unknown }) => void>();
   const reload = () => { for (const observer of observers) observer({ get: () => config }); };
   const ctx = {
@@ -22,9 +24,11 @@ export function fixture() {
         resolve: async () => { resolutions++; afterResolve(); return { type: "oauth", access, expires, metadata, get refresh(): never { throw new Error("Refresh must never be read"); } }; },
       },
     },
+    storage: { get: async (key: string) => storage.get(key), set: async (key: string, value: unknown) => { storage.set(key, value); } },
   } as unknown as Context;
   const binding = new Binding(ctx, "grayboard", () => { drifts++; });
-  return { ctx, binding, config, metadata, reload, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, afterResolve: (callback: () => void) => { afterResolve = callback; } };
+  // `rotate`: the host stores a new access token, expiring `ms` from now (OpenCode's own refresh).
+  return { ctx, binding, config, metadata, reload, storage, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, rotate: (value: string, ms = 60_000) => { access = value; expires = Date.now() + ms; }, afterResolve: (callback: () => void) => { afterResolve = callback; } };
 }
 test("native discovery needs no explicit OAuth block or fixed name; exact grant is projected", async () => {
   const f = fixture(), e = await f.binding.capture("R");
@@ -58,6 +62,30 @@ test("native expiry and status refuse; no refresh or private secret is read", as
   await expect(f.binding.access(e)).rejects.toThrow("Signed out of grayboard in OpenCode; reconnect or sign in using OpenCode");
   const g = fixture(), expected = await g.binding.capture("R"); g.status("needs_auth");
   await expect(g.binding.access(expected)).rejects.toThrow("authentication");
+});
+// #472: the server's expiry precedes OpenCode's stored one by the token
+// response's latency, so a request can 401 just before the host refreshes.
+test("a 401 at the token's stored expiry is the rollover, not a rejection; a token the host already replaced retries", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  const rejected = () => [...f.storage.keys()].filter(key => key.startsWith("rejectedAccess:"));
+  const token = await f.binding.token(e);
+  f.rotate(token, 2_000);
+  const expiry = await f.binding.unauthorized(e, token).catch(error => error);
+  expect(expiry).toBeInstanceOf(AccessExpired);
+  expect(expiry.reason).toBe("expired");
+  expect(rejected()).toEqual([]);
+  expect(await f.binding.token(e)).toBe(token);
+  // OpenCode stored its refresh before the 401 arrived: the SDK's retry sends the new token.
+  f.rotate("fake-access-two");
+  await f.binding.unauthorized(e, token);
+  expect(rejected()).toEqual([]);
+  expect(await f.binding.token(e)).toBe("fake-access-two");
+  // A 401 for a token far from its expiry is still a rejection (#388 item 8).
+  const refusal = await f.binding.unauthorized(e, "fake-access-two").catch(error => error);
+  expect(refusal).toBeInstanceOf(Refusal);
+  expect(refusal).not.toBeInstanceOf(AccessExpired);
+  expect(rejected()).toHaveLength(1);
+  await expect(f.binding.token(e)).rejects.toThrow("Native access was rejected");
 });
 test("static authority headers and disabled OAuth never become subscriber authority", async () => {
   for (const key of ["Authorization", "X-Grayboard-Identity", "X-Grayboard-Lease", "X-Grayboard-Client"]) {

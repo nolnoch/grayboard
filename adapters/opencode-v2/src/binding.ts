@@ -8,6 +8,11 @@ import type { OpenCodeEnrollment } from "./approval.js";
 export const SIGN_IN = "reconnect or sign in using OpenCode";
 type Expected = Pick<OpenCodeEnrollment, "configuration" | "integrationID" | "connectionID">;
 const fingerprint = (token: string) => createHash("sha256").update(token).digest("hex");
+// A client stamps a token's `expires` when the token response arrives, so the
+// server's own expiry precedes OpenCode's stored one by that response's
+// latency (clock skew between the hosts cancels out). A 401 this close to the
+// stored expiry is the hourly rollover, not a rejection (#472).
+const EXPIRY_SKEW_MS = 5_000;
 // OpenCode's native MCP grant as the Controller's credential: the plugin reads
 // the host's current access token and never refreshes it. `drift` latches every
 // root when the endpoint, account or grant behind an enrollment changed.
@@ -71,7 +76,7 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     const scope = [...new Set(m.scope.split(/\s+/).filter(Boolean))].sort();
     if (!scope.includes("grayboard:tools") || !scope.includes("grayboard:delivery")) throw new Refusal("auth", "Native grant needs both Grayboard scopes");
     const configuration: Configuration = { ...endpoint, issuer: m.issuer, clientID: m.client.client_id, scope: scope.join(" ") };
-    return { configuration, access: credential.access };
+    return { configuration, access: credential.access, expires: credential.expires };
   }
   private async projection(expected?: Expected) {
     const endpoint = await this.configuration();
@@ -89,7 +94,8 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     return { version: 2, sessionID, mcpName: this.name, ...captured };
   }
   async check(expected: Expected) { await this.projection(expected); }
-  async access(expected: Expected) {
+  // The host's current access token for `expected`, with its stored expiry.
+  private async stored(expected: Expected) {
     await this.check(expected);
     const endpoint = await this.configuration();
     if (!same(endpoint, { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.mismatch();
@@ -97,15 +103,23 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     const projected = await this.project(selected, endpoint);
     if (!same(projected.configuration, expected.configuration)) this.mismatch();
     await this.check(expected);
-    return projected.access;
+    return projected;
   }
+  async access(expected: Expected) { return (await this.stored(expected)).access; }
   private rejected(e: Expected) { return `rejectedAccess:${e.integrationID}:${e.connectionID}`; }
   async token(e: OpenCodeEnrollment) {
     const token = await this.access(e);
     if (await this.ctx.storage.get(this.rejected(e)) === fingerprint(token)) throw new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
     return token;
   }
+  // A 401 for `token`: returns when the host already replaced it (the SDK
+  // retries with the new one); at its stored expiry it is the rollover
+  // (AccessExpired, which the Controller waits out); otherwise the server
+  // rejected it, recorded so token() refuses it until native auth changes.
   async unauthorized(e: OpenCodeEnrollment, token: string) {
+    const stored = await this.stored(e);
+    if (token && stored.access !== token) return;
+    if (stored.expires - Date.now() <= EXPIRY_SKEW_MS) throw new AccessExpired("OpenCode", SIGN_IN);
     if (token) await this.ctx.storage.set(this.rejected(e), fingerprint(token));
     throw new Refusal("auth", "Restore authentication through native MCP; the plugin never refreshes credentials");
   }
