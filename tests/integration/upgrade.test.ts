@@ -72,7 +72,10 @@ afterEach(async () => {
       await b?.stop();
     },
     () => closeSessions(),
-    () => Promise.all(releaseHosted.splice(0).map((s) => s.close())),
+    async () => {
+      const failed = (await Promise.allSettled(releaseHosted.splice(0).map((s) => s.close()))).find((r) => r.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+    },
     () => {
       slack?.stop();
       slack = undefined;
@@ -233,6 +236,8 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   const authorize = await request(`${issuer}/oauth/authorize?` + new URLSearchParams({ ...binding, response_type: "code", scope: HOSTED_SCOPES.join(" "), state: secret(),
     code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }));
   expect(authorize.status, await authorize.clone().text()).toBe(303);
+  // Anywhere else (Google's sign-in) means the release refused the hand-written session.
+  expect(authorize.headers.get("Location"), "the release didn't accept the hand-written oauth_browsers session").toStartWith(`${issuer}/oauth/consent`);
   const page = await (await request(authorize.headers.get("Location")!)).text();
   const form = { request: /name="request" value="([^"]+)"/.exec(page)?.[1] ?? "", csrf: /name="csrf" value="([^"]+)"/.exec(page)?.[1] ?? "" };
   const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ ...form, decision: "approve" }) });
@@ -431,6 +436,9 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   const be = await session("alice@example.com", "be");
   const fe = await session("bob@example.com", "fe");
   const w = await writeAll(be, fe, "bob@example.com/fe", "alice@example.com/be");
+  // Every write path exists from v2.3.0 on: no probe may skip one. (A copy: bun's toMatchObject writes its
+  // asymmetric matchers into the object it checks.)
+  if (HOSTED_ONLY) expect({ ...w }).toMatchObject({ muted: true, watched: true, inbox: true, acked: true, queued: expect.any(Number), attachment: expect.any(Number), postFile: expect.any(Number) });
   const creds = join(dir, "alice-credentials");
   writeFileSync(creds, JSON.stringify({ session_token: alice, server: old.base, user_email: "alice@example.com" }));
   const team = (bin?: string, ...args: string[]) => runCli(["team", ...args], { bin, cwd: dir, env: serverEnv(dir, old!.base, alice, "be", { GRAYBOARD_CREDENTIALS: creds }) });
