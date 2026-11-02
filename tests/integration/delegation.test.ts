@@ -1,11 +1,10 @@
 // Delegation (#184): local-mode sessions (separate `grayboard mcp --mode
 // local` children) over real processes, and the server's: a requester on a
 // hosted MCP session, a launcher on an application session, since a hosted
-// session can't be a launcher yet (#451). The three tests that audit a
-// refused delegate stay on server-mode sessions until #452. The launcher
-// opt-in, the delegate tool's resolution rules, the payload's
-// harness-neutrality, the human fallback, and result-return through the
-// pending/promise machinery.
+// session can't be a launcher yet (#451). The launcher opt-in, the delegate
+// tool's resolution rules, the payload's harness-neutrality, the human
+// fallback, refusals and their audit rows (kept by a hosted call since #452),
+// and result-return through the pending/promise machinery.
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -179,33 +178,28 @@ test("server: the hello's launcher flag records the capability; delegate deliver
   }
 }, 30_000);
 
-// hosted twin: #452
 test("server: delegation stays within the requester's user (review 1-2)", async () => {
-  const srv = new TestServer();
+  const srv = serve();
   try {
     // Two users, one launcher each. alice's launcher sorts before bob's.
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
-    const aliceBe = await srv.session(alice, "be", { BUS_LAUNCHER: "1" });
-    await srv.session(bob, "be", { BUS_LAUNCHER: "1" });
-    const bobSim = await srv.session(bob, "sim");
+    const aliceBe = srv.appSession(alice, "be", { hello: { launcher: true } });
+    await aliceBe.connect();
+    await srv.appSession(bob, "be", { hello: { launcher: true } }).connect();
+    const bobSim = await srv.hosted("bob@b.com", "sim");
 
     // Auto-pick: bob's own launcher takes it, never alice's (whose handle
     // sorts first), and the human fallback doesn't fire while bob's launcher
     // is live.
-    const r = await call(bobSim.c, "delegate", { persona: "a researcher", task: "t" });
+    const r = await bobSim.call<Delegated>("delegate", { persona: "a researcher", task: "t" });
     expect(r.to).toBe("bob@b.com/be");
     expect(r.human_fallback).toBeUndefined();
 
-    // An explicit cross-user `to` is refused, naming the scope.
-    try {
-      await call(bobSim.c, "delegate", { persona: "p", task: "t", to: "alice@example.com/be" });
-      throw new Error("expected a refusal");
-    } catch (e) {
-      expect((e as Error).message).toMatch(/own user|authority ruling/);
-    }
+    // An explicit cross-user `to` is refused, naming the scope...
+    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/own user|authority ruling/);
     // ...and nothing landed on alice's launcher.
-    expect(aliceBe.pushes.length).toBe(0);
+    await aliceBe.none(direct());
 
     // The audit names the refusals and the request (review 4).
     const audits = srv.app.db.query(`SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
@@ -215,7 +209,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     const sets = srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'handle.launcher_set'`).get() as any;
     expect(sets.n).toBeGreaterThanOrEqual(2);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 30_000);
 
@@ -276,24 +270,17 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   }
 }, 30_000);
 
-// hosted twin: #452
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
   // No launcher live, human not linked: refused with the undo.
-  const srv = new TestServer();
+  const srv = serve();
   try {
-    const token = await srv.login("you@example.com");
-    const sim = await srv.session(token, "sim");
-    try {
-      await call(sim.c, "delegate", { persona: "p", task: "t" });
-      throw new Error("expected a refusal");
-    } catch (e) {
-      expect((e as Error).message).toMatch(/no live launcher session/);
-    }
+    const sim = await srv.hosted("you@example.com", "sim");
+    await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/no live launcher session/);
     // The refusal is audited with its reason.
     const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC`).get() as any;
     expect(JSON.parse(refused.detail).reason).toMatch(/no live launcher session/);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 30_000);
 
@@ -362,11 +349,10 @@ test("server: a hold owner with the launcher flag isn't advertised or instructed
   }
 }, 30_000);
 
-// hosted twin: #452
 test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
-  const srv = new TestServer({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  const srv = serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   try {
     await srv.app.slackReady;
     const token = await srv.login("alice@example.com");
@@ -376,8 +362,8 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     slack.say(`link ${r.body.code}`);
     await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 
-    const sim = await srv.session(token, "sim");
-    const req = await call(sim.c, "delegate", { persona: "a researcher", task: "t" });
+    const sim = await srv.hosted("alice@example.com", "sim");
+    const req = await sim.call<Delegated>("delegate", { persona: "a researcher", task: "t" });
     expect(req.to).toBe("alice@example.com/human");
     expect(req.human_fallback).toBe(true);
     expect(req.note).toContain("settle the thread");
@@ -393,18 +379,18 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
     srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`);
-    await expect(call(sim.c, "delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
+    await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
     const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);
     const lastRefused = after.filter((a) => a.action === "delegation.refused").at(-1)!;
     expect(JSON.parse(lastRefused.detail).reason).toMatch(/not found/);
 
     // An unresolvable `to` is audited as a refusal too (review 4).
-    await expect(call(sim.c, "delegate", { persona: "p", task: "t", to: "ghost" })).rejects.toThrow();
+    await expect(sim.call("delegate", { persona: "p", task: "t", to: "ghost" })).rejects.toThrow();
     const final = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid`).all() as any[];
     expect(JSON.parse(final.at(-1)!.detail).reason).toBeTruthy();
   } finally {
-    srv.stop();
+    await srv.stop();
     slack.stop();
   }
 }, 40_000);
