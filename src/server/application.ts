@@ -787,14 +787,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // undeliverableId read ids.writes_as, so a send to its ID is pointed at the alias.
       if (!prior) {
         repo.atomic(() => {
-          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(facts?.model ? { model: facts.model } : {}), ...(facts?.effort ? { effort: facts.effort } : {}) });
-          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(facts?.model ? { model: cleanFact(facts.model) } : {}), ...(facts?.effort ? { effort: cleanFact(facts.effort) } : {}) });
+          const model = cleanFact(facts?.model), effort = cleanFact(facts?.effort);
+          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
         });
       }
       else {
         touchId(db, id);
         // A new ownership of the same ID reports its own model and effort: what the last one reported is stale.
-        setIdFacts(db, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
+        const changed = setIdFacts(db, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
+        if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
         if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
       }
@@ -803,7 +805,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // before and after, only when one changed. Absent fields keep the stored value.
     hostedFacts(authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
       const changed = setIdFacts(db, id, facts);
-      if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after });
+      if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
     },
     // A tools-only declaration's alias, resolved and checked: a name the
     // principal may act in, never one another user's session uses (S7, S8); it may share the

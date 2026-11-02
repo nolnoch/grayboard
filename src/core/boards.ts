@@ -218,11 +218,12 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
 
 // A self-reported session fact (harness, model, effort; #284 S12) as stored:
 // one line of at most SESSION_FACT_MAX characters, since peer_list puts it in
-// other agents' prompts, with the bidi and format characters that could
-// reorder what follows it (the class hosted-core's `shownText` refuses) dropped
-// too: a hosted client sends it over the network (#364). Empty is none.
+// other agents' prompts. Format characters (\p{Cf}: the bidi controls that
+// could reorder what follows, direction marks, zero-width characters) go
+// first, then the line is folded, then NFC, so match:{model} compares what a
+// reader sees: a hosted client sends it over the network (#364). Empty is none.
 export function cleanFact(v: string | null | undefined): string | null {
-  return v ? oneLine(v).replace(/[\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, SESSION_FACT_MAX).trim() || null : null;
+  return v ? oneLine(v.replace(/\p{Cf}/gu, "")).normalize("NFC").slice(0, SESSION_FACT_MAX).trim() || null : null;
 }
 
 /**

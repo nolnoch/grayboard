@@ -58,6 +58,13 @@ function sessionFacts(meta: unknown): { facts?: SessionFacts } {
   }
   return Object.keys(facts).length ? { facts } : {};
 }
+// A request `_meta` with the model and effort removed: for a replayed meta (a legacy GET routes by its POST's), whose
+// facts are stale and would revert the latest (#364).
+export function withoutFacts(meta: unknown): unknown {
+  if (!meta || typeof meta !== "object" || !(GRAYBOARD_MODEL_META in meta || GRAYBOARD_EFFORT_META in meta)) return meta;
+  const { [GRAYBOARD_MODEL_META]: _model, [GRAYBOARD_EFFORT_META]: _effort, ...rest } = meta as Record<string, unknown>;
+  return rest;
+}
 // A generic-key client's declared delivery (#429): how its sessions receive messages, so
 // `initialize` and bind results describe that delivery with the client's own channel
 // source. Text only: it grants and authorizes nothing, so nothing audits it. Other
