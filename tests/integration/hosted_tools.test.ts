@@ -508,3 +508,20 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
     { actor: A, identity: `${A}/be`, filename: "c.txt", size: 30, reason: over.body.message },
   ]);
 });
+
+// #463 item 1: a hosted session with no name holds no lease and receives nothing, so peer_list doesn't list it (WSS listed its
+// unbound sessions because they received mail addressed to their ID). This is the intended behaviour, docs/architecture.md §4.
+test("#463: an unbound hosted session is not listed in peer_list, for its user or anyone", async () => {
+  const be = await srv.hosted(A, "be");
+  await srv.hosted(A, null);
+  expect((await be.call<{ unbound_sessions?: unknown }>("peer_list")).unbound_sessions).toBeUndefined();
+});
+
+// #463 item 2: the hosted whoami names the session ID and the principal beside the holds, as the local and WSS ones did.
+test("#463: whoami names the session ID, the holds oldest first and the principal", async () => {
+  const s = await srv.hosted(A, null);
+  expect(await s.call("whoami")).toMatchObject({ id: expect.stringMatching(/^id:/), principal: A, held: [], primary: null, unbound: true });
+  await s.bind("zed");
+  await s.bind("alpha");
+  expect(await s.call("whoami")).toMatchObject({ principal: A, held: [`${A}/zed`, `${A}/alpha`], primary: `${A}/zed` });
+});

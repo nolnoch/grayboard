@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { SendResult } from "../../src/server/application.ts";
+import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
@@ -73,7 +74,7 @@ test("dm_ack takes a list: unknown ids are reported beside the acked, and all un
 // check (hosted.ts), with bad_request and a shorter reason.
 test("a bind to the reserved human name is refused and leaves the session unbound", async () => {
   const s = await srv.hosted(A, null);
-  await expect(s.bind("human")).rejects.toMatchObject({ code: "bad_request", message: "human is reserved for the trusted bridge" });
+  await expect(s.bind("human")).rejects.toMatchObject({ code: "forbidden", message: HUMAN_RESERVED });
   expect(await s.call("whoami")).toHaveProperty("unbound", true);
 });
 
