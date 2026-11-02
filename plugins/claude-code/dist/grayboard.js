@@ -14157,7 +14157,7 @@ class StdioServerTransport {
 // package.json
 var package_default = {
   name: "grayboard",
-  version: "2.2.0",
+  version: "2.3.0",
   description: "Durable Claude-to-Claude message bus over the channels protocol",
   type: "module",
   private: true,
