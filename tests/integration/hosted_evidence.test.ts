@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { junit, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -72,7 +72,7 @@ const matrixModes: Record<string, { raw: string; exit: number }> = {
   "matrix-truncated": { raw: matrixReady.slice(0, -1), exit: 0 },
   "matrix-oversized": { raw: "SECRET".repeat(2000), exit: 0 },
 };
-for (const mode of ["assertion", "truncated", "crash", "provenance", "success", "cross-filesystem", ...Object.keys(invalidXML), ...Object.keys(matrixModes)]) test.skipIf(mode === "cross-filesystem" && process.platform !== "linux")(`hosted evidence allowlist: ${mode} never publishes raw diagnostics`, () => {
+for (const mode of ["assertion", "truncated", "crash", "provenance", "success", "cross-filesystem", ...Object.keys(invalidXML), ...Object.keys(matrixModes)]) test.skipIf(mode === "cross-filesystem" && process.platform !== "linux")(`hosted evidence allowlist: ${mode} publishes the output and a verdict`, () => {
   const matrixMode = matrixModes[mode];
   const success = mode === "success" || mode === "cross-filesystem" || mode === "matrix-success";
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
@@ -143,28 +143,26 @@ esac
   expect(metadata(join(parent, ".git"))).toBe(before);
   expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
   const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(output);
-  for (const value of secrets) { expect(terminal.includes(value)).toBe(false); expect(published.includes(value)).toBe(false); }
   expect(result.exitCode).toBe(success ? 0 : 1);
   expect(readFileSync(join(output, "result"), "utf8")).toContain(success ? "passed" : "failed");
-  const xml = readFileSync(join(output, "evidence/unit.xml"), "utf8");
-  expect(xml).toContain(success ? 'failures="0"' : '<failure message="Private diagnostics withheld"/>');
+  const evidence = join(output, "evidence"), diagnostics = readFileSync(join(evidence, "diagnostics.log"), "utf8");
+  // The child's output reaches the job log and the retained evidence alike.
   if (mode === "assertion") {
-    expect(texts(join(root, "private"))).toContain(secrets[0]!);
-    expect(xml).toContain('tests="5" failures="5"');
+    for (const value of secrets.slice(0, 1)) { expect(terminal).toContain(value); expect(diagnostics).toContain(value); }
+    expect(readFileSync(join(evidence, "unit.xml"), "utf8")).toContain(secrets[0]!);
+    expect(readFileSync(join(evidence, "unrecognized.log"), "utf8")).toBe(secrets[2]);
   }
-  const summary = JSON.parse(readFileSync(join(output, "evidence/summary.json"), "utf8"));
+  if (matrixMode) { expect(terminal).toContain(secrets[0]!); expect(diagnostics).toContain(secrets[0]!); }
+  const summary = JSON.parse(readFileSync(join(evidence, "summary.json"), "utf8"));
   expect(summary.evidenceProcessed).toBe(mode === "assertion" || success || ["matrix-prepare", "matrix-interrupted", "matrix-exit"].includes(mode));
-  const names = readdirSync(join(output, "evidence"));
-  const allowlist = ["exit", "hosted.log", "provenance.json", "result", "source-revision", "source-status", "summary.json", "unit.xml", ...(matrixMode ? ["matrix.json"] : [])];
-  expect(names.every(name => allowlist.includes(name))).toBe(true);
-  expect(names.includes("matrix.json")).toBe(!!matrixMode);
+  if (!summary.evidenceProcessed) expect(summary.problem).toBeString();
+  expect(existsSync(join(evidence, "matrix.json"))).toBe(!!matrixMode);
   if (matrixMode) {
-    const data = JSON.parse(readFileSync(join(output, "evidence/matrix.json"), "utf8"));
+    const data = JSON.parse(readFileSync(join(evidence, "matrix.json"), "utf8"));
     expect(data.phase).toBe(mode === "matrix-success" ? "complete" : mode === "matrix-prepare" ? "prepare" : ["matrix-interrupted", "matrix-exit"].includes(mode) ? "case" : "invalid");
     expect(summary.runtimeExit).toBe(matrixMode.exit);
-    expect(names.length).toBe(summary.evidenceProcessed ? 9 : 6);
   }
-  if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(output, "evidence/result"), "utf8")).toBe("failed\n"); }
+  if (invalidXML[mode]) { expect(summary.runtimeExit).toBe(0); expect(summary.exit).toBe(1); expect(readFileSync(join(evidence, "result"), "utf8")).toBe("failed\n"); }
 }, 30_000);
 
 test("each hosted suite requires its complete actual installation inventory and flags", () => {
@@ -204,12 +202,9 @@ test("fixture Git filtering covers documented local variables without clearing t
   expect(repositoryGitEnv({ ...Object.fromEntries(names.map(name => [name, "fixture-only"])), PATH: "/fixture/bin", GIT_SSH_COMMAND: "ssh" })).toEqual({ PATH: "/fixture/bin", GIT_SSH_COMMAND: "ssh" });
 });
 
-test("JUnit rejects partial metadata and strips all names, diagnostics and attributes", () => {
-  expect(() => junit('<testsuites tests="1" failures="0" skipped="0">', false)).toThrow();
-  const xml = junit(document('<testcase name="arbitrary-secret"><system-out>&amp;&lt;&gt;&quot;&apos;&#65;&#x1F600;</system-out></testcase>'), true);
-  expect(xml).not.toContain("arbitrary-secret"); expect(xml).toContain('tests="2" failures="1"');
-  const properties = junit(document('<properties><property name="ci" value="https://ci.example.com/&amp;private-property"/><property name="commit" value="private-property"/></properties><testcase/>'), false);
-  expect(properties).toContain('tests="1" failures="0"'); expect(properties.includes("private-property")).toBe(false); expect(properties.includes("property")).toBe(false);
-  expect(() => junit(" ".repeat(8 * 1024 * 1024) + document(), false)).toThrow();
-  expect(() => junit(document('<testcase><system-out>\u0000</system-out></testcase>'), false)).toThrow();
+test("JUnit counts reject partial or inconsistent documents and read the failure count of a valid one", () => {
+  expect(() => junitCounts('<testsuites tests="1" failures="0" skipped="0">')).toThrow();
+  expect(junitCounts(document('<testcase name="a"><failure/></testcase><testcase name="b"/>', 'tests="2" failures="1" skipped="0"'))).toEqual({ tests: 2, failures: 1, skipped: 0 });
+  expect(() => junitCounts(" ".repeat(8 * 1024 * 1024) + document())).toThrow();
+  expect(() => junitCounts(document('<testcase><system-out>\u0000</system-out></testcase>'))).toThrow();
 });
