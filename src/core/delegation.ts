@@ -34,12 +34,6 @@ export function launchers(db: Database): string[] {
   return (db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-// The session's capability, rewritten by each of its owner hellos on a server
-// (local mode records it when the session registers).
-export function setLauncher(db: Database, id: string, on: boolean): void {
-  db.prepare(`UPDATE ids SET launcher = ? WHERE id = ?`).run(on ? 1 : 0, id);
-}
-
 // An explicit delegate(to) may name any alias a launcher session holds.
 export function isLauncher(db: Database, handle: string): boolean {
   return !!db.prepare(`${LAUNCHER_SQL} AND a.address = ?`).get(handle);

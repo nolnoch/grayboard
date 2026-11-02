@@ -1,7 +1,7 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createWsRefusal, type RefusalData } from "./ws_refusal.ts";
-import { SWEEP_MS, createApplication, type ApplicationOptions } from "./application.ts";
+import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
 import { createHostedMcp } from "./mcp.ts";
@@ -29,7 +29,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const application = createApplication(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,
   });
-  const { revalidate, disconnectUser, disconnectSession, accessChanged, stopExpiry, wake, sweepSessions } = application;
+  const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
   const refusal = createWsRefusal();
 
   const authGate = new AuthGate(repo, {
@@ -97,7 +97,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, disconnectSession, accessChanged }, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: refusal.handlers,
@@ -115,7 +115,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let stopRetention: (() => void) | undefined;
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
-    timers.push(setInterval(sweepLimits, 30_000), setInterval(revalidate, 30_000), setInterval(() => sweepSessions(), SWEEP_MS));
+    timers.push(setInterval(sweepLimits, 30_000), setInterval(revalidate, 30_000));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
 
@@ -132,8 +132,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // The auth re-check and limiter sweep, for tests that run without it.
     revalidate,
     sweepLimits,
-    // Ends sessions past their grace (S4), for tests that run without the interval.
-    sweepSessions,
     authGate,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),

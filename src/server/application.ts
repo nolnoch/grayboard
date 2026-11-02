@@ -1,27 +1,27 @@
-// The server's transport-neutral session and operation core (#402): WSS
-// (src/server/ws.ts) and hosted MCP (src/server/mcp.ts, src/server/hosted.ts)
-// both call it. The session model is #284's: the hello is the session (its
-// ID, from the client's key), aliases come by bind and go by unbind, a
-// session holds several, and a closed connection's session outlives it for a
-// grace before it ends (PR 3, PR 4).
-import type { HelloOk, HelloRequest, BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
+// The server's session and operation core (#402): hosted MCP
+// (src/server/mcp.ts, src/server/hosted.ts) and the Slack bridge's in-process
+// human call it. The session model is #284's: a session has an ID, aliases
+// come by bind and go by unbind, and a session holds several. The WSS
+// transport and its hello are gone (#282): a hosted session's lifetime is the
+// hosted store's lease, not a connection's grace.
+import type { HelloOk, BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation, setLauncher } from "../core/delegation.ts";
+import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
-  idStatuses, logBinding, mintSessionKey, orderCandidates, primaryOf, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
-  type AliasUse, type Candidate, type Continuity, type IdRow,
+  idStatuses, logBinding, orderCandidates, primaryOf, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
+  type AliasUse, type Candidate, type Continuity,
 } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { canSend, type HumanReach } from "./can_send.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
-import { authLost, type AuthedUser, type AuthLost } from "./auth.ts";
+import type { AuthedUser } from "./auth.ts";
 import {
-  ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, cleanPlace, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
+  ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, idCollisionText, inheritStatus, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -55,11 +55,7 @@ export type DeliveryEvent =
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
   probe(ms: number): Promise<boolean>;
-  keepAlive?(): void;
   closed(error: ApplicationError): void;
-  // The server released an alias the session held (#284 S9): WSS sends an
-  // alias_lost frame. A sink without it learns from its next call.
-  aliasLost?(alias: string, reason: string): void;
 };
 // A hosted session's facts, for its MCP instructions (src/server/mcp.ts).
 export type IdentityInfo = {
@@ -83,27 +79,18 @@ export type ApplicationOptions = {
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
-  // The hub's clock: the rate limiters', the write-dedup window's
-  // (src/server/write_dedup.ts) and the grace's. Tests move it instead of sleeping.
+  // The hub's clock: the rate limiters' and the write-dedup window's
+  // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
-};
-export type HelloOptions = Omit<HelloRequest, "type" | "req_id" | "proto"> & {
-  // Whether the transport is still open; checked after each await.
-  alive?: () => boolean;
 };
 export type HelloResult = Omit<HelloOk, "type" | "req_id">;
 export type BindResult = { alias: string; held: string[]; notices?: string[]; restored?: Continuity };
 export type UnbindResult = { alias: string; released: boolean; held: string[]; left?: string[] };
 
-/** How long a session outlives its connection's close (#284 S4): a resume within it re-attaches. */
-export const GRACE_MS = 30_000;
-/** How often the sweep ends sessions past their grace (S4). */
-export const SWEEP_MS = 5_000;
-
 /**
  * The reads a hosted session with no name may make (master's read-only
- * model, kept for hosted MCP). Unlike a WSS session (S13), it doesn't act
- * as its ID: the hosted session ID is routing, not a capability (#229).
+ * model, kept for hosted MCP). It doesn't act as its ID: the hosted session
+ * ID is routing, not a capability (#229).
  */
 export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
 const UNBOUND_ERROR = "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
@@ -124,7 +111,7 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
-  transport: "wss" | "hosted" = "wss";
+  transport: "bridge" | "hosted" = "bridge";
   // The address the session writes as by default (#284 S1, S8): its oldest
   // hold, else its ID; a tools-only session's writes_as.
   primary = "";
@@ -182,15 +169,8 @@ type Hub = {
   // address -> the session pushes go to: a push session's ID and its bound
   // aliases, a Slack bridge human's email/human, a hosted lease's name.
   registry: Map<string, ApplicationSession>;
-  // session ID -> its WSS connection's session: every agent connection
-  // (push, hold and tools-only), so probe, supersede and grace treat them alike.
-  holders: Map<string, ApplicationSession>;
   // session ID -> the hosted session holding its name (hosted.ts reconcile).
   hostedHolders: Map<string, ApplicationSession>;
-  // session ID -> the probe a hello is running against its connection
-  probing: Map<string, Promise<boolean>>;
-  // session ID -> when its grace ends: its connection closed, its holds stay (S4).
-  grace: Map<string, number>;
   sessions: Set<ApplicationSession>;
   probeMs: number;
   humanReach: HumanReach;
@@ -308,16 +288,6 @@ function noticesFor(hub: Hub, addresses: string[], first: string[] = []): string
   ];
 }
 
-// The token session an ID last said hello under, so a logout finds its IDs
-// in their grace too (#351).
-function setTokenSession(db: CoreDb, id: string, tokenSession: number): void {
-  db.prepare(`UPDATE ids SET token_session = ? WHERE id = ?`).run(tokenSession, id);
-}
-
-function idsOfToken(db: CoreDb, tokenSession: number): string[] {
-  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND token_session = ?`).all(tokenSession) as { id: string }[]).map((r) => r.id);
-}
-
 // When each alias was last used and where, for hosted candidates.
 function sessionsSeen(db: CoreDb, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
   const rows = db
@@ -370,16 +340,13 @@ function createLazily(hub: Hub, authed: AuthedUser, { address, scope }: Exclude<
   onAliasCreated(db, repo, authed.user_id, address);
 }
 
-// Who holds an alias, for an alias_held refusal: its ID, where it runs, and
-// for a session in its grace, when it disconnected and when it ends.
+// Who holds an alias, for an alias_held refusal: its ID and where it runs.
 function describeHolder(hub: Hub, id: string): string {
   const place = idRow(hub.db, id)?.place;
-  const until = hub.grace.get(id);
-  const grace = until === undefined ? "" : `; disconnected at ${new Date(until - GRACE_MS).toISOString()}, ends by ${new Date(until).toISOString()}`;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
   const hosted = hub.repo.hosted.get(id);
   if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
-  return `the session ${id}${place ? `, in ${place}` : ""}${grace}`;
+  return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
 
 // A bind's claim to continue an earlier session on the alias (#211), checked
@@ -409,10 +376,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     repo,
     db,
     registry: new Map(),
-    holders: new Map(),
     hostedHolders: new Map(),
-    probing: new Map(),
-    grace: new Map(),
     sessions: new Set(),
     probeMs: opts.probeMs ?? 2000,
     humanReach: opts.humanReach ?? "team",
@@ -468,17 +432,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   }
   // Announces claims that lapse on their boards.
   const expiry = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
-  // No connection outlives the server, but a session does, for its grace
-  // (S4): every one a previous run left gets a grace from now, so a deploy
-  // ends only the sessions that don't come back, through endSession. A
-  // hosted ID is outside the WSS lifecycle: its hosted store ends it.
-  const startedAt = now();
-  for (const id of unendedIds(db)) if (!repo.hosted.owned(id)) hub.grace.set(id, startedAt + GRACE_MS);
-
-  // The session leaves the hub's maps: superseded, ended, revoked or closed.
+  // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
-    const id = session.sessionId;
-    if (id && hub.holders.get(id) === session) hub.holders.delete(id);
     for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
   }
   function close(session: ApplicationSession, _why = "connection closed") {
@@ -494,28 +449,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
       return;
     }
+    // alias_holds is the hosted hold set's only truth (#451): a close is a rebuild
+    // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
-    if (session.transport === "hosted") {
-      for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
-      // alias_holds is the hosted hold set's only truth (#451): a close is a rebuild
-      // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
-      if (hub.hostedHolders.get(id) === session) hub.hostedHolders.delete(id);
-      if (session.writerId) touchId(db, session.writerId);
-      return;
-    }
-    // A superseded, ended or revoked connection was detached when it was;
-    // its close records nothing.
-    if (!id || hub.holders.get(id) !== session) return;
     detach(session);
-    touchId(db, id);
-    for (const a of session.holds) touchAlias(db, a);
-    // Its holds stay: a 30 s blip must not lose the aliases (S4).
-    const until = now() + GRACE_MS;
-    hub.grace.set(id, until);
-    writeAudit(repo, "id.detached", session.authed.user_email, id, { held: session.holds, grace_until: until });
+    if (hub.hostedHolders.get(id) === session) hub.hostedHolders.delete(id);
+    if (session.writerId) touchId(db, session.writerId);
   }
-  // The server closes the session: it leaves the hub without a grace, its
-  // transport is told why and closes.
+  // The server closes the session: it leaves the hub, and its transport is
+  // told why and closes.
   function terminate(session: ApplicationSession, error: ApplicationError) {
     detach(session);
     session.closedBy = error;
@@ -525,7 +467,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   function valid(session: ApplicationSession, allowUnbound = false) {
     if (session.ended) fail("id_ended", `session ${session.sessionId} has ended`);
     if (!session.active || !hub.sessions.has(session)) {
-      // A superseded connection is told so (#284 S3), a revoked tools-only
+      // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
       // is closed (#402).
       const why = session.closedBy;
@@ -547,8 +489,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Ends sessions, each in its own transaction (bounces, claim releases,
   // holds released), then wakes what that changed and sweeps the freed
   // upload bytes. One end that throws is logged and audited id.end_failed
-  // and leaves the others ended; its ID goes (back) into the grace, so a
-  // sweep retries it rather than the sweep's interval dying with it.
+  // and leaves the others ended; the next revalidate (a revoked alias) or
+  // start (a leftover) retries it.
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
     const woken = new Set<string>();
@@ -557,13 +499,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       try {
         ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: now(), audit: serverAuditSink(repo) }));
       } catch (e) {
-        const retryAt = now() + GRACE_MS;
-        if (!hub.holders.has(id)) hub.grace.set(id, retryAt);
-        console.error(`[grayboard] ending session ${id} (${why}) failed; retrying after ${new Date(retryAt).toISOString()}:`, e);
-        writeAudit(repo, "id.end_failed", null, id, { why, error: String(e), retry_at: retryAt });
+        console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
+        writeAudit(repo, "id.end_failed", null, id, { why, error: String(e) });
         continue;
       }
-      hub.grace.delete(id);
       // An end that found the session already ended sends nothing again.
       if (!ended.ended) continue;
       for (const h of ended.wake) woken.add(h);
@@ -578,34 +517,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     wake(hub, [...woken]);
     void sweepBlobs(db, repo.blobs);
   }
-  // Ends every session past its grace (S4), on its own SWEEP_MS interval, so
-  // the end lands 30-35 s after the close. An ID with a live connection only
-  // leaves the grace: a stale close must not end a session that came back.
-  function sweepSessions(at = now()): void {
-    const due: string[] = [];
-    for (const [id, until] of hub.grace) {
-      if (hub.holders.has(id)) hub.grace.delete(id);
-      else if (until <= at) due.push(id);
-    }
-    endIds(due, "grace");
-  }
-  // Auth is checked at the upgrade and again at each hello, so a connection
-  // outlives its credential unless it is closed when the credential goes
-  // (#70, #351). closeConns closes the WSS sessions `match` selects:
-  // detached first (their close then records no grace), told why, audited,
-  // closed. It returns their IDs. The Slack bridge's humans and hosted
-  // sessions never appear here: hub.holders has none of them.
-  function closeConns(match: (s: ApplicationSession) => boolean, message: string, why: string): string[] {
-    const closed: string[] = [];
-    for (const s of [...hub.holders.values()]) {
-      if (!match(s)) continue;
-      const id = s.sessionId;
-      writeAudit(repo, "auth.connection_closed", s.authed.user_email, id, { token_session: s.authed.session_id, why });
-      terminate(s, new ApplicationError("unauthenticated", message));
-      closed.push(id);
-    }
-    return closed;
-  }
+  // The WSS transport is gone (#282): no connection can come back for a
+  // session a previous run left unended, because only a hello re-attached one.
+  // End each at start, as the grace sweep would have: holds and claims
+  // released, mail bounced. A hosted ID is the hosted store's to end.
+  endIds(unendedIds(db).filter((id) => !repo.hosted.owned(id)), "wss_removed");
   // Re-checks the aliases that sessions act as (S9) against mayActIn, for
   // one principal's sessions or (null) every session's, and revokes the ones
   // it now refuses. by: the user whose act changed the access (an admin's
@@ -622,22 +538,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   }
   // Takes aliases from sessions whose principals may no longer act in their
   // scopes (S9). A holder keeps its ID and its other holds: only the revoked
-  // hold is released, and a live one is told (alias_lost) and sends as its
-  // primary from here. A tools-only session writes only as its writes_as,
-  // so it has nothing left to be: its session ends, and its reconnect's
-  // hello is refused. A hosted root's hold is released in the database (#408)
-  // and its generation bumped (#451): the live holder is rebuilt and its lease
-  // closed, and the next request or whoami tells the session what it lost.
+  // hold is released. A tools-only session writes only as its writes_as, so
+  // it has nothing left to be: its ownership ends. A hosted root's hold is
+  // released in the database (#408) and its generation bumped (#451): the live
+  // holder is rebuilt and its lease closed, and the next request or whoami
+  // tells the session what it lost.
   function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): void {
     if (!uses.length) return;
     const ended: string[] = [];
     for (const u of uses) {
       const { reason } = u;
-      const s = hub.holders.get(u.id);
       const hosted = repo.hosted.owned(u.id);
       if (!u.held) {
         writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
-        if (s) terminate(s, new ApplicationError("forbidden", `this connection wrote as "${u.address}", and ${reason}`));
         // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
         if (hosted) repo.hosted.atomic(() => repo.hosted.end(u.id, "revoked", now()));
         else ended.push(u.id);
@@ -659,169 +572,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         }
       };
       if (hosted) repo.hosted.atomic(revoke); else repo.atomic(revoke);
-      if (!s || !s.holds.includes(u.address)) continue;
-      setHolds(hub, s, s.holds.filter((a) => a !== u.address));
-      s.sink.aliasLost?.(u.address, reason);
     }
     endIds(ended, "revoked");
   }
 
-  // The hello is the session (#284 S1, S3): it registers the key's ID, or
-  // re-attaches a session in its grace, holds and all. Aliases come by bind.
-  async function hello(authed: AuthedUser, sink: DeliverySink, m: HelloOptions): Promise<{ session: ApplicationSession; ok: HelloResult }> {
-    const { holders } = hub;
-    const id = m.session_key ? idAddress(m.session_key) : null;
-    // Client text: cleaned once, before any audit or log carries it.
-    const where = cleanPlace(m.where ?? null);
-    // First, before anything reads or writes the database.
-    const t = hub.helloLimiter.take(authed.user_email, { session_id: id, place: where });
-    if (!t.ok) fail("rate_limited", `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
-    const alive = () => m.alive?.() ?? true;
-    const closed = () => fail("unauthenticated", "session is closed");
-    // Auth is checked at the upgrade, so a token revoked since (logout, an
-    // out-of-band reset) or a user disabled since is refused here (#351).
-    const refuseAuth = (why: AuthLost): never => {
-      writeAudit(repo, "auth.hello_refused", authed.user_email, id, { token_session: authed.session_id, why, place: where });
-      return fail("unauthenticated", why === "token_revoked" ? "this sign-in was signed out" : "this user is disabled");
-    };
-    const lost = authLost(authed, repo);
-    if (lost) return refuseAuth(lost);
-    if (id === null) return fail("bad_request", "a hello needs a session_key");
-    const push = m.push !== false;
-    const toolsOnly = !push && m.hold !== true;
-    // A tools-only connection writes as an alias it may act in, but never holds it (S7).
-    let writesAs: Exclude<Target, { error: string }> | undefined;
-    if (toolsOnly) {
-      const target = bindTarget(hub, authed, m.writes_as ?? "");
-      if ("error" in target) {
-        if (target.address) logBinding(db, id, target.address, "refused", target.error);
-        return fail(target.code, target.error);
-      }
-      const other = aliasUser(db, target.address, authed.user_email);
-      if (other) {
-        const why = `another user's session ${other}`;
-        logBinding(db, id, target.address, "refused", why);
-        return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
-      }
-      writesAs = target;
-    }
-    const collide = (why: string): never => {
-      writeAudit(repo, "id.collision", authed.user_email, id, { why, place: where });
-      return fail("id_collision", idCollisionText(id, why));
-    };
-    // Never probe or supersede another principal's connection: its row is
-    // checked before anything touches the hub.
-    const row = idRow(db, id);
-    if (row && row.principal !== authed.user_email) return collide("is another principal's session");
-    if (row?.ended_at != null) return collide(`ended at ${new Date(row.ended_at).toISOString()}`);
-    // A hosted ID is the hosted store's, never a WSS session's.
-    if (repo.hosted.owned(id)) return collide("is a hosted session's");
-    // A re-attach is the session it registered as: a tools-only session
-    // writes as the same alias, and a push or hold one writes as nobody else.
-    // Checked before the probe, so a mismatched hello never supersedes.
-    const sameShape = (r: IdRow) => r.writes_as === (writesAs?.address ?? null);
-    const shapeWhy = (r: IdRow) => `registered writing as ${r.writes_as ? `"${r.writes_as}"` : "its own addresses"}, and this hello writes as ${writesAs ? `"${writesAs.address}"` : "its own"}`;
-    if (row && !sameShape(row)) return collide(shapeWhy(row));
-
-    // One live connection per session. A connection on this ID that still
-    // answers is a second process on one key: refused. One that doesn't is
-    // dead (a reconnect beat its close): superseded. Each await can change the
-    // hub (a close, another hello), so after one, check again from the top;
-    // between the last check and holders.set below nothing awaits (#69).
-    for (;;) {
-      const inFlight = hub.probing.get(id);
-      if (inFlight) {
-        // Another hello is probing the holder: whoever wins, it's settled after.
-        await inFlight;
-        if (!alive()) return closed();
-        // A revoked token must not register an ID after any wait (#351).
-        const lostWait = authLost(authed, repo);
-        if (lostWait) return refuseAuth(lostWait);
-        continue;
-      }
-      const holder = holders.get(id);
-      if (!holder) break;
-      const probing = holder.sink.probe(hub.probeMs).catch(() => false).finally(() => {
-        if (hub.probing.get(id) === probing) hub.probing.delete(id);
-      });
-      hub.probing.set(id, probing);
-      if (await probing) return collide("is live on another connection");
-      if (!alive()) return closed();
-      // Before the holder is superseded: a revoked token must not take it over (#351).
-      const lostProbe = authLost(authed, repo);
-      if (lostProbe) return refuseAuth(lostProbe);
-      if (holders.get(id) === holder) {
-        // Detached first, so its close finds another connection holding the
-        // ID and records no grace (S3).
-        writeAudit(repo, "id.superseded", authed.user_email, id, { old_place: holder.place ?? null, place: where });
-        terminate(holder, new ApplicationError("superseded", "a newer connection took over this session"));
-      }
-    }
-    // The row again: the session may have ended during an await.
-    const current = idRow(db, id);
-    if (current?.ended_at != null) return collide(`ended at ${new Date(current.ended_at).toISOString()}`);
-    if (current && !sameShape(current)) return collide(shapeWhy(current));
-    const launcher = push && m.launcher === true;
-    if (!current) {
-      repo.atomic(() => {
-        if (writesAs) createLazily(hub, authed, writesAs, id);
-        const reused = registerId(db, {
-          id, principal: authed.user_email, place: where, launcher, keyed: m.keyed === true, ...(writesAs === undefined ? {} : { writesAs: writesAs.address }),
-          harness: m.harness, model: m.model, effort: m.effort,
-        });
-        // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
-        if (reused) writeAudit(repo, "id.reused", authed.user_email, id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at });
-        writeAudit(repo, "id.registered", authed.user_email, id, {
-          delivery: writesAs === undefined ? "push" : "none", ...(m.hold ? { hold: true } : {}), ...(writesAs === undefined ? {} : { writes_as: writesAs.address }), keyed: m.keyed === true, place: where,
-        });
-      });
-    } else {
-      setPlace(db, id, where);
-      touchId(db, id);
-      // Every push hello rewrites the flag; registerId wrote it for a new row.
-      if (push) setLauncher(db, id, launcher);
-      // Possession of the key is the proof; resume is detail only (S3).
-      writeAudit(repo, "id.reattached", authed.user_email, id, { resume: m.resume === true, in_grace: hub.grace.has(id), place: where });
-    }
-    setTokenSession(db, id, authed.session_id);
-    hub.grace.delete(id);
-    // Audited, changed or not (#184 review 4/6): a hold or tools-only
-    // connection can't receive a delegation, so it's never a launcher.
-    if (push) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: launcher });
-
-    const session = new ApplicationSession(authed, sink, false, push);
-    session.sessionId = id;
-    session.writerId = id;
-    session.place = where;
-    session.transport = "wss";
-    hub.sessions.add(session);
-    holders.set(id, session);
-    if (writesAs) {
-      session.toolsOnly = true;
-      session.primary = writesAs.address;
-      session.addresses = [writesAs.address];
-    } else {
-      // A re-attach restores every hold, in bound order (S8).
-      setHolds(hub, session, holdsOf(db, id));
-    }
-    const bound = session.holds;
-    for (const a of bound) touchAlias(db, a);
-
-    // Drained by a session that shows its notices (push or hold), never a
-    // tools-only one's (#402): its notices may go nowhere.
-    const bridgeNotice = toolsOnly ? undefined : owedBridgeNotice(repo, authed.user_email);
-    const notices = noticesFor(hub, session.addresses, [
-      ...(launcher ? launcherInstruction() : []),
-      // Before the claims: drained once, so a cut must not take it.
-      ...(bridgeNotice ? [bridgeNotice] : []),
-    ]);
-    return {
-      session,
-      ok: { id, ...(bound.length ? { bound: [...bound] } : {}), ...helloOkFields(hub, authed), ...(notices.length ? { notices } : {}) },
-    };
-  }
-
-  // The Slack bridge's in-process human (S16): no ID, no ids row, no grace.
+  // The Slack bridge's in-process human (S16): no ID and no ids row.
   // It holds email/human and logs bind events under the literal `human`.
   async function attachHuman(authed: AuthedUser, sink: DeliverySink): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
@@ -910,17 +665,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
     }
-    // Another session's hold is never taken over, live or in its grace. A hosted
+    // Another session's hold is never taken over. A hosted
     // holder was probed by bind (#402), or cleared by the hosted service: one idle
     // past the hosted window ended and freed the alias; a live one refuses the bind.
     const holder = holderOf(db, address);
     if (holder !== null && holder !== id) {
       const who = describeHolder(hub, holder);
-      // A holder in its grace frees the alias by the sweep after it ends,
-      // unless it comes back: a restore retries then (S11).
-      const until = hub.grace.get(holder);
-      const wait = until === undefined ? {} : { retry_after_ms: Math.max(0, until - now()) + SWEEP_MS };
-      return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who, ...wait });
+      return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the
     // alias is in use, so it's exclusive all the same (S8, decided).
@@ -972,24 +723,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     return { alias: address, released: true, held: [...session.holds], ...(left.length ? { left } : {}) };
   }
 
-  // end (S4): an unkeyed session's clean exit ends it at once. The session
-  // leaves the hub first, so its close records no grace.
-  function end(session: ApplicationSession): void {
-    valid(session);
-    if (session.human) fail("bad_request", "the Slack bridge's humans have no session to end");
-    if (session.transport === "hosted") fail("bad_request", "a hosted session ends through session_end");
-    detach(session);
-    session.ended = true;
-    endIds([session.sessionId], "exit");
-  }
-
   const application = {
     repo,
     // The live session holding `full`, WSS or hosted: the hub's view, which
     // a transaction changes only after it commits (the hosted store's
     // reconcile), as master's holder map did.
     hostedHolder(full: string): ApplicationSession | undefined {
-      for (const s of [...hub.hostedHolders.values(), ...hub.holders.values()]) if (s.active && s.holds.includes(full)) return s;
+      for (const s of hub.hostedHolders.values()) if (s.active && s.holds.includes(full)) return s;
       return undefined;
     },
     admitHosted,
@@ -1067,40 +807,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return byOwner;
     },
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
-    hello,
-    // Hello then bind, as a WSS client does: a test convenience composing the
-    // real operations. name undefined: an unbound session, acting as its ID.
-    async selectIdentity(
-      authed: AuthedUser, name: string | undefined, sink: DeliverySink,
-      options: HelloOptions & { create?: boolean } = {},
-    ) {
-      const { create, ...m } = options;
-      // A push: false connection without hold is tools-only (S7): it writes
-      // as the name, and binds nothing.
-      const toolsOnly = m.push === false && m.hold !== true && name !== undefined;
-      const { session, ok } = await hello(authed, sink, { ...m, ...(toolsOnly ? { writes_as: name } : {}), session_key: m.session_key ?? mintSessionKey() });
-      if (name !== undefined && !toolsOnly) {
-        try { await bind(session, { alias: name, ...(create === undefined ? {} : { create }) }); }
-        catch (e) {
-          // A session this call minted ends with its refusal; one on the
-          // caller's key closes, into its grace.
-          if (session.active && !session.ended) {
-            if (m.session_key === undefined) end(session);
-            close(session);
-          }
-          throw e;
-        }
-      }
-      const info: IdentityInfo = { identity_full: session.primary, ...helloOkFields(hub, authed), ...(ok.notices ? { notices: ok.notices } : {}) };
-      return { session, info, ok };
-    },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
     bind,
     bindNow,
     hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
     unbind,
-    end,
     close,
     revalidateSession: valid,
     // Everything owed to a push session, after its hello's answer: direct
@@ -1221,53 +933,28 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       afterCommit(db, () => expiry.arm());
       wake(hub, handles);
     },
-    // An admin revoked or disabled a user: every session of theirs closes,
-    // and their WSS sessions end at once, live or in their grace, not
-    // through the grace (S4). Hosted sessions close; the hosted store ends
-    // them (disabled users) on its sweep.
+    // An admin revoked or disabled a user: every session of theirs closes.
+    // The hosted store ends them (disabled users) on its sweep.
     disconnectUser(userId: number) {
-      closeConns((s) => s.authed.user_id === userId, "an admin signed this user out", "user_signed_out");
       for (const s of [...hub.sessions]) {
         if (!s.human && s.authed.user_id === userId) terminate(s, new ApplicationError("unauthenticated", "an admin signed this user out"));
       }
-      const email = repo.users.findById(userId)?.email;
-      if (!email) return;
-      endIds(unendedIds(db, email).filter((id) => !repo.hosted.owned(id)), "revoked");
-    },
-    // One token was revoked (logout, #351): its connections close and its
-    // sessions end, live or in their grace; the user's other tokens keep theirs.
-    disconnectSession(tokenSession: number, why: string) {
-      const closed = closeConns((s) => s.authed.session_id === tokenSession, "this sign-in was signed out", why);
-      endIds([...new Set([...closed, ...idsOfToken(db, tokenSession)])], "signed_out");
     },
     // What a principal may act in changed (S9): a team leave or removal now,
     // #270's grants later. Its sessions stop acting as aliases it lost now,
     // not when they next bind.
     accessChanged(principal: string, by: string) { recheckAliases(principal, by); },
-    // Catches a token revoked or user disabled with no server route to say so
-    // (a database reset, an operator edit), and an alias its session's
-    // principal may no longer act as (S9's backstop to accessChanged).
+    // Catches a user disabled with no server route to say so (a database
+    // reset, an operator edit), and an alias its session's principal may no
+    // longer act as (S9's backstop to accessChanged).
     revalidate() {
       for (const observer of [...observers]) observerLive(observer);
-      const tokens = new Map<number, AuthedUser>();
-      for (const s of hub.holders.values()) tokens.set(s.authed.session_id, s.authed);
       const users = new Set<number>();
-      for (const [sid, authed] of tokens) {
-        const lost = authLost(authed, repo);
-        if (lost === "token_revoked") application.disconnectSession(sid, "token_revoked");
-        else if (lost === "user_disabled") users.add(authed.user_id);
-      }
       for (const s of hub.sessions) {
         if (!s.human && repo.users.findById(s.authed.user_id)?.disabled_at != null) users.add(s.authed.user_id);
       }
       for (const id of users) application.disconnectUser(id);
       recheckAliases(null, null);
-    },
-    sweepSessions,
-    heartbeat() {
-      application.revalidate();
-      hub.helloLimiter.sweep();
-      for (const s of hub.sessions) s.sink.keepAlive?.();
     },
     sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
     stopExpiry() {
@@ -1327,7 +1014,6 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
 // listed as master listed it (#402).
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
   const mine = [
-    ...[...hub.holders.values()].filter((c) => c.push && c.holds.length === 0),
     ...[...hub.sessions].filter((c) => c.transport === "hosted" && c.readOnly),
   ].filter((c) => c.authed.user_id === session.authed.user_id);
   const statuses = idStatuses(hub.db, mine.map((c) => c.sessionId));

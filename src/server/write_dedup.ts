@@ -34,7 +34,7 @@ export type DedupCall = {
   session: string;
   sender: string;
   actor: string;
-  transport: "wss" | "hosted";
+  transport: "bridge" | "hosted";
   args: Record<string, unknown>;
   resend: boolean;
 };
