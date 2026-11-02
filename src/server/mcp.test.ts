@@ -834,6 +834,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
+  expect(hosted.activeGetStreams).toBe(0);
   // The SDK client reopens its GET on the same sid with the refreshed token; that request re-admits the session.
   await untilHosted(() => f.gets.length === 2 && hosted.activeGetStreams === 1, 5000);
   expect(hosted.activeLegacySessions).toBe(1);
@@ -899,6 +900,7 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   // A second session whose token expires inside the first one's idle window finds the dormant bound full.
   token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now - OAUTH_TTL.access + 30_000, OPENCODE_CLIENT).token;
   await connect("2025-11-25");
+  await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeLegacySessions).toBe(1);
   f.time.now += 30_000;
   f.tick();
@@ -907,6 +909,9 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
   const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all();
   expect(refused.map(row => JSON.parse(row.detail).kind)).toEqual(["dormant"]);
+  // The dropped session's GET still gets its close row.
+  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
+  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired", "access_expired"]);
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {

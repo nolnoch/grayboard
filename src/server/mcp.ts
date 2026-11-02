@@ -418,7 +418,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   function sleep(legacy: Legacy) {
     const hold = reserve("dormant", legacy.principal);
-    if (!hold) { legacyAudit(legacy, "hosted.legacy_dropped", { reason: "capacity" }); retire(legacy); return; }
+    if (!hold) {
+      if (legacy.stream) streamClosed(legacy.stream.context, new ApplicationError("unauthenticated", "unauthenticated"));
+      drop(legacy, "capacity");
+      return;
+    }
     legacy.release();
     legacyAll.delete(legacy);
     legacy.dormant = { since: now(), release: hold };
