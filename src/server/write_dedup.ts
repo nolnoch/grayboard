@@ -25,7 +25,7 @@ export function fingerprint(tool: DedupTool, session: string, sender: string, ar
   return createHash("sha256").update(canonicalJson({ tool, session, sender, args })).digest("hex");
 }
 
-// One call to dedup. session: the calling session's ID (on WSS, ws.data.sessionId),
+// One call to dedup. session: the calling session's ID (a hosted session's ID),
 // so sibling subagents writing under one name don't collapse. sender: the
 // address the written row records. actor: the user's email, for the audit
 // rows. transport: which server path took the call, for those rows.

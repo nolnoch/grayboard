@@ -3,7 +3,7 @@
 // as before; an installed hosted plugin is disabled (its grant is kept for a
 // switch back). Server mode: the hosted plugin from this repo's marketplace,
 // with no grayboard process at runtime, so the entry (which would run a
-// second, WSS-backed server in the same session) and the hook go.
+// second server in the same session) and the hook go.
 //
 // Measured against Claude Code 2.1.316 in a scratch CLAUDE_CONFIG_DIR:
 // `plugin marketplace add` of an added marketplace exits 0 with "already on

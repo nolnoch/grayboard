@@ -58,8 +58,8 @@ export function deliveryDeclaration(principal: OAuthPrincipal, meta: unknown): D
 }
 const POLL_NOTE = "No pushes reach this session; check dm_inbox and board_read yourself.";
 // A hosted session with no name reads and nothing else (master's model; see
-// UNBOUND_READS): its instructions say so, unlike a WSS session's, which acts
-// as its ID (#284 S13).
+// UNBOUND_READS): its instructions say so, unlike the removed WSS session's, which
+// acted as its ID (#284 S13).
 export function hostedUnboundInstruction(candidates: Candidate[], notes: string[] = []): string {
   const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
@@ -138,7 +138,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
-      // its shape is refused on every request, as WSS's re-attach is (#451 A4).
+      // its shape is refused on every request (#451 A4).
       const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs);
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }

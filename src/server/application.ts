@@ -605,7 +605,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
   // already holds answers ok and applies only `meta`; the others stay held,
   // and the primary changes only when the session held nothing.
-  // A WSS holder of the alias, or a hosted one, answers a probe before the bind decides
+  // A hosted holder of the alias answers a probe before the bind decides
   // (#402); bindNow is the rest, synchronous, which a hosted bind needs inside its
   // transaction (hosted.ts clears a stale hosted contender itself first, so any hosted
   // holder bindNow sees is live).
@@ -730,7 +730,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
   const application = {
     repo,
-    // The live session holding `full`, WSS or hosted: the hub's view, which
+    // The live session holding `full`: the hub's view, which
     // a transaction changes only after it commits (the hosted store's
     // reconcile), as master's holder map did.
     hostedHolder(full: string): ApplicationSession | undefined {
@@ -741,8 +741,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     hostedCandidates(authed: AuthedUser) { return candidates(hub, authed); },
     // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
     hostedHolds(id: string): string[] { return holdsOf(db, id); },
-    // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing, as a WSS
-    // tools-only connection. Otherwise the session holds `holds`, reads as them and its
+    // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
+    // Otherwise the session holds `holds`, reads as them and its
     // ID, and writes as the oldest; none held reads and nothing else (readOnly).
     hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, place: string | null, sink: DeliverySink, hold = false, push = false) {
       const session = new ApplicationSession(authed, sink, false, push);
@@ -778,7 +778,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         writeAudit(repo, "id.collision", authed.user_email, id, { why });
         fail("id_collision", idCollisionText(id, why));
       }
-      // A tools-only root is registered as WSS's is (A4): aliasUser, aliasUses and
+      // A tools-only root's writes_as is registered here (A4): aliasUser, aliasUses and
       // undeliverableId read ids.writes_as, so a send to its ID is pointed at the alias.
       if (!prior) {
         repo.atomic(() => {
@@ -792,10 +792,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
       }
     },
-    // A tools-only declaration's alias, resolved and checked the way a WSS hello's writes_as
-    // is: a name the principal may act in, never one another user's session uses (S7, S8);
-    // it shares the alias with a holder, as WSS. create: the first request makes the alias
-    // lazily, as hello does.
+    // A tools-only declaration's alias, resolved and checked: a name the
+    // principal may act in, never one another user's session uses (S7, S8); it may share the
+    // alias with a holder. create: the first request makes the alias lazily.
     hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false): string {
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
