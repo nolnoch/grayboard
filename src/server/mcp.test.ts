@@ -11,7 +11,7 @@ import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
-import { createOAuthServer } from "./oauth.ts";
+import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { randomBytes } from "node:crypto";
 import { hashToken } from "./auth.ts";
@@ -52,6 +52,7 @@ afterEach(async () => {
   expect(hosted.activeBusListeners).toBe(0);
   expect(hosted.activeWatches).toBe(0);
   expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activePosts).toBe(0);
   oauth.close();
   application.stopExpiry();
@@ -749,33 +750,163 @@ test("global POST admission remains bounded across distinct authenticated users"
   await (await connect()).listResources();
 });
 
-for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
+// Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timer for explicit ticks.
+async function clocked(limits?: McpLimits) {
   await hosted.close(); oauth.close();
-  let clock = Date.now();
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => clock });
+  const time = { now: Date.now() };
+  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
   const intervals: (() => void)[] = [];
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) intervals.push(fn);
     return interval(fn, ms, ...args);
   }) as typeof setInterval);
-  try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, limits: fairLimits, now: () => clock }); }
+  try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}) }); }
   finally { spy.mockRestore(); }
-  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], clock, OPENCODE_CLIENT).token;
+  return { time, tick: () => { for (const tick of intervals) tick(); } };
+}
+
+for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
+  const { time, tick } = await clocked(fairLimits);
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT).token;
   const modern = await connect(), legacy = await connect("2025-11-25");
   await modern.callTool({ name: "board_create", arguments: { name: "expiry", purpose: "admission lifecycle" } });
   await modern.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
-  if (ending === "revoke") store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, clock);
-  else clock += OAUTH_TTL.access + 1;
-  for (const tick of intervals) tick();
+  if (ending === "revoke") store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, time.now);
+  else time.now += OAUTH_TTL.access + 1;
+  tick();
   await untilHosted(() => hosted.activeListens === 0 && hosted.activeLegacySessions === 0 && hosted.activePosts === 0);
-  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], clock, OPENCODE_CLIENT).token;
+  // Expiry with the grant active sleeps the legacy session without its admission; a revoked token retires it (#476).
+  expect(hosted.dormantLegacySessions).toBe(ending === "expiry" ? 1 : 0);
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT).token;
   const replacement = await connect();
   const listen = await replacement.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
   await connect("2025-11-25");
   expect(hosted.activeListens).toBe(1); expect(hosted.activeLegacySessions).toBe(1);
   await listen.close();
   await legacy.close();
+});
+
+// #476: a legacy-protocol client (OpenCode's native MCP client) idle past its access token's expiry.
+async function dormantFixture(limits?: McpLimits) {
+  const { time, tick } = await clocked(limits);
+  const grant = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
+  token = grant.token;
+  const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
+  const gets: Request[] = [], hints: string[] = [], sids = new Set<string>();
+  const client = await connect("2025-11-25", undefined, headers, request => {
+    const sid = request.headers.get("Mcp-Session-Id");
+    if (sid) sids.add(sid);
+    if (request.method === "GET") gets.push(request);
+  });
+  client.setNotificationHandler("notifications/resources/updated", n => { hints.push(n.params.uri); });
+  const uri = "grayboard://boards/dormant";
+  expect((await client.callTool({ name: "board_create", arguments: { name: "dormant", purpose: "legacy dormancy" } })).isError).not.toBe(true);
+  expect(await client.subscribeResource({ uri })).toEqual({});
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  expect(sids.size).toBe(1);
+  let refresh = grant.refreshToken;
+  return {
+    client, gets, hints, sids, uri, grant, headers, time, tick, sid: [...sids][0]!,
+    // Rotates the refresh token on the same grant and sends the new access token from then on.
+    refresh() {
+      const access = randomBytes(32).toString("base64url"), next = randomBytes(32).toString("base64url");
+      expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refresh), tokens: {
+        ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(next), accessExpiresAt: time.now + OAUTH_TTL.access, refreshExpiresAt: time.now + OAUTH_TTL.refresh,
+      } }, time.now).status).toBe("ok");
+      refresh = next;
+      headers.set("Authorization", `Bearer ${access}`);
+      return access;
+    },
+  };
+}
+const legacyRows = () => store.db.query<{ action: string; target: string | null; detail: string }, []>("SELECT action, target, detail FROM access_log WHERE action LIKE 'hosted.legacy%' ORDER BY rowid").all()
+  .map((row): Record<string, unknown> => ({ action: row.action, target: row.target, ...JSON.parse(row.detail) as Record<string, unknown> }));
+const rawLegacy = (method: string, sid: string, access: string) => hosted.fetch(new Request("http://localhost/mcp", { method, headers: {
+  Authorization: `Bearer ${access}`, "Mcp-Session-Id": sid, "Mcp-Protocol-Version": "2025-11-25", Accept: "application/json, text/event-stream",
+} }));
+
+test("a legacy session idle past access expiry sleeps without admission and resumes on the same sid after refresh", async () => {
+  const f = await dormantFixture();
+  const hostedId = sessionContext(oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } })) as OAuthPrincipal, meta);
+  f.time.now += OAUTH_TTL.access + 1;
+  f.refresh();
+  f.tick();
+  expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.dormantLegacySessions).toBe(1);
+  // The SDK client reopens its GET on the same sid with the refreshed token; that request re-admits the session.
+  await untilHosted(() => f.gets.length === 2 && hosted.activeGetStreams === 1, 5000);
+  expect(hosted.activeLegacySessions).toBe(1);
+  expect(hosted.dormantLegacySessions).toBe(0);
+  expect((await f.client.callTool({ name: "board_post", arguments: { board: "dormant", body: "after rollover" } })).isError).not.toBe(true);
+  await untilHosted(() => f.hints.length === 1, 5000);
+  expect(f.hints).toEqual([f.uri]);
+  expect([...f.sids]).toEqual([f.sid]);
+  const rows = legacyRows();
+  const target = "id" in hostedId ? hostedId.id : null;
+  expect(rows).toEqual([
+    { action: "hosted.legacy_dormant", target, subscriptions: 1, ref: expect.any(String), grant: f.grant.grantId, client_id: OPENCODE_CLIENT },
+    { action: "hosted.legacy_rehydrated", target, dormant_ms: expect.any(Number), ref: rows[0]!.ref, grant: f.grant.grantId, client_id: OPENCODE_CLIENT },
+  ]);
+  expect(JSON.stringify(rows)).not.toContain(f.sid);
+  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
+  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired"]);
+});
+
+test("a dormant sid answers 404 to another binding and only its own user's new grant drops it", async () => {
+  const f = await dormantFixture();
+  f.time.now += OAUTH_TTL.access + 1;
+  f.tick();
+  expect(hosted.dormantLegacySessions).toBe(1);
+  const stranger = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
+  expect((await rawLegacy("GET", f.sid, stranger)).status).toBe(404);
+  expect(hosted.dormantLegacySessions).toBe(1);
+  const regranted = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
+  expect((await rawLegacy("GET", f.sid, regranted)).status).toBe(404);
+  expect(hosted.dormantLegacySessions).toBe(0);
+  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "grant_changed"]]);
+  // Dropped is never resurrected, even for the original grant.
+  expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+});
+
+for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
+  const f = await dormantFixture();
+  f.time.now += OAUTH_TTL.access + 1;
+  f.tick();
+  expect(hosted.dormantLegacySessions).toBe(1);
+  if (ending === "idle") {
+    f.time.now += 59_999; f.tick();
+    expect(hosted.dormantLegacySessions).toBe(1);
+    f.time.now += 1; f.tick();
+  } else if (ending === "grant_ended") {
+    store.repo.oauth.revokeToken(hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now);
+    f.tick();
+  } else {
+    // Teardown reserves no admission.
+    expect((await rawLegacy("DELETE", f.sid, f.refresh())).status).toBe(200);
+  }
+  expect(hosted.dormantLegacySessions).toBe(0);
+  expect(hosted.activeLegacySessions).toBe(0);
+  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", ending]]);
+  if (ending !== "grant_ended") expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+});
+
+test("the dormant registry is bounded by the legacy limits", async () => {
+  const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
+  f.time.now += OAUTH_TTL.access + 1;
+  f.tick();
+  expect(hosted.dormantLegacySessions).toBe(1);
+  // A second session whose token expires inside the first one's idle window finds the dormant bound full.
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now - OAUTH_TTL.access + 30_000, OPENCODE_CLIENT).token;
+  await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(1);
+  f.time.now += 30_000;
+  f.tick();
+  expect(hosted.activeLegacySessions).toBe(0);
+  expect(hosted.dormantLegacySessions).toBe(1);
+  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
+  const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all();
+  expect(refused.map(row => JSON.parse(row.detail).kind)).toEqual(["dormant"]);
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
@@ -851,8 +982,8 @@ test("shutdown awaits pending original request source cancellation", async () =>
   expect(hosted.activePosts).toBe(0);
 });
 
-async function untilHosted(predicate: () => boolean) {
-  const deadline = performance.now() + 1000;
+async function untilHosted(predicate: () => boolean, ms = 1000) {
+  const deadline = performance.now() + ms;
   while (!predicate() && performance.now() < deadline) await Bun.sleep(1);
   expect(predicate()).toBe(true);
 }
