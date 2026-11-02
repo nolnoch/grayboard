@@ -4,6 +4,7 @@ import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, 
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { runOAuthFlow } from "./oauth_flow.ts";
+import { UPGRADE_REFUSAL } from "../shared/protocol.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -483,15 +484,11 @@ claimCmd
 
 // ── human (local mode) ───────────────────────────────────────────────────────
 
-// Server mode has no announcements or human board create yet (#24); --mode local reaches the local
-// bus on a machine signed in to a server, as for the bridge.
+// These commands act on the local bus whether or not the machine is signed in to a server, as
+// `grayboard mcp` does (#282 A1); on a server, your human is `grayboard slack link`.
 function requireLocalBus(mode: string | undefined): void {
   if (mode !== undefined && mode !== "local") {
     console.error(`[grayboard] --mode must be local, not "${mode}"`);
-    process.exit(1);
-  }
-  if (mode === undefined && busMode() === "server") {
-    console.error("[grayboard] these commands are local-mode only for now (#24; on a server, your human is grayboard slack link); --mode local uses this machine's local bus");
     process.exit(1);
   }
 }
@@ -586,20 +583,29 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
+// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+function refuseServerMode(mode: string | undefined): void {
+  if (mode === "server") {
+    console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
+    process.exit(1);
+  }
+  if (mode !== undefined && mode !== "local") {
+    console.error(`[grayboard] --mode must be local, not "${mode}"`);
+    process.exit(1);
+  }
+}
+
+// Local on every machine: a signed-in user's local entries keep working, and a
+// distributed bus is reached through the hosted MCP entry (#282).
 program
   .command("mcp")
-  .description("Run the MCP server for Claude Code: server mode when signed in, local otherwise")
-  .option("--mode <mode>", "Force local or server mode, e.g. for one repo")
+  .description("Run the local-bus MCP server")
+  .option("--mode <mode>", "local (the only mode; server is served by the hosted MCP entry)")
   .action(async (opts: { mode?: string }) => {
-    const mode = opts.mode ?? busMode();
-    if (mode !== "local" && mode !== "server") {
-      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
-      process.exit(1);
-    }
+    refuseServerMode(opts.mode);
     // stdout is the MCP transport from here on; log to stderr only.
     try {
-      if (mode === "server") await import("../plugin/mcp.ts");
-      else await import("../local/mcp.ts");
+      await import("../local/mcp.ts");
     } catch (e) {
       console.error(`[grayboard] ${(e as Error).message}`);
       process.exit(1);
@@ -608,19 +614,14 @@ program
 
 // The adapters that serve grayboard's tools themselves (pi, opencode; #182
 // decision 13) register them from this list at load. It's what `mcp` would
-// serve in the same mode, and printing it opens no bus and no connection.
+// serve, and printing it opens no bus and no connection.
 program
   .command("tools", { hidden: true })
   .description("Print the tools `grayboard mcp` serves, as JSON")
-  .option("--mode <mode>", "Force local or server mode, as for mcp")
+  .option("--mode <mode>", "local, as for mcp")
   .action(async (opts: { mode?: string }) => {
-    const mode = opts.mode ?? busMode();
-    if (mode !== "local" && mode !== "server") {
-      console.error(`[grayboard] --mode must be local or server, not "${mode}"`);
-      process.exit(1);
-    }
-    const tools = mode === "server" ? (await import("../plugin/tools.ts")).SERVER_TOOLS : (await import("../local/tools.ts")).LOCAL_TOOLS;
-    console.log(JSON.stringify(tools));
+    refuseServerMode(opts.mode);
+    console.log(JSON.stringify((await import("../local/tools.ts")).LOCAL_TOOLS));
   });
 
 program
@@ -761,10 +762,15 @@ program
     // grayboard process, serves its tools and delivers its pushes; the
     // entry, disabled, is the plugin's config. opencode merges opencode.json
     // and opencode.jsonc, so this leaves a commented .jsonc alone.
+    // A team server is reached only through opencode's hosted MCP entry (#282): the
+    // `grayboard mcp` entry this step writes would run the local bus, so server mode skips it.
     const opencode = !!Bun.which("opencode");
-    const ocGuard = opts.register && opencode ? opencodeShimGuard(OC_DIR) : { skip: false };
+    if (opts.register && opencode && server) {
+      console.log(`opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server.replace(/\/+$/, "")}/mcp --config <opencode config file> --revision <full git sha>`);
+    }
+    const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
@@ -908,6 +914,12 @@ identityCmd
       return;
     }
 
+    // Before anything is reserved: the entry `--mcp` writes runs `grayboard mcp`, which joins this machine's
+    // local bus, so on a server it would name a session that never reaches the team.
+    if (mcpPath) {
+      console.error("--mcp writes a `grayboard mcp` entry, which joins this machine's local bus (#282). On a server a session binds its name through the hosted plugin (`grayboard setup`).");
+      process.exit(1);
+    }
     let res: { name: string; created_at: number };
     try {
       res = await makeClient().post("/api/identities", { name }) as typeof res;
@@ -918,8 +930,6 @@ identityCmd
     } else {
       console.log(`Created identity '${res!.name}'`);
     }
-
-    if (mcpPath) writeMcpJson(mcpPath, name.toLowerCase(), opts.force ?? false);
   });
 
 identityCmd

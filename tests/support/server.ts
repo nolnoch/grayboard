@@ -11,12 +11,10 @@ import { verifySessionToken } from "../../src/server/auth.ts";
 import type { Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
+import { cleanEnv } from "./env.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { AppSession, type AppSessionOptions } from "./app_session.ts";
-import { cleanEnv, serverEnv } from "./env.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from "./hosted_session.ts";
-import { mcpSession, type Session } from "./mcp.ts";
-import { WsClient, type WsClientOptions } from "./ws_client.ts";
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
   return {
@@ -50,7 +48,6 @@ export class TestServer {
   readonly base: string;
   readonly config: Config;
   readonly dir = mkdtempSync(join(tmpdir(), "gb-server-"));
-  private clients: WsClient[] = [];
   private appSessions: AppSession[] = [];
   private hostedSessions: HostedSession[] = [];
 
@@ -84,16 +81,10 @@ export class TestServer {
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
-  // A raw WebSocket client (identity null: an unbound session); closed by stop().
-  client(token: string, identity: string | null, opts: WsClientOptions = {}): WsClient {
-    const c = new WsClient(this.base, token, identity, opts);
-    this.clients.push(c);
-    return c;
-  }
-
-  // An application-level session (no socket): ws.ts's calls for one
-  // connection, signed in with `token` as the WSS upgrade resolves it
-  // (app.ts). Identity null stays unbound; connect() it. Closed by stop().
+  // An application-level session (no socket, no hosted store): the
+  // application's own operations for one session, signed in with `token` as
+  // an API request resolves it. Identity null stays unbound; connect() it.
+  // Closed by stop().
   appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
     const authed = verifySessionToken(token, this.app.repo, this.app.touches);
     if (!authed) throw new Error("appSession: the token doesn't authenticate");
@@ -114,17 +105,9 @@ export class TestServer {
     return s;
   }
 
-  // A server-mode `grayboard mcp` child signed in with `token`, started in
-  // `cwd` (default: this server's dir); identity null starts it unbound.
-  // closeSessions() ends it.
-  session(token: string, identity: string | null, extra: Record<string, string> = {}, cwd = this.dir): Promise<Session> {
-    return mcpSession({ env: serverEnv(this.dir, this.base, token, identity, extra), cwd, args: ["mcp", "--mode", "server"] });
-  }
-
   // Every driver closes before the app stops; a hosted close that failed is
   // reported once the server is down and its dir removed.
   async stop(): Promise<void> {
-    for (const c of this.clients.splice(0)) c.close();
     for (const s of this.appSessions.splice(0)) s.close();
     const hosted = await Promise.allSettled(this.hostedSessions.splice(0).map((s) => s.close()));
     await this.app.stop();

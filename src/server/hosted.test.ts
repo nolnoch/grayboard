@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -355,8 +355,9 @@ async function paused<T>(point: string, start: () => Promise<T>, overlap: () => 
 test("pending holds the reader gate while rebind waits; stale receipt cannot move the old cursor", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const lease = await delivery.open(principal, context("root"));
-  const sender = (await application.selectIdentity(tokenSession(application.repo, principal.authed), "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
-  application.send(sender, "you@example.com/fe", "old mailbox");
+  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  await sender.connect();
+  await sender.send("you@example.com/fe", "old mailbox");
   let binding!: ReturnType<typeof hosted.bind>, finished = false;
   const issued = await paused("hosted:pending:in-gate", () => delivery.pending(principal, context("root"), lease.capability), async () => {
     binding = hosted.bind(principal, context("root"), { name: "be", create: true }).then(value => { finished = true; return value; });
@@ -382,9 +383,10 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
 
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
-  const sender = (await application.selectIdentity(tokenSession(application.repo, principal.authed), "sender", { deliver() {}, closed() {}, probe: async () => true }, { push: false })).session;
+  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
-    application.send(sender, "you@example.com/fe", "not for be");
+    await sender.send("you@example.com/fe", "not for be");
     expect(application.hostedHolder("you@example.com/fe")).toBeDefined();
     expect(application.hostedHolder("you@example.com/be")).toBe(application.hostedHolder("you@example.com/fe"));
   });
@@ -392,15 +394,13 @@ test("bind publishes its new hold before the after-commit pause and the first ho
   expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);
 });
 
-test("WSS contender releases a never-leased hosted owner only after the idle window", async () => {
+test("a hosted contender releases a never-leased hosted owner only after the idle window", async () => {
+  // Rehomed from a WSS contender (#282): hello's idle-window release was removed with the socket; hosted.bind keeps it between two hosted roots.
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
-  const sink = { deliver() {}, closed() {}, probe: async () => true };
-  await expect(application.selectIdentity(tokenSession(application.repo, principal.authed), "fe", sink)).rejects.toHaveProperty("code", "alias_held"); // #284: a WSS bind's refusal (was identity_in_use)
+  await expect(hosted.bind(principal, context("contender"), { name: "fe" })).rejects.toHaveProperty("code", "alias_held");
   now += 900_001;
-  const acquired = await application.selectIdentity(tokenSession(application.repo, principal.authed), "fe", sink);
-  expect(acquired.session.identityFull).toBe("you@example.com/fe");
-  expect(database.repo.hosted.all()).toEqual([]);
-  application.close(acquired.session);
+  await hosted.bind(principal, context("contender"), { name: "fe" });
+  expect(database.repo.hosted.all().map(row => row.session_id)).toEqual([(context("contender") as { id: string }).id]);
 });
 
 test("a hosted root holds several names: bind adds, unbind releases one and promotes the oldest, the last leaves it owning but unbound (#451)", async () => {
@@ -452,6 +452,14 @@ test("a generic-key poll root's writes_as is recorded, makes it tools-only, and 
   await expect(hosted.whoami(generic, meta("be"))).rejects.toHaveProperty("code", "id_collision");
   // A plain principal's declaration is never read.
   expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_WRITES_AS_META]: "fe" })).not.toHaveProperty("writesAs");
+});
+
+test("a refused writes_as declaration through the hosted gate keeps its refused row after the transaction rolls back (#452)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-human", [GRAYBOARD_WRITES_AS_META]: "human" });
+  await expect(hosted.whoami(generic, ctx)).rejects.toHaveProperty("code", "forbidden");
+  expect(database.repo.hosted.all()).toEqual([]);
+  expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
 });
 
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {

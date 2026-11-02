@@ -120,10 +120,15 @@ function expectRegistered(server?: string): void {
       { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
     ]);
   }
-  // Disabled: the opencode and local pi adapters serve the tools and read their command here.
-  expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-  const local = server ? ["opencode"] as const : ["omp", "opencode", "pi"] as const;
-  for (const harness of local) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+  if (server) {
+    // opencode reaches a server only through its hosted entry (setup-opencode), which setup doesn't write (#282).
+    expect(existsSync(join(home, ".config", "opencode", "opencode.json"))).toBe(false);
+    expect(existsSync(join(home, ...ADAPTERS.opencode))).toBe(false);
+  } else {
+    // Disabled: the opencode and local pi adapters serve the tools and read their command here.
+    expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
+    for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+  }
   if (server) {
     for (const [harness, dot] of [["omp", ".omp"], ["pi", ".pi"]] as const) {
       const entry = existsSync(join(home, dot, "agent", "mcp.json")) ? json(dot, "agent", "mcp.json").mcpServers?.grayboard : undefined;
@@ -163,16 +168,18 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   await expectOk(grayboard("login", "--dev", "you@example.com", "--server", srv.base));
   expect(statSync(CREDENTIALS()).mode & 0o777).toBe(0o600);
 
-  expect(await expectOk(grayboard("setup", "-y", "--server", srv.base))).toContain(`Signed in to ${srv.base} as you@example.com.`);
+  const setup = await expectOk(grayboard("setup", "-y", "--server", srv.base));
+  expect(setup).toContain(`Signed in to ${srv.base} as you@example.com.`);
+  expect(setup).toContain(`grayboard setup-opencode --url ${srv.base}/mcp`);
   expectRegistered(srv.base);
 
   await expectOk(grayboard("logout"));
-  // Still there, so `grayboard mcp` stays in server mode and says why it can't start.
+  // Still there, so the server-mode commands stay in server mode and say why they can't run.
   expect(statSync(CREDENTIALS()).size).toBe(0);
   expect(statSync(CREDENTIALS()).mode & 0o777).toBe(0o600);
-  const mcp = await grayboard("mcp");
-  expect(mcp.code).not.toBe(0);
-  expect(mcp.err).toContain("signed out");
+  const claims = await grayboard("claims");
+  expect(claims.code).not.toBe(0);
+  expect(claims.err).toContain("grayboard login");
 
   await expectOk(grayboard("setup", "-y", "--local"));
   expect(existsSync(CREDENTIALS())).toBe(false);

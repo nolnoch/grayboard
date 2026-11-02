@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
+import type { AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
@@ -24,6 +25,16 @@ type Delegated = { to: string; message_id: number; delivered_now: boolean; human
 type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: string }[] };
 // A server whose hosted sessions can poll their inbox freely.
 const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
+
+// The hello's launcher flag is gone with the hello (#282), so nothing in a
+// hosted session sets ids.launcher yet (#451): the fixture sets the row the
+// delegate resolution and peer_list read, on a connected application session.
+async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
+  const s = srv.appSession(token, identity);
+  await s.connect();
+  srv.app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(s.id);
+  return s;
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-delegate-"));
@@ -133,12 +144,11 @@ test("local: no live launcher surfaces the request to the declared human", async
 }, 30_000);
 
 // hosted twin: #451 (the launcher)
-test("server: the hello's launcher flag records the capability; delegate delivers", async () => {
+test("server: the launcher flag on a session's ID records the capability; delegate delivers", async () => {
   const srv = serve();
   try {
     const token = await srv.login("you@example.com");
-    const be = srv.appSession(token, "be", { hello: { launcher: true } });
-    await be.connect();
+    const be = await launcher(srv, token, "be");
     const sim = await srv.hosted("you@example.com", "sim");
 
     const peers = (await sim.call<{ peers: Peer[] }>("peer_list")).peers;
@@ -184,9 +194,8 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     // Two users, one launcher each. alice's launcher sorts before bob's.
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
-    const aliceBe = srv.appSession(alice, "be", { hello: { launcher: true } });
-    await aliceBe.connect();
-    await srv.appSession(bob, "be", { hello: { launcher: true } }).connect();
+    const aliceBe = await launcher(srv, alice, "be");
+    await launcher(srv, bob, "be");
     const bobSim = await srv.hosted("bob@b.com", "sim");
 
     // Auto-pick: bob's own launcher takes it, never alice's (whose handle
@@ -205,28 +214,6 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     const audits = srv.app.db.query(`SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(audits.some((a) => a.action === "delegation.requested" && a.target === "bob@b.com/be")).toBe(true);
     expect(audits.some((a) => a.action === "delegation.refused")).toBe(true);
-    // The launcher flag flip is audited too.
-    const sets = srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'handle.launcher_set'`).get() as any;
-    expect(sets.n).toBeGreaterThanOrEqual(2);
-  } finally {
-    await srv.stop();
-  }
-}, 30_000);
-
-// hosted twin: #451 (a tools-only sidecar)
-test("server: a launcher that can't receive isn't advertised or instructed (review 6)", async () => {
-  const srv = serve();
-  try {
-    const token = await srv.login("you@example.com");
-    // A tools-only connection beside the owner: it never becomes the
-    // launcher, whatever its hello says.
-    await srv.appSession(token, "be").connect();
-    await srv.appSession(token, "be", { push: false, hello: { launcher: true } }).connect();
-    const sim = await srv.hosted("you@example.com", "sim");
-    const peers = (await sim.call<{ peers: Peer[] }>("peer_list")).peers;
-    expect(peers.find((p) => p.handle === "you@example.com/be")?.launcher).toBeUndefined();
-    // Delegating to it is refused: not a launcher (the flag was never set).
-    await expect(sim.call("delegate", { persona: "p", task: "t", to: "be" })).rejects.toThrow(/isn't a launcher session/);
   } finally {
     await srv.stop();
   }
@@ -325,30 +312,6 @@ test("local: a re-pick retracts the missed pick's message and returns the new on
   expect((inbox.promised ?? []).some((p: any) => p.to === "be")).toBe(false);
 }, 30_000);
 
-// hosted twin: #451 (a hold session, the launcher)
-test("server: a hold owner with the launcher flag isn't advertised or instructed (review 6)", async () => {
-  const srv = serve();
-  try {
-    const token = await srv.login("you@example.com");
-    // A hold connection owns its name but can't receive pushes: the flag and
-    // the instruction are gated on push mode (review 6). The positive
-    // control proves both observables: a push launcher is advertised and
-    // instructed.
-    const pushHello = await srv.appSession(token, "be", { hello: { launcher: true } }).connect();
-    expect((pushHello.notices ?? []).join("\n")).toContain("You're a launcher session");
-
-    const heldHello = await srv.appSession(token, "bo", { push: false, hold: true, hello: { launcher: true } }).connect();
-    expect((heldHello.notices ?? []).join("\n")).not.toContain("You're a launcher session");
-
-    const sim = await srv.hosted("you@example.com", "sim");
-    const peers = (await sim.call<{ peers: Peer[] }>("peer_list", { include_offline: true })).peers;
-    expect(peers.find((p) => p.handle === "you@example.com/bo")?.launcher).toBeUndefined();
-    await expect(sim.call("delegate", { persona: "p", task: "t", to: "bo" })).rejects.toThrow(/isn't a launcher session/);
-  } finally {
-    await srv.stop();
-  }
-}, 30_000);
-
 test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
@@ -409,8 +372,7 @@ test("local and server: a delegate to a launcher session's second alias is accep
   const srv = serve();
   try {
     const token = await srv.login("you@example.com");
-    const sbe = srv.appSession(token, "be", { hello: { launcher: true } });
-    await sbe.connect();
+    const sbe = await launcher(srv, token, "be");
     await sbe.bind("be2", { create: true });
     const ssim = await srv.hosted("you@example.com", "sim");
     const peers = (await ssim.call<{ peers: Peer[] }>("peer_list")).peers;

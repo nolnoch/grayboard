@@ -6,9 +6,10 @@ import { until } from "../support/until.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 
-// The hello bucket is the application's (application.hello), separate from
-// the hosted request bucket; the hellos are application sessions (#282).
-test("hosted traffic at 5 requests/s cannot starve same-user hellos; exhaustion is isolated", async () => {
+// The per-user bind bucket (helloLimit: the hello that shared it is gone, #282)
+// is the application's, separate from the hosted request bucket; the binds are
+// application sessions'.
+test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion is isolated", async () => {
   let now = 0;
   const srv = new TestServer({}, { now: () => now });
   const client = new Client({ name: "load", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
@@ -37,14 +38,14 @@ test("hosted traffic at 5 requests/s cannot starve same-user hellos; exhaustion 
       now += 200;
       expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
     }
-    await srv.appSession(token, null).connect();
+    await srv.appSession(token, "ops").connect();
     let refused = false;
     for (let n = 0; n < 121; n++) {
       try { await client.callTool({ name: "board_list", arguments: {} }); }
       catch { refused = true; break; }
     }
     expect(refused).toBe(true);
-    await srv.appSession(token, null).connect();
+    await srv.appSession(token, "qa").connect();
     const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);

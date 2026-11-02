@@ -21,7 +21,7 @@ import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 
 // The launchers on the roster: aliases whose session opted in (BUS_LAUNCHER=1,
-// or the hello's launcher flag); offline ones by the session that last held
+// or a stored launcher flag); offline ones by the session that last held
 // them, as peer_list shows. Humans can't spawn — a bridge holds their
 // identity — and viewers have no aliases row.
 const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
@@ -32,12 +32,6 @@ const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALI
 export function launchers(db: Database): string[] {
   const primary = `(a.address = ${primaryHoldSql("i.id")} OR NOT EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address))`;
   return (db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
-}
-
-// The session's capability, rewritten by each of its owner hellos on a server
-// (local mode records it when the session registers).
-export function setLauncher(db: Database, id: string, on: boolean): void {
-  db.prepare(`UPDATE ids SET launcher = ? WHERE id = ?`).run(on ? 1 : 0, id);
 }
 
 // An explicit delegate(to) may name any alias a launcher session holds.

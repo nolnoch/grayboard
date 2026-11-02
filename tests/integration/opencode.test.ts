@@ -30,8 +30,8 @@ afterEach(async () => {
 type Driver = { pid: number; send(op: string, args?: Record<string, unknown>): Promise<any> };
 
 // The entry grayboard setup writes, in a user-level opencode.json under dir.
-function entry(mode: "local" | "server", over: Record<string, unknown> = {}) {
-  return { type: "local", command: [process.execPath, CLI, "mcp", "--mode", mode], environment: { BUS_PUSH: "off" }, enabled: false, ...over };
+function entry(over: Record<string, unknown> = {}) {
+  return { type: "local", command: [process.execPath, CLI, "mcp", "--mode", "local"], environment: { BUS_PUSH: "off" }, enabled: false, ...over };
 }
 
 function driver(identity: string | undefined, e: Record<string, unknown>): Driver {
@@ -78,17 +78,15 @@ function normalize(s: any): any {
   return Object.fromEntries(Object.entries(rest).map(([k, v]) => [k, normalize(v)]));
 }
 
-for (const mode of ["local", "server"] as const) {
-  test(`opencode (${mode}): every tool \`grayboard tools\` lists converts to zod with the same schema`, async () => {
-    const listed = JSON.parse(Bun.spawnSync([process.execPath, CLI, "tools", "--mode", mode], { env: localEnv(dir) }).stdout.toString()) as { name: string; inputSchema: unknown }[];
-    const { tools } = await driver("oc", entry(mode)).send("init");
-    expect(Object.keys(tools).sort()).toEqual(listed.map((t) => `grayboard_${t.name}`).sort());
-    for (const t of listed) expect([t.name, normalize(tools[`grayboard_${t.name}`])]).toEqual([t.name, normalize(t.inputSchema)]);
-  });
-}
+test("opencode: every tool `grayboard tools` lists converts to zod with the same schema", async () => {
+  const listed = JSON.parse(Bun.spawnSync([process.execPath, CLI, "tools", "--mode", "local"], { env: localEnv(dir) }).stdout.toString()) as { name: string; inputSchema: unknown }[];
+  const { tools } = await driver("oc", entry()).send("init");
+  expect(Object.keys(tools).sort()).toEqual(listed.map((t) => `grayboard_${t.name}`).sort());
+  for (const t of listed) expect([t.name, normalize(tools[`grayboard_${t.name}`])]).toEqual([t.name, normalize(t.inputSchema)]);
+});
 
 test("opencode: a free-map argument (bind's meta, peer_list's match) keeps its keys through the zod parse", async () => {
-  const oc = driver("oc", entry("local"));
+  const oc = driver("oc", entry());
   await oc.send("init");
   expect(await oc.send("parse", { tool: "grayboard_bind", args: { name: "x", meta: { task: "t", owner: "o" } } })).toEqual({ name: "x", meta: { task: "t", owner: "o" } });
   expect(await oc.send("parse", { tool: "grayboard_peer_list", args: { match: { model: "m" } } })).toEqual({ match: { model: "m" } });
@@ -96,9 +94,9 @@ test("opencode: a free-map argument (bind's meta, peer_list's match) keeps its k
 
 test("opencode: an unbound session acts as its ID; bind and rebind move the one grayboard process and the system prompt follows in full", async () => {
   const peer = await localSession(dir, "peer");
-  const oc = driver(undefined, entry("local"));
+  const oc = driver(undefined, entry());
   await oc.send("init");
-  await oc.send("config", { cfg: { mcp: { grayboard: entry("local") } } });
+  await oc.send("config", { cfg: { mcp: { grayboard: entry() } } });
   // The first turn can start before the child's initialize: it waits for it.
   expect((await oc.send("system", { sessionID: "s1" })).join("\n")).toContain("This session has no bus name yet, so it acts as its ID");
   expect(grayboardChildren(oc.pid)).toHaveLength(1);
@@ -138,9 +136,9 @@ test("opencode: a project config's grayboard command never runs; the user-level 
   const marker = join(dir, "project-command-ran");
   const evil = join(dir, "evil.sh");
   writeFileSync(evil, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
-  const oc = driver("oc", entry("local"));
+  const oc = driver("oc", entry());
   await oc.send("init");
-  await oc.send("config", { cfg: { mcp: { grayboard: entry("local", { command: [evil, "mcp"], environment: { BUS_IDENTITY: "evil" } }) } } });
+  await oc.send("config", { cfg: { mcp: { grayboard: entry({ command: [evil, "mcp"], environment: { BUS_IDENTITY: "evil" } }) } } });
   await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
   expect(await oc.send("call", { tool: "grayboard_peer_list", args: {} })).toContain('"you": "oc"');
   expect(existsSync(marker)).toBe(false);
@@ -148,9 +146,9 @@ test("opencode: a project config's grayboard command never runs; the user-level 
 });
 
 test("opencode: an enabled grayboard MCP entry is refused: calls fail with the fix and nothing starts", async () => {
-  const oc = driver("oc", entry("local"));
+  const oc = driver("oc", entry());
   await oc.send("init");
-  await oc.send("config", { cfg: { mcp: { grayboard: entry("local", { enabled: true }) } } });
+  await oc.send("config", { cfg: { mcp: { grayboard: entry({ enabled: true }) } } });
   expect((await oc.send("state")).toasts.join("\n")).toContain("is enabled");
   await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
   await expect(oc.send("call", { tool: "grayboard_board_list", args: {} })).rejects.toThrow('Set "enabled": false');
@@ -160,6 +158,6 @@ test("opencode: an enabled grayboard MCP entry is refused: calls fail with the f
 
 test("opencode: no grayboard at the entry's command fails the plugin's init with the reason", async () => {
   const missing = join(dir, "no-such-grayboard");
-  const oc = driver("oc", entry("local", { command: [missing, "mcp"] }));
+  const oc = driver("oc", entry({ command: [missing, "mcp"] }));
   await expect(oc.send("init")).rejects.toThrow(`\`${missing} tools\` failed to run`);
 });

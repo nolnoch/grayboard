@@ -1,82 +1,73 @@
-// An application-level session: what src/server/ws.ts does for one
-// connection, with no socket and no frames (#282). Each request is built as
-// the client frame and checked by parseClientMessage, as ws.ts receives it;
-// then the same application calls run in the same order: hello, then replay;
-// bind, then replay of its alias; revalidateSession before every later
-// operation. Refusals reject with the ApplicationError the WSS error frame
-// carried (code, message, extra).
+// An application-level session: no socket, no frames, no hosted store (#282).
+// It is a session the way application.hostedSession builds one, registered
+// with hostedRegister and given its aliases by application.bind, so tests
+// drive the application's own operations (send, bind, call, replay...) with
+// no transport in between. It is not a hosted-store root: it has no lease, no
+// ownership and no generation, and nothing in the hosted service sees it. A
+// session with no alias is hosted's read-only kind (it may not send), and the
+// first bind lifts that, as a rebuilt hosted session would. Refusals reject
+// with the ApplicationError the operation threw (code, message, extra).
 import { expect } from "bun:test";
-import { mintSessionKey } from "../../src/core/bindings.ts";
+import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
 import type { PendingRef } from "../../src/core/boards.ts";
 import {
-  ApplicationError,
   type Application,
   type ApplicationSession,
   type BindResult,
   type DeliveryEvent,
   type DeliverySink,
   type DirectMessage,
-  type HelloOptions,
-  type HelloResult,
   type HistoryMessage,
+  type IdentityInfo,
   type InboxResult,
   type SendResult,
   type UnbindResult,
 } from "../../src/server/application.ts";
 import type { AuthedUser } from "../../src/server/auth.ts";
-import {
-  parseClientMessage,
-  PROTO,
-  type ClientMessage,
-  type DelegateRequest,
-  type DelegateResult,
-  type ErrorCode,
-} from "../../src/shared/protocol.ts";
+import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
 import { until } from "./until.ts";
 
 export type AppEvent =
   | DeliveryEvent
-  // DeliverySink.aliasLost: the server released an alias the session held.
-  | { kind: "alias_lost"; alias: string; reason: string }
-  // DeliverySink.closed: the server closed the session; the driver then closes, as the socket did.
-  | { kind: "closed"; code: ErrorCode; message: string }
-  // DeliverySink.keepAlive: the heartbeat's ping.
-  | { kind: "keep_alive" };
+  // DeliverySink.closed: the server closed the session; the driver then closes.
+  | { kind: "closed"; code: ErrorCode; message: string };
 
-// push/hold/key: as a WSS client's hello (push: false with no hold is a
-// tools-only session, whose identity is its writes_as; key: the session key,
-// minted when absent). hello: further hello fields; `alive` is the driver's
-// own (open until close()). bind: further fields for the identity's bind.
-// probe: how the session answers the hello's holder probe: "answer" (a live
-// client's pong, the default), "silent" (no pong: false after the probe's
-// ms), or a function of the ms.
+// push/hold/key: a session with push: false and no hold is tools-only, whose
+// identity is the alias it writes as; key: the session key its ID derives
+// from, minted when absent. harness: what hostedRegister records. bind:
+// further fields for the identity's bind. probe: how the session answers a
+// bind's probe of its alias (a contender asking whether the holder is alive):
+// "answer" (the default), "silent" (no answer: false after the probe's ms), or
+// a function of the ms.
 export type AppSessionOptions = {
   push?: boolean;
   hold?: boolean;
   key?: string;
-  hello?: Partial<Omit<HelloOptions, "alive">>;
+  harness?: string;
   bind?: Record<string, unknown>;
   probe?: "answer" | "silent" | ((ms: number) => Promise<boolean>);
 };
 
+// What connect() answers: the session's ID and what its user's instructions
+// would carry, and the bind's result when the identity was bound.
+export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
+
 type Waiter = { pred: (e: AppEvent) => boolean; resolve: (e: AppEvent) => void; reject: (e: Error) => void };
-type Frame<T extends ClientMessage["type"]> = Extract<ClientMessage, { type: T }>;
 
 export class AppSession {
   readonly key: string;
-  // The session's ID, from the hello's answer.
+  // The session's ID, from its key.
   id = "";
   session!: ApplicationSession;
   // Every event no next() has taken yet, oldest first.
   events: AppEvent[] = [];
   private waiters: Waiter[] = [];
   private closed = false;
-  private n = 0;
 
   constructor(
     private readonly application: Application,
     private readonly authed: AuthedUser,
-    // The alias to bind after the hello; null stays an unbound session.
+    // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
     private readonly opts: AppSessionOptions = {},
   ) {
@@ -87,7 +78,7 @@ export class AppSession {
     return this.identity ?? (this.id || "unbound");
   }
 
-  // The sink ws.ts's sinkFor would be, with events in place of frames.
+  // The sink a hosted session has, with events in place of a stream.
   private sink(): DeliverySink {
     return {
       deliver: (event) => this.arrive(event),
@@ -95,17 +86,10 @@ export class AppSession {
         this.arrive({ kind: "closed", code: error.code, message: error.message });
         this.drop(`closed by the server (${error.code}: ${error.message})`);
       },
-      aliasLost: (alias, reason) => {
-        if (!this.closed) this.arrive({ kind: "alias_lost", alias, reason });
-      },
-      keepAlive: () => {
-        if (!this.closed) this.arrive({ kind: "keep_alive" });
-      },
       probe: (ms) => {
         const probe = this.opts.probe ?? "answer";
         if (probe === "answer") return Promise.resolve(!this.closed);
         if (typeof probe === "function") return probe(ms);
-        // No pong: ws.ts's probe timer answers false.
         const { promise, resolve } = Promise.withResolvers<boolean>();
         setTimeout(() => resolve(false), ms);
         return promise;
@@ -119,8 +103,8 @@ export class AppSession {
     else this.events.push(e);
   }
 
-  // The connection is gone: its session closes (ws.ts's close handler) and
-  // every pending wait fails now, not at its timeout.
+  // The connection is gone: its session closes and every pending wait fails
+  // now, not at its timeout.
   private drop(why: string): void {
     if (!this.closed) {
       this.closed = true;
@@ -129,88 +113,56 @@ export class AppSession {
     for (const w of this.waiters.splice(0)) w.reject(new Error(`${this.label}: ${why}`));
   }
 
-  // The frame as ws.ts parses it from the wire (JSON, then
-  // parseClientMessage); a malformed one is ws.ts's bad_request.
-  private frame<T extends ClientMessage["type"]>(fields: { type: T } & Record<string, unknown>): Frame<T> {
-    try {
-      // parseClientMessage answers the variant its `type` names.
-      return parseClientMessage(JSON.parse(JSON.stringify({ ...fields, req_id: `r${++this.n}` }))) as Frame<T>;
-    } catch (e) {
-      throw new ApplicationError("bad_request", (e as Error).message);
-    }
-  }
-
-  // Every operation after the hello (ws.ts:132-141): parsed, then the
-  // session revalidated; a session that fails it is refused and its
-  // connection closes.
-  private live<T extends ClientMessage["type"]>(fields: { type: T } & Record<string, unknown>): { msg: Frame<T>; session: ApplicationSession } {
+  // Every operation after connect: the session revalidated first; one that
+  // fails it is refused and closes.
+  private live(): ApplicationSession {
     if (!this.session) throw new Error(`${this.label}: not connected`);
-    const msg = this.frame(fields);
     try {
       this.application.revalidateSession(this.session, true);
     } catch (e) {
       this.drop(`refused: ${(e as Error).message}`);
       throw e;
     }
-    return { msg, session: this.session };
+    return this.session;
   }
 
-  // The hello (ws.ts:115-131), then a bind of the identity unless it's
-  // null, tools-only or already held. Rejects with the ApplicationError that
-  // refused either.
-  async connect(): Promise<HelloResult & { bind?: BindResult }> {
+  // Registers the session, then binds the identity unless it's null or
+  // tools-only (a tools-only session writes as it and binds nothing). Rejects
+  // with the ApplicationError that refused either.
+  async connect(): Promise<AppConnected> {
     if (this.session || this.closed) throw new Error(`${this.label}: connect() runs once, before close()`);
     const toolsOnly = this.opts.push === false && this.opts.hold !== true;
-    const { type: _t, req_id: _r, proto: _p, ...hello } = this.frame({
-      type: "hello", proto: PROTO, session_key: this.key,
-      ...(this.opts.push === false ? { push: false } : {}),
-      ...(this.opts.hold ? { hold: true } : {}),
-      ...(toolsOnly && this.identity !== null ? { writes_as: this.identity } : {}),
-      ...this.opts.hello,
-    });
-    let session: ApplicationSession, ok: HelloResult;
+    const id = idAddress(this.key);
+    let info: IdentityInfo;
     try {
-      ({ session, ok } = await this.application.hello(this.authed, this.sink(), { ...hello, alive: () => !this.closed }));
+      const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
+      this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
+      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
     } catch (e) {
-      this.drop(`hello refused: ${(e as Error).message}`);
+      this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
     }
-    this.session = session;
-    this.id = ok.id;
-    // Closed while the hello answered: its session closes too.
-    if (this.closed) {
-      this.application.close(session);
-      throw new Error(`${this.label}: closed during its hello`);
-    }
-    try {
-      this.application.replay(session);
-    } catch (e) {
-      this.drop(`refused: ${(e as Error).message}`);
-      throw e;
-    }
+    this.id = id;
+    const ok: AppConnected = { id, ...info };
     if (this.identity === null || toolsOnly) return ok;
-    const full = this.identity.includes("/") ? this.identity : `${ok.user_email}/${this.identity}`;
-    if (ok.bound?.includes(full)) return ok;
     return { ...ok, bind: await this.bind(this.identity, this.opts.bind) };
   }
 
-  // bind, then the new alias's mail and boards (ws.ts:143-149).
-  async bind(alias: string, extra: Record<string, unknown> = {}): Promise<BindResult> {
-    const { msg, session } = this.live({ type: "bind", alias, ...extra });
-    const { type: _t, req_id: _r, ...bind } = msg;
-    const ok = await this.application.bind(session, bind);
+  // bind, then the new alias's mail and boards. The first bind makes the
+  // session a writer, as a rebuilt hosted session is.
+  async bind(alias: string, extra: { create?: boolean; meta?: unknown; restored_from?: string; previous_key?: string } = {}): Promise<BindResult> {
+    const session = this.live();
+    const ok = await this.application.bind(session, { alias, ...extra } as Parameters<Application["bind"]>[1]);
+    if (session.readOnly) {
+      session.readOnly = false;
+      session.writerId = this.id;
+    }
     this.application.replay(session, [ok.alias]);
     return ok;
   }
 
   async unbind(alias: string): Promise<UnbindResult> {
-    const { msg, session } = this.live({ type: "unbind", alias });
-    return this.application.unbind(session, msg.alias);
-  }
-
-  async end(): Promise<void> {
-    const { session } = this.live({ type: "end" });
-    this.application.end(session);
+    return this.application.unbind(this.live(), alias);
   }
 
   async send(
@@ -218,58 +170,49 @@ export class AppSession {
     body: string,
     opts: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
   ): Promise<SendResult> {
-    const { msg, session } = this.live({ type: "send", recipient, body, ...opts });
-    return this.application.send(session, msg.recipient, msg.body, msg);
+    return this.application.send(this.live(), recipient, body, opts);
   }
 
   async delegate(req: Omit<DelegateRequest, "type" | "req_id">): Promise<DelegateResult> {
-    const { msg, session } = this.live({ type: "delegate", ...req });
-    return this.application.delegate(session, msg);
+    return this.application.delegate(this.live(), req);
   }
 
   async history(opts: { peer?: string; limit?: number; before_id?: number } = {}): Promise<HistoryMessage[]> {
-    const { msg, session } = this.live({ type: "history", ...opts });
-    return this.application.history(session, msg);
+    return this.application.history(this.live(), opts);
   }
 
   async thread(id: number): Promise<DirectMessage[]> {
-    const { msg, session } = this.live({ type: "thread", message_id: id });
-    return this.application.thread(session, msg.message_id);
+    return this.application.thread(this.live(), id);
   }
 
   async inbox(days?: number): Promise<InboxResult> {
-    const { msg, session } = this.live({ type: "inbox", days });
-    return this.application.inbox(session, msg.days);
+    return this.application.inbox(this.live(), days);
   }
 
-  // A board or claim tool; resolves with the result the call publishes
-  // (ws.ts's call_ok), after its commit and before its deliveries. T is the
-  // shape the caller expects; nothing checks it.
+  // A board or claim tool; resolves with the result the call publishes, after
+  // its commit and before its deliveries. T is the shape the caller expects;
+  // nothing checks it.
   async call<T = unknown>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
-    const { msg, session } = this.live({ type: "call", tool, args });
+    const session = this.live();
     const { promise, resolve } = Promise.withResolvers<T>();
-    this.application.call(session, msg.tool, msg.args, (result) => resolve(result as T));
+    this.application.call(session, tool, args, (result) => resolve(result as T));
     return promise;
   }
 
   async ack(ids: number[]): Promise<void> {
-    const { msg, session } = this.live({ type: "ack", message_ids: ids });
-    this.application.receiptDirect(session, msg.message_ids);
+    this.application.receiptDirect(this.live(), ids);
   }
 
   async boardAck(refs: PendingRef[]): Promise<void> {
-    const { msg, session } = this.live({ type: "board_ack", refs });
-    this.application.receiptBoards(session, msg.refs);
+    this.application.receiptBoards(this.live(), refs);
   }
 
   async dmAck(id: number): Promise<void> {
-    const { msg, session } = this.live({ type: "dm_ack", message_id: id });
-    this.application.acknowledgeDm(session, msg.message_id);
+    this.application.acknowledgeDm(this.live(), id);
   }
 
   async retract(id: number): Promise<{ note?: string }> {
-    const { msg, session } = this.live({ type: "dm_retract", message_id: id });
-    return this.application.retract(session, msg.message_id);
+    return this.application.retract(this.live(), id);
   }
 
   // The first event matching pred, taken from those already here or the
@@ -306,8 +249,7 @@ export class AppSession {
     }, ms + 1000, `${this.label}: no event matching ${pred} for ${ms} ms`);
   }
 
-  // The connection closes (ws.ts's close handler): application.close, which
-  // starts a WSS session's grace. Later operations are refused.
+  // The session closes (application.close). Later operations are refused.
   close(): void {
     this.drop("closed");
   }
