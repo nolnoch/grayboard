@@ -8,6 +8,7 @@ import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
+import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
@@ -583,20 +584,26 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
 }
 
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
+  // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
+  // marks it, so a host caching this session's instructions fetches them again.
+  const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
+    ? { ...result, content: [...result.content, { type: "text", text: notice }], _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
+    let notice: string | undefined;
     try {
       const context = current(ctx);
-      return text(await hosted.run(context.principal, context.sessionContext, tool, call) ?? "ok");
+      return said(text(await hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
       const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
-      return { ...text(`error: ${message}`), isError: true };
+      return said({ ...text(`error: ${message}`), isError: true }, notice);
     }
   };
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: z.strictObject({}) }, async (_, ctx) => {
     const context = current(ctx);
-    return text(await hosted.whoami(context.principal, context.sessionContext));
+    let notice: string | undefined;
+    return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
