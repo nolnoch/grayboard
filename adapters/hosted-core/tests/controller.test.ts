@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { Controller, type ControllerOptions } from "../src/controller.js";
-import { AccessExpired, Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
+import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
 import { LeaseUnavailable, ServerUnreachable, SubscriberError, Wire, type WireOptions } from "../src/wire.js";
@@ -23,6 +23,8 @@ function runtime(mode: Mode) {
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
+  // While set, the credential's token() finds the access token ended for this reason.
+  let accessFault: AccessReason | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined;
   const loops: FakeWire[] = [];
@@ -33,11 +35,12 @@ function runtime(mode: Mode) {
     capability?: string;
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
-    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); if (beforeRetry) loops.push(this); }
-    // Only the run loop's wire has beforeRetry. The SDK wraps a token() failure
-    // during connect in its version-negotiation error.
+    constructor(options: WireOptions, readonly auth: { token(): Promise<string> }, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); if (beforeRetry) loops.push(this); }
+    // Only the run loop's wire has beforeRetry. The SDK reads the token while
+    // connecting and wraps a token() failure in its version-negotiation error.
     async connect() {
       if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
+      try { await this.auth.token(); } catch (error) { throw new Error("Version negotiation probe failed", { cause: error }); }
     }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
@@ -88,7 +91,7 @@ function runtime(mode: Mode) {
     capture: async sessionID => { if (signedOut) throw new AccessExpired("pi", "run /grayboard login"); return { version: 2, sessionID, configuration: configuration() }; },
     check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
-    token: async () => "access",
+    token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
   };
   const approval: ApprovalPort<Enrollment> | null = mode === "approval" ? {
@@ -122,6 +125,8 @@ function runtime(mode: Mode) {
     closeStream: (id: string) => { streams.get(id)?.(); },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
+    // token() refuses with AccessExpired(reason) until called again without one.
+    expireAccess: (reason?: AccessReason) => { accessFault = reason; },
     // The nth delivery_renew throws `error` once, after running `then`.
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
@@ -445,6 +450,59 @@ test.each(modes)("a refresh another process holds is retried like an outage, pas
     expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "refresh_in_progress" } });
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
   } finally { await c.close(); await r.controller.close(); }
+});
+
+// #472: a host that rotates its own access token (OpenCode's native grant)
+// does so at or just after expiry, up to ~1.5 s after the server closed the
+// stream for it. Virtual time is the backoff waited since that close.
+test.each(modes)("an `expired` access token at a stream close is polled until the host rotates it: same ownership, no budget spent (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  let elapsed = 0;
+  const c = r.make({ wait: async ms => { waits.push(ms); if ((elapsed += ms) >= 1500) r.expireAccess(); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active");
+    const ownership = r.root(c)?.ownership;
+    r.batches.set("R", [r.item("direct:1")]);
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.batches.get("R")?.length === 0);
+    // The close's own backoff, then 500 ms rotation polls; a spent failure would back off 1000 ms.
+    expect(waits).toEqual([500, 500, 500]);
+    expect(r.root(c)).toMatchObject({ state: "active", ownership, failure: { operation: "reopen", code: "native_access_expired" } });
+    expect(r.named("delivery_open")).toHaveLength(2);
+    expect(r.named("bind")).toHaveLength(1);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+test.each(modes)("an `expired` access token the host never rotates pauses once the 10 s grace runs out (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active");
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.root(c)?.state === "paused");
+    expect(waits).toEqual(Array(21).fill(500));
+    expect(r.root(c)?.code).toBe("native_access_expired");
+    expect(r.named("delivery_open")).toHaveLength(1);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+// Own-login adapters (pi, omp, Claude Code) refresh 60 s early and end a grant
+// only with these reasons: they get no rotation grace.
+test.each(modes)("own-login access ends (`login_required`, `refresh_outcome_unknown`) still pause at once, with no rotation polls (%s)", async mode => {
+  for (const reason of ["login_required", "refresh_outcome_unknown"] as const) {
+    const r = runtime(mode), waits: number[] = [];
+    const c = r.make({ wait: async ms => { waits.push(ms); } });
+    try {
+      await c.enroll("R", ["be"], true);
+      await until(() => r.root(c)?.state === "active");
+      r.expireAccess(reason); r.closeStream("R");
+      await until(() => r.root(c)?.state === "paused");
+      expect(waits).toEqual([500]);
+      expect(r.root(c)?.code).toBe(reason);
+    } finally { await c.close(); await r.controller.close(); }
+  }
 });
 
 // #444: the per-session stop before the control queue.

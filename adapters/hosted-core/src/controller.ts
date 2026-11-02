@@ -35,6 +35,14 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // the item again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
+// A host that rotates its own access token (OpenCode's native grant) stores
+// the refresh at or just after expiry: up to ~1.5 s after the server closed
+// the stream for it (#472). An `expired` token outside an outage is polled
+// that long before it pauses. 10 s keeps the reopen inside the server's 30 s
+// lease TTL (the last renew is at most 10 s old), so a rollover keeps its
+// ownership. Own-login adapters (pi, omp, Claude Code) never hit it: they
+// refresh 60 s early and end a grant as `login_required` or `refresh_outcome_unknown`.
+const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -64,6 +72,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Sessions a shutdown has begun for: treated like `stopped`, per session,
   // since one Controller may run several roots (OpenCode V2).
   private readonly ending = new Set<string>();
+  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace).
+  private readonly closing = new AbortController();
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -326,8 +336,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     // leases don't count server downtime (#423) and a busy refresh is never
     // taken over; only a healthy lease (renew or receipt) resets the backoff.
     // outage is set only by a failed request: the server also closes the
-    // stream when access expires, and that expiry must still pause.
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    // stream when access expires, and that expiry waits only for the host's
+    // rotation (`rotation`: the grace spent since the last whoami succeeded).
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, rotation = 0, outage = false, inItem = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
@@ -337,7 +348,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
-        outage = false;
+        outage = false; rotation = 0;
         await this.guard(r, epoch, signal);
         if (!current.held.length) {
           r.lease = undefined;
@@ -410,6 +421,13 @@ export class Controller<E extends Enrollment = Enrollment> {
             : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          continue;
+        }
+        if (error instanceof AccessExpired && error.reason === "expired" && rotation < ROTATION_GRACE_MS) {
+          rotation += ROTATION_POLL_MS;
+          this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
+          ready();
+          await this.wait(ROTATION_POLL_MS, signal);
           continue;
         }
         if (error instanceof Refusal || error instanceof DeliveryStopped) throw error;
@@ -492,9 +510,23 @@ export class Controller<E extends Enrollment = Enrollment> {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
+  // Runs `call`, retrying it while the host's access token reads `expired`, one
+  // poll per attempt, for as long as `spent` leaves of the rotation grace (#472).
+  private async rotated<T>(spent: { ms: number }, call: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try { return await call(); }
+      catch (error) {
+        if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS) throw error;
+        spent.ms += ROTATION_POLL_MS;
+        await this.wait(ROTATION_POLL_MS, this.closing.signal);
+      }
+    }
+  }
   async restore() {
     await this.diagnostics.restore(async id => { await this.activeRoot(id); return true; });
     if (!this.port.approval) return;
+    // One rotation grace for the whole pass: the roots share the host's credential.
+    const spent = { ms: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped) continue;
@@ -504,14 +536,28 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (!saved.approval) throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
         const e = saved.approval;
         const previous = this.status().roots.find(record => record.sessionID === id);
-        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused";
+        // A pause for an access token the host rotates itself isn't a refusal
+        // (#472): a restart re-checks the credential and resumes. Its cause is
+        // the record's code, or the failure an earlier restart's own paused
+        // record carried forward.
+        const expired = previous?.state === "paused" && previous.operation !== "session_end" && (previous.code ?? previous.failure?.code) === "native_access_expired";
+        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused" && !expired;
         const held = await this.remembered(id, e);
         const r: Root<E> = { e: { ...e, ...(held ? { held } : {}) }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set() };
         this.roots.set(id, r);
         if (paused) { this.set(r, "paused", `Saved approval paused; ${this.hint}`); continue; }
-        await this.port.credential.check(e);
+        try { await this.rotated(spent, () => this.port.credential.check(e)); }
+        catch (error) {
+          if (!expired) throw error;
+          // Still expired after the grace: the next restart checks again. A
+          // refusal now (another account, a revoked grant) is the pause's cause from here on.
+          const cause = this.expired(error);
+          r.paused = true;
+          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          continue;
+        }
         await this.watch(e);
-        await this.prepare(r, true, true);
+        await this.rotated(spent, () => this.prepare(r, true, true));
       } catch {
         const r = this.roots.get(id);
         if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
@@ -599,7 +645,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.failure(operation, undefined);
   }
   async close() {
-    this.stopped = true;
+    this.stopped = true; this.closing.abort();
     for (const r of this.roots.values()) r.abort?.abort();
     await this.controls;
     for (const r of this.roots.values()) await this.stop(r);

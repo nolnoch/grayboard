@@ -29,7 +29,8 @@ export class Refusal extends Error {
 export type AccessReason = "expired" | "login_required" | "refresh_outcome_unknown";
 // The access token can't be used and only a new sign-in restores it. It pauses
 // like any auth refusal, except during a server outage, when the host couldn't
-// refresh it either (#423).
+// refresh it either (#423), and, when `expired`, for the grace a host that
+// rotates its own token takes to store the refresh (#472).
 export class AccessExpired extends Refusal {
   constructor(readonly harness: string, readonly action: string, readonly reason: AccessReason = "expired") { super("auth", `Signed out of grayboard in ${harness}; ${action}`); }
 }

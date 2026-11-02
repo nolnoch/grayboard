@@ -84,7 +84,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, subscriptions: (call: () => Promise<void> | undefined) => { subscription = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: () => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, subscriptions: (call: () => Promise<void> | undefined) => { subscription = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: (restartWait?: (ms: number, signal: AbortSignal) => Promise<void>) => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, restartWait), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("diagnostic failures never inspect hostile error properties and retain cleanup classification", async () => {
   let reads = 0; const error = new Error();
@@ -481,17 +481,19 @@ test("a lease lost outside any item pauses after bounded recoveries despite succ
   } finally { await r.controller.close(); }
 });
 // An approved root on an actual controller with an immediate backoff, whose
-// first subscription closes on demand (the server stopping, #423).
-async function outage() {
-  const r = runtime(), waits: number[] = [], codes: string[] = [];
-  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async ms => { waits.push(ms); }, record => { if (record.code) codes.push(record.code); });
+// first subscription closes on demand (the server stopping, #423). `waited`
+// sees the backoff waited so far, a virtual clock from that close.
+async function outage(waited?: (elapsed: number) => void) {
+  const r = runtime(), waits: number[] = [], codes: string[] = [], states: string[] = [];
+  let elapsed = 0;
+  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async ms => { waits.push(ms); waited?.(elapsed += ms); }, record => { states.push(record.state); if (record.code) codes.push(record.code); });
   const first = Promise.withResolvers<void>();
   let listens = 0;
   r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
   r.bind("R", "be");
   await controller.enroll("R");
   await until(() => controller.status().state === "active" && listens === 1);
-  return { r, controller, waits, codes, stop: () => first.resolve() };
+  return { r, controller, waits, codes, states, stop: () => first.resolve() };
 }
 const item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" };
 test("server outages and subscription closures never spend the failure budget, and recovery reopens", async () => {
@@ -518,7 +520,7 @@ test("server outages and subscription closures never spend the failure budget, a
     expect(o.controller.status().state).toBe("active");
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
-test("a native token that expires during an outage keeps retrying; outside one it pauses", async () => {
+test("a native token that expires during an outage keeps retrying; outside one it waits out the rotation grace, then pauses", async () => {
   const o = await outage();
   try {
     const failures: Error[] = [new ServerUnreachable(new Error("down")), new NativeAccessExpired(), new NativeAccessExpired()];
@@ -530,31 +532,122 @@ test("a native token that expires during an outage keeps retrying; outside one i
     expect(o.codes).toContain("native_access_expired");
     expect(o.controller.status().state).toBe("active");
   } finally { await o.controller.close(); await o.r.controller.close(); }
-  // Outside an outage: an ordinary failure reconnects, and that connect finds the token expired.
-  const p = runtime({}, async () => {});
+  // Outside an outage: an ordinary failure reconnects, and every connect from then on finds the token expired.
+  const waits: number[] = [], p = runtime({}, async ms => { waits.push(ms); });
   try {
     let connects = 0;
     p.readFailure(() => { p.readFailure(() => {}); throw new Error("transient"); });
-    p.observe(async operation => { if (operation === "connect" && ++connects === 3) throw new NativeAccessExpired(); });
+    p.observe(async operation => { if (operation === "connect" && ++connects >= 3) throw new NativeAccessExpired(); });
     p.bind("R", "be");
     await p.controller.enroll("R");
     await until(() => p.controller.status().state === "paused");
-    expect(connects).toBe(3);
+    // The failure's backoff, then the rotation grace: 20 polls of 500 ms (#472).
+    expect(waits).toEqual([500, ...Array(20).fill(500)]);
+    expect(connects).toBe(23);
     expect(p.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await p.controller.close(); }
 });
-test("a closed subscription is not an outage: native expiry on the reconnect pauses, even wrapped by the SDK", async () => {
+test("a closed subscription is not an outage: native expiry on every reconnect, even wrapped by the SDK, pauses once the rotation grace runs out", async () => {
   const o = await outage();
   try {
     let connects = 0;
     // The SDK wraps errors thrown during connect (EraNegotiationFailed {cause}).
-    o.r.observe(async operation => { if (operation === "connect" && ++connects === 1) throw new Error("era negotiation failed", { cause: new NativeAccessExpired() }); });
+    o.r.observe(async operation => { if (operation === "connect") { connects++; throw new Error("era negotiation failed", { cause: new NativeAccessExpired() }); } });
     o.stop();
     await until(() => o.controller.status().state === "paused");
-    expect(connects).toBe(1);
+    expect(connects).toBe(21);
+    expect(o.waits).toEqual(Array(21).fill(500));
     expect(o.codes).toContain("subscription_closed");
     expect(o.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+// #472: OpenCode refreshes its native token at or just after expiry, up to
+// ~1.5 s after the server closed the stream for it; until then the real
+// Binding finds the stored token expired. Virtual time is the backoff waited since the close.
+for (const lands of [400, 1500]) test(`OpenCode's refresh landing ${lands} ms after the access-expiry close resumes the same ownership without pausing or spending budget`, async () => {
+  const o = await outage(elapsed => { if (elapsed >= lands) o.r.f.rotate("fake-access-two"); });
+  try {
+    const ownership = o.controller.status().roots.find(root => root.sessionID === "R")?.ownership;
+    expect(ownership).toBe(1);
+    o.r.f.expire();
+    o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
+    o.stop();
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    // The close's own backoff, then 500 ms rotation polls; a spent failure would back off 1000 ms.
+    expect(o.waits).toEqual(lands === 400 ? [500] : [500, 500, 500]);
+    expect(o.codes.includes("native_access_expired")).toBe(lands === 1500);
+    expect(o.states).not.toContain("paused");
+    expect(o.codes).not.toContain("retry_exhausted");
+    expect(o.controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership });
+    expect(o.r.calls.filter(c => c.name === "delivery_open")).toHaveLength(2);
+    expect(o.r.calls.some(c => c.name === "bind")).toBe(false);
+    expect(o.r.admissions).toHaveLength(1);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+test("a native refresh that never lands within the rotation grace pauses as before, without releasing the lease", async () => {
+  const o = await outage();
+  try {
+    o.r.f.expire();
+    o.stop();
+    await until(() => o.controller.status().state === "paused");
+    expect(o.waits).toEqual(Array(21).fill(500));
+    expect(o.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
+    expect(o.r.calls.filter(c => c.name === "delivery_open")).toHaveLength(1);
+    expect(o.r.calls.some(c => ["delivery_release", "session_end"].includes(c.name))).toBe(false);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+// #472: a restart restores a pause from its diagnostic record. One whose cause
+// was native access expiry is not a refusal: the restored root re-checks the
+// host's credential, waiting for a refresh that lands after load, and resumes.
+test("a native access expiry pause doesn't survive a restart: restore waits for the host's refresh and resumes the same ownership", async () => {
+  const r = runtime({}, async () => {}); let restarted: Controller | undefined;
+  try {
+    const first = Promise.withResolvers<void>();
+    let listens = 0;
+    r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active" && listens === 1);
+    await r.controller.enroll("B"); await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
+    r.f.expire(); first.resolve();
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
+    expect(r.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
+    await r.controller.close();
+    // OpenCode restarts with the token still expired and refreshes it after the plugin loads.
+    let polls = 0;
+    restarted = r.restart(async () => { if (++polls === 3) r.f.rotate("fake-access-two"); });
+    const start = r.calls.length;
+    await restarted.restore();
+    await until(() => restarted!.status().roots.filter(root => root.state === "active").length === 2);
+    expect(polls).toBe(3);
+    expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership: 1 });
+    expect(r.calls.slice(start).filter(c => c.name === "delivery_open").map(c => c.sessionID).sort()).toEqual(["B", "R"]);
+    expect(r.calls.slice(start).some(c => c.name === "bind")).toBe(false);
+    expect(r.storage.get("paused:R")).toBe(false);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
+test.each(["account", "revoked"])("a genuine refusal at restart keeps a native access expiry pause, for good (%s)", async refusal => {
+  const r = runtime({}, async () => {}); let restarted: Controller | undefined, again: Controller | undefined;
+  try {
+    const first = Promise.withResolvers<void>();
+    r.subscriptions(() => first.promise);
+    r.bind("R", "be");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    r.f.expire(); first.resolve();
+    await until(() => r.controller.status().state === "paused");
+    await r.controller.close();
+    r.f.rotate("fake-access-two");
+    if (refusal === "account") r.f.select("other"); else r.f.status("needs_auth");
+    restarted = r.restart(async () => {});
+    const start = r.calls.length;
+    await restarted.restore();
+    expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
+    await restarted.close();
+    // The refusal is now the pause's cause: a later restart with the host healthy again still doesn't resume it.
+    if (refusal === "account") r.f.select("credential-one"); else r.f.status(undefined);
+    again = r.restart(async () => {}); await again.restore();
+    expect(again.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
+    expect(r.calls.slice(start).some(c => c.name === "delivery_open")).toBe(false);
+  } finally { await again?.close(); await restarted?.close(); await r.controller.close(); }
 });
 test("typed HTTP429 backoff survives successful opens until a complete admission cycle", async () => {
   const r = runtime();
