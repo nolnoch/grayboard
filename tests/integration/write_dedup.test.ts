@@ -259,7 +259,6 @@ describe("dedup and state answers (in process)", () => {
   type Sent = SendResult & Replayed & { attachments?: { id: number; sha256: string }[] };
   const dm = (s: AppSession, body: string, extra: Parameters<AppSession["send"]>[2] = {}) => s.send("you@example.com/fe", body, extra) as Promise<Sent>;
 
-  // hosted twin: #460 (hosted dm_send has no resend)
   test("resend: true writes a second row and a request.resent row", async () => {
     await offline("fe");
     const be = await session("be");
@@ -273,6 +272,21 @@ describe("dedup and state answers (in process)", () => {
     // A later plain repeat replays the forced one.
     expect((await dm(be, "ok")).replayed!.ref.id).toBe(forced.message_id);
     await expect(be.send("fe", "x", { resend: "yes" as unknown as boolean })).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("resend must be boolean") });
+  });
+
+  test("hosted dm_send: following the replay note's resend: true writes a second row (#460)", async () => {
+    await offline("fe");
+    const be = await srv.hosted("you@example.com", "be");
+    const send = (extra: Record<string, unknown> = {}) => be.call<Sent>("dm_send", { to: "fe", body: "hosted ok", ...extra });
+    const first = await send();
+    const replay = await send();
+    expect(replay.note).toEndWith("To send it again on purpose, call with resend: true.");
+    const forced = await send({ resend: true });
+    expect(forced.replayed).toBeUndefined();
+    expect(forced.message_id).not.toBe(first.message_id);
+    expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hosted ok'")).toBe(2);
+    const resent = q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[];
+    expect(resent.map((r) => JSON.parse(r.detail))).toEqual([expect.objectContaining({ tool: "dm_send", ref_kind: "message", ref_id: forced.message_id })]);
   });
 
   test("a repeat after the original was retracted sends anew; dm_retract repeats answer from its audit row", async () => {
