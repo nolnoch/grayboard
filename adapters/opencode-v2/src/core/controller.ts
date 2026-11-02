@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
 import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
-import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type Lease } from "./model.js";
+import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { SessionRoutes } from "./sessions.js";
 import { end, register } from "./children.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Operation, type Status } from "./diagnostics.js";
@@ -56,6 +56,8 @@ function fingerprint(e: Enrollment) {
   const c = e.configuration;
   return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.held ?? []])).digest("hex");
 }
+// An address as a status line writes it: the name without its scope (its user's, or a team's).
+const display = (address: string) => shortOf(address.slice(0, address.lastIndexOf("/")), address);
 
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
@@ -261,7 +263,19 @@ export class Controller<E extends Enrollment = Enrollment> {
     } catch { return undefined; }
   }
   // A root's holds as its user writes them, for a status line.
-  private names(e: E) { return (e.held ?? []).map(address => shortOf(address.slice(0, address.lastIndexOf("/")), address)).join(", "); }
+  private names(e: E) { return (e.held ?? []).map(display).join(", "); }
+  // A whoami's holds the server took (#453), each reported once, for the status line it sets.
+  private lostNote(current: BindingState) { return current.alias_lost?.length ? ` (lost ${current.alias_lost.map(l => `${display(l.alias)}: ${l.reason}`).join("; ")})` : ""; }
+  // Drops the holds a whoami says the server took (#453) from those the root expects, durably, so neither the
+  // run loop nor a resume binds them again and the rest keep receiving, as on WSS. Any other change still pauses.
+  private async dropLost(r: Root<E>, current: BindingState) {
+    const lost = new Set(current.alias_lost?.map(l => l.alias));
+    const kept = r.e.held?.filter(address => !lost.has(address));
+    if (!kept || kept.length === r.e.held!.length) return false;
+    r.e = { ...r.e, held: kept };
+    await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: kept });
+    return true;
+  }
   // Binds the remembered holds `have` lacks (all of them after an ended ownership, the missing ones after a partial
   // loss). `tolerant` (a resume's prepare): a hold now refused (revoked, taken, deleted) is skipped and recorded, so
   // it doesn't keep the others from resuming, and the refusals are returned for the caller to raise if nothing ends
@@ -287,6 +301,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       await this.guard(r, epoch, signal);
       let current = bindingOf(await wire.call("whoami"));
       await this.guard(r, epoch, signal);
+      if (await this.dropLost(r, current)) await this.guard(r, epoch, signal);
       if (r.e.held?.some(address => !current.held.includes(address)) && resume) {
         const refused = await this.bindAll(r, wire, r.e.held, current.held, true);
         await this.guard(r, epoch, signal);
@@ -296,7 +311,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         for (const error of refused) this.diagnostics.record({ state: "degraded", message: `Could not resume a held name (${error.code}); it is no longer held`, operation: "prepare", sessionID: r.e.sessionID, code: error.code });
       }
       if (r.epoch !== epoch || r.paused || this.stopped) return;
-      if (!current.held.length) { this.set(r, "unbound", "Root approved, unbound; bind(name) to take one"); return; }
+      if (!current.held.length) { this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`); return; }
       await this.guard(r, epoch, signal);
       r.e = { ...r.e, held: current.held };
       await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: current.held });
@@ -341,6 +356,11 @@ export class Controller<E extends Enrollment = Enrollment> {
         const current = bindingOf(await wire.call("whoami"));
         outage = false;
         await this.guard(r, epoch, signal);
+        if (await this.dropLost(r, current)) {
+          e = { ...e, held: r.e.held };
+          await this.guard(r, epoch, signal);
+          if (!e.held?.length) { r.lease = undefined; this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`); return; }
+        }
         if (!current.held.length) {
           r.lease = undefined;
           await this.bindAll(r, wire, e.held ?? [], []);
@@ -349,7 +369,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         const lease = leaseOf(await wire.call("delivery_open"), e);
         await this.guard(r, epoch, signal);
         r.lease = lease; wire.capability = lease.capability;
-        this.set(r, "active", `Subscribed as ${this.names(e)}; receipts follow durable root admission`);
+        this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake: (() => void) | undefined, closed = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });

@@ -21,6 +21,8 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
+  // Holds the server took (#453), per session: the subscriber whoami reports them once, as the server does.
+  const lost = new Map<string, { alias: string; reason: string }[]>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
@@ -45,7 +47,9 @@ function runtime(mode: Mode) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") {
         if (!this.beforeRetry && prepareHold) await prepareHold;
-        return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(!row?.held.length ? { unbound: true } : {}) };
+        const taken = lost.get(this.sessionID) ?? [];
+        lost.delete(this.sessionID);
+        return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(taken.length ? { alias_lost: taken } : {}), ...(!row?.held.length ? { unbound: true } : {}) };
       }
       if (name === "bind") {
         if (address(args.name as string).endsWith("/gone")) throw new SubscriberError("alias_held");
@@ -120,6 +124,14 @@ function runtime(mode: Mode) {
     // The grant changes before any watch's next tick; the server then closes `id`'s stream.
     revoke: (id: string) => { grant++; streams.get(id)?.(); },
     closeStream: (id: string) => { streams.get(id)?.(); },
+    // The server takes a hold (#453, a revoked access): released, the generation bumped, the stream closed,
+    // and the next whoami reports it.
+    loseHold: (id: string, name: string, reason: string) => {
+      const row = rows.get(id)!;
+      row.held = row.held.filter(h => h !== address(name)); row.generation++;
+      lost.set(id, [...(lost.get(id) ?? []), { alias: address(name), reason }]);
+      streams.get(id)?.();
+    },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
     // The nth delivery_renew throws `error` once, after running `then`.
@@ -625,10 +637,32 @@ test.each(modes)("resume rebinds every remembered hold in order, and a hold drop
     await until(() => r.root(c)?.state === "active");
     expect(r.named("bind").slice(binds).map(x => x.args.name)).toEqual([at("be"), at("fe")]);
     expect(r.rows.get("R")?.held).toEqual([at("be"), at("fe")]);
-    // Revocation (or another process's unbind): the held set no longer matches what this root started with.
+    // A drop no whoami's alias_lost explains (another process's unbind): the held set no longer matches what this root started with.
     const row = r.rows.get("R")!;
     r.rows.set("R", { ...row, held: [at("fe")], generation: row.generation + 1 });
     r.closeStream("R");
     await until(() => r.root(c)?.state === "paused");
   } finally { await c.close(); }
+});
+
+// #453: a hold the server took, which whoami reports as alias_lost, is a known loss, not an unexplained change.
+test.each(modes)("a hold whoami reports lost leaves the root receiving under the rest, remembered and on the status line; losing the last leaves it unbound (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  try {
+    await r.controller.enroll("R", ["be", "eng/build"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    r.loseHold("R", "eng/build", reason);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
+    expect(r.root(r.controller)).toMatchObject({ held: [at("be")], message: `Subscribed as be (lost build: ${reason}); receipts follow durable root admission` });
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [at("be")] });
+    expect(await r.controller.carried("R")).toEqual([at("be")]);
+    // The second loss's status line names only it: the first was reported once.
+    r.loseHold("R", "be", reason);
+    await until(() => r.root(r.controller)?.state === "unbound");
+    expect(r.root(r.controller)!.message).toBe(`Root approved, unbound (lost be: ${reason}); bind(name) to take one`);
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+    // Neither loss is bound again.
+    expect(r.named("bind").map(c => c.args.name)).toEqual(["be", "eng/build"]);
+  } finally { await r.controller.close(); }
 });

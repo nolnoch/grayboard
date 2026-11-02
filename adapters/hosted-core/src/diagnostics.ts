@@ -1,5 +1,5 @@
 import type { KeyValueStorage } from "./port.js";
-import { ServerUnreachable, SubscriberError, SubscriptionClosed, holderText } from "./wire.js";
+import { ServerUnreachable, SubscriberError, SubscriptionClosed, shownText } from "./wire.js";
 import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated, validHeld } from "./model.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; held?: string[]; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
@@ -41,7 +41,7 @@ export function failureMessage(error: unknown, resumeHint: string): string {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;
     const holder = Object.getOwnPropertyDescriptor(error, "holder")?.value;
-    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "alias_held" && holderText(holder) ? `; held by ${holder}` : ""}`;
+    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "alias_held" && shownText(holder) ? `; held by ${holder}` : ""}`;
   }
   return `Operation failed; ${resumeHint}`;
 }

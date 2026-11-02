@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { HostedStore, HostedSession, HostedEnd } from "./hosted-types.ts";
+import type { HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -273,6 +273,17 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
     -- A hosted root's holds are alias_holds rows (#451); the unique index on its old single name goes (migrateHostedHolds).
     DROP INDEX IF EXISTS idx_hosted_name;
+    -- A hosted root's holds the server took (#453, revokeAliases), one row per alias (a second loss restates it).
+    -- Two readers each take a row once: the agent (told_at: its native whoami or tool result carried the notice)
+    -- and the root's Controller (seen_at: its subscriber whoami reported it, so the shrunken held set is a known
+    -- loss, not a pause); a row both took is deleted. An ownership end deletes the row and these with it: the next
+    -- ownership starts holding nothing. was_primary: the hold was the root's primary, for the notice's "sends as ... now".
+    CREATE TABLE IF NOT EXISTS hosted_alias_lost (
+      session_id TEXT NOT NULL REFERENCES hosted_sessions(session_id) ON DELETE CASCADE,
+      alias TEXT NOT NULL, reason TEXT NOT NULL, was_primary INTEGER NOT NULL, at INTEGER NOT NULL,
+      told_at INTEGER, seen_at INTEGER,
+      PRIMARY KEY (session_id, alias)
+    );
     -- Server-wide scalar state. alive_at: the server's last heartbeat (epoch ms),
     -- so a restart can credit hosted leases with the downtime (#423). builtin_clients:
     -- when this database first ran with the built-in OAuth clients (#429), which revoked
@@ -1251,6 +1262,11 @@ function makeHostedStore(db: Database): HostedStore {
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
   };
+  // The hosted_alias_lost column each reader marks when it takes a lost hold (#453).
+  const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
+  const lostOf = (session: string, reader: LostReader) => db.query<{ alias: string; reason: string; was_primary: number }, [string]>(
+    `SELECT alias, reason, was_primary FROM hosted_alias_lost WHERE session_id = ? AND ${LOST_READ[reader]} IS NULL ORDER BY at, rowid`,
+  ).all(session).map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
   const store: HostedStore = {
     atomic: fn => db.transaction(fn).immediate(),
     subscribe: () => () => {},
@@ -1295,6 +1311,19 @@ function makeHostedStore(db: Database): HostedStore {
       for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
+    },
+    lose(session, lost, now) {
+      db.run(`INSERT INTO hosted_alias_lost(session_id, alias, reason, was_primary, at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, alias) DO UPDATE SET reason = excluded.reason, was_primary = excluded.was_primary, at = excluded.at, told_at = NULL, seen_at = NULL`,
+        [session, lost.alias, lost.reason, lost.primary ? 1 : 0, now]);
+    },
+    lost: (session, reader) => lostOf(session, reader),
+    takeLost(session, reader, now) {
+      const lost = lostOf(session, reader);
+      if (!lost.length) return lost;
+      db.run(`UPDATE hosted_alias_lost SET ${LOST_READ[reader]} = ? WHERE session_id = ? AND ${LOST_READ[reader]} IS NULL`, [now, session]);
+      db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND told_at IS NOT NULL AND seen_at IS NOT NULL", [session]);
+      return lost;
     },
     aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat(now) {

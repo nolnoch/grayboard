@@ -15,7 +15,7 @@ import { ackIds, ackResult } from "../shared/inbox.ts";
 import { checkBody } from "../core/boards.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
 import {
-  TOOLS_ONLY_BIND, bindMissed, bindOk, boundInstructions, envSessionKey, heldNote, idAddress, launcherNote, mintSessionKey, notHolding, restoreNote, unbindMissed,
+  TOOLS_ONLY_BIND, aliasLostNotice, bindMissed, bindOk, boundInstructions, envSessionKey, heldNote, idAddress, launcherNote, mintSessionKey, notHolding, restoreNote, unbindMissed,
   unbindOk, unboundInstruction,
 } from "../core/bindings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
@@ -208,9 +208,8 @@ const client: GrayboardClient = new GrayboardClient(
       held = held.filter((h) => h !== m.alias);
       if (!held.length) boundNotices = [];
       writeNames();
-      nameNotice = `This session lost its bus name "${short(m.alias)}": ${m.reason}. ` + (held.length
-        ? before === primary() ? `It still sends as "${short(primary())}".` : `It sends as "${short(primary())}" now.`
-        : `It acts as its ID (${client.id}) now: bind(name) to take another.`);
+      nameNotice = aliasLostNotice([{ alias: short(m.alias), reason: m.reason }], held.length ? short(primary()) : null, before !== primary(),
+        `It acts as its ID (${client.id}) now: bind(name) to take another.`);
       instructionsStale = true;
       console.error(`[grayboard] session ${client.id} lost "${m.alias}": ${m.reason}`);
     },

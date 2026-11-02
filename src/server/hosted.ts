@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
-import { asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
+import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -10,7 +10,7 @@ import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSess
 import type { OAuthPrincipal } from "./oauth.ts";
 import { harnessFor } from "./oauth-config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
-import type { HostedEnd, HostedSession } from "./hosted-types.ts";
+import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
@@ -78,6 +78,8 @@ export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDe
 }
 // A name as the session sees it: its own scope's prefix dropped (the plugin's short()).
 const shortOf = (email: string) => (address: string) => address.startsWith(`${email}/`) ? address.slice(email.length + 1) : address;
+// The alias_lost notice's last sentence for a root left holding nothing: unbound, it only reads.
+const LOST_ALL = "It has no bus name now, so it only reads: bind(name) to take another.";
 const quietSink: DeliverySink = { deliver() {}, probe: async () => true, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
 // How often the sweep timer records the server's liveness; after a crash the
@@ -277,6 +279,23 @@ export function createHostedSessions(application: Application, options: { now?: 
     const current = fresh ? rootOf(fresh) : undefined;
     if (!fresh || fresh.ownership_id !== row.ownership_id || fresh.root_session_id !== row.root_session_id || !current || current.session_id !== root.session_id || current.ownership_id !== root.ownership_id || current.bind_gen !== root.bind_gen || (current.lease_deadline !== null && current.lease_deadline <= now())) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
   }
+  // The holds the server took from root `row` (#453) that `reader` hasn't taken, taken now: the agent's (a native
+  // whoami or tool result) audited, the Controller's (its subscriber whoami) not. A child's call takes none: bind
+  // is the root's, and an adapter's own probe from a child (pi's) would swallow the notice.
+  function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): HostedLost[] {
+    // The read first, so a call with nothing pending opens no transaction (whose commit wakes the observers).
+    if (!row || row.root_session_id || !store.lost(row.session_id, reader).length) return [];
+    return store.atomic(() => {
+      const taken = store.takeLost(row.session_id, reader, now());
+      if (taken.length && reader === "agent") audit(row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
+      return taken;
+    });
+  }
+  // The agent's notice for lost holds, said as the plugin says its alias_lost frame.
+  function lostNotice(p: OAuthPrincipal, row: HostedSession, lost: HostedLost[]): string {
+    const short = shortOf(p.authed.user_email), primary = application.hostedHolds(row.session_id)[0];
+    return aliasLostNotice(lost.map(l => ({ alias: short(l.alias), reason: l.reason })), primary === undefined ? null : short(primary), lost.some(l => l.primary), LOST_ALL);
+  }
   const service = {
     application,
     limits,
@@ -293,8 +312,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     sweep,
     listen(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row)); },
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T): Promise<T> {
+    // `told` (a native tool call): gets the alias_lost notice, if any, for the result.
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void): Promise<T> {
       return withGate(p, context, false, async row => {
+        const taken = told ? takeLost(p, row, "agent") : [];
+        if (taken.length) told!(lostNotice(p, row!, taken));
         const root = row ? rootOf(row) : undefined;
         if (!(root && named(root)) && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         const selected = snapshot(p, row);
@@ -351,11 +373,15 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
-    async whoami(p: OAuthPrincipal, context: SessionContext) {
+    // `alias_lost` (#453): the holds the server took that this reader hasn't taken: `told` (the native whoami)
+    // takes the agent's with the notice; the subscriber's (the Controller's) takes its own, so either order works.
+    async whoami(p: OAuthPrincipal, context: SessionContext, told?: (notice: string) => void) {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(row) : undefined;
+        const taken = takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
+        if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(root.session_id) : [];
-        return { held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null,
+        return { held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed) } : {}) };

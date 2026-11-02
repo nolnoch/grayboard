@@ -627,7 +627,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // so it has nothing left to be: its session ends, and its reconnect's
   // hello is refused. A hosted root's hold is released in the database (#408)
   // and its generation bumped (#451): the live holder is rebuilt and its lease
-  // closed, and the next request or whoami tells the session what it lost.
+  // closed. HTTP has no frame to tell it, so the loss is kept until the root's
+  // next native whoami or tool result and its Controller's whoami each took it (#453).
   function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): void {
     if (!uses.length) return;
     const ended: string[] = [];
@@ -646,6 +647,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // A hosted root's change goes through the hosted store's transaction, whose commit tells the hosted
       // service and delivery to close the lease now, not at its next renewal.
       const revoke = () => {
+        const primary = hosted && holdsOf(db, u.id)[0] === u.address;
         dropHold(db, u.address, u.id);
         logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
         writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
@@ -655,6 +657,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
             repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(db, u.id).length ? row.lease_deadline : null });
             if (row.lease_deadline !== null) writeAudit(repo, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
+            repo.hosted.lose(u.id, { alias: u.address, reason, primary }, now());
           }
         }
       };
