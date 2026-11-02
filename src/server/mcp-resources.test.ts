@@ -1,5 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -262,8 +262,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = await application.selectIdentity(tokenSession(application.repo, grant.authed), "be", { deliver() {}, probe: async () => true, closed() {} });
-      application.close(replacement.session);
+      const replacement = new AppSession(application, grant.authed, "be");
+      await replacement.connect();
+      replacement.close();
     }
   } finally { resume(); hosted.delivery.open = original; }
 });

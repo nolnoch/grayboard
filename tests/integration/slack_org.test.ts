@@ -1,7 +1,6 @@
 // The org Slack bridge (src/server/slack.ts) end to end: an in-memory server
 // with a fake Slack, and agents as hosted MCP sessions (#282). Linking, the
-// human identity's round trip, who may reach it, and unlinking. The notice a
-// bridge death owes its owner rides a hello's answer: application sessions.
+// human identity's round trip, who may reach it, and unlinking.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
@@ -343,63 +342,9 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   await until(() => posted("while disabled"));
 }, 30_000);
 
-// hosted twin: #451 (a hello's notices)
-test("a fatal bridge stop tells the owner on their next hello, once", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
-  await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
-
-  const hello = await srv.appSession(alice, "be").connect();
-  const bridgeNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
-  expect(bridgeNotices).toHaveLength(1);
-  expect(bridgeNotices[0]).toContain("your Slack bridge stopped at ");
-  expect(bridgeNotices[0]).toContain("link_disabled");
-});
-
-// hosted twin: #451 (a hello's notices)
-test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  const { claim } = await import("../../src/core/claims.ts");
-  claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
-  const notices = (await srv.appSession(alice, "be").connect()).notices ?? [];
-  const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
-  const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
-  expect(bridge).toBeGreaterThanOrEqual(0);
-  expect(claims).toBe(notices.length - 1);
-  expect(bridge).toBeLessThan(claims);
-});
-
-// hosted twin: #451 (a hello's notices)
-test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
-  const first = await srv.appSession(alice, "be").connect();
-  expect((first.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
-
-  // A second bridge instance (the server-restart analog) re-attaches the same
-  // user and dies fatally again inside the dedup window: the death records,
-  // the notice doesn't repeat.
-  const { SlackBridge } = await import("../../src/server/slack.ts");
-  const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
-    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
-  });
-  await second.start();
-  second.stop({ fatal: true, detail: "second fatal" });
-
-  const hello = await srv.appSession(alice, "fe").connect();
-  const againNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
-  expect(againNotices).toHaveLength(0);
-  const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
-  expect(count.n).toBe(2);
-});
-
-// hosted twin: #451 (a hello's notices)
-test("a bridge that fails at boot tells its linked users, via the durable links", async () => {
+// The notice the owner used to get on their next WSS hello is gone with it
+// (#282): no hosted session carries it, so what stays is the durable record.
+test("a bridge that fails at boot records its death for its linked users, via the durable links", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   // A fresh bridge against a dead Slack URL throws at auth.test before any
@@ -415,60 +360,12 @@ test("a bridge that fails at boot tells its linked users, via the durable links"
   const row = srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human");
   expect(row).toBeDefined();
   expect(JSON.parse(row!.detail!)).toMatchObject({ reason: expect.stringMatching(/not started/) });
-
-  const hello = await srv.appSession(alice, "be").connect();
-  expect((hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 });
 
-// A restart inside the dedup window must not lose an armed-but-undelivered
-// notice: the dedup counts notices delivered, not deaths recorded. hosted twin: #451 (a hello's notices)
-test("an armed but undelivered notice survives a restart inside the dedup window", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  // Death #1 arms a notice nobody has collected: no hello since.
-  srv.app.slack.stop({ fatal: true, detail: "token revoked" });
-
-  // The restart analog: a second bridge over the same database re-attaches
-  // and dies fatally again inside the dedup window. The owner is told once,
-  // of the newest death.
-  const { SlackBridge } = await import("../../src/server/slack.ts");
-  const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
-    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
-  });
-  await second.start();
-  second.stop({ fatal: true, detail: "token revoked again" });
-
-  const hello = await srv.appSession(alice, "be").connect();
-  const bridgeNotices = (hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
-  expect(bridgeNotices).toHaveLength(1);
-  expect(bridgeNotices[0]).toContain("token revoked again");
-});
-
-// Trusted human attachment must not consume the owner's notice. hosted twin: #451 (a hello's notices)
-test("the bridge's own human hello doesn't drain the owner's notice", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "died" });
-  // A restarted bridge attaches the same user: its attach sends a human hello.
-  const { SlackBridge } = await import("../../src/server/slack.ts");
-  const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
-    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
-  });
-  await second.start();
-
-  const hello = await srv.appSession(alice, "be").connect();
-  expect((hello.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
-});
-
-// hosted twin: #451 (a hello's notices)
-test("a deliberate bridge teardown stays silent (no audit row, no notice)", async () => {
+test("a deliberate bridge teardown stays silent (no audit row)", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop();
-  const hello = await srv.appSession(alice, "be").connect();
-  expect(hello.notices ?? []).toHaveLength(0);
   expect(srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human")).toBeUndefined();
 });
 
@@ -497,9 +394,9 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
   }
 }, 30_000);
 
-// A hello's answer says so; a hosted session's instructions, built from the
+// A session's facts say so; a hosted session's instructions, built from the
 // same fact, drop the human sentence.
-test("helloOk.human.linked is false while the bridge is down", async () => {
+test("a session's human.linked is false while the bridge is down", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack.stop({ fatal: true, detail: "recheck" });

@@ -2,8 +2,8 @@
 // first and then the board's one roster match, an ambiguous bare name
 // refuses the post with the candidates, and @id: names the session whatever
 // it's bound to. Person-scope names are hosted MCP sessions (#282); a team
-// alias and an unbound session are application sessions, as hosted can be
-// neither yet.
+// alias and a session bound to a second name are application sessions, as
+// hosted can't hold a team alias yet.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
@@ -30,9 +30,8 @@ afterEach(() => srv.stop());
 const mentioned = (body: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.body === body);
 
 // An application session: a hosted session holds one person-scope name, so
-// it can't hold the team alias eng/deploy, and with no name it receives
-// nothing, so it can't be the unbound session an @id: reaches (#451).
-async function connect(token: string, identity: string | null): Promise<AppSession> {
+// it can't hold the team alias eng/deploy (#451).
+async function connect(token: string, identity: string): Promise<AppSession> {
   const s = srv.appSession(token, identity);
   await s.connect();
   return s;
@@ -70,12 +69,14 @@ test("@scope/name is exact; a bare name is the author's own scope's first, else 
   await deploy.next(mentioned(body));
 });
 
-// hosted twin: #451 (deploy, a team alias; the unbound session an @id: reaches)
+// hosted twin: #451 (deploy, a team alias)
 test("an ambiguous bare name refuses the post with its candidates; an @id: reaches the session", async () => {
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
   const deploy = await connect(bob, "eng/deploy");
-  const unbound = await connect(alice, null);
+  // A session with no name holds no lease and receives nothing (#229), so the
+  // session an @id: names is one bound to a name of its own.
+  const bound = await connect(alice, "sim");
   await deploy.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // eng has no qa of its own, and two people's are on the roster.
@@ -87,7 +88,7 @@ test("an ambiguous bare name refuses the post with its candidates; an @id: reach
   await aqa.none(board());
   await bqa.none(board());
 
-  const body = `@${unbound.id.toUpperCase()} by id`;
-  expect((await deploy.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual([unbound.id]);
-  await unbound.next(mentioned(body));
+  const body = `@${bound.id.toUpperCase()} by id`;
+  expect((await deploy.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual([bound.id]);
+  await bound.next(mentioned(body));
 });

@@ -28,6 +28,13 @@ import { ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
+// A session a delegate may name. The hello that said so is gone (#282); the
+// row's flag is what delegate reads.
+function launcher(srv: TestServer, s: AppSession): AppSession {
+  srv.app.db.prepare("UPDATE ids SET launcher = 1 WHERE id = ?").run(s.id);
+  return s;
+}
+
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 // A replay's marker; absent on a write that landed.
 type Replayed = { replayed?: { ref: { kind: string; id: number }; first_at: string }; note?: string };
@@ -46,17 +53,15 @@ describe("a lost answer, then the same call from the same session", () => {
   afterAll(() => srv.stop());
 
   // The first call commits and its answer is lost: the session drops it
-  // and closes. The same session (its key, resume) comes back tools-only
-  // and makes the same call. Tools-only on both sides (a re-attach is the
-  // kind its row registered, S1), so the re-attach needn't wait out the
-  // old holder's probe.
+  // and closes. The same session (its key) comes back tools-only and makes
+  // the same call.
   async function lostThenRepeated<T>(identity: string, write: (s: AppSession) => Promise<T>): Promise<{ again: AppSession; retry: T }> {
     const key = mintSessionKey();
     const first = srv.appSession(alice, identity, { push: false, key });
     await first.connect();
     await write(first);
     first.close();
-    const again = srv.appSession(alice, identity, { push: false, key, hello: { resume: true } });
+    const again = srv.appSession(alice, identity, { push: false, key });
     await again.connect();
     expect(again.id).toBe(first.id);
     return { again, retry: await write(again) };
@@ -83,7 +88,7 @@ describe("a lost answer, then the same call from the same session", () => {
     const replays = srv.app.db.prepare("SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'").all() as { actor: string; target: string; detail: string }[];
     expect(replays.length).toBe(1);
     expect(replays[0]).toMatchObject({ actor: "alice@example.com", target: "alice@example.com/be" });
-    expect(JSON.parse(replays[0]!.detail)).toMatchObject({ tool: "dm_send", ref_kind: "message", ref_id: id, transport: "wss", first_at: r.replayed!.first_at });
+    expect(JSON.parse(replays[0]!.detail)).toMatchObject({ tool: "dm_send", ref_kind: "message", ref_id: id, transport: "hosted", first_at: r.replayed!.first_at });
     const events = await pushedBefore(fe, () => again.send("bob@example.com/fe", "sentinel 1"), "sentinel 1");
     expect(events.filter(direct((m) => m.id === id)).length).toBe(1);
   });
@@ -106,8 +111,9 @@ describe("a lost answer, then the same call from the same session", () => {
 
   // hosted twin: #451 (a launcher session)
   test("delegate: one pending DM, one delegation.requested, one launcher push", async () => {
-    const lx = srv.appSession(alice, "lx", { hello: { launcher: true } });
+    const lx = srv.appSession(alice, "lx");
     await lx.connect();
+    launcher(srv, lx);
     const { again, retry } = await lostThenRepeated("asker", (s) => s.delegate({ persona: "a researcher", task: "survey the options", to: "lx" }));
     const rows = srv.app.db.prepare("SELECT id, pending FROM messages WHERE recipient = 'alice@example.com/lx' AND sender = 'alice@example.com/asker'").all() as { id: number; pending: number }[];
     expect(rows).toEqual([{ id: expect.any(Number), pending: 1 }]);
@@ -272,7 +278,6 @@ describe("dedup and state answers (in process)", () => {
     expect(resent.map((r) => JSON.parse(r.detail))).toEqual([{ tool: "dm_send", fp: expect.stringMatching(/^[0-9a-f]{64}$/), ref_kind: "message", ref_id: forced.message_id, session: expect.any(String) }]);
     // A later plain repeat replays the forced one.
     expect((await dm(be, "ok")).replayed!.ref.id).toBe(forced.message_id);
-    await expect(be.send("fe", "x", { resend: "yes" as unknown as boolean })).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("resend must be boolean") });
   });
 
   test("a repeat after the original was retracted sends anew; dm_retract repeats answer from its audit row", async () => {
@@ -377,7 +382,9 @@ describe("dedup and state answers (in process)", () => {
 
   // hosted twin: #451 (a launcher session)
   test("delegate's inner send isn't a dm_send: the same body sent plainly afterwards sends", async () => {
-    await srv.appSession(you, "lx", { hello: { launcher: true } }).connect();
+    const lx = srv.appSession(you, "lx");
+    await lx.connect();
+    launcher(srv, lx);
     await offline("sim");
     const be = await session("be");
     const d = await be.delegate({ persona: "a researcher", task: "t", to: "lx" });

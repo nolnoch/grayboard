@@ -126,10 +126,9 @@ function parseAttachmentLimits(env: Record<string, string | undefined>): { attac
   return { attachmentLimits: { file, total }, attachmentUserQuota: quota };
 }
 
-// The rate's floor caps one token's refill at 10s; with the client's jitter
-// (up to 1.5x) that still fits the 25s a rate-limited session waits at
-// startup (HELLO_LIMITED_MS, src/plugin/mcp.ts), so it can still start. The
-// burst's ceiling keeps a typo from switching the limit off.
+// The rate's floor caps one token's refill at 10s, so a limited caller is
+// never told to wait longer than that. The burst's ceiling keeps a typo from
+// switching the limit off.
 const MIN_PER_SEC = 0.1;
 const MAX_BURST = 10_000;
 
