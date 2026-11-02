@@ -699,7 +699,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     });
 
     setHolds(hub, session, holdsOf(db, id));
-    const notices = noticesFor(hub, session.addresses);
+    // The first bind of a user's session after the bridge died carries the death notice, once.
+    const owed = owedBridgeNotice(repo, authed.user_email);
+    const notices = noticesFor(hub, session.addresses, owed ? [owed] : []);
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}), ...(restored ? { restored } : {}) };
   }
 
@@ -771,10 +773,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null) {
       const prior = idRow(db, id);
-      if (prior && prior.principal !== authed.user_email) fail("id_collision", idCollisionText(id, "is another principal's session"));
+      if (prior && prior.principal !== authed.user_email) {
+        const why = "is another principal's session";
+        writeAudit(repo, "id.collision", authed.user_email, id, { why });
+        fail("id_collision", idCollisionText(id, why));
+      }
       // A tools-only root is registered as WSS's is (A4): aliasUser, aliasUses and
       // undeliverableId read ids.writes_as, so a send to its ID is pointed at the alias.
-      if (!prior) registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }) });
+      if (!prior) {
+        repo.atomic(() => {
+          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }) });
+          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }) });
+        });
+      }
       else {
         touchId(db, id);
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
@@ -787,9 +798,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // lazily, as hello does.
     hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false): string {
       const target = bindTarget(hub, authed, raw);
-      if ("error" in target) return fail(target.code, target.error);
+      if ("error" in target) {
+        if (target.address) logBinding(db, id, target.address, "refused", target.error);
+        return fail(target.code, target.error);
+      }
       const other = aliasUser(db, target.address, authed.user_email);
-      if (other) return fail("alias_held", aliasHeldText(target.address, `another user's session ${other}`, "write as another name"));
+      if (other) {
+        const why = `another user's session ${other}`;
+        logBinding(db, id, target.address, "refused", why);
+        return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
+      }
       if (create) createLazily(hub, authed, target, id);
       return target.address;
     },

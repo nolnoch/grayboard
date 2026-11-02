@@ -542,6 +542,9 @@ test("#284: a key whose ID is another principal's session is refused with id_col
   expect(rows(`SELECT address, id FROM alias_holds`)).toEqual([{ address: `${A}/api`, id: idAddress(key) }]);
   expect(await refuses(() => app("api", { key, token: bob }).connect())).toMatchObject({ code: "id_collision", message: expect.stringContaining(idAddress(key)) });
   expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/api` }]);
+  expect(rows(`SELECT action, target FROM access_log WHERE action IN ('id.registered', 'id.collision') ORDER BY id`)).toEqual([
+    { action: "id.registered", target: idAddress(key) }, { action: "id.collision", target: idAddress(key) },
+  ]);
   // The owner's next bind is the same session: one ids row, a second hold.
   expect(await mine.bind("web")).toMatchObject({ alias: `${A}/web` });
   expect(rows(`SELECT id FROM ids`)).toEqual([{ id: idAddress(key) }]);
@@ -571,9 +574,9 @@ test("audit 19: a bind or writes_as refused for an invalid or reserved name is r
   expect(await refuses(() => app("human").connect())).toMatchObject({ code: "forbidden" });
   // A tools-only connection can't write as it either.
   expect(await refuses(() => app("human", { push: false }).connect())).toMatchObject({ code: "forbidden" });
-  // The bind's refusal is logged under its session's ID. A writes_as refusal
-  // (hostedWritesAs) logs no binding event, unlike the hello's it replaced.
-  expect(events("human")).toEqual([{ session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: expect.stringContaining("human") }]);
+  // Each refusal is logged under its session's ID: the bind's and the writes_as's.
+  const refused = { session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: expect.stringContaining("human") };
+  expect(events("human")).toEqual([refused, refused]);
 });
 
 // #284 S7: every agent connection is a session, so a write carries the

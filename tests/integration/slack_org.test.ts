@@ -404,3 +404,55 @@ test("a session's human.linked is false while the bridge is down", async () => {
   expect(hello.human?.linked).toBe(false);
   expect(await (await hosted("alice@example.com", "fe")).instructionsNow()).not.toContain('dm_send(to="human")');
 });
+
+test("a fatal bridge stop tells the owner on their next bind, once", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
+
+  const hello = await srv.appSession(alice, "be").connect();
+  const bridgeNotices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  expect(bridgeNotices).toHaveLength(1);
+  expect(bridgeNotices[0]).toContain("your Slack bridge stopped at ");
+  expect(bridgeNotices[0]).toContain("link_disabled");
+});
+
+test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const { claim } = await import("../../src/core/claims.ts");
+  claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
+  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  const notices = (await srv.appSession(alice, "be").connect()).bind?.notices ?? [];
+  const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
+  const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
+  expect(bridge).toBeGreaterThanOrEqual(0);
+  expect(claims).toBe(notices.length - 1);
+  expect(bridge).toBeLessThan(claims);
+});
+
+test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  const first = await srv.appSession(alice, "be").connect();
+  expect((first.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
+
+  // A second bridge instance (the server-restart analog) re-attaches the same
+  // user and dies fatally again inside the dedup window: the death records,
+  // the notice doesn't repeat.
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const second = new SlackBridge({
+    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
+    appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
+  });
+  await second.start();
+  second.stop({ fatal: true, detail: "second fatal" });
+
+  const hello = await srv.appSession(alice, "fe").connect();
+  const againNotices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+  expect(againNotices).toHaveLength(0);
+  const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
+  expect(count.n).toBe(2);
+});
