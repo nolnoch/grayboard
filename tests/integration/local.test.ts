@@ -8,6 +8,7 @@ import { basename, join } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { localBusDir } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
+import { UPGRADE_REFUSAL } from "../../src/shared/protocol.ts";
 import { runCli } from "../support/cli.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
@@ -134,17 +135,41 @@ test("grayboard mcp: local mode when signed out, named after the repo", async ()
   expect((await call(be, "peer_list")).peers.map((p: any) => p.handle)).toEqual(["api", "be"]);
 }, 20_000);
 
-test("grayboard mcp: a signed-out credentials file fails instead of falling back to local", async () => {
+// `mcp` is the local bus on every machine (#282): a signed-out file doesn't stop it.
+test("grayboard mcp: a signed-out credentials file still serves the local bus", async () => {
   writeFileSync(join(dir, "credentials"), "");
-  const r = await runCli(["mcp"], { cwd: dir, env: busEnv("be") });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("signed out");
+  const be = await start("be");
+  expect((await call(be, "peer_list")).you).toBe("be");
 }, 20_000);
 
 test("grayboard mcp --mode local overrides a signed-in credentials file", async () => {
   writeFileSync(join(dir, "credentials"), JSON.stringify({ session_token: "x", server: "http://127.0.0.1:9", user_email: "a@b.c" }));
   const be = await start("be");
   expect((await call(be, "peer_list")).you).toBe("be");
+}, 20_000);
+
+test("grayboard mcp with no --mode on a signed-in machine serves the local bus (#282 A1)", async () => {
+  writeFileSync(join(dir, "credentials"), JSON.stringify({ session_token: "x", server: "http://127.0.0.1:9", user_email: "a@b.c" }));
+  const be = await start("be", dir, ["mcp"]);
+  expect((await call(be, "peer_list")).you).toBe("be");
+}, 20_000);
+
+test("grayboard mcp --mode server and tools --mode server are refused with the upgrade message (#282)", async () => {
+  for (const args of [["mcp", "--mode", "server"], ["tools", "--mode", "server"]]) {
+    const r = await runCli(args, { cwd: dir, env: busEnv() });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(UPGRADE_REFUSAL);
+  }
+}, 20_000);
+
+test("a signed-in machine: identity create --mcp is refused before anything is reserved, and human/announce still act on the local bus (#282 A1)", async () => {
+  writeFileSync(join(dir, "credentials"), JSON.stringify({ session_token: "x", server: "http://127.0.0.1:9", user_email: "a@b.c" }));
+  const path = join(dir, ".mcp.json");
+  const r = await runCli(["identity", "create", "be", "--mcp", path], { cwd: dir, env: busEnv() });
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("local bus");
+  expect(() => readFileSync(path)).toThrow();
+  expect((await runCli(["human"], { cwd: dir, env: busEnv() })).err).not.toContain("local-mode only");
 }, 20_000);
 
 test("dm_send to a handle that never connected is an error, not a silent queue", async () => {

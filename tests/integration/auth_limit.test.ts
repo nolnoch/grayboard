@@ -6,15 +6,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from "@modelcontextprotocol/client";
-import { mintSessionKey } from "../../src/core/bindings.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
-import { GrayboardClient } from "../../src/plugin/client.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
-import { until } from "../support/until.ts";
 
 const A = "alice@example.com";
 const cleanup: (() => void)[] = [];
@@ -36,12 +33,6 @@ function serve(o: ConstructorParameters<typeof TestServer>[0] = {}) {
   return { srv, clock, lookups: () => lookups };
 }
 
-// An upgrade attempt from `from` (an X-Forwarded-For, believed from the
-// loopback peer by default), as fetch sees it: refusals come back as bodies.
-const upgrade = (srv: TestServer, token: string | null, from: string) =>
-  fetch(`${srv.base}/ws`, {
-    headers: { Upgrade: "websocket", Connection: "Upgrade", "X-Forwarded-For": from, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-  });
 const get = (srv: TestServer, path: string, token: string | null, from: string) =>
   fetch(`${srv.base}${path}`, { headers: { "X-Forwarded-For": from, ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
 // A hosted MCP tools/list from `from` with an OAuth access token: the session transport after WSS (#282).
@@ -64,52 +55,6 @@ const audit = (srv: TestServer, action: string) =>
 const X = "198.51.100.1";
 const Y = "198.51.100.2";
 
-test("burst bad upgrades are refused 401; the next gets 429 with a wait, before any token lookup", async () => {
-  const { srv, lookups } = serve();
-  for (let i = 0; i < 3; i++) expect((await upgrade(srv, `bad${i}`, X)).status).toBe(401);
-  expect(lookups()).toBe(3);
-  const r = await upgrade(srv, "bad", X);
-  expect(r.status).toBe(429);
-  expect(r.headers.get("retry-after")).toBe("10");
-  expect(await r.json()).toEqual({ code: "rate_limited", message: "too many authentication failures from this address; retry in 10s", retry_after_ms: 10_000 });
-  expect(lookups()).toBe(3);
-  // A missing token costs nothing: a page can open a WebSocket cross-origin.
-  for (let i = 0; i < 5; i++) expect((await upgrade(srv, null, Y)).status).toBe(401);
-  expect(srv.app.authGate.size).toBe(1);
-});
-
-test("a limited address is refused everything, a valid token and /healthz too; another address isn't", async () => {
-  const { srv } = serve();
-  const alice = await srv.login(A);
-  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", "bad", X);
-  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
-  expect((await get(srv, "/healthz", null, X)).status).toBe(429);
-  expect((await srv.client(alice, null, { headers: { "X-Forwarded-For": X } }).connect().catch((e: Error) => e.message))).toMatch(/socket/);
-  expect((await get(srv, "/api/whoami", alice, Y)).status).toBe(200);
-  expect((await srv.client(alice, null, { headers: { "X-Forwarded-For": Y } }).connect()).type).toBe("hello_ok");
-});
-
-test("valid traffic, 403s, 404s and requests with no token never spend; a refused token on any path does", async () => {
-  const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
-  const alice = await srv.login(A);
-  for (let i = 0; i < 5; i++) {
-    expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
-    expect((await srv.client(alice, null, { headers: { "X-Forwarded-For": X } }).connect()).type).toBe("hello_ok");
-    // Not an admin, and no such route.
-    expect((await fetch(`${srv.base}/api/admin/users`, { method: "POST", headers: { Authorization: `Bearer ${alice}`, "X-Forwarded-For": X }, body: "{}" })).status).toBe(403);
-    expect((await get(srv, "/api/nothing-here", alice, X)).status).toBe(404);
-    // No token: an <img> on any page can make a browser send this.
-    expect((await get(srv, "/api/whoami", null, X)).status).toBe(401);
-  }
-  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
-  // An unknown path isn't a public route, so requireAuth answers it: a bad token is a 401, charged by chargeRefusedToken.
-  expect((await get(srv, "/api/nothing-here", "bad", X)).status).toBe(401);
-  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
-});
-
-// The three tests above drive the WSS upgrade (its own auth and charge,
-// app.ts) beside the HTTP routes; the gate's own semantics follow over HTTP
-// alone, the hosted MCP standing in for the session transport (#282).
 test("burst refused tokens on a route are refused 401; the next gets 429 with a wait, before any token lookup", async () => {
   const { srv, lookups } = serve();
   for (let i = 0; i < 3; i++) expect((await get(srv, "/api/whoami", `bad${i}`, X)).status).toBe(401);
@@ -216,179 +161,6 @@ test("a run of refusals writes one row and one log line at its start and one at 
   expect(JSON.parse(ended[0]!.detail)).toEqual({ refused: 4 });
   expect(srv.app.authGate.size).toBe(0);
 });
-
-const HELLO_OK = { type: "hello_ok", id: "id:aaaaaaaaaaaaa", user_email: A, teams: [] };
-
-// A stand-in server that accepts only the token `good()` names: anything
-// else gets `refuse()` on the upgrade and on /api/whoami. Records when each
-// upgrade attempt and probe came.
-function stub(good: () => string, refuse: () => Response) {
-  const upgrades: number[] = [];
-  const whoami: number[] = [];
-  const server = Bun.serve({
-    port: 0,
-    fetch(req, server) {
-      const ok = req.headers.get("authorization") === `Bearer ${good()}`;
-      if (new URL(req.url).pathname === "/api/whoami") {
-        whoami.push(Date.now());
-        return ok ? Response.json({}) : refuse();
-      }
-      upgrades.push(Date.now());
-      if (ok && server.upgrade(req)) return;
-      return refuse();
-    },
-    websocket: {
-      message(ws, raw) {
-        const m = JSON.parse(String(raw));
-        if (m.type === "hello") ws.send(JSON.stringify({ req_id: m.req_id, ...HELLO_OK }));
-      },
-    },
-  });
-  cleanup.push(() => server.stop(true));
-  return { url: `http://localhost:${server.port}`, upgrades, whoami, server };
-}
-
-const unauthenticated = () => Response.json({ code: "unauthenticated", message: "invalid token" }, { status: 401 });
-
-test("after a confirmed 401 a running client stops retrying, and reconnects at once on a new token or after the slow retry", async () => {
-  let valid = "t1";
-  let token = "t1";
-  const s = stub(() => valid, unauthenticated);
-  const c = new GrayboardClient(s.url, () => token, mintSessionKey(), async () => {}, async () => {}, undefined, { tokenPollMs: 50, signedOutRetryMs: 3000 });
-  cleanup.push(() => c.close());
-  c.connect();
-  await c.ready();
-
-  // The token is revoked and the connection drops: the reconnect's check
-  // (after the 1s backoff) is refused, so no upgrade is tried: a dead token
-  // costs the address one failure per attempt.
-  valid = "t2";
-  const upgrades = s.upgrades.length;
-  (c as any).ws.close();
-  await until(() => s.whoami.length === 2, 3000);
-  // The slow retry (3s, jittered up to 4.5s) checks the old token once more,
-  // and is refused again; the backoff alone would have tried after 2s.
-  await until(() => s.whoami.length === 3, 6000);
-  expect(s.upgrades.length).toBe(upgrades);
-  expect(s.whoami[2]! - s.whoami[1]!).toBeGreaterThanOrEqual(2900);
-
-  // A new sign-in is seen at the next look (50ms), not at the slow retry.
-  const t = Date.now();
-  token = "t2";
-  await c.ready();
-  expect(Date.now() - t).toBeLessThan(1000);
-}, 10_000);
-
-const limited = (ms: number) => () => Response.json({ code: "rate_limited", message: "too many authentication failures from this address; retry in 1s", retry_after_ms: ms }, { status: 429 });
-
-test("on a limited address the client waits at least its own backoff, keeps doubling it, and says which limit", async () => {
-  let open = false;
-  // The server asks for only 100ms each time.
-  const s = stub(() => (open ? "t" : "never"), limited(100));
-  const c = new GrayboardClient(s.url, () => "t", mintSessionKey(), async () => {}, async () => {});
-  cleanup.push(() => c.close());
-  c.connect();
-  await until(() => c.rateLimited(), 2000);
-  expect(c.rateLimited()).toMatchObject({ what: "this address after repeated authentication failures", message: "too many authentication failures from this address; retry in 1s" });
-  await until(() => s.whoami.length === 3, 5000);
-  // 1s, then 2s: the floor is the backoff, which a 429 never resets.
-  expect(s.whoami[1]! - s.whoami[0]!).toBeGreaterThanOrEqual(1000);
-  expect(s.whoami[2]! - s.whoami[1]!).toBeGreaterThanOrEqual(2000);
-  // The checks were refused, so no upgrade was tried.
-  expect(s.upgrades).toEqual([]);
-  open = true;
-  await c.ready();
-  expect(c.rateLimited()).toBeNull();
-}, 15_000);
-
-test("a 429 without grayboard's code is waited out by its Retry-After, and named as such", async () => {
-  let open = false;
-  const s = stub(() => (open ? "t" : "never"), () => new Response("busy", { status: 429, headers: { "Retry-After": "2" } }));
-  const c = new GrayboardClient(s.url, () => "t", mintSessionKey(), async () => {}, async () => {});
-  cleanup.push(() => c.close());
-  c.connect();
-  await until(() => c.rateLimited(), 2000);
-  expect(c.rateLimited()).toMatchObject({ what: "requests from this client", message: `HTTP 429 from ${s.url}, Retry-After 2` });
-  await until(() => s.whoami.length === 2, 5000);
-  // The header's 2s, not the 1s backoff.
-  expect(s.whoami[1]! - s.whoami[0]!).toBeGreaterThanOrEqual(2000);
-  open = true;
-  await c.ready();
-  expect(c.rateLimited()).toBeNull();
-}, 15_000);
-
-test("a token check that never answers is abandoned at its deadline and retried", async () => {
-  let checks = 0;
-  const server = Bun.serve({
-    port: 0,
-    fetch(req, server) {
-      if (new URL(req.url).pathname === "/api/whoami") {
-        checks++;
-        // The first check stalls, as behind a proxy that never answers.
-        return checks === 1 ? new Promise<Response>(() => {}) : Response.json({});
-      }
-      if (server.upgrade(req)) return;
-      return new Response("no", { status: 400 });
-    },
-    websocket: {
-      message(ws, raw) {
-        const m = JSON.parse(String(raw));
-        if (m.type === "hello") ws.send(JSON.stringify({ req_id: m.req_id, ...HELLO_OK }));
-      },
-    },
-  });
-  cleanup.push(() => server.stop(true));
-  const c = new GrayboardClient(`http://localhost:${server.port}`, () => "t", mintSessionKey(), async () => {}, async () => {}, undefined, { probeTimeoutMs: 200 });
-  cleanup.push(() => c.close());
-  const observed = c as unknown as {
-    checkToken(token: string): Promise<{ kind: string; why?: string }>;
-    reconnectIn(delay: number, why: string): void;
-  };
-  const check = observed.checkToken;
-  const reconnect = observed.reconnectIn;
-  const probes: { kind: string; why?: string }[] = [];
-  const delays: number[] = [];
-  observed.checkToken = async (token) => {
-    const result = await check.call(c, token);
-    probes.push(result);
-    return result;
-  };
-  observed.reconnectIn = (delay, why) => {
-    delays.push(delay);
-    reconnect.call(c, delay, why);
-  };
-  try {
-    c.connect();
-    await c.ready();
-    expect(checks).toBe(2);
-    expect(probes).toEqual([{ kind: "unanswered", why: "no answer within 0s" }, { kind: "ok" }]);
-    expect(delays).toEqual([1000]);
-  } finally {
-    observed.checkToken = check;
-    observed.reconnectIn = reconnect;
-  }
-}, 10_000);
-
-test("at startup a limited address is waited out when the retry fits the window, and named when it doesn't", async () => {
-  // Real time: the login spends one token and the bad call the other. A token
-  // takes 2s to refill, longer than the child takes to spawn, so its first
-  // connect is refused; the stderr check fails the test if it isn't, rather
-  // than letting a connect that was never limited pass as a wait.
-  const fits = new TestServer({ authFailLimit: { burst: 2, perSec: 0.5 } });
-  cleanup.push(() => fits.stop());
-  const alice = await fits.login(A);
-  expect((await fetch(`${fits.base}/api/whoami`, { headers: { Authorization: "Bearer bad" } })).status).toBe(401);
-  expect((await fetch(`${fits.base}/api/whoami`)).status).toBe(429);
-  const s = await fits.session(alice, "fe", { BUS_TEST_HELLO_MS: "300", BUS_TEST_HELLO_LIMITED_MS: "6000" });
-  expect(s.stderr()).toMatch(/connection as session id:\w+ rate limited \(too many authentication failures from this address/);
-  expect(s.c.getInstructions()).toContain(`identity "fe"`);
-
-  const stuck = new TestServer({ authFailLimit: { burst: 2, perSec: 0.1 } });
-  cleanup.push(() => stuck.stop());
-  const bob = await stuck.login("bob@example.com");
-  await fetch(`${stuck.base}/api/whoami`, { headers: { Authorization: "Bearer bad" } });
-  await expect(stuck.session(bob, "fe", { BUS_TEST_HELLO_MS: "300", BUS_TEST_HELLO_LIMITED_MS: "1000" })).rejects.toThrow(/rate-limiting this address after repeated authentication failures \(too many authentication failures from this address; retry in \d+s\)/);
-}, 20_000);
 
 test("a CLI command on a limited address prints the server's wait", async () => {
   const srv = new TestServer({ authFailLimit: { burst: 1, perSec: 0.1 } });

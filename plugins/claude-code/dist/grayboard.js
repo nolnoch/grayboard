@@ -35309,6 +35309,10 @@ var native_tools_default = [
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
         },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
         as: {
           type: "string",
           description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."

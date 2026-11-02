@@ -306,14 +306,14 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
-// hosted twin: #451 (an application-level push owner and its `end`)
+// hosted twin: #451 (an application-level push owner and its unbind)
 test("explicit open conflicts with an existing live push owner; native and subscriber reads do not", async () => {
   const grant = issue();
   const login = await fetch(base + "/api/auth/dev-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const { session_token } = await login.json() as { session_token: string };
   const authed = verifySessionToken(session_token, app.repo, app.touches);
   if (!authed) throw new Error("the dev-login token doesn't authenticate");
-  // #284: the hello is the session (a session key); the name comes by bind.
+  // The session registers first; the name comes by bind.
   const owner = new AppSession(app.application, authed, "be");
   await owner.connect();
   const native = await connect(grant.token);
@@ -323,8 +323,8 @@ test("explicit open conflicts with an existing live push owner; native and subsc
   expect(app.mcp.activeLeases).toBe(0);
   expect((await call(sub.client, "delivery_open")).isError).toBe(true);
   expect(app.mcp.activeLeases).toBe(0);
-  // A closed session holds its aliases through its grace (#284 S4); a clean exit ends it at once.
-  await owner.end();
+  // A closed session no longer ends and keeps its holds (#282); the owner gives the name up with unbind.
+  await owner.unbind("be");
   owner.close();
   expect((await call(sub.client, "bind", { name: "be" })).isError).not.toBe(true);
   await open(sub.client, sub.headers);
