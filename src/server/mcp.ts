@@ -388,11 +388,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     track(Promise.resolve().then(() => legacy.server.close()).catch(report));
     track(Promise.resolve().then(() => legacy.transport.close()).catch(report));
   }
-  // A hosted stream the 1 s timer stops is audited with why (#472): the access
-  // token's expiry (the hourly rollover), else the refusal's code.
-  function streamClosed(live: Live, error: unknown) {
-    const { context } = live;
-    if (!("id" in context.sessionContext)) return;
+  // A hosted stream the 1 s timer stops is audited once with why (#472): the
+  // access token's expiry (the hourly rollover), else the refusal's code. A
+  // stream whose client already closed it isn't the server's stop: it goes unaudited.
+  const auditedStreams = new WeakSet<Context>();
+  function streamClosed(context: Context, error: unknown) {
+    if (!("id" in context.sessionContext) || context.request.signal.aborted || auditedStreams.has(context)) return;
+    auditedStreams.add(context);
     try {
       const reason = context.principal.accessExpiry <= now() ? "access_expired" : error instanceof ApplicationError ? error.code : "failed";
       hosted.audit(context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
@@ -404,8 +406,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
     }
-    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(live, e); live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); track(stream.stop()); } }
+    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(live.context, e); live.stop(); } }
+    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(context, e); track(stream.stop()); } }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {

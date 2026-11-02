@@ -222,7 +222,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.guard(r, epoch, signal);
         });
       }
-      await this.prepare(r, !!previous?.paused && !names.length);
+      await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
@@ -246,7 +246,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.roots.set(sessionID, r); this.drifted = false;
     await this.watch(r.e);
     this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
-    try { await this.prepare(r, true); }
+    try { await this.rotated({ ms: 0 }, () => this.prepare(r, true)); }
     catch (error) { if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -521,6 +521,8 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS) throw error;
         spent.ms += ROTATION_POLL_MS;
         await this.wait(ROTATION_POLL_MS, this.closing.signal);
+        // A close that ended the wait refuses the retry: nothing would dispose what it registers.
+        if (this.stopped) throw error;
       }
     }
   }
@@ -542,15 +544,19 @@ export class Controller<E extends Enrollment = Enrollment> {
         // (#472): a restart re-checks the credential and resumes. Its cause is
         // the record's code, or the failure an earlier restart's own paused
         // record carried forward.
-        const expired = previous?.state === "paused" && previous.operation !== "session_end" && (previous.code ?? previous.failure?.code) === "native_access_expired";
+        const expired = previous?.state === "paused" && (previous.code ?? previous.failure?.code) === "native_access_expired";
         const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused" && !expired;
         const held = await this.remembered(id, e);
         const r: Root<E> = { e: { ...e, ...(held ? { held } : {}) }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set() };
         this.roots.set(id, r);
         if (paused) { this.set(r, "paused", `Saved approval paused; ${this.hint}`); continue; }
+        // Say the pause is clearing before the grace: the old paused record would otherwise stand for up to its length.
+        if (expired) this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
         try { await this.rotated(spent, () => this.port.credential.check(e)); }
         catch (error) {
           if (!expired) throw error;
+          // A session ended, or a native bind started this root, during the grace: that state stands.
+          if (this.roots.get(id) !== r || r.paused || r.task) continue;
           // Still expired after the grace: the next restart checks again. A
           // refusal now (another account, a revoked grant) is the pause's cause from here on.
           const cause = this.expired(error);
@@ -558,6 +564,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
           continue;
         }
+        if (this.roots.get(id) !== r) continue;
         await this.watch(e);
         await this.rotated(spent, () => this.prepare(r, true, true));
       } catch {
@@ -594,7 +601,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           const output = event.result.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
           if (output?.unbound === true && r.e.held?.length) {
             await this.stop(r); r.lease = undefined;
-            await this.prepare(r, true);
+            await this.rotated({ ms: 0 }, () => this.prepare(r, true));
           }
           return;
         }
@@ -609,7 +616,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: [] });
           }
         }
-        await this.prepare(r, false);
+        await this.rotated({ ms: 0 }, () => this.prepare(r, false));
       } catch (error) { if (!this.drifted) this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
     });
   }

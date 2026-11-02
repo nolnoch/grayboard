@@ -564,7 +564,7 @@ test("a closed subscription is not an outage: native expiry on every reconnect, 
 // #472: OpenCode refreshes its native token at or just after expiry, up to
 // ~1.5 s after the server closed the stream for it; until then the real
 // Binding finds the stored token expired. Virtual time is the backoff waited since the close.
-for (const lands of [400, 1500]) test(`OpenCode's refresh landing ${lands} ms after the access-expiry close resumes the same ownership without pausing or spending budget`, async () => {
+for (const lands of [600, 1500]) test(`OpenCode's refresh landing ${lands} ms after the access-expiry close resumes the same ownership without pausing or spending budget`, async () => {
   const o = await outage(elapsed => { if (elapsed >= lands) o.r.f.rotate("fake-access-two"); });
   try {
     const ownership = o.controller.status().roots.find(root => root.sessionID === "R")?.ownership;
@@ -574,8 +574,8 @@ for (const lands of [400, 1500]) test(`OpenCode's refresh landing ${lands} ms af
     o.stop();
     await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
     // The close's own backoff, then 500 ms rotation polls; a spent failure would back off 1000 ms.
-    expect(o.waits).toEqual(lands === 400 ? [500] : [500, 500, 500]);
-    expect(o.codes.includes("native_access_expired")).toBe(lands === 1500);
+    expect(o.waits).toEqual(lands === 600 ? [500, 500] : [500, 500, 500]);
+    expect(o.codes).toContain("native_access_expired");
     expect(o.states).not.toContain("paused");
     expect(o.codes).not.toContain("retry_exhausted");
     expect(o.controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership });
@@ -599,7 +599,8 @@ test("a native refresh that never lands within the rotation grace pauses as befo
 // #472: a restart restores a pause from its diagnostic record. One whose cause
 // was native access expiry is not a refusal: the restored root re-checks the
 // host's credential, waiting for a refresh that lands after load, and resumes.
-test("a native access expiry pause doesn't survive a restart: restore waits for the host's refresh and resumes the same ownership", async () => {
+// A record 2.2.0 wrote carries the cause only as its `failure.code`.
+test.each([false, true])("a native access expiry pause doesn't survive a restart: restore waits for the host's refresh and resumes the same ownership (code only in failure: %j)", async legacy => {
   const r = runtime({}, async () => {}); let restarted: Controller | undefined;
   try {
     const first = Promise.withResolvers<void>();
@@ -612,13 +613,22 @@ test("a native access expiry pause doesn't survive a restart: restore waits for 
     await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
     expect(r.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
     await r.controller.close();
+    if (legacy) {
+      const saved = r.storage.get("diagnostics:v1") as { sessionID?: string; code?: string; time: number }[];
+      r.storage.set("diagnostics:v1", saved.map(({ code, ...d }) => d.sessionID === "R" ? { ...d, failure: { operation: "reopen", code: "native_access_expired", time: d.time } } : { ...d, ...(code ? { code } : {}) }));
+    }
     // OpenCode restarts with the token still expired and refreshes it after the plugin loads.
-    let polls = 0;
-    restarted = r.restart(async () => { if (++polls === 3) r.f.rotate("fake-access-two"); });
+    let polls = 0, during: unknown;
+    restarted = r.restart(async () => {
+      if (++polls === 1) during = restarted!.status().roots.find(root => root.sessionID === "R");
+      if (polls === 3) r.f.rotate("fake-access-two");
+    });
     const start = r.calls.length;
     await restarted.restore();
     await until(() => restarted!.status().roots.filter(root => root.state === "active").length === 2);
     expect(polls).toBe(3);
+    // The grace is visible: the old paused record gives way to a retrying one before the check.
+    expect(during).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
     expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership: 1 });
     expect(r.calls.slice(start).filter(c => c.name === "delivery_open").map(c => c.sessionID).sort()).toEqual(["B", "R"]);
     expect(r.calls.slice(start).some(c => c.name === "bind")).toBe(false);
