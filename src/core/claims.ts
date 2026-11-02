@@ -42,8 +42,7 @@ function validKey(key: string): string {
   return k;
 }
 
-// "moved": a hosted rebind carried the claim to the new name (moveClaims).
-type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire" | "moved";
+type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 
 // One claim_events row; callers are inside the claim's transaction.
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
@@ -190,19 +189,6 @@ export function release(
     const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
     return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session);
   }).immediate();
-}
-
-// A hosted session that rebinds takes its claims to the new name (#182),
-// as master's hosted bind did. WSS and local sessions keep their claims on
-// the address they were taken under (#284 S6, PR 4: claims stay with an
-// unbound alias); only src/server/application.ts hostedBind calls this.
-// Hosted holds one name, so its claims move with it; S6 applies to WSS and local (#407).
-// Runs inside the caller's transaction (the bind's). Each move is a "moved"
-// event under the new holder, held_by naming the old one.
-export function moveClaims(db: Database, from: string, to: string, now = Date.now()): Claim[] {
-  const moved = db.prepare(`UPDATE claims SET holder = ? WHERE holder = ? AND expires_at > ? RETURNING *`).all(to, from, now) as Claim[];
-  for (const c of moved) logEvent(db, "moved", to, c, now, from);
-  return moved;
 }
 
 // A queue post's holder replied in its thread: the work is handled. Releases

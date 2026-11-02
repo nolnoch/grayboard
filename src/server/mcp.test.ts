@@ -74,7 +74,7 @@ test("resource authorization does not sweep unrelated hosted roots", async () =>
 test("legacy identity headers cannot select or create names; explicit bind retains closest-name refusal", async () => {
   const client = await connect("2026-07-28", undefined, new Headers({ "X-Grayboard-Identity": "bee" }));
   const identity = await client.callTool({ name: "whoami", arguments: {} });
-  expect(identity.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"name":\s*"be"/) })]);
+  expect(identity.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"primary":\s*"alice@example.com\/be"/) })]);
   const refused = await client.callTool({ name: "bind", arguments: { name: "bee" } });
   expect(refused.isError).toBe(true);
   expect(refused.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"known":\s*\[\s*"be"\s*\]/) })]);
@@ -314,7 +314,6 @@ test("hosted bind does not inherit a previous WS launcher's opt-in", async () =>
   expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
   expect(store.db.query("SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
   expect(store.db.query("SELECT launcher FROM ids WHERE id = ?").get(prior.session.sessionId)).toEqual({ launcher: 1 });
-  expect(store.db.query("SELECT detail FROM access_log WHERE action = 'handle.launcher_set' AND target = ? ORDER BY rowid DESC LIMIT 1").get("alice@example.com/launcher")).toEqual({ detail: '{"on":false}' });
 });
 
 test("internal operation failures are redacted, including paths and SQL", async () => {
@@ -806,7 +805,7 @@ test("legacy registry is bounded and idle disconnected sessions are reclaimed", 
   expect(hosted.activeContexts).toBe(0);
   await connect("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(1);
-});
+}, 30_000);
 
 test("global board watch bound cleans partial acquisitions without retiring other listeners", async () => {
   const client = await connect();

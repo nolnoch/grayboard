@@ -50,7 +50,7 @@ async function connect(token: string, version: string, role?: string, identity =
   if (principal instanceof Response) throw new Error("fixture authentication failed");
   const routing = sessionContext(principal, { "ai.opencode/sessionID": identity });
   const current = await app.mcp.sessions.whoami(principal, routing);
-  if (!current.name) await app.mcp.sessions.bind(principal, routing, { name: identity, create: true });
+  if (!current.held.length) await app.mcp.sessions.bind(principal, routing, { name: identity, create: true });
   if (role) headers.set("X-Grayboard-Client", role);
   const hints: string[] = [], getHeaders: Headers[] = [];
   let getGate: Promise<void> | undefined;
@@ -280,7 +280,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
     expect(app.mcp.activeGetStreams).toBe(0);
     expect(app.mcp.activeWatches).toBe(0);
     expect(app.mcp.activeLegacySessions).toBe(1);
-    expect(await call(c, "whoami")).toMatchObject({ name: "be" });
+    expect(await call(c, "whoami")).toMatchObject({ primary: "alice@example.com/be" });
     await call(c, "board_post", { board: "e2e", body: "old registration while disconnected" });
     await call(c, "board_post", { board: "next", body: "current registration while disconnected" });
     expect(c.hints).toEqual([]);
@@ -305,7 +305,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   const rotated = refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
   app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
-  expect(await call(c, "whoami")).toMatchObject({ name: "be" });
+  expect(await call(c, "whoami")).toMatchObject({ primary: "alice@example.com/be" });
   await until(() => app.mcp.activeWatches === 0);
   expect(app.mcp.activeLegacySessions).toBe(1);
   // The protocol session survives; only its old GET access snapshot was retired.

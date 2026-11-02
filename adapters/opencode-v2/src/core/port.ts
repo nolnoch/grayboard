@@ -7,7 +7,8 @@ import type { Identity, Item } from "./model.js";
 import type { SessionPath } from "./sessions.js";
 
 export type Configuration = { type: "remote"; url: string; issuer: string; clientID: string; scope: string; configHash: string };
-export type Enrollment = { version: 2; sessionID: string; configuration: Configuration; name?: string };
+// `held`: the root's holds as full addresses, oldest first; the first is the one it sends as (#451).
+export type Enrollment = { version: 2; sessionID: string; configuration: Configuration; held?: string[] };
 export type Delivery = { mode: "push" | "poll"; source: string };
 export interface KeyValueStorage { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> }
 

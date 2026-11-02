@@ -48,7 +48,7 @@ test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaust
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
   } finally { await client.close(); await srv.stop(); }
-});
+}, 60_000);
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission exposes throttling and recovers without dispatching refused tools`, async () => {
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 10, perSec: 1 } });

@@ -11,20 +11,48 @@
   },
   {
     "name": "bind",
-    "description": "Take or change this session's name; unknown names require create:true.",
+    "description": "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another; you send as the first you bound, and unbind releases one you're done with. A name that has never existed needs create: true.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "name": {
           "type": "string",
-          "maxLength": 32
+          "maxLength": 160
         },
         "create": {
           "type": "boolean"
         },
+        "meta": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
+        },
         "where": {
           "type": "string",
           "maxLength": 1024
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    },
+    "_meta": {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    "name": "unbind",
+    "description": "unbind(name): release one of your aliases; its mail and claims stay with it for its next holder.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 160
         }
       },
       "required": [

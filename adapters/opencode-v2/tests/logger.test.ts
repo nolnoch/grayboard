@@ -4,7 +4,7 @@ import { captureLogger } from "../src/logger.js";
 import { Diagnostics, logFields, type RecordStatus } from "../src/core/diagnostics.js";
 import type { Context } from "@opencode/plugin/promise/plugin";
 
-const record: RecordStatus = { sessionID: "R", name: "be", ownership: 7, state: "paused", message: "Bearer secret-canary\n at bearer-token.ts", operation: "subscriber", code: "retry_exhausted", time: 123 };
+const record: RecordStatus = { sessionID: "R", held: ["you@example.com/be"], ownership: 7, state: "paused", message: "Bearer secret-canary\n at bearer-token.ts", operation: "subscriber", code: "retry_exhausted", time: 123 };
 function storage() {
   const values = new Map<string, Awaited<ReturnType<Context["storage"]["get"]>>>(), writes: unknown[] = [];
   const store = { get: async (key: string) => values.get(key), set: async (key: string, value: Parameters<Context["storage"]["set"]>[1]) => { values.set(key, structuredClone(value)); writes.push(value); }, remove: async (key: string) => { values.delete(key); }, scan: async () => ({ entries: [] }) } satisfies Context["storage"];

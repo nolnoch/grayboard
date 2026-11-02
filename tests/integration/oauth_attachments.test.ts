@@ -56,7 +56,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
-  expect(info.name).toBe("be");
+  expect(info.primary).toBe("alice@example.com/be");
   const upload = await attachment(alice.token);
   expect(upload.status).toBe(201);
   expect(upload.headers.get("Cache-Control")).toBe("private, no-store");

@@ -18,7 +18,7 @@ import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
 import { afterProducers } from "./causal.js";
 
-type Row = { name: string | null; ownership: number; generation: number; capability?: string };
+type Row = { held: string[]; ownership: number; generation: number; capability?: string };
 async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }
 function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: number, signal: AbortSignal) => Promise<void>) {
   const f = fixture(), rows = new Map<string, Row>(), nodes = new Map<string, { id: string; parentID?: string; time: { archived?: number }; metadata: Record<string, unknown> }>();
@@ -31,7 +31,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   let subscription: (() => Promise<void> | undefined) | undefined;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
-  const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
+  const bind = (id: string, name: string) => { const old = rows.get(id), address = name.includes("/") ? name : `you@example.com/${name}`, held = old?.held ?? []; rows.set(id, { held: held.includes(address) ? held : [...held, address], ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
     admissionRetryAfterMs?: number;
@@ -42,19 +42,19 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
     async call(name: string, args: Record<string, unknown> = {}) {
       calls.push({ sessionID: this.sessionID, name, args });
       let row = rows.get(this.sessionID);
-      if (name === "whoami") { await observation?.("whoami"); return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true, candidates: ["be", "fe"] } : {}) }; }
+      if (name === "whoami") { await observation?.("whoami"); return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(!row?.held.length ? { unbound: true, candidates: ["be", "fe"] } : {}) }; }
       if (name === "bind") {
-        if (refuseBind) throw new SubscriberError("identity_in_use", undefined, "the hosted session ses_other, in /work/app, last seen 3s ago");
+        if (refuseBind) throw new SubscriberError("alias_held", undefined, "the hosted session ses_other, in /work/app, last seen 3s ago");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
         await observation?.("bind");
-        return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
+        return { name: row.held[0]!.split("/")[1], ownership: row.ownership, instructions: ["bound"] };
       }
       if (name === "session_register") { await holdRegister?.(); return { registered: true }; }
       if (name === "session_end" || name === "delivery_release") { rows.delete(this.sessionID); return { ok: true }; }
       if (name === "delivery_open") {
-        if (!row?.name) throw new Error("unbound");
+        if (!row?.held.length) throw new Error("unbound");
         row.capability = (String(row.ownership) + String(row.generation)).padEnd(43, "a");
-        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
+        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: row.held[0] } };
       }
       if (name === "delivery_renew") await observation?.("delivery_renew");
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
@@ -109,7 +109,7 @@ test("diagnostic failures never inspect hostile error properties and retain clea
 test("stored diagnostics are closed DTOs and hostile records cannot escape or stop healthy history", async () => {
   const sessionID = "ses_" + "b".repeat(64), secret = "PRIVATE_DIAGNOSTIC_CANARY";
   let getters = 0;
-  const safe = { state: "paused", message: secret, sessionID, operation: "delivery", time: 1, name: "be", ownership: 1 };
+  const safe = { state: "paused", message: secret, sessionID, operation: "delivery", time: 1, held: ["you@example.com/be"], ownership: 1 };
   const hostile = { ...safe, sessionID: "ses_" + "c".repeat(64) };
   Object.defineProperty(hostile, "message", { enumerable: true, get() { getters++; throw new Error(secret); } });
   const values = [hostile, { ...safe, ownership: -1 }, { ...safe, failure: { operation: "session_end", code: "operation_failed", time: 1, exception: secret } }, safe];
@@ -127,7 +127,7 @@ test("diagnostics retain each root across unrelated activity and restart without
   const r = runtime({}, async () => {}); let restarted: Controller | undefined;
   try {
     r.bind("R", "be"); r.bind("B", "fe");
-    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new Error("secret-token\n at bearer-token.ts:1"); });
     await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused");
     r.admission(async () => {});
@@ -175,7 +175,7 @@ test.each([false, true])("expiry failed-continuation barrier joins actual subscr
   });
   try {
     r.bind("R", "be");
-    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { admission.release(); await releaseAdmission.promise; forwarded = true; gate.returned(); });
     r.observe(async operation => {
       if (outage && ["delivery_renew", "connect"].includes(operation)) await gate.observe(async () => { throw error; });
@@ -208,7 +208,7 @@ test.each([false, true])("terminal retry pause survives diagnostic emission fail
   });
   try {
     r.bind("R", "be");
-    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new Error("synthetic-private-error"); });
     await controller.enroll("R"); await until(() => exhausted); await controller.close();
     expect(r.admissions).toHaveLength(8);
@@ -234,7 +234,7 @@ test("remembered-name bookkeeping cannot grant approval after a concurrent revoc
   let revoked = false;
   Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: async (key: string, value: Parameters<Context["storage"]["set"]>[1]) => {
     await original(key, value);
-    if (key === "rememberedName:R" && !revoked) {
+    if (key === "rememberedHeld:R" && !revoked) {
       revoked = true;
       const saved = r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean };
       saved.enabled = false;
@@ -294,7 +294,7 @@ test.each(["edited", "prepare"])("restore isolates a %s root without releasing a
     expect(r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "R")).toBe(false);
     expect(r.storage.get("paused:R")).toBe(false);
     expect(r.storage.get("paused:B")).toBe(false);
-    expect(r.rows.get("B")?.name).toBe("fe");
+    expect(r.rows.get("B")?.held).toEqual(["you@example.com/fe"]);
   } finally { await restored?.close(); await r.controller.close(); }
 });
 
@@ -397,7 +397,7 @@ test("capacity recovery rebinds without creation and receipts the reissued item 
     await until(() => r.calls.some(c => c.name === "delivery_receipt"));
     expect(r.rows.get("R")?.ownership).toBe(2);
     expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(1);
-    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "be", create: false, where: "/worktree" }]);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/worktree" }]);
     expect(r.admissions).toHaveLength(1);
     expect(r.batches.get("R")).toEqual([]);
     expect(r.nodes.get("R")?.metadata).toMatchObject({ "grayboard.enrollment": { enabled: true } });
@@ -415,7 +415,7 @@ test.each(["receipt_capacity", "bad_request"])("only typed %s controls bounded c
     const releases = r.calls.filter(c => c.name === "delivery_release");
     expect(releases).toHaveLength(code === "receipt_capacity" ? 8 : 0);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
-    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual(code === "receipt_capacity" ? Array.from({ length: 7 }, () => ({ name: "be", create: false, where: "/worktree" })) : []);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual(code === "receipt_capacity" ? Array.from({ length: 7 }, () => ({ name: "you@example.com/be", create: false, where: "/worktree" })) : []);
     if (code === "receipt_capacity") {
       const first = r.calls.findIndex(c => c.name === "delivery_release");
       expect(r.calls.slice(first, first + 4).map(c => c.name)).toEqual(["delivery_release", "whoami", "bind", "delivery_open"]);
@@ -428,7 +428,7 @@ test("a poison item exhausts eight attempts despite successful same-lease opens,
   const r = runtime({}, async ms => { waits.push(ms); });
   try {
     r.bind("R", "be");
-    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" })));
+    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" })));
     r.admission(async () => { throw new Error("synthetic refused"); });
     await r.controller.enroll("R");
     await until(() => r.controller.status().state === "paused");
@@ -445,7 +445,7 @@ test("a successful receipt alone resets progress budget for the next item", asyn
   const r = runtime({}, async () => {});
   try {
     r.bind("R", "be");
-    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" })));
+    r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" })));
     let tries = 0;
     r.admission(async () => { if (++tries !== 8) throw new Error("synthetic refused"); });
     await r.controller.enroll("R");
@@ -460,7 +460,7 @@ test("repeated successful opens reset lease recovery but cannot erase one item's
   const r = runtime({}, async () => {});
   try {
     r.bind("R", "be");
-    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new LeaseUnavailable(); });
     await r.controller.enroll("R");
     await until(() => r.controller.status().state === "paused");
@@ -493,7 +493,7 @@ async function outage() {
   await until(() => controller.status().state === "active" && listens === 1);
   return { r, controller, waits, codes, stop: () => first.resolve() };
 }
-const item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" };
+const item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" };
 test("server outages and subscription closures never spend the failure budget, and recovery reopens", async () => {
   const o = await outage();
   try {
@@ -560,7 +560,7 @@ test("typed HTTP429 backoff survives successful opens until a complete admission
   const r = runtime();
   try {
     r.bind("R", "be"); r.throttle(2);
-    r.batches.set("R", [{ id: "direct:throttled", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:throttled", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     const started = Date.now(); await r.controller.enroll("R");
     for (let i = 0; i < 500 && !r.calls.some(c => c.name === "delivery_receipt"); i++) await Bun.sleep(10);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(3);
@@ -584,7 +584,7 @@ test("two approved roots on shared native config keep independent names, leases 
   const r = runtime();
   try {
     r.bind("R", "be"); r.bind("B", "fe");
-    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.batches.set("B", [{ id: "direct:2", actionable: false, event: {}, ownership: 2, bind_gen: 1, name: "fe" }]);
     await r.controller.enroll("R"); await r.controller.enroll("B");
     await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2);
@@ -608,7 +608,7 @@ test("retained routes close children independently, child-first and root-first l
   try {
     r.bind("R", "be"); await r.controller.enroll("R"); await r.before("G");
     r.nodes.delete("C"); await r.controller.observe("session.deleted", { sessionID: "C" });
-    expect(r.rows.get("R")?.name).toBe("be");
+    expect(r.rows.get("R")?.held).toEqual(["you@example.com/be"]);
     await r.controller.observe("session.deleted", { sessionID: "C" });
     expect(r.calls.filter(c => c.name === "session_end" && c.sessionID === "C")).toHaveLength(1);
     r.nodes.delete("R"); await r.controller.observe("session.archived", { sessionID: "R" });
@@ -659,7 +659,7 @@ test("pause ends ownership, resume rebinds remembered name create:false; held na
     r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
     await r.controller.pause(); expect(r.rows.has("R")).toBe(false);
     await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
-    expect(r.calls.find(c => c.name === "bind")?.args).toMatchObject({ name: "be", create: false });
+    expect(r.calls.find(c => c.name === "bind")?.args).toMatchObject({ name: "you@example.com/be", create: false });
     await r.controller.pause(); r.refuse(); await r.controller.enroll("R"); await Bun.sleep(20);
     expect(r.controller.status().message).toContain("approval saved");
     expect(r.controller.status().message.split("; held by the hosted session ses_other, in /work/app, last seen 3s ago")).toHaveLength(2);
@@ -679,7 +679,7 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
     expect(restarted.status().state).toBe("paused");
     await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
     expect(restarted.status().roots.find(root => root.sessionID === ended)?.state).toBe("paused");
-    expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "fe", create: false });
+    expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "you@example.com/fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 
@@ -706,7 +706,7 @@ test("ordinary native unbound result rebinds the durable name once with create:f
     r.rows.delete("R");
     await r.controller.after({ sessionID: "R", tool: "grayboard_whoami", id: "call", status: "completed", result: { output: { unbound: true, name: null, ownership: null } } });
     await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2);
-    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "be", create: false, where: "/worktree" }]);
+    expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/worktree" }]);
     await r.before("G");
     expect(r.calls.at(-1)?.args).toEqual({ child: "G", via: ["C"] });
   } finally { await r.controller.close(); }
@@ -714,7 +714,7 @@ test("ordinary native unbound result rebinds the durable name once with create:f
 test("pause during awaited admission suppresses receipt without pretending host write was recalled", async () => {
   const r = runtime(); let unblock!: () => void;
   try {
-    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
     await r.controller.enroll("R"); await until(() => !!unblock);
     const pausing = r.controller.pause(); await Bun.sleep(5); unblock(); await pausing;
@@ -726,7 +726,7 @@ test("pause during awaited admission suppresses receipt without pretending host 
 test.each(["session.archived", "session.deleted", "credential.switched", "rebind", "expiry"])("%s during host admission suppresses stale receipt", async mode => {
   const r = runtime(); let unblock!: () => void;
   try {
-    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
     await r.controller.enroll("R"); await until(() => !!unblock);
     let ending: Promise<unknown> | undefined;
@@ -744,7 +744,7 @@ test.each(["session.archived", "session.deleted", "credential.switched", "rebind
 test("configuration away-and-back during host admission remains latched and sends no receipt", async () => {
   const r = runtime(); let unblock!: () => void;
   try {
-    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
     await r.controller.enroll("R"); await until(() => !!unblock);
     r.f.config.url = "https://other.example.com/mcp"; r.f.reload();
@@ -848,7 +848,7 @@ test("registration refusal rejects the child's native call before dispatch", asy
 test("issued stamp mismatch never admits or receipts", async () => {
   const r = runtime();
   try {
-    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 99, bind_gen: 1, name: "be" }]);
+    r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 99, bind_gen: 1, address: "you@example.com/be" }]);
     await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused");
     expect(r.admissions).toHaveLength(0); expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
   } finally { await r.controller.close(); }
@@ -859,7 +859,7 @@ test("lost receipt reopens and receipts without admitting the item again", async
   const r = runtime();
   try {
     r.bind("R", "be"); r.rejectReceipt();
-    r.batches.set("R", [{ id: "direct:1", actionable: false, event: {}, ownership: 1, bind_gen: 1, name: "be" }]);
+    r.batches.set("R", [{ id: "direct:1", actionable: false, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2);
     expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
     expect(r.calls.filter(c => c.name === "delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]);

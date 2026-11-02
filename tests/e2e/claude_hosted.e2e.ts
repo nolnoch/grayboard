@@ -78,7 +78,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
     await seedGrant(srv, join(h.config, "plugins/data/grayboard-grayboard"), "grayboard-claude-code");
 
     tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
-    const hosted = () => srv.app.db.query<{ source_session_id: string; name: string | null }, []>("SELECT source_session_id, name FROM hosted_sessions").all();
+    const hosted = () => srv.app.db.query<{ source_session_id: string; name: string | null }, []>("SELECT source_session_id, (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name FROM hosted_sessions").all();
     await until(() => hosted().length > 0, 60_000, `the plugin (from ${from}) to open its hosted session`);
     const session = hosted()[0]!.source_session_id;
 

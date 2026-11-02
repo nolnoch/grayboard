@@ -92,7 +92,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink) {
   const rpc = await ctx.rpc.register(Grayboard, {
     status: async () => controller.status(),
     enroll: async input => {
-      try { await restoring; return await controller.enroll(input.sessionID, input.name, input.create); }
+      try { await restoring; return await controller.enroll(input.sessionID, input.name ? [input.name] : [], input.create); }
       catch { await controller.enrollmentFailure(input.sessionID); return { state: "paused", message: "Enrollment refused; check the active root, trusted issuer and native MCP configuration/sign-in", roots: controller.status().roots }; }
     },
     pause: async () => { await restoring; return controller.pause(); },

@@ -190,7 +190,7 @@ test("all HTTP methods authenticate; identity headers never bind an uncontextual
       requestInit: { headers: { Authorization: `Bearer ${token}`, ...(identity ? { "X-Grayboard-Identity": identity } : {}) } },
     }));
     expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
-    expect(value(await client.callTool({ name: "whoami", arguments: {} })).name).toBeNull();
+    expect(value(await client.callTool({ name: "whoami", arguments: {} })).primary).toBeNull();
     expect((await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "no context" } })).isError).toBe(true);
     expect((await client.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).toBe(true);
   }

@@ -148,7 +148,12 @@ async function invoke(sessionID: string, tool: string, args: Record<string, unkn
   await host!.session.switchModel({ sessionID, model: { providerID: "fixture", id: "fixture" } });
   await host!.session.prompt({ sessionID, text: "Invoke " + tool }); await host!.session.wait({ sessionID }); target = undefined;
 }
-function row(raw: string) { return app.db.prepare("SELECT * FROM hosted_sessions WHERE source_session_id = ?").get(raw) as { session_id: string; root_session_id: string | null; ownership_id: number; bind_gen: number; name: string | null; grant_id: string; lease_deadline: number | null } | null; }
+// A hosted root's holds are alias_holds rows (#451): `held` the short names oldest first, `name` the primary.
+const holds = (id: string) => (app.db.prepare("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").all(id) as { address: string }[]).map(h => h.address.slice(h.address.lastIndexOf("/") + 1));
+function row(raw: string) {
+  const r = app.db.prepare("SELECT * FROM hosted_sessions WHERE source_session_id = ?").get(raw) as { session_id: string; root_session_id: string | null; ownership_id: number; bind_gen: number; grant_id: string; lease_deadline: number | null } | null;
+  return r && { ...r, held: holds(r.session_id), name: holds(r.session_id)[0] ?? null };
+}
 const makeRoot = (title: string) => host!.session.create({ location, title, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
 try {
   host = await createHost(); await host.agent.list({ location }); await wait(() => ctx, Boolean, "fixture setup");
@@ -335,10 +340,9 @@ try {
   assert.equal(claimHolder(), "you@example.com/be");
   const ownership = row(a.id)!.ownership_id;
   for (const name of ["r1", "r2", "r3", "r4"]) { const before = opens.length; await invoke(a.id, "bind", { name, create: true }); await wait(() => opens.length, n => n === before + 1, "one rebind lease " + name); assert.equal(row(a.id)!.ownership_id, ownership); assert.equal(app.mcp.activeLeases, 2); }
-  assert.equal(row(a.id)!.bind_gen, 5); assert.equal(claimHolder(), "you@example.com/r4");
+  assert.equal(row(a.id)!.bind_gen, 5); assert.deepEqual(row(a.id)!.held, ["be", "r1", "r2", "r3", "r4"], "A bind adds a hold (#451)"); assert.equal(claimHolder(), "you@example.com/be", "A claim stays with its alias");
   assert.equal(row(child.id)?.root_session_id, row(a.id)?.session_id, "Registered child survives native rebind ownership generations");
-  await invoke(b.id, "bind", { name: "be" });
-  await invoke(b.id, "claim_release", { key: "ticket:ENG-142" }); assert.equal(claimHolder(), "you@example.com/r4", "Successor owner of the old mailbox cannot release moved claim");
+  await invoke(b.id, "claim_release", { key: "ticket:ENG-142" }); assert.equal(claimHolder(), "you@example.com/be", "A root that doesn't hold the claim's alias cannot release it");
   await invoke(a.id, "claim_release", { key: "ticket:ENG-142" }); assert.equal(claimHolder(), undefined);
   assert.equal(new Set(calls.map(c => c.accessHash)).size, 1, "Native and subscriber share exactly the current single native access token");
   assert(calls.some(c => c.subscriber)); assert(calls.some(c => !c.subscriber));
@@ -352,7 +356,7 @@ try {
     assert.equal((session.metadata?.["grayboard.enrollment"] as { enabled?: unknown } | undefined)?.enabled, false, "B approval remains disabled");
   };
   await wait(() => app.mcp.activeLeases, n => n === 1, "pause resume remembered name");
-  assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === "r4" && c.args.create === false));
+  for (const name of ["be", "r1", "r2", "r3", "r4"]) assert(calls.some(c => c.name === "bind" && c.session === a.id && c.subscriber && c.args.name === `you@example.com/${name}` && c.args.create === false), `resume rebinds ${name} by address (#451)`);
   const board = createBoard(app.db, "you@example.com/r4", "fixture", "Fixture board"); subscribe(app.db, "you@example.com/r4", board.name, "digest");
   const beforeDigest = modelCalls; post(app.db, "you@example.com/sim", board.name, "Idle digest"); app.application.boardsChanged([board.name]);
   await wait(() => host!.session.inbox.list({ sessionID: a.id }), xs => xs.length >= 1, "digest durable idle admission"); assert.equal(modelCalls, beforeDigest);
@@ -468,7 +472,7 @@ try {
   await invoke(a.id, "bind", { name: "final" }); assert.notEqual(row(a.id)!.grant_id, g1, "Only owning G2 success attaches grant");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "G2 attached lease");
   revokeFixtureGrant(g1);
-  assert.equal(row(a.id)?.name, "final", "Revoking old G1 does not release G2 owner");
+  assert.ok(row(a.id)?.held.includes("final"), "Revoking old G1 does not release G2 owner");
   revokeFixtureGrant(row(a.id)!.grant_id);
   await wait(() => app.mcp.activeLeases, n => n === 0, "G2 revoke ends actual lease"); assert.equal(row(a.id), null);
   await wait(() => rpc.status({}, { location }), s => ["auth", "paused"].includes(rootStatus(s, a.id)?.state ?? ""), "revoked token fail closed");

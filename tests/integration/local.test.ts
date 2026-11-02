@@ -251,7 +251,8 @@ test("dm_inbox lists what you owe: replied and acked messages drop out", async (
 
 test("dm_send pending lists a promise in dm_inbox until your next message in the thread, or a dm_ack", async () => {
   const be = await start("be");
-  const fe = await start("fe");
+  const feS = await session("fe");
+  const fe = feS.c;
   const q = await call(fe, "dm_send", { to: "be", body: "can you check the soak?" });
   const p = await call(be, "dm_send", { to: "fe", body: "on it, results by noon", parent_id: q.message_id, pending: true });
   expect(p).toMatchObject({ pending: true });
@@ -265,6 +266,9 @@ test("dm_send pending lists a promise in dm_inbox until your next message in the
 
   // dm_ack drops your own promise; it still can't ack your other sends.
   const p2 = await call(be, "dm_send", { to: "fe", body: "will follow up", pending: true });
+  // Wait for the push first: a request that arrives while the push to a local
+  // session is still being written can leave that process deaf under load (#457).
+  await until(() => contents(feS).some((c) => c.includes("will follow up")), 15_000, "fe's push of the promise");
   await expect(call(fe, "dm_ack", { message_id: [p2.message_id] })).resolves.toBe("ok");
   expect((await call(be, "dm_inbox")).promised).toHaveLength(1);
   expect(await call(be, "dm_ack", { message_id: p2.message_id })).toBe("ok");

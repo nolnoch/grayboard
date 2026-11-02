@@ -2,23 +2,23 @@
 // Do not edit: change hosted-core, then run `bun scripts/sync_hosted_core.ts`.
 import type { KeyValueStorage } from "./port.js";
 import { ServerUnreachable, SubscriberError, SubscriptionClosed, holderText } from "./wire.js";
-import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated } from "./model.js";
+import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated, validHeld } from "./model.js";
 
-export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; name?: string; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
+export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; held?: string[]; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
 export type Status = { state: string; message: string; sessionID?: string; roots: RecordStatus[] };
 export type DiagnosticSink = (record: Readonly<RecordStatus>) => void | Promise<void>;
 export class DeliveryStopped extends Error {
   constructor(readonly item?: string) { super("Delivery retry budget exhausted"); }
 }
 const key = "diagnostics:v1";
-const fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
+const fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 const states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 // Every operation a record may name; anything else reads as invalid, and a
 // host's own reports (the tool proxy's `report`) take their names from here.
 const OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register"] as const;
 export type Operation = typeof OPERATIONS[number];
 const operations = new Set<string>(OPERATIONS);
-const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
   if (error instanceof ServerUnreachable) return "server_unreachable";
@@ -43,7 +43,7 @@ export function failureMessage(error: unknown, resumeHint: string): string {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;
     const holder = Object.getOwnPropertyDescriptor(error, "holder")?.value;
-    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "identity_in_use" && holderText(holder) ? `; held by ${holder}` : ""}`;
+    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every(v => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "alias_held" && holderText(holder) ? `; held by ${holder}` : ""}`;
   }
   return `Operation failed; ${resumeHint}`;
 }
@@ -72,21 +72,21 @@ function project(value: unknown, restored = false): RecordStatus | undefined {
   const d = data(value, fields);
   if (!d || typeof d.state !== "string" || !states.has(d.state) || typeof d.operation !== "string" || !operations.has(d.operation) || !clock(d.time)) return;
   if (d.sessionID !== undefined && (typeof d.sessionID !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(d.sessionID))) return;
-  if (d.name !== undefined && (typeof d.name !== "string" || !/^[a-z0-9_-]{1,32}$/.test(d.name))) return;
+  if (d.held !== undefined && !validHeld(d.held)) return;
   if (d.ownership !== undefined && (typeof d.ownership !== "number" || !Number.isSafeInteger(d.ownership) || d.ownership <= 0)) return;
   if (d.code !== undefined && (typeof d.code !== "string" || !codes.has(d.code))) return;
   const failure = d.failure === undefined ? undefined : failureDTO(d.failure);
   if (d.failure !== undefined && !failure) return;
   if (typeof d.message !== "string" || d.message.length > 16384) return;
-  const message = restored ? `Saved ${d.state} status${d.name ? ` for ${d.name}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
-  return { state: d.state, message, operation: d.operation, time: d.time, ...(typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}), ...(typeof d.name === "string" ? { name: d.name } : {}), ...(typeof d.ownership === "number" ? { ownership: d.ownership } : {}), ...(typeof d.code === "string" ? { code: d.code } : {}), ...(failure ? { failure } : {}) };
+  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
+  return { state: d.state, message, operation: d.operation, time: d.time, ...(typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}), ...(d.held !== undefined ? { held: d.held } : {}), ...(typeof d.ownership === "number" ? { ownership: d.ownership } : {}), ...(typeof d.code === "string" ? { code: d.code } : {}), ...(failure ? { failure } : {}) };
 }
 
 export function logFields(value: unknown) {
   const r = project(value, true);
   if (!r) return;
   return { category: "grayboard.subscriber", operation: r.operation, state: r.state, time: r.time,
-    ...(r.sessionID ? { root: r.sessionID } : {}), ...(r.name ? { name: r.name } : {}),
+    ...(r.sessionID ? { root: r.sessionID } : {}), ...(r.held?.length ? { held: r.held } : {}),
     ...(r.ownership ? { ownership: r.ownership } : {}), ...(r.code ? { code: r.code } : {}) };
 }
 

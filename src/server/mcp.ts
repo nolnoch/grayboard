@@ -2,6 +2,7 @@ import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStanda
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
 import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
+import { BIND_TOOL, UNBIND_TOOL } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
@@ -205,7 +206,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const row = hosted.row(context.sessionContext.id);
     if (!row) return false;
     const root = hosted.rootOf(row);
-    return !!root.name && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
+    return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
   const unlistenHosted = hosted.listen(() => {
     for (const live of [...lives]) {
@@ -585,9 +586,20 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     const context = current(ctx);
     return text(await hosted.whoami(context.principal, context.sessionContext));
   });
-  server.registerTool("bind", { description: "Take or change this session's name; unknown names require create:true.", inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
+  const bindRefusal = (e: unknown, tool: string) => {
+    report(e, tool);
+    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request"].includes(e.code)) refuse(e.code);
+    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
+  };
+  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.
+  server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
+    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
-    catch (e) { report(e, "bind"); if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code)) refuse(e.code); return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
+    catch (e) { return bindRefusal(e, "bind"); }
+  });
+  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: z.strictObject({ name: z.string().max(160) }) }, async (args, ctx) => {
+    try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
+    catch (e) { return bindRefusal(e, "unbind"); }
   });
   for (const tool of boardTools({ teams: true })) {
     const properties = { ...tool.inputSchema.properties };
