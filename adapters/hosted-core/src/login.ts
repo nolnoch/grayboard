@@ -323,12 +323,16 @@ export class Login {
   // ---- login and logout ----
 
   // One flow at a time per store across processes: a call that finds
-  // another session signing in waits for it and shares its grant.
-  login(signal?: AbortSignal): Promise<void> {
-    this.signingIn ??= this.signIn(signal).finally(() => { this.signingIn = undefined; });
+  // another session signing in waits for it and shares its grant. An explicit
+  // login always runs a flow unless another process's landed while this one
+  // started; an automatic one (ifSignedOut: it started because a token
+  // request found no grant) also returns once the store holds a live grant,
+  // however long ago it landed, so two processes signed out together prompt once.
+  login(signal?: AbortSignal, ifSignedOut = false): Promise<void> {
+    this.signingIn ??= this.signIn(signal, ifSignedOut).finally(() => { this.signingIn = undefined; });
     return this.signingIn;
   }
-  private async signIn(signal: AbortSignal | undefined): Promise<void> {
+  private async signIn(signal: AbortSignal | undefined, ifSignedOut: boolean): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const before = (await this.read())?.epoch;
     const lockPath = `${this.path}.login.lock`;
@@ -345,7 +349,7 @@ export class Login {
         if (live(now)) return;
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (now?.epoch !== before && live(now)) return;
+      if (live(now) && (ifSignedOut || now.epoch !== before)) return;
       await this.flow(signal);
     } finally { lock.release(); }
   }

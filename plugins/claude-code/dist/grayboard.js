@@ -32347,13 +32347,13 @@ ${config.clientId}`)}.json`);
       throw new ServerOutdated(this.config.harness);
     return meta;
   }
-  login(signal) {
-    this.signingIn ??= this.signIn(signal).finally(() => {
+  login(signal, ifSignedOut = false) {
+    this.signingIn ??= this.signIn(signal, ifSignedOut).finally(() => {
       this.signingIn = undefined;
     });
     return this.signingIn;
   }
-  async signIn(signal) {
+  async signIn(signal, ifSignedOut) {
     await mkdir2(dirname2(this.path), { recursive: true, mode: 448 });
     const before = (await this.read())?.epoch;
     const lockPath = `${this.path}.login.lock`;
@@ -32370,7 +32370,7 @@ ${config.clientId}`)}.json`);
           return;
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (now?.epoch !== before && live(now))
+      if (live(now) && (ifSignedOut || now.epoch !== before))
         return;
       await this.flow(signal);
     } finally {
@@ -37243,7 +37243,7 @@ function createPlugin(o) {
     if (!login || !root || !interactive || closed || signingIn || !initialized)
       return;
     const abort = new AbortController;
-    const done = login.login(abort.signal).then(async () => {
+    const done = login.login(abort.signal, true).then(async () => {
       await complete?.();
       say("signed in");
       await root.credentialChanged();
