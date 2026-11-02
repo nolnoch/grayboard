@@ -74,7 +74,8 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
 
 test("outside-network hosted suites run only nightly, explicitly, or across the release boundary", () => {
   const hosted = Bun.YAML.parse(read(".github/workflows/hosted.yml")) as any;
-  expect(hosted.on).toEqual({ workflow_call: null });
+  expect(Object.keys(hosted.on)).toEqual(["workflow_call"]);
+  expect(Object.keys(hosted.on.workflow_call.inputs)).toEqual(["rep"]);
   expect(JSON.stringify(hosted)).not.toMatch(/hosted-(?:live|public)|CIMD_LIVE|PUBLIC_REVISION/);
   const nightly = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;
   expect(Object.keys(nightly.on)).toEqual(["schedule", "workflow_dispatch", "workflow_call"]);
