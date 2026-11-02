@@ -607,7 +607,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
-    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request"].includes(e.code)) refuse(e.code);
+    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
     return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.

@@ -5,7 +5,6 @@ import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
-import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { harnessFor } from "./oauth-config.ts";
@@ -404,7 +403,6 @@ export function createHostedSessions(application: Application, options: { now?: 
     async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
-      if (normalized.name.slice(normalized.name.lastIndexOf("/") + 1) === HUMAN_NAME) throw new ApplicationError("forbidden", HUMAN_RESERVED);
       const refusals: Array<[string, string]> = [];
       const result = await service.owning(p, context, row => {
         refusals.length = 0;
