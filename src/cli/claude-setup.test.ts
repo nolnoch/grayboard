@@ -34,6 +34,7 @@ switch (cmd) {
     s.pluginConfigs = { ...s.pluginConfigs, [args[2]]: { options: { server_url: args[4].slice("server_url=".length) } } };
     write(settings, s); break;
   }
+  case "plugin update": if (s.enabledPlugins?.[args[2]] === undefined) { console.error("plugin not installed"); process.exit(1); } break;
   case "plugin disable": if (s.enabledPlugins?.[args[2]] !== true) { console.error("already disabled"); process.exit(1); } s.enabledPlugins[args[2]] = false; write(settings, s); break;
   default: console.error("stub: unexpected " + cmd); process.exit(2);
 }
@@ -81,6 +82,7 @@ const PLUGIN_URL = `${SERVER}/mcp`;
 const LOCAL = [`claude mcp remove --scope user grayboard`, `claude mcp add --scope user grayboard -- bun ${cli} mcp`];
 const PLUGIN = [`claude plugin marketplace add ${REPO}`, "claude plugin marketplace update grayboard",
   `claude plugin install grayboard@grayboard --config server_url=${PLUGIN_URL}`, "claude mcp remove --scope user grayboard"];
+const UPDATE = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard"];
 const HOOK = [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: `bun ${cli} session-start`, timeout: 10 }] }];
 
 test("setup switches Claude Code local → server → local: the entry and hook, then the plugin, then the entry with the plugin disabled", () => {
@@ -154,7 +156,31 @@ test("refresh-adapters moves a server-mode user's Claude Code entry to the plugi
   expect(out).toContain(`Installed the Claude Code plugin grayboard@grayboard for ${PLUGIN_URL}`);
   expect(f.entry()).toBeUndefined();
   expect(f.hook()).toBeUndefined();
-  // Migrated: nothing left to move.
+  // Migrated: nothing left to move, and the installed plugin updates (#443).
+  const again = f.run("refresh-adapters");
+  expect(f.argv()).toEqual(UPDATE);
+  expect(again).toContain("Updated the Claude Code plugin grayboard@grayboard");
+});
+
+test("refresh-adapters in server mode updates an enabled plugin, skips a disabled or absent one, reports a failed update, and warns about a repo .mcp.json entry (#443)", () => {
+  const f = fixture();
+  f.signIn();
+  // Absent: nothing to update.
+  f.run("refresh-adapters");
+  expect(f.argv()).toEqual([]);
+  f.run("setup", "-y");
+  f.argv();
+  writeFileSync(join(f.root, ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"] } } }));
+  const out = f.run("refresh-adapters");
+  expect(f.argv()).toEqual(UPDATE);
+  expect(out).toContain(`${join(f.root, ".mcp.json")} has a grayboard entry`);
+  // A failed update names the command and fails the run.
+  const failed = f.exec(["refresh-adapters"], { STUB_FAIL: "plugin update" });
+  expect(failed.exitCode).toBe(1);
+  expect(failed.stdout).toContain("`claude plugin update grayboard@grayboard` failed: stub: plugin update failed");
+  f.argv();
+  // Disabled: left alone.
+  writeFileSync(join(f.root, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "grayboard@grayboard": false } }));
   f.run("refresh-adapters");
   expect(f.argv()).toEqual([]);
 });

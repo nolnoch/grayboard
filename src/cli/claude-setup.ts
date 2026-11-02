@@ -78,6 +78,28 @@ export function installClaudePlugin(run: ClaudeCli, server: string, which: (cmd:
 }
 
 /**
+ * Server mode, plugin installed and enabled: fetch the marketplace's current
+ * catalog and update the plugin to it. Returns what happened; throws on a
+ * failed `claude` command. A running session keeps the old plugin until
+ * restarted. The catalog's pin moves only when a release's `plugin-pin` PR
+ * merges, so an update right after a release can find nothing newer.
+ */
+export function refreshClaudePlugin(run: ClaudeCli): string[] {
+  if (!pluginEnabled()) return [];
+  for (const args of [["plugin", "marketplace", "update", MARKETPLACE], ["plugin", "update", CLAUDE_PLUGIN]]) {
+    const r = run(args);
+    if (r.exitCode !== 0) throw new Error(`\`${shown(args)}\` failed${r.out ? `: ${r.out}` : ""}`);
+  }
+  return [`Updated the Claude Code plugin ${CLAUDE_PLUGIN} to the marketplace's current pin; restart Claude Code sessions to load it (a release's pin lags until its plugin-pin PR merges)`];
+}
+
+/** Whether user settings enable the hosted plugin. Throws when the file can't be parsed. */
+export const pluginEnabled = () => userJson<{ enabledPlugins?: Record<string, unknown> }>(claudeSettingsPath())?.enabledPlugins?.[CLAUDE_PLUGIN] === true;
+
+/** Whether `dir`'s `.mcp.json` holds a `grayboard` entry, which beside the hosted plugin runs a second grayboard in one session. */
+export const hasProjectEntry = (dir: string) => !!userJson<{ mcpServers?: Record<string, unknown> }>(join(dir, ".mcp.json"))?.mcpServers?.grayboard;
+
+/**
  * Local mode: register `command args` at user scope, title sessions with the
  * SessionStart hook, and disable the hosted plugin if it's enabled. Returns
  * what changed; throws on a failed registration.
@@ -93,7 +115,7 @@ export function registerClaudeLocal(run: ClaudeCli, command: string, args: strin
   const notes = [`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`];
   // `disable` fails on a plugin that's disabled or absent, so it runs only
   // where user settings enable it.
-  if (userJson<{ enabledPlugins?: Record<string, unknown> }>(claudeSettingsPath())?.enabledPlugins?.[CLAUDE_PLUGIN] === true) {
+  if (pluginEnabled()) {
     const disable = ["plugin", "disable", CLAUDE_PLUGIN];
     const d = run(disable);
     if (d.exitCode !== 0) throw new Error(`\`${shown(disable)}\` failed${d.out ? `: ${d.out}` : ""}`);
