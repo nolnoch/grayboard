@@ -14,6 +14,12 @@ export function matrixCaseID(env: NodeJS.ProcessEnv): number {
   return index + 1;
 }
 
+// The case's scenario, boundary and crash are constants from the table above, safe to print in evidence.
+export function matrixCaseName(id: number): string {
+  const c = matrixCases[id - 1]!;
+  return [c.scenario, c.boundary, c.crash && `crash-${c.crash}`].filter(Boolean).join("/");
+}
+
 export function matrixStart(path: string, id: number) {
   if (id === 1) appendFileSync(path, '{"phase":"prepare","state":"finished","exit":0}\n');
   appendFileSync(path, JSON.stringify({ phase: "case", id, state: "started" }) + "\n");
@@ -44,7 +50,7 @@ export function matrixObservation(raw: string, runtimeExit: number) {
   }
   if (cases.length === matrixCases.length && exit === 0) { phase = "complete"; id = undefined; }
   if (runtimeExit === 0 && (phase !== "complete" || cases.some(c => c.exit !== 0))) invalid();
-  return { phase, ...(id === undefined ? {} : { id }), state, exit, completed: cases.length, cases };
+  return { phase, ...(id === undefined ? {} : { id, name: matrixCaseName(id) }), state, exit, completed: cases.length, cases };
 }
 
 if (import.meta.main) {
