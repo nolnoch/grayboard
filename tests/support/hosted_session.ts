@@ -171,7 +171,12 @@ export class HostedSession {
     return new Uint8Array(await (await this.attachment("GET", `/${id}`)).arrayBuffer());
   }
 
-  private async attachment(method: "POST" | "GET", path: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
+  // An unsent upload withdrawn, as hosted-core's proxy releases a refused send's files.
+  async release(id: number): Promise<void> {
+    await (await this.attachment("DELETE", `/${id}`)).body?.cancel();
+  }
+
+  private async attachment(method: "POST" | "GET" | "DELETE", path: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
     const headers = new Headers({ Authorization: `Bearer ${this.token}`, "X-Grayboard-Session": encodeURIComponent(this.sessionId) });
     if (body) headers.set("Content-Type", "application/octet-stream");
     const r = await fetch(`${this.wireOptions.url}/attachments${path}`, { method, headers, ...(body ? { body } : {}) });

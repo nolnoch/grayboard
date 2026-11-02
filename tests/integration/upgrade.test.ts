@@ -20,6 +20,9 @@ import { FakeSlack } from "./fake_slack.ts";
 import { runCli } from "../support/cli.ts";
 import { localEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
+import type { DeliveryEvent } from "../../src/server/application.ts";
+import { direct } from "../support/events.ts";
+import type { HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
 import { newer } from "../../src/cli/update.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
@@ -68,9 +71,10 @@ afterEach(async () => {
     async () => {
       if (old) await stopOld();
     },
-    () => {
-      srv?.stop();
+    async () => {
+      const s = srv;
       srv = undefined;
+      await s?.stop();
     },
     () => keep(label, dir),
     () => rmSync(dir, { recursive: true, force: true }),
@@ -179,7 +183,53 @@ async function writeAll(be: Session, fe: Session, feHandle: string, beHandle: st
   return w;
 }
 
-async function readAll(be: Session, fe: Session, w: Written, beHandle: string, feHandle: string): Promise<void> {
+// What the read-back needs of a session, so one read-back serves a plugin
+// session (local mode) and a hosted session (the server, #282).
+type Reader = {
+  call: (tool: string, args?: Record<string, unknown>) => Promise<any>;
+  // A push whose text matches arrives.
+  hear: (match: (text: string) => boolean) => Promise<void>;
+  // No push whose text matches has arrived.
+  quiet: (match: (text: string) => boolean) => Promise<void>;
+  // The DM `offline` arrives, and it is the only DM pushed.
+  onlyDm: (offline: string) => Promise<void>;
+  file: (id: number) => Promise<Uint8Array>;
+};
+
+function pluginReader(s: Session): Reader {
+  return {
+    call: (tool, args) => s.call(tool, args),
+    hear: async (match) => {
+      await until(() => s.pushes.find((p) => match(p.content)), 10_000);
+    },
+    quiet: async (match) => expect(s.pushes.some((p) => match(p.content))).toBe(false),
+    onlyDm: async (offline) => {
+      await until(() => s.pushes.find((p) => p.content === offline), 10_000);
+      expect(s.pushes.filter((p) => p.meta.message_id !== undefined).map((p) => p.content)).toEqual([offline]);
+    },
+    file: async (id) => new Uint8Array(readFileSync((await s.call("attachment_get", { id })).path)),
+  };
+}
+
+// A hosted item's text: a DM's body, a board item's post body.
+const textOf = (e: DeliveryEvent) => (e.kind === "direct" ? e.message.body : ((e.item as { post?: { body: string } }).post?.body ?? ""));
+
+function hostedReader(s: HostedSession): Reader {
+  return {
+    call: (tool, args) => s.call(tool, args),
+    hear: async (match) => {
+      await s.next((e) => match(textOf(e)), 10_000);
+    },
+    quiet: (match) => s.none((e) => match(textOf(e))),
+    onlyDm: async (offline) => {
+      await s.next(direct((m) => m.body === offline), 10_000);
+      await s.none(direct());
+    },
+    file: (id) => s.download(id),
+  };
+}
+
+async function readAll(be: Reader, fe: Reader, w: Written, beHandle: string, feHandle: string): Promise<void> {
   const thread = await fe.call("board_read", { board: "e2e", thread: w.root });
   expect(thread.posts.map((p: { body: string }) => p.body)).toEqual(["root", "reply"]);
   expect(await fe.call("board_list")).toEqual(expect.arrayContaining([expect.objectContaining({ name: "e2e", purpose: "fixtures", mode: "digest" })]));
@@ -187,7 +237,7 @@ async function readAll(be: Session, fe: Session, w: Written, beHandle: string, f
   // The watch reads back as its effect: fe hears the release.
   if (w.watched) {
     await be.call("claim_release", { key: "ticket:ENG-1", note: "done" });
-    await until(() => fe.pushes.find((p) => p.content.startsWith("[release] ticket:ENG-1")));
+    await fe.hear((t) => t.startsWith("[release] ticket:ENG-1"));
   }
   const history = await be.call("dm_history", { peer: feHandle });
   expect(history.map((m: { body: string }) => m.body)).toContain("question");
@@ -196,22 +246,16 @@ async function readAll(be: Session, fe: Session, w: Written, beHandle: string, f
   if (w.inbox) expect(inbox.unanswered.map((m: { body: string }) => m.body)).toContain("question");
   if (w.inbox && w.acked) expect(inbox.unanswered.map((m: { body: string }) => m.body)).not.toContain("fyi");
   if (w.queued) expect(inbox.promised.map((m: { id: number }) => m.id)).toContain(w.queued);
-  if (w.attachment) {
-    const saved = await fe.call("attachment_get", { id: w.attachment });
-    expect(new Uint8Array(readFileSync(saved.path))).toEqual(PNG);
-  }
-  if (w.postFile) {
-    const saved = await fe.call("attachment_get", { id: w.postFile });
-    expect(new Uint8Array(readFileSync(saved.path))).toEqual(PNG);
-  }
+  if (w.attachment) expect(await fe.file(w.attachment)).toEqual(PNG);
+  if (w.postFile) expect(await fe.file(w.postFile)).toEqual(PNG);
   // The mute reads back as its effect: with fe in push mode, a new post
   // reaches it and a reply in the muted thread doesn't.
   if (w.muted) {
     await fe.call("board_subscribe", { board: "e2e", mode: "push" });
     await be.call("board_post", { board: "e2e", body: "muted reply", parent_id: w.root });
     await be.call("board_post", { board: "e2e", body: "after the mute" });
-    await until(() => fe.pushes.find((p) => p.content.includes("after the mute")));
-    expect(fe.pushes.some((p) => p.content.includes("muted reply"))).toBe(false);
+    await fe.hear((t) => t.includes("after the mute"));
+    await fe.quiet((t) => t.includes("muted reply"));
   }
 }
 
@@ -256,12 +300,9 @@ async function sendWhileOffline(m: Mailbox, be: Session, fe: Session, sim: () =>
 }
 
 // After the upgrade: the offline DM arrives, and nothing it follows comes again.
-async function expectReadPointsKept(be: Session, fe: Session): Promise<void> {
-  for (const [s, offline] of [[be, "while be was out"], [fe, "while fe was out"]] as const) {
-    await until(() => s.pushes.find((p) => p.content === offline), 10_000);
-    const dms = s.pushes.filter((p) => p.meta.message_id !== undefined).map((p) => p.content);
-    expect(dms).toEqual([offline]);
-  }
+async function expectReadPointsKept(be: Reader, fe: Reader): Promise<void> {
+  await be.onlyDm("while be was out");
+  await fe.onlyDm("while fe was out");
 }
 
 test(`server: a database ${FROM} wrote opens and reads back`, async () => {
@@ -300,10 +341,12 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   keep(`${label}-as-written`, join(dir, "old"));
   const before = schema(dbPath);
 
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   // The old sign-ins still hold.
-  const be2 = await srv.session(alice, "be");
-  const fe2 = await srv.session(bob, "fe");
+  for (const token of [alice, bob]) expect((await srv.api(token, "GET", "/api/whoami")).status).toBe(200);
+  // The read-back is a hosted session's: the names the release wrote bind as they stand.
+  const be2 = hostedReader(await srv.hosted("alice@example.com", "be", { create: false }));
+  const fe2 = hostedReader(await srv.hosted("bob@example.com", "fe", { create: false }));
   await expectReadPointsKept(be2, fe2);
   await readAll(be2, fe2, w, "alice@example.com/be", "bob@example.com/fe");
   writeFileSync(creds, JSON.stringify({ session_token: alice, server: srv.base, user_email: "alice@example.com" }));
@@ -313,7 +356,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   }
 
   const fresh = new TestServer({ dbPath: join(dir, "fresh.db") });
-  fresh.stop();
+  await fresh.stop();
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 }, 60_000);
 
@@ -334,8 +377,8 @@ test(`local: a bus ${FROM} wrote opens and reads back`, async () => {
   keep(`${label}-as-written`, bus);
   const before = schema(join(bus, "bus.db"));
 
-  const be2 = await localSession(bus, "be");
-  const fe2 = await localSession(bus, "fe");
+  const be2 = pluginReader(await localSession(bus, "be"));
+  const fe2 = pluginReader(await localSession(bus, "fe"));
   await expectReadPointsKept(be2, fe2);
   await readAll(be2, fe2, w, "be", "fe");
   if (human) expect((await runCli(["human"], { cwd: bus, env: localEnv(bus) })).out).toContain("alex");

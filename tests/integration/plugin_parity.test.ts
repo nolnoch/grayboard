@@ -14,6 +14,7 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { board, direct } from "../support/events.ts";
+import { HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -192,3 +193,67 @@ test("a repeat of a dm_send with `as`, holds unchanged, replays the first result
   expect(rows).toEqual([{ id: first.message_id, sender: `${A}/ops` }]);
   expect(retry).toMatchObject({ message_id: first.message_id, replayed: { ref: { kind: "message", id: first.message_id } } });
 });
+
+// hosted twin: #451 (tools-only writes_as). hub.test.ts's tools-only test
+// covers its pushes; this is its reads of the name's mail.
+test("a tools-only session beside the owner reads the name's mail, and isn't pushed it", async () => {
+  const alice = await srv.login(A);
+  const owner = srv.appSession(alice, "be");
+  const tools = srv.appSession(alice, "be", { push: false });
+  await Promise.all([owner.connect(), tools.connect()]);
+  const fe = await srv.hosted(B, "fe");
+  expect(await fe.call<SendResult>("dm_send", { to: `${A}/be`, body: "hi" })).toMatchObject({ delivered_now: true });
+  expect((await tools.inbox()).unanswered.map((m) => m.body)).toEqual(["hi"]);
+  expect((await owner.next(direct())).message.body).toBe("hi");
+  await tools.none(direct());
+});
+
+// A refused write's files are released by the client (the plugin, and
+// hosted-core's proxy: hosted_core_proxy.test.ts); the server's half is that
+// a refused dm_send or board_post binds none of them, and the release
+// route then frees each, audited, its bytes with it.
+test("a send or post the server refuses binds none of its uploads; releasing them frees the user's unsent quota", async () => {
+  const be = await srv.hosted(A, "be");
+  const refused = async (tool: string, args: Record<string, unknown>) => {
+    const id = await be.upload("notes.md", "# notes");
+    await expect(be.call(tool, { ...args, attachment_ids: [id] })).rejects.toBeInstanceOf(HostedToolError);
+    expect(srv.app.db.query("SELECT message_id, post_id FROM attachments WHERE id = ?").get(id)).toEqual({ message_id: null, post_id: null });
+    await be.release(id);
+  };
+  await refused("dm_send", { to: "nobody@example.com/x", body: "x" });
+  await refused("board_post", { board: "nope", body: "x" });
+  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachments").get()).toEqual({ n: 0 });
+  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
+  expect(srv.app.db.query("SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id").all()).toEqual([
+    { action: "attachment.uploaded" }, { action: "attachment.released" },
+    { action: "attachment.uploaded" }, { action: "attachment.released" },
+  ]);
+});
+
+// hosted twin: #451 (a second alias, `as`), #460 (resend). The plugin
+// refuses a lost write's repeat once its holds changed (src/plugin/mcp.ts);
+// the server's half is how it matches a repeat: by session, sender and
+// arguments, so a bind that leaves the sender alone still replays, a repeat
+// under another sender is another write, and resend writes again.
+test("a repeat after the session's holds changed replays while its sender is unchanged; another sender or resend writes again", async () => {
+  const be = srv.appSession(await srv.login(A), "be");
+  await be.connect();
+  const first = await be.send("be", "once");
+  await be.bind("ops", { create: true });
+  expect(await be.send("be", "once")).toMatchObject({ message_id: first.message_id, replayed: { ref: { kind: "message", id: first.message_id } } });
+  const asOps = await be.send("be", "once", { as: "ops" });
+  expect(asOps).not.toHaveProperty("replayed");
+  const resent = await be.send("be", "once", { resend: true });
+  expect(resent).not.toHaveProperty("replayed");
+  expect((await be.send("be", "once")).replayed?.ref.id).toBe(resent.message_id);
+  expect(srv.app.db.query("SELECT sender FROM messages WHERE body = 'once' ORDER BY id").all()).toEqual([
+    { sender: `${A}/be` }, { sender: `${A}/ops` }, { sender: `${A}/be` },
+  ]);
+
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const post = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "posted once" });
+  expect(await be.call("board_post", { board: "e2e", body: "posted once" })).toMatchObject({ replayed: { ref: { kind: "post", id: post.post_id } } });
+  expect(await be.call("board_post", { board: "e2e", body: "posted once", resend: true })).not.toHaveProperty("replayed");
+  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'").get()).toEqual({ n: 2 });
+});
+
