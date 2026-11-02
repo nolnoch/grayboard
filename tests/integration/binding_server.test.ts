@@ -51,6 +51,11 @@ const status = (address: string) => rows<{ status: string | null }>(`SELECT i.st
 const contents = (s: Session) => s.pushes.map((p) => p.content);
 // An unbound session's own row in peer_list's unbound_sessions.
 const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
+// The address a DM from `s` with no `as` goes out under: what it writes as.
+async function sentAs(s: AppSession, body: string): Promise<string> {
+  await s.send(`${A}/be`, body);
+  return rows<{ sender: string }>(`SELECT sender FROM messages WHERE body = ?`, body)[0]!.sender;
+}
 
 // A tool call's error text; a call that succeeds fails the test.
 async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
@@ -71,6 +76,15 @@ const app = (identity: string | null, o: AppSessionOptions & { token?: string } 
 async function connect(identity: string | null, opts: AppSessionOptions & { token?: string } = {}): Promise<AppSession> {
   const s = app(identity, opts);
   await s.connect();
+  return s;
+}
+// A keyed resume: the hello answers the name already bound, so connect()
+// binds nothing (it re-binds silently when the hello's `bound` lacks it).
+async function resume(identity: string, key: string): Promise<AppSession> {
+  const s = app(identity, { key, hello: { resume: true } });
+  const ok = await s.connect();
+  expect(ok.bound).toEqual([`${A}/${identity}`]);
+  expect(ok.bind).toBeUndefined();
   return s;
 }
 // The ApplicationError a connect or a call is refused with.
@@ -97,11 +111,28 @@ test("1, 3, 14: an unbound session acts as its ID, is listed for its user only, 
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   await be.call("board_post", { board: "e2e", body: "hello" });
 
-  // An unbound hosted session: reads as its ID, receives nothing until it binds.
-  // (14's unbound_sessions visibility across sessions is hub mechanics: covered
-  // at the application level in src/server/application.test.ts.)
+  // An unbound hosted session reads, and receives nothing until it binds: it
+  // holds no lease.
   const s = await srv.hosted(A, null);
   expect((await s.call<{ posts: { body: string }[] }>("board_read", { board: "e2e" })).posts.map((p) => p.body)).toEqual(["hello"]);
+
+  // An unbound session that persists (AppSession) acts as its ID (#284 S1):
+  // it writes as its ID, and a DM to its ID reaches it.
+  const u = await connect(null);
+  await u.call("board_post", { board: "e2e", body: "from the id" });
+  expect(rows(`SELECT author FROM posts WHERE body = 'from the id'`)).toEqual([{ author: u.id }]);
+  await u.send("be", "hi from the id");
+  expect((await be.next(direct((m) => m.body === "hi from the id"))).event.message.sender).toBe(u.id);
+  await be.call("dm_send", { to: u.id, body: "reply" });
+  await u.next(direct((m) => m.body === "reply"));
+  // 14: the user's other sessions see it by session ID; another user's don't.
+  const seen = (await be.call<{ unbound_sessions?: { session_id: string; self?: true }[] }>("peer_list", {})).unbound_sessions;
+  expect(seen).toEqual([expect.objectContaining({ session_id: u.id, unbound: true, online: true })]);
+  expect(seen![0]!.self).toBeUndefined();
+  expect((await (await srv.hosted("bob@example.com", "ops")).call<{ unbound_sessions?: unknown }>("peer_list", {})).unbound_sessions).toBeUndefined();
+  // Bound, it's gone from the list.
+  await u.bind("api3", { create: true });
+  expect((await be.call<{ unbound_sessions?: unknown }>("peer_list", {})).unbound_sessions).toBeUndefined();
 
   // 3: a new name gets none of api's mail. The probe DM to api2 arrives
   // first: had the bind delivered api's backlog, it would have preceded it.
@@ -149,7 +180,6 @@ test("2, 13: a second session on a held explicit name starts unbound and names t
 }, 20_000);
 
 test("4, 13: a never-seen name needs create; the refusal lists the closest names", async () => {
-  // hosted twin: #452 (the refusal's binding row rolls back on the hosted path)
   const dead = await srv.hosted(A, "fe");
   await dead.close();
   const s = await srv.hosted(A, null);
@@ -158,6 +188,10 @@ test("4, 13: a never-seen name needs create; the refusal lists the closest names
   expect(rows(`SELECT 1 FROM aliases WHERE name = 'fee'`)).toEqual([]);
   await s.bind("fee");
   expect((await s.call<{ held: string[] }>("whoami", {})).held).toEqual([`${A}/fee`]);
+  // The refusal is logged against the session that later bound the name.
+  const [refused, bound] = events("fee");
+  expect(refused).toEqual({ session_id: bound!.session_id, event: "refused", detail: expect.stringContaining("closest: fe") });
+  expect(bound!.event).toBe("bound");
 }, 20_000);
 
 // hosted twin: #451 (unbind, multi-alias holds)
@@ -184,10 +218,13 @@ test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mai
   expect((await be.call<{ peers: { handle: string }[] }>("peer_list", {})).peers).toEqual(
     expect.arrayContaining([expect.objectContaining({ handle: `${A}/fe` })]),
   );
+  // The primary, the oldest hold, is what it writes as by default.
+  expect(await sentAs(s, "as the primary")).toBe(`${A}/fe`);
 
   // Unbinding the primary promotes the next oldest hold.
   const u = await s.unbind("fe");
   expect(u).toMatchObject({ alias: `${A}/fe`, released: true, held: [`${A}/fe2`] });
+  expect(await sentAs(s, "as the promoted hold")).toBe(`${A}/fe2`);
   // #284 S6: claims stay with the address they were taken under.
   expect(u.left).toEqual(["ticket:ENG-142"]);
   expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: "unbind" });
@@ -210,6 +247,7 @@ test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mai
   // Unbinding the last hold leaves the session acting as its ID.
   expect(await s.unbind("fe2")).toMatchObject({ alias: `${A}/fe2`, released: true, held: [] });
   expect(s.session.holds).toEqual([]);
+  expect(await sentAs(s, "as the id")).toBe(s.id);
 }, 40_000);
 
 // hosted twin: #451 (multi-alias holds)
@@ -217,6 +255,8 @@ test("#284 S1: the primary is the oldest hold; a ninth hold is refused", async (
   const s = await connect(null);
   for (const n of ["zed", "alpha", "c", "d", "e", "f", "g", "h"]) await s.bind(n, { create: true });
   expect(s.session.holds[0]).toBe(`${A}/zed`);
+  await connect("be");
+  expect(await sentAs(s, "as the oldest")).toBe(`${A}/zed`);
   await expect(s.bind("i", { create: true })).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("already holds 8 names") });
   expect(rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/i`)).toEqual([]);
 }, 40_000);
@@ -344,7 +384,7 @@ test("audit 3, 4: a reconnect on the session's key keeps its hold; another sessi
   expect(inGrace.extra.retry_after_ms).toBeGreaterThan(30_000);
 
   // The same key re-attaches: the hold and the claim are its, and nothing is rebound.
-  const back = await connect("fe", { key, hello: { resume: true } });
+  const back = await resume("fe", key);
   expect(back.id).toBe(sid);
   expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe` }]);
   // One refusal row per reason: held live, then held in the grace.
@@ -441,7 +481,7 @@ test("audit 15: a holder whose server restarts re-attaches within the grace and 
   expect(e.message).toContain("ends by");
   expect(e.extra.retry_after_ms).toBeGreaterThan(0);
   // The holder re-attaches on its key within the grace and keeps its name.
-  const back = await connect("fe", { key: s.key, hello: { resume: true } });
+  const back = await resume("fe", s.key);
   expect(back.id).toBe(holder);
   expect(events("fe").map((e2) => e2.event)).toEqual(["bound", "refused"]);
 }, 30_000);
@@ -909,7 +949,7 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
   await ws.call("peer_status", { text: "mid-task" });
   ws.close();
   // A reconnect on its key re-attaches: same ID, still bound, status kept, no rebind.
-  ws = await connect("api", { key: mine, hello: { resume: true } });
+  ws = await resume("api", mine);
   expect(ws.id).toBe(idAddress(mine));
   expect(ws.session.holds).toEqual([`${A}/api`]);
   expect(apiStatus()).toBe("mid-task");
