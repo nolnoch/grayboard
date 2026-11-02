@@ -10,8 +10,8 @@ export type WireOptions = { url: string; sessionKey: string; client: { name: str
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
 }
-// The server's holder is free text naming the account's other session; it is shown, so it must not carry control or bidi characters.
-export const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
+// Server free text the host shows (an alias_held holder, an alias_lost reason): bounded, and no control or bidi characters.
+export const shownText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
@@ -22,7 +22,7 @@ export function subscriberError(value: unknown, leaseOperation: boolean): Subscr
   const suggestions = (value as { known?: unknown } | undefined)?.known;
   const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 256 && suggestions.every(name => typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name)) ? [...new Set(suggestions as string[])] : undefined;
   const holder = (value as { holder?: unknown } | undefined)?.holder;
-  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "alias_held" && holderText(holder) ? holder : undefined);
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "alias_held" && shownText(holder) ? holder : undefined);
 }
 // The server refused the connection's first request (server/discover or
 // initialize) with an HTTP status the SDK would report only as a failed

@@ -21,10 +21,13 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
+  // Holds the server took (#453), per session: the subscriber whoami reports them, and the next delivery_open
+  // takes the reported ones, as the server does.
+  const lost = new Map<string, { alias: string; reason: string; reported: boolean }[]>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
-  let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined;
+  let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   const loops: FakeWire[] = [];
   const address = (name: string) => name.includes("/") ? name : `you@example.com/${name}`;
   // A bind adds a hold; an unbind releases one and bumps the generation too (#451).
@@ -45,12 +48,16 @@ function runtime(mode: Mode) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") {
         if (!this.beforeRetry && prepareHold) await prepareHold;
-        return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(!row?.held.length ? { unbound: true } : {}) };
+        // The server reports each loss to the Controller until its next delivery_open (#453).
+        const taken = lost.get(this.sessionID) ?? [];
+        for (const l of taken) l.reported = true;
+        return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(taken.length ? { alias_lost: taken.map(({ alias, reason }) => ({ alias, reason })) } : {}), ...(!row?.held.length ? { unbound: true } : {}) };
       }
       if (name === "bind") {
         if (address(args.name as string).endsWith("/gone")) throw new SubscriberError("alias_held");
         if (!args.create && !rows.get(this.sessionID) && !["you@example.com/be", "you@example.com/fe"].includes(address(args.name as string))) throw new Error("identity_unknown");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
+        lost.set(this.sessionID, (lost.get(this.sessionID) ?? []).filter(l => l.alias !== address(args.name as string)));
         return { name: row.held[0]!.split("/")[1], ownership: row.ownership, instructions: ["bound"] };
       }
       if (name === "unbind") {
@@ -60,7 +67,9 @@ function runtime(mode: Mode) {
       if (name === "session_register") return { registered: true };
       if (name === "session_end" || name === "delivery_release") { rows.delete(this.sessionID); return { ok: true }; }
       if (name === "delivery_open") {
+        if (beforeOpen) { const hook = beforeOpen; beforeOpen = undefined; hook(); row = rows.get(this.sessionID); }
         if (!row?.held.length) throw new Error("unbound");
+        lost.set(this.sessionID, (lost.get(this.sessionID) ?? []).filter(l => !l.reported));
         row.capability = `${row.ownership}_${row.generation}`.padEnd(43, "a");
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: row.held[0] } };
       }
@@ -115,11 +124,21 @@ function runtime(mode: Mode) {
     controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts, loops,
     // Every prepare's whoami waits on `gate` from now on.
     holdPrepare: (gate: Promise<void>) => { prepareHold = gate; },
+    // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
+    beforeOpen: (hook: () => void) => { beforeOpen = hook; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     // The grant changes before any watch's next tick; the server then closes `id`'s stream.
     revoke: (id: string) => { grant++; streams.get(id)?.(); },
     closeStream: (id: string) => { streams.get(id)?.(); },
+    // The server takes a hold (#453, a revoked access): released, the generation bumped, the stream closed,
+    // and whoami reports it until the next delivery_open.
+    loseHold: (id: string, name: string, reason: string) => {
+      const row = rows.get(id)!;
+      row.held = row.held.filter(h => h !== address(name)); row.generation++;
+      lost.set(id, [...(lost.get(id) ?? []), { alias: address(name), reason, reported: false }]);
+      streams.get(id)?.();
+    },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
     // The nth delivery_renew throws `error` once, after running `then`.
@@ -625,10 +644,63 @@ test.each(modes)("resume rebinds every remembered hold in order, and a hold drop
     await until(() => r.root(c)?.state === "active");
     expect(r.named("bind").slice(binds).map(x => x.args.name)).toEqual([at("be"), at("fe")]);
     expect(r.rows.get("R")?.held).toEqual([at("be"), at("fe")]);
-    // Revocation (or another process's unbind): the held set no longer matches what this root started with.
+    // A drop no whoami's alias_lost explains (another process's unbind): the held set no longer matches what this root started with.
     const row = r.rows.get("R")!;
     r.rows.set("R", { ...row, held: [at("fe")], generation: row.generation + 1 });
     r.closeStream("R");
     await until(() => r.root(c)?.state === "paused");
   } finally { await c.close(); }
+});
+
+// #453: a hold the server took, which whoami reports as alias_lost, is a known loss, not an unexplained change.
+test.each(modes)("a hold whoami reports lost leaves the root receiving under the rest, remembered and on the status line; losing the last leaves it unbound (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  try {
+    await r.controller.enroll("R", ["be", "eng/build"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    r.loseHold("R", "eng/build", reason);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
+    expect(r.root(r.controller)).toMatchObject({ held: [at("be")], message: `Subscribed as be (lost build: ${reason}); receipts follow durable root admission` });
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [at("be")] });
+    expect(await r.controller.carried("R")).toEqual([at("be")]);
+    // The second loss's status line names only it: the first was taken by the reopen's delivery_open.
+    r.loseHold("R", "be", reason);
+    await until(() => r.root(r.controller)?.state === "unbound");
+    expect(r.root(r.controller)!.message).toBe(`Root approved, unbound (lost be: ${reason}); bind(name) to take one`);
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+    // Neither loss is bound again.
+    expect(r.named("bind").map(c => c.args.name)).toEqual(["be", "eng/build"]);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a loss a resume's whoami finds stays on the status line and isn't bound again (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  await r.controller.enroll("R", ["be", "eng/build"], true);
+  await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+  await r.controller.close();
+  // The fake stores a team alias as written (`eng/build`), as its binds did.
+  r.rows.set("R", { held: [at("be"), "eng/build"], ownership: 1, generation: 5 });
+  r.loseHold("R", "eng/build", reason);
+  const restarted = r.make(), binds = r.named("bind").length;
+  try {
+    await restarted.resume("R");
+    await until(() => r.root(restarted)?.state === "active");
+    expect(r.root(restarted)).toMatchObject({ held: [at("be")], message: `Subscribed as be (lost build: ${reason}); receipts follow durable root admission` });
+    expect(r.named("bind").slice(binds)).toEqual([]);
+  } finally { await restarted.close(); }
+});
+
+test.each(modes)("a primary lost between the run loop's whoami and delivery_open reopens under the rest instead of pausing (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  try {
+    await r.controller.enroll("R", ["be", "eng/build"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    r.beforeOpen(() => r.loseHold("R", "be", reason));
+    r.closeStream("R");
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
+    expect(r.root(r.controller)).toMatchObject({ held: ["eng/build"], message: `Subscribed as build (lost be: ${reason}); receipts follow durable root admission` });
+  } finally { await r.controller.close(); }
 });

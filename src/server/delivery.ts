@@ -76,6 +76,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
         if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
+        hosted.seeLost(p, row);
         previous = [...leases.values()].find(l => l.sessionId === row.session_id);
         if (previous && matches(previous, row)) return previous;
         if (leases.size >= 256 || [...leases.values()].filter(l => l.principal.authed.user_id === p.authed.user_id).length >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");

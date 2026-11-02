@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { HostedStore, HostedSession, HostedEnd } from "./hosted-types.ts";
+import type { HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -273,6 +273,19 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
     -- A hosted root's holds are alias_holds rows (#451); the unique index on its old single name goes (migrateHostedHolds).
     DROP INDEX IF EXISTS idx_hosted_name;
+    -- A hosted root's holds the server took (#453, revokeAliases), one row per alias (a second loss restates it).
+    -- Two readers: the agent takes a row once (told_at: its native whoami or tool result carried the notice); the
+    -- root's Controller is reported it by every subscriber whoami (reported_at: the first) until its next
+    -- delivery_open (seen_at), which it sends only after applying the loss, so the shrunken held set is a known
+    -- loss, not a pause, even when a whoami's response is lost. A row both took is deleted; a bind of the alias
+    -- deletes it too. An ownership end deletes the row and these with it: the next ownership starts holding
+    -- nothing. was_primary: the hold was the root's primary, for the notice's "sends as ... now".
+    CREATE TABLE IF NOT EXISTS hosted_alias_lost (
+      session_id TEXT NOT NULL REFERENCES hosted_sessions(session_id) ON DELETE CASCADE,
+      alias TEXT NOT NULL, reason TEXT NOT NULL, was_primary INTEGER NOT NULL, at INTEGER NOT NULL,
+      told_at INTEGER, reported_at INTEGER, seen_at INTEGER,
+      PRIMARY KEY (session_id, alias)
+    );
     -- Server-wide scalar state. alive_at: the server's last heartbeat (epoch ms),
     -- so a restart can credit hosted leases with the downtime (#423). builtin_clients:
     -- when this database first ran with the built-in OAuth clients (#429), which revoked
@@ -1251,6 +1264,19 @@ function makeHostedStore(db: Database): HostedStore {
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
   };
+  // The hosted_alias_lost column each reader's take marks (#453).
+  const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
+  const lostOf = (session: string, where: string) => db.query<{ alias: string; reason: string; was_primary: number }, [string]>(
+    `SELECT alias, reason, was_primary FROM hosted_alias_lost WHERE session_id = ? AND ${where} ORDER BY at, rowid`,
+  ).all(session).map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
+  // Marks `where`'s rows' `column` and deletes the rows both readers took.
+  const takeLost = (session: string, where: string, column: string, now: number) => {
+    const lost = lostOf(session, where);
+    if (!lost.length) return lost;
+    db.run(`UPDATE hosted_alias_lost SET ${column} = ? WHERE session_id = ? AND ${where}`, [now, session]);
+    db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND told_at IS NOT NULL AND seen_at IS NOT NULL", [session]);
+    return lost;
+  };
   const store: HostedStore = {
     atomic: fn => db.transaction(fn).immediate(),
     subscribe: () => () => {},
@@ -1295,6 +1321,21 @@ function makeHostedStore(db: Database): HostedStore {
       for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
+    },
+    lose(session, lost, now) {
+      db.run(`INSERT INTO hosted_alias_lost(session_id, alias, reason, was_primary, at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, alias) DO UPDATE SET reason = excluded.reason, was_primary = excluded.was_primary, at = excluded.at, told_at = NULL, reported_at = NULL, seen_at = NULL`,
+        [session, lost.alias, lost.reason, lost.primary ? 1 : 0, now]);
+    },
+    lost: (session, reader) => lostOf(session, `${LOST_READ[reader]} IS NULL`),
+    tellLost: (session, now) => takeLost(session, "told_at IS NULL", "told_at", now),
+    reportLost(session, now) {
+      db.run("UPDATE hosted_alias_lost SET reported_at = ? WHERE session_id = ? AND seen_at IS NULL AND reported_at IS NULL", [now, session]);
+      return lostOf(session, "seen_at IS NULL");
+    },
+    seeLost: (session, now) => takeLost(session, "seen_at IS NULL AND reported_at IS NOT NULL", "seen_at", now),
+    forgetLost(session, alias) {
+      db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND alias = ?", [session, alias]);
     },
     aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat(now) {

@@ -2,6 +2,7 @@
 // Do not edit: change hosted-core, then run `bun scripts/sync_hosted_core.ts`.
 import { createHash } from "node:crypto";
 import type { Enrollment } from "./port.js";
+import { shownText } from "./wire.js";
 export type { Configuration, Enrollment } from "./port.js";
 
 // `identity_full` is the lease's primary hold, the one the session sends as.
@@ -10,7 +11,9 @@ export type Identity = { user: { email: string }; identity_full: string; issuer:
 export type Item = { id: string; actionable: boolean; event: unknown; ownership: number; bind_gen: number; address?: string };
 export type Lease = { capability: string; identity: Identity; ownership: number; bind_gen: number; expiresAt: number };
 // whoami's answer for a root: every hold's full address, oldest first (`held`), and the one it sends as.
-export type BindingState = { held: string[]; primary: string | null; ownership: number | null; unbound?: boolean; child?: boolean; candidates?: unknown[] };
+// `alias_lost` (#453): holds the server took (a revoked access), each reported once to this (subscriber) reader.
+export type Lost = { alias: string; reason: string };
+export type BindingState = { held: string[]; primary: string | null; ownership: number | null; alias_lost?: Lost[]; unbound?: boolean; child?: boolean; candidates?: unknown[] };
 const ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
 const MAX_HELD = 64;
 export const validAddress = (value: unknown): value is string => typeof value === "string" && ADDRESS.test(value);
@@ -71,7 +74,8 @@ export function identityOf(value: unknown, e: Enrollment): Identity {
 }
 export function bindingOf(value: unknown): BindingState {
   const b = value as BindingState;
-  if (!b || !validHeld(b.held) || !(b.primary === null || validAddress(b.primary)) || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child) throw new Refusal("root", "Invalid root binding response");
+  if (!b || !validHeld(b.held) || !(b.primary === null || validAddress(b.primary)) || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child ||
+    !(b.alias_lost === undefined || Array.isArray(b.alias_lost) && b.alias_lost.length <= MAX_HELD && b.alias_lost.every(l => l && validAddress(l.alias) && shownText(l.reason)))) throw new Refusal("root", "Invalid root binding response");
   return b;
 }
 export function leaseOf(value: unknown, e: Enrollment): Lease {
