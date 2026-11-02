@@ -435,8 +435,9 @@ test("attachments on a team board post follow the board; a retracted DM takes it
 
   const up = await upload(alice, "be", "plan.md", "# plan");
   expect(up.body.type).toBe("text/markdown");
-  // A client can't name paths for the server to read.
-  await expect(a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).rejects.toBeInstanceOf(HostedToolError);
+  // A client can't name paths for the server to read: the hosted board_post
+  // has no attachments field (attachment_ids only), and refuses one.
+  await expect(a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).rejects.toMatchObject({ message: "Input validation error: Invalid arguments for tool board_post: data must NOT have additional properties" });
   const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: "@sim plan attached", attachment_ids: [up.body.id] });
   const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6, sha256: up.body.sha256 };
   expect(posted.attachments).toEqual([info]);

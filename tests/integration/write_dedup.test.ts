@@ -1,24 +1,32 @@
 // Append-write dedup and state-derived repeats (#254): a write whose answer
 // was lost, called again, returns the first result instead of landing twice.
-// Dedup is the application's (dedupWrite in src/server/application.ts), so
-// the server cases drive it in process through AppSession: a lost answer is
-// a write whose result the caller never read, and the retry is the same
-// call again from the same session.
+// Dedup is the application's (dedupWrite in src/server/application.ts). The
+// lost-answer window itself (committed, not yet answered or delivered) is
+// forced on a hosted MCP session against the server as its own process, so
+// the write:after-commit pause blocks only the server: the caller is gone
+// when delivery and the answer run. The rest drive it in process through
+// AppSession, where a lost answer is a write whose result the caller never
+// read, and the retry is the same call again from the same session.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
 import type { SendResult } from "../../src/server/application.ts";
+import { openDatabase } from "../../src/server/db.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { localEnv } from "../support/env.ts";
 import { runCli } from "../support/cli.ts";
 import type { AppSession } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
-import { TestServer } from "../support/server.ts";
+import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
+import { ROOT } from "../support/paths.ts";
+import { ServerProcess, TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 // A replay's marker; absent on a write that landed.
@@ -112,6 +120,119 @@ describe("a lost answer, then the same call from the same session", () => {
     const events = await pushedBefore(lx, () => again.send("lx", "sentinel 3"), "sentinel 3");
     expect(events.filter(direct((m) => m.id === id)).length).toBe(1);
   });
+});
+
+describe("a lost answer over hosted MCP, then the same call (server process)", () => {
+  const PAUSE = "write:after-commit";
+  let dir: string;
+  let srv: ServerProcess;
+  let alice: string;
+  let bob: string;
+  const go = () => join(dir, "go");
+  const db = () => new Database(join(dir, "bus.db"), { readonly: true });
+  const hits = (what: "hit" | "released") => srv.log().split(`test pause ${what}: ${PAUSE}`).length - 1;
+  const sessions: HostedSession[] = [];
+  const session = async (token: string, identity: string, opts: { sessionId?: string; delivery?: boolean } = {}) => {
+    const s = new HostedSession(`${srv.base}/mcp`, token, identity, opts);
+    sessions.push(s);
+    await s.connect();
+    return s;
+  };
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "gb-dedup-"));
+    srv = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], join(dir, "bus.db"), {
+      BUS_TEST_PAUSE: PAUSE, BUS_TEST_PAUSE_FILE: go(),
+      // Inbox polling spends hosted requests.
+      GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
+    });
+    // Grants written through the server's database beside the running
+    // process (WAL), as a finished hosted login leaves them. ServerProcess's
+    // public URL is http://localhost, so its OAuth resource is http://localhost/mcp.
+    const store = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+    try {
+      const token = (email: string) => issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT).token;
+      alice = token("alice@example.com");
+      bob = token("bob@example.com");
+    } finally {
+      store.db.close();
+    }
+  });
+  afterAll(async () => {
+    writeFileSync(go(), "");
+    await Promise.allSettled(sessions.splice(0).map((s) => s.close()));
+    await srv.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The first call commits and pauses before its answer and its delivery;
+  // its client drops (the request aborted, both wires closed); the pause
+  // releases, so delivery runs and the answer goes nowhere; the same raw
+  // session comes back and makes the same call. No lease on either side,
+  // so the caller holds nothing a re-attach must wait out.
+  // `hints`: the recipient's wake-up count, none while the pause holds.
+  async function lostThenRepeated<T>(identity: string, tool: string, args: Record<string, unknown>, hints: () => number): Promise<{ again: HostedSession; retry: T }> {
+    rmSync(go(), { force: true });
+    const first = await session(alice, identity, { delivery: false });
+    const before = hits("hit");
+    const lost = first.callRaw(tool, args).then(() => "answered", () => "lost");
+    await until(() => hits("hit") > before, 10_000, "the pause after the commit");
+    await first.drop();
+    expect(await lost).toBe("lost");
+    expect(hints()).toBe(0);
+    const released = hits("released");
+    writeFileSync(go(), "");
+    await until(() => hits("released") > released, 10_000, "the pause's release");
+    // The paused call's delivery, run after its caller dropped.
+    await until(() => hints() > 0, 5000, "the recipient's wake-up");
+    const again = await session(alice, identity, { sessionId: first.sessionId, delivery: false });
+    return { again, retry: await again.call<T>(tool, args) };
+  }
+
+  test("dm_send: one row, the repeat answered as replayed, delivered once, one request.replayed", async () => {
+    const fe = await session(bob, "fe");
+    const watch = await fe.watch();
+    const { retry } = await lostThenRepeated<SendResult & Replayed>("be", "dm_send", { to: "bob@example.com/fe", body: "lost answer dm" }, watch.hints);
+    await watch.close();
+    const d = db();
+    try {
+      const rows = d.prepare("SELECT id FROM messages WHERE body = 'lost answer dm'").all() as { id: number }[];
+      expect(rows.length).toBe(1);
+      const id = rows[0]!.id;
+      expect(retry.replayed!.first_at).toMatch(ISO);
+      expect(retry).toMatchObject({ message_id: id, delivered_now: true, replayed: { ref: { kind: "message", id } } });
+      expect(retry.note).toBe(`already sent to bob@example.com/fe at ${retry.replayed!.first_at} as message ${id}; this repeat was not sent. To send it again on purpose, call with resend: true.`);
+      const replays = d.prepare("SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'").all() as { actor: string; target: string; detail: string }[];
+      expect(replays.length).toBe(1);
+      expect(replays[0]).toMatchObject({ actor: "alice@example.com", target: "alice@example.com/be" });
+      expect(JSON.parse(replays[0]!.detail)).toMatchObject({ tool: "dm_send", ref_kind: "message", ref_id: id, transport: "hosted", first_at: retry.replayed!.first_at });
+      // The inbox is the message rows, so one row is one delivery.
+      expect((await fe.next(direct((m) => m.id === id), 5000)).event.message.sender).toBe("alice@example.com/be");
+    } finally {
+      d.close();
+    }
+  }, 30_000);
+
+  test("board_post on a queue board: one post, one queue claim, one delivery", async () => {
+    const lane = await session(bob, "lane");
+    await lane.call("board_create", { name: "work", purpose: "a queue", kind: "queue" });
+    const watch = await lane.watch();
+    const { retry } = await lostThenRepeated<{ post_id: number; board: string; note: string } & Replayed>("poster", "board_post", { board: "#Work", body: "process next batch" }, watch.hints);
+    await watch.close();
+    const d = db();
+    try {
+      const posts = d.prepare("SELECT id FROM posts WHERE body = 'process next batch'").all() as { id: number }[];
+      expect(posts.length).toBe(1);
+      const id = posts[0]!.id;
+      expect(retry).toMatchObject({ post_id: id, board: "work", replayed: { ref: { kind: "post", id } } });
+      expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
+      expect(d.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
+      expect(d.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
+      await lane.next(board((i) => i.post?.id === id), 5000);
+    } finally {
+      d.close();
+    }
+  }, 30_000);
 });
 
 describe("dedup and state answers (in process)", () => {

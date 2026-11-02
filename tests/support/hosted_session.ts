@@ -205,6 +205,21 @@ export class HostedSession {
     this.subscriber.capability = undefined;
   }
 
+  // The lease's wake-ups, as a hosted client listens for them: the
+  // subscriber's subscriptions/listen on grayboard://inbox, and a count of
+  // the notifications/resources/updated it receives (the server's
+  // delivery.changed, sent when an item reaches the lease). close() ends
+  // the listen.
+  async watch(): Promise<{ hints: () => number; close: () => Promise<void> }> {
+    if (!this.lease) throw new Error(`${this.label}: no delivery lease (unbound, or delivery: false)`);
+    let hints = 0;
+    this.subscriber.client.setNotificationHandler("notifications/resources/updated", (n) => {
+      if (n.params.uri === "grayboard://inbox") hints++;
+    });
+    const subscription = await this.subscriber.listen();
+    return { hints: () => hints, close: () => subscription.close() };
+  }
+
   // The lease's inbox as it stands: a read, which acknowledges nothing.
   async inbox(): Promise<InboxItem[]> {
     if (!this.lease) throw new Error(`${this.label}: no delivery lease (unbound, or delivery: false)`);
@@ -272,6 +287,18 @@ export class HostedSession {
         await Promise.all([this.native.close(), this.subscriber.close()]);
         this.abort.abort();
       }
+    })();
+    return this.closing;
+  }
+
+  // The client gone mid-call, as a harness that dies: every in-flight
+  // request aborted and both wires closed, with no release. Its ownership
+  // and lease stay the server's to expire or a re-attach to take.
+  drop(): Promise<void> {
+    this.closing ??= (async () => {
+      this.abort.abort();
+      this.lease = undefined;
+      await Promise.allSettled([this.native.close(), this.subscriber.close()]);
     })();
     return this.closing;
   }
