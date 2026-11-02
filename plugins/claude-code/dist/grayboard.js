@@ -35487,6 +35487,10 @@ function describeFetchError(e, ms) {
   return e instanceof Error && e.name === "TimeoutError" ? `no answer within ${Math.round(ms / 1000)}s` : e.message;
 }
 
+// src/shared/session_meta.ts
+var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
+var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
+
 // adapters/hosted-core/src/proxy.ts
 var NativeToolSchema = strictObject({
   name: string2().min(1),
@@ -35628,9 +35632,10 @@ class ToolProxy {
         return failure2(expired.message);
       throw error;
     }
-    let outcome = { status: "error" };
+    let outcome = { status: "error" }, lost = false;
     try {
       const result = await this.dispatch(name, args, sessionID);
+      lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError)
         outcome = { status: "completed", output: outputOf(result) };
       return result;
@@ -35640,7 +35645,7 @@ class ToolProxy {
         return failure2(expired.message);
       throw error;
     } finally {
-      if (name === "bind" || name === "unbind")
+      if (name === "bind" || name === "unbind" || lost)
         this.forget(sessionID);
       try {
         await this.options.hooks?.afterCall({ sessionID, tool: name, result: outcome });
@@ -35865,9 +35870,6 @@ class ToolProxy {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
 }
-
-// src/shared/session_meta.ts
-var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
@@ -36308,7 +36310,7 @@ class Controller {
     return current.alias_lost?.length ? ` (lost ${current.alias_lost.map((l) => `${display(l.alias)}: ${l.reason}`).join("; ")})` : "";
   }
   async dropLost(r, current) {
-    const lost = new Set(current.alias_lost?.map((l) => l.alias));
+    const lost = new Set(current.alias_lost?.map((l) => l.alias).filter((address) => !current.held.includes(address)));
     const kept = r.e.held?.filter((address) => !lost.has(address));
     if (!kept || kept.length === r.e.held.length)
       return false;
@@ -36362,7 +36364,7 @@ class Controller {
       await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: current.held });
       await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
-        this.set(r, "approved", `Bound ${this.names(r.e)}; opening delivery`, "prepare");
+        this.set(r, "approved", `Bound ${this.names(r.e)}${this.lostNote(current)}; opening delivery`, "prepare");
         const started = this.start(r);
         if (waitForStart)
           await started;
@@ -36387,7 +36389,7 @@ class Controller {
     return started;
   }
   async run(r, e, epoch, signal, ready) {
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false, reidentified = false;
     let pendingItem;
     const attempts = new Map;
     while (!signal.aborted && failures < 8) {
@@ -36414,7 +36416,16 @@ class Controller {
           await this.guard(r, epoch, signal);
         } else if (!sameHeld(current.held, e.held))
           throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
-        const lease = leaseOf(await wire.call("delivery_open"), e);
+        let lease;
+        try {
+          lease = leaseOf(await wire.call("delivery_open"), e);
+        } catch (error) {
+          if (!(error instanceof Refusal) || reidentified)
+            throw error;
+          reidentified = true;
+          continue;
+        }
+        reidentified = false;
         await this.guard(r, epoch, signal);
         r.lease = lease;
         wire.capability = lease.capability;

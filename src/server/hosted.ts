@@ -279,15 +279,17 @@ export function createHostedSessions(application: Application, options: { now?: 
     const current = fresh ? rootOf(fresh) : undefined;
     if (!fresh || fresh.ownership_id !== row.ownership_id || fresh.root_session_id !== row.root_session_id || !current || current.session_id !== root.session_id || current.ownership_id !== root.ownership_id || current.bind_gen !== root.bind_gen || (current.lease_deadline !== null && current.lease_deadline <= now())) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
   }
-  // The holds the server took from root `row` (#453) that `reader` hasn't taken, taken now: the agent's (a native
-  // whoami or tool result) audited, the Controller's (its subscriber whoami) not. A child's call takes none: bind
-  // is the root's, and an adapter's own probe from a child (pi's) would swallow the notice.
+  // The holds the server took from root `row` (#453) that `reader` hasn't taken: the agent's (a native whoami or
+  // tool result) taken now, audited; the Controller's (its subscriber whoami) reported, taken by its next
+  // delivery_open (`seeLost`). A child's call takes none: bind is the root's, and an adapter's own probe from a
+  // child (pi's) would swallow the notice.
   function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): HostedLost[] {
     // The read first, so a call with nothing pending opens no transaction (whose commit wakes the observers).
     if (!row || row.root_session_id || !store.lost(row.session_id, reader).length) return [];
     return store.atomic(() => {
-      const taken = store.takeLost(row.session_id, reader, now());
-      if (taken.length && reader === "agent") audit(row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
+      if (reader === "controller") return store.reportLost(row.session_id, now());
+      const taken = store.tellLost(row.session_id, now());
+      if (taken.length) audit(row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
       return taken;
     });
   }
@@ -308,6 +310,13 @@ export function createHostedSessions(application: Application, options: { now?: 
     rootOnly,
     named,
     audit,
+    // Inside delivery_open's transaction (#453): the lost holds root `row`'s Controller was reported, taken. Its
+    // run loop opens only after the same iteration's whoami and the durable drop, so these are applied.
+    seeLost(p: OAuthPrincipal, row: HostedSession) {
+      if (!store.lost(row.session_id, "controller").length) return;
+      const seen = store.seeLost(row.session_id, now());
+      if (seen.length) audit(row.session_id, "hosted.alias_lost_seen", { aliases: seen.map(l => l.alias), ownership: row.ownership_id }, p);
+    },
     reconcile,
     sweep,
     listen(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
@@ -374,7 +383,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
     // `alias_lost` (#453): the holds the server took that this reader hasn't taken: `told` (the native whoami)
-    // takes the agent's with the notice; the subscriber's (the Controller's) takes its own, so either order works.
+    // takes the agent's with the notice; the subscriber's (the Controller's) reports its own until its next
+    // delivery_open, so either order works and a lost response loses nothing.
     async whoami(p: OAuthPrincipal, context: SessionContext, told?: (notice: string) => void) {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(row) : undefined;
@@ -413,6 +423,8 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (added || args.where !== undefined) store.update({ ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
           if (args.where !== undefined) application.hostedPlace(row.session_id, args.where);
           if (added && row.lease_deadline !== null) audit(row.session_id, "hosted.lease_closed", { reason: "rebound" });
+          // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
+          if (added) store.forgetLost(row.session_id, ok.alias);
           return { ok, added: ok.held.length !== before.length, first: before.length === 0, ownership: row.ownership_id };
         } finally { application.close(selected.session); }
       }, async result => {

@@ -266,8 +266,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   private lostNote(current: BindingState) { return current.alias_lost?.length ? ` (lost ${current.alias_lost.map(l => `${display(l.alias)}: ${l.reason}`).join("; ")})` : ""; }
   // Drops the holds a whoami says the server took (#453) from those the root expects, durably, so neither the
   // run loop nor a resume binds them again and the rest keep receiving, as on WSS. Any other change still pauses.
+  // The server reports them until the next delivery_open, so a repeat is a no-op; one held again isn't lost.
   private async dropLost(r: Root<E>, current: BindingState) {
-    const lost = new Set(current.alias_lost?.map(l => l.alias));
+    const lost = new Set(current.alias_lost?.map(l => l.alias).filter(address => !current.held.includes(address)));
     const kept = r.e.held?.filter(address => !lost.has(address));
     if (!kept || kept.length === r.e.held!.length) return false;
     r.e = { ...r.e, held: kept };
@@ -315,7 +316,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: current.held });
       await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
-        this.set(r, "approved", `Bound ${this.names(r.e)}; opening delivery`, "prepare");
+        this.set(r, "approved", `Bound ${this.names(r.e)}${this.lostNote(current)}; opening delivery`, "prepare");
         const started = this.start(r);
         if (waitForStart) await started;
       }
@@ -342,7 +343,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     // taken over; only a healthy lease (renew or receipt) resets the backoff.
     // outage is set only by a failed request: the server also closes the
     // stream when access expires, and that expiry must still pause.
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false, reidentified = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
@@ -364,7 +365,16 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.bindAll(r, wire, e.held ?? [], []);
           await this.guard(r, epoch, signal);
         } else if (!sameHeld(current.held, e.held)) throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
-        const lease = leaseOf(await wire.call("delivery_open"), e);
+        let lease: Lease;
+        try { lease = leaseOf(await wire.call("delivery_open"), e); }
+        catch (error) {
+          // The primary revoked between this whoami and delivery_open (#453) gives a lease naming another
+          // identity: the next iteration's whoami reports the loss. Once; a second refusal pauses.
+          if (!(error instanceof Refusal) || reidentified) throw error;
+          reidentified = true;
+          continue;
+        }
+        reidentified = false;
         await this.guard(r, epoch, signal);
         r.lease = lease; wire.capability = lease.capability;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);

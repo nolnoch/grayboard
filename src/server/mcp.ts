@@ -8,6 +8,7 @@ import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
+import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
@@ -571,8 +572,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
 }
 
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
-  // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do.
-  const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice ? { ...result, content: [...result.content, { type: "text", text: notice }] } : result;
+  // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
+  // marks it, so a host caching this session's instructions fetches them again.
+  const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
+    ? { ...result, content: [...result.content, { type: "text", text: notice }], _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
