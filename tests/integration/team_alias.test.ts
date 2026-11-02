@@ -106,22 +106,7 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   expect(holder("eng/build")).toEqual([kept.id]);
 });
 
-// PR 2: deleted with src/plugin (it drops a lost alias and says so in its next tool result and on stderr); the server half is the next test.
-test("the plugin drops a lost team alias and says so in the next tool result", async () => {
-  const s = await srv.session(bob, "eng/build");
-  expect((await s.call("peer_list", {})).you).toBe("eng/build");
-  expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
-  await until(() => s.stderr().includes(`lost "eng/build"`));
-  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
-  const id = JSON.parse((r.content as { text: string }[])[0]!.text).you;
-  expect(id).toMatch(/^id:[0-9a-z]{13}$/);
-  expect((r.content as { text: string }[]).slice(1).map((c) => c.text)).toContain(
-    `This session lost its bus name "eng/build": ${REASON}. It acts as its ID (${id}) now: bind(name) to take another.`,
-  );
-  expect((r.structuredContent as { name: string | null }).name).toBeNull();
-}, 20_000);
-
-// The server half of the test above: a session that loses its team alias is
+// A session that loses its team alias is
 // told (alias_lost, with the reason) and acts as its ID from then on.
 // hosted twin: #451 (a team alias on a session, alias_lost)
 test("a session that loses its team alias is told why and acts as its ID", async () => {

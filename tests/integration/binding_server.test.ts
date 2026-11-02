@@ -2,20 +2,18 @@
 // is its hello and acts as its ID until it binds, a bind is a frame on its
 // one connection, a rebind leaves claims behind, and what the server records.
 // Each numbered title is the #182 acceptance criterion the test shows.
-import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
-import { cleanEnv, serverEnv } from "../support/env.ts";
-import { PROTO, PROTO_REFUSAL } from "../../src/shared/protocol.ts";
-import { closeSessions, mcpSession, stopSession as stop, type Session } from "../support/mcp.ts";
-import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { cleanEnv } from "../support/env.ts";
+import { closeSessions } from "../support/mcp.ts";
 import { idAddress } from "../../src/core/bindings.ts";
-import { ApplicationError, GRACE_MS, SWEEP_MS } from "../../src/server/application.ts";
+import { ApplicationError, GRACE_MS } from "../../src/server/application.ts";
 import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
-import { ServerProcess, TestServer } from "../support/server.ts";
+import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 let srv: TestServer;
@@ -38,9 +36,6 @@ afterEach(async () => {
   for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-const session = (identity: string | null, o: { token?: string; cwd?: string; extra?: Record<string, string> } = {}): Promise<Session> =>
-  srv.session(o.token ?? alice, identity, o.extra, o.cwd);
-
 function rows<T>(sql: string, ...args: (string | number)[]): T[] {
   return srv.app.db.query(sql).all(...args) as T[];
 }
@@ -48,25 +43,11 @@ function rows<T>(sql: string, ...args: (string | number)[]): T[] {
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, `${A}/${name}`);
 // The status of the session holding `address` (#284: status is the session's).
 const status = (address: string) => rows<{ status: string | null }>(`SELECT i.status FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`, address)[0]!.status;
-const contents = (s: Session) => s.pushes.map((p) => p.content);
-// An unbound session's own row in peer_list's unbound_sessions.
-const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
 // The address a DM from `s` with no `as` goes out under: what it writes as.
 async function sentAs(s: AppSession, body: string): Promise<string> {
   await s.send(`${A}/be`, body);
   return rows<{ sender: string }>(`SELECT sender FROM messages WHERE body = ?`, body)[0]!.sender;
 }
-
-// A tool call's error text; a call that succeeds fails the test.
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
-
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(srv.dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(srv.dir, `go-${point}`), "");
 
 // AppSession drivers (no socket, no frames; #282 PR 1).
 const app = (identity: string | null, o: AppSessionOptions & { token?: string } = {}): AppSession => {
@@ -146,18 +127,6 @@ test("1, 3, 14: an unbound session acts as its ID, is listed for its user only, 
   expect(got).toEqual(["one", "two", "three"]);
   await be.call("dm_send", { to: "api", body: "four" });
   await s.next(direct((m) => m.body === "four"));
-}, 30_000);
-
-test("15: an unbound exit removes its name record, a bound exit keeps it", async () => {
-  const records = join(srv.dir, "home", ".claude-bus");
-  const u = await session(null);
-  expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(true);
-  await stop(u.c);
-  expect(existsSync(join(records, `bind.${u.harnessPid}`))).toBe(false);
-  const b = await session("api");
-  await stop(b.c);
-  // Server mode records the full address the bind returned.
-  expect(JSON.parse(readFileSync(join(records, `bind.${b.harnessPid}`), "utf8")).names).toEqual([`${A}/api`]);
 }, 30_000);
 
 test("2, 13: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {
@@ -296,44 +265,8 @@ test("#284 S2: a DM pushed for an alias and unacked at its unbind reaches its ne
   await t.next(direct((m) => m.body === "unacked"));
 }, 30_000);
 
-
-// A server-mode child of an interactive Claude Code started without a channels
-// flag: its harness runs as `claude`, with CLAUDECODE=1.
-async function channelsOffSession(identity: string | null): Promise<Session> {
-  const claude = join(srv.dir, "claude");
-  if (!existsSync(claude)) symlinkSync(process.execPath, claude);
-  const s = await mcpSession({
-    env: serverEnv(srv.dir, srv.base, alice, identity, { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" }), cwd: srv.dir, args: ["mcp", "--mode", "server"], harness: claude,
-  });
-  expect(s.stderr()).toContain("channels are off (the session wasn't started with");
-  return s;
-}
-
-test("audit 2: a channels-off session holds its names: never online, and an unbind leaves its claims", async () => {
-  const s = await channelsOffSession("fe");
-  const be = await session("be");
-  await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
-  expect(await refusal(await channelsOffSession(null), "bind", { name: "fe" })).toContain("alias_held");
-  expect(await refusal(await session(null), "bind", { name: "fe" })).toContain("alias_held");
-  // It holds the name without taking pushes: not online, and DMs wait.
-  const fe = () => be.call("peer_list", { include_offline: true }).then((r) => r.peers.find((p: any) => p.handle === `${A}/fe`));
-  expect((await fe()).online).toBe(false);
-
-  await s.call("bind", { name: "fe2", create: true });
-  const result = await s.call("unbind", { name: "fe" });
-  expect(result).toContain(`these are now "fe"'s next holder's: ticket:ENG-142.`);
-  expect((await be.call("claim_list", {})).map((c: any) => c.holder)).toEqual([`${A}/fe`]);
-  const sid = events("fe")[0]!.session_id;
-  expect(events("fe").map((e) => e.event)).toEqual(["bound", "refused", "refused", "released"]);
-  expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: "unbind" });
-  expect(events("fe2")).toEqual([{ session_id: sid, event: "bound", detail: null }]);
-  // fe is free now.
-  const other = await session(null);
-  await other.call("bind", { name: "fe" });
-}, 40_000);
-
-// hosted twin: #451 (hold-only session, unbind). The server half of the test
-// above: a hold-only connection (no push) is what a channels-off process is.
+// hosted twin: #451 (hold-only session, unbind).
+// a hold-only connection (no push) is what a channels-off process is.
 test("audit 2 (server): a hold-only session holds its names: never online, and an unbind leaves its claims", async () => {
   const s = await connect("fe", { push: false, hold: true });
   const be = await connect("be");
@@ -400,20 +333,8 @@ test("audit 5: a bind whose answer was lost is settled by calling it again: the 
   expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
 }, 20_000);
 
-test("audit 11: a call issued during a bind waits for it, and runs as the name it bound", async () => {
-  const s = await session(null, { extra: pauseEnv("bind:after-acquire") });
-  const order: string[] = [];
-  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }).then((r) => (order.push("bind"), r));
-  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
-  const take = s.c.callTool({ name: "claim_take", arguments: { key: "ticket:ENG-142", ttl_minutes: 60 } }).then((r) => (order.push("claim_take"), r));
-  release("bind:after-acquire");
-  expect((await bind).isError).toBeFalsy();
-  expect((await take).isError).toBeFalsy();
-  expect(order).toEqual(["bind", "claim_take"]);
-  expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe` }]);
-}, 20_000);
-
-// The server half of the test above: bind is atomic — its hold is in place
+//
+// bind is atomic — its hold is in place
 // before its answer, and a call right after runs as the bound name.
 test("audit 11 (server): a call after a bind runs as the name it bound", async () => {
   const s = await connect(null);
@@ -421,36 +342,6 @@ test("audit 11 (server): a call after a bind runs as the name it bound", async (
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
   expect(rows(`SELECT holder FROM claims`)).toEqual([{ holder: `${A}/fe` }]);
 }, 20_000);
-
-test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
-  const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
-  const abort = new AbortController();
-  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }, undefined, { signal: abort.signal });
-  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
-  // The process is stopped past its last cancel check, so it reads the cancel only after it answers.
-  abort.abort();
-  await expect(bind).rejects.toThrow();
-  release("bind:after-acquire");
-  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
-  const texts = (r.content as { text: string }[]).map((c) => c.text);
-  expect(JSON.parse(texts[0]!).you).toBe(`${A}/old`);
-  expect(texts.slice(1).join(" ")).toContain(`bind("fe") completed after it was cancelled. Bound to "fe"; you hold "old", "fe" and send as "old".`);
-  expect((r.structuredContent as any).instructions.slice(0, 2)).toEqual([`You are identity "old" on the grayboard bus, which coordinates between agents.`, `You also hold "fe"; you send as "old" unless a call passes as, and a reply goes as the alias its message reached.`]);
-  expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
-}, 20_000);
-
-// Stop the session's grayboard process (the harness's child) for the length of
-// `during`. It resumes even when `during` throws: a stopped child outlives its
-// harness, as an orphan nothing can resume.
-async function whileStopped(s: Session, during: () => Promise<void>) {
-  const pid = Number(Bun.spawnSync(["pgrep", "-P", String(s.harnessPid)]).stdout.toString().trim());
-  process.kill(pid, "SIGSTOP");
-  try {
-    await during();
-  } finally {
-    process.kill(pid, "SIGCONT");
-  }
-}
 
 // hosted twin: #451 (holder probe)
 test("audit 15: a holder that can't answer keeps its name: another session's bind is refused, never a takeover", async () => {
@@ -486,56 +377,7 @@ test("audit 15: a holder whose server restarts re-attaches within the grace and 
   expect(events("fe").map((e2) => e2.event)).toEqual(["bound", "refused"]);
 }, 30_000);
 
-// S4/S11: a session whose server ended it during an outage comes back on a
-// new key, and takes its alias back proving descent with the old key: its
-// status carries over and the agent is told its ID changed.
-test("a session ended during an outage reconnects on a new ID and takes its alias back with previous_key", async () => {
-  const dbDir = mkdtempSync(join(tmpdir(), "gb-db-"));
-  const dbPath = join(dbDir, "gb.db");
-  let clock = Date.now();
-  srv.stop();
-  srv = new TestServer({ dbPath }, { now: () => clock });
-  alice = await srv.login(A);
-  const s = await session("fe");
-  await s.call("peer_status", { text: "mid-task" });
-  const old = events("fe")[0]!.session_id;
-  let next: TestServer | undefined;
-  try {
-    await whileStopped(s, async () => {
-      const port = srv.app.server.port!;
-      srv.app.stop();
-      // The restarted server seeds a grace for the session; it runs out
-      // before the plugin can reconnect (the sweep runs before the event
-      // loop accepts a connection).
-      next = new TestServer({ dbPath, httpPort: port }, { now: () => clock });
-      clock += GRACE_MS + 1;
-      next.app.sweepSessions();
-    });
-    const db = next!.app.db;
-    await until(() => db.query(`SELECT 1 FROM alias_holds WHERE address = ?`).all(`${A}/fe`).length > 0, 10_000, "the rekeyed bind");
-    const now = (db.query(`SELECT id FROM alias_holds WHERE address = ?`).get(`${A}/fe`) as { id: string }).id;
-    expect(now).not.toBe(old);
-    expect(db.query(`SELECT ended_at FROM ids WHERE id = ?`).get(old)).toEqual({ ended_at: clock });
-    expect(db.query(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`).get(`${A}/fe`)).toEqual({ session_id: now, event: "bound", detail: `restored after end of session ${old}` });
-    expect(db.query(`SELECT status FROM ids WHERE id = ?`).get(now)).toEqual({ status: "mid-task" });
-    // The next tool result says so, after the result itself.
-    const r = await s.c.callTool({ name: "peer_list", arguments: {} });
-    expect((r.content as { text: string }[]).slice(1).map((c) => c.text)).toContain(
-      `This session's ID changed from ${old} to ${now}: it was disconnected past the server's grace, so the old session ended and DMs sent to the old ID bounce. It took back "fe".`,
-    );
-  } finally {
-    // Hand the restarted server to afterEach's awaited stop; the old one's
-    // app was already stopped above.
-    if (next) {
-      srv = next;
-      tempDirs.push(dbDir);
-    } else {
-      rmSync(dbDir, { recursive: true, force: true });
-    }
-  }
-}, 30_000);
-
-// hosted twin: #451 (previous_key rekey). The server half of the test above.
+// hosted twin: #451 (previous_key rekey).
 test("a session ended during an outage takes its alias back with previous_key (server)", async () => {
   await restarted();
   await srv.stop();
@@ -559,51 +401,8 @@ test("a session ended during an outage takes its alias back with previous_key (s
   expect(rows(`SELECT status FROM ids WHERE id = ?`, now)).toEqual([{ status: "mid-task" }]);
 }, 30_000);
 
-// Audit P1 (#345): a tools-only session binds nothing, so a rekey sends no
-// bind: its new hello writes as its name again, and it keeps writing as it.
-test("a tools-only session ended during an outage reconnects on a new ID still writing as its name", async () => {
-  const dbDir = mkdtempSync(join(tmpdir(), "gb-db-"));
-  const dbPath = join(dbDir, "gb.db");
-  let clock = Date.now();
-  srv.stop();
-  srv = new TestServer({ dbPath }, { now: () => clock });
-  alice = await srv.login(A);
-  const s = await session("be", { extra: { BUS_PUSH: "off" } });
-  await s.call("dm_send", { to: `${A}/be`, body: "before" });
-  const old = rows<{ id: string }>(`SELECT id FROM ids WHERE writes_as = ?`, `${A}/be`)[0]!.id;
-  let next: TestServer | undefined;
-  try {
-    await whileStopped(s, async () => {
-      const port = srv.app.server.port!;
-      srv.app.stop();
-      next = new TestServer({ dbPath, httpPort: port }, { now: () => clock });
-      clock += GRACE_MS + 1;
-      next.app.sweepSessions();
-    });
-    const db = next!.app.db;
-    const r = await until(() => s.c.callTool({ name: "dm_send", arguments: { to: `${A}/be`, body: "after" } }).then((r) => (r.isError ? null : r)), 10_000, "the reconnect");
-    const now = (db.query(`SELECT id FROM ids WHERE writes_as = ? AND ended_at IS NULL`).get(`${A}/be`) as { id: string }).id;
-    expect(now).not.toBe(old);
-    expect(db.query(`SELECT sender, sender_id FROM messages WHERE body = 'after'`).get()).toEqual({ sender: `${A}/be`, sender_id: now });
-    expect((r.content as { text: string }[]).slice(1).map((c) => c.text)).toContain(
-      `This session's ID changed from ${old} to ${now}: it was disconnected past the server's grace, so the old session ended and DMs sent to the old ID bounce.`,
-    );
-    expect(db.query(`SELECT COUNT(*) AS n FROM binding_events`).get()).toEqual({ n: 0 });
-    expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
-  } finally {
-    // Hand the restarted server to afterEach's awaited stop; the old one's
-    // app was already stopped above.
-    if (next) {
-      srv = next;
-      tempDirs.push(dbDir);
-    } else {
-      rmSync(dbDir, { recursive: true, force: true });
-    }
-  }
-}, 30_000);
-
-// hosted twin: #451 (writes_as/tools-only rekey). The server half of the test
-// above: the new session's hello writes as its name, with no bind and no
+// hosted twin: #451 (writes_as/tools-only rekey).
+// the new session's hello writes as its name, with no bind and no
 // binding events.
 test("a tools-only session ended during an outage comes back on a new ID still writing as its name (server)", async () => {
   await restarted();
@@ -659,76 +458,8 @@ test("16, 18: raw binds: create: false, lazy create; a hello needs a key, and an
   expect(rows(`SELECT holder FROM claims WHERE key = 'k'`)).toEqual([{ holder: ro.id }]);
 }, 20_000);
 
-
-let rel: ReleaseBinaries;
-beforeAll(async () => {
-  rel = await releaseBinaries(await latestV1Release());
-}, 120_000);
-
-test("18: against a 1.x server, a 2.x session fails at start with the server's refusal", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-oldsrv-"));
-  const old = await ServerProcess.start(rel.server, join(dir, "bus.db"));
-  try {
-    const token = await old.login(A);
-    for (const identity of [null, "fe"]) {
-      const start = mcpSession({ env: serverEnv(dir, old.base, token, identity), cwd: dir, args: ["mcp", "--mode", "server"] });
-      await expect(start).rejects.toThrow(/identity must be string/);
-    }
-  } finally {
-    await closeSessions();
-    await old.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-}, 60_000);
-
-test("S15: a 1.x CLI against this server fails at start with the update hint", async () => {
-  for (const identity of [null, "fe"]) {
-    const start = mcpSession({ env: serverEnv(srv.dir, srv.base, alice, identity), cwd: srv.dir, args: ["mcp", "--mode", "server"], bin: rel.cli });
-    await expect(start).rejects.toThrow(PROTO_REFUSAL);
-  }
-  // Refused by the parser, before the limiter and the DB.
-  expect(rows(`SELECT id FROM ids`)).toEqual([]);
-}, 60_000);
-
-test("11: a restart under the same harness takes its names back, or restores them once a crashed predecessor's grace ends; a fresh harness starts unbound", async () => {
-  // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
-  // It takes back every name it held, in order (S10); restored_from proves nothing, so its status stays behind (S11).
-  let s = await session("be");
-  await s.call("bind", { name: "api", create: true });
-  await s.call("peer_status", { text: "mid-task" });
-  const peer = await session("fe");
-  // A clean restart (/mcp reconnect): the old session ended, so the name is free.
-  const before = events("api").at(-1)!.session_id;
-  s = await s.restart("reconnect");
-  expect(s.c.getInstructions()).toStartWith(`You are identity "be"`);
-  expect(s.c.getInstructions()).toContain(`You also hold "api"`);
-  expect(s.c.getInstructions()).toContain(`The server couldn't verify that this session continues the one that held "be", "api" (restore claimed from ${before}, not verified), so that session's status wasn't carried over: peer_status to set yours.`);
-  expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
-  for (const name of ["be", "api"]) {
-    expect(events(name).at(-1)).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restore claimed from ${before}, not verified` });
-  }
-  // Its mail arrives; its status didn't carry over.
-  expect((await peer.call("peer_list", {})).peers).toContainEqual(expect.objectContaining({ handle: `${A}/api` }));
-  expect((await peer.call("peer_list", {})).peers).not.toContainEqual(expect.objectContaining({ status: "mid-task" }));
-  await peer.call("dm_send", { to: "api", body: "after restart" });
-  await until(() => contents(s).includes("after restart"));
-
-  // A crash leaves the old session in its grace, holding the name: the
-  // restart starts unbound and says it's restoring it (S11).
-  s = await s.restart("crash");
-  expect(s.c.getInstructions()).toContain(`This session has no bus name yet, so it acts as its ID`);
-  expect(s.c.getInstructions()).toContain(`the one before it held "api" and is in its reconnect grace, so this session is restoring it`);
-  expect((await s.call("peer_list", {})).you).not.toBe(`${A}/api`);
-
-  // A new harness process is a new session: unbound, with no restore.
-  await stop(s.c);
-  const fresh = await session(null);
-  expect(fresh.c.getInstructions()).toContain("This session has no bus name yet");
-  expect(fresh.c.getInstructions()).not.toContain("restarted");
-}, 60_000);
-
-// hosted twin: #451 (restored_from restore). The server half of the test
-// above: a bind's restored_from claim is never verified — the name binds
+// hosted twin: #451 (restored_from restore).
+// a bind's restored_from claim is never verified — the name binds
 // (when free), the status stays behind, and the event logs the claim.
 test("11 (server): a restored_from claim binds unverified, with the status left behind and the claim logged", async () => {
   const first = await connect("be");
@@ -750,39 +481,8 @@ test("11 (server): a restored_from claim binds unverified, with the status left 
   await s.next(direct((m) => m.body === "after restart"));
 }, 30_000);
 
-// S11: a crash restart's restore completes in the background once the
-// predecessor's grace ends and the sweep frees the alias. The server's clock
-// is injected and the restart paused before its bind, so the refusal's wait
-// is one sweep tick, not the whole grace.
-test("11: a restore waiting out a crashed predecessor's grace binds once the sweep ends it", async () => {
-  srv.stop();
-  let clock = Date.now();
-  srv = new TestServer({}, { now: () => clock });
-  alice = await srv.login(A);
-  let s = await session("api", { extra: pauseEnv("restore:before-bind") });
-  const before = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)[0]!.id;
-  const crashed = clock;
-  const restarted = s.restart("crash");
-  // The old session is in its grace, and the new one about to restore.
-  await until(() => rows(`SELECT 1 FROM access_log WHERE action = 'id.detached' AND target = ?`, before).length > 0);
-  await until(() => s.stderr().includes("test pause hit: restore:before-bind"));
-  clock = crashed + GRACE_MS - 1;
-  release("restore:before-bind");
-  s = await restarted;
-  expect(s.c.getInstructions()).toContain(`so this session is restoring it: it binds "api" by itself within ${Math.ceil((1 + SWEEP_MS) / 1000)}s`);
-  const after = await sessionId(s);
-  // The grace runs out; the sweep ends the old session and frees the alias.
-  clock += 1;
-  srv.app.sweepSessions();
-  expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, before)).toEqual([{ ended_at: clock }]);
-  await until(() => rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`).length > 0, SWEEP_MS + 5000, "the restore's bind");
-  expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: after }]);
-  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restore claimed from ${before}, not verified` });
-  expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
-}, 30_000);
-
-// hosted twin: #451 (restore waits out the grace). The server half of the
-// test above: the restore's bind is refused with a wait during the grace and
+// hosted twin: #451 (restore waits out the grace).
+// the restore's bind is refused with a wait during the grace and
 // succeeds once the sweep ends the predecessor.
 test("11 (server): a restore refused during the predecessor's grace binds after the sweep", async () => {
   let clock = Date.now();
@@ -809,46 +509,8 @@ test("11 (server): a restore refused during the predecessor's grace binds after 
   expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: s.id }]);
 }, 30_000);
 
-// Audit P7 (#345): the user's bind limit refuses the restore's bind with a
-// wait; the restore retries after it, as the startup bind does.
-test("11: a restore refused by the bind limit retries after the wait it was given", async () => {
-  srv.stop();
-  let clock = Date.now();
-  srv = new TestServer({ helloLimit: { burst: 10, perSec: 1 } }, { now: () => clock });
-  alice = await srv.login(A);
-  let s = await session("api", { extra: pauseEnv("restore:before-bind") });
-  const before = rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)[0]!.id;
-  const crashed = clock;
-  const restarted = s.restart("crash");
-  // As above: the startup bind's refusal waits one sweep tick.
-  await until(() => s.stderr().includes("test pause hit: restore:before-bind"));
-  clock = crashed + GRACE_MS - 1;
-  release("restore:before-bind");
-  s = await restarted;
-  expect(s.c.getInstructions()).toContain(`so this session is restoring it`);
-  const after = await sessionId(s);
-  // Spend the rest of alice's hellos; the clock stands still, so none refill.
-  for (;;) {
-    const r = await srv.client(alice, null).connect();
-    if (r.type === "error") {
-      expect(r.code).toBe("rate_limited");
-      break;
-    }
-  }
-  // The grace runs out and frees the alias; the restore's bind is limited.
-  clock += 1;
-  srv.app.sweepSessions();
-  await until(() => /restoring "alice@example\.com\/api" retries in \d+ms: rate_limited/.test(s.stderr()), SWEEP_MS + 5000, "the limited restore");
-  expect(rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([]);
-  clock += 2000;
-  await until(() => rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`).length > 0, 5000, "the retried restore");
-  expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: after }]);
-  expect(events("api").at(-1)).toEqual({ session_id: after, event: "bound", detail: `restore claimed from ${before}, not verified` });
-  expect(s.stderr()).not.toContain(`didn't restore`);
-}, 30_000);
-
-// hosted twin: #451 (bind limiter on the restore path). The server half of
-// the test above: the user's bind limit refuses the restore's bind with a
+// hosted twin: #451 (bind limiter on the restore path).
+// the user's bind limit refuses the restore's bind with a
 // wait, and the retry after it succeeds.
 test("11 (server): a restore refused by the bind limit binds after the wait", async () => {
   let clock = Date.now();
@@ -978,7 +640,6 @@ test("#211, S4: a reconnect inside the grace is the same session; past its end, 
   expect(apiStatus()).toBe("resumable");
 }, 20_000);
 
-
 // #284: a session's ID is one principal's. Another user presenting the same
 // key is refused, never attached to the session's row; the owner's own
 // further hellos and binds are the same session.
@@ -999,7 +660,6 @@ test("#284: a key whose ID is another principal's session is refused with id_col
   expect(rows(`SELECT 1 FROM alias_holds`)).toEqual([]);
 });
 
-
 // #284 decision 5: teams and service principals share one namespace.
 test("#284: creating a team refuses a name another principal holds", async () => {
   srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
@@ -1007,16 +667,6 @@ test("#284: creating a team refuses a name another principal holds", async () =>
   expect(r.status).toBe(409);
   expect(r.body.message).toContain(`"ingest" belongs to another team or service principal`);
 });
-
-test("13 (decision 13): `grayboard tools` prints what the session serves; bind's result carries its name and instructions", async () => {
-  const s = await session(null);
-  const printed = await runCli(["tools", "--json"], { cwd: srv.dir, env: serverEnv(srv.dir, srv.base, alice, null) });
-  expect(printed.code).toBe(0);
-  expect(JSON.parse(printed.out)).toEqual((await s.c.listTools()).tools);
-  const r = await s.c.callTool({ name: "bind", arguments: { name: "api", create: true } });
-  expect(r.structuredContent).toEqual({ name: "api", instructions: expect.any(Array) });
-  expect((r.structuredContent as { instructions: string[] }).instructions[0]).toStartWith(`You are identity "api"`);
-}, 20_000);
 
 test("13 (server): a hosted bind's result carries its name and instructions", async () => {
   const s = await srv.hosted(A, null, { delivery: false });
@@ -1037,7 +687,6 @@ test("audit 19: a bind or writes_as refused for an invalid or reserved name is r
   expect(rowsFor).toEqual([refused, refused]);
   expect(rowsFor[0]!.session_id).not.toBe(rowsFor[1]!.session_id);
 });
-
 
 // #284 S7: every agent connection is a session, so a write carries the
 // writing session's ID: a tools-only connection's is its own, not the owner's.
@@ -1184,29 +833,8 @@ test("#284 #360: grayboard claim release as an alias releases its session's ID-h
   expect(rows(`SELECT holder FROM claims WHERE key = 'ticket:ENG-7'`)).toEqual([]);
 }, 30_000);
 
-// #284 S10 on the server: a restart takes back what it can of its record; a
-// name another live session holds is named in a note, and the rest still bind.
-test("#284 S10: a restart takes back its names but one held by another, which a note names", async () => {
-  let s = await session("be");
-  await s.call("bind", { name: "api", create: true });
-  const path = join(srv.dir, "home", ".claude-bus", `bind.${s.harnessPid}`);
-  const rec = JSON.parse(readFileSync(path, "utf8"));
-  expect(rec.names).toEqual([`${A}/be`, `${A}/api`]);
-  await s.call("unbind", { name: "api" });
-  const t = await session(null);
-  const tid = await sessionId(t);
-  await t.call("bind", { name: "api" });
-  writeFileSync(path, JSON.stringify(rec));
-  s = await s.restart("reconnect");
-  expect((await s.call("peer_list", {})).you).toBe(`${A}/be`);
-  expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: tid }]);
-  expect(s.c.getInstructions()).toContain(`This grayboard process restarted; the one before it held "api", but`);
-  expect(s.c.getInstructions()).toContain("so this session doesn't hold it.");
-  expect(s.c.getInstructions()).not.toContain(`You also hold "api"`);
-}, 40_000);
-
-// hosted twin: #451 (record-based restore). The server half of the test
-// above: restoring a name another live session holds is refused, naming the
+// hosted twin: #451 (record-based restore).
+// restoring a name another live session holds is refused, naming the
 // holder, while the rest restore.
 test("#284 S10 (server): a restore takes back its names but one held by another", async () => {
   const s = await connect("be");
@@ -1223,20 +851,6 @@ test("#284 S10 (server): a restore takes back its names but one held by another"
   expect(e.code).toBe("alias_held");
   expect(e.message).toContain(t.id);
   expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: t.id }]);
-}, 30_000);
-
-// A record written before several aliases carries one `name`; client files
-// can't be migrated, so it still restores.
-test("#284 S10: a name record from before several aliases (one `name`) still restores on the server", async () => {
-  let s = await session("api");
-  const path = join(srv.dir, "home", ".claude-bus", `bind.${s.harnessPid}`);
-  const { names, ...rec } = JSON.parse(readFileSync(path, "utf8"));
-  expect(names).toEqual([`${A}/api`]);
-  writeFileSync(path, JSON.stringify({ ...rec, name: `${A}/api` }));
-  const before = events("api").at(-1)!.session_id;
-  s = await s.restart("reconnect");
-  expect((await s.call("peer_list", {})).you).toBe(`${A}/api`);
-  expect(events("api").at(-1)).toEqual({ session_id: expect.not.stringMatching(before), event: "bound", detail: `restore claimed from ${before}, not verified` });
 }, 30_000);
 
 // #284 S16: the Slack bridge's human is its user's `human` and nothing else.
@@ -1355,8 +969,6 @@ test("#259: a stray refused a while its holder lives takes it after the end, unv
 });
 
 // #284 S11 on the server: the holds are the session's, oldest first. The
-// whoami fields the server-mode client added locally (its ID, principal) are
-// plugin behaviour, deleted with it; the tools-only half is #451's.
 test("#284 S11: whoami over the server names the ID, the holds oldest first and the principal", async () => {
   const s = await srv.hosted(A, null, { delivery: false });
   expect(await s.call<{ held: string[]; primary: string | null; unbound?: boolean }>("whoami", {})).toMatchObject({ held: [], primary: null, unbound: true });
@@ -1365,28 +977,8 @@ test("#284 S11: whoami over the server names the ID, the holds oldest first and 
   expect(await s.call<{ held: string[]; primary: string }>("whoami", {})).toMatchObject({ held: [`${A}/zed`, `${A}/alpha`], primary: `${A}/zed` });
 }, 30_000);
 
-// #284 S1: the primary is the first alias bound, even when binds share a
-// millisecond: bound_at is made monotonic per session, so neither the clock
-// nor the address order decides. The restore loop binds in record order.
-test("#284 S1: with the server's clock frozen, the first alias bound stays the primary, through a restart's restore", async () => {
-  srv.stop();
-  const frozen = Date.now();
-  srv = new TestServer({}, { now: () => frozen });
-  alice = await srv.login(A);
-  let s = await session("zed");
-  await s.call("bind", { name: "alpha", create: true });
-  await s.call("bind", { name: "mid", create: true });
-  const order = () => rows<{ address: string }>(`SELECT address FROM alias_holds ORDER BY bound_at`).map((r) => r.address);
-  expect(order()).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
-  expect((await s.call("whoami", {})).primary).toBe(`${A}/zed`);
-  s = await s.restart("reconnect");
-  expect(order()).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
-  expect((await s.call("whoami", {})).aliases).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
-  expect(s.c.getInstructions()).toStartWith(`You are identity "zed"`);
-}, 40_000);
-
-// hosted twin: #451 (multi-alias restore). The server half of the test
-// above: bound_at is monotonic per session, so the primary survives a frozen
+// hosted twin: #451 (multi-alias restore).
+// bound_at is monotonic per session, so the primary survives a frozen
 // clock, and a restore re-binds in the same order.
 test("#284 S1 (server): with the server's clock frozen, the first alias bound stays the primary through a restore", async () => {
   await srv.stop();

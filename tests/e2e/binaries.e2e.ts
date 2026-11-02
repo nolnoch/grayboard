@@ -11,13 +11,11 @@ import { join } from "node:path";
 import { openDatabase } from "../../src/server/db.ts";
 import { direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
-import { serverEnv } from "../support/env.ts";
-import { closeSessions, mcpSession } from "../support/mcp.ts";
+import { closeSessions } from "../support/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { piScenario } from "../support/pi.ts";
 import { keep } from "../support/run_dir.ts";
 import { ServerProcess } from "../support/server.ts";
-import { until } from "../support/until.ts";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -82,37 +80,6 @@ test("pi: the compiled CLI and the adapter it carries wake a pi session", () => 
   label = "pi";
   return piScenario(dir, CLI);
 }, 90_000);
-
-test("server: the compiled server, started from an env file, relays a DM and its reply between compiled CLIs", async () => {
-  label = "server";
-  const envFile = join(dir, "env");
-  // The shape of /etc/grayboard/env (install.sh's new-server steps), with dev
-  // auth in place of the Google client secret.
-  writeFileSync(envFile, [
-    "# grayboard server",
-    `GRAYBOARD_DB_PATH=${join(dir, "grayboard.db")}`,
-    "GRAYBOARD_PUBLIC_URL=http://localhost",
-    "GRAYBOARD_ORG_DOMAIN=example.com",
-    "GOOGLE_OAUTH_CLIENT_ID=e2e",
-    "GRAYBOARD_DEV_AUTH=1",
-    "GRAYBOARD_HTTP_PORT=0",
-    "",
-  ].join("\n"));
-  const { GRAYBOARD_DB_PATH: dbPath, ...env } = readEnvFile(envFile);
-  server = await ServerProcess.start(SERVER, dbPath!, env);
-  const session = async (email: string, identity: string) =>
-    mcpSession({ bin: CLI, env: serverEnv(dir, server!.base, await server!.login(email), identity), cwd: dir, args: ["mcp", "--mode", "server"] });
-  const be = await session("alice@example.com", "be");
-  const fe = await session("bob@example.com", "fe");
-
-  const q = await fe.call("dm_send", { to: "alice@example.com/be", body: "ping" });
-  expect(q.delivered_now).toBe(true);
-  const got = await until(() => be.pushes.find((p) => p.content === "ping"));
-  expect(got.meta.from).toBe("bob@example.com/fe");
-  await be.call("dm_send", { to: "bob@example.com/fe", body: "pong", parent_id: Number(got.meta.message_id) });
-  const reply = await until(() => fe.pushes.find((p) => p.content === "pong"));
-  expect(reply.meta.parent_id).toBe(String(q.message_id));
-}, 60_000);
 
 // The compiled server as install.sh sets it up: /etc/grayboard/env's shape,
 // with dev auth in place of the Google client secret, read as systemd's

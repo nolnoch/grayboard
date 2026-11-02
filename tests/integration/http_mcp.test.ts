@@ -322,25 +322,6 @@ test("old session remains accepted on retained API but not new MCP", async () =>
   expect((await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } })).status).toBe(401);
 });
 
-// The same, and a WSS upgrade with that token opens a socket: the WSS half
-// goes with ws.ts (#282 PR 2); the HTTP halves are the test above.
-test("old session remains accepted on retained API and WS but not new MCP", async () => {
-  const token = await legacyLogin();
-  const headers = { Authorization: `Bearer ${token}` };
-  const api = await fetch(`${base}/api/auth/config`, { headers });
-  expect(api.status).toBe(200);
-  const owned = await fetch(`${base}/api/identities`, { headers });
-  expect(owned.status).toBe(200);
-  const refused = await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } });
-  expect(refused.status).toBe(401);
-  const ws = new WebSocket(base.replace("http:", "ws:"), { headers });
-  const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
-  await new Promise<void>((resolve, reject) => { ws.onopen = () => resolve(); ws.onerror = () => reject(new Error("WS failed")); });
-  expect(ws.readyState).toBe(WebSocket.OPEN);
-  ws.close();
-  await closed;
-});
-
 test("connected clients cannot dispatch after their actual access deadline", async () => {
   const client = await connect(await login());
   clock = Date.now() + 3_600_001;

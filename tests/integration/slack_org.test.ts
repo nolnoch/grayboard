@@ -8,8 +8,6 @@ import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
 import type { SendResult } from "../../src/shared/protocol.ts";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 
 import { FakeSlack } from "./fake_slack.ts";
 import { direct } from "../support/events.ts";
@@ -42,9 +40,6 @@ afterEach(async () => {
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 
-// A server-mode `grayboard mcp` child: only the plugin-client tests use it,
-// deleted with src/plugin (#282 PR 2).
-const session = (token: string, identity: string) => srv.session(token, identity);
 // An agent: a hosted MCP session of `email`'s, bound to `identity`.
 const hosted = (email: string, identity: string) => srv.hosted(email, identity);
 
@@ -62,32 +57,6 @@ async function link(token: string): Promise<void> {
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 }
-
-// PR 2: deleted with src/plugin (its human="true" marking, src/plugin/mcp.ts:179); the server half is the hosted test after it.
-test("link, then an agent's DM to human is a Slack thread whose reply comes back marked human", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  const me = await api(alice, "GET", "/api/whoami");
-  expect(me.body.identities).toContain("human");
-
-  const be = await session(alice, "be");
-  expect(be.c.getInstructions()).toContain('"human"');
-  const q = await be.call("dm_send", { to: "human", body: "Return 204 or []?" });
-  expect(q.delivered_now).toBe(true);
-  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("204")));
-  expect(top).toMatchObject({ channel: DM, username: "be", markdown_text: "**be** Return 204 or []?" });
-  expect(top.thread_ts).toBeUndefined();
-
-  const { envelope } = slack.say("[] please", { thread_ts: tsOf(top) });
-  const got = await until(() => be.pushes.find((p) => p.content === "[] please"));
-  expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
-  await until(() => slack.acks.includes(envelope));
-
-  const follow = await be.call("dm_send", { to: "human", body: "done", parent_id: Number(got.meta.message_id) });
-  expect(follow.delivered_now).toBe(true);
-  const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
-  expect(post.thread_ts).toBe(tsOf(top));
-}, 30_000);
 
 test("link, then a hosted agent's DM to human is a Slack thread whose reply comes back from the human", async () => {
   const alice = await login("alice@example.com");
@@ -112,48 +81,6 @@ test("link, then a hosted agent's DM to human is a Slack thread whose reply come
   expect(follow.delivered_now).toBe(true);
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** done"));
   expect(post.thread_ts).toBe(tsOf(top));
-}, 30_000);
-
-// PR 2: deleted with src/plugin (its path uploads, attachments meta text and attachment_get saving to a dir); the server half is the hosted test after it.
-test("attachments cross the org bridge both ways, and the audit log says where they went", async () => {
-  const alice = await login("alice@example.com");
-  await link(alice);
-  const be = await session(alice, "be");
-  const tmp = mkdtempSync(join(srv.dir, "attach-"));
-  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9]);
-  writeFileSync(join(tmp, "shot.png"), png);
-  const q = await be.call("dm_send", { to: "human", body: "look", attachments: [join(tmp, "shot.png")] });
-  const s = await until(() => slack.shares()[0]);
-  expect(s).toMatchObject({ channel_id: DM, blocks: [{ type: "markdown", text: "**be** look" }] });
-  // Slack ignores username on completeUploadExternal (measured); the name rides in the text.
-  expect(s.username).toBeUndefined();
-  expect(s.thread_ts).toBeUndefined();
-  expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
-
-  // The relay maps the thread once files.info shows the share's ts, which lags the upload.
-  await until(() => srv.app.db.prepare(`SELECT 1 FROM slack_threads WHERE thread_ts = ?`).get(s.ts));
-  slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
-  const got = await until(() => be.pushes.find((p) => p.content === "here"));
-  expect(got.meta).toMatchObject({ from: "alice@example.com/human", parent_id: String(q.message_id), human: "true" });
-  expect(got.meta.attachments).toMatch(/^\d+:reply\.md text\/markdown 3B sha256:[0-9a-f]{64}$/);
-  const id = Number(got.meta.attachments!.split(":")[0]);
-  const saved = await be.call("attachment_get", { id, dir: tmp });
-  expect(readFileSync(saved.path, "utf8")).toBe("ok\n");
-
-  const audit = (action: string) =>
-    srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
-  const sent = await until(() => audit("attachment.sent_to_slack")[0]);
-  expect(sent.actor).toBe("alice@example.com");
-  const sha256 = createHash("sha256").update(png).digest("hex");
-  expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
-  // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
-  const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
-  expect(bound).toEqual([
-    { target: `attachment:${q.attachments[0].id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
-    { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: Number(got.meta.message_id), recipient: "alice@example.com/be" },
-  ]);
-  const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
-  expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
 }, 30_000);
 
 test("attachments cross the org bridge both ways for a hosted session, and the audit log says where they went", async () => {
