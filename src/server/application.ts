@@ -1538,7 +1538,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       return { payload, ref: w.ref, msg: w.msg };
     });
   } catch (e) {
-    // Written after the rollback, so the refusal's row stays.
+    // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
       refused({ reason: e.message, to: m.to });
       throw coreRefusal(e);

@@ -197,12 +197,28 @@ test("a failing postcommit effect does not suppress later effects or retain boar
 });
 
 // #452: a refusal thrown inside `hosted.run`'s transaction rolls its audit row back with the call, so the row is written after the unwind.
-const refusals = () => database.db.query("SELECT action, detail FROM access_log WHERE action = 'delegation.refused'").all() as { action: string; detail: string }[];
+const refusals = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused'").all() as { actor: string; target: string; detail: string }[];
 const refused = (request: Parameters<typeof application.delegate>[1]) => mcp.sessions.run(principal, context(), "delegate", session => application.delegate(session, request));
 
 test("hosted delegate: an unresolvable `to` leaves its refusal audit row", async () => {
   await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow();
   expect(refusals()).toHaveLength(1);
+  expect(refusals()[0]).toMatchObject({ actor: "you@example.com" });
+  expect(refusals()[0]!.target).toBe("you@example.com/fe");
+  expect(JSON.parse(refusals()[0]!.detail)).toMatchObject({ to: "nobody-here" });
+});
+
+test("hosted delegate: a successful delegation leaves no refusal row", async () => {
+  await refused({ persona: "researcher", task: "x", to: "launcher" });
+  expect(refusals()).toEqual([]);
+});
+
+test("hosted delegate: a failing refusal-audit write does not mask the refusal", async () => {
+  failAudit("delegation.refused");
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow(/nobody-here|resolve|no /i);
+  expect(error).toHaveBeenCalled();
+  error.mockRestore();
 });
 
 test("hosted delegate: a resolution refusal (explicit non-launcher target) leaves its audit row", async () => {
