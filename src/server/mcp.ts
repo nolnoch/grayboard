@@ -1,7 +1,7 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
+import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE, RESEND_PARAM } from "../core/tools.ts";
 import { BIND_TOOL, UNBIND_TOOL } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
@@ -616,7 +616,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   }
   server.registerTool("dm_send", {
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
-    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), as: z.string().describe(AS_PARAM.description).optional() }),
+    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), resend: z.boolean().describe(RESEND_PARAM.description).optional(), as: z.string().describe(AS_PARAM.description).optional() }),
   }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
