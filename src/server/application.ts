@@ -139,6 +139,11 @@ export class ApplicationSession {
   ended = false;
   // Why it closed, when the server closed it: what a later call is told.
   closedBy?: ApplicationError;
+  // Set by a caller that runs the call inside an outer transaction (hosted's
+  // `run`, #452): a refusal's audit row is handed to it, to be written after
+  // the transaction unwinds, because writing it inside would roll it back with
+  // the refused call. Unset, the row is written at once.
+  afterRollback?: (write: () => void) => void;
   constructor(
     readonly authed: AuthedUser,
     readonly sink: DeliverySink,
@@ -1500,13 +1505,14 @@ function handleSend(
 function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">): DelegateResult {
   const { repo, db } = hub;
   const { authed } = session;
+  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, detail));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
       to = resolvePeer(repo, session.primary, m.to).address;
     } catch (e) {
       // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
-      if (e instanceof ApplicationError) writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { reason: e.message, to: m.to });
+      if (e instanceof ApplicationError) refused({ reason: e.message, to: m.to });
       throw e;
     }
   }
@@ -1532,14 +1538,14 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       return { payload, ref: w.ref, msg: w.msg };
     });
   } catch (e) {
-    // Written after the rollback, so the refusal's row stays.
+    // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
-      writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { reason: e.message, to: m.to });
+      refused({ reason: e.message, to: m.to });
       throw coreRefusal(e);
     }
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
-    if (e instanceof ApplicationError) writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { reason: e.message, to: picked });
+    if (e instanceof ApplicationError) refused({ reason: e.message, to: picked });
     throw e;
   }
   if ("replay" in out) return out.replay;
