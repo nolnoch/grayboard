@@ -4,7 +4,7 @@
 // come by bind and go by unbind, and a session holds several. The WSS
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
-import type { HelloOk, BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
+import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -58,14 +58,16 @@ export type DeliverySink = {
   closed(error: ApplicationError): void;
 };
 // A hosted session's facts, for its MCP instructions (src/server/mcp.ts).
-export type IdentityInfo = {
-  candidates?: Candidate[];
-  identity_full: string;
+export type SessionFacts = {
   user_email: string;
   teams: string[];
-  notices?: string[];
   human: { handle: string; linked: boolean };
   attachment_limits: AttachmentLimits;
+};
+export type IdentityInfo = SessionFacts & {
+  candidates?: Candidate[];
+  identity_full: string;
+  notices?: string[];
 };
 export type SendResult = WireSendResult;
 export type InboxResult = {
@@ -83,7 +85,8 @@ export type ApplicationOptions = {
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
 };
-export type HelloResult = Omit<HelloOk, "type" | "req_id">;
+// What a session's user facts are: the bridge's human attach answers them.
+export type HelloResult = { id: string } & SessionFacts;
 export type BindResult = { alias: string; held: string[]; notices?: string[]; restored?: Continuity };
 export type UnbindResult = { alias: string; released: boolean; held: string[]; left?: string[] };
 
@@ -267,7 +270,7 @@ function owedBridgeNotice(repo: Repo, email: string): string | undefined {
   return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
 }
 
-function helloOkFields(hub: Hub, authed: AuthedUser): Pick<HelloOk, "user_email" | "teams" | "attachment_limits"> & { human: { handle: string; linked: boolean } } {
+function helloOkFields(hub: Hub, authed: AuthedUser): SessionFacts {
   const { repo } = hub;
   return {
     user_email: authed.user_email,
