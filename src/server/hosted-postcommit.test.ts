@@ -195,3 +195,22 @@ test("a failing postcommit effect does not suppress later effects or retain boar
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
 });
+
+// #452: a refusal thrown inside `hosted.run`'s transaction rolls its audit row back with the call, so the row is written after the unwind.
+const refusals = () => database.db.query("SELECT action, detail FROM access_log WHERE action = 'delegation.refused'").all() as { action: string; detail: string }[];
+const refused = (request: Parameters<typeof application.delegate>[1]) => mcp.sessions.run(principal, context(), "delegate", session => application.delegate(session, request));
+
+test("hosted delegate: an unresolvable `to` leaves its refusal audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
+});
+
+test("hosted delegate: a resolution refusal (explicit non-launcher target) leaves its audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x", to: "fe" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
+});
+
+test("hosted delegate: a refused send (oversize task) leaves its audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x".repeat(2_000_000), to: "launcher" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
+});
