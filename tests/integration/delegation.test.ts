@@ -1,20 +1,30 @@
-// Delegation (#184) over real processes: local-mode sessions (separate
-// `grayboard mcp --mode local` children) and server-mode sessions on a
-// TestServer. The launcher opt-in (BUS_LAUNCHER=1), the delegate tool's
-// resolution rules, the payload's harness-neutrality, the human fallback,
-// and result-return through the pending/promise machinery.
+// Delegation (#184): local-mode sessions (separate `grayboard mcp --mode
+// local` children) over real processes, and the server's: a requester on a
+// hosted MCP session, a launcher on an application session, since a hosted
+// session can't be a launcher yet (#451). The three tests that audit a
+// refused delegate stay on server-mode sessions until #452. The launcher
+// opt-in, the delegate tool's resolution rules, the payload's
+// harness-neutrality, the human fallback, and result-return through the
+// pending/promise machinery.
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
+import { direct } from "../support/events.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 let dir: string;
+
+type Peer = { handle: string; launcher?: true };
+type Delegated = { to: string; message_id: number; delivered_now: boolean; human_fallback?: true; note: string };
+type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: string }[] };
+// A server whose hosted sessions can poll their inbox freely.
+const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-delegate-"));
@@ -123,51 +133,53 @@ test("local: no live launcher surfaces the request to the declared human", async
   expect(thread[0].body).toContain("BUS_LAUNCHER=1");
 }, 30_000);
 
+// hosted twin: #451 (the launcher)
 test("server: the hello's launcher flag records the capability; delegate delivers", async () => {
-  const srv = new TestServer();
+  const srv = serve();
   try {
     const token = await srv.login("you@example.com");
-    const be = await srv.session(token, "be", { BUS_LAUNCHER: "1" });
-    const sim = await srv.session(token, "sim");
+    const be = srv.appSession(token, "be", { hello: { launcher: true } });
+    await be.connect();
+    const sim = await srv.hosted("you@example.com", "sim");
 
-    const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
+    const peers = (await sim.call<{ peers: Peer[] }>("peer_list")).peers;
     expect(peers.find((p) => p.handle === "you@example.com/be")?.launcher).toBe(true);
 
     // A bare name resolves like dm_send's recipient (#184 review 7) — and a
     // mixed-case one too (review 15). The delivered note is the shared
     // builder's, the same string local sends (review 13).
-    const r = await call(sim.c, "delegate", { persona: "a doc agent", task: "draft the README intro", to: "be", context: "audience: first-time users" });
+    const r = await sim.call<Delegated>("delegate", { persona: "a doc agent", task: "draft the README intro", to: "be", context: "audience: first-time users" });
     expect(r.to).toBe("you@example.com/be");
     expect(r.delivered_now).toBe(true);
     expect(r.note).toContain("Recipient was online; pushed.");
     expect(r.note).toContain("settle the thread");
-    const mixed = await call(sim.c, "delegate", { persona: "a doc agent", task: "t2", to: "Be" });
+    const mixed = await sim.call<Delegated>("delegate", { persona: "a doc agent", task: "t2", to: "Be" });
     expect(mixed.to).toBe("you@example.com/be");
-    await until(() => be.pushes.length > 1, 10_000, "the second push");
     // Each delegate's push carries its own brief: the first with its context,
     // the mixed-case one without.
-    const payload = String(be.pushes[0]!.content);
+    const payload = (await be.next(direct(), 10_000)).message.body;
     expect(payload).toContain('"persona": "a doc agent"');
     expect(payload).toContain('"context": "audience: first-time users"');
-    expect(String(be.pushes[1]!.content)).toContain('"task": "t2"');
+    expect((await be.next(direct(), 10_000)).message.body).toContain('"task": "t2"');
 
     // sim's dm_inbox shows be's report; one dm_ack settles the thread.
-    await call(be.c, "dm_send", { to: "sim", body: "Result: drafted.", parent_id: r.message_id });
+    await be.send("sim", "Result: drafted.", { parent_id: r.message_id });
     await until(async () => {
-      const after = await call(sim.c, "dm_inbox");
-      return (after.unanswered ?? []).some((m: any) => m.from === "you@example.com/be");
+      const after = await sim.call<Inbox>("dm_inbox");
+      return (after.unanswered ?? []).some((m) => m.from === "you@example.com/be");
     }, 10_000, "the result to arrive");
-    const thread = await call(sim.c, "dm_thread", { thread: r.message_id });
+    const thread = await sim.call<{ id: number }[]>("dm_thread", { thread: r.message_id });
     // Both delegations' threads are settled: the mixed-case one is its own
     // promise.
-    await call(sim.c, "dm_ack", { message_id: [r.message_id, mixed.message_id, thread.at(-1).id] });
-    const settled = await call(sim.c, "dm_inbox");
-    expect((settled.promised ?? []).some((p: any) => p.to === "you@example.com/be")).toBe(false);
+    await sim.call("dm_ack", { message_id: [r.message_id, mixed.message_id, thread.at(-1)!.id] });
+    const settled = await sim.call<Inbox>("dm_inbox");
+    expect((settled.promised ?? []).some((p) => p.to === "you@example.com/be")).toBe(false);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 30_000);
 
+// hosted twin: #452
 test("server: delegation stays within the requester's user (review 1-2)", async () => {
   const srv = new TestServer();
   try {
@@ -207,26 +219,22 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
   }
 }, 30_000);
 
+// hosted twin: #451 (a tools-only sidecar)
 test("server: a launcher that can't receive isn't advertised or instructed (review 6)", async () => {
-  const srv = new TestServer();
+  const srv = serve();
   try {
     const token = await srv.login("you@example.com");
     // A tools-only connection beside the owner: it never becomes the
-    // launcher, whatever its env says.
-    await srv.session(token, "be");
-    await srv.session(token, "be", { BUS_LAUNCHER: "1", BUS_PUSH: "off" });
-    const sim = await srv.session(token, "sim");
-    const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
+    // launcher, whatever its hello says.
+    await srv.appSession(token, "be").connect();
+    await srv.appSession(token, "be", { push: false, hello: { launcher: true } }).connect();
+    const sim = await srv.hosted("you@example.com", "sim");
+    const peers = (await sim.call<{ peers: Peer[] }>("peer_list")).peers;
     expect(peers.find((p) => p.handle === "you@example.com/be")?.launcher).toBeUndefined();
     // Delegating to it is refused: not a launcher (the flag was never set).
-    try {
-      await call(sim.c, "delegate", { persona: "p", task: "t", to: "be" });
-      throw new Error("expected a refusal");
-    } catch (e) {
-      expect((e as Error).message).toMatch(/isn't a launcher session/);
-    }
+    await expect(sim.call("delegate", { persona: "p", task: "t", to: "be" })).rejects.toThrow(/isn't a launcher session/);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 30_000);
 
@@ -268,6 +276,7 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   }
 }, 30_000);
 
+// hosted twin: #452
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
   // No launcher live, human not linked: refused with the undo.
   const srv = new TestServer();
@@ -329,33 +338,31 @@ test("local: a re-pick retracts the missed pick's message and returns the new on
   expect((inbox.promised ?? []).some((p: any) => p.to === "be")).toBe(false);
 }, 30_000);
 
+// hosted twin: #451 (a hold session, the launcher)
 test("server: a hold owner with the launcher flag isn't advertised or instructed (review 6)", async () => {
-  const srv = new TestServer();
+  const srv = serve();
   try {
     const token = await srv.login("you@example.com");
     // A hold connection owns its name but can't receive pushes: the flag and
     // the instruction are gated on push mode (review 6). The positive
     // control proves both observables: a push launcher is advertised and
     // instructed.
-    const pusher = srv.client(token, "be", { hello: { launcher: true } });
-    const pushHello = await pusher.connect();
-    expect(pushHello.type).toBe("hello_ok");
+    const pushHello = await srv.appSession(token, "be", { hello: { launcher: true } }).connect();
     expect((pushHello.notices ?? []).join("\n")).toContain("You're a launcher session");
 
-    const held = srv.client(token, "bo", { push: false, hold: true, hello: { launcher: true } });
-    const heldHello = await held.connect();
-    expect(heldHello).toMatchObject({ type: "hello_ok" });
+    const heldHello = await srv.appSession(token, "bo", { push: false, hold: true, hello: { launcher: true } }).connect();
     expect((heldHello.notices ?? []).join("\n")).not.toContain("You're a launcher session");
 
-    const sim = await srv.session(token, "sim");
-    const peers = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];
+    const sim = await srv.hosted("you@example.com", "sim");
+    const peers = (await sim.call<{ peers: Peer[] }>("peer_list", { include_offline: true })).peers;
     expect(peers.find((p) => p.handle === "you@example.com/bo")?.launcher).toBeUndefined();
-    await expect(call(sim.c, "delegate", { persona: "p", task: "t", to: "bo" })).rejects.toThrow(/isn't a launcher session/);
+    await expect(sim.call("delegate", { persona: "p", task: "t", to: "bo" })).rejects.toThrow(/isn't a launcher session/);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 30_000);
 
+// hosted twin: #452
 test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
@@ -404,6 +411,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
 
 // #284 PR 4: the launcher flag is the session's, so it stands behind every
 // alias the session holds; a delegate to its second alias lands on it.
+// hosted twin: #451 (multi-alias holds, the launcher)
 test("local and server: a delegate to a launcher session's second alias is accepted", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   await call(be.c, "bind", { name: "be2", create: true });
@@ -412,18 +420,19 @@ test("local and server: a delegate to a launcher session's second alias is accep
   expect(r).toMatchObject({ to: "be2", delivered_now: true });
   await until(() => be.pushes.some((p) => String(p.content).includes('"task": "local t"')), 10_000, "the local push");
 
-  const srv = new TestServer();
+  const srv = serve();
   try {
     const token = await srv.login("you@example.com");
-    const sbe = await srv.session(token, "be", { BUS_LAUNCHER: "1" });
-    await call(sbe.c, "bind", { name: "be2", create: true });
-    const ssim = await srv.session(token, "sim");
-    const peers = (await call(ssim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
+    const sbe = srv.appSession(token, "be", { hello: { launcher: true } });
+    await sbe.connect();
+    await sbe.bind("be2", { create: true });
+    const ssim = await srv.hosted("you@example.com", "sim");
+    const peers = (await ssim.call<{ peers: Peer[] }>("peer_list")).peers;
     expect(peers.find((p) => p.handle === "you@example.com/be2")?.launcher).toBe(true);
-    const s = await call(ssim.c, "delegate", { persona: "p", task: "server t", to: "be2" });
+    const s = await ssim.call("delegate", { persona: "p", task: "server t", to: "be2" });
     expect(s).toMatchObject({ to: "you@example.com/be2", delivered_now: true });
-    await until(() => sbe.pushes.some((p) => String(p.content).includes('"task": "server t"')), 10_000, "the server push");
+    await sbe.next(direct((m) => m.body.includes('"task": "server t"')), 10_000);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }, 40_000);

@@ -5,11 +5,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from "@modelcontextprotocol/client";
 import { mintSessionKey } from "../../src/core/bindings.ts";
+import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -41,6 +44,20 @@ const upgrade = (srv: TestServer, token: string | null, from: string) =>
   });
 const get = (srv: TestServer, path: string, token: string | null, from: string) =>
   fetch(`${srv.base}${path}`, { headers: { "X-Forwarded-For": from, ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
+// A hosted MCP tools/list from `from` with an OAuth access token: the session transport after WSS (#282).
+const mcpList = (srv: TestServer, token: string, from: string) =>
+  fetch(`${srv.base}/mcp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`, "X-Forwarded-For": from, "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list",
+      "Content-Type": "application/json", Accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "tools/list",
+      params: { _meta: { [PROTOCOL_VERSION_META_KEY]: "2026-07-28", [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } },
+    }),
+  });
+const hostedToken = (srv: TestServer) => issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
 const audit = (srv: TestServer, action: string) =>
   srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = ?`).all(action) as { actor: string | null; target: string; detail: string }[];
 
@@ -78,6 +95,54 @@ test("valid traffic, 403s, 404s and requests with no token never spend; a refuse
   for (let i = 0; i < 5; i++) {
     expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
     expect((await srv.client(alice, null, { headers: { "X-Forwarded-For": X } }).connect()).type).toBe("hello_ok");
+    // Not an admin, and no such route.
+    expect((await fetch(`${srv.base}/api/admin/users`, { method: "POST", headers: { Authorization: `Bearer ${alice}`, "X-Forwarded-For": X }, body: "{}" })).status).toBe(403);
+    expect((await get(srv, "/api/nothing-here", alice, X)).status).toBe(404);
+    // No token: an <img> on any page can make a browser send this.
+    expect((await get(srv, "/api/whoami", null, X)).status).toBe(401);
+  }
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
+  // An unknown path isn't a public route, so requireAuth answers it: a bad token is a 401, charged by chargeRefusedToken.
+  expect((await get(srv, "/api/nothing-here", "bad", X)).status).toBe(401);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
+});
+
+// The three tests above drive the WSS upgrade (its own auth and charge,
+// app.ts) beside the HTTP routes; the gate's own semantics follow over HTTP
+// alone, the hosted MCP standing in for the session transport (#282).
+test("burst refused tokens on a route are refused 401; the next gets 429 with a wait, before any token lookup", async () => {
+  const { srv, lookups } = serve();
+  for (let i = 0; i < 3; i++) expect((await get(srv, "/api/whoami", `bad${i}`, X)).status).toBe(401);
+  expect(lookups()).toBe(3);
+  const r = await get(srv, "/api/whoami", "bad", X);
+  expect(r.status).toBe(429);
+  expect(r.headers.get("retry-after")).toBe("10");
+  expect(await r.json()).toEqual({ code: "rate_limited", message: "too many authentication failures from this address; retry in 10s", retry_after_ms: 10_000 });
+  expect(lookups()).toBe(3);
+  // A missing token costs nothing: an <img> on any page can make a browser send this.
+  for (let i = 0; i < 5; i++) expect((await get(srv, "/api/whoami", null, Y)).status).toBe(401);
+  expect(srv.app.authGate.size).toBe(1);
+});
+
+test("a limited address is refused everything, a valid token, /healthz and the hosted MCP too; another address isn't", async () => {
+  const { srv } = serve();
+  const alice = await srv.login(A);
+  const hosted = hostedToken(srv);
+  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", "bad", X);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
+  expect((await get(srv, "/healthz", null, X)).status).toBe(429);
+  expect((await mcpList(srv, hosted, X)).status).toBe(429);
+  expect((await get(srv, "/api/whoami", alice, Y)).status).toBe(200);
+  expect((await mcpList(srv, hosted, Y)).status).toBe(200);
+});
+
+test("valid traffic, hosted MCP included, 403s, 404s and requests with no token never spend; a refused token on any path does", async () => {
+  const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const alice = await srv.login(A);
+  const hosted = hostedToken(srv);
+  for (let i = 0; i < 5; i++) {
+    expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
+    expect((await mcpList(srv, hosted, X)).status).toBe(200);
     // Not an admin, and no such route.
     expect((await fetch(`${srv.base}/api/admin/users`, { method: "POST", headers: { Authorization: `Bearer ${alice}`, "X-Forwarded-For": X }, body: "{}" })).status).toBe(403);
     expect((await get(srv, "/api/nothing-here", alice, X)).status).toBe(404);

@@ -1,9 +1,11 @@
 // The per-user hello limit (#210): the server refuses a hello over the
 // bucket before touching the database, the Slack bridge is exempt, and the
-// client waits a refusal out instead of failing or hammering.
+// client waits a refusal out instead of failing or hammering. The server's
+// half is the application's hello and bind (#282: application sessions).
 import { afterEach, expect, test } from "bun:test";
 
 import { FakeSlack } from "./fake_slack.ts";
+import { ApplicationError } from "../../src/server/application.ts";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { GrayboardClient } from "../../src/plugin/client.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -26,43 +28,50 @@ function serve(o: ConstructorParameters<typeof TestServer>[0]): TestServer {
 
 const count = (srv: TestServer, sql: string, ...args: string[]) => (srv.app.db.query(sql).get(...args) as { n: number }).n;
 
+// The ApplicationError a connect (its hello, or the identity's bind) or a bind is refused with.
+async function refusal(p: Promise<unknown>): Promise<ApplicationError> {
+  const e = await p.then(() => undefined, (e: unknown) => e);
+  if (!(e instanceof ApplicationError)) throw new Error(`expected a refusal, got ${e}`);
+  return e;
+}
+
 test("a hello over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
   // A hello and a bind each take a token (#284: binds create aliases).
   const srv = serve({ helloLimit: { burst: 3, perSec: 4 } });
   const alice = await srv.login(A);
   const bob = await srv.login("bob@example.com");
-  expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
-  expect((await srv.client(alice, "be").connect()).type).toBe("hello_ok");
+  await srv.appSession(alice, null).connect();
+  await srv.appSession(alice, "be").connect();
 
   // A session that would bind, create its name and log a refusal.
-  const r = await srv.client(alice, "fe", { hello: { create: false } }).connect();
-  expect(r).toMatchObject({ type: "error", req_id: "h", code: "rate_limited" });
-  expect(r.retry_after_ms).toBeGreaterThan(0);
-  expect(r.retry_after_ms).toBeLessThanOrEqual(250);
+  const r = await refusal(srv.appSession(alice, "fe").connect());
+  expect(r.code).toBe("rate_limited");
+  expect(r.extra.retry_after_ms).toBeGreaterThan(0);
+  expect(r.extra.retry_after_ms).toBeLessThanOrEqual(250);
   expect(r.message).toMatch(/too many connections for this user; retry in \ds/);
   expect(count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ?`, `${A}/fe`)).toBe(0);
   expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/fe`)).toBe(0);
 
   // Another user's bucket is their own.
-  expect((await srv.client(bob, "be").connect()).type).toBe("hello_ok");
+  await srv.appSession(bob, "be").connect();
 
   // A second refusal in the same run is audited once.
-  expect((await srv.client(alice, null).connect()).code).toBe("rate_limited");
+  expect((await refusal(srv.appSession(alice, null).connect())).code).toBe("rate_limited");
   expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'hello.rate_limited' AND actor = ?`, A)).toBe(1);
   // The start row names the hello that tripped it and the wait it was given.
   const start = JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'hello.rate_limited'`).get() as { detail: string }).detail);
   expect(start).toMatchObject({ session_id: expect.stringMatching(/^id:/), place: null });
-  expect(start.retry_after_ms).toBe(r.retry_after_ms);
+  expect(start.retry_after_ms).toBe(r.extra.retry_after_ms);
 
   // The run ends only once the bucket is full again (3 tokens at 4/s: 750ms
   // from empty). The wait is the bucket's own clock, not a race; polling with
   // hellos would keep it from filling.
   const fullAt = Date.now() + 800;
   await until(() => Date.now() >= fullAt);
-  expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
+  await srv.appSession(alice, null).connect();
   expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'hello.rate_limit_ended'`)).toBe(1);
   expect(JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'hello.rate_limit_ended'`).get() as { detail: string }).detail).refused).toBeGreaterThanOrEqual(2);
-  expect((await srv.client(alice, "fe").connect()).bind_ok.alias).toBe(`${A}/fe`);
+  expect((await srv.appSession(alice, "fe").connect()).bind?.alias).toBe(`${A}/fe`);
 });
 
 test("the Slack bridge's human connection is exempt", async () => {
@@ -71,8 +80,8 @@ test("the Slack bridge's human connection is exempt", async () => {
   const srv = serve({ helloLimit: { burst: 1, perSec: 0.01 }, slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   await srv.app.slackReady;
   const alice = await srv.login(A);
-  expect((await srv.client(alice, null).connect()).type).toBe("hello_ok");
-  expect((await srv.client(alice, null).connect()).code).toBe("rate_limited");
+  await srv.appSession(alice, null).connect();
+  expect((await refusal(srv.appSession(alice, null).connect())).code).toBe("rate_limited");
 
   const r = await srv.api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`);
@@ -82,16 +91,16 @@ test("the Slack bridge's human connection is exempt", async () => {
 test("a bind spends the user's hello bucket: binds and hellos drain one bucket", async () => {
   const srv = serve({ helloLimit: { burst: 3, perSec: 0.01 } });
   const alice = await srv.login(A);
-  const a = srv.client(alice, null);
-  expect((await a.connect()).type).toBe("hello_ok");
-  expect((await a.bind("be")).type).toBe("bind_ok");
-  expect((await a.bind("fe")).type).toBe("bind_ok");
+  const a = srv.appSession(alice, null);
+  await a.connect();
+  await a.bind("be");
+  await a.bind("fe");
   // Three tokens spent, one by the hello and two by binds: the next of either is refused.
-  const bind = await a.bind("ops");
-  expect(bind).toMatchObject({ type: "error", code: "rate_limited", message: expect.stringMatching(/too many binds for this user; retry in \d+s/) });
-  expect(bind.retry_after_ms).toBeGreaterThan(0);
+  const bind = await refusal(a.bind("ops"));
+  expect(bind).toMatchObject({ code: "rate_limited", message: expect.stringMatching(/too many binds for this user; retry in \d+s/) });
+  expect(bind.extra.retry_after_ms).toBeGreaterThan(0);
   expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/ops`)).toBe(0);
-  expect((await srv.client(alice, null).connect()).code).toBe("rate_limited");
+  expect((await refusal(srv.appSession(alice, null).connect())).code).toBe("rate_limited");
 });
 
 test("a session started while its user is rate-limited waits and binds", async () => {

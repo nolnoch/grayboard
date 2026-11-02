@@ -78,6 +78,8 @@ export class HostedSession {
   readonly sessionId: string;
   readonly native: NativeWire;
   readonly subscriber: Wire;
+  // Both wires' options: instructionsNow()'s wire and the attachment routes use them.
+  private readonly wireOptions: WireOptions;
   private readonly abort = new AbortController();
   private lease?: { capability: string; expiresAt: number; ttl: number };
   // Items read and not yet taken by next(), oldest first; every ID read, so
@@ -99,6 +101,7 @@ export class HostedSession {
     this.sessionId = opts.sessionId ?? `test-${randomBytes(8).toString("hex")}`;
     const options: WireOptions = { url, sessionKey: GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
     const auth = { token: async () => token };
+    this.wireOptions = options;
     this.native = new NativeWire(options, auth, this.abort.signal, this.sessionId);
     this.subscriber = new Wire(options, auth, this.abort.signal, this.sessionId);
   }
@@ -139,6 +142,41 @@ export class HostedSession {
   // The server's instructions for this session, from the native initialize.
   instructions(): string | undefined {
     return this.native.instructions();
+  }
+
+  // The instructions a native connection opened now gets: initialize
+  // composes them from the session's binding at that moment, as a harness
+  // sees on reconnecting (instructions() is connect()'s, before its bind).
+  async instructionsNow(): Promise<string | undefined> {
+    const wire = new NativeWire(this.wireOptions, { token: async () => this.token }, this.abort.signal, this.sessionId);
+    await wire.connect();
+    try {
+      return wire.instructions();
+    } finally {
+      await wire.close();
+    }
+  }
+
+  // The hosted attachment routes (src/server/mcp-attachments.ts), as
+  // hosted-core's proxy calls them: the session in X-Grayboard-Session, the
+  // server acting as its bound name. upload answers the attachment's id.
+  async upload(filename: string, data: Uint8Array<ArrayBuffer> | string): Promise<number> {
+    const r = await this.attachment("POST", `?filename=${encodeURIComponent(filename)}`, typeof data === "string" ? new TextEncoder().encode(data) : data);
+    const stored: unknown = await r.json();
+    if (stored && typeof stored === "object" && "id" in stored && typeof stored.id === "number") return stored.id;
+    throw new Error(`${this.label}: the attachment upload answered ${JSON.stringify(stored)}`);
+  }
+
+  async download(id: number): Promise<Uint8Array> {
+    return new Uint8Array(await (await this.attachment("GET", `/${id}`)).arrayBuffer());
+  }
+
+  private async attachment(method: "POST" | "GET", path: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
+    const headers = new Headers({ Authorization: `Bearer ${this.token}`, "X-Grayboard-Session": encodeURIComponent(this.sessionId) });
+    if (body) headers.set("Content-Type", "application/octet-stream");
+    const r = await fetch(`${this.wireOptions.url}/attachments${path}`, { method, headers, ...(body ? { body } : {}) });
+    if (!r.ok) throw new Error(`${this.label}: ${method} attachments${path} answered ${r.status}: ${await r.text()}`);
+    return r;
   }
 
   // The agent's bind tool. A bind closes any open lease (its bind_gen
