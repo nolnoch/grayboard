@@ -603,6 +603,7 @@ program
   .option("--mode <mode>", "local (the only mode; server is served by the hosted MCP entry)")
   .action(async (opts: { mode?: string }) => {
     refuseServerMode(opts.mode);
+    (await import("../local/launch.ts")).launch.modePinned = opts.mode === "local";
     // stdout is the MCP transport from here on; log to stderr only.
     try {
       await import("../local/mcp.ts");

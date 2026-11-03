@@ -59,7 +59,9 @@ import { testPause } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
-import { channelsOff, channelsOffNotice, checkArgs, parentCommandLine, updateNotice } from "../shared/toolguard.ts";
+import { channelsOff, channelsOffNotice, checkArgs, parentCommandLine, signedInLocalNotice, updateNotice } from "../shared/toolguard.ts";
+import { busMode, loadCredentials } from "../cli/api.ts";
+import { launch } from "./launch.ts";
 import {
   PROMISE_DAYS,
   STALE_UNDELIVERED_MS,
@@ -306,6 +308,16 @@ if (WRITES_AS) {
   }
   writeNames();
 }
+// A machine signed in to a server (#491): a bare `grayboard mcp` entry is
+// most likely a pre-plugin one that meant the server before #282, so its
+// session is told, in every render, that the team isn't on this bus; an entry
+// that passes `--mode local` chose it and is only audited.
+const SIGNED_IN = busMode() === "server";
+const signedInServer = SIGNED_IN ? loadCredentials()?.server : undefined;
+const SIGNED_IN_SERVER = SIGNED_IN ? process.env.GRAYBOARD_SERVER || (typeof signedInServer === "string" && signedInServer ? signedInServer : null) : null;
+const SIGNED_IN_NOTICE = SIGNED_IN && !launch.modePinned ? signedInLocalNotice(SIGNED_IN_SERVER) : null;
+if (SIGNED_IN) writeCoreAudit(db, "id.signed_in_local", SESSION_ID, SESSION_ID, { server: SIGNED_IN_SERVER, mode_pinned: launch.modePinned });
+if (SIGNED_IN_NOTICE) console.error(`[grayboard] this machine is signed in to ${SIGNED_IN_SERVER ?? "a grayboard server"}, but this entry runs the local bus. Run \`grayboard setup\` to use the server, \`grayboard setup --local\` if this machine should be local, or pass \`--mode local\` to keep this entry local on purpose.`);
 console.error(`[grayboard] local mode, session ${SESSION_ID}, ${held.length ? `identity "${held.join('", "')}"` : WRITES_AS ? `writing as "${WRITES_AS}"` : "unbound"}`);
 
 // What the session is told as it is now (core's boundInstructions): as its
@@ -316,7 +328,8 @@ console.error(`[grayboard] local mode, session ${SESSION_ID}, ${held.length ? `i
 function localInstructions(general: boolean, notes: string[] = []): string[] {
   const name = primary();
   const lead = !WRITES_AS && !held.length ? [unboundInstruction(SESSION_ID, unboundCandidates, notes)] : notes;
-  return boundInstructions(
+  // First in every render (initialize, bind and unbind results): the adapters rebuild their prompt from the latter.
+  return [...(SIGNED_IN_NOTICE ? [SIGNED_IN_NOTICE] : []), ...boundInstructions(
     name,
     DEFAULT_CHANNEL_SOURCE,
     general,
@@ -331,7 +344,7 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
       ...claimsInstruction(listClaims(db), addresses()),
     ],
     held.slice(1),
-  );
+  )];
 }
 // The candidates an unbound session is offered: read at start, and again when
 // an unbind leaves it holding nothing.

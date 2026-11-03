@@ -56,6 +56,15 @@ export function channelsOffNotice(reason: string): string {
 }
 
 /**
+ * The warning a bare `grayboard mcp` gets on a machine signed in to a server
+ * (#491): it runs the local bus, so the team isn't here. `server` is null when
+ * the sign-in doesn't name one (a truncated, signed-out credentials file).
+ */
+export function signedInLocalNotice(server: string | null): string {
+  return `Warning: this machine is signed in to ${server ?? "a grayboard server"}, but this grayboard MCP entry runs the local bus: that server's peers, names and messages aren't here, and an empty peer list isn't the team's. Tell the user: \`grayboard setup\` registers this harness for the server; \`grayboard setup --local\` if this machine should be local; \`--mode local\` on this entry keeps the local bus on purpose.`;
+}
+
+/**
  * Why Claude Code won't show this local-mode server's channel notifications
  * (the shared rule, `claudeChannels`), or null when it will or can't tell.
  * Only a child of Claude Code itself is checked: CLAUDECODE=1 is inherited by
