@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import { createHostedSessions, deliveryDeclaration, sessionContext } from "./hosted.ts";
+import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import { aliasUser, boundInstructions } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
@@ -512,4 +513,55 @@ test("a root whose last hold is revoked or unbound has no lease, so the sweep le
   now += 300_000; // past any lease, short of the idle window
   hosted.sweep();
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(id(raw))).toBeDefined();
+});
+
+test("a request's model and effort are the session's latest: registered, updated on a change, never cleared by absence, restated by a new ownership, audited (#364)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "facts-root", ...extra });
+  const id = (ctx() as { id: string }).id;
+  const facts = () => database.db.prepare("SELECT model, effort FROM ids WHERE id = ?").get(id);
+  const changes = () => database.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'id.facts_changed'").all().map(r => JSON.parse(r.detail));
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "claude-opus-5-5", [GRAYBOARD_EFFORT_META]: "high" }));
+  expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
+  // No facts, or one of them: the other keeps its value.
+  await hosted.whoami(generic, ctx());
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "claude-sonnet-5-5" }));
+  expect(facts()).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
+  // An unchanged value writes nothing to audit; a change records before and after.
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "claude-sonnet-5-5" }));
+  expect(changes()).toMatchObject([
+    { before: { model: "claude-opus-5-5", effort: "high" }, after: { model: "claude-sonnet-5-5", effort: "high" }, why: "request" },
+  ]);
+  // A new ownership of the same ID reports its own: the last one's model is stale. Audited like a request's change.
+  await hosted.end(generic, ctx());
+  await hosted.whoami(generic, ctx());
+  expect(facts()).toEqual({ model: null, effort: null });
+  await hosted.end(generic, ctx());
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "claude-haiku-5-5" }));
+  expect(facts()).toEqual({ model: "claude-haiku-5-5", effort: null });
+  expect(changes().slice(1)).toEqual([
+    { before: { model: "claude-sonnet-5-5", effort: "high" }, after: { model: null, effort: null }, why: "ownership" },
+    { before: { model: null, effort: null }, after: { model: "claude-haiku-5-5", effort: null }, why: "ownership" },
+  ]);
+});
+
+test("a model or effort that isn't a string is refused, an empty one is none, and format characters and length are cut when stored (#364)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const meta = (extra: Record<string, unknown>) => ({ [GRAYBOARD_SESSION_META]: "facts-bad", ...extra });
+  expect(() => sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: 5 }))).toThrow(`_meta["${GRAYBOARD_MODEL_META}"] must be a string`);
+  expect(sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: "" }))).not.toHaveProperty("facts");
+  // Any client's facts are read, not only a generic key's.
+  expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_EFFORT_META]: "low" })).toMatchObject({ facts: { effort: "low" } });
+  const ctx = sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: `a\u202eb\u2066c\u200e\u200b\n${"x".repeat(200)}` }));
+  await hosted.whoami(generic, ctx);
+  const stored = (database.db.prepare("SELECT model FROM ids WHERE id = ?").get((ctx as { id: string }).id) as { model: string }).model;
+  expect(stored).toMatch(/^abc x+$/);
+  expect(stored.length).toBe(64);
+});
+
+test("cleanFact drops format characters before folding the line, and stores NFC, so match compares what a reader sees (#364)", () => {
+  expect(cleanFact("a \u202e b")).toBe("a b");
+  expect(cleanFact("x\u200fy\u061c\ufeff")).toBe("xy");
+  expect(cleanFact("e\u0301")).toBe("\u00e9");
+  expect(cleanFact("\u200b")).toBeNull();
 });

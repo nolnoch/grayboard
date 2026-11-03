@@ -22,7 +22,7 @@ import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
-  setAliasMeta, setPlace, touchAlias, touchId, registerId, idCollisionText, inheritStatus, normalizeBoard, getBoard,
+  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, inheritStatus, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -776,7 +776,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
     // (`hostedCollided`, written after the rollback); without it the row is written here.
-    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void) {
+    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
@@ -787,15 +787,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // undeliverableId read ids.writes_as, so a send to its ID is pointed at the alias.
       if (!prior) {
         repo.atomic(() => {
-          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }) });
-          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }) });
+          const model = cleanFact(facts?.model), effort = cleanFact(facts?.effort);
+          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
         });
       }
       else {
         touchId(db, id);
+        // A new ownership of the same ID reports its own model and effort: what the last one reported is stale.
+        const changed = setIdFacts(db, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
+        if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
         if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
       }
+    },
+    // The latest model and effort a hosted session's request reports (#364): written, and audited with the
+    // before and after, only when one changed. Absent fields keep the stored value.
+    hostedFacts(authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
+      const changed = setIdFacts(db, id, facts);
+      if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
     },
     // A tools-only declaration's alias, resolved and checked: a name the
     // principal may act in, never one another user's session uses (S7, S8); it may share the

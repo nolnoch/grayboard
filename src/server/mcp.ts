@@ -13,7 +13,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedUnboundInstruction, sessionContext, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -151,19 +151,23 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const principal = oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) return refuse(principal);
     const meta = exchanges.getStore()?.meta;
-    const routing = sessionContext(principal, meta);
-    let declared: DeclaredDelivery | undefined;
-    // Native requests only, before admission: the subscriber role ignores the declaration.
-    try { declared = role === "native" ? deliveryDeclaration(principal, meta) : undefined; }
-    catch (error) {
+    // A malformed `_meta` field is the client's bug: refused with its own message and logged, so it's diagnosable.
+    const metaRefusal = (reason: string, error: unknown): never => {
       if (!(error instanceof ApplicationError)) throw error;
       const exchange = exchanges.getStore();
       if (exchange) {
         exchange.principal = principal.authed.user_id;
-        logRefusal("delivery_declaration", exchange, { client_id: principal.clientId });
+        logRefusal(reason, exchange, { client_id: principal.clientId });
       }
       return refuse(Response.json({ code: error.code, message: error.message }, { status: 400 }));
-    }
+    };
+    let routing: SessionContext;
+    try { routing = sessionContext(principal, meta); }
+    catch (error) { return metaRefusal("session_meta", error); }
+    let declared: DeclaredDelivery | undefined;
+    // Native requests only, before admission: the subscriber role ignores the declaration.
+    try { declared = role === "native" ? deliveryDeclaration(principal, meta) : undefined; }
+    catch (error) { return metaRefusal("delivery_declaration", error); }
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
       application.admitHosted(principal.authed, "id" in routing ? routing.id : null);
@@ -554,7 +558,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               const sid = req.headers.get("Mcp-Session-Id");
               let legacy = sid ? legacySessions.get(sid) : undefined;
               if (sid && !legacy) { releasePost(); return new Response("unknown MCP session", { status: 404 }); }
-              if (req.method !== "POST" && legacy) exchange.meta = legacy.meta;
+              // A GET or DELETE replays the creating POST's `_meta` for routing; its model and effort are stale by then (#364).
+              if (req.method !== "POST" && legacy) exchange.meta = withoutFacts(legacy.meta);
               const context = exchange.context = await select(req);
               // The timer may have dropped this sid while identity selection awaited.
               if (legacy?.stopped) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }

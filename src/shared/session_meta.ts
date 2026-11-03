@@ -11,3 +11,8 @@ export const GRAYBOARD_WRITES_AS_META = "io.github.nolnoch.grayboard/writes_as";
 // On a native tool result, not a request (#453): the result carries an alias_lost notice, so the root's holds
 // changed and a host that caches the session's instructions (hosted-core's proxy) fetches them again.
 export const GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
+// Beside the session key, the harness's current model and effort (#364), one line each. A client sends them on its
+// native requests whenever it knows them and never clears one by omitting it; the server keeps the latest as the
+// session's `ids.model`/`ids.effort`, which peer_list shows and match:{model, effort} filters on.
+export const GRAYBOARD_MODEL_META = "io.github.nolnoch.grayboard/model";
+export const GRAYBOARD_EFFORT_META = "io.github.nolnoch.grayboard/effort";
