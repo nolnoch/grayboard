@@ -35366,7 +35366,7 @@ var native_tools_default = [
   },
   {
     name: "dm_history",
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
+    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {

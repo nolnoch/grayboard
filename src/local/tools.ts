@@ -43,7 +43,7 @@ export const LOCAL_TOOLS = [
   {
     name: "dm_history",
     description:
-      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session.",
+      "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {

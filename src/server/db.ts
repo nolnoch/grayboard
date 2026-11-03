@@ -28,7 +28,8 @@ export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; 
 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; pending: number; kind: "bounce" | null; attachments?: AttachmentInfo[] };
+// delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at: number | null; pending: number; kind: "bounce" | null; attachments?: AttachmentInfo[] };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
 // doesn't leak. `me`: every address the caller reads as (#284 S8).
@@ -51,8 +52,8 @@ export type WriteReceipt = {
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads and pushes.
-const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, pending, kind`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
+const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, delivered_at, pending, kind`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind`;
 const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 
 // A synchronous callback's result: a promise is refused at compile time, so
@@ -136,6 +137,8 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
+    markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
     // and has no reply. False if any of that doesn't hold.
     retract(sender: string, id: number): boolean;
@@ -206,7 +209,7 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
              LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
 // queuedTo: per recipient, the DMs its read point hasn't reached. Exported
@@ -220,7 +223,7 @@ export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
 // the same EXPLAIN pin.
 export const RETRACTABLE_SQL = `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0)
+                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
 
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
@@ -483,6 +486,8 @@ function initSchema(db: Database): void {
   if (!msgCols.some((c) => c.name === "pending")) db.exec(`ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0`);
   if (!msgCols.some((c) => c.name === "sender_id")) db.exec(`ALTER TABLE messages ADD COLUMN sender_id TEXT`);
   if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
+  // delivered_at: when the message was handed to its recipient's harness (#470).
+  if (!msgCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE messages ADD COLUMN delivered_at INTEGER`);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -795,6 +800,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+      },
+      markDelivered(id, at) {
+        db.run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
       retract(sender, id) {
         return db.transaction(() => {

@@ -772,7 +772,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
   }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
   server.registerTool("dm_history", {
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID.",
+    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
   }, (a, ctx) => run(ctx, "dm_history", session => application.history(session, a)));
   server.registerTool("dm_thread", { description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },

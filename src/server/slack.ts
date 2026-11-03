@@ -265,9 +265,12 @@ export class SlackBridge implements SlackLinker {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
         if (!session.active) throw new Error("Slack delivery session ended before receipt");
+        // A message Slack refused (msg_too_long) is given up, never posted: its
+        // cursor moves but it isn't stamped delivered (#470).
+        const posted = (repo.slack.progress(link.user_id, ref(id)) as { posted?: boolean } | undefined)?.posted === true;
         // Receipt is synchronous and validates the live session; retain progress on any refusal.
         if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
-        else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)]);
+        else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)], { handed: posted });
         repo.slack.clearProgress(link.user_id, ref(id));
         outbox.delete(id);
       },

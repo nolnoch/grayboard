@@ -30,6 +30,7 @@ import {
   ackMessage,
   blobs,
   db,
+  deliveredTo,
   getCursor,
   getHistory,
   getMessage,
@@ -40,7 +41,6 @@ import {
   retractMessage,
   retractedAt,
   sentPending,
-  setCursor,
   undeliveredFrom,
   type Message,
   unreadFor,
@@ -187,6 +187,14 @@ const WRITES_AS = PUSH ? null : SUGGESTED;
 // process receives nothing, so its ID isn't one of its addresses.
 const primary = (): string => WRITES_AS ?? primaryOf(held, SESSION_ID);
 const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...held, SESSION_ID]);
+// The first successful write of a session acting as its ID says how to get a
+// readable name, once per session (#470).
+let bindHinted = false;
+function bindHint(): { bind_hint?: string } {
+  if (bindHinted || WRITES_AS || held.length) return {};
+  bindHinted = true;
+  return { bind_hint: `You act as ${primary()}; bind(name) gives peers a readable name.` };
+}
 // Notes on how this session started: why it has no name, or a name its
 // restart couldn't take back. For its instructions.
 const startNotes: string[] = [];
@@ -554,7 +562,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }));
     // The result names the sender whenever it isn't the primary.
-    const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}) };
+    const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}), ...bindHint() };
     // A socket that answers for a released name is a bind's swap window: the
     // DM stays queued for the name's next holder (#182 audit 29).
     const delivered = (await poke(recipient)) && !lastWasRelease(db, recipient);
@@ -619,7 +627,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     if (done !== undefined) return text(`ok: ${alreadyRetracted(done)}`);
     if (!m || !ADDRS.includes(m.sender)) return refuse(retractRefusal.notYours(a.message_id as number));
     // A probe is a wakeup: a live recipient drains the message now.
-    if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
+    if (m.delivered_at !== null || getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
     if (!retractMessage(m.sender, m.id)) {
       return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
     }
@@ -659,7 +667,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       db.transaction(() => callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
     );
     await wakeAll(wake);
-    return text(result);
+    // board_post and a taken claim are writes; a claim held by someone else is a refusal.
+    const wrote = typeof result === "object" && result !== null && (name === "board_post" || (name === "claim_take" && "ok" in result && result.ok === true));
+    return text(wrote ? { ...result, ...bindHint() } : result);
   }
 
   throw new Error(`unknown tool: ${name}`);
@@ -739,7 +749,7 @@ async function drainLoop(): Promise<void> {
         if (isHuman(db, msg.sender)) params.meta.human = "true";
         await mcp.notification({ method: "notifications/claude/channel", params });
         if (sessionEnded) return;
-        setCursor(reader, msg.id);
+        deliveredTo(reader, msg.id);
       }
     }
     // A post pending for several addresses (an ID and an alias subscription)
