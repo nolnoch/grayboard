@@ -139,7 +139,7 @@ export class AppSession {
     try {
       const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
       this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
-      if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id);
+      if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
       ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
     } catch (e) {
       this.drop(`connect refused: ${(e as Error).message}`);

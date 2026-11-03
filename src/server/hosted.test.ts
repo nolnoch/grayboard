@@ -604,7 +604,7 @@ test("a request's launcher declaration is the ownership's: set by any root reque
   await hosted.end(generic, toolsOnly);
   await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
   expect(flag()).toBe(1);
-  expect(audited()).toEqual([{ target: id, detail: JSON.stringify({ on: true }) }]);
+  expect(audited().map(a => ({ target: a.target, ...JSON.parse(a.detail) }))).toEqual([{ target: id, on: true, ownership: expect.any(Number), client_id: "grayboard-pi" }]);
   // The ownership's end clears it; a new ownership that declares nothing isn't one, and one that declares restates it.
   await hosted.end(generic, ctx());
   expect(flag()).toBe(0);

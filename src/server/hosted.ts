@@ -199,7 +199,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
     // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
     // and a tools-only root's are ignored; only the ownership's end clears it.
-    if (row && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id);
+    if (row && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
     return row;
   }
   function rootOf(row: HostedSession): HostedSession {

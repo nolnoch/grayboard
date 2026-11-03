@@ -808,8 +808,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // A root's request declared a launcher (#473, #520): the flag is the ownership's (`ids.launcher`; its end clears
     // it), turned on by whichever of its requests declares first and audited as a local session's is, once.
-    hostedDeclareLauncher(authed: AuthedUser, id: string) {
-      if (db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1`).run(id).changes) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true });
+    // `detail`: which ownership and client turned it on, now that a later request can (#520).
+    hostedDeclareLauncher(authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
+      if (db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1`).run(id).changes) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value.
@@ -853,8 +854,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
       return byOwner;
     },
-    // Whether the session's ownership registered as a launcher (#473): what its instruction text follows, since the
-    // stored flag, not a later request's declaration, decides whether it receives delegation requests.
+    // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
+    // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
     hostedLauncher(id: string): boolean { return (db.prepare(`SELECT launcher FROM ids WHERE id = ?`).get(id) as { launcher: number | null } | null)?.launcher === 1; },
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.

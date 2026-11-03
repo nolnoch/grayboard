@@ -20,6 +20,7 @@ export const GRAYBOARD_EFFORT_META = "io.github.nolnoch.grayboard/effort";
 // bare identity name; the server keeps the first request's for the session's life and ignores later ones.
 export const GRAYBOARD_SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 // Beside the session key, a launcher declaration (#473): `true` says this session's harness can spawn subagents, the
-// hosted counterpart of a local session's BUS_LAUNCHER=1. It is stated when an ownership starts and kept until it
-// ends (`ids.launcher`); a later request's value is not read, and anything but a boolean is refused.
+// hosted counterpart of a local session's BUS_LAUNCHER=1. Any request of a root's ownership that states it turns the
+// flag on (#520), kept until the ownership ends (`ids.launcher`); `false` or absence never clears it, and anything
+// but a boolean is refused.
 export const GRAYBOARD_LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
