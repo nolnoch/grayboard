@@ -2,10 +2,10 @@ import { age } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at?: number | null; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; body: string; attachments?: AttachmentInfo[] };
+export type InboxItem = { id: number; from: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
@@ -32,6 +32,7 @@ function item(m: Msg, now: number) {
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
     ...(m.kind ? { kind: m.kind } : {}),
     age: age(now - m.created_at),
+    ...(m.delivered_at != null ? { delivered_at: m.delivered_at } : {}),
     body: m.body.length > SNIPPET ? `${m.body.slice(0, SNIPPET)}… (dm_thread for the rest)` : m.body,
     ...(m.attachments ? { attachments: m.attachments } : {}),
   };
@@ -51,12 +52,15 @@ export function promised(me: string[], candidates: Msg[], threadOf: (id: number)
   return lastWord(me, candidates, threadOf).map((m) => ({ id: m.id, to: m.recipient, ...item(m, now) }));
 }
 
-// A message as a read shows it. pending is stored as 0/1 and kind as null
-// for an ordinary message; rows show each only when set, so history and
-// threads don't pay for them on every message.
-export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null }>(m: M): Omit<M, "pending" | "kind"> & { pending?: true; kind?: "bounce" } {
-  const { pending, kind, ...rest } = m;
-  return { ...rest, ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}) };
+// A message as a read shows it. pending is stored as 0/1, kind as null for
+// an ordinary message and delivered_at as null until the message reaches its
+// recipient's harness; rows show each only when set, so history and threads
+// don't pay for them on every message.
+export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null; delivered_at?: number | null }>(
+  m: M,
+): Omit<M, "pending" | "kind" | "delivered_at"> & { pending?: true; kind?: "bounce"; delivered_at?: number } {
+  const { pending, kind, delivered_at, ...rest } = m;
+  return { ...rest, ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}), ...(delivered_at != null ? { delivered_at } : {}) };
 }
 
 // dm_history's limit, checked alike in both modes (#75).

@@ -2,6 +2,7 @@
 // `grayboard mcp --mode local` driven by an MCP client, sharing a temp database
 // and socket directory. Covers liveness in `who`, which only works across processes.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -257,6 +258,51 @@ test("senders see what hasn't reached an offline peer: send result, history, and
   await start("fe");
   await Bun.sleep(300); // fe's first drain moves its cursor
   expect((await call(be, "dm_history", { peer: "fe" })).map((m: any) => m.delivered)).toEqual([true, true]);
+}, 20_000);
+
+// #470: a push stamps delivered_at; queued mail has none; a cursor-proven row
+// from before the column is delivered without it.
+test("a pushed DM carries delivered_at in history, thread and inbox; queued and pre-column rows don't", async () => {
+  const be = await start("be");
+  const fe = await session("fe");
+  const t0 = Date.now();
+  const pushed = await call(be, "dm_send", { to: "fe", body: "stamp me" });
+  const history = () => call(be, "dm_history", { peer: "fe" });
+  const [row] = await until(async () => { const h = await history(); return h[0]?.delivered_at ? h : null; });
+  expect(row).toMatchObject({ id: pushed.message_id, delivered: true });
+  expect(row.delivered_at).toBeGreaterThanOrEqual(t0);
+  expect((await call(be, "dm_thread", { thread: pushed.message_id }))[0].delivered_at).toBe(row.delivered_at);
+  expect((await call(fe.c, "dm_inbox")).unanswered[0]).toMatchObject({ id: pushed.message_id, delivered_at: row.delivered_at });
+
+  await stop(fe.c);
+  const queued = await call(be, "dm_send", { to: "fe", body: "waits" });
+  const waiting = (await history()).find((m: { id: number }) => m.id === queued.message_id);
+  expect(waiting.delivered).toBe(false);
+  expect(waiting).not.toHaveProperty("delivered_at");
+
+  const db = new Database(join(dir, "bus.db"));
+  db.run(`UPDATE messages SET delivered_at = NULL WHERE id = ?`, [pushed.message_id]);
+  db.close();
+  const old = (await history()).find((m: { id: number }) => m.id === pushed.message_id);
+  expect(old.delivered).toBe(true);
+  expect(old).not.toHaveProperty("delivered_at");
+}, 20_000);
+
+// #470: a session acting as its ID hears once, on its first successful write, that a name helps.
+test("bind_hint: once on an unbound session's first successful write; never on a refusal or when bound", async () => {
+  const be = await start("be");
+  const anon = await start(undefined);
+  const { id } = await call(anon, "whoami");
+  await call(be, "board_create", { name: "e2e", purpose: "fixtures" });
+  expect(await call(be, "claim_take", { key: "k" })).not.toHaveProperty("bind_hint");
+  expect(await call(be, "dm_send", { to: "be", body: "self" })).not.toHaveProperty("bind_hint");
+
+  const refused = await call(anon, "claim_take", { key: "k" });
+  expect(refused).toMatchObject({ ok: false, held_by: "be" });
+  expect(refused).not.toHaveProperty("bind_hint");
+  expect((await call(anon, "board_post", { board: "e2e", body: "hello" })).bind_hint).toBe(`You act as ${id}; bind(name) gives peers a readable name.`);
+  expect(await call(anon, "dm_send", { to: "be", body: "hi" })).not.toHaveProperty("bind_hint");
+  expect(await call(anon, "claim_take", { key: "k2" })).not.toHaveProperty("bind_hint");
 }, 20_000);
 
 test("dm_inbox lists what you owe: replied and acked messages drop out", async () => {

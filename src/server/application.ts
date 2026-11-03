@@ -944,7 +944,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     receiptDirect(session: ApplicationSession, ids: number[]) {
       valid(session);
-      handleAck(session, ids, repo);
+      handleAck(session, ids, repo, now());
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
@@ -1415,7 +1415,7 @@ function handleHistory(hub: Hub, session: ApplicationSession, peer: string | und
   };
   // Newest `lim` before beforeId, shown oldest first as in local mode.
   const messages = repo.messages.history(mine, peerFull, lim, beforeId).reverse().map((m) =>
-    mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient) ? { ...m, delivered: reached(m.recipient) >= m.id } : m,
+    mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || reached(m.recipient) >= m.id } : m,
   );
   return messages.map(showMessage);
 }
@@ -1448,11 +1448,14 @@ function handleThread(session: ApplicationSession, messageId: number, repo: Repo
   return repo.messages.thread(messageId).filter(mine).map(showMessage);
 }
 
-function handleAck(session: ApplicationSession, messageIds: number[], repo: Repo): void {
+// A receipt: the harness was handed these ids. Each stamps its delivery time
+// once and moves its recipient address's cursor; only your own direct
+// messages count (S8).
+function handleAck(session: ApplicationSession, messageIds: number[], repo: Repo, at: number): void {
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(msgId);
-    // Only your own direct messages move a cursor: their recipient address's (S8).
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
+    repo.messages.markDelivered(msgId, at);
     repo.cursors.advance(msg.recipient, "direct", msg.recipient, msgId);
   }
 }

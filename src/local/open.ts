@@ -83,6 +83,8 @@ function initLocalSchema(db: Database): void {
   // kind: 'bounce' for a message returned by an ended ID (#284 decision 10);
   // null for an ordinary message.
   if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
+  // delivered_at: when the message was handed to its recipient's harness (#470).
+  if (!msgCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE messages ADD COLUMN delivered_at INTEGER`);
   // The attachment model (#284 PR 2, S2). For a keyed session (BUS_SESSION_KEY)
   // pid + proc_start are its harness's, whose exit ends the session, and
   // attached_pid + attached_start are the grayboard mcp child serving it (null

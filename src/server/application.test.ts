@@ -65,6 +65,41 @@ test("typed operations and delivery need no frames; receipts alone move the deli
   expect((await a.inbox()).promised).toBeUndefined();
 });
 
+// #470: a receipt stamps delivered_at once; a cursor move alone (the Slack
+// link-time backlog skip, or mail from before the column) proves delivery
+// without a time.
+test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered without it", async () => {
+  const a = await connect(alice, "be");
+  const b = await connect(bob, "fe");
+  const sent = await a.send("bob@example.com/fe", "stamp me");
+  await b.next(isDirect);
+  const before = await a.history();
+  expect(before[0]).toMatchObject({ id: sent.message_id, delivered: false });
+  expect(before[0]).not.toHaveProperty("delivered_at");
+  expect((await a.thread(sent.message_id))[0]).not.toHaveProperty("delivered_at");
+
+  const t0 = Date.now();
+  await b.ack([sent.message_id]);
+  const [row] = await a.history();
+  const stamp = row!.delivered_at!;
+  expect(row!.delivered).toBe(true);
+  expect(stamp).toBeGreaterThanOrEqual(t0);
+  expect((await a.thread(sent.message_id))[0]!.delivered_at).toBe(stamp);
+  expect((await b.inbox()).unanswered[0]).toMatchObject({ id: sent.message_id, delivered_at: stamp });
+  // A repeated receipt keeps the first stamp.
+  store.repo.messages.markDelivered(sent.message_id, stamp + 60_000);
+  await b.ack([sent.message_id]);
+  expect((await a.history())[0]!.delivered_at).toBe(stamp);
+
+  b.close();
+  const queued = await a.send("bob@example.com/fe", "skipped backlog");
+  expect((await a.history()).at(-1)).toMatchObject({ id: queued.message_id, delivered: false });
+  store.repo.cursors.advance("bob@example.com/fe", "direct", "bob@example.com/fe", queued.message_id);
+  const skipped = (await a.history()).at(-1)!;
+  expect(skipped).toMatchObject({ id: queued.message_id, delivered: true });
+  expect(skipped).not.toHaveProperty("delivered_at");
+});
+
 test("board observers are independent hints with concealed access and explicit lifecycle cleanup", async () => {
   const a = (await connect(alice, "be", { push: false })).session;
   application.call(a, "board_create", { name: "e2e", purpose: "tests" });

@@ -33,6 +33,9 @@ export type Message = {
   body: string;
   parent_id: number | null;
   created_at: number;
+  // When it was handed to the recipient's harness; null until then, and for
+  // mail delivered before the column (#470).
+  delivered_at: number | null;
   pending: number;
   // 'bounce' for a message returned by an ended ID (#284 S12); else null.
   kind: "bounce" | null;
@@ -42,8 +45,8 @@ export type Message = {
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads.
-const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, pending, kind`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.pending, m.kind`;
+const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, delivered_at, pending, kind`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind`;
 
 // Stores the message from session `senderId` and binds the uploads `ids` of
 // `uploader` (the session's addresses, #284 S5; local mode has one user, so
@@ -98,13 +101,18 @@ export function getCursor(reader: string): number {
   return row?.last_seen_id ?? 0;
 }
 
-export function setCursor(reader: string, last_seen_id: number): void {
-  db.prepare(
-    `INSERT INTO cursors (reader, last_seen_id)
-     VALUES (?, ?)
-     ON CONFLICT(reader) DO UPDATE SET last_seen_id = excluded.last_seen_id
-     WHERE excluded.last_seen_id > cursors.last_seen_id`,
-  ).run(reader, last_seen_id);
+// The harness was handed message `id` for `reader`: stamps its delivery time
+// once and moves the reader's cursor, in one transaction.
+export function deliveredTo(reader: string, id: number, at = Date.now()): void {
+  db.transaction(() => {
+    db.prepare(`UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`).run(at, id);
+    db.prepare(
+      `INSERT INTO cursors (reader, last_seen_id)
+       VALUES (?, ?)
+       ON CONFLICT(reader) DO UPDATE SET last_seen_id = excluded.last_seen_id
+       WHERE excluded.last_seen_id > cursors.last_seen_id`,
+    ).run(reader, id);
+  })();
 }
 
 export function getMessage(id: number): Message | undefined {
@@ -198,7 +206,7 @@ export function getHistory(
   args.push(limit);
   const rows = withAttachments(db, "message", db.prepare(sql).all(...args) as Message[]);
   return rows.reverse().map((m) =>
-    me.includes(m.sender) && !me.includes(m.recipient) ? { ...m, delivered: getCursor(m.recipient) >= m.id } : m,
+    me.includes(m.sender) && !me.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || getCursor(m.recipient) >= m.id } : m,
   );
 }
 
