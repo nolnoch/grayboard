@@ -643,7 +643,7 @@ claude plugin install grayboard@grayboard --config server_url=https://grayboard.
 claude mcp remove --scope user grayboard
 ```
 
-A failed command leaves the local registration in place. `grayboard setup --local` disables the plugin and keeps its sign-in for a switch back; `grayboard update` moves a machine still registered the old way onto the plugin. The Claude Code version it's tested against is `CLAUDE_CODE_VERSION` in `tests/support/claude_code.ts`.
+A failed command leaves the local registration in place. `grayboard setup --local` disables the plugin and keeps its sign-in for a switch back; `grayboard update` moves a machine still registered the old way onto the plugin, and updates a plugin enabled in your user settings to the marketplace's current pin (`claude plugin marketplace update` then `claude plugin update`), printing what `claude plugin update` reports; running sessions load a new version after a restart, and a release's pin lags until its `plugin-pin` PR merges. With the plugin enabled, it warns about a `grayboard` entry in a `.mcp.json` in the current directory or any directory above it, which runs a second grayboard beside the plugin in a session started there. The Claude Code version it's tested against is `CLAUDE_CODE_VERSION` in `tests/support/claude_code.ts`.
 
 Launch Claude Code with the plugin's channel:
 

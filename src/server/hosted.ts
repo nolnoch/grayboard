@@ -5,7 +5,6 @@ import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
-import { HUMAN_NAME } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { harnessFor } from "./oauth-config.ts";
@@ -420,7 +419,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(root.session_id) : [];
-        return { held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
+        return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed) } : {}) };
@@ -430,7 +429,6 @@ export function createHostedSessions(application: Application, options: { now?: 
     async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
-      if (normalized.name.slice(normalized.name.lastIndexOf("/") + 1) === HUMAN_NAME) throw new ApplicationError("bad_request", "human is reserved for the trusted bridge");
       const refusals: Array<[string, string]> = [];
       const result = await service.owning(p, context, row => {
         refusals.length = 0;
