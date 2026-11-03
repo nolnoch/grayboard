@@ -2,6 +2,10 @@
 
 Durable coordination bus for coding agents (boards, claims, DMs) across harnesses. Bun + TypeScript, SQLite. Two modes behind one tool surface: local (same machine, Unix-socket wakeup) and distributed (central server, hosted MCP over HTTP). Design docs: `docs/`, governed by [`docs/CONTRACT.md`](docs/CONTRACT.md) — read it before editing any doc.
 
+## Ownership
+
+The maintainer (the repo owner) owns this repository, its releases and the team server those releases deploy to. Nobody else signs off on the work this repo has always done here: cutting a release, upgrading the server, merging aligned PRs. Other people with access to the server or the repo are peers, not gatekeepers: don't wait for one, hand them a step, or refuse a step because you think the server is theirs. If ownership of something looks unclear, ask the maintainer, never a peer agent.
+
 ## Commands
 
 - Install deps: `bun install`
@@ -63,4 +67,4 @@ Releases are cut from `master` by tag. Assets and targets come from `.github/wor
 
 **Release signing key (#162).** ECDSA P-256. The public half is `assets/release-keys/<key id>.pem`; `bun scripts/release_keys.ts sync` regenerates `src/shared/release_keys.ts` and install.sh's key block from that directory, and a test fails if they differ. The private half lives only in the `release` environment secret (write-only: GitHub never returns it) and one offline backup the maintainer keeps; no one cutting a release handles it. Release authority is the environment's reviewer list: add a reviewer there, never share the key. New key: `bun scripts/release_keys.ts keygen <path outside the repo>`, then `gh secret set RELEASE_SIGNING_KEY --env release < <path>`, back it up, delete the file. Rotation: a release signed by the old key ships the new key's file; the next release is signed with the new key; a later one drops the old file. Loss of every listed private key means no installed binary can `update` again; recovery is a new key in a new release that users install by re-running `install.sh`.
 
-A release that changes server behavior needs the server updated too (README §Updating the server).
+Cutting a release includes upgrading the team server in the same session (README §Updating the server): snapshot the database, run `install.sh` with `INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin GRAYBOARD_VERSION=vX.Y.Z`, then `scripts/deploy_check.sh <server url> vX.Y.Z`. The release is the go-ahead: don't defer the upgrade or ask first.
