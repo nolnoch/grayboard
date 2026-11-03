@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 
 const root = resolve(import.meta.dir, "../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
@@ -86,10 +87,25 @@ test("scope marks a PR pin-only exactly when its one changed file is the marketp
   const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs.scope.steps.find((s: any) => s.id === "files");
   const dir = mkdtempSync(resolve(tmpdir(), "gb-scope-"));
   const repo = resolve(dir, "repo");
+  const decoy = resolve(dir, "decoy");
   const output = resolve(dir, "output");
   try {
+    // Under the pre-push hook git exports GIT_DIR and friends for the pushing
+    // checkout; inherited, they'd aim every command below at it. A decoy
+    // stands in for that checkout and must come through untouched.
+    const run = (cwd: string, env: Record<string, string>, ...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout.toString().trim();
+    };
+    mkdirSync(decoy);
+    const clean = repositoryGitEnv(process.env);
+    run(decoy, clean, "init", "-q");
+    run(decoy, clean, "commit", "-q", "--allow-empty", "-m", "decoy");
+    const decoyHead = run(decoy, clean, "rev-parse", "HEAD");
+    const env = repositoryGitEnv({ ...process.env, GIT_DIR: resolve(decoy, ".git"), GIT_WORK_TREE: decoy, GIT_INDEX_FILE: resolve(decoy, ".git/index") });
     const git = (...args: string[]) => {
-      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
       if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
       return r.stdout.toString().trim();
     };
@@ -106,9 +122,9 @@ test("scope marks a PR pin-only exactly when its one changed file is the marketp
       git("commit", "-q", "--allow-empty", "-m", "c");
       return git("rev-parse", "HEAD");
     };
-    const scope = (env: Record<string, string>) => {
+    const scope = (vars: Record<string, string>) => {
       writeFileSync(output, "");
-      const r = Bun.spawnSync(["bash", "-e", "-c", step.run], { cwd: repo, env: { ...Bun.env, GITHUB_OUTPUT: output, ...env }, stdout: "pipe", stderr: "pipe" });
+      const r = Bun.spawnSync(["bash", "-e", "-c", step.run], { cwd: repo, env: { ...env, GITHUB_OUTPUT: output, ...vars }, stdout: "pipe", stderr: "pipe" });
       expect(r.stderr.toString()).toBe("");
       expect(r.exitCode).toBe(0);
       return { pin: readFileSync(output, "utf8"), stdout: r.stdout.toString() };
@@ -129,6 +145,9 @@ test("scope marks a PR pin-only exactly when its one changed file is the marketp
     const at = (line: string) => stdout.split("\n").indexOf(line);
     expect(at(`::stop-commands::${token}`)).toBeLessThan(at("::error::injected"));
     expect(at("::error::injected")).toBeLessThan(at(`::${token}::`));
+    expect(run(decoy, clean, "rev-parse", "HEAD")).toBe(decoyHead);
+    expect(run(decoy, clean, "config", "core.bare")).toBe("false");
+    expect(run(decoy, clean, "status", "--porcelain")).toBe("");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
