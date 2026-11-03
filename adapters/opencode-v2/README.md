@@ -21,7 +21,7 @@ Replace the placeholder with the complete hash, not a branch, tag or abbreviated
 }
 ```
 
-Use native `/mcps` to sign in. No explicit OAuth client/scopes block or identity header is required. The selected native grant must authorize both `grayboard:tools` and `grayboard:delivery`. Current access and exact issuer/client/scope come from public connection projection; incomplete metadata or expired access fails closed. `Authorization`, `X-Grayboard-Identity`, subscriber-role and lease headers in the native entry are refused. Optional plugin `issuer` pins the exact native issuer string; it is not an endpoint-derived guess.
+Use native `/mcps` to sign in. No explicit OAuth client/scopes block or identity header is required. The selected native grant must authorize both `grayboard:tools` and `grayboard:delivery`. Current access and exact issuer/client/scope come from public connection projection; incomplete metadata or expired access fails closed. `Authorization`, `X-Grayboard-Identity`, subscriber-role and lease headers in the native entry are refused. Optional plugin `issuer` pins the exact native issuer string; it is not an endpoint-derived guess. Optional plugin `launcher: true` (only literal `true` counts) is this harness's `BUS_LAUNCHER=1`: every subscriber request declares the root a delegation launcher, so `delegate` can reach it once it's enrolled and bound.
 
 OpenCode loads the companion `./tui` entry alongside the package. A separate CLI talking to a remote OpenCode server needs the companion installed in its local CLI plugins too. The companion talks to public host RPC; no Grayboard executable is required.
 

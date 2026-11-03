@@ -18,7 +18,7 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 // `facts`: the model and effort the request reports (#364); present only, never a clearing.
 export type SessionFacts = { model?: string; effort?: string };
 // `suggested`: the name the request's checkout suggests (#443), normalized.
-// `launcher`: the request declares its harness can spawn subagents (#473); read at an ownership's start, and it only
+// `launcher`: the request declares its harness can spawn subagents (#473); any request of a root's ownership turns it on (#520), and it only
 // words the bind and initialize text afterwards.
 export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
@@ -186,7 +186,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), { ...context.facts, ...(context.launcher && writesAs === null ? { launcher: true } : {}) });
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -196,6 +196,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     }
     // The latest model and effort a request reports (#364); a write only on a change.
     if (row && context.facts) application.hostedFacts(p.authed, row.session_id, context.facts);
+    // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
+    // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
+    // and a tools-only root's are ignored; only the ownership's end clears it.
+    if (row && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id);
     return row;
   }
   function rootOf(row: HostedSession): HostedSession {

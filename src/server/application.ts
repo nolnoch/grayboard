@@ -781,7 +781,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
     // (`hostedCollided`, written after the rollback); without it the row is written here.
-    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string; launcher?: boolean }) {
+    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
@@ -793,10 +793,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (!prior) {
         repo.atomic(() => {
           const model = cleanFact(facts?.model), effort = cleanFact(facts?.effort);
-          registerId(db, { id, principal: authed.user_email, harness, launcher: facts?.launcher === true, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+          registerId(db, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
           writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
-          // The flag is the ownership's (ids.launcher, #473), audited as a local session's is, once per ownership.
-          if (facts?.launcher === true) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true });
         });
       }
       else {
@@ -806,12 +804,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
         if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
-        // The ownership's end cleared the launcher flag; a new one restates it (#473).
-        if (facts?.launcher === true) {
-          db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(id);
-          writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true });
-        }
       }
+    },
+    // A root's request declared a launcher (#473, #520): the flag is the ownership's (`ids.launcher`; its end clears
+    // it), turned on by whichever of its requests declares first and audited as a local session's is, once.
+    hostedDeclareLauncher(authed: AuthedUser, id: string) {
+      if (db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1`).run(id).changes) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value.
