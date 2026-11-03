@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configuredIdentity, defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { configuredIdentity, defaultIdentity, describeLocation, linkedWorktreeName, pinnedIdentity, resolveIdentity, sessionIdentity } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -123,9 +123,9 @@ describe("sessionIdentity", () => {
   });
 
   test("a BUS_IDENTITY equal to the repo's .omp/mcp.json pin stays derived: the suffix composes", () => {
-    // omp pins its own identity in .omp/mcp.json (README §Other harnesses)
-    // and delivers it as BUS_IDENTITY — an omp session in a worktree must
-    // keep the suffix it always had, so comparing against .mcp.json alone
+    // A BUS_IDENTITY equal to omp's .omp/mcp.json pin re-delivers it (omp
+    // ran that entry before #523) — an omp session in a worktree must keep
+    // the suffix it always had, so comparing against .mcp.json alone
     // (treating omp's pin as explicit) would orphan that handle's mail.
     const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
     mkdirSync(at("repo", ".omp"), { recursive: true });
@@ -146,18 +146,32 @@ describe("sessionIdentity", () => {
     }
   });
 
-  test("a repo with only an omp pin keeps the directory default: echo detection, not default naming", () => {
-    // The omp pin participates in isExplicitIdentity only (a BUS_IDENTITY
-    // re-delivering it stays derived). Default naming with no BUS_IDENTITY
-    // stays .mcp.json alone, as before this PR: a repo that pins only
-    // .omp/mcp.json keeps its directory-derived handles (#182 specifies
-    // default resolution further).
-    const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "fe" } } } };
+  test("default naming reads a repo's .omp/mcp.json pin under omp only, after .mcp.json, enabled or not", () => {
+    // Other harnesses never read .omp/mcp.json: a repo that pins only there
+    // keeps their directory-derived handles (#182). Under omp (its local
+    // adapter sets BUS_HARNESS=omp) the pin names the session, from a
+    // disabled entry too, since the adapter refuses an enabled one (#523).
+    const ompPin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], enabled: false, env: { BUS_IDENTITY: "fe" } } } };
     mkdirSync(at("repo", ".omp"), { recursive: true });
     writeFileSync(at("repo", ".omp", "mcp.json"), JSON.stringify(ompPin));
     try {
-      expect(sessionIdentity({}, at("repo", "src"))).toBe("repo");
-      expect(sessionIdentity({}, at("repo", ".wt", "stream"))).toBe("repo-stream");
+      for (const env of [{}, { BUS_HARNESS: "pi" }]) {
+        expect(sessionIdentity(env, at("repo", "src"))).toBe("repo");
+        expect(sessionIdentity(env, at("repo", ".wt", "stream"))).toBe("repo-stream");
+        expect(pinnedIdentity(at("repo", "src"), env)).toBeUndefined();
+      }
+      const omp = { BUS_HARNESS: "omp" };
+      expect(sessionIdentity(omp, at("repo", "src"))).toBe("fe");
+      expect(sessionIdentity(omp, at("repo", ".wt", "stream"))).toBe("fe-stream");
+      expect(pinnedIdentity(at("repo", "src"), omp)).toEqual({ name: "fe", file: ".omp/mcp.json" });
+      // .mcp.json's pin comes first, under omp too.
+      writeFileSync(at("repo", ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } }));
+      try {
+        expect(sessionIdentity(omp, at("repo", "src"))).toBe("be");
+        expect(pinnedIdentity(at("repo", "src"), omp)).toEqual({ name: "be", file: ".mcp.json" });
+      } finally {
+        rmSync(at("repo", ".mcp.json"));
+      }
     } finally {
       rmSync(at("repo", ".omp"), { recursive: true, force: true });
     }

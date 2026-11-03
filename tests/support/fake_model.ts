@@ -42,15 +42,16 @@ const actedSince = (req: ChatRequest, at: number): boolean => req.messages.slice
 
 // A subagent fan-out through omp's `task` tool (#280): when the latest user
 // message matches `trigger`, the parent calls `task` with `n` assignments, each
-// naming its child (`fake-child-<i>`). A child's own conversation, found by its
-// name in the first user message, makes the calls `child(i)` scripts, one per
-// assistant message, then ends its turn with text.
-export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Reply[]): Rule[] {
+// naming its child (`fake-child-<i>`, i from `first`: omp names agents per
+// process, so two fan-outs in one process need distinct ones). A child's own
+// conversation, found by its name in the first user message, makes the calls
+// `child(i)` scripts, one per assistant message, then ends its turn with text.
+export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Reply[], first = 0): Rule[] {
   const name = /\bfake-child-(\d+)\b/;
   const parent: Rule = (req) => {
     const at = req.messages.findLastIndex((m) => m.role === "user");
     if (at < 0 || !trigger.test(lastUserText(req)) || actedSince(req, at)) return undefined;
-    const tasks = Array.from({ length: n }, (_, i) => ({ name: `FakeChild${i}`, task: `You are fake-child-${i}.`, solutionSpace: "scripted" }));
+    const tasks = Array.from({ length: n }, (_, k) => first + k).map((i) => ({ name: `FakeChild${i}`, task: `You are fake-child-${i}.`, solutionSpace: "scripted" }));
     return { tool: "task", args: { context: "fake fan-out", tasks } };
   };
   const children: Rule = (req) => {
