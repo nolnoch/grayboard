@@ -123,7 +123,8 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
 
 /** What kind of session a registration is, beyond its row: see IdFacts. */
 // model, effort: what the session reports running on (BUS_MODEL, BUS_EFFORT; #284 S12).
-export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean; model?: string; effort?: string };
+// harnessSession: the harness's own id for it (BUS_HARNESS_SESSION, #523 step 5).
+export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean; model?: string; effort?: string; harnessSession?: string };
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
@@ -134,21 +135,25 @@ export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: bool
  * (attachSession) instead.
  */
 export function registerSession(db: Database, s: SessionRow, kind: SessionKind = {}): void {
+  db.transaction(() => registerRows(db, s, kind)).immediate();
+}
+
+// registerSession's rows, in the caller's transaction.
+function registerRows(db: Database, s: SessionRow, kind: SessionKind): void {
   // A keyed tools-only process has no harness row: its key is passed explicitly.
-  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null, model, effort } = kind;
-  db.transaction(() => {
-    const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed, model, effort }, s.started_at);
-    // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
-    if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });
-    db.prepare(
-      `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
-    writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
-      delivery: writesAs === undefined ? "push" : "none", ...(writesAs === undefined ? {} : { writes_as: writesAs }),
-      ...(viewer ? { viewer: true } : {}),
-      keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
-    });
-  }).immediate();
+  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null, model, effort, harnessSession } = kind;
+  const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed, model, effort, harnessSession }, s.started_at);
+  // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
+  if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });
+  db.prepare(
+    `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
+  writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
+    delivery: writesAs === undefined ? "push" : "none", ...(writesAs === undefined ? {} : { writes_as: writesAs }),
+    ...(viewer ? { viewer: true } : {}),
+    keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
+    ...(harnessSession === undefined ? {} : { harness_session: harnessSession }),
+  });
 }
 
 /**
@@ -167,6 +172,12 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
  * `raw` is harness-asserted: the child acts only under its root's
  * addresses, so the claim grants nothing and attributes the write.
  *
+ * A runner child (#523 step 5: a subagent process of its own, such as
+ * pi-subagents' detached runner) registers itself, with `own`: its own
+ * harness, cwd and harness session, unkeyed (its ID is minted, not derived
+ * from the root's key), and `detail` for the audit row. `raw` is then its
+ * harness session, or null.
+ *
  * Its bindings row (#539) copies the root's liveness (pid, start time,
  * harness pid and rule), unbound, with no attached process: v2.0.0 to v2.3.1
  * end every unended ID with no bindings row on each open, and judge this one
@@ -176,7 +187,7 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
  * so the copy stays true. This tree never reads it as a session
  * (SESSION_SQL) and drops it when the root ends (end).
  */
-export function registerChild(db: Database, root: string, child: string, raw: string, now = Date.now()): void {
+export function registerChild(db: Database, root: string, child: string, raw: string | null, now = Date.now(), own?: RunnerFacts): void {
   db.transaction(() => {
     const prior = db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(child) as { root_id: string | null; ended_at: number | null } | null;
     if (prior && prior.root_id !== root) throw new CoreError(`id_collision: ${child} is another session's ID, not a child of ${root}`);
@@ -189,11 +200,14 @@ export function registerChild(db: Database, root: string, child: string, raw: st
       { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
     if (!live) throw new CoreError(`id_ended: session ${root} has ended`);
     const r = db.prepare(`SELECT harness, cwd, keyed FROM ids WHERE id = ?`).get(root) as { harness: string | null; cwd: string | null; keyed: number } | null;
-    const reused = registerId(db, { id: child, principal: null, harness: r?.harness ?? null, cwd: r?.cwd ?? null, launcher: false, keyed: r?.keyed === 1, rootId: root }, now);
+    const facts = own
+      ? { harness: own.harness, cwd: own.cwd, keyed: false, harnessSession: own.harnessSession }
+      : { harness: r?.harness ?? null, cwd: r?.cwd ?? null, keyed: r?.keyed === 1 };
+    const reused = registerId(db, { id: child, principal: null, launcher: false, ...facts, rootId: root }, now);
     if (reused) writeCoreAudit(db, "id.reused", child, child, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: process.pid });
     db.prepare(`INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(child, live.pid, live.proc_start, live.harness_pid, now, live.harness_rule);
-    writeCoreAudit(db, "id.child_seen", root, child, { child, root, raw, pid: process.pid, liveness_pid: live.pid });
+    writeCoreAudit(db, "id.child_seen", root, child, { child, root, raw, pid: process.pid, liveness_pid: live.pid, ...own?.detail });
   }).immediate();
 }
 
@@ -222,6 +236,76 @@ export class ChildSessions {
     touchId(this.db, child.id, now);
     return child.id;
   }
+}
+
+/** A runner child's own facts (registerChild's `own`), and the audit detail its registration carries. */
+export type RunnerFacts = { harness: string | null; cwd: string | null; harnessSession?: string; detail?: Record<string, unknown> };
+
+/**
+ * The live session a runner child (#523 step 5) acts under: the root
+ * session that recorded `parentSession` as its harness session
+ * (BUS_HARNESS_SESSION), alive by its bindings row's pid and start time,
+ * whose harness pid is among this process's ancestors `up`. Only an
+ * ancestor: the harness session is the harness's assertion, and a live
+ * session elsewhere that recorded it (the same pi session reopened in
+ * another process) didn't start this one. The nearest when several are.
+ * Else why none is, for the fallback's log and audit.
+ */
+export function runnerRoot(db: Database, parentSession: string, up = ancestors()): { root: string } | { why: string } {
+  const rows = db.prepare(
+    `SELECT i.id AS session_id, b.pid, b.proc_start, b.harness_pid FROM ids i JOIN bindings b ON b.session_id = i.id
+      WHERE i.harness_session = ? AND i.root_id IS NULL AND i.ended_at IS NULL AND i.delivery = 'push' AND i.viewer = 0`,
+  ).all(parentSession) as { session_id: string; pid: number; proc_start: string | null; harness_pid: number | null }[];
+  const { alive } = aliveRows(rows);
+  const mine = alive
+    .filter((r) => r.harness_pid !== null && up.includes(r.harness_pid))
+    .sort((a, b) => up.indexOf(a.harness_pid!) - up.indexOf(b.harness_pid!));
+  if (mine.length) return { root: mine[0]!.session_id };
+  const other = alive[0];
+  if (other) return { why: `the live session ${other.session_id} recorded harness session ${parentSession}, but its harness pid ${other.harness_pid} isn't an ancestor of this process` };
+  return { why: `no live session recorded harness session ${parentSession}` };
+}
+
+/**
+ * Whether runner child `child` still acts under `root` (#523 step 5):
+ * neither has ended, and the root's process is the one its bindings row
+ * names. Read before each of the child's calls.
+ */
+export function runnerRootLive(db: Database, child: string, root: string): boolean {
+  const r = db.prepare(
+    `SELECT b.pid, b.proc_start FROM bindings b JOIN ids r ON r.id = b.session_id JOIN ids c ON c.id = ?1
+      WHERE b.session_id = ?2 AND r.ended_at IS NULL AND c.ended_at IS NULL AND c.root_id = ?2`,
+  ).get(child, root) as { pid: number; proc_start: string | null } | null;
+  return r !== null && isAlive(r.pid, r.proc_start);
+}
+
+/**
+ * Runner child `child` (#523 step 5) of `root` becoming its own root
+ * session `self`, registered unbound with `kind`; `detail` goes in the audit
+ * row. A new ID, never the child's: a child ID is never an address, ended or
+ * not, and its row keeps `root_id`, the lasting record of whose subagent
+ * wrote what it stored as `via`.
+ */
+export type Leave = { child: string; root: string; self: SessionRow; kind: SessionKind; detail: Record<string, unknown> };
+
+// In the caller's transaction: `self` registers, the child ends (unless its
+// root's end already ended it), and `action` is audited on `self`.
+function leaveRoot(db: Database, l: Leave, action: "id.promoted" | "id.child_fallback", why: string, now: number): Ended {
+  registerRows(db, l.self, l.kind);
+  const out: Ended = { ended: [], wake: [] };
+  const r = end(db, l.child, why, now);
+  if (r.ended) merge(out, l.child, r);
+  writeCoreAudit(db, action, l.self.session_id, l.self.session_id, { child: l.child, root: l.root, pid: process.pid, ...l.detail });
+  return out;
+}
+
+/**
+ * A runner child whose root isn't live (#523 step 5), its parent harness
+ * having exited while it runs on, is its own session from now on
+ * (`id.child_fallback`). A bind promotes one instead (acquireName's `promote`).
+ */
+export function childFallback(db: Database, l: Leave): Ended {
+  return db.transaction(() => leaveRoot(db, l, "id.child_fallback", `its root ${l.root} isn't live`, Date.now())).immediate();
 }
 
 export type AttachResult = { ok: true; held: string[] } | { ok: false; error: string };
@@ -456,6 +540,12 @@ function holdingSession(db: Database, name: string, sessionId: string | null = n
  * against the name's history in the transaction that logs the bind (#211),
  * and `restored` says whether it held. Refusals are logged.
  *
+ * `promote`: a runner child's bind (#523 step 5), which promotes it to its
+ * own root session `sessionId` (promote.self), in the transaction that takes
+ * the hold: a refused bind leaves it the child it was, its refusal logged
+ * under the child's ID; a taken one registers the new session, ends the
+ * child and audits `id.promoted` (leaveRoot) before the hold.
+ *
  * The socket probe for a pre-upgrade holder (no live hold, live socket) runs
  * before the lock and is re-checked against the rows inside it, so the write
  * lock is never held across a probe. A dead holder doesn't skip it: a settled
@@ -465,7 +555,7 @@ export async function acquireName(
   db: Database,
   sessionId: string,
   name: string,
-  opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet },
+  opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet; promote?: Leave },
 ): Promise<AcquireResult> {
   const before = holdingSession(db, name, sessionId);
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
@@ -475,7 +565,7 @@ export async function acquireName(
     const now = Date.now();
     let ended = NOTHING_ENDED;
     const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
-      logBinding(db, sessionId, name, "refused", extra.holder ?? error, now);
+      logBinding(db, opts.promote?.child ?? sessionId, name, "refused", extra.holder ?? error, now);
       return { ok: false, error, ...extra, ended };
     };
     testPause("bind:in-txn");
@@ -497,6 +587,10 @@ export async function acquireName(
     if (sockLive) {
       const who = noRowHolder(db, name, before !== null || holder !== null);
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
+    }
+    if (opts.promote) {
+      const promoted = leaveRoot(db, opts.promote, "id.promoted", `promoted to its own session ${sessionId}`, now);
+      ended = { ended: [...ended.ended, ...promoted.ended], wake: [...new Set([...ended.wake, ...promoted.wake])] };
     }
 
     // bindings.name mirrors the primary for a 1.x process sharing the file

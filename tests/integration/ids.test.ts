@@ -439,6 +439,37 @@ test("a child's bind and unbind are refused child_session; its raw ID must be 1â
   expect(childSeen()).toHaveLength(2);
 }, 30_000);
 
+// #523 step 5: a runner child (a subagent process of its own, BUS_PARENT_SESSION)
+// is the child of the live root that recorded that harness session, only if
+// the root's harness is among the runner's ancestors; a subagent calling
+// through the runner is the root's child too, as hosted resolves a nested
+// subagent to its root: a child's root is always a root. Each test session
+// runs under a harness of its own, so the root here is keyed to this test
+// process, which every session descends from.
+test("a runner child acts under the root its harness started; a subagent calling through it is the root's child, not the runner's", async () => {
+  const fe = await localSession(dir, "fe", { extra: { BUS_SESSION_KEY: mintSessionKey(), BUS_HARNESS_PID: String(process.pid), BUS_HARNESS_SESSION: "pi-1" } });
+  const be = await localSession(dir, "be", { extra: { BUS_HARNESS_SESSION: "pi-2" } });
+  const root = (await fe.call("whoami")).id as string;
+  // be's harness didn't start it: it is its own session.
+  const stray = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-2" } });
+  const own = (await stray.call("whoami")) as Who;
+  expect(own).toEqual({ id: own.id, primary: own.id, aliases: [], principal: null });
+  expect(rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'id.child_fallback' AND actor = ?`, own.id).map((r) => JSON.parse(r.detail).why))
+    .toEqual([expect.stringMatching(/^the live session id:\w+ recorded harness session pi-2, but its harness pid \d+ isn't an ancestor of this process$/)]);
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1" } });
+  const who = (await runner.call("whoami")) as Who;
+  expect(who).toEqual({ id: who.id, primary: "fe", aliases: ["fe"], principal: null, root, child: true });
+  const nested = await asChild<Who>(runner, "worker-1", "whoami");
+  expect(nested).toEqual({ id: nested.id, primary: "fe", aliases: ["fe"], principal: null, root, child: true });
+  expect(nested.id).not.toBe(who.id);
+  expect(rows(`SELECT id, root_id FROM ids WHERE root_id IS NOT NULL ORDER BY rowid`)).toEqual([{ id: who.id, root_id: root }, { id: nested.id, root_id: root }]);
+  await asChild<Sent>(runner, "worker-1", "dm_send", { to: "be", body: "from the nested subagent" });
+  expect(rows(`SELECT sender, sender_id, via FROM messages WHERE body = 'from the nested subagent'`)).toEqual([{ sender: "fe", sender_id: nested.id, via: nested.id }]);
+  expect(await childRefusal(runner, "worker-1", "bind", { name: "qa", create: true })).toBe(`error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`);
+  await until(() => be.pushes.some((p) => p.content === "from the nested subagent"));
+  expect(be.pushes.find((p) => p.content === "from the nested subagent")!.meta).toMatchObject({ from: "fe", via: nested.id });
+}, 30_000);
+
 test("a DM or @mention to a child's ID is refused child_session naming its root's primary; the child ends with its root and stays refused", async () => {
   const be = await session("be");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
