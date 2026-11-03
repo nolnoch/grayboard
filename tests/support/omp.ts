@@ -17,7 +17,7 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv } from "./env.ts";
 import { messageText, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { answerPeer, expectDeliveryRecords, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { grayboardDescendants } from "./procs.ts";
 import { ROOT } from "./paths.ts";
 import { until } from "./until.ts";
@@ -99,6 +99,17 @@ const liveChildren = (srv: HostedServer, root: string): string[] => srv.app.db.q
   "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?").all(root).map((r) => r.session_id);
 // A model request made by a task subagent (taskFanout's child prompt).
 const fromChild = (req: ChatRequest): boolean => /\bfake-child-\d+\b/.test(messageText(req.messages.find((m) => m.role === "user") ?? { role: "user", content: "" }));
+// The non-tool text of a request: the system prompt and any message omp
+// injected (a custom message reaches the model as developer or user).
+const promptOf = (req: ChatRequest): string => req.messages.filter((m) => m.role !== "tool").map(messageText).join("\n");
+// The request that carried DM `ping` holds `name`'s instructions once and not
+// the unbound ones: a turn a push started gets them refreshed or injected (#441).
+function expectInstructed(model: FakeModel, ping: number, name: string): void {
+  const req = model.requests.find((r) => r.body.messages.some((m) => messageText(m).includes(`<channel source="grayboard" message_id="${ping}"`)));
+  expect(req).toBeDefined();
+  expect(promptOf(req!.body).split(`You are "alice@example.com/${name}" on grayboard.`)).toHaveLength(2);
+  expect(promptOf(req!.body)).not.toContain("no bus name yet");
+}
 
 type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
 
@@ -215,12 +226,10 @@ export function ompHostedScenario(dir: string): Promise<void> {
     await idle(omp);
     const woken = model.requests[asked]!.body;
     expect(messageText(woken.messages.at(-1)!)).toContain(`<channel source="grayboard" message_id="${ping}" from="${PEER}"`);
-    // omp runs before_agent_start only for a user prompt, so a wake keeps the
-    // last prompt's system prompt (here still unbound); the bind result in
-    // context says that note no longer applies, as with local omp's static
-    // MCP instructions.
-    expect(systemText(woken)).toBe(systemText(model.requests[asked - 1]!.body));
-    expect(woken.messages.some((m) => messageText(m).includes("the instructions' note that this session has no bus name no longer applies"))).toBe(true);
+    // omp runs before_agent_start only for a user prompt; the entry rewrites
+    // the stale (unbound) instructions in the wake's request (#441).
+    expect(systemText(woken)).toContain('You are "alice@example.com/omp-task" on grayboard.');
+    expect(systemText(woken)).not.toContain("no bus name yet");
     expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
     expect(srv.app.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM messages WHERE parent_id = ?").get(ping)!.n).toBe(1);
 
@@ -298,6 +307,13 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body LIKE 'child %' ORDER BY body").all())
       .toEqual([0, 1].map((i) => ({ body: `child ${i}`, sender: "alice@example.com/omp-task" })));
     expect(liveChildren(srv, root).sort()).toEqual([...children].sort());
+    // A subagent's requests carry no grayboard instructions.
+    const childRequests = model.requests.filter((r) => fromChild(r.body));
+    expect(childRequests.length).toBeGreaterThan(0);
+    for (const r of childRequests) {
+      expect(promptOf(r.body)).not.toContain("on grayboard.");
+      expect(promptOf(r.body)).not.toContain("no bus name yet");
+    }
 
     // A peer's DM mid-run reaches main once and no subagent.
     const ping = await pingPong(srv, peer, "omp-task");
@@ -324,13 +340,14 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 // the first session rebinds that session's remembered name. Each time the
 // name receives in the current session and the outgoing one has ended.
 export function ompHostedCarryScenario(dir: string): Promise<void> {
-  return withHosted(dir, [scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-carry", create: true } }])], async ({ srv, peer, start }) => {
+  return withHosted(dir, [scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-carry", create: true } }])], async ({ srv, model, peer, start }) => {
     await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
     const omp = start({ persist: true });
     const first = await omp.command({ type: "get_state" }, 30_000);
     await omp.command({ type: "prompt", message: "bind" });
     await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 30_000, "first session leased as omp-carry");
-    await pingPong(srv, peer, "omp-carry");
+    const p1 = await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, p1, "omp-carry");
     await idle(omp);
     const firstOwnership = ompRow(srv, first.sessionId)!.ownership_id;
 
@@ -342,7 +359,7 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect(ompRow(srv, first.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, firstOwnership)).toBe(true);
     expect(ompRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, await pingPong(srv, peer, "omp-carry"), "omp-carry");
     await idle(omp);
 
     // /new carries it on.
@@ -353,7 +370,8 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     await until(() => leasedAs(srv, fresh.sessionId, "omp-carry"), 15_000, "new session leased as omp-carry");
     expect(ompRow(srv, forked.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, forkOwnership)).toBe(true);
-    await pingPong(srv, peer, "omp-carry");
+    const p3 = await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, p3, "omp-carry");
     await idle(omp);
 
     // /resume of the first session: it rebinds the name it remembers.
@@ -361,10 +379,15 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect((await omp.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
     await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 15_000, "resumed first session leased as omp-carry");
     expect(ompRow(srv, fresh.sessionId)).toBeUndefined();
-    await pingPong(srv, peer, "omp-carry");
+    const p4 = await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, p4, "omp-carry");
     await idle(omp);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+    // Each session's file records its deliveries: the first holds the DMs it
+    // received before the fork and after the resume, /new's the one it did.
+    await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "omp-carry");
+    await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "omp-carry");
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, first.sessionId), 10_000, "released on quit");
   });

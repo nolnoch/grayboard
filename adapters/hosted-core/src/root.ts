@@ -29,6 +29,7 @@ export type RootOptions = {
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
   admit(item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
+  receipted?(ids: readonly string[]): void; // the server committed these items' receipt (HostPort.receipted)
   onTools(tools: NativeTool[]): void;
 };
 export type RootStatus = {
@@ -199,6 +200,7 @@ export class RootDelivery {
         if (signal.aborted) throw new Refusal("paused", `the ${c.harness} session closed`);
         await this.o.admit(item, stableID, identity, signal);
       },
+      ...(this.o.receipted ? { receipted: (_e: unknown, ids: readonly string[]) => this.o.receipted!(ids) } : {}),
     };
   }
 

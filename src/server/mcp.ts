@@ -33,7 +33,10 @@ const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", te
 // `declared`: the native request's declared delivery (#429), for text only.
 type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
-type Legacy = { meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean };
+// A legacy session whose access token expired with its grant still active sleeps
+// (#476): its admission is released, its sid stays, and the binding's next
+// authenticated request re-admits it. `dormant` holds the separate dormant bound.
+type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; dormant?: { since: number; release(): void } };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits }) {
@@ -50,12 +53,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
   let closed = false, posts = 0, busListeners = 0;
   const limits = opts.limits ?? DEFAULT_MCP_LIMITS;
-  const capacity = { listen: new Map<number, number>(), legacy: new Map<number, number>(), post: new Map<number, number>() };
-  const used = { listen: 0, legacy: 0, post: 0 };
-  function reserve(kind: keyof McpLimits, principal: OAuthPrincipal): (() => void) | undefined {
-    const counts = capacity[kind], user = principal.authed.user_id;
+  // Dormant legacy sessions hold no admission; their own bound reuses the legacy limits (#476).
+  type CapacityKind = keyof McpLimits | "dormant";
+  const capacity: Record<CapacityKind, Map<number, number>> = { listen: new Map(), legacy: new Map(), post: new Map(), dormant: new Map() };
+  const used: Record<CapacityKind, number> = { listen: 0, legacy: 0, post: 0, dormant: 0 };
+  function reserve(kind: CapacityKind, principal: OAuthPrincipal): (() => void) | undefined {
+    const counts = capacity[kind], user = principal.authed.user_id, limit = limits[kind === "dormant" ? "legacy" : kind];
     const count = counts.get(user) ?? 0;
-    const scope = used[kind] >= limits[kind].global ? "global" : count >= limits[kind].perUser ? "user" : undefined;
+    const scope = used[kind] >= limit.global ? "global" : count >= limit.perUser ? "user" : undefined;
     if (scope) {
       writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId });
       return undefined;
@@ -91,6 +96,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const principals = new Map<ApplicationSession, OAuthPrincipal>();
   const legacySessions = new Map<string, Legacy>();
   const legacyAll = new Set<Legacy>();
+  const legacyDormant = new Set<Legacy>();
   const lives = new Set<Live>();
   const forwarding = new Set<OwnedStream>();
   const streamContexts = new Map<OwnedStream, Context>();
@@ -290,7 +296,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       closed() {
         if (!capability) return;
         for (const live of [...lives]) if (live.uris.get("grayboard://inbox") === capability) live.stop();
-        for (const legacy of legacyAll) if (legacy.subscriptions.get("grayboard://inbox") === capability) legacy.subscriptions.delete("grayboard://inbox");
+        for (const legacy of [...legacyAll, ...legacyDormant]) if (legacy.subscriptions.get("grayboard://inbox") === capability) legacy.subscriptions.delete("grayboard://inbox");
       },
     };
   }
@@ -300,7 +306,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.declared),
+      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.declared, "id" in context.sessionContext && application.hostedLauncher(context.sessionContext.id)),
     });
     server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });
@@ -385,7 +391,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (failed) report();
     legacy.stopped = true;
     legacy.release();
+    legacy.dormant?.release();
     legacyAll.delete(legacy);
+    legacyDormant.delete(legacy);
     for (const [id, value] of legacySessions) if (value === legacy) legacySessions.delete(id);
     if (legacy.stream?.stream) streamContexts.delete(legacy.stream.stream);
     try { legacy.stream?.stop(); } catch { report(); }
@@ -405,10 +413,51 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       hosted.audit(context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
     } catch (e) { hostedFailure("mcp.stream", e); }
   }
+  // Legacy lifecycle transitions are audited with a per-session random ref, never the sid (#476).
+  function legacyAudit(legacy: Legacy, action: "hosted.legacy_dormant" | "hosted.legacy_rehydrated" | "hosted.legacy_dropped", detail: Record<string, unknown>) {
+    try {
+      const context = sessionContext(legacy.principal, legacy.meta);
+      writeAudit(application.repo, action, legacy.principal.authed.user_email, "id" in context ? context.id : null, { ...detail, ref: legacy.ref, grant: legacy.principal.grantId, client_id: legacy.principal.clientId });
+    } catch (e) { hostedFailure("mcp.legacy", e); }
+  }
+  function sleep(legacy: Legacy) {
+    const hold = reserve("dormant", legacy.principal);
+    if (!hold) {
+      if (legacy.stream) streamClosed(legacy.stream.context, new ApplicationError("unauthenticated", "unauthenticated"));
+      drop(legacy, "capacity");
+      return;
+    }
+    legacy.release();
+    legacyAll.delete(legacy);
+    legacy.dormant = { since: now(), release: hold };
+    legacyDormant.add(legacy);
+    const stream = legacy.stream;
+    if (stream) {
+      if (stream.stream) streamContexts.delete(stream.stream);
+      streamClosed(stream.context, new ApplicationError("unauthenticated", "unauthenticated"));
+      stream.stop();
+    }
+    legacyAudit(legacy, "hosted.legacy_dormant", { subscriptions: legacy.subscriptions.size });
+  }
+  function drop(legacy: Legacy, reason: string, failed = false) {
+    if (legacy.stopped) return;
+    legacyAudit(legacy, "hosted.legacy_dropped", { reason, dormant_ms: legacy.dormant ? now() - legacy.dormant.since : 0 });
+    retire(legacy, failed);
+  }
   const timer = setInterval(() => {
+    for (const legacy of [...legacyDormant]) {
+      try {
+        if (!oauth.isGrantActive(legacy.principal.grantId)) drop(legacy, "grant_ended");
+        // An in-flight POST keeps its transport; idleness counts from dormancy or the last request, whichever is later.
+        else if (legacy.posts === 0 && now() - Math.max(legacy.dormant!.since, legacy.lastUsed) >= 60_000) drop(legacy, "idle");
+      } catch { drop(legacy, "failed", true); }
+    }
     for (const legacy of [...legacyAll]) {
       try {
-        if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
+        if (!oauth.isAuthorized(legacy.principal)) {
+          if (legacy.principal.accessExpiry <= now() && oauth.isGrantActive(legacy.principal.grantId)) sleep(legacy);
+          else retire(legacy);
+        } else if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
     }
     for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(live.context, e); live.stop(); } }
@@ -443,6 +492,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     get activeGetStreams() { return [...lives].filter(l => !!l.legacy).length; },
     get activeInboxListeners() { return [...lives].filter(l => l.uris.has("grayboard://inbox")).length; },
     get activeLegacySessions() { return legacyAll.size; },
+    get dormantLegacySessions() { return legacyDormant.size; },
     get activePosts() { return posts; },
     async fetch(original: Request, address = "unknown"): Promise<Response> {
       const boundary: Exchange = { request: original, address, protocol: MCP_PROTOCOL_VERSIONS.includes(original.headers.get("Mcp-Protocol-Version") ?? "") ? original.headers.get("Mcp-Protocol-Version")! : "unspecified" };
@@ -511,12 +561,35 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               // A GET or DELETE replays the creating POST's `_meta` for routing; its model and effort are stale by then (#364).
               if (req.method !== "POST" && legacy) exchange.meta = withoutFacts(legacy.meta);
               const context = exchange.context = await select(req);
+              // The timer may have dropped this sid while identity selection awaited.
+              if (legacy?.stopped) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }
+              if (legacy?.dormant) {
+                // A dormant sid is never resurrected for another binding: 404 tells its client to re-initialize (#476).
+                // Only its own user under a new grant drops it; a stranger's guess leaves it to the idle reclaim.
+                if (!matches(legacy.binding, binding(context))) {
+                  const own = legacy.binding.user === principal.authed.user_id && legacy.binding.email === principal.authed.user_email;
+                  if (own && legacy.binding.grant !== principal.grantId) drop(legacy, "grant_changed");
+                  context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 });
+                }
+                // Teardown needs no admission.
+                if (req.method === "DELETE") { drop(legacy, "deleted"); context.finish(); releasePost(); return new Response(null, { status: 200 }); }
+                const release = reserve("legacy", principal);
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                const since = legacy.dormant.since;
+                legacy.dormant.release();
+                legacy.dormant = undefined;
+                legacyDormant.delete(legacy);
+                legacy.release = release;
+                legacy.principal = principal;
+                legacyAll.add(legacy);
+                legacyAudit(legacy, "hosted.legacy_rehydrated", { dormant_ms: now() - since });
+              }
               if (legacy && !matches(legacy.binding, binding(context))) { context.finish(); releasePost(); return new Response("MCP session binding mismatch", { status: 403 }); }
               if (!legacy) {
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
                 const release = reserve("legacy", principal);
                 if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
-                legacy = { meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
+                legacy = { ref: crypto.randomUUID(), meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
                 const created = legacy;
                 newLegacy = legacy;
                 legacy.transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID(), keepAliveMs: 5000,
@@ -575,6 +648,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       clearInterval(timer);
       shutdown.abort();
       for (const live of [...lives]) live.stop();
+      for (const legacy of [...legacyDormant]) drop(legacy, "shutdown");
       for (const legacy of [...legacyAll]) retire(legacy);
       // A failed drain or lease detach mustn't skip the final heartbeat or leave
       // the hosted timer running against a closed database (#423).
@@ -612,7 +686,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
-    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request"].includes(e.code)) refuse(e.code);
+    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
     return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.

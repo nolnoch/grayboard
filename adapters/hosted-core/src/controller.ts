@@ -424,6 +424,7 @@ export class Controller<E extends Enrollment = Enrollment> {
                 await wire!.call("delivery_receipt", { ids });
                 for (const id of ids) { attempts.delete(id); r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`); }
                 failures = 0; throttles = 0; recoveries = 0; unreachable = 0; pendingItem = undefined;
+                try { this.port.receipted?.(e, ids); } catch (error) { this.failure("receipt_hook", error, r); }
               });
               if (items.length === 100) dirty = true;
             }

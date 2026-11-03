@@ -30,6 +30,8 @@ function runtime(mode: Mode) {
   let accessFault: AccessReason | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
+  // The host's receipt hook (#441), when a test sets one.
+  let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
   const loops: FakeWire[] = [];
   const address = (name: string) => name.includes("/") ? name : `you@example.com/${name}`;
   // A bind adds a hold; an unbind releases one and bumps the generation too (#451).
@@ -117,6 +119,7 @@ function runtime(mode: Mode) {
     ancestry: sessionID => resolveRoot(sessionID, async id => { if (!nodes.has(id)) throw new Error("missing"); return { id, parentID: nodes.get(id), time: {} }; }),
     credential, approval,
     admit: async (e, item, id, _identity, signal) => { admits.push({ sessionID: e.sessionID, id, item: item.id }); await admitHold?.(signal); },
+    receipted: (e, ids) => receiptHook?.(e.sessionID, ids),
   };
   const make = (options: ControllerOptions = {}) => new Controller(port, { Transport: FakeWire as unknown as typeof Wire, ...options });
   const controller = make();
@@ -130,6 +133,7 @@ function runtime(mode: Mode) {
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
+    onReceipted: (hook: (sessionID: string, ids: readonly string[]) => void) => { receiptHook = hook; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     // The grant changes before any watch's next tick; the server then closes `id`'s stream.
     revoke: (id: string) => { grant++; streams.get(id)?.(); },
@@ -390,6 +394,30 @@ test.each(modes)("a receipt that fails once leaves the item admitted once and re
     expect(r.admits.map(a => a.item)).toEqual(["direct:1", "direct:2"]);
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"], ["direct:2"]]);
   } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a receipt hook that throws: each receipt still commits once, the root isn't paused, the sink names the hook (%s)", async mode => {
+  const r = runtime(mode);
+  const records: { state: string; operation: string; sessionID?: string }[] = [];
+  const c = r.make({ sink: record => { records.push({ ...record }); } });
+  const hooked: [string, string[]][] = [];
+  r.onReceipted((sessionID, ids) => { hooked.push([sessionID, [...ids]]); throw new Error("session file gone"); });
+  try {
+    r.batches.set("R", [r.item("direct:1"), r.item("direct:2")]);
+    await c.enroll("R", ["be"], true);
+    await until(() => r.batches.get("R")?.length === 0 && hooked.length === 2, 10_000);
+    expect(hooked).toEqual([["R", ["direct:1"]], ["R", ["direct:2"]]]);
+    // Neither item replayed, nor the lease reopened: the loop never saw the throw.
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1", "direct:2"]);
+    expect(r.named("delivery_receipt").map(x => x.args.ids)).toEqual([["direct:1"], ["direct:2"]]);
+    expect(r.named("delivery_open")).toHaveLength(1);
+    // Reported, not paused: the last record is the hook's, and delivery goes on.
+    expect(r.root(c)).toMatchObject({ state: "degraded", operation: "receipt_hook" });
+    expect(records.filter(x => x.operation === "receipt_hook")).toEqual([
+      expect.objectContaining({ state: "degraded", sessionID: "R" }),
+      expect.objectContaining({ state: "degraded", sessionID: "R" }),
+    ]);
+  } finally { await c.close(); await r.controller.close(); }
 });
 
 // The item's first renew is #2 (#1 is the pre-admission renew): it fails

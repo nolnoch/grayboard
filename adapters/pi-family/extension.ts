@@ -35,6 +35,12 @@ export type SessionInfo = { id: string; file?: string; parentFile?: string; reas
 // when the runner gave no parent session, so it can't be attributed) through
 // the intermediate subagent sessions `via`, outermost first (audit only).
 export type Marker = { child: false } | { child: true; root?: string; via?: string[] };
+// An admission (rendered and handed to the harness) or a receipt (the server
+// committed it). `root` names the session that admitted it, since /fork
+// copies entries into the fork; `itemId` joins an admission to its receipt.
+export type DeliveryEntry =
+  | { event: "admitted"; root: string; itemId: string; stableID: string; wake: boolean; at: string }
+  | { event: "receipted"; root: string; itemIds: string[]; at: string };
 
 export interface Harness {
   readonly name: string;     // "pi" | "omp", in messages
@@ -47,6 +53,9 @@ export interface Harness {
   // A rendered `<channel>`; `wake` starts a turn (idle) or steers in (mid-run).
   deliver(content: string, wake: boolean): void;
   notify(message: string, level: Level): void;
+  // Appends a `grayboard-delivery` entry to the session file (pi.appendEntry):
+  // the delivery record of the session an item changed. Never message bodies.
+  record(data: DeliveryEntry): void;
 }
 
 export const LOGIN_ACTION = "run /grayboard login";
@@ -110,6 +119,11 @@ export function createGrayboard(h: Harness): Grayboard {
   // Said until this session's shutdown finishes, so its own records (a
   // release that failed) land inside the harness's shutdown handler.
   const log = (message: string, level: Level = "info") => { if (!done) h.notify(`grayboard: ${message}`, level); };
+  // Same gate. A record that fails never fails the admission or receipt it records.
+  const record = (data: DeliveryEntry) => {
+    if (done) return;
+    try { h.record(data); } catch (error) { log(`couldn't record a delivery ${data.event} in the session file: ${message(error)}`, "warning"); }
+  };
   // The bind's `where` (peer_list, a name refusal's holder text): this
   // process's checkout, as server mode's `grayboard mcp` sent it.
   const place = describeLocation(process.cwd()) ?? h.name;
@@ -150,7 +164,7 @@ export function createGrayboard(h: Harness): Grayboard {
 
   const client = login ? new HostedClient({
     harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
-    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, log,
+    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
   }) : undefined;
 
   // ---- tools ----
@@ -278,10 +292,13 @@ export function createGrayboard(h: Harness): Grayboard {
         if (!admitted) state.admitted.set(id, admitted = new Set());
         if (admitted.has(stableID)) return;
         const params = channelParams(item, identity);
-        h.deliver(render(params, SOURCE), wakes(item.actionable, params.meta));
+        const wake = wakes(item.actionable, params.meta);
+        h.deliver(render(params, SOURCE), wake);
         admitted.add(stableID);
         if (admitted.size > ADMITTED_LIMIT) admitted.delete(admitted.values().next().value!);
+        record({ event: "admitted", root: id, itemId: item.id, stableID, wake, at: new Date().toISOString() });
       },
+      receipted: ids => record({ event: "receipted", root: id, itemIds: [...ids], at: new Date().toISOString() }),
       onTools: tools => h.register(tools, call),
     });
     await root.start();

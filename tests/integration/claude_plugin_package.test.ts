@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { BUNDLE, bundle } from "../../scripts/build_claude_plugin.ts";
-import { pinMarketplace, SHA_RE, TAG_RE } from "../../scripts/pin_claude_plugin.ts";
+import { pinMarketplace, renderMarketplace, SHA_RE, TAG_RE, verifyPin } from "../../scripts/pin_claude_plugin.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const ROOT = resolve(import.meta.dir, "../..");
@@ -65,6 +65,47 @@ test("the release job's pin writes that entry, replacing any earlier pin, and re
   expect({ ...next, plugins: [] }).toEqual({ ...marketplace, plugins: [] });
   expect(() => pinMarketplace(marketplace, "2.3.0", sha)).toThrow("isn't a release tag");
   expect(() => pinMarketplace(marketplace, "v2.3.0", sha.slice(1))).toThrow("isn't a full 40-hex commit");
+});
+
+// #507: a pin-only PR skips the suites, so its check must prove the file is
+// only a forward pin: anything else beside the pin, or a downgrade, fails.
+test("the pin PR's check accepts exactly the script's re-pin of the base to a newer release", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const base = renderMarketplace(pinMarketplace(marketplace, "v2.3.0", sha));
+  const pinned = (ref: string, doc = JSON.parse(base)) => renderMarketplace(pinMarketplace(doc, ref, sha.replace("0", "f")));
+  expect(verifyPin(base, pinned("v2.3.1"))).toEqual({ ref: "v2.3.1", sha: sha.replace("0", "f") });
+  expect(verifyPin(renderMarketplace({ ...marketplace, plugins: [] }), pinned("v2.3.0"))).toEqual({ ref: "v2.3.0", sha: sha.replace("0", "f") });
+  const head = JSON.parse(pinned("v2.3.1"));
+  const changed = (edit: (doc: any) => void) => { const doc = structuredClone(head); edit(doc); return renderMarketplace(doc); };
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].mcpServers = { x: { command: "sh" } }; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.extra = 1; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.owner = { name: "someone" }; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins.push(doc.plugins[0]); }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.url = "https://example.com/x.git"; }))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, JSON.stringify(head))).toThrow("changes more than the base's pin");
+  expect(() => verifyPin(base, pinned("v2.3.0"))).toThrow("v2.3.0 isn't newer than the base's pin v2.3.0");
+  expect(() => verifyPin(base, pinned("v2.2.9"))).toThrow("isn't newer");
+  expect(() => verifyPin(base, pinned("v2.3.0-rc1"))).toThrow("isn't newer");
+  expect(() => verifyPin(base, changed((doc) => { doc.plugins[0].source.sha = "HEAD"; }))).toThrow("isn't a full 40-hex commit");
+  expect(() => verifyPin(base, renderMarketplace({ ...head, plugins: [] }))).toThrow("no pinned grayboard entry");
+});
+
+test("`verify <base>` checks the committed marketplace against a base file and exits 1 naming the failure", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-pin-verify-"));
+  try {
+    const run = (base: string) => {
+      writeFileSync(join(dir, "base.json"), base);
+      return Bun.spawnSync([process.execPath, join(ROOT, "scripts/pin_claude_plugin.ts"), "verify", join(dir, "base.json")], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    };
+    const ok = run(renderMarketplace({ ...marketplace, plugins: [] }));
+    expect(ok.stderr.toString()).toBe("");
+    expect(ok.stdout.toString()).toContain(`only moves the pin, to ${marketplace.plugins[0].source.ref}`);
+    expect(ok.exitCode).toBe(0);
+    const same = run(readFileSync(join(ROOT, ".claude-plugin/marketplace.json"), "utf8"));
+    expect(same.stderr.toString()).toContain("pin check failed:");
+    expect(same.stderr.toString()).toContain("isn't newer than the base's pin");
+    expect(same.exitCode).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("the bundle runs under bun: logout on an empty data dir has nothing to sign out of", () => {

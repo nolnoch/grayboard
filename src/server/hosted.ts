@@ -3,13 +3,14 @@ import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
+import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import { harnessFor } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -17,7 +18,9 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 // `facts`: the model and effort the request reports (#364); present only, never a clearing.
 export type SessionFacts = { model?: string; effort?: string };
 // `suggested`: the name the request's checkout suggests (#443), normalized.
-export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string } | { missing: string };
+// `launcher`: the request declares its harness can spawn subagents (#473); read at an ownership's start, and it only
+// words the bind and initialize text afterwards.
+export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
   for (const value of [String(user), client, raw]) {
@@ -39,7 +42,7 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
   if (!("id" in base)) return base;
-  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta) };
+  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_WRITES_AS_META];
@@ -67,6 +70,15 @@ function suggestedName(meta: unknown): { suggested?: string } {
   const normalized = typeof raw === "string" ? normalizeIdentityName(raw) : undefined;
   if (!normalized?.ok || normalized.name === HUMAN_NAME) throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_SUGGESTED_META}"] must be an identity name (1-32 chars of a-z 0-9 _ -, not "${HUMAN_NAME}")`);
   return { suggested: normalized.name };
+}
+// A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
+// third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are
+// the same (a session that never declared one). It grants nothing beyond receiving the session's own user's requests.
+function launcherDeclaration(meta: unknown): { launcher?: true } {
+  if (!meta || typeof meta !== "object" || !(GRAYBOARD_LAUNCHER_META in meta)) return {};
+  const raw = (meta as Record<string, unknown>)[GRAYBOARD_LAUNCHER_META];
+  if (typeof raw !== "boolean") throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
+  return raw ? { launcher: true } : {};
 }
 // A request `_meta` with the model and effort removed: for a replayed meta (a legacy GET routes by its POST's), whose
 // facts are stale and would revert the latest (#364).
@@ -101,12 +113,13 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
 }
 // A bound native session's `initialize` text. Without a push declaration it assumes a
 // polling client, so the channel lines don't apply.
-export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery): string {
+export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery, launcher = false): string {
   return [
     ...(declared?.mode === "push"
       ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared.source)]
       : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, ...(declared ? [POLL_NOTE] : []), ...COORDINATION_INSTRUCTIONS]),
     ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
+    ...(launcher ? launcherInstruction() : []),
     ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
   ].join(" ");
 }
@@ -172,7 +185,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), { ...context.facts, ...(context.launcher && writesAs === null ? { launcher: true } : {}) });
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -430,7 +443,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(root.session_id) : [];
-        return { held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
+        return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed, root?.suggested ?? null) } : {}) };
@@ -440,7 +453,6 @@ export function createHostedSessions(application: Application, options: { now?: 
     async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
-      if (normalized.name.slice(normalized.name.lastIndexOf("/") + 1) === HUMAN_NAME) throw new ApplicationError("bad_request", "human is reserved for the trusted bridge");
       const refusals: Array<[string, string]> = [];
       const result = await service.owning(p, context, row => {
         refusals.length = 0;
@@ -484,7 +496,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const note = !declared ? [`No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       // The general part rides the text on a root's first hold: a hosted root has had no bind to carry it before.
-      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => [], notices, held.slice(1)), note);
+      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], notices, held.slice(1)), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
@@ -511,7 +523,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (!result.ok.released) return { content: [{ type: "text" as const, text: notHolding(alias) }], structuredContent: { name: held[0] ?? null, instructions: [], ownership: result.ownership } };
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const instructions = held.length
-        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => [], [], held.slice(1))
+        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], [], held.slice(1))
         : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed, result.suggested))];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? "", result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
