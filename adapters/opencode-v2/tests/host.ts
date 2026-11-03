@@ -341,6 +341,17 @@ try {
     text = said(lead.id);
     assert(text.includes(boundAs("lead")) && text.includes(channel) && text.includes(launcher) && !text.includes(unbound), "Configured launcher root sees its bound and launcher text");
     console.log("REAL_INSTRUCTIONS_CONFIGURED_LAUNCHER_OK");
+    // #535: a subagent of the launcher root gets the server's child text from its first request: it writes
+    // as the root, and is neither unbound nor a launcher.
+    const sub = await host.session.create({ location, parentID: lead.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+    await invoke(sub.id, "whoami", {});
+    const first = modelRequests.find(r => r.sessionID === sub.id);
+    assert(first, "a model request for the subagent");
+    const subText = (() => { const strings: string[] = [], walk = (v: unknown): void => { if (typeof v === "string") strings.push(v); else if (v && typeof v === "object") Object.values(v).forEach(walk); }; walk(JSON.parse(first.body)); return strings.join("\n"); })();
+    assert(subText.includes(`You are a subagent acting as "you@example.com/lead" on grayboard`), "The subagent's first request carries the server's child text");
+    assert(!subText.includes(unbound) && !subText.includes(launcher) && !subText.includes(boundAs("lead")), "A subagent's request carries neither the unbound, the launcher nor the root's text");
+    assert.equal(row(sub.id)?.root_session_id, row(lead.id)?.session_id, "The subagent registered under its root");
+    console.log("REAL_INSTRUCTIONS_SUBAGENT_OK");
     // No launcher option: bound and pushed, no launcher lines.
     pluginOptions = {};
     await restart();

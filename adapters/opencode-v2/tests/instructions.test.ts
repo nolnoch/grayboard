@@ -6,7 +6,7 @@ import { OpenCodeController, nativeFetcher, setup, watchRoots } from "../src/lif
 import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, ServerUnreachable, type Wire } from "../src/core/wire.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
-import { fixture } from "./native-fixture.js";
+import { fixture, until } from "./native-fixture.js";
 
 // OpenCode's `entries()` (core/mcp-guidance, @opencode/core 2.1.4) for a codemode server and a plain one.
 const execute = '    Use tools from this server through `execute` under `tools["grayboard"]`.';
@@ -224,4 +224,113 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
   // In-flight fetches abort first, then the hook goes, before the controller closes.
   expect(order.slice(0, 2)).toEqual(["instructions", "context"]);
   expect(order).toContain("execute.before");
+});
+
+test("a subagent's cached text follows its root: invalidating the root refetches it, a failure names the root, a changed root starts over (#535)", async () => {
+  const fetched: string[] = [], reported: [string, string | undefined][] = [];
+  let fail = false;
+  const cache = new RootInstructions(async id => { fetched.push(id); if (fail) throw new ServerUnreachable("down"); return `text ${id} ${fetched.length}`; }, (id, _e, root) => { reported.push([id, root]); });
+  expect(await cache.current("C", "R")).toBe("text C 1");
+  expect(await cache.current("C", "R")).toBe("text C 1");
+  cache.invalidate("R");
+  expect(await cache.current("C", "R")).toBe("text C 2");
+  // A child's own invalidation (its refused bind) touches only itself.
+  cache.invalidate("C");
+  expect(await cache.current("C", "R")).toBe("text C 3");
+  fail = true; cache.invalidate("R");
+  expect(await cache.current("C", "R")).toBe("text C 3");
+  expect(reported).toEqual([["C", "R"]]);
+  fail = false;
+  // Asked under another root (or as a root), the entry is dropped and fetched afresh.
+  expect(await cache.current("C")).toBe("text C 5");
+  expect(fetched).toEqual(["C", "C", "C", "C", "C"]);
+  cache.close();
+});
+
+test("the native fetcher registers a subagent under its enrolled root before naming it, and its wire declares no launcher (#535)", async () => {
+  const f = fixture(), metadata = new Map<string, Record<string, unknown>>();
+  const parents: Record<string, string> = { C: "R", G: "C", U: "S", X: "R" };
+  const ctx = {
+    ...f.ctx, location: { directory: "/worktree" },
+    session: { get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, time: {}, metadata: metadata.get(sessionID) ?? {}, ...(parents[sessionID] ? { parentID: parents[sessionID] } : {}) }), update: async ({ sessionID, metadata: m }: { sessionID: string; metadata: Record<string, unknown> }) => { metadata.set(sessionID, m); }, synthetic: async () => {} },
+    tool: { list: async () => [] },
+  } as unknown as Context;
+  const order: string[] = [];
+  class IdleWire { client = { setNotificationHandler: () => {} }; constructor(_o: unknown, _a: unknown, readonly signal: AbortSignal, readonly sessionID: string) {} async connect() {} async close() {} async call(name: string, args?: unknown) { if (name === "session_register") { order.push(`register ${this.sessionID} ${JSON.stringify(args)}`); if ((args as { child: string }).child === "X") throw new Error("child_bound"); } return name === "whoami" ? { held: [], primary: null, unbound: true, candidates: [] } : {}; } async read() { return { items: [] }; } async listen() { return { closed: new Promise<void>(() => {}), close: async () => {} }; } }
+  const records: RecordStatus[] = [];
+  const controller = new OpenCodeController(ctx, { mcpName: "grayboard", launcher: true }, IdleWire as unknown as typeof Wire, undefined, record => { records.push(record); });
+  const connect = spyOn(Client.prototype, "connect").mockResolvedValue(undefined);
+  const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
+  const instructions = spyOn(NativeWire.prototype, "instructions").mockImplementation(function(this: NativeWire) {
+    order.push(`initialize ${JSON.stringify((this as unknown as { meta(): Record<string, unknown> }).meta())}`);
+    return "child text";
+  });
+  try {
+    const fetch = nativeFetcher(controller);
+    // An unenrolled root's subagent gets nothing and registers nothing.
+    expect(await fetch("C", new AbortController().signal)).toBeUndefined();
+    expect(await controller.childRoot("U")).toBeUndefined();
+    expect(order).toEqual([]);
+    expect((await controller.enroll("R")).state).toBe("approved");
+    expect(await controller.childRoot("R")).toBeUndefined();
+    expect(await controller.childRoot("G")).toEqual({ sessionID: "G", root: "R", via: ["C"] });
+    expect(await fetch("G", new AbortController().signal)).toBe("child text");
+    expect(order).toEqual([`register R {"child":"G","via":["C"]}`, `initialize {"ai.opencode/sessionID":"G"}`]);
+    // A refused registration names no wire: unregistered, the key would start an ownership of its own.
+    order.length = 0;
+    await expect(fetch("X", new AbortController().signal)).rejects.toThrow("child_bound");
+    expect(order).toEqual([`register R {"child":"X"}`]);
+    // The fetch reports its own failure; the refusal doesn't degrade the root.
+    expect(records.filter(r => r.operation === "child_register")).toEqual([]);
+  } finally {
+    await controller.close();
+    instructions.mockRestore(); connect.mockRestore(); close.mockRestore();
+  }
+});
+
+test("setup prefetches a subagent's text when it's created, its context hook rewrites the subagent with it, and forgets it when the subagent is deleted (#535)", async () => {
+  const f = fixture();
+  let hook: ((request: unknown) => Promise<void>) | undefined;
+  let remove!: () => void;
+  const deleted = new Promise<void>(resolve => { remove = resolve; });
+  const ctx = {
+    ...f.ctx, location: { directory: "/worktree" }, options: {},
+    session: {
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, time: {}, metadata: {}, ...(sessionID === "C" ? { parentID: "R" } : {}) }), update: async () => {}, synthetic: async () => {},
+      hook: async (_name: string, callback: (request: unknown) => Promise<void>) => { hook = callback; return { dispose: async () => {} }; },
+    },
+    rpc: { register: async () => ({ dispose: async () => {} }) },
+    tool: { list: async () => [], hook: async () => ({ dispose: async () => {} }) },
+    event: {
+      async *subscribe({ signal }: { signal: AbortSignal }) {
+        yield { type: "session.created", data: { sessionID: "C" } };
+        await deleted;
+        yield { type: "session.deleted", data: { sessionID: "C" } };
+        if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+      },
+    },
+  } as unknown as Context;
+  const forgot = spyOn(RootInstructions.prototype, "forget");
+  const enrolled = spyOn(OpenCodeController.prototype, "enrollment").mockImplementation((id: string) => id === "R" ? {} as never : undefined);
+  const childRoot = spyOn(OpenCodeController.prototype, "childRoot").mockImplementation(async (id: string) => id === "C" ? { sessionID: "C", root: "R", via: [] } : undefined);
+  const fetched: string[] = [];
+  const cleanup = await setup(ctx, () => {}, () => {}, async id => { fetched.push(id); return id === "C" ? "child text" : bound; });
+  try {
+    await until(() => fetched.includes("C"));
+    const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
+    await hook!({ sessionID: "C", system, messages: [] });
+    expect(system[1]!.text).toBe(render("child text"));
+    const other = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
+    await hook!({ sessionID: "S", system: other, messages: [] });
+    expect(other[1]!.text).toBe(render(unbound));
+    expect(fetched).toEqual(["C"]);
+    // A deleted subagent's text goes; a session reusing the ID would fetch afresh.
+    remove();
+    await until(() => forgot.mock.calls.some(([id]) => id === "C"));
+    await hook!({ sessionID: "C", system: [{ type: "text", text: render(unbound) }], messages: [] });
+    expect(fetched).toEqual(["C", "C"]);
+  } finally {
+    await cleanup!();
+    enrolled.mockRestore(); childRoot.mockRestore(); forgot.mockRestore();
+  }
 });

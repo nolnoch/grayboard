@@ -36141,6 +36141,13 @@ class SessionRoutes {
       throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
   }
+  get(sessionID) {
+    const path = this.paths.get(sessionID);
+    return path ? { ...path, via: [...path.via] } : undefined;
+  }
+  isEnded(sessionID) {
+    return this.ended.has(sessionID);
+  }
   end(sessionID) {
     if (this.ended.has(sessionID))
       return;
@@ -36162,6 +36169,7 @@ async function end(temporary, path) {
 // adapters/hosted-core/src/controller.ts
 var DRIFTED = "Grayboard credential changed";
 var ADMITTED_LIMIT = 100;
+var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
 function sleep5(ms, signal) {
@@ -36192,6 +36200,7 @@ var display = (address) => shortOf(address.slice(0, address.lastIndexOf("/")), a
 class Controller {
   port;
   routes = new SessionRoutes;
+  lookups = new Map;
   Transport;
   roots = new Map;
   watches = new Map;
@@ -36259,6 +36268,40 @@ class Controller {
       this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
     return path;
+  }
+  async childRoot(sessionID) {
+    let path = this.routes.get(sessionID) ?? this.lookups.get(sessionID);
+    if (!path) {
+      if (this.routes.isEnded(sessionID))
+        return;
+      try {
+        path = await this.port.ancestry(sessionID);
+      } catch {
+        return;
+      }
+      if (this.routes.isEnded(sessionID) || this.routes.isEnded(path.root))
+        return;
+      this.lookups.set(sessionID, path);
+      if (this.lookups.size > LOOKUPS)
+        this.lookups.delete(this.lookups.keys().next().value);
+    }
+    const r = this.roots.get(path.root);
+    return path.root !== sessionID && r && !r.paused ? path : undefined;
+  }
+  async enlist(path, report = true) {
+    const r = this.roots.get(path.root);
+    const e = r?.e ?? await this.port.credential.capture(path.root);
+    const call = (sessionID, c) => this.temporary(e, c, sessionID);
+    await register2(call, { root: path.root, via: path.via, child: path.sessionID }).catch((error) => {
+      if (report)
+        this.failure("child_register", error, r);
+      throw error;
+    });
+    if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
+      await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+      throw new AncestryError("Grayboard session ended during registration");
+    }
+    this.routes.remember(path);
   }
   async activeRoot(sessionID) {
     const path = await this.path(sessionID);
@@ -36834,15 +36877,9 @@ class Controller {
     }
   }
   async beforeCall(event) {
-    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
-    if (path.root !== event.sessionID) {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await register2((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID }).catch((error) => {
-        this.failure("child_register", error, r);
-        throw error;
-      });
-      this.routes.remember(path);
-    }
+    const path = await this.path(event.sessionID);
+    if (path.root !== event.sessionID)
+      await this.enlist(path);
     if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID)
       await this.serial(async () => {
         const current = this.roots.get(path.root);
@@ -36903,6 +36940,7 @@ class Controller {
   async ended(sessionID) {
     if (this.stopped)
       return;
+    this.lookups.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path)
       return;

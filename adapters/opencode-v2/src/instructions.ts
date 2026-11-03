@@ -6,12 +6,14 @@ import { InsufficientScope } from "./core/wire.js";
 // its instructions for the process, so every session's system prompt carries
 // grayboard's session-less unbound text (#531). On each primary request of an
 // enrolled root, the plugin's `context` hook rebuilds grayboard's entry in that
-// prompt with the root's current server instructions: omp's #441 rewrite.
+// prompt with the root's current server instructions: omp's #441 rewrite. A
+// subagent of an enrolled root gets its own: the server's child text (#535).
 
-// A root's current server instructions; `signal` aborts at shutdown.
+// A session's current server instructions; `signal` aborts at shutdown.
 export type Fetcher = (sessionID: string, signal: AbortSignal) => Promise<string | undefined>;
 export type Plan = "none" | "replace";
-type Root = { text?: string; fresh: boolean; generation: number; fetching?: Promise<void>; reported: boolean };
+// `root` is set for a subagent: the root it writes as, whose changes refresh it.
+type Root = { text?: string; fresh: boolean; generation: number; fetching?: Promise<void>; reported: boolean; root?: string };
 
 // OpenCode puts no timeout on the hook and a rejected hook fails the step; a
 // fetch that outruns this still fills the cache for the next request.
@@ -51,20 +53,21 @@ function signedOut(error: unknown): boolean {
   return false;
 }
 
-// Each root's last fetched instructions, refetched after `invalidate`. One
-// fetch in flight per root; one that ends after an invalidation fetches again.
+// Each session's last fetched instructions, refetched after `invalidate`, which
+// a root passes on to its subagents. One fetch in flight per session; one that
+// ends after an invalidation fetches again.
 export class RootInstructions {
   private readonly roots = new Map<string, Root>();
   private readonly closing = new AbortController();
   constructor(
     private readonly fetch: Fetcher,
-    // A fetch failure, once per root until a fetch for it succeeds.
-    private readonly report: (sessionID: string, error: unknown) => void,
+    // A fetch failure, once per session until a fetch for it succeeds; `root`
+    // is the subagent's root.
+    private readonly report: (sessionID: string, error: unknown, root?: string) => void,
     private readonly deadline = DEADLINE_MS,
   ) {}
   invalidate(sessionID: string) {
-    const r = this.roots.get(sessionID);
-    if (r) { r.fresh = false; r.generation++; }
+    for (const [id, r] of this.roots) if (id === sessionID || r.root === sessionID) { r.fresh = false; r.generation++; }
   }
   forget(sessionID: string) { this.invalidate(sessionID); this.roots.delete(sessionID); }
   close() { this.closing.abort(); this.roots.clear(); }
@@ -74,11 +77,13 @@ export class RootInstructions {
     const r = this.roots.get(sessionID);
     return r?.text === undefined ? "none" : r.fresh && !r.reported ? "fresh" : "stale";
   }
-  // The root's instructions within the deadline: fresh, or the last fetched while a refetch runs.
-  async current(sessionID: string): Promise<string | undefined> {
+  // The session's instructions within the deadline: fresh, or the last fetched
+  // while a refetch runs. A subagent names its `root`.
+  async current(sessionID: string, root?: string): Promise<string | undefined> {
     if (this.closing.signal.aborted) return;
     let r = this.roots.get(sessionID);
-    if (!r) { r = { fresh: false, generation: 0, reported: false }; this.roots.set(sessionID, r); }
+    if (r && r.root !== root) { this.forget(sessionID); r = undefined; }
+    if (!r) { r = { fresh: false, generation: 0, reported: false, ...(root ? { root } : {}) }; this.roots.set(sessionID, r); }
     if (r.fresh) return r.text;
     const fetching = r.fetching ?? this.start(sessionID, r);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -102,7 +107,7 @@ export class RootInstructions {
           // costs one wait per root rather than one per request.
           if (signedOut(error)) r.text = undefined;
           else if (generation === r.generation) r.fresh = true;
-          if (!r.reported) { r.reported = true; this.report(sessionID, error); }
+          if (!r.reported) { r.reported = true; this.report(sessionID, error, r.root); }
           return;
         }
       }

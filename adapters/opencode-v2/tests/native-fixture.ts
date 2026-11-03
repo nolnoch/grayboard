@@ -29,3 +29,6 @@ export function fixture() {
   // `rotate`: the host stores a new access token, expiring `ms` from now (OpenCode's own refresh).
   return { ctx, binding, config, metadata, reload, storage, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, rotate: (value: string, ms = 60_000) => { access = value; expires = Date.now() + ms; }, afterResolve: (callback: () => void) => { afterResolve = callback; } };
 }
+
+// Polls a condition for up to a second.
+export async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }

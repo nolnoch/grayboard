@@ -30,6 +30,11 @@ export class SessionRoutes {
     if (previous && previous.root !== path.root) throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
   }
+  get(sessionID: string): SessionPath | undefined {
+    const path = this.paths.get(sessionID);
+    return path ? { ...path, via: [...path.via] } : undefined;
+  }
+  isEnded(sessionID: string): boolean { return this.ended.has(sessionID); }
   end(sessionID: string): SessionPath | undefined {
     if (this.ended.has(sessionID)) return;
     this.ended.add(sessionID);

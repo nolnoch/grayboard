@@ -352,6 +352,41 @@ test.each(modes)("child registration runs on the root's wire before the child's 
   } finally { await r.controller.close(); }
 });
 
+test.each(modes)("childRoot resolves a descendant of an enrolled, unpaused root once, and nothing for a root, an unenrolled or paused root, or a missing session (#535) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    expect(await r.controller.childRoot("C")).toBeUndefined();
+    // A lookup isn't a route: ending a session the server never saw sends nothing.
+    expect(await r.controller.childRoot("B")).toBeUndefined();
+    await r.controller.ended("B");
+    expect(r.named("session_end")).toEqual([]);
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    expect(await r.controller.childRoot("R")).toBeUndefined();
+    expect(await r.controller.childRoot("missing")).toBeUndefined();
+    expect(await r.controller.childRoot("G")).toEqual({ sessionID: "G", root: "R", via: ["C"] });
+    // Resolved once: the route stays when OpenCode no longer has the session.
+    r.nodes.delete("C");
+    expect(await r.controller.childRoot("G")).toEqual({ sessionID: "G", root: "R", via: ["C"] });
+    await r.controller.pause();
+    expect(await r.controller.childRoot("G")).toBeUndefined();
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a descendant that ends while its registration is in flight ends the row it made and isn't routed (#535) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const enlisting = r.controller.enlist({ sessionID: "C", root: "R", via: [] });
+    await r.controller.ended("C");
+    await expect(enlisting).rejects.toThrow("ended during registration");
+    expect(r.named("session_register").map(c => c.args)).toEqual([{ child: "C" }]);
+    expect(r.named("session_end").map(c => c.sessionID)).toEqual(["C"]);
+    expect(await r.controller.childRoot("C")).toBeUndefined();
+  } finally { await r.controller.close(); }
+});
+
 test.each(modes)("a root's bind stops delivery before the call and reopens under the new name after it (%s)", async mode => {
   const r = runtime(mode);
   try {
