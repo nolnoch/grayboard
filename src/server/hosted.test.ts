@@ -282,6 +282,67 @@ test("children cannot bind or own delivery, and child end leaves root", async ()
   expect(await hosted.whoami(principal, context("child"))).toHaveProperty("unbound", true);
 });
 
+// #523: the root's inbox is its own; a child neither lists nor acks it, while the
+// root's dm_inbox, dm_ack and a child's explicit reads go on as before.
+test("a child's dm_inbox, dm_ack and board_subscribe are refused child_session; its dm_history and dm_thread aren't", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("peer"), { name: "be", create: true });
+  const { child } = await hosted.register(principal, context("root"), "child") as { child: string };
+  const sent = await hosted.run(principal, context("peer"), "dm_send", (s) => application.send(s, "you@example.com/fe", "owed by the root"));
+  const message = `${child} is a subagent of you@example.com/fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
+  await expect(hosted.run(principal, context("child"), "dm_inbox", (s) => application.inbox(s))).rejects.toMatchObject({ code: "child_session", message });
+  await expect(hosted.run(principal, context("child"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id))).rejects.toMatchObject({ code: "child_session", message });
+  await hosted.run(principal, context("peer"), "board_create", (s) => application.call(s, "board_create", { name: "e2e", purpose: "test" }));
+  const subs = { code: "child_session", message: `${child} is a subagent of you@example.com/fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.` };
+  await expect(hosted.run(principal, context("child"), "board_subscribe", (s) => application.call(s, "board_subscribe", { board: "e2e", mode: "push" }))).rejects.toMatchObject(subs);
+  await expect(hosted.run(principal, context("child"), "board_subscribe", (s) => application.call(s, "board_subscribe", { board: "e2e", mode: "off", thread: 1 }))).rejects.toMatchObject(subs);
+  expect(database.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE board = 'e2e' AND handle = 'you@example.com/fe'").get()).toEqual({ n: 0 });
+  expect((await hosted.run(principal, context("child"), "dm_history", (s) => application.history(s))).map((m) => m.id)).toEqual([sent.message_id]);
+  expect((await hosted.run(principal, context("child"), "dm_thread", (s) => application.thread(s, sent.message_id))).map((m) => m.id)).toEqual([sent.message_id]);
+  // The root's inbox still owes it, and the root's own ack settles it.
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered.map((m) => m.id)).toEqual([sent.message_id]);
+  await hosted.run(principal, context("root"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id));
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered).toEqual([]);
+});
+
+// #523 audit 2: under a root with no name yet, a child is offered no names to
+// bind, and its write is refused naming the root, not with "bind a name first".
+test("a child of an unbound root gets no bind candidates, and its write is refused naming its root", async () => {
+  const { child, root } = await hosted.register(principal, context("root"), "child") as { child: string; root: string };
+  const who = await hosted.whoami(principal, context("child"));
+  expect(who).toMatchObject({ id: child, root, child: true, unbound: true });
+  expect(who).not.toHaveProperty("candidates");
+  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("candidates");
+  await expect(hosted.run(principal, context("child"), "dm_send", (s) => application.send(s, "you@example.com/be", "x")))
+    .rejects.toMatchObject({ code: "unbound", message: `unbound; this session is a subagent of ${root}, which has no bus name yet. Its writes work once ${root} binds one; binding is the root's.` });
+  await expect(hosted.run(principal, context("other"), "dm_send", (s) => application.send(s, "you@example.com/be", "x")))
+    .rejects.toMatchObject({ code: "unbound", message: "unbound; bind a name first, or have this session's root register it as a child (session_register)" });
+});
+
+// #523 audit 6: a child's delegation audit rows name it under `child`, beside the routing `via`; a root's name none.
+test("a child's delegate request and refusal are audited naming the child; the root's name none", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("peer"), { name: "be", create: true });
+  const { child } = await hosted.register(principal, context("root"), "child") as { child: string };
+  const ask = { persona: "a reviewer", task: "review", to: "be" };
+  await expect(hosted.run(principal, context("child"), "delegate", (s) => application.delegate(s, ask))).rejects.toThrow("isn't a launcher session");
+  await expect(hosted.run(principal, context("root"), "delegate", (s) => application.delegate(s, { ...ask, task: "the root's own" }))).rejects.toThrow("isn't a launcher session");
+  const rows = (database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid").all() as { actor: string; target: string; detail: string }[])
+    .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
+  expect(rows.map((r) => [r.actor, r.target, r.detail.to, r.detail.child])).toEqual([
+    ["you@example.com", "you@example.com/fe", "be", child],
+    ["you@example.com", "you@example.com/fe", "be", undefined],
+  ]);
+  // be declares itself a launcher and goes live: the child's request lands, audited naming it.
+  await hosted.whoami(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "peer", [GRAYBOARD_LAUNCHER_META]: true }));
+  await delivery.open(principal, context("peer"));
+  const sent = await hosted.run(principal, context("child"), "delegate", (s) => application.delegate(s, { ...ask, task: "now a launcher" }));
+  const requested = database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.requested'").all() as { actor: string; target: string; detail: string }[];
+  expect(requested.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([
+    { actor: "you@example.com", target: "you@example.com/be", detail: { requester: "you@example.com/fe", via: "explicit", message_id: sent.message_id, child } },
+  ]);
+});
+
 test("registration rejects invalid ownership graphs without moving an existing child", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("other"), { name: "be", create: true });

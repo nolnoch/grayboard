@@ -10,7 +10,7 @@ import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./w
 import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate, type Continuity,
 } from "../core/bindings.ts";
@@ -117,12 +117,18 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
+  // A hosted child's own ID (#523): it acts under its root's addresses, and
+  // its writes store this as `via` so readers see which subagent wrote them.
+  // The root's read state isn't its: its board_read peeks, and dm_inbox and
+  // dm_ack are refused (childInbox).
+  via?: string;
   transport: "bridge" | "hosted" = "bridge";
   // The address the session writes as by default (#284 S1, S8): its oldest
   // hold, else its ID; a tools-only session's writes_as.
   primary = "";
-  // Every address it reads as: its holds, oldest first, then its ID; a
-  // tools-only session's [writes_as]. Primary first.
+  // Every address it reads as: its holds, oldest first, then its ID (a
+  // hosted child's: its root's ID, never its own); a tools-only session's
+  // [writes_as]. Primary first.
   addresses: string[] = [];
   // The aliases the session holds, oldest first (PR 4 S1); set by setHolds.
   holds: string[] = [];
@@ -153,6 +159,13 @@ export class ApplicationSession {
 
 function fail(code: ApplicationCode, message: string, extra: ApplicationError["extra"] = {}): never {
   throw new ApplicationError(code, message, extra);
+}
+
+// A child (#523) neither takes on nor changes its root's read state: dm_inbox,
+// dm_ack and board_subscribe are the root's (childStateRefusal names them).
+function childState(session: ApplicationSession, tool: string): void {
+  const refused = session.via === undefined ? null : childStateRefusal(tool, session.via, session.primary);
+  if (refused !== null) fail("child_session", refused);
 }
 
 // A refused call's code and message: an ID that can't receive names its own
@@ -751,8 +764,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
     // Otherwise the session holds `holds`, reads as them and its
     // ID, and writes as the oldest; none held reads and nothing else (readOnly). `row`: the hosted root's
-    // place and suggested name (#443), null with no row.
-    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false) {
+    // place and suggested name (#443), null with no row. `root`: set for a child session (#523),
+    // which acts under its root's addresses, never its own ID (not an address), and whose writes
+    // carry its ID as `via`.
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
@@ -764,19 +779,28 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         session.addresses = [writesAs];
       } else {
         session.holds = holds;
-        session.primary = primaryOf(holds, id);
-        session.addresses = [...holds, id];
+        session.primary = primaryOf(holds, root ?? id);
+        session.addresses = [...holds, root ?? id];
       }
-      if (!session.readOnly && idRow(db, id)?.principal === authed.user_email) session.writerId = id;
+      // A child is one whether or not its root holds a name yet: its text and refusals are a child's.
+      const own = idRow(db, id)?.principal === authed.user_email;
+      if (!session.readOnly && own) session.writerId = id;
+      if (root !== null && own) session.via = id;
       hub.sessions.add(session);
       if (hold && holds.length) hub.hostedHolders.set(id, session);
       if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
-        ...(session.readOnly ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
+        ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
       return { session, info };
+    },
+    // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
+    // child's source row (deleted at the child's end) so a send or mention to the child's ID keeps
+    // being refused child_session; null when the ID starts as a root, which makes it an address again.
+    hostedRoot(id: string, root: string | null) {
+      db.prepare(`UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?`).run(root, id, root);
     },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
@@ -902,6 +926,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     inbox(session: ApplicationSession, days?: number) {
       valid(session);
+      childState(session, "dm_inbox");
       return handleInbox(hub, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
@@ -963,6 +988,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // sentPending match a.reader = m.recipient, or m.sender.
     acknowledgeDm(session: ApplicationSession, id: number) {
       valid(session);
+      childState(session, "dm_ack");
       const m = repo.messages.getById(id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
         : mine.includes(m.recipient) ? m.recipient
@@ -1164,7 +1190,7 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session));
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session), session.via ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1247,7 +1273,9 @@ function handleSend(
 function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">): DelegateResult {
   const { repo, db } = hub;
   const { authed } = session;
-  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, detail));
+  // The audit rows name the child that called, beside the routing `via` (#523).
+  const byChild = session.via === undefined ? {} : { child: session.via };
+  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
@@ -1276,6 +1304,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
         requester: session.primary,
         via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
         message_id: w.msg.id,
+        ...byChild,
       });
       return { payload, ref: w.ref, msg: w.msg };
     });
@@ -1326,11 +1355,13 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
 function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
   const { db } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
+  childState(session, tool);
   const ctx: ToolContext = {
     online: h => hub.registry.get(h)?.active === true,
     files: { limits: hub.repo.attachmentLimits, principal: uploaderOf(session).principal },
     human: session.human,
     ...(session.writerId ? { session: session.writerId } : {}),
+    ...(session.via ? { via: session.via } : {}),
     addresses: session.addresses,
     ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),

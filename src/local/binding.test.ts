@@ -3,10 +3,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
-import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
+import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
+import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { acquireName, attachSession, candidateNames, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, liveSessions, reap, registerChild, registerSession, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -175,4 +175,108 @@ test("retention keeps each name's latest bound or moved event", () => {
     { session_id: s2, name: "fe", event: "bound" },
     { session_id: s1, name: "be", event: "moved" },
   ]);
+});
+
+// #523: a child session's first sight writes its ids row (the root's facts,
+// delivery 'none', root_id) and one id.child_seen row; a second sight is the
+// same child; a row that isn't this root's live child is refused.
+test("registerChild records a child once, audited; another root's ID or an ended child is refused", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const [root, child, other] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe"];
+  registerSession(db, { ...thisSession(root, null, "/work/repo"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness: "omp" }, { keyed: true });
+  registerChild(db, root, child, "reviewer-1");
+  registerChild(db, root, child, "reviewer-1");
+  expect(db.prepare(`SELECT harness, cwd, keyed, delivery, root_id, ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "omp", cwd: "/work/repo", keyed: 1, delivery: "none", root_id: root, ended_at: null });
+  const seen = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`).all() as { actor: string; target: string; detail: string }[];
+  expect(seen.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: process.pid } }]);
+  // A child has no process row: it is never a live receiver.
+  expect(db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(child)).toBeNull();
+  expect(liveSessions(db).alive.map((r) => r.session_id)).toEqual([root]);
+
+  registerSession(db, { ...thisSession(other), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  expect(() => registerChild(db, root, other, "reviewer-2")).toThrow(`id_collision: ${other} is another session's ID, not a child of ${root}`);
+  expect(() => registerChild(db, other, child, "reviewer-1")).toThrow(`id_collision: ${child} is another session's ID, not a child of ${other}`);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
+  expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+});
+
+// #523 audit 3: a root has at most MAX_CHILDREN child sessions at once, as
+// hosted. A local child has no end of its own, so the root's other children
+// count only while seen inside the idle window; a known child seen again
+// keeps its own place.
+test("a root's child past MAX_CHILDREN is refused while the others are fresh, and accepted once they've gone idle", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const root = "id:0123456789abc";
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const kid = (i: number) => `id:k${String(i).padStart(12, "0")}`;
+  const t0 = 1_800_000_000_000;
+  for (let i = 0; i < MAX_CHILDREN; i++) registerChild(db, root, kid(i), `sub-${i}`, t0);
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + 1000)).toThrow(childCapacity(root));
+  expect(db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toBeNull();
+  registerChild(db, root, kid(0), "sub-0", t0 + 1000);
+  // At the window's edge the others still count; one past it, only the two seen since do.
+  const window = DEFAULT_IDLE_SECONDS * 1000;
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window)).toThrow(childCapacity(root));
+  touchId(db, kid(1), t0 + window + 1);
+  registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window + 1);
+  expect(db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toEqual({ root_id: root, ended_at: null });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #523 audit 3: the root process's child cache derives each child's ID from
+// the root's key, registers it once and touches it per call; it forgets a
+// child idle past the window, so its memory stays bounded by the cap, and the
+// forgotten child seen again is the same child, with no second audit row.
+test("ChildSessions keeps only the children seen inside the idle window, refusing past MAX_CHILDREN", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const key = "ab".repeat(32);
+  const root = idAddress(key);
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const children = new ChildSessions(db, root, key);
+  const t0 = 1_800_000_000_000, window = DEFAULT_IDLE_SECONDS * 1000;
+  const first = children.resolve("sub-0", t0);
+  expect(first).toBe(childSessionId(key, "sub-0"));
+  for (let i = 1; i < MAX_CHILDREN; i++) children.resolve(`sub-${i}`, t0);
+  expect(children.size).toBe(MAX_CHILDREN);
+  expect(() => children.resolve("sub-overflow", t0 + 1)).toThrow(childCapacity(root));
+  // A known child resolves again, keeping its place, and is touched.
+  expect(children.resolve("sub-0", t0 + 2)).toBe(first);
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 + 2 });
+  // Past the window every child but sub-0 is forgotten; the newcomer takes a place.
+  children.resolve("sub-overflow", t0 + window + 1);
+  expect(children.size).toBe(2);
+  // sub-1, forgotten, comes back as the same child: no second id.child_seen.
+  expect(children.resolve("sub-1", t0 + window + 2)).toBe(childSessionId(key, "sub-1"));
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #523: the orphan sweep (an unended ID with no bindings row) passes over a
+// live root's children, which never have one; it ends a child whose root is
+// gone, ended by a reap, by an older grayboard that knew no children, or pruned.
+test("reading live sessions keeps a live root's children and ends those whose root is dead, ended or pruned", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const live = "id:0123456789abc", dead = "id:0123456789abd", old = "id:0123456789abe", pruned = "id:0123456789abf";
+  registerSession(db, { ...thisSession(live), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  for (const id of [dead, old, pruned]) registerSession(db, { ...thisSession(id), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const childOf = (root: string) => `id:${root.slice(-3)}0000000000`;
+  for (const root of [live, dead, old, pruned]) registerChild(db, root, childOf(root), `child-of-${root}`);
+  // dead: its process is gone, so a reap ends it. old: an older grayboard ended it and dropped its row.
+  // pruned: its ids row is past retention.
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(dead);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(old);
+  db.prepare(`DELETE FROM bindings WHERE session_id IN (?, ?)`).run(old, pruned);
+  db.prepare(`DELETE FROM ids WHERE id = ?`).run(pruned);
+
+  const r = liveSessions(db);
+  expect(r.alive.map((s) => s.session_id)).toEqual([live]);
+  const ended = (id: string) => (db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null }).ended_at;
+  expect(ended(childOf(live))).toBeNull();
+  for (const root of [dead, old, pruned]) expect(ended(childOf(root))).not.toBeNull();
+  const whys = Object.fromEntries((db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.ended'`).all() as { target: string; detail: string }[])
+    .map((a) => [a.target, JSON.parse(a.detail).why]));
+  expect(whys).toMatchObject({ [childOf(dead)]: `its root ${dead} ended`, [childOf(old)]: `its root ${old} ended`, [childOf(pruned)]: `its root ${pruned} ended` });
+  expect(whys).not.toHaveProperty(childOf(live));
+  // A second read finds nothing more to end.
+  expect(liveSessions(db)).toMatchObject({ alive: [{ session_id: live }], ended: [] });
 });

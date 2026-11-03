@@ -16,6 +16,7 @@ import {
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
+import { viaLabel } from "../shared/notifications.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
@@ -60,7 +61,8 @@ export type RelayOptions = {
   shareWaitMs?: number;
 };
 
-type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; body: string; attachments: number[] };
+// via: the child session (a harness subagent, #523) that wrote it under `from`, from the channel meta.
+type Item = { kind: "dm" | "board"; board: string | null; root: number; id: number; from: string; via?: string; body: string; attachments: number[] };
 
 type UploadedFile = { id: string; title: string; attachment: number; sha256: string };
 
@@ -208,7 +210,7 @@ export class Relay {
       // The meta format changed under the relay: say so rather than drop the files.
       progress.refused ??= [{ attachment: null, name: "its files", why: (e as Error).message }];
     }
-    const base = { from: m.from ?? "?", body: p.content, attachments };
+    const base = { from: m.from ?? "?", ...(m.via ? { via: m.via } : {}), body: p.content, attachments };
     if (m.board && m.post_id) {
       const id = Number(m.post_id);
       const root = m.parent_id ? await this.boardRoot(m.board, id) : id;
@@ -241,7 +243,7 @@ export class Relay {
         if (this.stopped) throw new Error("relay stopped");
         row = this.store.thread(x.kind, x.board, x.root);
       }
-      const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused));
+      const text = () => format(name, row ? null : x.board, x.body, x.id, warning(progress.refused), x.via);
       // The item's message ts; null when Slack took it but never said where.
       let ts: string | null | undefined;
       // Slack may deliver a reply before the post's HTTP response reaches us.
@@ -645,13 +647,14 @@ function warning(refused: Refused[] | undefined): string | undefined {
 
 /**
  * A grayboard item as Slack Markdown. The sender's handle leads in bold, so
- * attribution survives even if Slack ignores the username override. A new
+ * attribution survives even if Slack ignores the username override. A child
+ * writer (`via`, #523) follows it, labelled as the harness's claim. A new
  * thread from a board names the board. A handle with an email in it goes in a
  * code span, or Slack auto-links the address and shows it as "mailto:…".
  * A note (files that didn't make it) ends it, and the body is cut to fit.
  */
-export function format(from: string, board: string | null, body: string, id: number, note?: string): string {
-  const name = from.includes("@") ? `\`${from}\`` : `**${from}**`;
+export function format(from: string, board: string | null, body: string, id: number, note?: string, via?: string): string {
+  const name = (from.includes("@") ? `\`${from}\`` : `**${from}**`) + (via ? ` (${viaLabel(via)})` : "");
   const head = board ? `${name} · #${board} ·` : name;
   const tail = note ? `\n\n${note.length > MAX_NOTE ? `${note.slice(0, MAX_NOTE)}…` : note}` : "";
   const max = MAX_BODY - tail.length;

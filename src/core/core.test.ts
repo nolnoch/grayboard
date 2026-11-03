@@ -35,11 +35,13 @@ import {
   touchAlias,
   who,
   type Access,
+  type ReadResult,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
 import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
+import { boardNotification } from "../shared/notifications.ts";
 
 let db: Database;
 
@@ -256,6 +258,117 @@ test("a mention doesn't also count toward the mentioned subscriber's digest", ()
   post(db, "be", "e2e", "unrelated");
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 1, latest: { body: "unrelated" } }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["unrelated"]);
+});
+
+// #523: a child's post (a harness subagent writing under its root's address)
+// shows via wherever the post is read: the push, the digest's latest (meta and
+// prose), board_read and the snapshot; a root's post carries no via key at all.
+test("a child's post shows via in its push, the digest, reads and the snapshot; a root's post has no via key", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "be", root, 1);
+  subscribe(db, "sim", "e2e", "push");
+  subscribe(db, "fe", "e2e", "digest");
+  const byChild = callBoardTool(db, "be", "board_post", { board: "e2e", body: "from the subagent" }, { session: child, via: child, addresses: ["be", root] });
+  expect(byChild.result).toMatchObject({ post_id: expect.any(Number) });
+  expect(db.prepare(`SELECT author, author_id, via FROM posts WHERE body = 'from the subagent'`).get()).toEqual({ author: "be", author_id: child, via: child });
+
+  const [push] = drain("sim");
+  expect(push).toMatchObject({ kind: "push", post: { author: "be", via: child } });
+  expect(boardNotification(push!).meta).toMatchObject({ from: "be", via: child });
+  const [digest] = drain("fe", true);
+  expect(digest).toMatchObject({ kind: "digest", latest: { author: "be", via: child } });
+  expect(boardNotification(digest!).content).toContain(`Latest from be (subagent ${child}, harness-asserted): "from the subagent"`);
+  expect(boardNotification(digest!).meta).not.toHaveProperty("via");
+  // Caught up, the digest re-arms for the next post.
+  read(db, "fe", "e2e");
+  post(db, "be", "e2e", "from the root", null, { author_id: root, addresses: ["be", root] });
+  const [rootPush] = drain("sim");
+  expect(rootPush).toMatchObject({ kind: "push", post: { body: "from the root" } });
+  expect(rootPush!.kind === "push" && rootPush!.post).not.toHaveProperty("via");
+  expect(boardNotification(rootPush!).meta).not.toHaveProperty("via");
+  const [rootDigest] = drain("fe", true);
+  expect(boardNotification(rootDigest!).content).toContain(`Latest from be: "from the root"`);
+
+  // A subscriber's read, an addressless reader's (a board predicate) and the snapshot.
+  for (const posts of [read(db, "sim", "e2e", { limit: 10 }).posts, read(db, () => true, "e2e", { limit: 10 }).posts, snapshot(db, "sim", "e2e").posts]) {
+    expect(posts.map((p) => [p.body, p.via])).toEqual([["from the subagent", child], ["from the root", undefined]]);
+    expect(posts[1]).not.toHaveProperty("via");
+  }
+  // Pushes and digests go to subscribers, never to the root's own addresses.
+  expect(pendingFor(db, root, { all: true })).toEqual([]);
+});
+
+// #523: a child's board_read is its root's board without its root's read state:
+// the latest page and no unread view, and the root's cursor, unread count and
+// pending pushes are left for the root. Thread and before_id reads as usual.
+test("a child's board_read peeks: the root's cursor, unread count and pending push are left for the root", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "fe", root, 1);
+  subscribe(db, "fe", "e2e", "digest");
+  post(db, "be", "e2e", "unread one");
+  const mention = post(db, "be", "e2e", "@fe look").post;
+  const state = () => ({
+    cursor: db.prepare(`SELECT cursor, notified_id FROM subscriptions WHERE handle = 'fe' AND board = 'e2e'`).get(),
+    outbox: db.prepare(`SELECT post_id, delivered_at FROM outbox WHERE handle = 'fe'`).all(),
+  });
+  const before = state();
+  expect(before.outbox).toEqual([{ post_id: mention.id, delivered_at: null }]);
+  expect(listBoards(db, ["fe"])[0]!.unread).toBe(1);
+
+  const peek = (args: Record<string, unknown>) => callBoardTool(db, "fe", "board_read", { board: "e2e", ...args }, { session: child, via: child, addresses: ["fe", root] }).result as ReadResult;
+  const bodies = (r: ReadResult) => r.posts.map((p) => p.body);
+  expect(peek({})).toMatchObject({ unread_remaining: 0 });
+  expect(bodies(peek({}))).toEqual(["unread one", "@fe look"]);
+  expect(bodies(peek({ limit: 1 }))).toEqual(["@fe look"]);
+  expect(bodies(peek({ thread: mention.id }))).toEqual(["@fe look"]);
+  expect(bodies(peek({ before_id: mention.id }))).toEqual(["unread one"]);
+  expect(state()).toEqual(before);
+  expect(listBoards(db, ["fe"])[0]!.unread).toBe(1);
+
+  // The root's own read takes its unread post; its push is still waiting.
+  expect(bodies(read(db, "fe", "e2e"))).toEqual(["unread one"]);
+  expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention", post: { id: mention.id } }]);
+});
+
+// #523: a child's posts are its root's own, as the root's own posts are: none
+// of the root's addresses is pushed one or counts it unread, whichever of them
+// it wrote as, including a claim announcement (which passes no address set),
+// while other subscribers get it with via.
+test("a child's post and claim announcement are its root's own: none of the root's addresses is pushed one or shown it unread", () => {
+  const root = "id:0123456789abc", child = "id:0123456789abd";
+  registerId(db, { id: root, principal: null, launcher: false }, 1);
+  registerId(db, { id: child, principal: null, launcher: false, rootId: root }, 1);
+  holdAlias(db, "fe", root, 1);
+  holdAlias(db, "qa", root, 2);
+  seen("qa");
+  createBoard(db, "be", "ops", "digests");
+  subscribe(db, "fe", "e2e", "push");
+  subscribe(db, "fe", "ops", "digest");
+  subscribe(db, "sim", "e2e", "push");
+  const mine = ["fe", "qa", root];
+  const ctx = { session: child, via: child, addresses: mine };
+  // As the root's other alias, so the subscribed address isn't the author.
+  callBoardTool(db, "qa", "board_post", { board: "e2e", body: "subagent post" }, ctx);
+  callBoardTool(db, "qa", "board_post", { board: "ops", body: "subagent digest" }, ctx);
+  callBoardTool(db, "qa", "claim_take", { key: "ticket:ENG-7", board: "e2e" }, ctx);
+  // The root's own announcement, likewise.
+  callBoardTool(db, "qa", "claim_take", { key: "ticket:ENG-8", board: "e2e" }, { session: root, addresses: mine });
+
+  const outbox = db.prepare(`SELECT o.handle, p.body FROM outbox o JOIN posts p ON p.id = o.post_id ORDER BY o.post_id`).all() as { handle: string; body: string }[];
+  expect(outbox.filter((r) => mine.includes(r.handle))).toEqual([]);
+  expect(outbox.filter((r) => r.handle === "sim").map((r) => r.body)).toEqual(["subagent post", "[claim] ticket:ENG-7", "[claim] ticket:ENG-8"]);
+  expect(pendingFor(db, "sim")).toMatchObject([{ post: { body: "subagent post", via: child } }, { post: { body: "[claim] ticket:ENG-7", via: child } }, { post: { body: "[claim] ticket:ENG-8" } }]);
+  expect(listBoards(db, mine).map((b) => [b.name, b.unread])).toEqual([["e2e", 0], ["ops", 0]]);
+  for (const a of mine) expect(pendingFor(db, a, { all: true })).toEqual([]);
+  expect(read(db, "fe", "ops").unread_remaining).toBe(0);
+  // Another session's post is still the root's to read.
+  post(db, "be", "ops", "from be");
+  expect(listBoards(db, ["fe"]).find((b) => b.name === "ops")!.unread).toBe(1);
+  expect(pendingFor(db, "fe", { all: true })).toMatchObject([{ kind: "digest", board: "ops", unread: 1, latest: { body: "from be" } }]);
 });
 
 test("quiet subscribers are never pushed but see unread counts", () => {

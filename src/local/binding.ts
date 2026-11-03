@@ -11,10 +11,10 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, viewers, type AliasMetaSet } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, touchId, viewers, type AliasMetaSet } from "../core/boards.ts";
 import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
-import { aliasHeldText, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, MAX_CANDIDATES, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
+import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
 import { listClaims } from "../core/claims.ts";
 import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -147,6 +147,64 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
       keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     });
   }).immediate();
+}
+
+/**
+ * Child session `child` (a harness subagent, #523) of the live session
+ * `root`, registered when the root's process first sees it, or sees it again
+ * after it went idle: an ids row with the root's harness, cwd and keyedness,
+ * delivery 'none' (it receives nothing and is never an address) and
+ * `root_id`, which ends it with its root. The first sight is audited
+ * `id.child_seen` with the harness's raw id and this process's pid. A row
+ * already there is the same child (a root's keyed restart, or a quiet
+ * subagent's return) if it names this root and hasn't ended; anything else
+ * is refused. A local child has no end of its own, so the root's other
+ * children count toward MAX_CHILDREN only while seen within
+ * DEFAULT_IDLE_SECONDS of `now`, as hosted counts its live child rows.
+ * `raw` is harness-asserted: the child acts only under its root's
+ * addresses, so the claim grants nothing and attributes the write.
+ */
+export function registerChild(db: Database, root: string, child: string, raw: string, now = Date.now()): void {
+  db.transaction(() => {
+    const prior = db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(child) as { root_id: string | null; ended_at: number | null } | null;
+    if (prior && prior.root_id !== root) throw new CoreError(`id_collision: ${child} is another session's ID, not a child of ${root}`);
+    if (prior && prior.ended_at !== null) throw new CoreError(`id_ended: child session ${child} ended at ${new Date(prior.ended_at).toISOString()}`);
+    const { n } = db.prepare(`SELECT COUNT(*) AS n FROM ids WHERE root_id = ? AND id != ? AND ended_at IS NULL AND last_seen >= ?`)
+      .get(root, child, now - DEFAULT_IDLE_SECONDS * 1000) as { n: number };
+    if (n >= MAX_CHILDREN) throw new CoreError(childCapacity(root));
+    if (prior) return;
+    const r = db.prepare(`SELECT harness, cwd, keyed FROM ids WHERE id = ?`).get(root) as { harness: string | null; cwd: string | null; keyed: number } | null;
+    const reused = registerId(db, { id: child, principal: null, harness: r?.harness ?? null, cwd: r?.cwd ?? null, launcher: false, keyed: r?.keyed === 1, rootId: root }, now);
+    if (reused) writeCoreAudit(db, "id.reused", child, child, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: process.pid });
+    writeCoreAudit(db, "id.child_seen", root, child, { child, root, raw, pid: process.pid });
+  }).immediate();
+}
+
+/**
+ * The child sessions (#523) one root's process has seen inside the idle
+ * window, by the harness's raw subagent id. `resolve` gives a raw id's child
+ * ID at `now`: registered (registerChild, which caps them) on first sight or
+ * once it went quiet, then touched. A child unseen past DEFAULT_IDLE_SECONDS
+ * is forgotten, so a long session's finished subagents hold neither a place
+ * nor memory.
+ */
+export class ChildSessions {
+  readonly #seen = new Map<string, { id: string; at: number }>();
+  constructor(private readonly db: Database, private readonly root: string, private readonly rootKey: string) {}
+  get size(): number {
+    return this.#seen.size;
+  }
+  resolve(raw: string, now = Date.now()): string {
+    for (const [r, c] of this.#seen) if (c.at < now - DEFAULT_IDLE_SECONDS * 1000) this.#seen.delete(r);
+    let child = this.#seen.get(raw);
+    if (child === undefined) {
+      const id = childSessionId(this.rootKey, raw);
+      registerChild(this.db, this.root, id, raw, now);
+      this.#seen.set(raw, (child = { id, at: now }));
+    } else child.at = now;
+    touchId(this.db, child.id, now);
+    return child.id;
+  }
 }
 
 export type AttachResult = { ok: true; held: string[] } | { ok: false; error: string };
@@ -282,8 +340,12 @@ export function reap(db: Database, rows: SessionRow[], now: number): Ended {
 
 // Unended IDs with no bindings row: an older grayboard sharing the file
 // reaped the row, which deletes only that. Every live local session has one,
-// so these sessions are over.
-const ORPHAN_SQL = `SELECT id FROM ids WHERE ended_at IS NULL AND id NOT IN (SELECT session_id FROM bindings)`;
+// so these sessions are over. A child session (#523) has none of its own: it
+// is over when its root is (ended, or pruned), which an older grayboard that
+// ended the root without knowing children left unended.
+const ORPHAN_WHERE = `ended_at IS NULL AND (
+  root_id IS NULL AND id NOT IN (SELECT session_id FROM bindings)
+  OR root_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ids r WHERE r.id = ids.root_id AND r.ended_at IS NULL))`;
 
 /**
  * Every live session row that receives, ending the dead ones: those whose
@@ -297,7 +359,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const { alive: live, dead } = aliveRows(rows);
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
-  const orphans = db.prepare(ORPHAN_SQL).all() as { id: string }[];
+  const orphans = db.prepare(`SELECT id FROM ids WHERE ${ORPHAN_WHERE}`).all() as { id: string }[];
   if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
   testPause("end:before-txn");
   // Each candidate ends in its own transaction (#284 S3): one end that fails
@@ -322,8 +384,10 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   for (const { id } of orphans) {
     each(id, (now) => {
       const out: Ended = { ended: [], wake: [] };
-      if (!db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(id)) {
-        merge(out, id, endSession(db, localMail(db), id, { why: "its process row was removed by an older grayboard", now }));
+      const row = db.prepare(`SELECT root_id FROM ids WHERE id = ? AND ${ORPHAN_WHERE}`).get(id) as { root_id: string | null } | null;
+      if (row) {
+        const why = row.root_id === null ? "its process row was removed by an older grayboard" : `its root ${row.root_id} ended`;
+        merge(out, id, endSession(db, localMail(db), id, { why, now }));
       }
       return out;
     });

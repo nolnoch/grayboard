@@ -52,12 +52,13 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
 }
 
 // The calling session (#284): `addresses` is its address set, the primary
-// first; `session` its ID, recorded on the posts it makes (S8).
-export type ClaimCtx = { addresses?: string[]; session?: string };
+// first; `session` its ID, recorded on the posts it makes (S8); `via` the
+// child session acting under those addresses (#523), recorded beside it.
+export type ClaimCtx = { addresses?: string[]; session?: string; via?: string };
 
-function announce(db: Database, handle: string, board: string | null, text: string, session?: string): ClaimChanges {
+function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: session });
+  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
@@ -126,9 +127,9 @@ export function claim(
       .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
     logEvent(db, renewed ? "renew" : "take", as, row, now);
     const changed = !renewed
-      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts.session)
+      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
-        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts.session)
+        ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts)
         : { wake: [], boards: [] };
     return {
       ok: true, claim: row, renewed,
@@ -187,7 +188,7 @@ export function release(
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
     const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
-    return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx.session);
+    return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx);
   }).immediate();
 }
 

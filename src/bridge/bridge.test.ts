@@ -41,6 +41,30 @@ test("format leads with the handle, names the board on a new thread, and truncat
   const noted = format("be", null, "x".repeat(20_000), 7, "⚠️ " + "n".repeat(5_000));
   expect(noted.length).toBeLessThan(12_000);
   expect(noted).toContain("(truncated; the full text is grayboard message 7)\n\n⚠️ nnn");
+  // A child writer (#523) follows the handle, labelled as the harness's claim, on a new board thread too.
+  expect(format("be", null, "hi", 4, undefined, "id:0123456789abc")).toBe("**be** (subagent id:0123456789abc, harness-asserted) hi");
+  expect(format("bob@example.com/be", "e2e", "hi", 5, undefined, "id:0123456789abc")).toBe("`bob@example.com/be` (subagent id:0123456789abc, harness-asserted) · #e2e · hi");
+  expect(format("be", null, "x", 6, "⚠️ n", "id:0123456789abc")).toBe("**be** (subagent id:0123456789abc, harness-asserted) x\n\n⚠️ n");
+});
+
+test("a channel item's via (#523) reaches Slack after its sender; an item without one names the sender alone", async () => {
+  const posted: string[] = [];
+  const f: Fetch = async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)).markdown_text);
+    return Response.json({ ok: true, ts: `${posted.length}.0` });
+  };
+  const store = new Store(join(dir, "b.db"));
+  const relay = new Relay(store, { call: async () => ({ ok: true, value: [] }), ...noFiles }, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: () => {} });
+  store.enqueue({ content: "reviewed", meta: { message_id: "1", from: "be", via: "id:0123456789abc" } });
+  store.enqueue({ content: "found a bug", meta: { board: "e2e", post_id: "2", from: "be", via: "id:0123456789abc" } });
+  store.enqueue({ content: "from the root", meta: { message_id: "3", from: "be" } });
+  await relay.drain();
+  expect(posted).toEqual([
+    "**be** (subagent id:0123456789abc, harness-asserted) reviewed",
+    "**be** (subagent id:0123456789abc, harness-asserted) · #e2e · found a bug",
+    "**be** from the root",
+  ]);
+  store.close();
 });
 
 // ── config ───────────────────────────────────────────────────────────────────

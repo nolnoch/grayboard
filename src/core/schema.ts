@@ -245,6 +245,15 @@ export function initCoreSchema(db: Database): void {
   // hello under (#351), so a logout ends the token's IDs in their grace too,
   // which have no connection to find them by. Server-only; null locally.
   if (!idCols.has("token_session")) db.exec(`ALTER TABLE ids ADD COLUMN token_session INTEGER`);
+  // root_id: the root session a child session (a harness subagent, #523) acts
+  // under; null for a root. A child ID is never an address: a send or mention
+  // to it is refused child_session naming the root's primary (undeliverableId).
+  // Kept on the ids row, not the hosted store's, because a hosted child's
+  // source row is deleted when the child ends; a local child's row is ended
+  // with its root's (endSession). A hosted ID that later starts as a root
+  // clears it (hostedRoot).
+  if (!idCols.has("root_id")) db.exec(`ALTER TABLE ids ADD COLUMN root_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_root ON ids(root_id) WHERE root_id IS NOT NULL`);
   const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
     if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);
@@ -270,6 +279,11 @@ export function initCoreSchema(db: Database): void {
   // The session that wrote the post (#284), beside the address it posted as;
   // null for posts from before it, and for writers with no session.
   if (!postCols.some((c) => c.name === "author_id")) db.exec(`ALTER TABLE posts ADD COLUMN author_id TEXT`);
+  // The child session that wrote it (#523), when the writer was a harness
+  // subagent acting under its root's addresses; equal to author_id then, and
+  // null for a root's own writes. Stored at write time: a hosted child's
+  // source row is gone once it ends, so childhood can't be derived at read.
+  if (!postCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE posts ADD COLUMN via TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"

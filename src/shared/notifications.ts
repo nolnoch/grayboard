@@ -8,6 +8,9 @@ export type Post = {
   id: number;
   board: string;
   author: string;
+  // The child session (a harness subagent, #523) that wrote it under the
+  // author's address; absent for a root's own post.
+  via?: string;
   body: string;
   parent_id: number | null;
   created_at: number;
@@ -21,7 +24,16 @@ export type Pending =
   | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
-export type DirectNotice = { id: number; sender: string; recipient?: string; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+
+/**
+ * How text for a person names a child writer (#523): the harness asserted
+ * which subagent wrote it, and nothing on the bus checks that, so the label
+ * says so. Channel meta carries the bare ID as `via`.
+ */
+export function viaLabel(via: string): string {
+  return `subagent ${via}, harness-asserted`;
+}
 
 // A message's or post's files, in its channel meta. attachment_get isn't
 // alwaysLoad, so the notification that carries files names it; one without
@@ -37,6 +49,7 @@ function addFiles(meta: Record<string, string>, list: AttachmentInfo[] | undefin
 // `primary` (#284 S4): a one-address session pays nothing for it.
 export function dmNotification(msg: DirectNotice, primary?: string): { content: string; meta: Record<string, string> } {
   const meta: Record<string, string> = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.via) meta.via = msg.via;
   if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary) meta.to = msg.recipient;
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
   if (msg.kind) meta.kind = msg.kind;
@@ -55,14 +68,16 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
       reason: item.reason,
       created_at: String(p.created_at),
     };
+    if (p.via) meta.via = p.via;
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
     addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
+  const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
-    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "…" : ""}" Call board_read if it's relevant.`,
+    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "…" : ""}" Call board_read if it's relevant.`,
     meta: { board: item.board, kind: "digest", unread: String(item.unread) },
   };
 }

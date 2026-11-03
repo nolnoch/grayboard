@@ -13,7 +13,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
 import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -342,7 +342,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : boundInstruction(context),
+      instructions: role === "subscriber" ? undefined
+        : context.session.via ? hostedChildInstruction(info, context.session.via, context.session.readOnly)
+        : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? [])
+        : boundInstruction(context),
     });
     server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });

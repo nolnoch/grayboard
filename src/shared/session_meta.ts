@@ -24,3 +24,13 @@ export const GRAYBOARD_SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 // flag on (#520), kept until the ownership ends (`ids.launcher`); `false` or absence never clears it, and anything
 // but a boolean is refused.
 export const GRAYBOARD_LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
+// Local mode only (#523): on a tool call to `grayboard mcp`, the raw ID of the harness subagent making it, so the
+// call is that subagent's child session, acting under this session's addresses (src/local/mcp.ts). A separate key
+// from GRAYBOARD_SESSION_META, whose presence means "this session". Harness-asserted: it grants nothing beyond the
+// root's powers, and only attributes the write (`via`).
+export const GRAYBOARD_AGENT_META = "io.github.nolnoch.grayboard/agent";
+
+/** A harness-asserted raw session ID as every mode accepts one: 1–1024 characters, no control characters. */
+export function validSourceId(raw: unknown): raw is string {
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 1024 && !/[\x00-\x1f\x7f]/.test(raw);
+}

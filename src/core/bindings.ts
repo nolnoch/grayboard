@@ -40,6 +40,17 @@ export function idAddress(key: string): string {
   return `id:${crockford13(createHash("sha256").update(key).digest("hex").slice(0, 16))}`;
 }
 
+/**
+ * A local child session's ID (#523): a harness subagent `raw` (its harness's
+ * own session id) under the session whose key is `rootKey`. Derived from the
+ * secret key, so only the root's process can mint it, and stable for the
+ * same subagent across the root's keyed restarts. NUL separates the two: a
+ * valid `raw` has no control characters.
+ */
+export function childSessionId(rootKey: string, raw: string): string {
+  return idAddress(createHash("sha256").update(`${rootKey}\0${raw}`).digest("hex"));
+}
+
 // A 1.x session ID: the same 64 bits as 16 hex characters. Binding history
 // and name records written before #284 keep it; it is re-encoded on read,
 // never rewritten.
@@ -76,6 +87,41 @@ export const MAX_HOLDS = 8;
 /** The refusal for a bind past MAX_HOLDS. */
 export function tooManyHolds(held: string[]): string {
   return `this session already holds ${held.length} names (${held.join(", ")}); unbind one first`;
+}
+
+/**
+ * How long a session may go unseen before it is idle: hosted's default sweep
+ * window (GRAYBOARD_HOSTED_IDLE_SECONDS), and the window within which a local
+ * child counts toward MAX_CHILDREN (#523).
+ */
+export const DEFAULT_IDLE_SECONDS = 900;
+
+/**
+ * How many child sessions (#523) one root may have at once, in both modes. A
+ * hosted child's row ends at its subagent's end; a local child has no end of
+ * its own, so it counts only while seen within DEFAULT_IDLE_SECONDS.
+ */
+export const MAX_CHILDREN = 128;
+
+/** The refusal for a child session past MAX_CHILDREN under `root`. */
+export function childCapacity(root: string): string {
+  return `child capacity reached: session ${root} has ${MAX_CHILDREN} active child sessions, the most one session may have; a child's place frees when it ends or goes idle`;
+}
+
+// What a child session (#523) is told instead of a call that would take on or
+// change its root's read state: the inbox's owed-list and its acks, the root's
+// board subscriptions and thread mutes. dm_history, dm_thread and board_read
+// change nothing, so stay the child's.
+const ROOT_STATE: Record<string, string> = {
+  dm_inbox: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  dm_ack: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  board_subscribe: "its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.",
+};
+
+/** The child_session refusal for `tool` called by child `child` of the root writing as `rootPrimary`, or null if the tool is the child's. */
+export function childStateRefusal(tool: string, child: string, rootPrimary: string): string | null {
+  const why = ROOT_STATE[tool];
+  return why === undefined ? null : `${child} is a subagent of ${rootPrimary}; ${why}`;
 }
 
 /** Session `id` no longer holds `address`; a hold another session took since stays. */

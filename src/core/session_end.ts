@@ -13,7 +13,7 @@ import type { Database } from "bun:sqlite";
 import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
-import { logBinding } from "./bindings.ts";
+import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
 import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -106,6 +106,11 @@ export function endSession(
   db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(id);
   const detail = opts.why ? `session_end: ${opts.why}` : "session_end";
   for (const name of held) logBinding(db, id, name, "released", detail, now);
+  // Its child sessions (#523) act under its addresses, so they end with it, each audited.
+  const children = (db.prepare(`SELECT id FROM ids WHERE root_id = ? AND ended_at IS NULL ORDER BY id`).all(id) as { id: string }[]).map((r) => r.id);
+  for (const child of children) {
+    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}) }).wake) wake.add(h);
+  }
   (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
     principal: row?.principal ?? null,
     held,
@@ -113,6 +118,7 @@ export function endSession(
     bounced,
     ...(unbounced ? { unbounced } : {}),
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
+    ...(children.length ? { children } : {}),
   });
   wake.delete(id);
   return { ended: true, held, wake: [...wake] };
@@ -136,7 +142,9 @@ export function bounceBody(id: string, endedAt: number, held: string[]): string 
  * Refuse a send or mention to an ID that can't receive it, inside the
  * sender's write transaction so it can't race the end: an ended ID
  * (id_ended, naming what it held), one with no row (not_found: never
- * existed, or pruned past retention), a viewer (not_found) or a tools-only
+ * existed, or pruned past retention), a viewer (not_found), a child session
+ * (child_session, naming its root's primary: a child acts under its root's
+ * addresses, ended or not, so its ID is never an address) or a tools-only
  * session (no_delivery, naming the alias its owner writes as).
  */
 export function assertDeliverableId(db: Database, id: string): void {
@@ -151,7 +159,7 @@ export function assertDeliverableId(db: Database, id: string): void {
  */
 export class Undeliverable extends CoreError {
   constructor(
-    readonly code: "not_found" | "id_ended" | "no_delivery",
+    readonly code: "not_found" | "id_ended" | "no_delivery" | "child_session",
     readonly detail: string,
   ) {
     super(`${code}: ${detail}`);
@@ -160,10 +168,13 @@ export class Undeliverable extends CoreError {
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
 export function undeliverableId(db: Database, id: string): Undeliverable | null {
-  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer FROM ids WHERE id = ?`).get(id) as
-    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number }
+  const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer, root_id FROM ids WHERE id = ?`).get(id) as
+    | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number; root_id: string | null }
     | null;
   if (!r || r.viewer) return new Undeliverable("not_found", `no session ${id}`);
+  if (r.root_id !== null) {
+    return new Undeliverable("child_session", `${id} is a subagent acting under session ${r.root_id} and receives nothing; send to ${rootPrimary(db, r.root_id)}`);
+  }
   if (r.ended_at != null) {
     const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
     return new Undeliverable("id_ended", `${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
@@ -172,4 +183,18 @@ export function undeliverableId(db: Database, id: string): Undeliverable | null 
     return new Undeliverable("no_delivery", `${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
   }
   return null;
+}
+
+/**
+ * The address a child's root writes as by default: its oldest hold, else
+ * its writes_as, else (once ended) the first alias it held, else its ID.
+ */
+function rootPrimary(db: Database, root: string): string {
+  const holds = holdsOf(db, root);
+  if (holds.length) return primaryOf(holds, root);
+  const r = db.prepare(`SELECT ended_at, held_aliases_json, writes_as FROM ids WHERE id = ?`).get(root) as
+    | { ended_at: number | null; held_aliases_json: string | null; writes_as: string | null }
+    | null;
+  if (r?.writes_as) return r.writes_as;
+  return primaryOf(r?.ended_at != null && r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [], root);
 }

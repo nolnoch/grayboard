@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
-import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
+import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandidate, notHolding, unbindOk, type Candidate } from "../core/bindings.ts";
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
@@ -10,7 +10,7 @@ import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META, validSourceId } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -35,7 +35,7 @@ export function hostedSessionId(user: number, client: string, raw: string): stri
 // routes all map a raw source through the principal's own key, namespaced per client.
 export function sourceContext(principal: OAuthPrincipal, raw: unknown): SessionContext {
   if (principal.sourceKey === null) return { missing: "the client has no mapped source" };
-  if (typeof raw !== "string" || !raw.length || raw.length > 1024 || /[\x00-\x1f\x7f]/.test(raw)) return { missing: `the key _meta["${principal.sourceKey}"] is missing` };
+  if (!validSourceId(raw)) return { missing: `the key _meta["${principal.sourceKey}"] is missing` };
   return { id: hostedSessionId(principal.authed.user_id, principal.clientId, raw), raw };
 }
 export function sessionContext(principal: OAuthPrincipal, meta: unknown): SessionContext {
@@ -112,6 +112,8 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
   return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
 }
+// The line a session that is a team member is told, root or child.
+const TEAM_BOARDS_NOTE = "Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks.";
 // A session with no delivery declaration and no open lease: bind's note, and the bound initialize text's (#531).
 const noLeaseNote = (name: string) => `No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`;
 // A bound native session's `initialize` text. A declaration names its delivery. Without one (OpenCode), the
@@ -123,10 +125,28 @@ export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDe
     ...(push
       ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared?.source ?? DEFAULT_CHANNEL_SOURCE)]
       : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, declared ? POLL_NOTE : noLeaseNote(info.identity_full), ...COORDINATION_INSTRUCTIONS]),
-    ...(info.teams.length ? ["Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks."] : []),
+    ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
     ...(launcher ? launcherInstruction() : []),
     ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
   ].join(" ");
+}
+// A hosted child's `initialize` text (#523), in place of its root's: it acts as the root's primary, and
+// neither receives nor consumes the root's mail and board traffic, so the root's delivery lines don't apply.
+// A child binds nothing, so under a root with no name yet (`unbound`) it is told it only reads until the root
+// binds, never the root's "bind one" text.
+export function hostedChildInstruction(info: IdentityInfo, child: string, unbound = false): string {
+  return [
+    unbound
+      ? `You are a subagent on grayboard. Your root session has no bus name yet: until it binds one you can read boards, peers and claims, and you send nothing. Binding is your root's, not yours.`
+      : `You are a subagent acting as "${info.identity_full}" on grayboard; what you write shows your ID ${child} as via.`,
+    `Mail and board pushes are your root's: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read.`,
+    ...(unbound ? [] : COORDINATION_INSTRUCTIONS),
+    ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
+  ].join(" ");
+}
+// A child's write refused while its root `root` has no name (#523): the bind it needs is the root's.
+function childUnbound(root: string): string {
+  return `unbound; this session is a subagent of ${root}, which has no bus name yet. Its writes work once ${root} binds one; binding is the root's.`;
 }
 // A name as the session sees it: its own scope's prefix dropped (the plugin's short()).
 const shortOf = (email: string) => (address: string) => address.startsWith(`${email}/`) ? address.slice(email.length + 1) : address;
@@ -144,14 +164,14 @@ const DELIVERY_TTL_MS = 30_000;
 export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
-  const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? "900");
+  const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? String(DEFAULT_IDLE_SECONDS));
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive integer");
   const idle = rawIdle * 1000;
   // A delivery lease's TTL (createDelivery reads it from the service); the
   // restart credit caps a deadline at one TTL past startup (#423).
   const leaseTtl = DELIVERY_TTL_MS;
   const gates = new Map<string, { gate: BindGate; users: number }>();
-  const limits = { user: 256, global: 4096, children: 128 };
+  const limits = { user: 256, global: 4096, children: MAX_CHILDREN };
   function admit(user: number, root?: string) {
     const rows = store.all();
     if (rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user || (root && rows.filter(r => r.root_session_id === root).length >= limits.children)) throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
@@ -191,6 +211,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null };
       application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
+      // An ID that was a child (its source row ended) starts as a root: an address again (#523).
+      application.hostedRoot(row.session_id, null);
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -331,7 +353,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   function snapshot(p: OAuthPrincipal, row?: HostedSession) {
     const root = row ? rootOf(row) : undefined;
-    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
+    const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
+    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     authorized(p);
@@ -388,7 +412,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = told ? takeLost(p, row, "agent") : [];
         if (taken.length) told!(lostNotice(p, row!, taken));
         const root = row ? rootOf(row) : undefined;
-        if (!(root && named(root)) && !UNBOUND_READS.has(tool) && tool !== "whoami") throw new ApplicationError("unbound", "unbound; bind a name first, or have this session's root register it as a child (session_register)");
+        if (!(root && named(root)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
+          throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
+        }
         const selected = snapshot(p, row);
         // Refusal audits the call produced, written once the transaction has unwound (#452).
         const late: (() => void)[] = [];
@@ -455,7 +481,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
-          ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed, root?.suggested ?? null) } : {}) };
+          // A child binds nothing, so it isn't offered names to bind (#523).
+          ...(!(root && named(root, held)) ? { unbound: true, ...(row?.root_session_id ? {} : { candidates: application.hostedCandidates(p.authed, root?.suggested ?? null) }) } : {}) };
       });
     },
     // `declared`: the native request's declaration (deliveryDeclaration); text only.
@@ -540,7 +567,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async register(p: OAuthPrincipal, context: SessionContext, child: string, via: string[] = []) {
       if (!("id" in context)) throw new ApplicationError("unbound", "registration requires session context");
       const mapped = sourceContext(p, child);
-      if (!("id" in mapped) || !Array.isArray(via) || via.length > 16 || via.some(value => typeof value !== "string" || !value.length || value.length > 1024 || /[\x00-\x1f\x7f]/.test(value))) throw new ApplicationError("invalid_registration", "invalid child session source or ancestry");
+      if (!("id" in mapped) || !Array.isArray(via) || via.length > 16 || !via.every(validSourceId)) throw new ApplicationError("invalid_registration", "invalid child session source or ancestry");
       const childId = mapped.id;
       if (childId === context.id) throw new ApplicationError("invalid_registration", "a session cannot register itself");
       const before = store.get(context.id);
@@ -569,6 +596,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (existing?.root_session_id === root.session_id) return { message: "already registered" };
           if (existing) store.end(existing.session_id, "closed", now());
           application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
+          application.hostedRoot(childId, root.session_id);
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
