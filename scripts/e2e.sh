@@ -12,6 +12,10 @@
 #                                   tree's plugin, or with GRAYBOARD_E2E_TAG
 #                                   and GRAYBOARD_E2E_SHA the release's pin
 #                                   (see tests/e2e/claude_hosted.e2e.ts)
+#   scripts/e2e.sh claude-local     the pinned Claude Code with local-mode
+#                                   grayboard and its hooks: subagents' calls
+#                                   as child sessions, across /clear
+#                                   (see tests/e2e/claude_local.e2e.ts)
 # Each run writes its run dir (GRAYBOARD_E2E_RUN_DIR, default
 # .e2e-runs/<suite>-<UTC time>): per bun test run, its output (.log) and JUnit
 # report (.xml), plus whatever the tests keep (tests/support/run_dir.ts), and
@@ -22,9 +26,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 case "${1:-}" in
-  upgrade-matrix | binaries | claude-hosted | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
+  upgrade-matrix | binaries | claude-hosted | claude-local | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
   *)
-    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
+    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|claude-local|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
     exit 2
     ;;
 esac
@@ -97,5 +101,8 @@ case "$suite" in
     ;;
   claude-hosted)
     if suite_run claude-hosted ./tests/e2e/claude_hosted.e2e.ts; then verdict "passed"; else verdict "failed (claude-hosted.log in the run dir)"; fi
+    ;;
+  claude-local)
+    if suite_run claude-local ./tests/e2e/claude_local.e2e.ts; then verdict "passed"; else verdict "failed (claude-local.log in the run dir)"; fi
     ;;
 esac

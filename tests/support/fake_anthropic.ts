@@ -46,6 +46,32 @@ export function onUserText(trigger: string, server: string, tool: string, input:
 const WAIT = "WaitForMcpServers";
 
 /**
+ * Makes the tool calls `steps` in order, one per request, in a conversation
+ * whose user messages contain `trigger`, under the tool-use ids
+ * `toolu_<trigger>_<i>`. Like onUserText, it waits for `server` first. A
+ * subagent's conversation is its own: its user message is the prompt it was
+ * given, so a trigger in that prompt scripts the subagent.
+ */
+export function onUserSteps(trigger: string, server: string, steps: { tool: string; input: Record<string, unknown> }[]): Rule {
+  const base = `toolu_${trigger.replace(/\W/g, "_")}`;
+  return (req) => {
+    if (!userTexts(req).some((t) => t.includes(trigger))) return undefined;
+    const i = steps.findIndex((_, i) => !called(req, `${base}_${i}`));
+    if (i < 0) return undefined;
+    const { tool, input } = steps[i]!;
+    if (toolNames(req).includes(tool)) return { tool, id: `${base}_${i}`, input };
+    if (!toolNames(req).includes(WAIT)) return undefined;
+    return { tool: WAIT, id: `${base}_${i}_wait_${req.messages.length}`, input: { servers: [server] } };
+  };
+}
+
+/** The text of each tool_result the model was sent for the tool_use `id`. */
+export const toolResults = (model: FakeAnthropic, id: string): string[] =>
+  model.requests.flatMap((r) => r.body.messages.flatMap((m) => typeof m.content === "string" ? [] : m.content))
+    .filter((b) => b.type === "tool_result" && b.tool_use_id === id)
+    .map((b) => typeof b.content === "string" ? b.content : JSON.stringify(b.content));
+
+/**
  * Answers each Claude Code channel DM from a handle ending in `/from` once, with
  * the tool call `reply` makes from its message id and body. `source` is the
  * channel's server name (`plugin:grayboard:grayboard` for the plugin).
