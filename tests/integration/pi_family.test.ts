@@ -161,7 +161,8 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(row("root-alpha")!.lease_deadline).not.toBeNull();
 
   const beta = await root("root-beta", "beta");
-  expect((await beta.call("dm_send", { to: "alpha", body: "hello from beta" })).isError).toBeUndefined();
+  const sent = await beta.call("dm_send", { to: "alpha", body: "hello from beta" });
+  expect(sent.isError).toBeUndefined();
   await until(() => alpha.deliveries.length > 0);
   const [dm] = alpha.deliveries;
   expect(dm!.wake).toBe(true);
@@ -180,6 +181,15 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(alpha.deliveries[1]!.content).toContain(` from="${EMAIL}/human"`);
   expect(alpha.deliveries[1]!.content).toContain(` human="true"`);
   expect(beta.deliveries).toEqual([]);
+  // Each admission is recorded under the root, then its receipt; never a body.
+  const first = `direct:${payload(sent).message_id}`;
+  await until(() => alpha.records.filter(r => r.event === "receipted").flatMap(r => r.itemIds).length === 2, 10_000, "both receipts recorded");
+  const admitted = alpha.records.filter(r => r.event === "admitted");
+  expect(admitted).toHaveLength(2);
+  expect(admitted[0]).toMatchObject({ root: "root-alpha", itemId: first, wake: true });
+  expect(alpha.records.every(r => r.root === "root-alpha")).toBe(true);
+  expect(alpha.records.findIndex(r => r.event === "receipted" && r.itemIds.includes(first))).toBeGreaterThan(alpha.records.indexOf(admitted[0]!));
+  expect(JSON.stringify(alpha.records)).not.toContain("hello from");
 });
 
 test("/new carries the outgoing root's name, bound with this checkout as its place; a carry refused because another live session holds the name leaves the new session unbound, says so once, and /grayboard resume takes it once the name is free", async () => {
@@ -570,7 +580,7 @@ test("a /reload between an item's admission and its receipt doesn't deliver it t
   await before.ext.start({ id: "dup-1", reason: "startup" });
   expect((await before.call("bind", { name: "duper", create: true })).isError).toBeUndefined();
   await active(before, "dup-1", "duper");
-  await sender.call("dm_send", { to: "duper", body: "first" });
+  const first = `direct:${payload(await sender.call("dm_send", { to: "duper", body: "first" })).message_id}`;
   const after = await until(() => reloaded, 10_000, "the reload");
   await active(after, "dup-1", "duper");
   // Items admit in order: once the second arrives, the first was read again and skipped.
@@ -578,6 +588,9 @@ test("a /reload between an item's admission and its receipt doesn't deliver it t
   await until(() => after.deliveries.some(d => d.content.includes("second")), 10_000, "the second DM");
   expect(before.deliveries.map(d => d.content.includes("first"))).toEqual([true]);
   expect(after.deliveries.filter(d => d.content.includes("first"))).toEqual([]);
+  // The re-read after the reload admits nothing new, so records no second admission.
+  expect(before.records.filter(r => r.event === "admitted").map(r => r.itemId)).toEqual([first]);
+  expect(after.records.filter(r => r.event === "admitted" && r.itemId === first)).toEqual([]);
 });
 
 test("a child shut down while its registration is in flight still ends it, so it never counts toward the root's child cap", async () => {

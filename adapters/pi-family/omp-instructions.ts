@@ -22,14 +22,25 @@ export function plan(systemPrompt: readonly string[], injected: string | undefin
 }
 
 // Rewrites, in place, every string in `payload` equal to `from`; when none
-// is, every string containing it (providers that join the prompt's elements).
-// Returns the number of strings rewritten. Never rebuilds an object: Cursor's
-// payload is a protobuf message, and Anthropic's billing patch depends on
-// `system[0]`'s key order.
-export function replaceText(payload: unknown, from: string, to: string): number {
-  if (from === "") return 0;
+// is, every string equal to the whole system prompt joined as pi-ai's
+// `normalizeSystemPrompts` joins it (providers that send one system string),
+// rewritten to the same join with `from` replaced. Never a substring: a peer
+// message or tool result quoting the stale text stays as it was. Returns the
+// number of strings rewritten. Never rebuilds an object: Cursor's payload is
+// a protobuf message, and Anthropic's billing patch depends on `system[0]`'s
+// key order.
+export function replaceText(payload: unknown, systemPrompt: readonly string[], from: string, to: string): number {
   const exact = walk(payload, value => value === from ? to : undefined);
-  return exact || walk(payload, value => value.includes(from) ? value.replaceAll(from, () => to) : undefined);
+  if (exact) return exact;
+  const joined = join(systemPrompt);
+  const rewritten = join(systemPrompt.map(element => element === from ? to : element));
+  return walk(payload, value => value === joined ? rewritten : undefined);
+}
+
+// pi-ai's normalizeSystemPrompts, less its credential redaction: a prompt
+// omp redacted no longer equals the join, so the rewrite misses and warns.
+function join(systemPrompt: readonly string[]): string {
+  return systemPrompt.map(element => element.toWellFormed()).filter(element => element.trim().length > 0).join("\n\n");
 }
 
 function walk(root: unknown, rewrite: (value: string) => string | undefined): number {

@@ -102,12 +102,12 @@ const fromChild = (req: ChatRequest): boolean => /\bfake-child-\d+\b/.test(messa
 // The non-tool text of a request: the system prompt and any message omp
 // injected (a custom message reaches the model as developer or user).
 const promptOf = (req: ChatRequest): string => req.messages.filter((m) => m.role !== "tool").map(messageText).join("\n");
-// The request that carried DM `ping` holds `name`'s instructions and not the
-// unbound ones: a turn a push started gets them refreshed or injected (#441).
+// The request that carried DM `ping` holds `name`'s instructions once and not
+// the unbound ones: a turn a push started gets them refreshed or injected (#441).
 function expectInstructed(model: FakeModel, ping: number, name: string): void {
   const req = model.requests.find((r) => r.body.messages.some((m) => messageText(m).includes(`<channel source="grayboard" message_id="${ping}"`)));
   expect(req).toBeDefined();
-  expect(promptOf(req!.body)).toContain(`You are "alice@example.com/${name}" on grayboard.`);
+  expect(promptOf(req!.body).split(`You are "alice@example.com/${name}" on grayboard.`)).toHaveLength(2);
   expect(promptOf(req!.body)).not.toContain("no bus name yet");
 }
 
@@ -310,7 +310,10 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     // A subagent's requests carry no grayboard instructions.
     const childRequests = model.requests.filter((r) => fromChild(r.body));
     expect(childRequests.length).toBeGreaterThan(0);
-    for (const r of childRequests) expect(promptOf(r.body)).not.toContain("on grayboard.");
+    for (const r of childRequests) {
+      expect(promptOf(r.body)).not.toContain("on grayboard.");
+      expect(promptOf(r.body)).not.toContain("no bus name yet");
+    }
 
     // A peer's DM mid-run reaches main once and no subagent.
     const ping = await pingPong(srv, peer, "omp-task");

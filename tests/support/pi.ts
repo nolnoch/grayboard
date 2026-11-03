@@ -517,17 +517,23 @@ export async function pingPong(srv: HostedServer, peer: Peer, name: string): Pro
 }
 
 // The session file `file` records each of `pings` (DM ids, in order) admitted
-// under `root` and then receipted, and no message body in those records (#441).
+// under `root` and then receipted, and no message body in those records; it
+// never holds omp's hidden instructions message, which isn't persisted (#441).
 export async function expectDeliveryRecords(file: string, root: string, pings: number[], name: string): Promise<void> {
   type Entry = { event: "admitted"; root: string; itemId: string; stableID: string; wake: boolean } | { event: "receipted"; root: string; itemIds: string[] };
+  type Line = { type: string; customType?: string; data?: Entry };
   const want = pings.map((p) => `direct:${p}`);
-  const read = () => readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; customType?: string; data?: Entry })
-    .filter((e) => e.type === "custom" && e.customType === "grayboard-delivery").map((e) => e.data!);
+  // A line the harness is still writing doesn't parse yet: skipped, read next time.
+  const lines = () => readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((l): Line[] => {
+    try { return [JSON.parse(l) as Line]; } catch { return []; }
+  });
+  const read = () => lines().filter((e) => e.type === "custom" && e.customType === "grayboard-delivery").map((e) => e.data!);
   const entries = await until(() => {
     const r = read();
     const receipted = r.flatMap((e) => e.event === "receipted" ? e.itemIds : []);
     return want.every((id) => receipted.includes(id)) ? r : undefined;
   }, 15_000, `receipts for ${want.join(", ")} in ${file}`);
+  expect(lines().filter((e) => e.customType === "grayboard-instructions")).toEqual([]);
   const admitted = entries.filter((e) => e.event === "admitted");
   expect(admitted.map((e) => e.itemId)).toEqual(want);
   for (const e of entries) expect(e.root).toBe(root);
