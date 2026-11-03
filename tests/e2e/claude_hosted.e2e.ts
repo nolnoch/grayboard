@@ -141,15 +141,22 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's r
     const result = toolResults(model, first).join("\n");
     const link = new RegExp(`open (${RegExp.escape(srv.issuer)}/\\S+?) to sign in to grayboard`).exec(result);
     expect(link, result).not.toBeNull();
+    // A prompt that reached Claude Code while it was still wiring the
+    // connection was cancelled unshown, and the plugin sends it again: the
+    // user sees a prompt either way before opening the link.
+    const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
+    await until(() => debug().includes("Received elicitation request: "), 10_000, "Claude Code to show the sign-in prompt");
     expect(await browse(srv.issuer, link![1]!, "Claude Code")).toContain("Signed in to grayboard");
     const hosted = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // 2.1.316 keeps the URL prompt up after the plugin's completion notice and
     // its cancel, and the prompt takes the keyboard: the user dismisses it.
-    const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
+    // Keys typed before the main screen redraws can be lost (CI lost a letter).
     expect(debug()).toContain("Received elicitation completion notification");
+    const mark = tty.screen().length;
     tty.proc.terminal!.write("\x1b");
     await until(() => debug().includes('Elicitation response: {"action":"cancel"}'), 10_000, "Esc to dismiss the sign-in prompt");
+    await until(() => tty!.screen().slice(mark).includes("for shortcuts"), 10_000, "the main screen to redraw after the prompt");
     await tty.submit("WHOAMI-AGAIN");
     const again = "toolu_WHOAMI_AGAIN";
     await until(() => toolResults(model, again).length > 0, 30_000, "the second whoami result");

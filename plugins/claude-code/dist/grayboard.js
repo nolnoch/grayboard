@@ -37231,6 +37231,9 @@ var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any
 var INSTRUCTIONS_MS = 5000;
 var FLOW_MS2 = 10 * 60000;
 var LINK_MS = 20000;
+var UNSHOWN_MS = 1000;
+var RESEND_MS = 500;
+var RESENDS = 3;
 function pluginConfig(env) {
   const { CLAUDE_CODE_SESSION_ID: id, CLAUDE_PLUGIN_DATA: dataDir } = env, url = env.GRAYBOARD_SERVER_URL?.trim();
   if (!id)
@@ -37277,22 +37280,38 @@ function createPlugin(o) {
       say(`open ${url} to sign in to grayboard`);
       if (!server.getClientCapabilities()?.elicitation?.url)
         return;
-      const prompt = { id: randomUUID2(), withdraw: new AbortController };
-      if (flow)
-        flow.prompt = prompt;
-      say(`sign-in prompt sent (elicitation ${prompt.id})`);
-      let result;
-      try {
-        result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
-      } catch (error) {
-        if (prompt.withdraw.signal.aborted)
+      for (let sent = 0;; sent++) {
+        const prompt = { id: randomUUID2(), withdraw: new AbortController };
+        if (flow)
+          flow.prompt = prompt;
+        say(`sign-in prompt sent (elicitation ${prompt.id})`);
+        const start = Date.now();
+        let result;
+        try {
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+        } catch (error) {
+          if (prompt.withdraw.signal.aborted)
+            return;
+          say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
+          throw error;
+        }
+        const ms = Date.now() - start;
+        say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
+        if (result.action === "decline")
+          throw new LoginFailed("sign-in declined");
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow)
           return;
-        say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
-        throw error;
+        if (sent >= RESENDS) {
+          say(`sign-in prompt cancelled unshown ${sent + 1} times; the link in tool results remains`);
+          return;
+        }
+        say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
+        await after(RESEND_MS);
+        if (signingIn !== flow || flow.abort.signal.aborted) {
+          say("sign-in ended before the prompt was sent again");
+          return;
+        }
       }
-      say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action}`);
-      if (result.action === "decline")
-        throw new LoginFailed("sign-in declined");
     },
     notify: (message) => {
       say(message);

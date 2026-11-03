@@ -296,6 +296,28 @@ test("a prompt left unanswered (#497): every signed-out result carries the link,
   expect(said).not.toContain("sign-in failed");
 }, 40_000);
 
+test("a prompt Claude Code cancels unshown (its connection-setup handler) is sent again; a cancel after it was shown is not", async () => {
+  // First answer: an instant cancel, as 2.1.316 gives while still wiring the
+  // connection. Second: shown, then Esc after the UNSHOWN_MS window.
+  let n = 0;
+  const s = await plugin("sess-unshown", {
+    answer: async () => {
+      if (n++ === 0) return "cancel";
+      await Bun.sleep(1_200);
+      return "cancel";
+    },
+  });
+  await until(() => s.elicits.length === 2, 10_000, "the prompt sent again after the unshown cancel");
+  expect(s.elicits[1]!.url).toBe(s.elicits[0]!.url);
+  await until(() => /answered: cancel after \d{4,} ms/.test(s.stderr()), 10_000, "the shown prompt's Esc");
+  // Esc keeps the flow and its link, and asks no more.
+  const call = await texts(s, "whoami");
+  expect(call.texts[0]).toContain(`open ${s.elicits[0]!.url} to sign in to grayboard`);
+  expect(s.elicits).toHaveLength(2);
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await signedIn(s);
+}, 40_000);
+
 test("a sign-in that can't reach the server says why in the next result", async () => {
   const s = await plugin("sess-unreachable", { env: { GRAYBOARD_SERVER_URL: "http://127.0.0.1:1/mcp" } });
   await until(() => s.stderr().includes("sign-in failed: "), 15_000, "the failed startup sign-in");
