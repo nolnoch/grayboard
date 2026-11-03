@@ -233,7 +233,7 @@ test("hold sessions block binding and candidates without push or online presence
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });
-  expect(application.hostedCandidates(alice)).toEqual([]);
+  expect(application.hostedCandidates(alice, null)).toEqual([]);
   const sender = await connect(bob, "sender");
   expect((await sender.send("alice@example.com/held", "queued")).delivered_now).toBe(false);
   await owner.none(() => true);

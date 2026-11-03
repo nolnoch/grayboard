@@ -6,19 +6,21 @@ import { aliasLostNotice, asSessionId, bindOk, boundInstructions, describeCandid
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
+import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
 // `facts`: the model and effort the request reports (#364); present only, never a clearing.
 export type SessionFacts = { model?: string; effort?: string };
+// `suggested`: the name the request's checkout suggests (#443), normalized.
 // `launcher`: the request declares its harness can spawn subagents (#473); read at an ownership's start, and it only
 // words the bind and initialize text afterwards.
-export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; launcher?: true } | { missing: string };
+export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
   for (const value of [String(user), client, raw]) {
@@ -40,7 +42,7 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
   if (!("id" in base)) return base;
-  const context = { ...base, ...sessionFacts(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}) };
+  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_WRITES_AS_META];
@@ -59,6 +61,16 @@ function sessionFacts(meta: unknown): { facts?: SessionFacts } {
     if (raw.length) facts[field] = raw;
   }
   return Object.keys(facts).length ? { facts } : {};
+}
+// The name a request's checkout suggests (#443), any client's: a hint that orders the unbound candidates and grants
+// nothing. A value that isn't a string is a client bug, refused as a malformed fact is; a string that isn't an identity
+// name (a checkout directory called `human`, a scoped `BUS_IDENTITY`) is no suggestion, as local mode treats it.
+function suggestedName(meta: unknown): { suggested?: string } {
+  if (!meta || typeof meta !== "object" || !(GRAYBOARD_SUGGESTED_META in meta)) return {};
+  const raw = (meta as Record<string, unknown>)[GRAYBOARD_SUGGESTED_META];
+  if (typeof raw !== "string") throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
+  const normalized = normalizeIdentityName(raw);
+  return normalized.ok && normalized.name !== HUMAN_NAME ? { suggested: normalized.name } : {};
 }
 // A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
 // third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are
@@ -173,7 +185,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
-        root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
+        root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null };
       application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), { ...context.facts, ...(context.launcher && writesAs === null ? { launcher: true } : {}) });
       store.insert(row);
     } else if (row && !row.root_session_id) {
@@ -215,7 +227,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     for (const row of rows) if (!holders.has(row.session_id)) {
       const user = repo.users.findById(row.user_id);
       if (!user) continue;
-      const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row.place,
+      const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row,
         { ...quietSink, probe: async () => gate(row.session_id).bind(async () => {
           sweep();
           const current = store.get(row.session_id);
@@ -311,7 +323,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   function snapshot(p: OAuthPrincipal, row?: HostedSession) {
     const root = row ? rootOf(row) : undefined;
-    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root?.place ?? null, quietSink), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     authorized(p);
@@ -435,7 +447,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
-          ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed) } : {}) };
+          ...(!(root && named(root, held)) ? { unbound: true, candidates: application.hostedCandidates(p.authed, root?.suggested ?? null) } : {}) };
       });
     },
     // `declared`: the native request's declaration (deliveryDeclaration); text only.
@@ -455,7 +467,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && other.last_seen_at < now() - idle))) {
           store.end(other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
         }
-        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row.place, quietSink);
+        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row, quietSink);
         try {
           const ok = application.bindNow(selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) }, (address, detail) => { refusals.push([address, detail]); });
           const added = ok.held.length !== before.length;
@@ -493,7 +505,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
       const result = await service.owning(p, context, row => {
         const before = application.hostedHolds(row.session_id);
-        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row.place, quietSink);
+        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row, quietSink);
         try {
           const ok = application.unbind(selected.session, args.name);
           if (ok.released) {
@@ -501,7 +513,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             store.update({ ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });
             if (row.lease_deadline !== null) audit(row.session_id, "hosted.lease_closed", { reason: "unbound" });
           }
-          return { ok, before, ownership: row.ownership_id };
+          return { ok, before, ownership: row.ownership_id, suggested: row.suggested };
         } finally { application.close(selected.session); }
       }, async result => {
         await testPauseAsync("hosted:unbind:after-commit");
@@ -513,7 +525,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const instructions = held.length
         ? (general: boolean) => boundInstructions(held[0]!, source, general, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], [], held.slice(1))
-        : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed))];
+        : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed, result.suggested))];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? "", result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
@@ -550,7 +562,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (existing) store.end(existing.session_id, "closed", now());
           application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
-            source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now() });
+            source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
         }); } catch (e) { for (const w of later) w(); throw e; }

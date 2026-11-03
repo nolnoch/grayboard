@@ -1,6 +1,7 @@
 // A hosted session's model and effort over real HTTP (#364): the `_meta` keys a client sends on its requests become the
 // session's latest facts, which peer_list shows and match:{model} filters on; a legacy GET, which routes by its creating
-// POST's `_meta`, never reverts them; a malformed fact is refused with its own message.
+// POST's `_meta`, never reverts them; a malformed fact is refused with its own message. The suggested name (#443) rides
+// the same `_meta` and orders the unbound session's candidates in its `initialize` instructions.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -11,7 +12,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
+import { GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 
 const A = "alice@example.com";
 let app: ReturnType<typeof startServer>;
@@ -34,14 +35,15 @@ const token = () => issueOAuth(app.repo, app.oauth.resource, A, ["grayboard:tool
 
 // A client whose every POST carries the session key and the current facts, as hosted-core's wire sends them.
 // `get: false`: the client opens no standalone GET (a 405 tells the SDK the server offers none), so a test's own GET is the session's only one.
-async function connect(version: string, raw: string, facts: { model?: unknown; effort?: unknown }, get = true) {
+async function connect(version: string, raw: string, facts: { model?: unknown; effort?: unknown; suggested?: unknown }, get = true) {
   const tok = token();
   const inject = async (request: Request): Promise<Request | Response> => {
     if (request.method === "GET" && !get) return new Response(null, { status: 405 });
     if (request.method !== "POST") return request;
     const body = await request.clone().json() as { params?: Record<string, unknown> };
     const meta = { ...(body.params?._meta as Record<string, unknown> | undefined), [GRAYBOARD_SESSION_META]: raw,
-      ...(facts.model === undefined ? {} : { [GRAYBOARD_MODEL_META]: facts.model }), ...(facts.effort === undefined ? {} : { [GRAYBOARD_EFFORT_META]: facts.effort }) };
+      ...(facts.model === undefined ? {} : { [GRAYBOARD_MODEL_META]: facts.model }), ...(facts.effort === undefined ? {} : { [GRAYBOARD_EFFORT_META]: facts.effort }),
+      ...(facts.suggested === undefined ? {} : { [GRAYBOARD_SUGGESTED_META]: facts.suggested }) };
     return new Request(request, { body: JSON.stringify({ ...body, params: { ...body.params, _meta: meta } }) });
   };
   const client = new Client({ name: "facts", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
@@ -85,4 +87,9 @@ test("a model that isn't a string is refused with a message naming the key (#364
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {}, _meta: { [GRAYBOARD_SESSION_META]: "facts-bad", [GRAYBOARD_MODEL_META]: 5 } } }) });
   expect(res.status).toBe(400);
   expect(await res.json()).toEqual({ code: "bad_request", message: `_meta["${GRAYBOARD_MODEL_META}"] must be a string` });
+});
+
+test("an unbound session's initialize instructions offer its suggested name first (#443)", async () => {
+  const { client } = await connect("2026-07-28", "suggested-root", { suggested: "grayboard-gb-aux" });
+  expect(client.getInstructions()).toContain("Candidates (free now): grayboard-gb-aux (this checkout's default: new: bind with create: true).");
 });
