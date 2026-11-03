@@ -29,7 +29,12 @@ export function render({ content, meta = {} }: ChannelParams): string {
 }
 
 export default function grayboard(pi: ExtensionAPI) {
-  pi.on("mcp_notification", (event) => {
+  // omp runs task subagents in-process, each with its own copy of this
+  // extension and the main session's MCP connections, so every live
+  // subagent sees each notification too. The pushes are the main session's
+  // mail: only its runtime relays them (#526).
+  pi.on("mcp_notification", (event, ctx) => {
+    if (ctx.agent.kind !== "main") return;
     if (event.server !== SERVER || event.method !== "notifications/claude/channel") return;
     const params = event.params as ChannelParams;
     const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";

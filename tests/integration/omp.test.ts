@@ -1,10 +1,11 @@
 // End-to-end with the real omp coding agent: the hosted scenarios in
-// tests/support/omp.ts, on the bundle the CLI embeds (server mode, #280).
+// tests/support/omp.ts, on the bundle the CLI embeds (server mode, #280), and
+// the local relay adapter.
 import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalTaskScenario } from "../support/omp.ts";
 
 let dir: string;
 
@@ -27,3 +28,5 @@ test("omp hosted /fork, /new and /resume in one runtime: each replaces the sessi
 test("omp hosted: 130 sequential subagents stay under the 128-child cap; each registers at its first call and ends with its run", () => ompHostedManyChildrenScenario(dir), 900_000);
 
 test("omp hosted: two processes on one agent dir share one refresh; /grayboard logout in one pauses both", () => ompHostedRefreshLogoutScenario(dir), 120_000);
+
+test("omp local task run: a peer's DM while two subagents run reaches main once and no subagent (#526)", () => ompLocalTaskScenario(dir), 120_000);

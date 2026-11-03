@@ -12,14 +12,15 @@ import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
-import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" };
+import { adapterBundle, adapterSource } from "../../src/cli/adapters.ts" with { type: "macro" };
 import { sha256Hex } from "../../src/shared/hash.ts";
-import { cleanEnv } from "./env.ts";
-import { messageText, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
+import { cleanEnv, localEnv } from "./env.ts";
+import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { localSession, stopSession, type Session } from "./mcp.ts";
 import { grayboardDescendants } from "./procs.ts";
-import { ROOT } from "./paths.ts";
+import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
 
 type OmpPackage = { version: string; bin: { omp: string } };
@@ -29,6 +30,7 @@ const OMP_CLI = join(dirname(OMP_PKG), OMP.bin.omp);
 const OMP_ARGS = ["--mode", "rpc", "--provider", "fake", "--model", "fake-1", "--no-lsp", "--no-skills", "--no-rules", "--no-context-files", "--no-title"];
 
 const BUNDLE = adapterBundle("omp");
+const SOURCE = adapterSource("omp");
 const OMP_CLIENT = "grayboard-omp";
 export const PREFIX = "mcp__grayboard_";
 const LOGIN_NOTICE = "grayboard: Signed out of grayboard in omp; run /grayboard login";
@@ -61,11 +63,16 @@ function installHosted(dir: string, srv: HostedServer, modelPort: number, settin
   for (const d of [join(agentDir, "extensions"), stateDirOf(dir), bin, join(dir, "home")]) mkdirSync(d, { recursive: true });
   writeFileSync(join(agentDir, "extensions", "grayboard.js"), BUNDLE);
   writeFileSync(join(stateDirOf(dir), "config.json"), JSON.stringify({ url: srv.resource }));
+  writeConfig(agentDir, modelPort, settings);
+  for (const opener of ["open", "xdg-open"]) writeFileSync(join(bin, opener), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+}
+
+// The fake model as omp's only provider, and config.yml with `settings`.
+function writeConfig(agentDir: string, modelPort: number, settings: Record<string, unknown>): void {
   writeFileSync(join(agentDir, "models.yml"), JSON.stringify({
     providers: { fake: { baseUrl: `http://localhost:${modelPort}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-1" }] } },
   }));
   writeFileSync(join(agentDir, "config.yml"), JSON.stringify({ tools: { xdev: false }, ...settings }));
-  for (const opener of ["open", "xdg-open"]) writeFileSync(join(bin, opener), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 }
 
 function startHostedOmp(dir: string, procs: ChildProcess[], { persist = false, session }: { persist?: boolean; session?: string } = {}): Pi {
@@ -98,7 +105,8 @@ const audits = (srv: HostedServer, action: string): Audit[] => srv.app.db.query<
 const liveChildren = (srv: HostedServer, root: string): string[] => srv.app.db.query<{ session_id: string }, [string]>(
   "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?").all(root).map((r) => r.session_id);
 // A model request made by a task subagent (taskFanout's child prompt).
-const fromChild = (req: ChatRequest): boolean => /\bfake-child-\d+\b/.test(messageText(req.messages.find((m) => m.role === "user") ?? { role: "user", content: "" }));
+const childOf = (req: ChatRequest): string | undefined => /\bfake-child-\d+\b/.exec(messageText(req.messages.find((m) => m.role === "user") ?? { role: "user", content: "" }))?.[0];
+const fromChild = (req: ChatRequest): boolean => childOf(req) !== undefined;
 // The non-tool text of a request: the system prompt and any message omp
 // injected (a custom message reaches the model as developer or user).
 const promptOf = (req: ChatRequest): string => req.messages.filter((m) => m.role !== "tool").map(messageText).join("\n");
@@ -328,9 +336,68 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child]).sort()).toEqual(children.map((c) => [root, c]).sort());
     expect(liveChildren(srv, root)).toEqual([]);
     await idle(omp);
+    // The children's requests after the ping (their runs' last steps) don't carry it either (#526).
+    const late = model.requests.filter((r) => fromChild(r.body)).slice(childRequests.length);
+    expect(late.length).toBeGreaterThan(0);
+    expect(model.requests.filter((r) => fromChild(r.body) && r.body.messages.some((m) => messageText(m).includes(`message_id="${ping}"`)))).toEqual([]);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
+  });
+}
+
+// Local mode, as `grayboard setup` leaves omp: the relay adapter
+// (adapterSource("omp")) at <agentDir>/extensions/grayboard.ts and an enabled
+// grayboard entry in <agentDir>/mcp.json, whose push-mode `grayboard mcp` omp
+// starts and whose tools omp serves. omp runs task subagents in-process on
+// the main session's MCP connections, so each live subagent's copy of the
+// adapter sees every channel notification too (#526). A peer's DM while two
+// subagents are held open (a bash gate) reaches main once and no subagent.
+export function ompLocalTaskScenario(dir: string): Promise<void> {
+  const gate = join(dir, "go");
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      ...taskFanout(2, /^fan out$/, () => [{ tool: "bash", args: { command: `while [ ! -f ${gate} ]; do sleep 0.1; done` } }]),
+      onChannelDm("peer", (id) => ({ tool: `${PREFIX}dm_send`, args: { to: "peer", body: "pong", parent_id: id } })),
+    ]);
+    let peer: Session | undefined;
+    try {
+      const agentDir = agentDirOf(dir);
+      mkdirSync(join(agentDir, "extensions"), { recursive: true });
+      writeFileSync(join(agentDir, "extensions", "grayboard.ts"), SOURCE);
+      writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] } } }));
+      writeConfig(agentDir, model.port, {});
+      peer = await localSession(dir, "peer");
+      const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, "--no-session"], {
+        cwd: dir, env: localEnv(dir, "omp-local", { PI_CODING_AGENT_DIR: agentDir }), stdio: ["pipe", "pipe", "pipe"],
+      });
+      procs.push(proc);
+      const omp = new Pi(proc);
+      await omp.command({ type: "get_state" }, 30_000);
+      await until(async () => (await peer.call("peer_list")).peers.some((x: any) => x.handle === "omp-local"), 30_000, "omp-local online");
+
+      // Both subagents are mid-run, held at the gate, when the DM lands.
+      await omp.command({ type: "prompt", message: "fan out" });
+      await until(() => new Set(model.requests.filter((r) => fromChild(r.body)).map((r) => childOf(r.body))).size === 2, 60_000, "both subagents running");
+      const ping = (await peer.call("dm_send", { to: "omp-local", body: "ping" })).message_id as number;
+      writeFileSync(gate, "");
+      await until(() => peer.pushes.find((x) => x.content.includes("pong")), 60_000, "pong at peer");
+      await idle(omp);
+
+      const carries = (r: ChatRequest) => r.messages.some((m) => messageText(m).includes(`message_id="${ping}"`));
+      expect(model.requests.filter((r) => fromChild(r.body) && carries(r.body)).map((r) => childOf(r.body))).toEqual([]);
+      expect(model.requests.filter((r) => !fromChild(r.body) && carries(r.body)).length).toBeGreaterThan(0);
+      expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
+      expect((await peer.call("dm_thread", { thread: ping })).map((m: any) => [m.sender, m.body])).toEqual([["peer", "ping"], ["omp-local", "pong"]]);
+      expect(model.unhandled).toEqual([]);
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
+      if (peer) await stopSession(peer.c);
+      model.stop();
+    }
   });
 }
 
