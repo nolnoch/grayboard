@@ -40,6 +40,17 @@ export function idAddress(key: string): string {
   return `id:${crockford13(createHash("sha256").update(key).digest("hex").slice(0, 16))}`;
 }
 
+/**
+ * A local child session's ID (#523): a harness subagent `raw` (its harness's
+ * own session id) under the session whose key is `rootKey`. Derived from the
+ * secret key, so only the root's process can mint it, and stable for the
+ * same subagent across the root's keyed restarts. NUL separates the two: a
+ * valid `raw` has no control characters.
+ */
+export function childSessionId(rootKey: string, raw: string): string {
+  return idAddress(createHash("sha256").update(`${rootKey}\0${raw}`).digest("hex"));
+}
+
 // A 1.x session ID: the same 64 bits as 16 hex characters. Binding history
 // and name records written before #284 keep it; it is re-encoded on read,
 // never rewritten.

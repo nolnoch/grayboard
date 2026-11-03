@@ -532,11 +532,12 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
   expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);
 });
 
+// #523: a child is told it acts as its root's name as a subagent, not given its root's delivery lines.
 test("a child's system-prompt instructions are its registered session's, even fetched before its first call", async () => {
   await root("prompt-root", "prompter");
   const child = instance({ child: true, root: "prompt-root" });
   await child.ext.start({ id: "prompt-child", reason: "startup" });
-  expect(await child.ext.instructions()).toStartWith(`You are "${EMAIL}/prompter" on grayboard.`);
+  expect(await child.ext.instructions()).toStartWith(`You are a subagent acting as "${EMAIL}/prompter" on grayboard; what you write shows your ID ${hostedId("prompt-child")} as via.`);
   expect(row("prompt-child")).toMatchObject({ root_session_id: hostedId("prompt-root") });
   expect((await child.call("whoami")).isError).toBeUndefined();
 });

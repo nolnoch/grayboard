@@ -2,10 +2,11 @@ import { age } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import type { AttachmentInfo } from "./attachments.ts";
 
-type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at?: number | null; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
+type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at?: number | null; kind?: "bounce" | null; via?: string | null; attachments?: AttachmentInfo[] };
 
-export type InboxItem = { id: number; from: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+// via (#523): the child session that wrote the message under its root's address.
+export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
 export const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
@@ -29,6 +30,7 @@ function lastWord<M extends Msg>(me: string[], candidates: M[], threadOf: (id: n
 
 function item(m: Msg, now: number) {
   return {
+    ...(m.via ? { via: m.via } : {}),
     ...(m.parent_id !== null ? { parent_id: m.parent_id } : {}),
     ...(m.kind ? { kind: m.kind } : {}),
     age: age(now - m.created_at),
@@ -53,14 +55,15 @@ export function promised(me: string[], candidates: Msg[], threadOf: (id: number)
 }
 
 // A message as a read shows it. pending is stored as 0/1, kind as null for
-// an ordinary message and delivered_at as null until the message reaches its
-// recipient's harness; rows show each only when set, so history and threads
-// don't pay for them on every message.
-export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null; delivered_at?: number | null }>(
+// an ordinary message, delivered_at as null until the message reaches its
+// recipient's harness and via (#523) as null for a root's own write; rows
+// show each only when set, so history and threads don't pay for them on
+// every message.
+export function showMessage<M extends { pending: number | boolean; kind?: "bounce" | null; delivered_at?: number | null; via?: string | null }>(
   m: M,
-): Omit<M, "pending" | "kind" | "delivered_at"> & { pending?: true; kind?: "bounce"; delivered_at?: number } {
-  const { pending, kind, delivered_at, ...rest } = m;
-  return { ...rest, ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}), ...(delivered_at != null ? { delivered_at } : {}) };
+): Omit<M, "pending" | "kind" | "delivered_at" | "via"> & { pending?: true; kind?: "bounce"; delivered_at?: number; via?: string } {
+  const { pending, kind, delivered_at, via, ...rest } = m;
+  return { ...rest, ...(via ? { via } : {}), ...(pending ? { pending: true as const } : {}), ...(kind ? { kind } : {}), ...(delivered_at != null ? { delivered_at } : {}) };
 }
 
 // dm_history's limit, checked alike in both modes (#75).
@@ -129,6 +132,13 @@ export function ackResult(acked: number[], missing: number[]): { text: string; i
   return acked.length
     ? { text: JSON.stringify({ acked, not_found: missing, note: why }), isError: false }
     : { text: `error: ${why}`, isError: true };
+}
+
+// dm_inbox and dm_ack by a child session (#523), a harness subagent acting under its root's addresses: the
+// owed-list and its acks are the root's state, which a subagent neither takes on as its own work nor consumes.
+// dm_history and dm_thread, which change nothing, stay its. Refused child_session in both modes.
+export function childInboxRefusal(child: string, rootPrimary: string): string {
+  return `${child} is a subagent of ${rootPrimary}; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
 }
 
 // Sent direct messages still queued a day later, so a stale "told them" in a

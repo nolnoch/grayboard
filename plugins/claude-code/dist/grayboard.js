@@ -34661,6 +34661,9 @@ function attachmentsDir(env = process.env) {
 }
 
 // src/shared/notifications.ts
+function viaLabel(via) {
+  return `subagent ${via}, harness-asserted`;
+}
 function addFiles(meta, list) {
   if (!list?.length)
     return;
@@ -34669,6 +34672,8 @@ function addFiles(meta, list) {
 }
 function dmNotification(msg, primary) {
   const meta = { message_id: String(msg.id), from: msg.sender, created_at: String(msg.created_at) };
+  if (msg.via)
+    meta.via = msg.via;
   if (primary !== undefined && msg.recipient !== undefined && msg.recipient !== primary)
     meta.to = msg.recipient;
   if (msg.parent_id !== null)
@@ -34688,6 +34693,8 @@ function boardNotification(item) {
       reason: item.reason,
       created_at: String(p.created_at)
     };
+    if (p.via)
+      meta.via = p.via;
     if (p.parent_id !== null)
       meta.parent_id = String(p.parent_id);
     addFiles(meta, p.attachments);
@@ -34696,8 +34703,9 @@ function boardNotification(item) {
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);
+  const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
-    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${item.latest.author}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
+    content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
     meta: { board: item.board, kind: "digest", unread: String(item.unread) }
   };
 }

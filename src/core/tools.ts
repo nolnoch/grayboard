@@ -352,6 +352,9 @@ export type BoardPostResult = {
 // `human`: the caller is the Slack bridge's human, exempt from #254's
 // answers from state.
 // `session`: the calling session's ID, recorded on its posts (#284).
+// `via`: set when that session is a child (#523), a harness subagent acting
+// under its root's addresses: recorded on its posts beside `session`. Its
+// board_read peeks: the root's cursors and pending pushes are left as they were.
 // `addresses`: the caller's address set, `handle` the one it acts as (#284 S5);
 // claims held by any of them are the caller's. Default [handle].
 export type ToolContext = {
@@ -360,6 +363,7 @@ export type ToolContext = {
   unbound?: UnboundPeer[];
   human?: boolean;
   session?: string;
+  via?: string;
   addresses?: string[];
   // A reader with no address (an unbound hosted session): board_list,
   // board_read, claim_list and peer_list judge board visibility by it
@@ -412,7 +416,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
+        { online: ctx.online, author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
       const isViewer = viewers(db);
       const result: BoardPostResult = {
@@ -431,6 +435,7 @@ export function callBoardTool(
         limit: optNum(a, "limit"),
         before_id: optNum(a, "before_id"),
         thread: optNum(a, "thread"),
+        peek: ctx.via !== undefined,
       });
       // Claims announced here stay in front of anyone reading the board.
       const held = listClaims(db).filter((c) => c.board === r.board);
@@ -486,6 +491,7 @@ export function callBoardTool(
         board: optStr(a, "board"),
         addresses: ctx.addresses,
         session: ctx.session,
+        via: ctx.via,
       });
       const { wake, boards, ...rest } = r;
       return { result: rest, wake, boards };
@@ -493,7 +499,7 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session });
+      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session, via: ctx.via });
       return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake, boards };
     }
 

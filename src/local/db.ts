@@ -39,21 +39,25 @@ export type Message = {
   pending: number;
   // 'bounce' for a message returned by an ended ID (#284 S12); else null.
   kind: "bounce" | null;
+  // The child session (a harness subagent, #523) that wrote it under its
+  // root's addresses; null for a root's own message.
+  via: string | null;
   // Present on reads when the message carries files.
   attachments?: AttachmentInfo[];
 };
 
 // A message's columns as readers see them. sender_id (#284) is the sending
-// session's provenance, kept in the database and left out of reads.
-const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, delivered_at, pending, kind`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind`;
+// session's provenance, kept in the database and left out of reads; via
+// (#523) is shown, since it names a child writer its root's address hides.
+const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, delivered_at, pending, kind, via`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind, m.via`;
 
 // Stores the message from session `senderId` and binds the uploads `ids` of
 // `uploader` (the session's addresses, #284 S5; local mode has one user, so
 // its principal is null) to it, in one transaction. A session ID recipient is
 // checked in that transaction, so the send can't race the session's end (#284
 // S8): it's refused once the end has the lock, and bounced by it if it landed
-// first.
+// first. `via`: the child session writing it (#523), else null.
 export function insertMessage(
   sender: string,
   senderId: string,
@@ -63,6 +67,7 @@ export function insertMessage(
   pending = false,
   ids: number[] = [],
   uploader: Uploader = { addresses: [sender], principal: null },
+  via: string | null = null,
 ): { id: number; attachments: AttachmentInfo[] } {
   testPause("send:before-txn");
   return db.transaction(() => {
@@ -70,10 +75,10 @@ export function insertMessage(
     const now = Date.now();
     const { lastInsertRowid } = db
       .prepare(
-        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending, via)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0);
+      .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0, via);
     const id = Number(lastInsertRowid);
     return { id, attachments: bindAttachments(db, ids, uploader, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();

@@ -282,6 +282,24 @@ test("children cannot bind or own delivery, and child end leaves root", async ()
   expect(await hosted.whoami(principal, context("child"))).toHaveProperty("unbound", true);
 });
 
+// #523: the root's inbox is its own; a child neither lists nor acks it, while the
+// root's dm_inbox, dm_ack and a child's explicit reads go on as before.
+test("a child's dm_inbox and dm_ack are refused child_session; its dm_history and dm_thread aren't", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("peer"), { name: "be", create: true });
+  const { child } = await hosted.register(principal, context("root"), "child") as { child: string };
+  const sent = await hosted.run(principal, context("peer"), "dm_send", (s) => application.send(s, "you@example.com/fe", "owed by the root"));
+  const message = `${child} is a subagent of you@example.com/fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
+  await expect(hosted.run(principal, context("child"), "dm_inbox", (s) => application.inbox(s))).rejects.toMatchObject({ code: "child_session", message });
+  await expect(hosted.run(principal, context("child"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id))).rejects.toMatchObject({ code: "child_session", message });
+  expect((await hosted.run(principal, context("child"), "dm_history", (s) => application.history(s))).map((m) => m.id)).toEqual([sent.message_id]);
+  expect((await hosted.run(principal, context("child"), "dm_thread", (s) => application.thread(s, sent.message_id))).map((m) => m.id)).toEqual([sent.message_id]);
+  // The root's inbox still owes it, and the root's own ack settles it.
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered.map((m) => m.id)).toEqual([sent.message_id]);
+  await hosted.run(principal, context("root"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id));
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered).toEqual([]);
+});
+
 test("registration rejects invalid ownership graphs without moving an existing child", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("other"), { name: "be", create: true });

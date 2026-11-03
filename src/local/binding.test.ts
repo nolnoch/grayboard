@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { acquireName, attachSession, candidateNames, liveSessions, reap, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { acquireName, attachSession, candidateNames, liveSessions, reap, registerChild, registerSession, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -175,4 +175,58 @@ test("retention keeps each name's latest bound or moved event", () => {
     { session_id: s2, name: "fe", event: "bound" },
     { session_id: s1, name: "be", event: "moved" },
   ]);
+});
+
+// #523: a child session's first sight writes its ids row (the root's facts,
+// delivery 'none', root_id) and one id.child_seen row; a second sight is the
+// same child; a row that isn't this root's live child is refused.
+test("registerChild records a child once, audited; another root's ID or an ended child is refused", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const [root, child, other] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe"];
+  registerSession(db, { ...thisSession(root, null, "/work/repo"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness: "omp" }, { keyed: true });
+  registerChild(db, root, child, "reviewer-1");
+  registerChild(db, root, child, "reviewer-1");
+  expect(db.prepare(`SELECT harness, cwd, keyed, delivery, root_id, ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "omp", cwd: "/work/repo", keyed: 1, delivery: "none", root_id: root, ended_at: null });
+  const seen = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`).all() as { actor: string; target: string; detail: string }[];
+  expect(seen.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: process.pid } }]);
+  // A child has no process row: it is never a live receiver.
+  expect(db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(child)).toBeNull();
+  expect(liveSessions(db).alive.map((r) => r.session_id)).toEqual([root]);
+
+  registerSession(db, { ...thisSession(other), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  expect(() => registerChild(db, root, other, "reviewer-2")).toThrow(`id_collision: ${other} is another session's ID, not a child of ${root}`);
+  expect(() => registerChild(db, other, child, "reviewer-1")).toThrow(`id_collision: ${child} is another session's ID, not a child of ${other}`);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
+  expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+});
+
+// #523: the orphan sweep (an unended ID with no bindings row) passes over a
+// live root's children, which never have one; it ends a child whose root is
+// gone, ended by a reap, by an older grayboard that knew no children, or pruned.
+test("reading live sessions keeps a live root's children and ends those whose root is dead, ended or pruned", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const live = "id:0123456789abc", dead = "id:0123456789abd", old = "id:0123456789abe", pruned = "id:0123456789abf";
+  registerSession(db, { ...thisSession(live), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  for (const id of [dead, old, pruned]) registerSession(db, { ...thisSession(id), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const childOf = (root: string) => `id:${root.slice(-3)}0000000000`;
+  for (const root of [live, dead, old, pruned]) registerChild(db, root, childOf(root), `child-of-${root}`);
+  // dead: its process is gone, so a reap ends it. old: an older grayboard ended it and dropped its row.
+  // pruned: its ids row is past retention.
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(dead);
+  db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(old);
+  db.prepare(`DELETE FROM bindings WHERE session_id IN (?, ?)`).run(old, pruned);
+  db.prepare(`DELETE FROM ids WHERE id = ?`).run(pruned);
+
+  const r = liveSessions(db);
+  expect(r.alive.map((s) => s.session_id)).toEqual([live]);
+  const ended = (id: string) => (db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id) as { ended_at: number | null }).ended_at;
+  expect(ended(childOf(live))).toBeNull();
+  for (const root of [dead, old, pruned]) expect(ended(childOf(root))).not.toBeNull();
+  const whys = Object.fromEntries((db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.ended'`).all() as { target: string; detail: string }[])
+    .map((a) => [a.target, JSON.parse(a.detail).why]));
+  expect(whys).toMatchObject({ [childOf(dead)]: `its root ${dead} ended`, [childOf(old)]: `its root ${old} ended`, [childOf(pruned)]: `its root ${pruned} ended` });
+  expect(whys).not.toHaveProperty(childOf(live));
+  // A second read finds nothing more to end.
+  expect(liveSessions(db)).toMatchObject({ alive: [{ session_id: live }], ended: [] });
 });

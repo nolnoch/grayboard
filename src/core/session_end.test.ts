@@ -115,6 +115,61 @@ test("a send to an ID is refused when it ended, has no row, is a viewer or recei
   expect(() => assertDeliverableId(db, OTHER)).toThrow(`no_delivery: ${OTHER} is a tools-only session and receives nothing; send to be`);
 });
 
+// #523: a child's ID is never an address, live or ended: the refusal names
+// the address its root writes as, whatever state the root is in.
+test("a send to a child session's ID is refused child_session, naming its root's primary", () => {
+  const db = bus();
+  const child = "id:0123456789abe";
+  registerId(db, { id: child, principal: null, launcher: false, rootId: ID }, 2);
+  expect(db.prepare(`SELECT delivery, root_id FROM ids WHERE id = ?`).get(child)).toEqual({ delivery: "none", root_id: ID });
+  const refused = (primary: string) => `child_session: ${child} is a subagent acting under session ${ID} and receives nothing; send to ${primary}`;
+  // An unbound root writes as its ID; a bound one as the hold it bound first (not the alphabetically first).
+  expect(() => assertDeliverableId(db, child)).toThrow(refused(ID));
+  holdAlias(db, "qa", ID, 7);
+  holdAlias(db, "fe", ID, 5);
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("qa"));
+  // A tools-only root writes as its alias.
+  db.prepare(`DELETE FROM alias_holds WHERE id = ?`).run(ID);
+  db.prepare(`UPDATE ids SET writes_as = 'be' WHERE id = ?`).run(ID);
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("be"));
+  db.prepare(`UPDATE ids SET writes_as = NULL WHERE id = ?`).run(ID);
+  // Ended, root and child: still child_session (not id_ended), naming the first alias the root held.
+  holdAlias(db, "fe", ID, 5);
+  end(db);
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ ended_at: 10_000 });
+  expect(() => assertDeliverableId(db, child)).toThrow(refused("fe"));
+  // A mention is refused alike, and nothing is posted.
+  createBoard(db, "be", "work", "work items");
+  expect(() => post(db, "be", "work", `ping @${child}`, null, { strictIds: true })).toThrow(refused("fe"));
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM posts`).get()).toEqual({ n: 0 });
+});
+
+// #523: a root's end ends its live children in the same transaction, each
+// audited with why; the root's id.ended lists them; an ended child is left alone.
+test("a root's end ends its live child sessions, audited, and wakes what their ends wake", () => {
+  const db = bus();
+  const [live, gone, unrelated] = ["id:0123456789abe", "id:0123456789abf", "id:0123456789abg"];
+  registerId(db, { id: live, principal: null, launcher: false, rootId: ID }, 2);
+  registerId(db, { id: gone, principal: null, launcher: false, rootId: ID }, 2);
+  registerId(db, { id: unrelated, principal: null, launcher: false, rootId: OTHER }, 2);
+  db.prepare(`UPDATE ids SET ended_at = 3 WHERE id = ?`).run(gone);
+  // A claim the child took as itself is released by its end, waking the watcher.
+  createBoard(db, "be", "work", "work items");
+  claim(db, live, "ticket:ENG-6", { board: "work", ttl_minutes: 60 });
+  watch(db, "qa", "ticket:ENG-6");
+
+  const r = end(db, ID, Date.now());
+  expect(r.wake).toContain("qa");
+  const ended = (db.prepare(`SELECT id, ended_at FROM ids WHERE id IN (?, ?, ?) ORDER BY id`).all(live, gone, unrelated) as { id: string; ended_at: number | null }[]);
+  expect(ended.map((e) => [e.id, e.ended_at === null ? null : e.ended_at === 3 ? 3 : "now"])).toEqual([[live, "now"], [gone, 3], [unrelated, null]]);
+  const audits = (db.prepare(`SELECT target, detail FROM audit_log WHERE action = 'id.ended' ORDER BY rowid`).all() as { target: string; detail: string }[])
+    .map((a) => ({ target: a.target, detail: JSON.parse(a.detail) }));
+  expect(audits.map((a) => a.target)).toEqual([live, ID]);
+  expect(audits[0]!.detail).toMatchObject({ held: [], why: `its root ${ID} ended` });
+  expect(audits[1]!.detail).toMatchObject({ children: [live] });
+  expect(db.prepare(`SELECT key FROM claims`).all()).toEqual([]);
+});
+
 // Audit S1 (#329): a claim event quotes its key, so a key naming an ID that
 // later ended must not refuse the sweep, every other claim, or the holder's
 // end. An author's own post naming that ID is still refused.

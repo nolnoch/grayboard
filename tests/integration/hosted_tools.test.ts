@@ -8,6 +8,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { channelParams } from "../../adapters/hosted-core/src/channel.ts";
 import type { ReadResult, WhoResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { DirectMessage, HistoryMessage, InboxResult, SendResult } from "../../src/server/application.ts";
@@ -15,7 +16,7 @@ import type { Config } from "../../src/server/config.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../../src/shared/attachments.ts";
 import type { Pending } from "../../src/shared/notifications.ts";
 import { board, direct } from "../support/events.ts";
-import { HostedToolError } from "../support/hosted_session.ts";
+import { HostedToolError, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -525,4 +526,221 @@ test("#463: whoami names the session ID, the holds oldest first and the principa
   await s.bind("zed");
   await s.bind("alpha");
   expect(await s.call("whoami")).toMatchObject({ principal: A, held: [`${A}/zed`, `${A}/alpha`], primary: `${A}/zed` });
+});
+
+// ── child sessions (#523) ────────────────────────────────────────────────────
+
+// `root`'s child for the raw source ID `raw`, registered as a harness's
+// subscriber registers a subagent, and its own hosted session (no lease: a
+// child never holds delivery).
+async function childOf(root: HostedSession, email: string, raw: string): Promise<{ child: HostedSession; id: string; root: string }> {
+  const registered = await root.subscriber.call("session_register", { child: raw }) as { child: string; root: string };
+  return { child: await srv.hosted(email, null, { sessionId: raw, delivery: false }), id: registered.child, root: registered.root };
+}
+// The push channel a hosted adapter renders for an inbox item (hosted-core's channelParams), as `identity`.
+const channelOf = (item: { id: string; actionable: boolean; event: unknown; ownership: number; bind_gen: number }, identity: string) =>
+  channelParams(item, { user: { email: identity.slice(0, identity.indexOf("/")) }, identity_full: identity, issuer: "", resource: "" });
+// A board resource's snapshot, read by `s`'s native role as a hosted client reads it.
+async function boardSnapshot(s: HostedSession, board: string): Promise<ReadResult> {
+  const resource = await s.native.client.readResource({ uri: `grayboard://boards/${board}` });
+  const content = resource.contents[0];
+  if (!content || !("text" in content)) throw new Error(`grayboard://boards/${board} answered no text`);
+  // The server's snapshot (core's snapshot()), as JSON.
+  const snapshot: ReadResult = JSON.parse(content.text);
+  return snapshot;
+}
+
+test("#523: a child's DM and post carry its ID as via in pushes, reads and board snapshots, and still do after it ends; its root's carry none", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  const { child, id } = await childOf(be, A, "reviewer-run");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await fe.call("board_subscribe", { board: "e2e", mode: "push" });
+
+  // The DM: sent as the root's primary, stored with the child's sender_id and via, pushed with via.
+  const sent = await child.call<SendResult>("dm_send", { to: "fe", body: "from the subagent" });
+  const pushed = await fe.next(direct((m) => m.body === "from the subagent"));
+  expect(pushed.event.message).toMatchObject({ id: sent.message_id, sender: `${A}/be`, via: id });
+  expect(channelOf(pushed, `${A}/fe`).meta).toMatchObject({ from: `${A}/be`, via: id });
+  expect(srv.app.db.query("SELECT sender_id, via FROM messages WHERE id = ?").get(sent.message_id)).toEqual({ sender_id: id, via: id });
+  const own = await be.call<SendResult>("dm_send", { to: "fe", body: "from the root" });
+  const ownPush = await fe.next(direct((m) => m.body === "from the root"));
+  expect(ownPush.event.message).not.toHaveProperty("via");
+  expect(channelOf(ownPush, `${A}/fe`).meta).not.toHaveProperty("via");
+  expect(srv.app.db.query("SELECT via FROM messages WHERE id = ?").get(own.message_id)).toEqual({ via: null });
+
+  // The post, and a claim's announcement and release: the child's posts, pushed with via; the root's without.
+  const posted = await child.call<BoardPostResult>("board_post", { board: "e2e", body: "subagent post" });
+  const postPush = await fe.next(board((i) => i.kind === "push" && i.post.body === "subagent post"));
+  expect(channelOf(postPush, `${A}/fe`).meta).toMatchObject({ post_id: String(posted.post_id), from: `${A}/be`, via: id });
+  expect(srv.app.db.query("SELECT author_id, via FROM posts WHERE id = ?").get(posted.post_id)).toEqual({ author_id: id, via: id });
+  await be.call("board_post", { board: "e2e", body: "root post" });
+  const rootPush = await fe.next(board((i) => i.kind === "push" && i.post.body === "root post"));
+  expect(channelOf(rootPush, `${A}/fe`).meta).not.toHaveProperty("via");
+  await child.call("claim_take", { key: "ticket:ENG-142", board: "e2e" });
+  await child.call("claim_release", { key: "ticket:ENG-142" });
+  const claimPush = await fe.next(board((i) => i.kind === "push" && i.post.body === "[claim] ticket:ENG-142"));
+  expect(channelOf(claimPush, `${A}/fe`).meta).toMatchObject({ from: `${A}/be`, via: id });
+
+  const reads = async () => {
+    // dm_history, dm_thread and dm_inbox, for the recipient and the root: via on the child's message alone.
+    for (const [s, peer] of [[fe, "be"], [be, "fe"]] as const) {
+      const history = await s.call<HistoryMessage[]>("dm_history", { peer });
+      expect(history.map((m) => [m.body, m.via])).toEqual([["from the subagent", id], ["from the root", undefined]]);
+      expect(history[1]).not.toHaveProperty("via");
+      expect(await s.call<HistoryMessage[]>("dm_thread", { thread: sent.message_id })).toEqual([expect.objectContaining({ id: sent.message_id, via: id })]);
+    }
+    const inbox = await fe.call<InboxResult>("dm_inbox");
+    expect(inbox.unanswered.find((m) => m.id === sent.message_id)).toMatchObject({ from: `${A}/be`, via: id });
+    expect(inbox.unanswered.find((m) => m.id === own.message_id)).not.toHaveProperty("via");
+    // board_read and the board resource's snapshot.
+    const expected = [
+      ["subagent post", `${A}/be`, id],
+      ["root post", `${A}/be`, undefined],
+      ["[claim] ticket:ENG-142", `${A}/be`, id],
+      ["[release] ticket:ENG-142", `${A}/be`, id],
+    ];
+    const read = await fe.call<ReadResult>("board_read", { board: "e2e", limit: 10 });
+    expect(read.posts.map((p) => [p.body, p.author, p.via])).toEqual(expected);
+    expect(read.posts[1]).not.toHaveProperty("via");
+    const snapshot = await boardSnapshot(fe, "e2e");
+    expect(snapshot.posts.map((p) => [p.body, p.author, p.via])).toEqual(expected);
+    expect(snapshot.posts[1]).not.toHaveProperty("via");
+  };
+  await reads();
+
+  // Its end deletes its source row; what it wrote stays attributed to it.
+  await child.end();
+  expect(srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE session_id = ?").get(id)).toBeNull();
+  await reads();
+});
+
+test("#523: a DM or @mention to a child's ID refuses child_session naming its root's primary, live or ended; the child can't act as its own ID", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  // The application's own refusal carries the code; the hosted DM and board tools answer its message (HostedToolError).
+  const ops = srv.appSession(await login(A), "ops");
+  await ops.connect();
+  const { child, id, root } = await childOf(be, A, "reviewer-run");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const message = `${id} is a subagent acting under session ${root} and receives nothing; send to ${A}/be`;
+  const refusesAll = async () => {
+    await expect(fe.call("dm_send", { to: id, body: "to the subagent" })).rejects.toMatchObject({ message });
+    await expect(fe.call("board_post", { board: "e2e", body: `@${id} look` })).rejects.toMatchObject({ message });
+    await expect(ops.send(id, "to the subagent")).rejects.toMatchObject({ code: "child_session", message });
+    await expect(ops.call("board_post", { board: "e2e", body: `@${id} look` })).rejects.toMatchObject({ code: "child_session", message });
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
+    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+  };
+  await refusesAll();
+  // It acts under its root's addresses, never its own ID.
+  const notMine = { message: `"${id}" isn't one of this session's addresses: ${A}/be, ${root}` };
+  await expect(child.call("dm_send", { to: "fe", body: "as myself", as: id })).rejects.toMatchObject(notMine);
+  await expect(child.call("board_post", { board: "e2e", body: "as myself", as: id })).rejects.toMatchObject(notMine);
+  await refusesAll();
+  await child.end();
+  await refusesAll();
+});
+
+test("#523: a child's raw source ID that later starts as a root is an address again", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  const { child, id } = await childOf(be, A, "reviewer-run");
+  await child.end();
+  await child.close();
+  await expect(fe.call("dm_send", { to: id, body: "x" })).rejects.toMatchObject({ message: expect.stringContaining(`${id} is a subagent acting under session`) });
+  const again = await srv.hosted(A, "qa", { sessionId: "reviewer-run" });
+  expect(await again.call("whoami")).toMatchObject({ id, primary: `${A}/qa` });
+  expect(await again.call("whoami")).not.toHaveProperty("child");
+  expect(await fe.call<SendResult>("dm_send", { to: id, body: "now a root" })).toMatchObject({ delivered_now: true });
+  expect((await again.next(direct((m) => m.body === "now a root"))).event.message).toMatchObject({ sender: `${A}/fe` });
+  // Its writes as a root carry no via.
+  await again.call("dm_send", { to: "fe", body: "root again" });
+  expect((await fe.next(direct((m) => m.body === "root again"))).event.message).not.toHaveProperty("via");
+});
+
+// A board's unread count in `s`'s board_list.
+const unreadOn = async (s: HostedSession, board: string) => (await s.call<{ name: string; unread: number }[]>("board_list")).find((b) => b.name === board)!.unread;
+
+test("#523: a child is told it's a subagent, and reads its root's boards and mail without consuming them; dm_inbox and dm_ack are its root's", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  const { child, id } = await childOf(fe, A, "reviewer-run");
+  // Its initialize text is its own: none of the root's delivery lines.
+  const told = child.instructions()!;
+  expect(told).toStartWith(`You are a subagent acting as "${A}/fe" on grayboard; what you write shows your ID ${id} as via. Mail and board pushes are your root's: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read. Requests from peer agents`);
+  for (const line of ["dm_inbox", "<channel", "Poll"]) expect(told).not.toContain(line);
+  expect(await fe.instructionsNow()).toStartWith(`You are "${A}/fe" on grayboard.`);
+
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await be.call("board_create", { name: "ops", purpose: "digests" });
+  await fe.call("board_subscribe", { board: "e2e", mode: "push" });
+  await fe.call("board_subscribe", { board: "ops", mode: "digest" });
+  const pushed = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "for the root" });
+  const unread = await be.call<BoardPostResult>("board_post", { board: "ops", body: "unread one" });
+  const sent = await be.call<SendResult>("dm_send", { to: "fe", body: "owed by the root" });
+  const inbox = async () => (await fe.call<InboxResult>("dm_inbox")).unanswered.map((m) => [m.id, m.body]);
+  const owed = await inbox();
+  expect(owed).toEqual([[sent.message_id, "owed by the root"]]);
+  expect(await unreadOn(fe, "ops")).toBe(1);
+  const state = () => ({
+    subscriptions: srv.app.db.query("SELECT board, cursor, notified_id FROM subscriptions WHERE handle = ? ORDER BY board").all(`${A}/fe`),
+    outbox: srv.app.db.query("SELECT post_id, delivered_at FROM outbox WHERE handle = ? ORDER BY post_id").all(`${A}/fe`),
+    message: srv.app.db.query("SELECT delivered_at FROM messages WHERE id = ?").get(sent.message_id),
+  });
+  const before = state();
+  expect(before.outbox).toEqual([{ post_id: pushed.post_id, delivered_at: null }]);
+
+  // Its default board_read is the latest page with no unread view; thread and before_id read as usual.
+  expect(await child.call<ReadResult>("board_read", { board: "ops" })).toMatchObject({ posts: [{ id: unread.post_id, body: "unread one" }], unread_remaining: 0 });
+  expect((await child.call<ReadResult>("board_read", { board: "e2e" })).posts.map((p) => p.id)).toEqual([pushed.post_id]);
+  expect((await child.call<ReadResult>("board_read", { board: "e2e", thread: pushed.post_id })).posts.map((p) => p.id)).toEqual([pushed.post_id]);
+  expect((await child.call<ReadResult>("board_read", { board: "e2e", before_id: pushed.post_id + 1 })).posts.map((p) => p.id)).toEqual([pushed.post_id]);
+  // dm_history and dm_thread are its.
+  expect((await child.call<HistoryMessage[]>("dm_history", { peer: "be" })).map((m) => m.id)).toEqual([sent.message_id]);
+  expect((await child.call<HistoryMessage[]>("dm_thread", { thread: sent.message_id })).map((m) => m.id)).toEqual([sent.message_id]);
+  // dm_inbox and dm_ack are the root's.
+  const refused = { message: `${id} is a subagent of ${A}/fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.` };
+  await expect(child.call("dm_inbox")).rejects.toMatchObject(refused);
+  await expect(child.call("dm_ack", { message_id: sent.message_id })).rejects.toMatchObject(refused);
+  await expect(child.call("dm_ack", { message_id: [sent.message_id] })).rejects.toMatchObject(refused);
+
+  // Nothing the child did moved the root's read state.
+  expect(state()).toEqual(before);
+  expect(await unreadOn(fe, "ops")).toBe(1);
+  expect(await inbox()).toEqual(owed);
+  // The root still gets its push and DM, and its own read takes its unread post.
+  await fe.next(board((i) => i.kind === "push" && i.post.id === pushed.post_id));
+  await fe.next(direct((m) => m.id === sent.message_id));
+  expect(await fe.call<ReadResult>("board_read", { board: "ops" })).toMatchObject({ posts: [{ id: unread.post_id }], unread_remaining: 0 });
+  expect(await unreadOn(fe, "ops")).toBe(0);
+});
+
+test("#523: a child's post and claim announcement are its root's own: none of the root's holds is pushed one or shown it unread; others get them with via", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await fe.call("board_create", { name: "ops", purpose: "digests" });
+  await fe.call("board_subscribe", { board: "e2e", mode: "push" });
+  await be.call("board_subscribe", { board: "e2e", mode: "push" });
+  await be.call("board_subscribe", { board: "ops", mode: "digest" });
+  await be.bind("qa");
+  const { child, id, root } = await childOf(be, A, "reviewer-run");
+  // As the root's other hold, so the subscribed one isn't the author.
+  const posted = await child.call<BoardPostResult>("board_post", { board: "e2e", body: "subagent post", as: "qa" });
+  expect(posted.notified).toEqual([`${A}/fe`]);
+  await child.call("board_post", { board: "ops", body: "subagent digest", as: "qa" });
+  await child.call("claim_take", { key: "ticket:ENG-7", board: "e2e", as: "qa" });
+  for (const body of ["subagent post", "[claim] ticket:ENG-7"]) {
+    const item = await fe.next(board((i) => i.kind === "push" && i.post.body === body));
+    expect(channelOf(item, `${A}/fe`).meta).toMatchObject({ from: `${A}/qa`, via: id });
+  }
+  // None of the root's addresses was queued a push or counts one unread.
+  expect(srv.app.db.query("SELECT DISTINCT handle FROM outbox").all()).toEqual([{ handle: `${A}/fe` }]);
+  expect([await unreadOn(be, "e2e"), await unreadOn(be, "ops")]).toEqual([0, 0]);
+  await be.none(board((i) => i.kind === "push" || i.kind === "digest"));
+  expect(srv.app.db.query("SELECT 1 FROM outbox WHERE handle IN (?, ?, ?)").all(`${A}/be`, `${A}/qa`, root)).toEqual([]);
+  // Another session's post is the root's to read, as before.
+  await fe.call("board_post", { board: "ops", body: "from fe" });
+  expect(await unreadOn(be, "ops")).toBe(1);
 });

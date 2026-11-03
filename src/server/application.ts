@@ -35,7 +35,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
 import { mayActIn, principalCanSee } from "./access.ts";
-import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
+import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, childInboxRefusal, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import { afterCommit } from "../core/sqlite.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -117,12 +117,18 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
+  // A hosted child's own ID (#523): it acts under its root's addresses, and
+  // its writes store this as `via` so readers see which subagent wrote them.
+  // The root's read state isn't its: its board_read peeks, and dm_inbox and
+  // dm_ack are refused (childInbox).
+  via?: string;
   transport: "bridge" | "hosted" = "bridge";
   // The address the session writes as by default (#284 S1, S8): its oldest
   // hold, else its ID; a tools-only session's writes_as.
   primary = "";
-  // Every address it reads as: its holds, oldest first, then its ID; a
-  // tools-only session's [writes_as]. Primary first.
+  // Every address it reads as: its holds, oldest first, then its ID (a
+  // hosted child's: its root's ID, never its own); a tools-only session's
+  // [writes_as]. Primary first.
   addresses: string[] = [];
   // The aliases the session holds, oldest first (PR 4 S1); set by setHolds.
   holds: string[] = [];
@@ -153,6 +159,11 @@ export class ApplicationSession {
 
 function fail(code: ApplicationCode, message: string, extra: ApplicationError["extra"] = {}): never {
   throw new ApplicationError(code, message, extra);
+}
+
+// A child (#523) neither takes on nor consumes its root's inbox: dm_inbox and dm_ack are the root's.
+function childInbox(session: ApplicationSession): void {
+  if (session.via !== undefined) fail("child_session", childInboxRefusal(session.via, session.primary));
 }
 
 // A refused call's code and message: an ID that can't receive names its own
@@ -751,8 +762,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
     // Otherwise the session holds `holds`, reads as them and its
     // ID, and writes as the oldest; none held reads and nothing else (readOnly). `row`: the hosted root's
-    // place and suggested name (#443), null with no row.
-    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false) {
+    // place and suggested name (#443), null with no row. `root`: set for a child session (#523),
+    // which acts under its root's addresses, never its own ID (not an address), and whose writes
+    // carry its ID as `via`.
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
@@ -764,10 +777,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         session.addresses = [writesAs];
       } else {
         session.holds = holds;
-        session.primary = primaryOf(holds, id);
-        session.addresses = [...holds, id];
+        session.primary = primaryOf(holds, root ?? id);
+        session.addresses = [...holds, root ?? id];
       }
-      if (!session.readOnly && idRow(db, id)?.principal === authed.user_email) session.writerId = id;
+      if (!session.readOnly && idRow(db, id)?.principal === authed.user_email) {
+        session.writerId = id;
+        if (root !== null) session.via = id;
+      }
       hub.sessions.add(session);
       if (hold && holds.length) hub.hostedHolders.set(id, session);
       if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
@@ -777,6 +793,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         ...(session.readOnly ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
       return { session, info };
+    },
+    // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
+    // child's source row (deleted at the child's end) so a send or mention to the child's ID keeps
+    // being refused child_session; null when the ID starts as a root, which makes it an address again.
+    hostedRoot(id: string, root: string | null) {
+      db.prepare(`UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?`).run(root, id, root);
     },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
@@ -903,6 +925,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     inbox(session: ApplicationSession, days?: number) {
       valid(session);
+      childInbox(session);
       return handleInbox(hub, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
@@ -964,6 +987,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // sentPending match a.reader = m.recipient, or m.sender.
     acknowledgeDm(session: ApplicationSession, id: number) {
       valid(session);
+      childInbox(session);
       const m = repo.messages.getById(id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
         : mine.includes(m.recipient) ? m.recipient
@@ -1165,7 +1189,7 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session));
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session), session.via ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1332,6 +1356,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     files: { limits: hub.repo.attachmentLimits, principal: uploaderOf(session).principal },
     human: session.human,
     ...(session.writerId ? { session: session.writerId } : {}),
+    ...(session.via ? { via: session.via } : {}),
     addresses: session.addresses,
     ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),

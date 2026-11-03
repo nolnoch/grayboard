@@ -82,6 +82,21 @@ test("link, then a hosted agent's DM to human is a Slack thread whose reply come
   expect(post.thread_ts).toBe(tsOf(top));
 }, 30_000);
 
+// #523: a subagent's DM to human reads in Slack as its root's name followed
+// by the child, labelled as what the harness asserted; the root's names itself alone.
+test("a hosted child's DM to human names the subagent after the sender, as the harness's claim", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const registered = await be.subscriber.call("session_register", { child: "reviewer-run" }) as { child: string };
+  const child = await srv.hosted("alice@example.com", null, { sessionId: "reviewer-run", delivery: false });
+  expect(await child.call<SendResult>("dm_send", { to: "human", body: "Reviewed: LGTM" })).toMatchObject({ delivered_now: true });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("LGTM")));
+  expect(top).toMatchObject({ channel: DM, username: "be", markdown_text: `**be** (subagent ${registered.child}, harness-asserted) Reviewed: LGTM` });
+  await be.call<SendResult>("dm_send", { to: "human", body: "the root's own" });
+  expect(await until(() => slack.posts().find((p) => p.markdown_text?.includes("the root's own")))).toMatchObject({ markdown_text: "**be** the root's own" });
+}, 30_000);
+
 // #470: delivered_at means the message reached Slack; one Slack refuses is
 // given up (its cursor moves, so it isn't retried) but never stamped.
 test("a DM Slack posts is stamped delivered_at; one Slack refuses is given up unstamped", async () => {

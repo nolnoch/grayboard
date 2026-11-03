@@ -11,17 +11,21 @@ import { endLocalSession, registerSession, thisSession } from "./binding.ts";
 import { deliverEnded, listenForWakeup } from "./wakeup.ts";
 import { idAddress, mintSessionKey } from "../core/bindings.ts";
 import { normalizeBoard, subscribe } from "../core/boards.ts";
-import type { Post } from "../shared/notifications.ts";
+import { viaLabel, type Post } from "../shared/notifications.ts";
 import { CoreError } from "../core/errors.ts";
 import { withAttachments } from "../core/attachments.ts";
 import { formatAttachmentsMeta } from "../shared/attachments.ts";
 
-function fmt(p: Post): string {
+// Rows straight from the table: via (#523) is null for a root's own post.
+type Row = Omit<Post, "via"> & { via?: string | null };
+
+function fmt(p: Row): string {
   const t = new Date(p.created_at).toTimeString().slice(0, 8);
   const reply = p.parent_id !== null ? ` ↳${p.parent_id}` : "";
   const body = p.body.replace(/\n/g, "\n    ");
   const files = p.attachments ? `\n    attachments: ${formatAttachmentsMeta(p.attachments)}` : "";
-  return `${t} [${p.id}${reply}] ${p.author}: ${body}${files}`;
+  const who = p.via ? `${p.author} (${viaLabel(p.via)})` : p.author;
+  return `${t} [${p.id}${reply}] ${who}: ${body}${files}`;
 }
 
 export async function runTail(boardInput: string, backlog: number): Promise<void> {
@@ -46,7 +50,7 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
   const recent = (
     db
       .prepare(`SELECT * FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`)
-      .all(board, Math.max(backlog, 0)) as Post[]
+      .all(board, Math.max(backlog, 0)) as Row[]
   ).reverse();
   for (const p of withAttachments(db, "post", recent)) console.log(fmt(p));
   let last = (db.prepare(`SELECT MAX(id) AS id FROM posts WHERE board = ?`).get(board) as {
@@ -56,7 +60,7 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
   const drain = () => {
     const posts = db
       .prepare(`SELECT * FROM posts WHERE board = ? AND id > ? ORDER BY id ASC`)
-      .all(board, last) as Post[];
+      .all(board, last) as Row[];
     for (const p of withAttachments(db, "post", posts)) console.log(fmt(p));
     if (posts.length) last = posts[posts.length - 1]!.id;
     db.prepare(`UPDATE subscriptions SET cursor = ?, notified_id = ? WHERE board = ? AND handle = ?`)

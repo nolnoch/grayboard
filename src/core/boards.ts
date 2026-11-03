@@ -46,9 +46,21 @@ export type Board = {
 };
 
 // A post's columns as readers see them. author_id (#284) is the writing
-// session's provenance, kept in the database and left out of reads and pushes.
-const POST_COLS = `id, board, author, body, parent_id, created_at, expires_at`;
-const P_POST_COLS = `p.id, p.board, p.author, p.body, p.parent_id, p.created_at, p.expires_at`;
+// session's provenance, kept in the database and left out of reads and pushes;
+// via (#523) is shown, since it names a child writer the author address hides.
+const POST_COLS = `id, board, author, via, body, parent_id, created_at, expires_at`;
+const P_POST_COLS = `p.id, p.board, p.author, p.via, p.body, p.parent_id, p.created_at, p.expires_at`;
+
+// A post row as stored: via null for a root's own post.
+type PostRow = Omit<Post, "via"> & { via: string | null };
+
+// A post as readers see it: via only when a child wrote it, so a root's
+// posts don't pay for the key.
+function showPost<P extends { via?: string | null }>(p: P): Omit<P, "via"> & { via?: string } {
+  if (p.via != null) return p as Omit<P, "via"> & { via?: string };
+  const { via: _, ...rest } = p;
+  return rest;
+}
 
 // Enough to acknowledge a Pending item after it crossed a wire.
 export type PendingRef =
@@ -167,6 +179,9 @@ export type IdFacts = {
   // Self-reported at launch (BUS_MODEL, BUS_EFFORT; the former hello), shown in peer_list (#284 S12).
   model?: string | null;
   effort?: string | null;
+  // A local child session (a harness subagent, #523): the root it acts under.
+  // It receives nothing (delivery 'none') and ends with its root.
+  rootId?: string;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -198,8 +213,8 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort));
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort, root_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined && f.rootId === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort), f.rootId ?? null);
   return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
 }
 
@@ -431,9 +446,12 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
   AND (o.wake = 1 OR o.delivered_at IS NOT NULL))`;
 
 // A post not written by the reader's session (#284 S5): neither as the
-// reader's address nor by the session that is it or holds it, whichever of
-// its addresses it wrote as. Binds the reader's address three times.
-const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND p.author_id = COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?))`;
+// reader's address nor by the session that is it or holds it, nor by a child
+// of that session (#523: a subagent writing under its addresses, whose posts
+// are its root's own), whichever of its addresses it wrote as. Binds the
+// reader's address three times.
+const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?)
+  IN (p.author_id, COALESCE((SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
@@ -597,12 +615,15 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // carry, bound in the post's transaction under the mode's size caps (send),
 // if the mode's user (send.principal) made them.
 // author_id: the posting session's ID (#284), when the writer is a session.
+// via: the child session writing it (#523), a harness subagent acting under
+// its root's addresses; author_id is then the child's ID too.
 // addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
 // queue claim held by any of them is acked, and none of them is pushed the post.
 export type PostOpts = {
   online?: (handle: string) => boolean;
   addresses?: string[];
   author_id?: string;
+  via?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; send?: FileSend };
   // An author's own words: an @id: that can't receive refuses the post.
@@ -684,12 +705,15 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
 export const REDELIVERED_NOTE = "queue post (redelivered)";
 
 // A post's author's address set as of now: the author, and its writing
-// session's ID and the aliases that session holds (#284 S5).
+// session's ID and the aliases that session holds (#284 S5); for a child's
+// post (#523), its root's ID and holds, the addresses the child acted under.
 function postAddresses(db: Database, postId: number): string[] {
   return (db.prepare(
     `SELECT p.author AS a FROM posts p WHERE p.id = ?1
      UNION SELECT p.author_id FROM posts p WHERE p.id = ?1 AND p.author_id IS NOT NULL
-     UNION SELECT h.address FROM posts p JOIN alias_holds h ON h.id = p.author_id WHERE p.id = ?1`,
+     UNION SELECT h.address FROM posts p JOIN alias_holds h ON h.id = p.author_id WHERE p.id = ?1
+     UNION SELECT i.root_id FROM posts p JOIN ids i ON i.id = p.author_id WHERE p.id = ?1 AND i.root_id IS NOT NULL
+     UNION SELECT h.address FROM posts p JOIN ids i ON i.id = p.author_id JOIN alias_holds h ON h.id = i.root_id WHERE p.id = ?1`,
   ).all(postId) as { a: string }[]).map((r) => r.a);
 }
 
@@ -769,14 +793,18 @@ export function post(
 
   return db.transaction((): PostResult => {
     const now = Date.now();
-    const p = db
+    const p = showPost(db
       .prepare(
-        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
-      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null) as Post;
+      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null) as PostRow);
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
+    // Nobody is told of, or handed, their own post: the poster's address set,
+    // and the writing session's own (its ID and holds; a child's root's, #523),
+    // which a caller passing no address set (a claim announcement) leaves out.
+    const own = [...new Set([...(opts.addresses ?? [handle]), ...postAddresses(db, p.id)])];
 
     // Highest-priority reason wins per handle: mention > thread > subscription.
     type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
@@ -807,7 +835,7 @@ export function post(
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
         // live lanes idle (#192 review).
-        const picked = queueLanes(db, b, opts.addresses ?? [handle], { online: opts.online })[0];
+        const picked = queueLanes(db, b, own, { online: opts.online })[0];
         if (picked) {
           targets.set(picked, { reason: "subscription", wake: true });
           claimQueuePost(db, board, p, picked, now);
@@ -856,7 +884,7 @@ export function post(
     if (parentId !== null && (b.kind ?? "broadcast") === "queue") {
       ackQueueClaim(db, opts.addresses ?? [handle], `queue:${board}:${threadRoot(db, parentId)}`, now);
     }
-    for (const a of opts.addresses ?? [handle]) targets.delete(a);
+    for (const a of own) targets.delete(a);
 
     const ins = db.prepare(
       `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
@@ -1158,13 +1186,13 @@ export function rosterHandles(db: Database): string[] {
 /**
  * Every address that may have a live session, for a mode that must check
  * liveness up front (#284 S8): the roster, and the session IDs that haven't
- * ended, deliver, aren't viewers and hold no alias (a bound session is
- * reached through its alias).
+ * ended, deliver, aren't viewers or children (#523: never an address) and
+ * hold no alias (a bound session is reached through its alias).
  */
 export function liveAddresses(db: Database): string[] {
   const ids = db
     .prepare(
-      `SELECT id FROM ids i WHERE ended_at IS NULL AND delivery = 'push' AND viewer = 0
+      `SELECT id FROM ids i WHERE ended_at IS NULL AND delivery = 'push' AND viewer = 0 AND root_id IS NULL
          AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id) ORDER BY id`,
     )
     .all() as { id: string }[];
@@ -1175,13 +1203,14 @@ export function liveAddresses(db: Database): string[] {
 export function activeAnnouncements(db: Database, now = Date.now()): Post[] {
   const board = access(db).announceBoard;
   if (!board) return [];
-  return db
+  return (db
     .prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? AND parent_id IS NULL AND expires_at > ? ORDER BY id ASC`)
-    .all(board, now) as Post[];
+    .all(board, now) as PostRow[]).map(showPost);
 }
 
 export function getPost(db: Database, id: number): Post | undefined {
-  return db.prepare(`SELECT ${POST_COLS} FROM posts WHERE id = ?`).get(id) as Post | undefined;
+  const row = db.prepare(`SELECT ${POST_COLS} FROM posts WHERE id = ?`).get(id) as PostRow | null;
+  return row ? showPost(row) : undefined;
 }
 
 export function boardCatalog(db: Database, handle: Viewer, after?: string): { boards: Board[]; next_after: string | null } {
@@ -1214,10 +1243,10 @@ export function snapshot(db: Database, handle: Viewer, boardInput: string, opts:
     throw new CoreError("snapshot before_id must be a positive safe integer");
   }
   const rows = (opts.before_id === undefined
-    ? db.prepare(`SELECT * FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`).all(board.name, limit + 1)
-    : db.prepare(`SELECT * FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(board.name, opts.before_id, limit + 1)) as Post[];
+    ? db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`).all(board.name, limit + 1)
+    : db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(board.name, opts.before_id, limit + 1)) as PostRow[];
   const more = rows.length > limit;
-  const posts = rows.slice(0, limit).reverse();
+  const posts = rows.slice(0, limit).reverse().map(showPost);
   return { board, posts: withAttachments(db, "post", posts), next_before_id: more ? posts[0]!.id : null };
 }
 
@@ -1228,17 +1257,19 @@ export type ReadResult = { board: string; posts: Post[]; unread_remaining: numbe
 // in its context for the rest of the session).
 // With before_id: page back through history. With thread: the whole thread.
 // Advances your cursor to the newest post returned. A predicate viewer has
-// no cursor: it gets the latest page and changes nothing.
+// no cursor: it gets the latest page and changes nothing. Nor does `peek` (a
+// child session's read, #523): the board is judged by the viewer, but the read
+// state is its root's, so it reads as a predicate viewer does.
 export function read(
   db: Database,
   viewer: Viewer,
   boardInput: string,
-  opts: { limit?: number; before_id?: number; thread?: number } = {},
+  opts: { limit?: number; before_id?: number; thread?: number; peek?: boolean } = {},
 ): ReadResult {
   const board = visibleBoard(db, viewer, boardInput).name;
-  const handle = typeof viewer === "string" ? viewer : null;
+  const handle = typeof viewer === "string" && !opts.peek ? viewer : null;
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
-  let posts: Post[];
+  let posts: PostRow[];
 
   if (opts.thread !== undefined) {
     const rootId = threadRoot(db, opts.thread);
@@ -1250,12 +1281,12 @@ export function read(
            SELECT ${P_POST_COLS} FROM posts p JOIN t ON p.parent_id = t.id
          ) SELECT * FROM t ORDER BY id ASC`,
       )
-      .all(rootId, board) as Post[];
+      .all(rootId, board) as PostRow[];
   } else if (opts.before_id !== undefined) {
     posts = (
       db
         .prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`)
-        .all(board, opts.before_id, limit) as Post[]
+        .all(board, opts.before_id, limit) as PostRow[]
     ).reverse();
   } else {
     const sub = handle === null ? undefined : db
@@ -1267,18 +1298,18 @@ export function read(
             `SELECT ${P_POST_COLS} FROM posts p WHERE board = ? AND id > ? AND ${NOT_OWN} AND ${NOT_PUSHED_YET}
               ORDER BY id ASC LIMIT ?`,
           )
-          .all(board, sub.cursor, handle, handle, handle, handle, limit) as Post[])
+          .all(board, sub.cursor, handle, handle, handle, handle, limit) as PostRow[])
       : [];
     if (posts.length === 0) {
       posts = (
         db
           .prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`)
-          .all(board, opts.limit === undefined ? 10 : limit) as Post[]
+          .all(board, opts.limit === undefined ? 10 : limit) as PostRow[]
       ).reverse();
     }
   }
 
-  if (handle === null) return { board, posts: withAttachments(db, "post", posts), unread_remaining: 0 };
+  if (handle === null) return { board, posts: withAttachments(db, "post", posts.map(showPost)), unread_remaining: 0 };
   const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
   if (maxId > 0) {
     db.prepare(
@@ -1300,7 +1331,7 @@ export function read(
     )
     .get(handle, board, handle, handle, handle, handle) as { n: number };
 
-  return { board, posts: withAttachments(db, "post", posts), unread_remaining: remaining.n };
+  return { board, posts: withAttachments(db, "post", posts.map(showPost)), unread_remaining: remaining.n };
 }
 
 // ── delivery ─────────────────────────────────────────────────────────────────
@@ -1335,9 +1366,10 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
         `SELECT o.reason, o.wake, ${P_POST_COLS} FROM outbox o JOIN posts p ON p.id = o.post_id
           WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
       )
-      .all(handle) as (Post & { reason: "mention" | "thread" | "subscription"; wake: number })[],
+      .all(handle) as (PostRow & { reason: "mention" | "thread" | "subscription"; wake: number })[],
   );
-  for (const { reason, wake, ...p } of pushes) {
+  for (const { reason, wake, ...row } of pushes) {
+    const p = showPost(row);
     if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
     else acknowledge(db, handle, { kind: "push", post_id: p.id });
   }

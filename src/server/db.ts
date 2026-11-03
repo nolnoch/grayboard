@@ -29,7 +29,8 @@ export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // attachments: present on reads when the message carries files.
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at: number | null; pending: number; kind: "bounce" | null; attachments?: AttachmentInfo[] };
+// via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
+export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at: number | null; pending: number; kind: "bounce" | null; via: string | null; attachments?: AttachmentInfo[] };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
 // doesn't leak. `me`: every address the caller reads as (#284 S8).
@@ -51,9 +52,10 @@ export type WriteReceipt = {
 };
 
 // A message's columns as readers see them. sender_id (#284) is the sending
-// session's provenance, kept in the database and left out of reads and pushes.
-const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, delivered_at, pending, kind`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind`;
+// session's provenance, kept in the database and left out of reads and pushes;
+// via (#523) is shown, since it names a child writer its root's address hides.
+const MSG_COLS = `id, sender, recipient_type, recipient, body, parent_id, created_at, delivered_at, pending, kind, via`;
+const M_MSG_COLS = `m.id, m.sender, m.recipient_type, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind, m.via`;
 const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 
 // A synchronous callback's result: a promise is refused at compile time, so
@@ -113,10 +115,10 @@ export interface Repo {
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
     // transaction (a refused id throws CoreError and nothing is written).
     // senderId: the sending session's ID (#284); null for a writer with no
-    // session.
+    // session. via: the child session that wrote it (#523), else null.
     insert(
       sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[],
-      senderId?: string | null, uploader?: Uploader,
+      senderId?: string | null, uploader?: Uploader, via?: string | null,
     ): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
@@ -235,6 +237,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     initSchema(d);
     initCoreSchema(d);
     migrateHostedHolds(d);
+    recordChildRoots(d);
     seedSchema(d, first);
   });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
@@ -258,6 +261,17 @@ function migrateHostedHolds(db: Database): void {
     INSERT OR IGNORE INTO alias_holds(address, id, bound_at)
       SELECT u.email || '/' || h.name, h.session_id, h.last_seen_at FROM hosted_sessions h JOIN users u ON u.id = h.user_id WHERE h.name IS NOT NULL;
     UPDATE hosted_sessions SET name = NULL WHERE name IS NOT NULL;
+  `);
+}
+
+// #523: a hosted child's root is recorded on its ids row (hostedRoot), where it
+// outlives the child's source row. A child registered before the column, or by
+// an older release sharing the file, gets it from its live source row here.
+// Runs after initCoreSchema, which adds ids.root_id.
+function recordChildRoots(db: Database): void {
+  db.exec(`
+    UPDATE ids SET root_id = (SELECT h.root_session_id FROM hosted_sessions h WHERE h.session_id = ids.id)
+      WHERE root_id IS NULL AND id IN (SELECT session_id FROM hosted_sessions WHERE root_session_id IS NOT NULL);
   `);
 }
 
@@ -488,6 +502,9 @@ function initSchema(db: Database): void {
   if (!msgCols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE messages ADD COLUMN kind TEXT`);
   // delivered_at: when the message was handed to its recipient's harness (#470).
   if (!msgCols.some((c) => c.name === "delivered_at")) db.exec(`ALTER TABLE messages ADD COLUMN delivered_at INTEGER`);
+  // via: the child session (a harness subagent, #523) that wrote it under its
+  // root's addresses; null for a root's own write.
+  if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -704,13 +721,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null, uploader) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null, uploader, via = null) {
         if (attachmentIds.length && !uploader) throw new Error("messages.insert: attachments need their uploader");
         return db.transaction(() => {
-          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number]>(
-            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0, via)!;
           const attachments = bindAttachments(db, attachmentIds, uploader!, { message_id: row.id }, attachmentLimits);
           return attachments.length ? { ...row, attachments } : row;
         })();
