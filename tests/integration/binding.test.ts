@@ -814,6 +814,8 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
   // Its own thread, as its sender.
   const r3 = await s.call("dm_send", { to: "peer", body: "r3", parent_id: r1.message_id });
   expect(senderOf(r3.message_id as number)).toBe("b");
+  // #524: a reply goes to the parent's other party, never a third.
+  expect(await refusal(s, "dm_send", { to: "a", body: "x", parent_id: toB.message_id })).toBe(`error: parent_id ${toB.message_id} is a thread with peer, so a reply goes to peer; to write to someone else, send without parent_id`);
 
   // b unbound and taken by t: a reply to mail that reached b is refused, not sent as a.
   const toB2 = await peer.call("dm_send", { to: "b", body: "to b again" });

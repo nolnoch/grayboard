@@ -166,6 +166,19 @@ export function replySender(parent: { sender: string; recipient: string }, holds
 }
 
 /**
+ * The address a DM reply must go to (#524): the parent's other party, its
+ * sender when `me` received it, else its recipient. A reply to anyone else
+ * would thread under a message one of whose parties can't read it.
+ */
+export function replyPeer(parent: { sender: string; recipient: string }, me: string[]): string {
+  return me.includes(parent.sender) ? parent.recipient : parent.sender;
+}
+
+export function replyPeerError(parentId: number, peer: string): string {
+  return `parent_id ${parentId} is a thread with ${peer}, so a reply goes to ${peer}; to write to someone else, send without parent_id`;
+}
+
+/**
  * The address set a caller acting as `address` reads as (#284 S8), for a
  * request that names one address (HTTP `?as=`, `grayboard claim`): `address`
  * first, then the rest of the address set of the session it is or that holds
