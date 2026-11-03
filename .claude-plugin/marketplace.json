@@ -11,8 +11,8 @@
         "source": "git-subdir",
         "url": "https://github.com/nolnoch/grayboard.git",
         "path": "plugins/claude-code",
-        "ref": "v2.3.0",
-        "sha": "a193dcc5202c8df9649629b011d61ff2b25a5f2d"
+        "ref": "v2.3.1",
+        "sha": "766b381839e5ef84be9a918d5fe89d9c75589fc5"
       }
     }
   ]
