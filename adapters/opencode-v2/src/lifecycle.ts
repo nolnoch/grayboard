@@ -4,11 +4,12 @@ import type { DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort } from "./core/port.js";
 import { Refusal, render } from "./core/model.js";
 import { resolveRoot } from "./core/sessions.js";
-import type { Wire } from "./core/wire.js";
+import { NativeWire, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
 import { Binding, SIGN_IN } from "./binding.js";
 import { Grayboard } from "./rpc.js";
+import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructions.js";
 
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean };
 type Invocation = { tool: string; sessionID: string; id: string };
@@ -57,8 +58,15 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   }
   async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
     const tool = await this.native(event.tool);
-    if (tool !== undefined) await this.afterCall({ sessionID: event.sessionID, tool, result: event.status === "completed" ? { status: "completed", output: event.result.output } : { status: "error" } });
+    if (tool === undefined) return;
+    try { await this.afterCall({ sessionID: event.sessionID, tool, result: event.status === "completed" ? { status: "completed", output: event.result.output } : { status: "error" } }); }
+    finally { if (tool === "bind" || tool === "unbind") this.bindingChanged?.(event.sessionID); }
   }
+  // A native bind or unbind ran for this session: its server instructions may have changed (#531).
+  bindingChanged?: (sessionID: string) => void;
+  // An enrolled root's enrollment (any state); children and unenrolled sessions have none.
+  enrollment(sessionID: string): OpenCodeEnrollment | undefined { return this.roots.get(sessionID)?.e; }
+  instructionsFailure(error: unknown) { this.failure("instructions", error); }
   async observe(type: string, data: unknown) {
     if (this.stopped) return;
     if (type === "session.created") {
@@ -82,7 +90,39 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   }
 }
 
-export async function setup(ctx: Context, sink: DiagnosticSink) {
+// A root's current server instructions over a native connection that names it,
+// as the root's own wires would (same URL, client and launcher declaration; no
+// delivery declaration, so no lease): one connect and close per fetch.
+export function nativeFetcher(controller: OpenCodeController): Fetcher {
+  return async (sessionID, signal) => {
+    const e = controller.enrollment(sessionID);
+    if (!e) return;
+    const port = controller.port;
+    let current: string | undefined;
+    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(port.launcher ? { launcher: true as const } : {}) }, {
+      token: async () => (current = await controller.binding.token(e)),
+      onUnauthorized: async () => controller.binding.unauthorized(e, current ?? ""),
+    }, signal, sessionID);
+    try { await wire.connect(); return wire.instructions(); }
+    finally { void wire.close().catch(() => {}); }
+  };
+}
+
+// A root's record whose state, holds or ownership changed: what its server
+// instructions describe may have changed with it (#531).
+export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) => void): DiagnosticSink {
+  const seen = new Map<string, string>();
+  return record => {
+    if (record.sessionID && record.operation !== "instructions") {
+      const shape = JSON.stringify([record.state, record.held ?? [], record.ownership ?? null]);
+      if (seen.get(record.sessionID) !== shape) { seen.set(record.sessionID, shape); changed(record.sessionID); }
+    }
+    return sink(record);
+  };
+}
+
+export type Debug = (message: string, fields: Record<string, unknown>) => void;
+export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = () => {}, fetcher?: Fetcher) {
   const options: Options = {
     mcpName: typeof ctx.options.mcpName === "string" ? ctx.options.mcpName : "grayboard",
     issuer: typeof ctx.options.issuer === "string" ? ctx.options.issuer : "",
@@ -90,7 +130,19 @@ export async function setup(ctx: Context, sink: DiagnosticSink) {
     create: ctx.options.create === true,
     launcher: ctx.options.launcher === true,
   };
-  const controller = new OpenCodeController(ctx, options, undefined, undefined, sink);
+  let instructions: RootInstructions | undefined;
+  const controller = new OpenCodeController(ctx, options, undefined, undefined, watchRoots(sink, id => instructions?.invalidate(id)));
+  instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (_sessionID, error) => controller.instructionsFailure(error));
+  controller.bindingChanged = id => instructions?.invalidate(id);
+  // Every primary request of an enrolled root carries its current instructions; other sessions' go as built.
+  // A rejected hook fails OpenCode's step, so it never rejects.
+  const context = await ctx.session.hook("context", async request => {
+    try {
+      if (!controller.enrollment(request.sessionID)) { instructions?.forget(request.sessionID); return; }
+      const plan: Plan = await rewrite(request, options.mcpName, id => instructions!.current(id));
+      debug("Grayboard instructions", { root: request.sessionID, plan });
+    } catch {}
+  });
   let restoring: Promise<unknown> = Promise.resolve();
   const rpc = await ctx.rpc.register(Grayboard, {
     status: async () => controller.status(),
@@ -121,6 +173,8 @@ export async function setup(ctx: Context, sink: DiagnosticSink) {
     await controller.restore().catch(() => { if (!events.signal.aborted) controller.backgroundFailure("restore"); });
   })();
   return async () => {
+    instructions.close();
+    await context.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
     events.abort();
     await controller.close();
     await restoring;
