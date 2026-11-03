@@ -152,10 +152,12 @@ export function createPlugin(o: PluginOptions): Plugin {
         // Only a decline ends the flow: Esc (cancel) may just free the keyboard
         // from a prompt Claude Code keeps up while the user finishes the link.
         if (result.action === "decline") throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || sent >= RESENDS || !flow) return;
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow) return;
+        if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link in tool results remains`); return; }
+        say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
-        if (signingIn !== flow || flow.abort.signal.aborted) return;
+        if (signingIn !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
       }
     },
     notify: message => {

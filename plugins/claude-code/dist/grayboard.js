@@ -37293,11 +37293,18 @@ function createPlugin(o) {
         say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
         if (result.action === "decline")
           throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || sent >= RESENDS || !flow)
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow)
           return;
+        if (sent >= RESENDS) {
+          say(`sign-in prompt cancelled unshown ${sent + 1} times; the link in tool results remains`);
+          return;
+        }
+        say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
-        if (signingIn !== flow || flow.abort.signal.aborted)
+        if (signingIn !== flow || flow.abort.signal.aborted) {
+          say("sign-in ended before the prompt was sent again");
           return;
+        }
       }
     },
     notify: (message) => {
