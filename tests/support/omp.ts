@@ -294,7 +294,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(new Set(registered.map((r) => r.detail.source_session_id)).size).toBe(2);
     expect(registered.map((r) => r.detail.source_session_id)).not.toContain(sessionId);
     expect(writes.map((w) => w.target).sort()).toEqual([...children].sort());
-    for (const w of writes) expect(w.detail).toMatchObject({ session: w.target, root, name: "omp-task" });
+    for (const w of writes) expect(w.detail).toMatchObject({ session: w.target, root, held: ["alice@example.com/omp-task"] });
     expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body LIKE 'child %' ORDER BY body").all())
       .toEqual([0, 1].map((i) => ({ body: `child ${i}`, sender: "alice@example.com/omp-task" })));
     expect(liveChildren(srv, root).sort()).toEqual([...children].sort());

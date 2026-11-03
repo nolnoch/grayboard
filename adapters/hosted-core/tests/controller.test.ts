@@ -4,13 +4,13 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { Controller, type ControllerOptions } from "../src/controller.js";
-import { AccessExpired, Refusal, RefreshInProgress, same, type Item } from "../src/model.js";
+import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
-import { LeaseUnavailable, ServerUnreachable, Wire, type WireOptions } from "../src/wire.js";
+import { LeaseUnavailable, ServerUnreachable, SubscriberError, Wire, type WireOptions } from "../src/wire.js";
 
 type Mode = "adapter" | "approval";
-type Row = { name: string | null; ownership: number; generation: number; capability?: string };
+type Row = { held: string[]; ownership: number; generation: number; capability?: string };
 type Call = { sessionID: string; name: string; args: Record<string, unknown> };
 const SESSION_KEY = "io.github.nolnoch.grayboard/sessionID";
 const DELIVERY = { mode: "push" as const, source: "grayboard" };
@@ -21,21 +21,29 @@ function runtime(mode: Mode) {
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
   const watchers = new Set<() => void>(), drifts: (() => void)[] = [], streams = new Map<string, () => void>();
   const approvals = new Map<string, { approval: Enrollment; enabled: boolean }>();
+  // Holds the server took (#453), per session: the subscriber whoami reports them, and the next delivery_open
+  // takes the reported ones, as the server does.
+  const lost = new Map<string, { alias: string; reason: string; reported: boolean }[]>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
+  // While set, the credential's token() finds the access token ended for this reason.
+  let accessFault: AccessReason | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
-  let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined;
+  let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   const loops: FakeWire[] = [];
-  const bind = (id: string, name: string) => { const old = rows.get(id); rows.set(id, { name, ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
+  const address = (name: string) => name.includes("/") ? name : `you@example.com/${name}`;
+  // A bind adds a hold; an unbind releases one and bumps the generation too (#451).
+  const bind = (id: string, name: string) => { const old = rows.get(id), held = old?.held ?? []; rows.set(id, { held: held.includes(address(name)) ? held : [...held, address(name)], ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
   class FakeWire {
     capability?: string;
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
-    constructor(options: WireOptions, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); if (beforeRetry) loops.push(this); }
-    // Only the run loop's wire has beforeRetry. The SDK wraps a token() failure
-    // during connect in its version-negotiation error.
+    constructor(options: WireOptions, readonly auth: { token(): Promise<string> }, readonly signal: AbortSignal, readonly sessionID: string, readonly beforeRetry?: () => Promise<void>) { wires.push(options); if (beforeRetry) loops.push(this); }
+    // Only the run loop's wire has beforeRetry. The SDK reads the token while
+    // connecting and wraps a token() failure in its version-negotiation error.
     async connect() {
       if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
+      try { await this.auth.token(); } catch (error) { throw new Error("Version negotiation probe failed", { cause: error }); }
     }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
@@ -43,19 +51,30 @@ function runtime(mode: Mode) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") {
         if (!this.beforeRetry && prepareHold) await prepareHold;
-        return { name: row?.name ?? null, ownership: row?.ownership ?? null, ...(!row?.name ? { unbound: true } : {}) };
+        // The server reports each loss to the Controller until its next delivery_open (#453).
+        const taken = lost.get(this.sessionID) ?? [];
+        for (const l of taken) l.reported = true;
+        return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(taken.length ? { alias_lost: taken.map(({ alias, reason }) => ({ alias, reason })) } : {}), ...(!row?.held.length ? { unbound: true } : {}) };
       }
       if (name === "bind") {
-        if (!args.create && !rows.get(this.sessionID) && args.name !== "be" && args.name !== "fe") throw new Error("identity_unknown");
+        if (address(args.name as string).endsWith("/gone")) throw new SubscriberError("alias_held");
+        if (!args.create && !rows.get(this.sessionID) && !["you@example.com/be", "you@example.com/fe"].includes(address(args.name as string))) throw new Error("identity_unknown");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
-        return { name: row.name, ownership: row.ownership, instructions: ["bound"] };
+        lost.set(this.sessionID, (lost.get(this.sessionID) ?? []).filter(l => l.alias !== address(args.name as string)));
+        return { name: row.held[0]!.split("/")[1], ownership: row.ownership, instructions: ["bound"] };
+      }
+      if (name === "unbind") {
+        if (row) { row.held = row.held.filter(h => h !== address(args.name as string)); row.generation++; }
+        return { name: row?.held[0]?.split("/")[1] ?? null, ownership: row?.ownership, instructions: ["unbound"] };
       }
       if (name === "session_register") return { registered: true };
       if (name === "session_end" || name === "delivery_release") { rows.delete(this.sessionID); return { ok: true }; }
       if (name === "delivery_open") {
-        if (!row?.name) throw new Error("unbound");
+        if (beforeOpen) { const hook = beforeOpen; beforeOpen = undefined; hook(); row = rows.get(this.sessionID); }
+        if (!row?.held.length) throw new Error("unbound");
+        lost.set(this.sessionID, (lost.get(this.sessionID) ?? []).filter(l => !l.reported));
         row.capability = `${row.ownership}_${row.generation}`.padEnd(43, "a");
-        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: `you@example.com/${row.name}` } };
+        return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: row.held[0] } };
       }
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_renew") {
@@ -81,7 +100,7 @@ function runtime(mode: Mode) {
     capture: async sessionID => { if (signedOut) throw new AccessExpired("pi", "run /grayboard login"); return { version: 2, sessionID, configuration: configuration() }; },
     check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
-    token: async () => "access",
+    token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
   };
   const approval: ApprovalPort<Enrollment> | null = mode === "approval" ? {
@@ -102,18 +121,31 @@ function runtime(mode: Mode) {
   const make = (options: ControllerOptions = {}) => new Controller(port, { Transport: FakeWire as unknown as typeof Wire, ...options });
   const controller = make();
   // The item a fresh root's first bind of `be` will be issued (ownership 1, generation 1).
-  const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, name: "be" });
+  const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" });
   const named = (name: string) => calls.filter(c => c.name === name);
   return {
     controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts, loops,
     // Every prepare's whoami waits on `gate` from now on.
     holdPrepare: (gate: Promise<void>) => { prepareHold = gate; },
+    // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
+    beforeOpen: (hook: () => void) => { beforeOpen = hook; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
     // The grant changes before any watch's next tick; the server then closes `id`'s stream.
     revoke: (id: string) => { grant++; streams.get(id)?.(); },
+    closeStream: (id: string) => { streams.get(id)?.(); },
+    // The server takes a hold (#453, a revoked access): released, the generation bumped, the stream closed,
+    // and whoami reports it until the next delivery_open.
+    loseHold: (id: string, name: string, reason: string) => {
+      const row = rows.get(id)!;
+      row.held = row.held.filter(h => h !== address(name)); row.generation++;
+      lost.set(id, [...(lost.get(id) ?? []), { alias: address(name), reason, reported: false }]);
+      streams.get(id)?.();
+    },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
+    // token() refuses with AccessExpired(reason) until called again without one.
+    expireAccess: (reason?: AccessReason) => { accessFault = reason; },
     // The nth delivery_renew throws `error` once, after running `then`.
     failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
     // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
@@ -129,11 +161,11 @@ test.each(modes)("enroll binds, opens delivery with the port's session key and d
   const r = runtime(mode);
   try {
     r.batches.set("R", [r.item("direct:1")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.named("delivery_receipt").length === 1);
     expect(r.admits.map(a => [a.sessionID, a.item])).toEqual([["R", "direct:1"]]);
     expect(r.admits[0]!.id).toMatch(/^msg_[a-f0-9]{64}$/);
-    expect(r.root(r.controller)).toMatchObject({ state: "active", name: "be" });
+    expect(r.root(r.controller)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
     expect(r.named("bind")[0]!.args).toEqual({ name: "be", create: true, where: "/work" });
     expect(r.wires.every(w => w.sessionKey === SESSION_KEY && same(w.delivery, DELIVERY) && w.client.name === "grayboard-test")).toBe(true);
     if (mode === "approval") expect(r.approvals.get("R")?.enabled).toBe(true);
@@ -151,7 +183,7 @@ test.each(modes)("a descendant can't enroll; ancestry is the port's (%s)", async
 
 test.each(modes)("resume rebinds the remembered name with create:false after a restart (%s)", async mode => {
   const r = runtime(mode);
-  await r.controller.enroll("R", "be", true);
+  await r.controller.enroll("R", ["be"], true);
   await until(() => r.root(r.controller)?.state === "active");
   await r.controller.close();
   r.rows.delete("R");
@@ -159,7 +191,7 @@ test.each(modes)("resume rebinds the remembered name with create:false after a r
   try {
     await restarted.resume("R");
     await until(() => r.root(restarted)?.state === "active");
-    expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "be", create: false, where: "/work" }]);
+    expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
     if (mode === "approval") await expect(restarted.resume("B")).rejects.toThrow("No saved approval for this root; run /grayboard resume");
     else {
       await restarted.resume("B");
@@ -168,28 +200,45 @@ test.each(modes)("resume rebinds the remembered name with create:false after a r
   } finally { await restarted.close(); }
 });
 
+test.each(modes)("resume rebinds only the remembered holds the server lost, and skips one it now refuses (%s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be", "fe"], true);
+  await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+  await r.controller.close();
+  // The server lost fe but kept be (a partial loss); the remembered set also names a hold now refused.
+  r.rows.get("R")!.held = ["you@example.com/be"];
+  (r.storage.get("rememberedHeld:R") as { held: string[] }).held.push("you@example.com/gone");
+  const restarted = r.make(), binds = r.named("bind").length;
+  try {
+    await restarted.resume("R");
+    await until(() => r.root(restarted)?.state === "active");
+    expect(r.named("bind").slice(binds).map(c => c.args.name)).toEqual(["you@example.com/fe", "you@example.com/gone"]);
+    expect(r.root(restarted)).toMatchObject({ held: ["you@example.com/be", "you@example.com/fe"] });
+  } finally { await restarted.close(); }
+});
+
 test.each(modes)("a drift from a watch already disposed (a check in flight when resume replaced the root) pauses nothing (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     const stale = r.drifts.at(-1)!;
     await r.controller.resume("R");
     await until(() => r.root(r.controller)?.state === "active");
     stale();
-    expect(r.root(r.controller)).toMatchObject({ state: "active", name: "be" });
+    expect(r.root(r.controller)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
     // The live root's own watch still pauses it.
     r.drift();
     expect(r.root(r.controller)).toMatchObject({ state: "paused" });
   } finally { await r.controller.close(); }
 });
 
-test.each(modes)("carried() is the name a resume would rebind now: none once the grant changed (%s)", async mode => {
+test.each(modes)("carried() is the holds a resume would rebind now: none once the grant changed (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
-    expect(await r.controller.carried("R")).toBe("be");
+    expect(await r.controller.carried("R")).toEqual(["you@example.com/be"]);
     expect(await r.controller.carried("B")).toBeUndefined();
     r.drift();
     expect(await r.controller.carried("R")).toBeUndefined();
@@ -199,7 +248,7 @@ test.each(modes)("carried() is the name a resume would rebind now: none once the
 test.each(modes)("pause releases ownership and keeps every root paused (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     await r.controller.pause();
     expect(r.named("delivery_release").map(c => c.sessionID)).toEqual(["R"]);
@@ -213,7 +262,7 @@ test.each(modes)("pause releases ownership and keeps every root paused (%s)", as
 test.each(modes.flatMap(mode => (["release", "detach"] as const).map(how => [mode, how] as const)))("shutdown %s/%s", async (mode, how) => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     await r.controller.shutdown("R", how);
     expect(r.root(r.controller)).toMatchObject({ state: "paused", message: how === "release" ? "Session shut down; ownership released" : "Session detached; lease retained for reload" });
@@ -229,8 +278,8 @@ test.each(modes.flatMap(mode => (["release", "detach"] as const).map(how => [mod
 test.each(modes)("credential drift pauses every root until it is resumed (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
-    await r.controller.enroll("B", "fe", true);
+    await r.controller.enroll("R", ["be"], true);
+    await r.controller.enroll("B", ["fe"], true);
     await until(() => r.root(r.controller, "B")?.state === "active" && r.root(r.controller)?.state === "active");
     r.drift();
     for (const id of ["R", "B"]) expect(r.root(r.controller, id)).toMatchObject({ state: "paused", message: "Grayboard credential changed; run /grayboard resume" });
@@ -253,8 +302,8 @@ test.each(modes)("a credential change the run loop's check sees before any watch
   const r = runtime(mode);
   const c = r.make({ wait: async () => {} });
   try {
-    await c.enroll("R", "be", true);
-    await c.enroll("B", "fe", true);
+    await c.enroll("R", ["be"], true);
+    await c.enroll("B", ["fe"], true);
     await until(() => r.root(c, "B")?.state === "active" && r.root(c)?.state === "active");
     r.revoke("R");
     await until(() => r.root(c)?.state === "paused");
@@ -266,7 +315,7 @@ test.each(modes)("a credential change the run loop's check sees before any watch
 test.each(modes)("an ended root releases ownership; an ended child ends only its own registration (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
     await r.controller.ended("C");
@@ -302,14 +351,14 @@ test.each(modes)("child registration runs on the root's wire before the child's 
 test.each(modes)("a root's bind stops delivery before the call and reopens under the new name after it (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     await r.controller.beforeCall({ sessionID: "R", tool: "bind" });
     expect(r.root(r.controller)).toMatchObject({ state: "rebinding", operation: "before_bind" });
-    r.rows.set("R", { name: "fe", ownership: r.rows.get("R")!.ownership, generation: r.rows.get("R")!.generation + 1 });
+    r.rows.set("R", { held: ["you@example.com/be", "you@example.com/fe"], ownership: r.rows.get("R")!.ownership, generation: r.rows.get("R")!.generation + 1 });
     await r.controller.afterCall({ sessionID: "R", tool: "bind", result: { status: "completed", output: { name: "fe", ownership: r.rows.get("R")!.ownership, instructions: ["bound"] } } });
-    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.name === "fe");
-    expect(r.storage.get("rememberedName:R")).toMatchObject({ name: "fe" });
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: ["you@example.com/be", "you@example.com/fe"] });
     await r.controller.afterCall({ sessionID: "R", tool: "bind", result: { status: "completed", output: { name: "fe" } } });
     expect(r.root(r.controller)).toMatchObject({ state: "approved", operation: "after" });
   } finally { await r.controller.close(); }
@@ -318,13 +367,13 @@ test.each(modes)("a root's bind stops delivery before the call and reopens under
 test.each(modes)("an unbound result from any tool rebinds the remembered name (%s)", async mode => {
   const r = runtime(mode);
   try {
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.root(r.controller)?.state === "active");
     r.rows.delete("R");
     const binds = r.named("bind").length;
     await r.controller.afterCall({ sessionID: "R", tool: "dm_send", result: { status: "completed", output: { unbound: true } } });
     await until(() => r.root(r.controller)?.state === "active");
-    expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "be", create: false, where: "/work" }]);
+    expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
     const after = r.named("bind").length;
     await r.controller.afterCall({ sessionID: "R", tool: "dm_send", result: { status: "error" } });
     expect(r.named("bind")).toHaveLength(after);
@@ -336,7 +385,7 @@ test.each(modes)("a receipt that fails once leaves the item admitted once and re
   try {
     r.failReceipt(1);
     r.batches.set("R", [r.item("direct:1"), r.item("direct:2")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1", "direct:2"]);
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"], ["direct:2"]]);
@@ -350,7 +399,7 @@ test.each(modes)("a post-admission renew that fails once (an outage) shows the i
   try {
     r.failRenewAt(2, () => new ServerUnreachable(new Error("blip")));
     r.batches.set("R", [r.item("direct:1")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
@@ -363,7 +412,7 @@ test.each(modes)("a post-admission renew that loses the lease: the next lease of
   try {
     r.failRenewAt(2, () => new LeaseUnavailable());
     r.batches.set("R", [r.item("direct:1")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
     expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
@@ -380,7 +429,7 @@ test.each(modes)("a lease that can't renew after admission never receipts it and
   try {
     r.loseRenewsFrom(2);
     r.batches.set("R", [r.item("direct:1")]);
-    await c.enroll("R", "be", true);
+    await c.enroll("R", ["be"], true);
     await until(() => r.root(c)?.state === "paused", 10_000);
     expect(r.root(c)?.message).toStartWith("Retry limit reached for direct:1; item remains unreceipted");
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
@@ -395,11 +444,11 @@ test.each(modes)("a lease lost after admission whose next lease has a new bind_g
     // The name was rebound meanwhile: the next lease and its inbox carry bind_gen 2.
     r.failRenewAt(2, () => new LeaseUnavailable(), () => {
       const row = r.rows.get("R")!;
-      r.rows.set("R", { name: row.name, ownership: row.ownership, generation: row.generation + 1 });
+      r.rows.set("R", { held: row.held, ownership: row.ownership, generation: row.generation + 1 });
       r.batches.set("R", [{ ...r.item("direct:1"), bind_gen: 2 }]);
     });
     r.batches.set("R", [r.item("direct:1")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1", "direct:1"]);
     expect(r.admits[1]!.id).toBe(r.admits[0]!.id);
@@ -414,12 +463,65 @@ test.each(modes)("a refresh another process holds is retried like an outage, pas
   try {
     r.refreshBusy(12);
     r.batches.set("R", [r.item("direct:1")]);
-    await c.enroll("R", "be", true);
+    await c.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(waits).toEqual([500, 1000, 2000, 4000, ...Array(8).fill(8000)]);
     expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "refresh_in_progress" } });
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
   } finally { await c.close(); await r.controller.close(); }
+});
+
+// #472: a host that rotates its own access token (OpenCode's native grant)
+// does so at or just after expiry, up to ~1.5 s after the server closed the
+// stream for it. Virtual time is the backoff waited since that close.
+test.each(modes)("an `expired` access token at a stream close is polled until the host rotates it: same ownership, no budget spent (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  let elapsed = 0;
+  const c = r.make({ wait: async ms => { waits.push(ms); if ((elapsed += ms) >= 1500) r.expireAccess(); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active");
+    const ownership = r.root(c)?.ownership;
+    r.batches.set("R", [r.item("direct:1")]);
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.batches.get("R")?.length === 0);
+    // The close's own backoff, then 500 ms rotation polls; a spent failure would back off 1000 ms.
+    expect(waits).toEqual([500, 500, 500]);
+    expect(r.root(c)).toMatchObject({ state: "active", ownership, failure: { operation: "reopen", code: "native_access_expired" } });
+    expect(r.named("delivery_open")).toHaveLength(2);
+    expect(r.named("bind")).toHaveLength(1);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+test.each(modes)("an `expired` access token the host never rotates pauses once the 10 s grace runs out (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active");
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.root(c)?.state === "paused");
+    expect(waits).toEqual(Array(21).fill(500));
+    expect(r.root(c)?.code).toBe("native_access_expired");
+    expect(r.named("delivery_open")).toHaveLength(1);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+// Own-login adapters (pi, omp, Claude Code) refresh 60 s early and end a grant
+// only with these reasons: they get no rotation grace.
+test.each(modes)("own-login access ends (`login_required`, `refresh_outcome_unknown`) still pause at once, with no rotation polls (%s)", async mode => {
+  for (const reason of ["login_required", "refresh_outcome_unknown"] as const) {
+    const r = runtime(mode), waits: number[] = [];
+    const c = r.make({ wait: async ms => { waits.push(ms); } });
+    try {
+      await c.enroll("R", ["be"], true);
+      await until(() => r.root(c)?.state === "active");
+      r.expireAccess(reason); r.closeStream("R");
+      await until(() => r.root(c)?.state === "paused");
+      expect(waits).toEqual([500]);
+      expect(r.root(c)?.code).toBe(reason);
+    } finally { await c.close(); await r.controller.close(); }
+  }
 });
 
 // #444: the per-session stop before the control queue.
@@ -437,18 +539,18 @@ test.each(modes)("shutdown aborts the run loop before the control queue; a resum
     const signals: AbortSignal[] = [];
     r.holdAdmit(heldAdmit(signals));
     r.batches.set("R", [r.item("direct:1")]);
-    await r.controller.enroll("R", "be", true);
+    await r.controller.enroll("R", ["be"], true);
     await until(() => signals.length === 1);
     // B's enroll holds the queue in its prepare.
     const gate = Promise.withResolvers<void>();
     r.holdPrepare(gate.promise);
-    const blocking = r.controller.enroll("B", "fe", true);
+    const blocking = r.controller.enroll("B", ["fe"], true);
     await until(() => r.named("whoami").some(c => c.sessionID === "B"));
     const shutdown = r.controller.shutdown("R", "release");
     expect(signals[0]!.aborted).toBe(true);
     // Bun's `expect(p).rejects` settles `p` on the spot, so capture the errors instead.
     const resumed = r.controller.resume("R").then(() => undefined, (error: Error) => error.message);
-    const enrolled = r.controller.enroll("R", "be").then(() => undefined, (error: Error) => error.message);
+    const enrolled = r.controller.enroll("R", ["be"]).then(() => undefined, (error: Error) => error.message);
     gate.resolve();
     await blocking;
     expect(await shutdown).toBeUndefined();
@@ -457,7 +559,7 @@ test.each(modes)("shutdown aborts the run loop before the control queue; a resum
     expect(r.rows.has("R")).toBe(false);
     expect(r.root(r.controller)).toMatchObject({ state: "paused", message: "Session shut down; ownership released" });
     await until(() => r.root(r.controller, "B")?.state === "active");
-    expect(r.root(r.controller, "B")).toMatchObject({ name: "fe" });
+    expect(r.root(r.controller, "B")).toMatchObject({ held: ["you@example.com/fe"] });
   } finally { await r.controller.close(); }
 });
 
@@ -469,7 +571,7 @@ test.each(modes)("an admit receives the run loop's signal; a shutdown's abort re
     const signals: AbortSignal[] = [];
     r.holdAdmit(heldAdmit(signals));
     r.batches.set("R", [r.item("direct:1")]);
-    await c.enroll("R", "be", true);
+    await c.enroll("R", ["be"], true);
     await until(() => signals.length === 1);
     expect(signals[0]).toBe(r.loops.at(-1)!.signal);
     await c.shutdown("R", "detach");
@@ -484,7 +586,7 @@ test.each(modes)("an admit receives the run loop's signal; a shutdown's abort re
 
 test.each(modes)("shutdown with carry returns the root's name read in the queue: a resume in flight ends at its next check without rebinding (%s)", async mode => {
   const r = runtime(mode);
-  await r.controller.enroll("R", "be", true);
+  await r.controller.enroll("R", ["be"], true);
   await until(() => r.root(r.controller)?.state === "active");
   await r.controller.close();
   // A restart: the server lost the binding, so the resume would rebind be.
@@ -497,7 +599,7 @@ test.each(modes)("shutdown with carry returns the root's name read in the queue:
     await until(() => r.named("whoami").length > whoamis);
     const carried = c.shutdown("R", "release", { carry: true });
     gate.resolve();
-    expect(await carried).toBe("be");
+    expect(await carried).toEqual(["you@example.com/be"]);
     await resumed;
     expect(r.named("bind").slice(binds)).toEqual([]);
     expect(r.named("delivery_open").filter(x => x.sessionID === "R")).toHaveLength(1);
@@ -508,7 +610,7 @@ test.each(modes)("shutdown with carry returns the root's name read in the queue:
 
 test.each(modes)("shutdown with carry after a completed resume returns the name it rebound (%s)", async mode => {
   const r = runtime(mode);
-  await r.controller.enroll("R", "be", true);
+  await r.controller.enroll("R", ["be"], true);
   await until(() => r.root(r.controller)?.state === "active");
   await r.controller.close();
   r.rows.delete("R");
@@ -516,15 +618,15 @@ test.each(modes)("shutdown with carry after a completed resume returns the name 
   try {
     await c.resume("R");
     await until(() => r.root(c)?.state === "active");
-    expect(r.named("bind").slice(binds).map(x => x.args)).toEqual([{ name: "be", create: false, where: "/work" }]);
-    expect(await c.shutdown("R", "detach", { carry: true })).toBe("be");
-    expect(r.rows.get("R")?.name).toBe("be");
+    expect(r.named("bind").slice(binds).map(x => x.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
+    expect(await c.shutdown("R", "detach", { carry: true })).toEqual(["you@example.com/be"]);
+    expect(r.rows.get("R")?.held).toEqual(["you@example.com/be"]);
   } finally { await c.close(); }
 });
 
 test.each(modes)("a release with no live root (its start never reached the queue) still ends the session (%s)", async mode => {
   const r = runtime(mode);
-  await r.controller.enroll("R", "be", true);
+  await r.controller.enroll("R", ["be"], true);
   await until(() => r.root(r.controller)?.state === "active");
   // A /reload: the old runtime detaches and keeps the lease.
   await r.controller.shutdown("R", "detach");
@@ -550,4 +652,113 @@ test.each(modes)("a release with no live root while signed out records its faile
     expect(records.filter(x => x.operation === "session_end")).toEqual([expect.objectContaining({ state: "degraded", sessionID: "R", message: expect.stringMatching(/^session_end failed \(/) })]);
     expect(r.named("session_end")).toEqual([]);
   } finally { await c.close(); await r.controller.close(); }
+});
+
+const at = (name: string) => `you@example.com/${name}`;
+
+test.each(modes)("a root with two holds admits mail for either, refuses an item for a hold it lacks (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    // Two binds: the lease is generation 2.
+    r.batches.set("R", [{ ...r.item("direct:1"), bind_gen: 2, address: at("fe") }, { ...r.item("push:2"), bind_gen: 2, address: undefined }, { ...r.item("direct:3"), bind_gen: 2, address: at("other") }]);
+    await r.controller.enroll("R", ["be", "fe"], true);
+    await until(() => r.root(r.controller)?.state === "paused");
+    expect(r.root(r.controller)).toMatchObject({ held: [at("be"), at("fe")] });
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1", "push:2"]);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("an unbind result restarts delivery under the remaining holds; the last one leaves the root unbound and forgets them (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be", "fe"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const row = r.rows.get("R")!;
+    await r.controller.beforeCall({ sessionID: "R", tool: "unbind" });
+    expect(r.root(r.controller)).toMatchObject({ state: "rebinding", operation: "before_bind" });
+    r.rows.set("R", { ...row, held: [at("fe")], generation: row.generation + 1 });
+    await r.controller.afterCall({ sessionID: "R", tool: "unbind", result: { status: "completed", output: { name: "fe", ownership: row.ownership, instructions: ["x"] } } });
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.[0] === at("fe"));
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [at("fe")] });
+    r.rows.set("R", { ...row, held: [], generation: row.generation + 2 });
+    await r.controller.afterCall({ sessionID: "R", tool: "unbind", result: { status: "completed", output: { name: null, ownership: row.ownership, instructions: ["x"] } } });
+    await until(() => r.root(r.controller)?.state === "unbound");
+    expect(await r.controller.carried("R")).toBeUndefined();
+    const binds = r.named("bind").length;
+    await r.controller.afterCall({ sessionID: "R", tool: "dm_send", result: { status: "completed", output: { unbound: true } } });
+    expect(r.named("bind").length).toBe(binds);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("resume rebinds every remembered hold in order, and a hold dropped without a native completion pauses (%s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be", "fe"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const c = r.make(), binds = r.named("bind").length;
+  try {
+    await c.resume("R");
+    await until(() => r.root(c)?.state === "active");
+    expect(r.named("bind").slice(binds).map(x => x.args.name)).toEqual([at("be"), at("fe")]);
+    expect(r.rows.get("R")?.held).toEqual([at("be"), at("fe")]);
+    // A drop no whoami's alias_lost explains (another process's unbind): the held set no longer matches what this root started with.
+    const row = r.rows.get("R")!;
+    r.rows.set("R", { ...row, held: [at("fe")], generation: row.generation + 1 });
+    r.closeStream("R");
+    await until(() => r.root(c)?.state === "paused");
+  } finally { await c.close(); }
+});
+
+// #453: a hold the server took, which whoami reports as alias_lost, is a known loss, not an unexplained change.
+test.each(modes)("a hold whoami reports lost leaves the root receiving under the rest, remembered and on the status line; losing the last leaves it unbound (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  try {
+    await r.controller.enroll("R", ["be", "eng/build"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    r.loseHold("R", "eng/build", reason);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
+    expect(r.root(r.controller)).toMatchObject({ held: [at("be")], message: `Subscribed as be (lost build: ${reason}); receipts follow durable root admission` });
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [at("be")] });
+    expect(await r.controller.carried("R")).toEqual([at("be")]);
+    // The second loss's status line names only it: the first was taken by the reopen's delivery_open.
+    r.loseHold("R", "be", reason);
+    await until(() => r.root(r.controller)?.state === "unbound");
+    expect(r.root(r.controller)!.message).toBe(`Root approved, unbound (lost be: ${reason}); bind(name) to take one`);
+    expect(r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+    // Neither loss is bound again.
+    expect(r.named("bind").map(c => c.args.name)).toEqual(["be", "eng/build"]);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a loss a resume's whoami finds stays on the status line and isn't bound again (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  await r.controller.enroll("R", ["be", "eng/build"], true);
+  await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+  await r.controller.close();
+  // The fake stores a team alias as written (`eng/build`), as its binds did.
+  r.rows.set("R", { held: [at("be"), "eng/build"], ownership: 1, generation: 5 });
+  r.loseHold("R", "eng/build", reason);
+  const restarted = r.make(), binds = r.named("bind").length;
+  try {
+    await restarted.resume("R");
+    await until(() => r.root(restarted)?.state === "active");
+    expect(r.root(restarted)).toMatchObject({ held: [at("be")], message: `Subscribed as be (lost build: ${reason}); receipts follow durable root admission` });
+    expect(r.named("bind").slice(binds)).toEqual([]);
+  } finally { await restarted.close(); }
+});
+
+test.each(modes)("a primary lost between the run loop's whoami and delivery_open reopens under the rest instead of pausing (%s)", async mode => {
+  const r = runtime(mode);
+  const reason = "you@example.com isn't a member of team eng";
+  try {
+    await r.controller.enroll("R", ["be", "eng/build"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 2);
+    r.beforeOpen(() => r.loseHold("R", "be", reason));
+    r.closeStream("R");
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
+    expect(r.root(r.controller)).toMatchObject({ held: ["eng/build"], message: `Subscribed as build (lost be: ${reason}); receipts follow durable root admission` });
+  } finally { await r.controller.close(); }
 });

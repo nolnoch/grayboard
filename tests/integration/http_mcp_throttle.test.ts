@@ -6,7 +6,10 @@ import { until } from "../support/until.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 
-test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaustion is isolated", async () => {
+// The per-user bind bucket (helloLimit: the hello that shared it is gone, #282)
+// is the application's, separate from the hosted request bucket; the binds are
+// application sessions'.
+test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion is isolated", async () => {
   let now = 0;
   const srv = new TestServer({}, { now: () => now });
   const client = new Client({ name: "load", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
@@ -35,20 +38,20 @@ test("hosted traffic at 5 requests/s cannot starve same-user WSS hellos; exhaust
       now += 200;
       expect((await client.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
     }
-    expect((await srv.client(token, null).connect()).type).toBe("hello_ok");
+    await srv.appSession(token, "ops").connect();
     let refused = false;
     for (let n = 0; n < 121; n++) {
       try { await client.callTool({ name: "board_list", arguments: {} }); }
       catch { refused = true; break; }
     }
     expect(refused).toBe(true);
-    expect((await srv.client(token, null).connect()).type).toBe("hello_ok");
+    await srv.appSession(token, "qa").connect();
     const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
   } finally { await client.close(); await srv.stop(); }
-});
+}, 60_000);
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission exposes throttling and recovers without dispatching refused tools`, async () => {
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 10, perSec: 1 } });

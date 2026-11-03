@@ -1,7 +1,7 @@
 // The factory module's isolation (#293, #323; principle 7, docs/boards.md §1):
 // nothing under src/ imports adapters/factory/, and the module imports nothing
-// in the repo beyond itself and the published client and protocol (its tests
-// may also use tests/support/). tests/integration/factory_isolation.test.ts
+// in the repo beyond itself and the published hosted client (its tests may
+// also use tests/support/). tests/integration/factory_isolation.test.ts
 // runs it against the repo, so bun test, the pre-push hook and CI enforce it.
 //
 //   bun scripts/check_factory_isolation.ts [root]   (default: this repo)
@@ -19,8 +19,12 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const FACTORY = "adapters/factory";
-// The published surface: the only src/ files the module may import.
-const PUBLISHED = new Set(["src/plugin/client.ts", "src/shared/protocol.ts"]);
+// The published surface (#282 A7): the one file outside the module it may import,
+// directly. Its own imports into src/shared are not followed, so the guarantee is
+// direct-import-only.
+const PUBLISHED = new Set(["adapters/hosted-core/src/client.ts"]);
+// Trees that must not import the factory: the server and the hosted client it consumes.
+const REVERSE = ["src", "adapters/hosted-core/src"];
 const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const TEST = /\.test\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
@@ -82,7 +86,8 @@ export function isolationViolations(root: string): string[] {
   const out: string[] = [];
   const where = (abs: string) => repoPath(root, abs)!;
 
-  for (const { path, link } of walk(join(root, "src"))) {
+  const outside = REVERSE.filter((d) => existsSync(join(root, d))).flatMap((d) => [...walk(join(root, d))].map((f) => ({ ...f, dir: d })));
+  for (const { path, link, dir } of outside) {
     if (link) {
       // Checked by where it points, so a link committed before its target lands is caught too.
       const real = repoPath(root, canonical(resolve(dirname(path), readlinkSync(path))));
@@ -90,7 +95,7 @@ export function isolationViolations(root: string): string[] {
       continue;
     }
     for (const { spec, target } of importsOf(root, path)) {
-      if (target && under(target, FACTORY)) out.push(`${where(path)}: src/ imports the factory module (${spec})`);
+      if (target && under(target, FACTORY)) out.push(`${where(path)}: ${dir}/ imports the factory module (${spec})`);
     }
   }
 
@@ -106,7 +111,7 @@ export function isolationViolations(root: string): string[] {
       if (target === null) out.push(`${where(path)}: imports ${spec}, outside the repo`);
       else if (under(target, FACTORY) || PUBLISHED.has(target)) continue;
       else if (test && under(target, "tests/support")) continue;
-      else out.push(`${where(path)}: imports ${target}, beyond the published client and protocol (${[...PUBLISHED].join(", ")})`);
+      else out.push(`${where(path)}: imports ${target}, beyond the published hosted client (${[...PUBLISHED].join(", ")})`);
     }
   }
   return out;

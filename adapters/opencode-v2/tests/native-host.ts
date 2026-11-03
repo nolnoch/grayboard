@@ -17,14 +17,14 @@ const { observeSubscriberWork } = await import("./subscriber-work.ts");
 const subscriberWork = await observeSubscriberWork(directory);
 const { default: installed, Grayboard } = await import(pathToFileURL(join(directory, "src/index.ts")).href) as typeof import("../src/index.js");
 const issuer = "https://grayboard.example.com", resource = issuer + "/mcp", scope = "grayboard:delivery grayboard:tools";
-type State = { name: string | null; ownership: number | null; gen: number; capability?: string };
+type State = { held: string[]; ownership: number | null; gen: number; capability?: string };
 const sessions = new Map<string, State>(), children = new Map<string, string>();
 const calls: { name: string; session: string; args: Record<string, unknown>; subscriber: boolean }[] = [];
 let nextOwnership = 0, codes = 0, refreshes = 0, callbackOrigin = "", mode = process.env.GRAYBOARD_NATIVE_MODE ?? "direct", target = "first";
 let ctx!: Context;
 let modelIssued = false;
 const parallelDispatch = new Set<string>(), streams = new Map<string, Set<symbol>>();
-const opened: { session: string; name: string; ownership: number }[] = [];
+const opened: { session: string; held: string[]; ownership: number }[] = [];
 const receipted = new Set<string>();
 const durable = mode === "durable" ? new DurableFixture(root) : undefined;
 if (durable?.phase === "reload") {
@@ -36,7 +36,8 @@ if (durable?.phase === "reload") {
   durable.holding = false;
 }
 const instrumented = durable ? instrument(installed, (input, forward) => durable.synthetic(input, forward)) : installed;
-const state = (id: string) => { if (!sessions.has(id)) sessions.set(id, { name: null, ownership: null, gen: 0 }); return sessions.get(id)!; };
+const address = (name: string) => "you@example.com/" + name;
+const state = (id: string) => { if (!sessions.has(id)) sessions.set(id, { held: [], ownership: null, gen: 0 }); return sessions.get(id)!; };
 const fetch0 = globalThis.fetch;
 const json = (id: unknown, result: unknown) => Response.json({ jsonrpc: "2.0", id, result });
 const result = (output: Record<string, unknown>) => ({ resultType: "complete", content: [{ type: "text", text: JSON.stringify(output) }], structuredContent: output });
@@ -91,7 +92,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   }
   if (b.method === "resources/read") {
     if (durable && !durable.batches.has(session)) await wait(async () => durable.batches.has(session), Boolean, "durable batch ready");
-    const items = durable ? (durable.batches.get(session) ?? []).filter(i => !durable.cursor.has(i.id)) : s.name === "parallel-final" && !receipted.has(session) ? [{ id: "fixture:parallel", actionable: false, event: { text: "Final parallel digest" }, ownership: s.ownership, bind_gen: s.gen, name: s.name }] : [];
+    const items = durable ? (durable.batches.get(session) ?? []).filter(i => !durable.cursor.has(i.id)) : s.held.includes("parallel-final") && !receipted.has(session) ? [{ id: "fixture:parallel", actionable: false, event: { text: "Final parallel digest" }, ownership: s.ownership, bind_gen: s.gen }] : [];
     return json(b.id, { resultType: "complete", ttlMs: 0, cacheScope: "private", contents: [{ uri: b.params.uri, mimeType: "application/json", text: JSON.stringify({ items }) }] });
   }
   if (b.method !== "tools/call") return json(b.id, {});
@@ -99,7 +100,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   calls.push({ name, session, args, subscriber }); console.log("MCP_CALL", JSON.stringify({ name, session, args, subscriber }));
   if (name === "whoami") {
     if (children.has(session)) return json(b.id, result({ kind: "child", root: children.get(session) }));
-    return json(b.id, result({ kind: "root", name: s.name, ownership: s.ownership, candidates: [] }));
+    return json(b.id, result({ kind: "root", held: s.held.map(address), primary: s.held[0] ? address(s.held[0]) : null, ownership: s.ownership, candidates: [] }));
   }
   if (name === "bind") {
     if (children.has(session)) return json(b.id, { resultType: "complete", isError: true, content: [{ type: "text", text: "child_session: bind is root-only" }] });
@@ -107,19 +108,19 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       parallelDispatch.add(args.name);
       await wait(async () => parallelDispatch.size, n => n === 2, "both native before hooks finished before first completion");
       if (args.name === "parallel-final") {
-        await wait(async () => opened, os => os.some(o => o.session === session && o.name === "parallel-first"), "first completion lease before second completion");
+        await wait(async () => opened, os => os.some(o => o.session === session && o.held.includes("parallel-first")), "first completion lease before second completion");
         console.log("PARALLEL_OVERLAP_ASSERTED", mode);
       }
     }
-    s.name = args.name; s.ownership ??= ++nextOwnership; s.gen++; s.capability = undefined;
-    return json(b.id, result({ name: s.name!, ownership: s.ownership, instructions: ["Bound fixture"] }));
+    if (!s.held.includes(args.name)) s.held.push(args.name); s.ownership ??= ++nextOwnership; s.gen++; s.capability = undefined;
+    return json(b.id, result({ name: s.held[0]!, ownership: s.ownership, instructions: ["Bound fixture"] }));
   }
   if (name === "session_register") { await Bun.sleep(80); children.set(args.child, session); return json(b.id, result({ registered: true })); }
-  if (name === "session_end") { children.delete(session); s.name = null; s.ownership = null; s.capability = undefined; return json(b.id, result({ ended: true })); }
+  if (name === "session_end") { children.delete(session); s.held = []; s.ownership = null; s.capability = undefined; return json(b.id, result({ ended: true })); }
   if (name === "delivery_open") {
-    assert(s.name && s.ownership); opened.push({ session, name: s.name, ownership: s.ownership });
+    assert(s.held.length && s.ownership); opened.push({ session, held: [...s.held], ownership: s.ownership });
     s.capability = String(s.ownership).padStart(40, "a") + String(s.gen).padStart(3, "0");
-    return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user_email: "you@example.com", identity_full: "you@example.com/" + s.name } }));
+    return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user_email: "you@example.com", identity_full: address(s.held[0]!) } }));
   }
   if (name.startsWith("delivery_")) {
     if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, structuredContent: { code: "not_found" }, content: [{ type: "text", text: "no live delivery lease" }] });
@@ -183,7 +184,7 @@ try {
     await host.session.switchModel({ sessionID: a.id, model: { providerID: "fixture", id: "fixture" } });
     await host.session.prompt({ sessionID: a.id, text: "Read my native binding" }); await host.session.wait({ sessionID: a.id });
     assert(calls.some(c => c.name === "whoami" && c.session === a.id && !c.subscriber));
-    assert.equal(state(a.id).name, null); assert.equal(state(a.id).ownership, null);
+    assert.deepEqual(state(a.id).held, []); assert.equal(state(a.id).ownership, null);
     assert.equal(calls.some(c => c.subscriber), false);
     console.log("NATIVE_DISABLED_HOST_OK", JSON.stringify({ codes, refreshes, root: a.id }));
   } else {
@@ -203,7 +204,7 @@ try {
   const b = await host.session.create({ location, title: "Root B", permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await rpc.enroll({ sessionID: b.id }, { location }); await invoke(b.id, "second");
   await wait(async () => calls, cs => cs.some(c => c.name === "delivery_open" && c.session === b.id), "root B lease");
-  assert.equal(state(a.id).name, "first"); assert.equal(state(b.id).name, "second"); assert.notEqual(state(a.id).ownership, state(b.id).ownership);
+  assert.deepEqual(state(a.id).held, ["first"]); assert.deepEqual(state(b.id).held, ["second"]); assert.notEqual(state(a.id).ownership, state(b.id).ownership);
   const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await invoke(grandchild.id, "ordinary-child");
@@ -216,7 +217,7 @@ try {
   assert.equal(calls.filter(c => c.name === "delivery_open").length, 2, "Children never receive their own leases");
   await host.session.update({ sessionID: child.id, archived: true });
   await wait(async () => calls, cs => cs.some(c => c.name === "session_end" && c.session === child.id), "child lifecycle");
-  assert.equal(state(a.id).name, "first");
+  assert.deepEqual(state(a.id).held, ["first"]);
   await host.session.remove({ sessionID: a.id });
   await wait(async () => calls, cs => cs.some(c => c.name === "session_end" && c.session === a.id), "root lifecycle");
   const parallel = await host.session.create({ location, title: "Parallel root", permissions: [{ action: "*", resource: "*", effect: "allow" }] });
@@ -226,11 +227,11 @@ try {
   await wait(async () => streams.get(parallel.id)?.size, n => n === 1, "exactly one live final stream");
   await wait(async () => receipted.has(parallel.id), Boolean, "final binding durable admission and receipt");
   assert.equal((await host.session.context({ sessionID: parallel.id })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 1);
-  assert.deepEqual(opened.filter(o => o.session === parallel.id).map(o => o.name), ["parallel-first", "parallel-final"]);
+  assert.deepEqual(opened.filter(o => o.session === parallel.id).map(o => o.held.join(",")), ["parallel-first", "parallel-first,parallel-final"]);
   assert.equal(new Set(opened.filter(o => o.session === parallel.id).map(o => o.ownership)).size, 1);
   assert.equal(calls.some(c => c.session === parallel.id && c.name === "delivery_release"), false);
   console.log("PARALLEL_FINAL_ACTIVE", JSON.stringify({ mode, opens: opened.filter(o => o.session === parallel.id), liveStreams: streams.get(parallel.id)?.size }));
-  await rpc.pause({}, { location }); assert.equal(state(b.id).name, null);
+  await rpc.pause({}, { location }); assert.deepEqual(state(b.id).held, []);
   assert.equal(codes, 1); assert.equal(refreshes, 0);
   console.log("NATIVE_HOST_OK", JSON.stringify({ mode, codes, refreshes, roots: [a.id, b.id], child: child.id, grandchild: grandchild.id, opens: calls.filter(c => c.name === "delivery_open").length }));
   }

@@ -21,7 +21,7 @@ import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
 import { CLAUDE_CODE_VERSION, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
 import { onChannelDm, onUserText, startFakeAnthropic } from "../support/fake_anthropic.ts";
 import { hostedServer, seedGrant } from "../support/hosted_oauth.ts";
-import { closeSessions } from "../support/mcp.ts";
+import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
 import { keep } from "../support/run_dir.ts";
 import { until } from "../support/until.ts";
@@ -78,20 +78,22 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
     await seedGrant(srv, join(h.config, "plugins/data/grayboard-grayboard"), "grayboard-claude-code");
 
     tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
-    const hosted = () => srv.app.db.query<{ source_session_id: string; name: string | null }, []>("SELECT source_session_id, name FROM hosted_sessions").all();
+    const hosted = () => srv.app.db.query<{ source_session_id: string; name: string | null }, []>("SELECT source_session_id, (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name FROM hosted_sessions").all();
     await until(() => hosted().length > 0, 60_000, `the plugin (from ${from}) to open its hosted session`);
     const session = hosted()[0]!.source_session_id;
 
     await tty.submit("BIND-NOW");
     await until(() => hosted().some((r) => r.name === "alpha"), 30_000, "the model's bind call to name the session alpha");
 
-    const beta = await srv.session(await srv.login("alice@example.com"), "beta");
+    // The peer is a hosted session of the same user's.
+    const beta = await srv.hosted("alice@example.com", "beta");
     await beta.call("dm_send", { to: "alpha", body: "ping" });
     const tag = `<channel source="${SOURCE}" message_id="`;
     await until(() => model.requests.some((r) => JSON.stringify(r.body.messages).includes(JSON.stringify(tag).slice(1, -1))), 30_000, "the DM to reach the model as a channel message");
-    await until(() => beta.pushes.some((p) => p.content === "pong"), 30_000, "the model's dm_send reply to reach beta");
+    await beta.next(direct((m) => m.body === "pong"), 30_000);
 
-    expect(transcript(h, session)).toContain(JSON.stringify(tag).slice(1, -1));
+    // Claude Code writes its transcript on its own schedule: the reply can reach beta first.
+    await until(() => transcript(h, session).includes(JSON.stringify(tag).slice(1, -1)), 10_000, "the channel message in the session's transcript");
     // The plugin is the session's grayboard: no grayboard CLI runs under Claude Code.
     const tree = descendants(tty.proc.pid);
     expect(tree.some(([, cmd]) => cmd.includes("dist/grayboard.js"))).toBe(true);
@@ -99,7 +101,6 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
     expect(model.unhandled).toEqual([]);
   } finally {
     await tty?.stop();
-    await closeSessions();
     model.stop();
     writeFileSync(join(dir, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
     await srv.stop();

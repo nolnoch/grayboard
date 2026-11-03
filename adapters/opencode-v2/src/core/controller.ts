@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
 import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
-import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, stableID, type Lease } from "./model.js";
+import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { SessionRoutes } from "./sessions.js";
 import { end, register } from "./children.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Operation, type Status } from "./diagnostics.js";
@@ -37,6 +37,14 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // the item again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
+// A host that rotates its own access token (OpenCode's native grant) stores
+// the refresh at or just after expiry: up to ~1.5 s after the server closed
+// the stream for it (#472). An `expired` token outside an outage is polled
+// that long before it pauses. 10 s keeps the reopen inside the server's 30 s
+// lease TTL (the last renew is at most 10 s old), so a rollover keeps its
+// ownership. Own-login adapters (pi, omp, Claude Code) never hit it: they
+// refresh 60 s early and end a grant as `login_required` or `refresh_outcome_unknown`.
+const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -54,8 +62,10 @@ function causeOf<T>(error: unknown, type: abstract new (...args: never[]) => T):
 // The admission target's identity when the host keeps no approval key.
 function fingerprint(e: Enrollment) {
   const c = e.configuration;
-  return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.name])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.held ?? []])).digest("hex");
 }
+// An address as a status line writes it: the name without its scope (its user's, or a team's).
+const display = (address: string) => shortOf(address.slice(0, address.lastIndexOf("/")), address);
 
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
@@ -66,6 +76,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Sessions a shutdown has begun for: treated like `stopped`, per session,
   // since one Controller may run several roots (OpenCode V2).
   private readonly ending = new Set<string>();
+  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace).
+  private readonly closing = new AbortController();
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -86,11 +98,11 @@ export class Controller<E extends Enrollment = Enrollment> {
   status(): Status { return this.diagnostics.status(); }
   async flushDiagnostics() { await this.diagnostics.flush(); }
   private set(r: Root<E>, state: string, message: string, operation: Operation = "delivery", code?: string) {
-    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), ...(code ? { code } : {}) });
+    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...(r.e.held?.length ? { held: r.e.held } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), ...(code ? { code } : {}) });
     r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
   }
   protected failure(operation: Operation, error: unknown, r?: Root<E>) {
-    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...(r ? { sessionID: r.e.sessionID, ...(r.e.name ? { name: r.e.name } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}) } : {}), code: failureCode(error) });
+    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...(r ? { sessionID: r.e.sessionID, ...(r.e.held?.length ? { held: r.e.held } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}) } : {}), code: failureCode(error) });
   }
   protected record(input: Parameters<Diagnostics["record"]>[0]) { this.diagnostics.record(input); }
   private serial<T>(call: () => Promise<T>): Promise<T> {
@@ -119,15 +131,15 @@ export class Controller<E extends Enrollment = Enrollment> {
     const path = await this.path(sessionID);
     if (path.root !== sessionID) throw new Refusal("root", "An active top-level root is required");
   }
-  // Remembered names and admission-target checks key on the approval (OpenCode)
+  // Remembered holds and admission-target checks key on the approval (OpenCode)
   // or, with an adapter-owned grant, on the grant's configuration.
   private approvalKey(e: E) { return this.port.approval ? this.port.approval.key(e) : e.configuration.configHash; }
   private key(e: E) { return this.port.approval ? this.port.approval.key(e) : fingerprint(e); }
-  private async remembered(sessionID: string, approval: E) {
-    const remembered = await this.port.storage.get(`rememberedName:${sessionID}`);
-    const name = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "name")?.value : undefined;
+  private async remembered(sessionID: string, approval: E): Promise<string[] | undefined> {
+    const remembered = await this.port.storage.get(`rememberedHeld:${sessionID}`);
+    const held = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "held")?.value : undefined;
     const key = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "approval")?.value : undefined;
-    return key === this.approvalKey(approval) && typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name) ? name : undefined;
+    return key === this.approvalKey(approval) && validHeld(held) && held.length ? held : undefined;
   }
   private async save(r: Root<E>, enabled: boolean) {
     if (!this.port.approval) return;
@@ -189,29 +201,30 @@ export class Controller<E extends Enrollment = Enrollment> {
     }
     await this.watches.get(sessionID)?.dispose(); this.watches.delete(sessionID);
   }
-  async enroll(sessionID: string, name?: string, create = false) { return this.serial(async () => {
+  // `names`: holds to bind now (each added to the root's others); none enrolls without binding.
+  async enroll(sessionID: string, names: readonly string[] = [], create = false) { return this.serial(async () => {
     if (this.stopped || this.ending.has(sessionID)) throw new Refusal("paused", "Grayboard is stopping");
     await this.activeRoot(sessionID);
     await this.unwatch(sessionID);
     const previous = this.roots.get(sessionID);
     if (previous) await this.stop(previous);
     const captured = await this.port.credential.capture(sessionID);
-    const e: E = { ...captured, ...(previous?.e.name ? { name: previous.e.name } : {}) };
+    const e: E = { ...captured, ...(previous?.e.held?.length ? { held: previous.e.held } : {}) };
     const r: Root<E> = { e, approval: structuredClone(e), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set() };
     this.roots.set(sessionID, r); this.drifted = false;
     await this.save(r, true);
     await this.watch(e);
     this.set(r, "approved", "Root approved; bind a name to receive deliveries");
     try {
-      if (name) {
+      if (names.length) {
         const epoch = r.epoch, signal = new AbortController().signal;
         await this.temporary(e, async w => {
           await this.guard(r, epoch, signal);
-          await w.call("bind", { name, create, where: this.port.place() });
+          for (const name of names) await w.call("bind", { name, create, where: this.port.place() });
           await this.guard(r, epoch, signal);
         });
       }
-      await this.prepare(r, !!previous?.paused && !name);
+      await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
@@ -229,13 +242,13 @@ export class Controller<E extends Enrollment = Enrollment> {
     const previous = this.roots.get(sessionID);
     if (previous) await this.stop(previous);
     const approval = await this.approvalFor(sessionID);
-    // A new grant (possibly another account) never inherits the old name.
-    const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
-    const r: Root<E> = { e: { ...approval, ...(name ? { name } : {}) }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set() };
+    // A new grant (possibly another account) never inherits the old holds.
+    const held = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.held : undefined);
+    const r: Root<E> = { e: { ...approval, ...(held?.length ? { held } : {}) }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set() };
     this.roots.set(sessionID, r); this.drifted = false;
     await this.watch(r.e);
-    this.set(r, "approved", name ? `Resuming ${name}` : "Root approved; bind a name to receive deliveries");
-    try { await this.prepare(r, true); }
+    this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
+    try { await this.rotated({ ms: 0 }, () => this.prepare(r, true)); }
     catch (error) { if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -249,15 +262,46 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.port.credential.check(saved.approval);
     return saved.approval;
   }
-  // The name a successor of `sessionID` binds (pi's /new and /fork): the name
+  // The holds a successor of `sessionID` binds (pi's /new and /fork): the holds
   // a resume of it would rebind now (remembered, else its live root's, under
-  // the current approval only), so a name a new sign-in dropped never
-  // carries. Undefined when there is none or it can't be read (signed out).
-  async carried(sessionID: string): Promise<string | undefined> {
+  // the current approval only), so a hold a new sign-in dropped never
+  // carries. Undefined when there are none or they can't be read (signed out).
+  async carried(sessionID: string): Promise<string[] | undefined> {
     try {
       const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
+      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
     } catch { return undefined; }
+  }
+  // A root's holds as its user writes them, for a status line.
+  private names(e: E) { return (e.held ?? []).map(display).join(", "); }
+  // A whoami's holds the server took (#453), for the status line it sets.
+  private lostNote(current: BindingState) { return current.alias_lost?.length ? ` (lost ${current.alias_lost.map(l => `${display(l.alias)}: ${l.reason}`).join("; ")})` : ""; }
+  // Drops the holds a whoami says the server took (#453) from those the root expects, durably, so neither the
+  // run loop nor a resume binds them again and the rest keep receiving. Any other change still pauses.
+  // The server reports them until the next delivery_open, so a repeat is a no-op; one held again isn't lost.
+  private async dropLost(r: Root<E>, current: BindingState) {
+    const lost = new Set(current.alias_lost?.map(l => l.alias).filter(address => !current.held.includes(address)));
+    const kept = r.e.held?.filter(address => !lost.has(address));
+    if (!kept || kept.length === r.e.held!.length) return false;
+    r.e = { ...r.e, held: kept };
+    await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: kept });
+    return true;
+  }
+  // Binds the remembered holds `have` lacks (all of them after an ended ownership, the missing ones after a partial
+  // loss). `tolerant` (a resume's prepare): a hold now refused (revoked, taken, deleted) is skipped and recorded, so
+  // it doesn't keep the others from resuming, and the refusals are returned for the caller to raise if nothing ends
+  // up held, or record if something did; the run loop, which must end up holding exactly `held`, and anything else (sign-in, outage) throws.
+  private async bindAll(r: Root<E>, wire: Wire, held: readonly string[], have: readonly string[], tolerant = false) {
+    const refused: SubscriberError[] = [];
+    for (const address of held) {
+      if (have.includes(address)) continue;
+      try { await wire.call("bind", { name: address, create: false, where: this.port.place() }); }
+      catch (error) {
+        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden"].includes(error.code))) throw error;
+        refused.push(error);
+      }
+    }
+    return refused;
   }
   private async prepare(r: Root<E>, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
@@ -268,20 +312,23 @@ export class Controller<E extends Enrollment = Enrollment> {
       await this.guard(r, epoch, signal);
       let current = bindingOf(await wire.call("whoami"));
       await this.guard(r, epoch, signal);
-      if (!current.name && r.e.name && resume) {
-        await wire.call("bind", { name: r.e.name, create: false, where: this.port.place() });
+      if (await this.dropLost(r, current)) await this.guard(r, epoch, signal);
+      if (r.e.held?.some(address => !current.held.includes(address)) && resume) {
+        const refused = await this.bindAll(r, wire, r.e.held, current.held, true);
         await this.guard(r, epoch, signal);
         current = bindingOf(await wire.call("whoami"));
         await this.guard(r, epoch, signal);
+        if (refused[0] && !current.held.length) throw refused[0];
+        for (const error of refused) this.diagnostics.record({ state: "degraded", message: `Could not resume a held name (${error.code}); it is no longer held`, operation: "prepare", sessionID: r.e.sessionID, code: error.code });
       }
       if (r.epoch !== epoch || r.paused || this.stopped) return;
-      if (!current.name) { this.set(r, "unbound", "Root approved, unbound; bind(name) to take one"); return; }
+      if (!current.held.length) { this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`); return; }
       await this.guard(r, epoch, signal);
-      r.e = { ...r.e, name: current.name };
-      await this.port.storage.set(`rememberedName:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), name: current.name });
+      r.e = { ...r.e, held: current.held };
+      await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: current.held });
       await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
-        this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
+        this.set(r, "approved", `Bound ${this.names(r.e)}${this.lostNote(current)}; opening delivery`, "prepare");
         const started = this.start(r);
         if (waitForStart) await started;
       }
@@ -307,8 +354,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     // leases don't count server downtime (#423) and a busy refresh is never
     // taken over; only a healthy lease (renew or receipt) resets the backoff.
     // outage is set only by a failed request: the server also closes the
-    // stream when access expires, and that expiry must still pause.
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    // stream when access expires, and that expiry waits only for the host's
+    // rotation (`rotation`: the grace spent since the last whoami succeeded).
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, rotation = 0, outage = false, inItem = false, reidentified = false;
     let pendingItem: string | undefined;
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
@@ -318,17 +366,31 @@ export class Controller<E extends Enrollment = Enrollment> {
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
-        outage = false;
+        outage = false; rotation = 0;
         await this.guard(r, epoch, signal);
-        if (!current.name) {
-          r.lease = undefined;
-          await wire.call("bind", { name: e.name, create: false, where: this.port.place() });
+        if (await this.dropLost(r, current)) {
+          e = { ...e, held: r.e.held };
           await this.guard(r, epoch, signal);
-        } else if (current.name !== e.name) throw new Refusal("identity", `Root binding changed without a native completion; ${this.hint}`);
-        const lease = leaseOf(await wire.call("delivery_open"), e);
+          if (!e.held?.length) { r.lease = undefined; this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`); return; }
+        }
+        if (!current.held.length) {
+          r.lease = undefined;
+          await this.bindAll(r, wire, e.held ?? [], []);
+          await this.guard(r, epoch, signal);
+        } else if (!sameHeld(current.held, e.held)) throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
+        let lease: Lease;
+        try { lease = leaseOf(await wire.call("delivery_open"), e); }
+        catch (error) {
+          // The primary revoked between this whoami and delivery_open (#453) gives a lease naming another
+          // identity: the next iteration's whoami reports the loss. Once; a second refusal pauses.
+          if (!(error instanceof Refusal) || reidentified) throw error;
+          reidentified = true;
+          continue;
+        }
+        reidentified = false;
         await this.guard(r, epoch, signal);
         r.lease = lease; wire.capability = lease.capability;
-        this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
+        this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake: (() => void) | undefined, closed = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
@@ -346,13 +408,13 @@ export class Controller<E extends Enrollment = Enrollment> {
                 const count = (attempts.get(item.id) ?? 0) + 1;
                 if (count > 8) throw new DeliveryStopped(pendingItem);
                 attempts.set(item.id, count);
-                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity) throw new Refusal("identity", "Issued batch does not match the immutable lease");
+                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.address !== undefined && !e.held?.includes(item.address)) throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
                 if (r.admitted.has(key)) { inItem = false; return; }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity, signal);
+                await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
@@ -393,11 +455,18 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
+        if (error instanceof AccessExpired && error.reason === "expired" && rotation < ROTATION_GRACE_MS) {
+          rotation += ROTATION_POLL_MS;
+          this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
+          ready();
+          await this.wait(ROTATION_POLL_MS, signal);
+          continue;
+        }
         if (error instanceof Refusal || error instanceof DeliveryStopped) throw error;
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;
           if (!inItem && ++recoveries > 3) throw new Refusal("paused", `Lease recovery limit reached; ${this.hint}`);
-        } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code)) throw error;
+        } else if (error instanceof SubscriberError && ["alias_held", "identity_unknown"].includes(error.code)) throw error;
         else {
           failures++;
           if (error instanceof SubscriberError && error.code === "receipt_capacity") {
@@ -447,7 +516,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // flight) still ends the session, freeing a lease an earlier runtime kept;
   // one that fails, a sign-out included, is recorded: the lease then stays
   // until it lapses.
-  shutdown(sessionID: string, mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string | undefined> {
+  shutdown(sessionID: string, mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string[] | undefined> {
     this.ending.add(sessionID);
     this.roots.get(sessionID)?.abort?.abort();
     return this.serial(async () => {
@@ -473,9 +542,25 @@ export class Controller<E extends Enrollment = Enrollment> {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
+  // Runs `call`, retrying it while the host's access token reads `expired`, one
+  // poll per attempt, for as long as `spent` leaves of the rotation grace (#472).
+  private async rotated<T>(spent: { ms: number }, call: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try { return await call(); }
+      catch (error) {
+        if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS) throw error;
+        spent.ms += ROTATION_POLL_MS;
+        await this.wait(ROTATION_POLL_MS, this.closing.signal);
+        // A close that ended the wait refuses the retry: nothing would dispose what it registers.
+        if (this.stopped) throw error;
+      }
+    }
+  }
   async restore() {
     await this.diagnostics.restore(async id => { await this.activeRoot(id); return true; });
     if (!this.port.approval) return;
+    // One rotation grace for the whole pass: the roots share the host's credential.
+    const spent = { ms: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped) continue;
@@ -485,14 +570,33 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (!saved.approval) throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
         const e = saved.approval;
         const previous = this.status().roots.find(record => record.sessionID === id);
-        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused";
-        const name = await this.remembered(id, e);
-        const r: Root<E> = { e: { ...e, ...(name ? { name } : {}) }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set() };
+        // A pause for an access token the host rotates itself isn't a refusal
+        // (#472): a restart re-checks the credential and resumes. Its cause is
+        // the record's code, or the failure an earlier restart's own paused
+        // record carried forward.
+        const expired = previous?.state === "paused" && (previous.code ?? previous.failure?.code) === "native_access_expired";
+        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused" && !expired;
+        const held = await this.remembered(id, e);
+        const r: Root<E> = { e: { ...e, ...(held ? { held } : {}) }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set() };
         this.roots.set(id, r);
         if (paused) { this.set(r, "paused", `Saved approval paused; ${this.hint}`); continue; }
-        await this.port.credential.check(e);
+        // Say the pause is clearing before the grace: the old paused record would otherwise stand for up to its length.
+        if (expired) this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
+        try { await this.rotated(spent, () => this.port.credential.check(e)); }
+        catch (error) {
+          if (!expired) throw error;
+          // A session ended, or a native bind started this root, during the grace: that state stands.
+          if (this.roots.get(id) !== r || r.paused || r.task) continue;
+          // Still expired after the grace: the next restart checks again. A
+          // refusal now (another account, a revoked grant) is the pause's cause from here on.
+          const cause = this.expired(error);
+          r.paused = true;
+          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          continue;
+        }
+        if (this.roots.get(id) !== r) continue;
         await this.watch(e);
-        await this.prepare(r, true, true);
+        await this.rotated(spent, () => this.prepare(r, true, true));
       } catch {
         const r = this.roots.get(id);
         if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
@@ -510,33 +614,39 @@ export class Controller<E extends Enrollment = Enrollment> {
         .catch(error => { this.failure("child_register", error, r); throw error; });
       this.routes.remember(path);
     }
-    if (event.tool === "bind" && path.root === event.sessionID) await this.serial(async () => {
+    if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID) await this.serial(async () => {
       const current = this.roots.get(path.root);
       if (current) { this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind"); await this.stop(current); }
       else this.diagnostics.record({ state: "rebinding", sessionID: path.root, message: this.port.approval ? "Native bind pending; receiving requires approval" : "Native bind pending", operation: "before_bind" });
     });
   }
-  // After a native call: a bind result restarts delivery under the new name; an
-  // `unbound` result from any tool rebinds the remembered name.
+  // After a native call: a bind or unbind result restarts delivery under the new
+  // hold set; an `unbound` result from any tool rebinds the remembered holds.
   async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       if (!r || r.paused || this.drifted || this.stopped) return;
       try {
-        if (event.tool !== "bind") {
+        if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
-          if (output?.unbound === true && r.e.name) {
+          if (output?.unbound === true && r.e.held?.length) {
             await this.stop(r); r.lease = undefined;
-            await this.prepare(r, true);
+            await this.rotated({ ms: 0 }, () => this.prepare(r, true));
           }
           return;
         }
         await this.stop(r);
         if (event.result.status === "completed") {
           const output = event.result.output as { name?: unknown; ownership?: unknown; instructions?: unknown } | undefined;
-          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every(line => typeof line === "string")) throw new Error("Native bind completion lacked validated output");
+          // An unbind that released the last hold answers name null: nothing is left to rebind.
+          const last = event.tool === "unbind" && output?.name === null;
+          if (!output || !(typeof output.name === "string" || last) || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every(line => typeof line === "string")) throw new Error("Native bind completion lacked validated output");
+          if (last) {
+            r.e = { ...r.e, held: [] };
+            await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: [] });
+          }
         }
-        await this.prepare(r, false);
+        await this.rotated({ ms: 0 }, () => this.prepare(r, false));
       } catch (error) { if (!this.drifted) this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
     });
   }
@@ -574,7 +684,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.failure(operation, undefined);
   }
   async close() {
-    this.stopped = true;
+    this.stopped = true; this.closing.abort();
     for (const r of this.roots.values()) r.abort?.abort();
     await this.controls;
     for (const r of this.roots.values()) await this.stop(r);

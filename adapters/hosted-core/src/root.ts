@@ -25,7 +25,7 @@ export type RootOptions = {
   stateDir: string;                 // deliveryPath / sessionPath base
   place: () => string;              // the bind's `where`
   push: boolean;                    // false: tools-only (Claude Code with channels off): no lock, no Controller
-  carried?: string;                 // a /new or /fork's carried name (pi/omp), taken by the first start that binds it
+  carried?: string[];               // a /new or /fork's carried holds (pi/omp), taken by the first start that binds them
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
   admit(item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
@@ -51,7 +51,7 @@ type Slot = typeof SLOTS[number];
 export class RootDelivery {
   private closed = false;          // shutdown began: nothing new starts
   private done = false;            // shutdown finished: nothing more is said
-  private shutting: Promise<string | undefined> | undefined;
+  private shutting: Promise<string[] | undefined> | undefined;
   private controller: Controller | undefined;
   private lock: Lock | undefined;
   private proxy: ToolProxy | undefined;
@@ -62,7 +62,7 @@ export class RootDelivery {
   private error: string | undefined;
   private signedOut: AccessExpired | undefined;
   private begun: string | undefined;     // the store epoch this root last (re)started under
-  private carrying: string | undefined;  // the carried name, until a start takes it
+  private carrying: string[] | undefined;  // the carried holds, until a start takes them
   private starting: Promise<void> | undefined;   // own(): the Controller and push proxy coming up
   private restarting: Promise<void> | undefined;
   private used = false;                  // a call went out under this session's id
@@ -226,12 +226,13 @@ export class RootDelivery {
       const root = status.roots.find(r => r.sessionID === id);
       // enroll's and resume's failures record operation "enroll"; a resume
       // names its root before the rebind, so the name alone proves nothing.
-      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
-      if (carried && bound && this.carrying === carried) this.carrying = undefined;
-      if (expected && bound !== expected && root?.state !== "paused") {
-        const now = bound ? `it is bound as ${bound}` : "it is unbound";
-        const text = carried ? `this session couldn't take the name ${carried} it carried over (${root?.message ?? status.message}); ${now}`
-          : `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${now}`;
+      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      if (carried && bound?.length && this.carrying === carried) this.carrying = undefined;
+      const missing = (expected ?? []).filter(address => !bound?.includes(address));
+      if (missing.length && root?.state !== "paused") {
+        const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
+        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
+          : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");
       }
@@ -285,7 +286,7 @@ export class RootDelivery {
   private sink: DiagnosticSink = async record => {
     const id = this.o.sessionID;
     if (record.sessionID !== undefined && record.sessionID !== id) return;
-    const binding = `${record.state}\n${record.name ?? ""}`;
+    const binding = `${record.state}\n${(record.held ?? []).join(",")}`;
     if (binding !== this.lastBinding) { this.lastBinding = binding; this.proxy?.forget(id); }
     if (record.state === "active") this.carrying = undefined;
     const key = `${record.state}\n${record.message}`;
@@ -359,16 +360,16 @@ export class RootDelivery {
   // Controller stops this session's run loop before its queue, so a start in
   // flight costs at most the request it is in. `carry` returns the name a
   // successor binds (pi's /new and /fork). Idempotent.
-  shutdown(mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string | undefined> {
+  shutdown(mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string[] | undefined> {
     return this.shutting ??= this.stop(mode, o);
   }
-  private async stop(mode: "release" | "detach", o: { carry?: boolean }): Promise<string | undefined> {
+  private async stop(mode: "release" | "detach", o: { carry?: boolean }): Promise<string[] | undefined> {
     this.closed = true;
     this.watcher?.dispose();
     this.subscription?.dispose();
     this.waiter?.abort();
     const id = this.o.sessionID;
-    let carried: string | undefined;
+    let carried: string[] | undefined;
     if (this.controller) {
       carried = await this.controller.shutdown(id, mode, o).catch(error => { this.log(`couldn't release delivery: ${message(error)}`, "warning"); return undefined; });
     }

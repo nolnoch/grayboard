@@ -63,7 +63,7 @@ afterEach(async () => {
 const user = () => srv.app.db.query<{ id: number }, [string]>("SELECT id FROM users WHERE email = ?").get(EMAIL)!.id;
 type Row = { name: string | null; lease_deadline: number | null; ownership_id: number };
 const row = (id: string) => srv.app.db.query<Row, [string]>(
-  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, id));
+  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline, ownership_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, id));
 const ownership = (ownershipId: number) => srv.app.db.query<{ ended_at: number | null; end_reason: string | null }, [number]>(
   "SELECT ended_at, end_reason FROM hosted_ownerships WHERE id = ?").get(ownershipId)!;
 const leaseClosed = (id: string) => srv.app.db.query<{ n: number }, [string]>(

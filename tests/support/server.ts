@@ -7,12 +7,14 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
+import { verifySessionToken } from "../../src/server/auth.ts";
 import type { Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { cleanEnv, serverEnv } from "./env.ts";
-import { mcpSession, type Session } from "./mcp.ts";
-import { WsClient, type WsClientOptions } from "./ws_client.ts";
+import { cleanEnv } from "./env.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
+import { AppSession, type AppSessionOptions } from "./app_session.ts";
+import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from "./hosted_session.ts";
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
   return {
@@ -46,7 +48,8 @@ export class TestServer {
   readonly base: string;
   readonly config: Config;
   readonly dir = mkdtempSync(join(tmpdir(), "gb-server-"));
-  private clients: WsClient[] = [];
+  private appSessions: AppSession[] = [];
+  private hostedSessions: HostedSession[] = [];
 
   // Tests skip the background timers unless they pass `background`.
   constructor(overrides: Partial<Config> = {}, opts: StartOptions = {}) {
@@ -78,24 +81,39 @@ export class TestServer {
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
-  // A raw WebSocket client (identity null: an unbound session); closed by stop().
-  client(token: string, identity: string | null, opts: WsClientOptions = {}): WsClient {
-    const c = new WsClient(this.base, token, identity, opts);
-    this.clients.push(c);
-    return c;
+  // An application-level session (no socket, no hosted store): the
+  // application's own operations for one session, signed in with `token` as
+  // an API request resolves it. Identity null stays unbound; connect() it.
+  // Closed by stop().
+  appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+    const authed = verifySessionToken(token, this.app.repo, this.app.touches);
+    if (!authed) throw new Error("appSession: the token doesn't authenticate");
+    const s = new AppSession(this.app.application, authed, identity, opts);
+    this.appSessions.push(s);
+    return s;
   }
 
-  // A server-mode `grayboard mcp` child signed in with `token`, started in
-  // `cwd` (default: this server's dir); identity null starts it unbound.
-  // closeSessions() ends it.
-  session(token: string, identity: string | null, extra: Record<string, string> = {}, cwd = this.dir): Promise<Session> {
-    return mcpSession({ env: serverEnv(this.dir, this.base, token, identity, extra), cwd, args: ["mcp", "--mode", "server"] });
+  // A hosted MCP session of `email`'s, through a built-in client's OAuth
+  // grant, connected (bound and leased unless identity is null). Closed by
+  // stop(). Inbox polling spends hosted requests: give this server a large
+  // hostedRequestLimit.
+  async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
+    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, opts.scopes ?? HOSTED_SCOPES, Date.now(), opts.client ?? HOSTED_CLIENT);
+    const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);
+    this.hostedSessions.push(s);
+    await s.connect();
+    return s;
   }
 
+  // Every driver closes before the app stops; a hosted close that failed is
+  // reported once the server is down and its dir removed.
   async stop(): Promise<void> {
-    for (const c of this.clients.splice(0)) c.close();
+    for (const s of this.appSessions.splice(0)) s.close();
+    const hosted = await Promise.allSettled(this.hostedSessions.splice(0).map((s) => s.close()));
     await this.app.stop();
     rmSync(this.dir, { recursive: true, force: true });
+    const failed = hosted.find((r) => r.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 }
 

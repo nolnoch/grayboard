@@ -164,7 +164,7 @@ export type IdFacts = {
   viewer?: boolean;
   // The ID came from a session key (#284 S10): retention leaves a tombstone for it.
   keyed?: boolean;
-  // Self-reported at launch (BUS_MODEL, BUS_EFFORT; the WSS hello), shown in peer_list (#284 S12).
+  // Self-reported at launch (BUS_MODEL, BUS_EFFORT; the former hello), shown in peer_list (#284 S12).
   model?: string | null;
   effort?: string | null;
 };

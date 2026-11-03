@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GRACE_MS, SWEEP_MS, createApplication, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { createApplication } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
@@ -16,11 +16,10 @@ let hosted: ReturnType<typeof createHostedSessions>;
 let delivery: ReturnType<typeof createDelivery>;
 let alice: DeliveryPrincipal;
 let bob: DeliveryPrincipal;
-let sender: ApplicationSession;
+let sender: AppSession;
 let dir: string;
 let now: number;
 let authorized: boolean;
-const sink: DeliverySink = { deliver() {}, closed() {}, probe: async () => true };
 const context = (p: DeliveryPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
@@ -34,15 +33,16 @@ beforeEach(async () => {
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  sender = (await application.selectIdentity(tokenSession(application.repo, alice.authed), "be", sink, { push: false })).session;
+  sender = new AppSession(application, alice.authed, "be", { push: false });
+  await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
-const send = (body = "hello", pending = false) => application.send(sender, "bob@example.com/fe", body, { pending }).message_id;
+const send = async (body = "hello", pending = false) => (await sender.send("bob@example.com/fe", body, { pending })).message_id;
 
 test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
   const lease = await delivery.open(bob, context(bob));
-  send();
+  await send();
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
   expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
@@ -55,12 +55,22 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
 });
 
+test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  const root = context(bob);
+  if (!("id" in root)) throw new Error("fixture has no mapped source");
+  await sender.send(root.id, "by id");
+  await send("by alias");
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  expect(items.map(item => item.address)).toEqual([undefined, "bob@example.com/fe"]);
+});
+
 test("delivery hook diagnostics never inspect forged stack messages or causes", async () => {
   const log = spyOn(console, "error").mockImplementation(() => {});
   const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
   try {
     const lease = await delivery.open(bob, context(bob), { changed: async () => { throw forged; }, closed: () => { throw forged; } });
-    send();
+    await send();
     await Promise.resolve(); await Promise.resolve();
     expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"delivery.changed","category":"failure","level":"error","class":"Error"}']);
     await delivery.release(bob, context(bob), lease.capability);
@@ -76,14 +86,14 @@ test("canceling duplicate open preserves accepted lease, children, receipts and 
   await hosted.register(bob, context(bob), "child");
   const first = await delivery.open(bob, context(bob), { changed: () => { originalHints++; } });
   delivery.accept(first);
-  send();
+  await send();
   const items = await delivery.pending(bob, context(bob), first.capability);
   const duplicate = await delivery.open(bob, context(bob), { changed: () => { duplicateHints++; } });
   await delivery.cancel(duplicate);
   expect(delivery.activeLeaseCount).toBe(1);
   expect(store.repo.hosted.all()).toHaveLength(2);
   expect(originalHints).toBe(1);
-  send("next message");
+  await send("next message");
   expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);
   await delivery.receipt(bob, context(bob), first.capability, [items[0]!.id]);
   await delivery.renew(bob, context(bob), first.capability);
@@ -123,7 +133,7 @@ test("old attempt cancellation cannot end a replacement generation or ownership"
 test("reads repeat without admission; receipt and dm_ack remain distinct", async () => {
   let hints = 0;
   const lease = await delivery.open(bob, context(bob), { changed: () => { hints++; throw new Error("lost hint"); } });
-  const first = send("first", true), second = send("second");
+  const first = await send("first", true), second = await send("second");
   expect(hints).toBe(2);
   const pending = await delivery.pending(bob, context(bob), lease.capability);
   expect(pending.map(p => p.id)).toEqual([`direct:${first}`, `direct:${second}`]);
@@ -132,14 +142,14 @@ test("reads repeat without admission; receipt and dm_ack remain distinct", async
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
   expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(second);
-  expect(application.inbox(sender).promised).toHaveLength(1);
+  expect((await sender.inbox()).promised).toHaveLength(1);
 });
 
 test("only an issued contiguous direct prefix advances MAX cursor, ignoring global gaps", async () => {
   const lease = await delivery.open(bob, context(bob));
-  send("first");
+  await send("first");
   store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "gap", null, false);
-  send("second");
+  await send("second");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[1]!.id])).rejects.toHaveProperty("code", "not_found");
   expect(store.repo.cursors.directFor("bob@example.com/fe")).toBe(0);
@@ -152,7 +162,7 @@ test("only an issued contiguous direct prefix advances MAX cursor, ignoring glob
 
 test("foreign principal, grant, session, and unissued receipt have no authority", async () => {
   const lease = await delivery.open(bob, context(bob));
-  const id = send();
+  const id = await send();
   await expect(delivery.receipt(bob, context(bob), lease.capability, [`direct:${id}`])).rejects.toHaveProperty("code", "not_found");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   for (const [p, c] of [[alice, context(alice)], [{ ...bob, grantId: "G2" }, context(bob)], [bob, context(bob, "other")]] as const) {
@@ -198,16 +208,15 @@ test("explicit release ends ownership and closes all children", async () => {
   expect(await hosted.whoami(bob, context(bob))).not.toHaveProperty("ownership", lease.ownership);
 });
 
-test("cross WSS/hosted holders share one exclusion path", async () => {
-  await expect(application.selectIdentity(tokenSession(application.repo, bob.authed), "fe", sink)).rejects.toHaveProperty("code", "alias_held"); // #284: a WSS bind's refusal (was identity_in_use)
-  const wss = (await application.selectIdentity(tokenSession(application.repo, bob.authed), "be", sink)).session;
-  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
-  application.close(wss);
-  // #284 S4: a closed WSS session holds its aliases through its grace; the sweep ends it.
-  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "identity_in_use");
-  application.sweepSessions(Date.now() + GRACE_MS + SWEEP_MS);
+test("cross application-level/hosted holders share one exclusion path", async () => {
+  await expect(new AppSession(application, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
+  const holder = new AppSession(application, bob.authed, "be");
+  await holder.connect();
+  await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
+  // Since #282 close() leaves an application-level hold (there is no grace to sweep it) and a hosted bind never probes it; an unbind frees it.
+  await holder.unbind("bob@example.com/be");
   await hosted.bind(bob, context(bob), { name: "be" });
-  expect(await hosted.whoami(bob, context(bob))).toHaveProperty("name", "be");
+  expect(await hosted.whoami(bob, context(bob))).toHaveProperty("held", ["bob@example.com/fe", "bob@example.com/be"]);
 });
 
 test("disable immediately closes held ownership and invalidates capability", async () => {
@@ -239,7 +248,7 @@ test("failed rebind preserves lease and original grant attachment", async () => 
 
 test("receipt storage failure rolls back direct admission and keeps the issued batch retryable", async () => {
   const lease = await delivery.open(bob, context(bob));
-  send();
+  await send();
   const batch = await delivery.pending(bob, context(bob), lease.capability);
   const original = application.receiptBoards;
   application.receiptBoards = () => { throw new Error("injected receipt rollback"); };
@@ -269,7 +278,7 @@ test("per-user delivery capacity refuses without attaching another grant or drop
 
 test("one lease admits more than 1000 deliveries with bounded idempotent receipt history", async () => {
   const lease = await delivery.open(bob, context(bob));
-  for (let i = 0; i < 1100; i++) send(`message ${i}`);
+  for (let i = 0; i < 1100; i++) await send(`message ${i}`);
   let firstId = "";
   let latest: string[] = [];
   for (let i = 0; i < 11; i++) {

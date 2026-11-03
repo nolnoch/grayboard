@@ -79,7 +79,7 @@ export const COMMAND = {
 // /fork carries, the live session files (file → root id), and per root
 // session the stable ids of items it admitted, which a /reload keeps (the
 // lease stays) while the Controller's own admission set doesn't outlive it.
-type Shared = { carried?: string; live: Map<string, string>; admitted: Map<string, Set<string>> };
+type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>> };
 const ADMITTED_LIMIT = 256;
 function shared(harness: string): Shared {
   const key = Symbol.for(`io.github.nolnoch.grayboard/${harness}-sessions`);
@@ -340,7 +340,7 @@ export function createGrayboard(h: Harness): Grayboard {
     const shown = (state: string, message: string) => !signedIn && state === "paused" && message.startsWith(DRIFTED) ? `signed out; ${LOGIN_ACTION}` : message;
     return [
       `${status.state}: ${shown(status.state, status.message)}`,
-      ...status.roots.map(r => `  ${r.sessionID ?? "-"}${r.name ? ` (${r.name})` : ""}: ${r.state}, ${shown(r.state, r.message)}${r.failure ? ` [last failure: ${r.failure.operation} ${r.failure.code}]` : ""}`),
+      ...status.roots.map(r => `  ${r.sessionID ?? "-"}${r.held?.length ? ` (${r.held.join(", ")})` : ""}: ${r.state}, ${shown(r.state, r.message)}${r.failure ? ` [last failure: ${r.failure.operation} ${r.failure.code}]` : ""}`),
     ].join("\n");
   };
 

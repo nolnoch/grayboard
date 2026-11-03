@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import { FakeSlack } from "./fake_slack.ts";
 import { TestServer } from "../support/server.ts";
-import { closeSessions } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 import { SlackBridge } from "../../src/server/slack.ts";
 function deferred<T = void>() { let resolve!: (v: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
@@ -18,7 +17,8 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     }
     return response;
   }) as typeof fetch;
-  const srv = new TestServer({ slack: { appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api } });
+  // Hosted inbox polling and the lease spend hosted requests.
+  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, slack: { appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api } });
   let restarted: SlackBridge | undefined;
   try {
     await srv.app.slackReady;
@@ -26,8 +26,8 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     const code = await srv.api(token, "POST", "/api/slack/link");
     slack.say(`link ${code.body.code}`);
     await until(() => slack.posts().find(p => p.markdown_text?.startsWith("Linked to")));
-    const agent = await srv.session(token, "fe");
-    const q = await agent.call("dm_send", { to: "human", body: "owned hosted question" });
+    const agent = await srv.hosted("you@example.com", "fe");
+    const q = await agent.call<{ delivered_now: boolean }>("dm_send", { to: "human", body: "owned hosted question" });
     await entered.promise;
     const linked = [...(srv.app.slack as any).linked.values()][0] as any;
     const receipt = srv.app.application.receiptDirect.bind(srv.app.application);
@@ -60,6 +60,6 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     expect(next.relay.store.pending()).toHaveLength(0);
   } finally {
     release.resolve(); restarted?.stop();
-    await closeSessions(); await srv.stop(); slack.stop(); globalThis.fetch = originalFetch;
+    await srv.stop(); slack.stop(); globalThis.fetch = originalFetch;
   }
 }, 20000);

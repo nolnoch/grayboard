@@ -24,7 +24,7 @@ CHANGED=$(git diff --name-only "docs-baseline...$SHA" 2>/dev/null) || exit 0
 # Loose structural filter; the pusher's judgment is the precise one, so err toward stopping.
 # Pass silently only when every changed file is docs, tests, gate tooling, images, or local
 # agent config.
-SIGNIFICANT=$(printf '%s\n' "$CHANGED" | grep -vE '^(docs/|tests/|scripts/|assets/|\.claude/)|\.md$|\.test\.ts$' || true)
+SIGNIFICANT=$(printf '%s\n' "$CHANGED" | grep -vE '^(docs/|tests/|scripts/|assets/|\.claude/)|/tests/|\.md$|\.test\.ts$' || true)
 [ -z "$SIGNIFICANT" ] && exit 0
 
 N=$(printf '%s\n' "$SIGNIFICANT" | wc -l)

@@ -47,4 +47,4 @@ async function main() {
   } else process.exitCode = code;
 }
 
-try { await main(); } catch { console.error("Matrix observation failed; private diagnostics withheld"); process.exitCode = 1; }
+try { await main(); } catch (error) { console.error(`Matrix observation failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }

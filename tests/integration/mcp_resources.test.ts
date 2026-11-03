@@ -11,8 +11,8 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
-import { hashToken } from "../../src/server/auth.ts";
-import { PROTO } from "../../src/shared/protocol.ts";
+import { hashToken, verifySessionToken } from "../../src/server/auth.ts";
+import { AppSession } from "../support/app_session.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
@@ -85,7 +85,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   await expect(call(native.client, "delivery_open")).rejects.toThrow("not found");
   expect((await native.client.listResourceTemplates()).resourceTemplates).toEqual([]);
   const who = value(await call(native.client, "whoami"));
-  expect(who).toMatchObject({ name: "be" });
+  expect(who).toMatchObject({ primary: "alice@example.com/be" });
   const identity = { identity_full: "alice@example.com/be" };
   await expect(read(native.client, "grayboard://identity")).rejects.toThrow();
   value(await call(native.client, "board_create", { name: "e2e", purpose: "fixtures" }));
@@ -105,7 +105,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   const sub = await connect(grant.token, version, "subscriber");
   expect((await sub.client.listResources()).resources.map(r => r.uri)).toEqual(["grayboard://inbox"]);
   expect(value(await call(sub.client, "whoami"))).toEqual(who);
-  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["whoami", "bind", "session_register", "session_end", "delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
+  expect((await sub.client.listTools()).tools.map(t => t.name)).toEqual(["whoami", "bind", "unbind", "session_register", "session_end", "delivery_open", "delivery_renew", "delivery_receipt", "delivery_release"]);
   await expect(call(sub.client, "dm_send", { to: "be", body: "not exposed" })).rejects.toThrow("not found");
   await expect(read(sub.client, "grayboard://boards/e2e")).rejects.toThrow();
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
@@ -284,7 +284,7 @@ test("fresh access of the same grant continues a lease; revoked access and repla
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
   sub.headers.set("Authorization", `Bearer ${token}`);
   expect(value(await call(sub.client, "delivery_renew")).capability).toBe(lease.capability);
-  expect(value(await call(sub.client, "whoami"))).toMatchObject({ name: "be" });
+  expect(value(await call(sub.client, "whoami"))).toMatchObject({ primary: "alice@example.com/be" });
   sub.headers.set("Authorization", `Bearer ${issue().token}`);
   expect((await call(sub.client, "delivery_release")).isError).toBe(true);
   sub.headers.set("Authorization", `Bearer ${token}`);
@@ -306,28 +306,16 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
-test("explicit open conflicts with an existing live WS-style owner; native and subscriber reads do not", async () => {
+// hosted twin: #451 (an application-level push owner and its unbind)
+test("explicit open conflicts with an existing live push owner; native and subscriber reads do not", async () => {
   const grant = issue();
   const login = await fetch(base + "/api/auth/dev-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const { session_token } = await login.json() as { session_token: string };
-  const ws = new WebSocket(base.replace("http:", "ws:"), { headers: { Authorization: `Bearer ${session_token}` } });
-  const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
-  const ready = new Promise<void>((resolve, reject) => {
-    ws.onerror = () => reject(new Error("WS failed"));
-    // #284: the hello is the session (proto 2, a session key); the name comes by bind.
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", req_id: "open", proto: PROTO, session_key: randomBytes(32).toString("hex") }));
-    ws.onmessage = event => {
-      const message = JSON.parse(String(event.data));
-      if (message.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
-      if (message.type === "hello_ok") ws.send(JSON.stringify({ type: "bind", req_id: "bind", alias: "be" }));
-      if (message.type === "bind_ok") resolve();
-      if (message.type === "end_ok") ended();
-      if (message.type === "error") reject(new Error(JSON.stringify(message)));
-    };
-  });
-  let ended!: () => void;
-  const endOk = new Promise<void>(resolve => { ended = resolve; });
-  await ready;
+  const authed = verifySessionToken(session_token, app.repo, app.touches);
+  if (!authed) throw new Error("the dev-login token doesn't authenticate");
+  // The session registers first; the name comes by bind.
+  const owner = new AppSession(app.application, authed, "be");
+  await owner.connect();
   const native = await connect(grant.token);
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
   expect(value(await call(native.client, "whoami"))).toHaveProperty("unbound", true);
@@ -335,11 +323,9 @@ test("explicit open conflicts with an existing live WS-style owner; native and s
   expect(app.mcp.activeLeases).toBe(0);
   expect((await call(sub.client, "delivery_open")).isError).toBe(true);
   expect(app.mcp.activeLeases).toBe(0);
-  // A closed WSS session holds its aliases through its grace (#284 S4); a clean exit ends it at once.
-  ws.send(JSON.stringify({ type: "end", req_id: "end" }));
-  await endOk;
-  ws.close();
-  await closed;
+  // A closed session no longer ends and keeps its holds (#282); the owner gives the name up with unbind.
+  await owner.unbind("be");
+  owner.close();
   expect((await call(sub.client, "bind", { name: "be" })).isError).not.toBe(true);
   await open(sub.client, sub.headers);
   expect(app.mcp.activeLeases).toBe(1);

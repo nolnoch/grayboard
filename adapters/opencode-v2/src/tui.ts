@@ -21,7 +21,7 @@ export default Plugin.define({ id: "grayboard.tui", setup(context) {
     } },
     { id: "grayboard.status", title: "Grayboard: delivery status", palette: true, slash: { name: "grayboard-status" }, run: async () => {
       const result = await rpc.status({}, { location: context.location ?? context.data.location.default() });
-      await context.ui.dialog.alert({ title: `Grayboard: ${result.state}`, message: [result.message, ...result.roots.map(root => `${root.sessionID ?? "background"}: ${root.state}${root.name ? ` (${root.name})` : ""}${root.ownership === undefined ? "" : ` ownership ${root.ownership}`} — ${root.message}`)].join("\n") });
+      await context.ui.dialog.alert({ title: `Grayboard: ${result.state}`, message: [result.message, ...result.roots.map(root => `${root.sessionID ?? "background"}: ${root.state}${root.held?.length ? ` (${root.held.join(", ")})` : ""}${root.ownership === undefined ? "" : ` ownership ${root.ownership}`} — ${root.message}`)].join("\n") });
     } },
   ] }));
 } });

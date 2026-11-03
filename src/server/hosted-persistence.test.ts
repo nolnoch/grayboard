@@ -93,9 +93,11 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   const rows = database.repo.hosted.all();
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
-  expect(rows[0]?.name).toBe("fe");
+  expect(application.hostedHolds(rows[0]!.session_id).map(short)).toEqual(["fe"]);
   expect(releases()).toEqual([{ detail: "expired" }]);
 }, 15_000);
+
+const short = (address: string) => address.slice(address.lastIndexOf("/") + 1);
 
 function external(operation: Record<string, unknown>) {
   const result = Bun.spawnSync([process.execPath, "tests/support/hosted-operation.ts", join(dir, "bus.db"), join(dir, "blobs"), JSON.stringify({ now, ...operation })], { stdin: Buffer.from(""), env: { ...process.env, BUS_TEST_PAUSE: "", BUS_TEST_PAUSE_FILE: "" } });
@@ -125,7 +127,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     const fresh = database.repo.hosted.get(id)!;
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
-    expect(fresh.name).toBe(change === "convert" ? null : "be");
+    expect(application.hostedHolds(fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
     expect(database.repo.aliases.find(`${p.authed.user_email}/new`)).toBeUndefined();
     expect(database.repo.hosted.all().some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
@@ -262,7 +264,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.child_registered'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
   database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
-  expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("name", "fe");
+  expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
   database.repo.users.setDisabled(second.authed.user_id, true);
   expect(database.repo.hosted.all()).toEqual([]);
@@ -281,5 +283,21 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(database.repo.hosted.all()).toEqual([]);
   await hosted.bind(first.principal, context(first.principal), { name: "fe" });
-  expect(await hosted.whoami(first.principal, context(first.principal))).toHaveProperty("name", "fe");
+  expect(await hosted.whoami(first.principal, context(first.principal))).toHaveProperty("primary", "you@example.com/fe");
+});
+
+test("a database a v2.x release wrote, with a hosted root bound under its single name, opens and keeps that hold (#451)", async () => {
+  const first = issue();
+  await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
+  const id = (context(first.principal) as { id: string }).id;
+  // The v2.x shape: the name on the row under its partial unique index, no writes_as, and the hold row its bind also wrote.
+  database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`);
+  close(); open();
+  expect(database.db.query("SELECT name FROM hosted_sessions").get()).toEqual({ name: null });
+  expect(database.db.query("SELECT 1 AS x FROM sqlite_master WHERE name = 'idx_hosted_name'").get()).toBeNull();
+  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
+  expect(await hosted.whoami(first.principal, context(first.principal))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe" });
+  // A second open changes nothing.
+  close(); open();
+  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
 });

@@ -56,7 +56,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
-  expect(info.name).toBe("be");
+  expect(info.primary).toBe("alice@example.com/be");
   const upload = await attachment(alice.token);
   expect(upload.status).toBe(201);
   expect(upload.headers.get("Cache-Control")).toBe("private, no-store");
@@ -128,8 +128,6 @@ test("old API remains session-only and OAuth cannot become admin or WS credentia
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   }
-  const ws = await fetch(`${base}/`, { headers: { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13", Authorization: `Bearer ${alice.token}` } });
-  expect(ws.status).toBe(401);
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
   await connect(alice.token, "2026-07-28");
   expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);

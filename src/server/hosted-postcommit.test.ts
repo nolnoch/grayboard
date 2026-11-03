@@ -1,12 +1,12 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession, type AppEvent } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
-import { createApplication, type DeliveryEvent } from "./application.ts";
+import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { sessionContext } from "./hosted.ts";
@@ -22,8 +22,8 @@ let oauth: ReturnType<typeof createOAuthServer>;
 let mcp: ReturnType<typeof createHostedMcp>;
 let principal: OAuthPrincipal;
 let token: string;
-let recipient: Awaited<ReturnType<typeof application.selectIdentity>>;
-let events: DeliveryEvent[];
+let recipient: AppSession;
+let events: AppEvent[];
 function context() {
   const routing = sessionContext(principal, { [OPENCODE_SESSION_META]: "root" });
   if (!("id" in routing)) throw new Error("fixture source mapping");
@@ -43,8 +43,11 @@ beforeEach(async () => {
   if (authenticated instanceof Response) throw new Error("fixture authentication");
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
-  events = [];
-  recipient = await application.selectIdentity(tokenSession(application.repo, principal.authed), "launcher", { deliver(event) { events.push(event); }, closed() {}, probe: async () => true }, { push: true, launcher: true });
+  recipient = new AppSession(application, principal.authed, "launcher");
+  await recipient.connect();
+  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
+  database.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(recipient.id);
+  events = recipient.events;
 });
 afterEach(async () => {
   await mcp.close(); oauth.close(); application.stopExpiry(); database.db.close();
@@ -194,4 +197,39 @@ test("a failing postcommit effect does not suppress later effects or retain boar
     expect(events.some(event => event.kind === "board")).toBe(true);
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
+});
+
+// #452: a refusal thrown inside `hosted.run`'s transaction rolls its audit row back with the call, so the row is written after the unwind.
+const refusals = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused'").all() as { actor: string; target: string; detail: string }[];
+const refused = (request: Parameters<typeof application.delegate>[1]) => mcp.sessions.run(principal, context(), "delegate", session => application.delegate(session, request));
+
+test("hosted delegate: an unresolvable `to` leaves its refusal audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
+  expect(refusals()[0]).toMatchObject({ actor: "you@example.com" });
+  expect(refusals()[0]!.target).toBe("you@example.com/fe");
+  expect(JSON.parse(refusals()[0]!.detail)).toMatchObject({ to: "nobody-here" });
+});
+
+test("hosted delegate: a successful delegation leaves no refusal row", async () => {
+  await refused({ persona: "researcher", task: "x", to: "launcher" });
+  expect(refusals()).toEqual([]);
+});
+
+test("hosted delegate: a failing refusal-audit write does not mask the refusal", async () => {
+  failAudit("delegation.refused");
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow(/nobody-here|resolve|no /i);
+  expect(error).toHaveBeenCalled();
+  error.mockRestore();
+});
+
+test("hosted delegate: a resolution refusal (explicit non-launcher target) leaves its audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x", to: "fe" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
+});
+
+test("hosted delegate: a refused send (oversize task) leaves its audit row", async () => {
+  await expect(refused({ persona: "researcher", task: "x".repeat(2_000_000), to: "launcher" })).rejects.toThrow();
+  expect(refusals()).toHaveLength(1);
 });

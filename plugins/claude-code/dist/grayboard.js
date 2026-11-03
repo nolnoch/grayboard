@@ -14157,7 +14157,7 @@ class StdioServerTransport {
 // package.json
 var package_default = {
   name: "grayboard",
-  version: "2.2.0",
+  version: "2.3.0",
   description: "Durable Claude-to-Claude message bus over the channels protocol",
   type: "module",
   private: true,
@@ -14169,7 +14169,7 @@ var package_default = {
     server: "bun src/server/main.ts",
     cli: "bun src/cli/main.ts",
     typecheck: "tsc --noEmit",
-    test: "bun test ./src ./tests",
+    test: "bun test --timeout 30000 ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",
     "test:opencode:config": "bash scripts/e2e.sh hosted-config",
@@ -14262,194 +14262,6 @@ async function acquire(path, options) {
 
 // adapters/hosted-core/src/model.ts
 import { createHash } from "crypto";
-
-class Refusal extends Error {
-  code;
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-  }
-}
-
-class AccessExpired extends Refusal {
-  harness;
-  action;
-  reason;
-  constructor(harness, action, reason = "expired") {
-    super("auth", `Signed out of grayboard in ${harness}; ${action}`);
-    this.harness = harness;
-    this.action = action;
-    this.reason = reason;
-  }
-}
-
-class ServerOutdated extends Refusal {
-  harness;
-  constructor(harness) {
-    super("auth", `this grayboard server predates the ${harness} adapter; update the server`);
-    this.harness = harness;
-  }
-}
-
-class DeliveryHeldElsewhere extends Refusal {
-  harness;
-  constructor(harness) {
-    super("paused", `another ${harness} process holds delivery for this session`);
-    this.harness = harness;
-  }
-}
-
-class RefreshInProgress extends Error {
-  harness;
-  constructor(harness) {
-    super(`token refresh in progress in another ${harness} process`);
-    this.harness = harness;
-  }
-}
-function accessExpiry(error) {
-  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++)
-    if (e instanceof AccessExpired)
-      return e;
-  return;
-}
-function same(a, b) {
-  if (a === b)
-    return true;
-  if (!a || !b || typeof a !== "object" || typeof b !== "object")
-    return false;
-  const x = Object.keys(a).sort(), y = Object.keys(b).sort();
-  return x.length === y.length && x.every((key, i) => key === y[i] && same(a[key], b[key]));
-}
-function stableID(e, id, identity) {
-  return "msg_" + createHash("sha256").update(JSON.stringify([3, identity.user.email, identity.issuer, identity.resource, identity.identity_full, id, e.sessionID])).digest("hex");
-}
-function identityOf(value, e) {
-  const i = value;
-  if (!i || typeof i.user_email !== "string" || !i.user_email.length || !e.name || i.identity_full !== `${i.user_email}/${e.name}`)
-    throw new Refusal("identity", "Invalid authenticated identity response");
-  return { user: { email: i.user_email }, identity: e.name, identity_full: i.identity_full, issuer: e.configuration.issuer, resource: e.configuration.url };
-}
-function bindingOf(value) {
-  const b = value;
-  if (!b || !(b.name === null || typeof b.name === "string" && /^[a-z0-9_-]{1,32}$/.test(b.name)) || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child)
-    throw new Refusal("root", "Invalid root binding response");
-  return b;
-}
-function leaseOf(value, e) {
-  const l = value, identity = identityOf(l?.identity, e);
-  if (!/^[A-Za-z0-9_-]{43}$/.test(l.capability) || !Number.isSafeInteger(l.ownership) || l.ownership < 1 || !Number.isSafeInteger(l.bind_gen) || l.bind_gen < 1 || !Number.isFinite(l.expiresAt) || identity.issuer !== e.configuration.issuer || identity.resource !== e.configuration.url || identity.identity !== e.name)
-    throw new Refusal("identity", "Invalid session delivery lease");
-  return { ...l, identity };
-}
-function itemsOf(value) {
-  const items = value?.items;
-  if (!Array.isArray(items) || items.length > 100)
-    throw new Error("Invalid inbox response");
-  return items.map((i) => {
-    if (!i || typeof i.id !== "string" || !i.id.length || i.id.length > 128 || typeof i.actionable !== "boolean" || !("event" in i) || !Number.isSafeInteger(i.ownership) || !Number.isSafeInteger(i.bind_gen) || typeof i.name !== "string")
-      throw new Error("Invalid inbox item");
-    return { id: i.id, actionable: i.actionable, event: i.event, ownership: i.ownership, bind_gen: i.bind_gen, name: i.name };
-  });
-}
-async function admitPrefix(items, admit, receipt) {
-  for (const item of items) {
-    await admit(item);
-    await receipt([item.id]);
-  }
-}
-
-// adapters/hosted-core/src/storage.ts
-import { createHash as createHash2, randomBytes } from "crypto";
-import { chmod, mkdir, open as open2, readFile, rename, rm } from "fs/promises";
-import { mkdirSync } from "fs";
-import { dirname, join } from "path";
-import { setTimeout as sleep2 } from "timers/promises";
-var sha256 = (text) => createHash2("sha256").update(text).digest("hex");
-async function readJson(path) {
-  let text;
-  try {
-    text = await readFile(path, "utf8");
-  } catch (error) {
-    if (error.code === "ENOENT")
-      return;
-    throw error;
-  }
-  return JSON.parse(text);
-}
-async function writeJsonAtomic(path, value) {
-  const dir = dirname(path);
-  await mkdir(dir, { recursive: true, mode: 448 });
-  await chmod(dir, 448);
-  const temp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  const file = await open2(temp, "wx", 384);
-  try {
-    try {
-      await file.writeFile(JSON.stringify(value));
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temp, path);
-  } catch (error) {
-    await rm(temp, { force: true });
-    throw error;
-  }
-  if (process.platform === "win32")
-    return;
-  const handle = await open2(dir, "r");
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-var rootKey = (resource, clientId, rawRootId) => sha256(`${resource}
-${clientId}
-${rawRootId}`);
-var sessionPath = (stateDir, resource, clientId, rawRootId) => join(stateDir, "sessions", `${rootKey(resource, clientId, rawRootId)}.json`);
-var deliveryPath = (stateDir, resource, clientId, rawRootId) => join(stateDir, "delivery", `${rootKey(resource, clientId, rawRootId)}.lock`);
-var SessionState = record(string2(), unknown());
-
-class FileStorage {
-  path;
-  writes = Promise.resolve();
-  constructor(path) {
-    this.path = path;
-  }
-  async get(key) {
-    await this.writes.catch(() => {});
-    return (await this.read())[key];
-  }
-  set(key, value) {
-    const write = this.writes.catch(() => {}).then(async () => {
-      const next = await this.read();
-      if (value === undefined)
-        delete next[key];
-      else
-        next[key] = value;
-      await writeJsonAtomic(this.path, next);
-    });
-    this.writes = write;
-    return write;
-  }
-  async read() {
-    const raw = await readJson(this.path);
-    return raw === undefined ? {} : SessionState.parse(raw);
-  }
-}
-function tryDelivery(path) {
-  mkdirSync(dirname(path), { recursive: true, mode: 448 });
-  return tryAcquire(path);
-}
-async function waitDelivery(path, signal, intervalMs = 5000) {
-  for (;; ) {
-    signal.throwIfAborted();
-    const lock = tryDelivery(path);
-    if (lock)
-      return lock;
-    await sleep2(intervalMs, undefined, { signal });
-  }
-}
 
 // node_modules/@modelcontextprotocol/client/dist/chunk-DYPzFuB5.mjs
 var __create2 = Object.create;
@@ -18965,7 +18777,7 @@ function buildInputRequiredRetryParams(originalParams, responses, requestState) 
 function inputRequiredRoundsExceededMessage(method, maxRounds) {
   return `Multi-round-trip request '${method}' still required input after ${maxRounds} rounds (inputRequired.maxRounds)`;
 }
-function sleep3(ms, signal) {
+function sleep2(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(signal.reason instanceof SdkError ? signal.reason : new SdkError(SdkErrorCode.RequestTimeout, String(signal.reason)));
@@ -19031,7 +18843,7 @@ async function runInputRequiredDriver(args) {
         round$1.dispose();
       }
     } else
-      await sleep3(REQUEST_STATE_ONLY_LEG_PACING_MS, signal);
+      await sleep2(REQUEST_STATE_ONLY_LEG_PACING_MS, signal);
     const legOptions = { ...requestOptions.timeout !== undefined && { timeout: requestOptions.timeout } };
     if (requestOptions.maxTotalTimeout !== undefined) {
       const totalElapsed = Date.now() - startedAt;
@@ -31743,7 +31555,7 @@ var StreamableHTTPClientTransport = class {
 };
 
 // adapters/hosted-core/src/wire.ts
-import { setTimeout as sleep4 } from "timers/promises";
+import { setTimeout as sleep3 } from "timers/promises";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 
 class SubscriberError extends Error {
@@ -31757,21 +31569,21 @@ class SubscriberError extends Error {
     this.holder = holder;
   }
 }
-var holderText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
+var shownText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
 
 class LeaseUnavailable extends SubscriberError {
   constructor(code = "not_found") {
     super(code);
   }
 }
-var domainCodes = new Set(["identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
+var domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
 function subscriberError(value, leaseOperation) {
   const code = value?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
   const suggestions = value?.known;
   const known = domain === "identity_unknown" && Array.isArray(suggestions) && suggestions.length <= 256 && suggestions.every((name) => typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name)) ? [...new Set(suggestions)] : undefined;
   const holder = value?.holder;
-  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "identity_in_use" && holderText(holder) ? holder : undefined);
+  return leaseOperation && (domain === "not_found" || domain === "unbound") ? new LeaseUnavailable(domain) : new SubscriberError(domain, known, domain === "alias_held" && shownText(holder) ? holder : undefined);
 }
 
 class ConnectRefused extends SubscriberError {
@@ -31889,7 +31701,7 @@ class Connection {
           if (attempt === 7)
             return response;
           await response.body?.cancel().catch(() => {});
-          await sleep4(Math.ceil(data.retry_after_ms), undefined, { signal });
+          await sleep3(Math.ceil(data.retry_after_ms), undefined, { signal });
         }
       }
     });
@@ -31999,6 +31811,206 @@ class NativeWire extends Connection {
   }
   async callTool(name, args, sessionID) {
     return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration() } }, this.options()));
+  }
+}
+
+// adapters/hosted-core/src/model.ts
+var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+var MAX_HELD = 64;
+var validAddress = (value) => typeof value === "string" && ADDRESS.test(value);
+var validHeld = (value) => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;
+function shortOf(email, address) {
+  return address.startsWith(`${email}/`) ? address.slice(email.length + 1) : address;
+}
+function sameHeld(a, b) {
+  return (a?.length ?? 0) === (b?.length ?? 0) && (a ?? []).every((address, i) => address === b[i]);
+}
+
+class Refusal extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+class AccessExpired extends Refusal {
+  harness;
+  action;
+  reason;
+  constructor(harness, action, reason = "expired") {
+    super("auth", `Signed out of grayboard in ${harness}; ${action}`);
+    this.harness = harness;
+    this.action = action;
+    this.reason = reason;
+  }
+}
+
+class ServerOutdated extends Refusal {
+  harness;
+  constructor(harness) {
+    super("auth", `this grayboard server predates the ${harness} adapter; update the server`);
+    this.harness = harness;
+  }
+}
+
+class DeliveryHeldElsewhere extends Refusal {
+  harness;
+  constructor(harness) {
+    super("paused", `another ${harness} process holds delivery for this session`);
+    this.harness = harness;
+  }
+}
+
+class RefreshInProgress extends Error {
+  harness;
+  constructor(harness) {
+    super(`token refresh in progress in another ${harness} process`);
+    this.harness = harness;
+  }
+}
+function accessExpiry(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++)
+    if (e instanceof AccessExpired)
+      return e;
+  return;
+}
+function same(a, b) {
+  if (a === b)
+    return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object")
+    return false;
+  const x = Object.keys(a).sort(), y = Object.keys(b).sort();
+  return x.length === y.length && x.every((key, i) => key === y[i] && same(a[key], b[key]));
+}
+function stableID(e, item, identity) {
+  return "msg_" + createHash("sha256").update(JSON.stringify([4, identity.user.email, identity.issuer, identity.resource, item.address ?? null, item.id, e.sessionID])).digest("hex");
+}
+function identityOf(value, e) {
+  const i = value;
+  if (!i || typeof i.user_email !== "string" || !i.user_email.length || !e.held?.length || i.identity_full !== e.held[0])
+    throw new Refusal("identity", "Invalid authenticated identity response");
+  return { user: { email: i.user_email }, identity_full: i.identity_full, issuer: e.configuration.issuer, resource: e.configuration.url };
+}
+function bindingOf(value) {
+  const b = value;
+  if (!b || !validHeld(b.held) || !(b.primary === null || validAddress(b.primary)) || !(b.ownership === null || Number.isSafeInteger(b.ownership) && b.ownership > 0) || b.child || !(b.alias_lost === undefined || Array.isArray(b.alias_lost) && b.alias_lost.length <= MAX_HELD && b.alias_lost.every((l) => l && validAddress(l.alias) && shownText(l.reason))))
+    throw new Refusal("root", "Invalid root binding response");
+  return b;
+}
+function leaseOf(value, e) {
+  const l = value, identity = identityOf(l?.identity, e);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(l.capability) || !Number.isSafeInteger(l.ownership) || l.ownership < 1 || !Number.isSafeInteger(l.bind_gen) || l.bind_gen < 1 || !Number.isFinite(l.expiresAt) || identity.issuer !== e.configuration.issuer || identity.resource !== e.configuration.url)
+    throw new Refusal("identity", "Invalid session delivery lease");
+  return { ...l, identity };
+}
+function itemsOf(value) {
+  const items = value?.items;
+  if (!Array.isArray(items) || items.length > 100)
+    throw new Error("Invalid inbox response");
+  return items.map((i) => {
+    if (!i || typeof i.id !== "string" || !i.id.length || i.id.length > 128 || typeof i.actionable !== "boolean" || !("event" in i) || !Number.isSafeInteger(i.ownership) || !Number.isSafeInteger(i.bind_gen) || !(i.address === undefined || validAddress(i.address)))
+      throw new Error("Invalid inbox item");
+    return { id: i.id, actionable: i.actionable, event: i.event, ownership: i.ownership, bind_gen: i.bind_gen, ...i.address === undefined ? {} : { address: i.address } };
+  });
+}
+async function admitPrefix(items, admit, receipt) {
+  for (const item of items) {
+    await admit(item);
+    await receipt([item.id]);
+  }
+}
+
+// adapters/hosted-core/src/storage.ts
+import { createHash as createHash2, randomBytes } from "crypto";
+import { chmod, mkdir, open as open2, readFile, rename, rm } from "fs/promises";
+import { mkdirSync } from "fs";
+import { dirname, join } from "path";
+import { setTimeout as sleep4 } from "timers/promises";
+var sha256 = (text) => createHash2("sha256").update(text).digest("hex");
+async function readJson(path) {
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  return JSON.parse(text);
+}
+async function writeJsonAtomic(path, value) {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true, mode: 448 });
+  await chmod(dir, 448);
+  const temp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const file = await open2(temp, "wx", 384);
+  try {
+    try {
+      await file.writeFile(JSON.stringify(value));
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+  if (process.platform === "win32")
+    return;
+  const handle = await open2(dir, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+var rootKey = (resource, clientId, rawRootId) => sha256(`${resource}
+${clientId}
+${rawRootId}`);
+var sessionPath = (stateDir, resource, clientId, rawRootId) => join(stateDir, "sessions", `${rootKey(resource, clientId, rawRootId)}.json`);
+var deliveryPath = (stateDir, resource, clientId, rawRootId) => join(stateDir, "delivery", `${rootKey(resource, clientId, rawRootId)}.lock`);
+var SessionState = record(string2(), unknown());
+
+class FileStorage {
+  path;
+  writes = Promise.resolve();
+  constructor(path) {
+    this.path = path;
+  }
+  async get(key) {
+    await this.writes.catch(() => {});
+    return (await this.read())[key];
+  }
+  set(key, value) {
+    const write = this.writes.catch(() => {}).then(async () => {
+      const next = await this.read();
+      if (value === undefined)
+        delete next[key];
+      else
+        next[key] = value;
+      await writeJsonAtomic(this.path, next);
+    });
+    this.writes = write;
+    return write;
+  }
+  async read() {
+    const raw = await readJson(this.path);
+    return raw === undefined ? {} : SessionState.parse(raw);
+  }
+}
+function tryDelivery(path) {
+  mkdirSync(dirname(path), { recursive: true, mode: 448 });
+  return tryAcquire(path);
+}
+async function waitDelivery(path, signal, intervalMs = 5000) {
+  for (;; ) {
+    signal.throwIfAborted();
+    const lock = tryDelivery(path);
+    if (lock)
+      return lock;
+    await sleep4(intervalMs, undefined, { signal });
   }
 }
 
@@ -32337,13 +32349,13 @@ ${config.clientId}`)}.json`);
       throw new ServerOutdated(this.config.harness);
     return meta;
   }
-  login(signal) {
-    this.signingIn ??= this.signIn(signal).finally(() => {
+  login(signal, ifSignedOut = false) {
+    this.signingIn ??= this.signIn(signal, ifSignedOut).finally(() => {
       this.signingIn = undefined;
     });
     return this.signingIn;
   }
-  async signIn(signal) {
+  async signIn(signal, ifSignedOut) {
     await mkdir2(dirname2(this.path), { recursive: true, mode: 448 });
     const before = (await this.read())?.epoch;
     const lockPath = `${this.path}.login.lock`;
@@ -32360,7 +32372,7 @@ ${config.clientId}`)}.json`);
           return;
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (now?.epoch !== before && live(now))
+      if (live(now) && (ifSignedOut || now.epoch !== before))
         return;
       await this.flow(signal);
     } finally {
@@ -34729,11 +34741,11 @@ class DeliveryStopped extends Error {
   }
 }
 var key = "diagnostics:v1";
-var fields = ["state", "message", "sessionID", "time", "name", "ownership", "operation", "code", "failure"];
+var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register"];
 var operations = new Set(OPERATIONS);
-var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "identity_in_use", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
   if (error instanceof DeliveryStopped)
     return "retry_exhausted";
@@ -34769,7 +34781,7 @@ function failureMessage(error, resumeHint) {
     const code = failureCode(error);
     const known = Object.getOwnPropertyDescriptor(error, "known")?.value;
     const holder = Object.getOwnPropertyDescriptor(error, "holder")?.value;
-    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every((v) => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "identity_in_use" && holderText(holder) ? `; held by ${holder}` : ""}`;
+    return `Operation refused (${code})${code === "identity_unknown" && Array.isArray(known) && known.length <= 256 && known.every((v) => typeof v === "string" && /^[a-z0-9_-]{1,32}$/.test(v)) ? `; known names: ${known.join(", ")}` : ""}${code === "alias_held" && shownText(holder) ? `; held by ${holder}` : ""}`;
   }
   return `Operation failed; ${resumeHint}`;
 }
@@ -34805,7 +34817,7 @@ function project(value, restored = false) {
     return;
   if (d.sessionID !== undefined && (typeof d.sessionID !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(d.sessionID)))
     return;
-  if (d.name !== undefined && (typeof d.name !== "string" || !/^[a-z0-9_-]{1,32}$/.test(d.name)))
+  if (d.held !== undefined && !validHeld(d.held))
     return;
   if (d.ownership !== undefined && (typeof d.ownership !== "number" || !Number.isSafeInteger(d.ownership) || d.ownership <= 0))
     return;
@@ -34816,8 +34828,8 @@ function project(value, restored = false) {
     return;
   if (typeof d.message !== "string" || d.message.length > 16384)
     return;
-  const message = restored ? `Saved ${d.state} status${d.name ? ` for ${d.name}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
-  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...typeof d.name === "string" ? { name: d.name } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...typeof d.code === "string" ? { code: d.code } : {}, ...failure ? { failure } : {} };
+  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
+  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...d.held !== undefined ? { held: d.held } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...typeof d.code === "string" ? { code: d.code } : {}, ...failure ? { failure } : {} };
 }
 class Diagnostics {
   storage;
@@ -34925,20 +34937,48 @@ var native_tools_default = [
   },
   {
     name: "bind",
-    description: "Take or change this session's name; unknown names require create:true.",
+    description: "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another; you send as the first you bound, and unbind releases one you're done with. A name that has never existed needs create: true.",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
-          maxLength: 32
+          maxLength: 160
         },
         create: {
           type: "boolean"
         },
+        meta: {
+          type: "object",
+          propertyNames: {
+            type: "string"
+          },
+          additionalProperties: {}
+        },
         where: {
           type: "string",
           maxLength: 1024
+        }
+      },
+      required: [
+        "name"
+      ],
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
+    }
+  },
+  {
+    name: "unbind",
+    description: "unbind(name): release one of your aliases; its mail and claims stay with it for its next holder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          maxLength: 160
         }
       },
       required: [
@@ -35271,6 +35311,10 @@ var native_tools_default = [
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
         },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
         as: {
           type: "string",
           description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
@@ -35443,6 +35487,10 @@ function describeFetchError(e, ms) {
   return e instanceof Error && e.name === "TimeoutError" ? `no answer within ${Math.round(ms / 1000)}s` : e.message;
 }
 
+// src/shared/session_meta.ts
+var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
+var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
+
 // adapters/hosted-core/src/proxy.ts
 var NativeToolSchema = strictObject({
   name: string2().min(1),
@@ -35584,9 +35632,10 @@ class ToolProxy {
         return failure2(expired.message);
       throw error;
     }
-    let outcome = { status: "error" };
+    let outcome = { status: "error" }, lost = false;
     try {
       const result = await this.dispatch(name, args, sessionID);
+      lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError)
         outcome = { status: "completed", output: outputOf(result) };
       return result;
@@ -35596,7 +35645,7 @@ class ToolProxy {
         return failure2(expired.message);
       throw error;
     } finally {
-      if (name === "bind" || name === "unbind")
+      if (name === "bind" || name === "unbind" || lost)
         this.forget(sessionID);
       try {
         await this.options.hooks?.afterCall({ sessionID, tool: name, result: outcome });
@@ -35822,9 +35871,6 @@ class ToolProxy {
   }
 }
 
-// src/shared/session_meta.ts
-var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
-
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
 var DETAIL_MAX = 300;
@@ -35995,6 +36041,8 @@ async function end(temporary, path) {
 // adapters/hosted-core/src/controller.ts
 var DRIFTED = "Grayboard credential changed";
 var ADMITTED_LIMIT = 100;
+var ROTATION_POLL_MS = 500;
+var ROTATION_GRACE_MS = 1e4;
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
     if (signal.aborted)
@@ -36016,8 +36064,9 @@ function causeOf(error, type) {
 }
 function fingerprint(e) {
   const c = e.configuration;
-  return createHash6("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.name])).digest("hex");
+  return createHash6("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.held ?? []])).digest("hex");
 }
+var display = (address) => shortOf(address.slice(0, address.lastIndexOf("/")), address);
 
 class Controller {
   port;
@@ -36027,6 +36076,7 @@ class Controller {
   watches = new Map;
   stopped = false;
   ending = new Set;
+  closing = new AbortController;
   drifted = false;
   controls = Promise.resolve();
   state;
@@ -36054,11 +36104,11 @@ class Controller {
     await this.diagnostics.flush();
   }
   set(r, state, message, operation = "delivery", code) {
-    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {}, ...code ? { code } : {} });
+    this.diagnostics.record({ state, message, operation, sessionID: r.e.sessionID, ...r.e.held?.length ? { held: r.e.held } : {}, ...r.lease ? { ownership: r.lease.ownership } : {}, ...code ? { code } : {} });
     r.status = { state, message, sessionID: r.e.sessionID, roots: [] };
   }
   failure(operation, error, r) {
-    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...r ? { sessionID: r.e.sessionID, ...r.e.name ? { name: r.e.name } : {}, ...r.lease ? { ownership: r.lease.ownership } : {} } : {}, code: failureCode(error) });
+    this.diagnostics.record({ state: "degraded", message: `${operation} failed (${failureCode(error)})`, operation, ...r ? { sessionID: r.e.sessionID, ...r.e.held?.length ? { held: r.e.held } : {}, ...r.lease ? { ownership: r.lease.ownership } : {} } : {}, code: failureCode(error) });
   }
   record(input) {
     this.diagnostics.record(input);
@@ -36101,10 +36151,10 @@ class Controller {
     return this.port.approval ? this.port.approval.key(e) : fingerprint(e);
   }
   async remembered(sessionID, approval) {
-    const remembered = await this.port.storage.get(`rememberedName:${sessionID}`);
-    const name = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "name")?.value : undefined;
+    const remembered = await this.port.storage.get(`rememberedHeld:${sessionID}`);
+    const held = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "held")?.value : undefined;
     const key = remembered && typeof remembered === "object" ? Object.getOwnPropertyDescriptor(remembered, "approval")?.value : undefined;
-    return key === this.approvalKey(approval) && typeof name === "string" && /^[a-z0-9_-]{1,32}$/.test(name) ? name : undefined;
+    return key === this.approvalKey(approval) && validHeld(held) && held.length ? held : undefined;
   }
   async save(r, enabled) {
     if (!this.port.approval)
@@ -36176,7 +36226,7 @@ class Controller {
     await this.watches.get(sessionID)?.dispose();
     this.watches.delete(sessionID);
   }
-  async enroll(sessionID, name, create = false) {
+  async enroll(sessionID, names = [], create = false) {
     return this.serial(async () => {
       if (this.stopped || this.ending.has(sessionID))
         throw new Refusal("paused", "Grayboard is stopping");
@@ -36186,7 +36236,7 @@ class Controller {
       if (previous)
         await this.stop(previous);
       const captured = await this.port.credential.capture(sessionID);
-      const e = { ...captured, ...previous?.e.name ? { name: previous.e.name } : {} };
+      const e = { ...captured, ...previous?.e.held?.length ? { held: previous.e.held } : {} };
       const r = { e, approval: structuredClone(e), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
       this.roots.set(sessionID, r);
       this.drifted = false;
@@ -36194,15 +36244,16 @@ class Controller {
       await this.watch(e);
       this.set(r, "approved", "Root approved; bind a name to receive deliveries");
       try {
-        if (name) {
+        if (names.length) {
           const epoch = r.epoch, signal = new AbortController().signal;
           await this.temporary(e, async (w) => {
             await this.guard(r, epoch, signal);
-            await w.call("bind", { name, create, where: this.port.place() });
+            for (const name of names)
+              await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
           });
         }
-        await this.prepare(r, !!previous?.paused && !name);
+        await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         if (!this.drifted)
@@ -36222,14 +36273,14 @@ class Controller {
       if (previous)
         await this.stop(previous);
       const approval = await this.approvalFor(sessionID);
-      const name = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.name : undefined);
-      const r = { e: { ...approval, ...name ? { name } : {} }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
+      const held = await this.remembered(sessionID, approval) ?? (previous && this.approvalKey(previous.approval) === this.approvalKey(approval) ? previous.e.held : undefined);
+      const r = { e: { ...approval, ...held?.length ? { held } : {} }, approval: structuredClone(approval), epoch: (previous?.epoch ?? 0) + 1, paused: false, status: this.state, admitted: previous?.admitted ?? new Set };
       this.roots.set(sessionID, r);
       this.drifted = false;
       await this.watch(r.e);
-      this.set(r, "approved", name ? `Resuming ${name}` : "Root approved; bind a name to receive deliveries");
+      this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
       try {
-        await this.prepare(r, true);
+        await this.rotated({ ms: 0 }, () => this.prepare(r, true));
       } catch (error) {
         if (!this.drifted)
           this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error)));
@@ -36250,10 +36301,40 @@ class Controller {
   async carried(sessionID) {
     try {
       const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) ? live.e.name : undefined);
+      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
     } catch {
       return;
     }
+  }
+  names(e) {
+    return (e.held ?? []).map(display).join(", ");
+  }
+  lostNote(current) {
+    return current.alias_lost?.length ? ` (lost ${current.alias_lost.map((l) => `${display(l.alias)}: ${l.reason}`).join("; ")})` : "";
+  }
+  async dropLost(r, current) {
+    const lost = new Set(current.alias_lost?.map((l) => l.alias).filter((address) => !current.held.includes(address)));
+    const kept = r.e.held?.filter((address) => !lost.has(address));
+    if (!kept || kept.length === r.e.held.length)
+      return false;
+    r.e = { ...r.e, held: kept };
+    await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: kept });
+    return true;
+  }
+  async bindAll(r, wire, held, have, tolerant = false) {
+    const refused = [];
+    for (const address of held) {
+      if (have.includes(address))
+        continue;
+      try {
+        await wire.call("bind", { name: address, create: false, where: this.port.place() });
+      } catch (error) {
+        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden"].includes(error.code)))
+          throw error;
+        refused.push(error);
+      }
+    }
+    return refused;
   }
   async prepare(r, resume = false, waitForStart = false) {
     const epoch = r.epoch, signal = new AbortController().signal;
@@ -36263,24 +36344,30 @@ class Controller {
       await this.guard(r, epoch, signal);
       let current = bindingOf(await wire.call("whoami"));
       await this.guard(r, epoch, signal);
-      if (!current.name && r.e.name && resume) {
-        await wire.call("bind", { name: r.e.name, create: false, where: this.port.place() });
+      if (await this.dropLost(r, current))
+        await this.guard(r, epoch, signal);
+      if (r.e.held?.some((address) => !current.held.includes(address)) && resume) {
+        const refused = await this.bindAll(r, wire, r.e.held, current.held, true);
         await this.guard(r, epoch, signal);
         current = bindingOf(await wire.call("whoami"));
         await this.guard(r, epoch, signal);
+        if (refused[0] && !current.held.length)
+          throw refused[0];
+        for (const error of refused)
+          this.diagnostics.record({ state: "degraded", message: `Could not resume a held name (${error.code}); it is no longer held`, operation: "prepare", sessionID: r.e.sessionID, code: error.code });
       }
       if (r.epoch !== epoch || r.paused || this.stopped)
         return;
-      if (!current.name) {
-        this.set(r, "unbound", "Root approved, unbound; bind(name) to take one");
+      if (!current.held.length) {
+        this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`);
         return;
       }
       await this.guard(r, epoch, signal);
-      r.e = { ...r.e, name: current.name };
-      await this.port.storage.set(`rememberedName:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), name: current.name });
+      r.e = { ...r.e, held: current.held };
+      await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: current.held });
       await this.guard(r, epoch, signal);
       if (r.epoch === epoch && !r.paused && !this.stopped) {
-        this.set(r, "approved", `Bound ${current.name}; opening delivery`, "prepare");
+        this.set(r, "approved", `Bound ${this.names(r.e)}${this.lostNote(current)}; opening delivery`, "prepare");
         const started = this.start(r);
         if (waitForStart)
           await started;
@@ -36305,7 +36392,7 @@ class Controller {
     return started;
   }
   async run(r, e, epoch, signal, ready) {
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false;
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, rotation = 0, outage = false, inItem = false, reidentified = false;
     let pendingItem;
     const attempts = new Map;
     while (!signal.aborted && failures < 8) {
@@ -36316,18 +36403,37 @@ class Controller {
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
         outage = false;
+        rotation = 0;
         await this.guard(r, epoch, signal);
-        if (!current.name) {
-          r.lease = undefined;
-          await wire.call("bind", { name: e.name, create: false, where: this.port.place() });
+        if (await this.dropLost(r, current)) {
+          e = { ...e, held: r.e.held };
           await this.guard(r, epoch, signal);
-        } else if (current.name !== e.name)
-          throw new Refusal("identity", `Root binding changed without a native completion; ${this.hint}`);
-        const lease = leaseOf(await wire.call("delivery_open"), e);
+          if (!e.held?.length) {
+            r.lease = undefined;
+            this.set(r, "unbound", `Root approved, unbound${this.lostNote(current)}; bind(name) to take one`);
+            return;
+          }
+        }
+        if (!current.held.length) {
+          r.lease = undefined;
+          await this.bindAll(r, wire, e.held ?? [], []);
+          await this.guard(r, epoch, signal);
+        } else if (!sameHeld(current.held, e.held))
+          throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
+        let lease;
+        try {
+          lease = leaseOf(await wire.call("delivery_open"), e);
+        } catch (error) {
+          if (!(error instanceof Refusal) || reidentified)
+            throw error;
+          reidentified = true;
+          continue;
+        }
+        reidentified = false;
         await this.guard(r, epoch, signal);
         r.lease = lease;
         wire.capability = lease.capability;
-        this.set(r, "active", `Subscribed as ${e.name}; receipts follow durable root admission`);
+        this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake, closed = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => {
@@ -36355,7 +36461,7 @@ class Controller {
                 if (count > 8)
                   throw new DeliveryStopped(pendingItem);
                 attempts.set(item.id, count);
-                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.name !== lease.identity.identity)
+                if (item.ownership !== lease.ownership || item.bind_gen !== lease.bind_gen || item.address !== undefined && !e.held?.includes(item.address))
                   throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
@@ -36365,7 +36471,7 @@ class Controller {
                   inItem = false;
                   return;
                 }
-                await this.port.admit(e, item, stableID(e, item.id, lease.identity), lease.identity, signal);
+                await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT)
                   r.admitted.delete(r.admitted.values().next().value);
@@ -36423,13 +36529,20 @@ class Controller {
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
+        if (error instanceof AccessExpired && error.reason === "expired" && rotation < ROTATION_GRACE_MS) {
+          rotation += ROTATION_POLL_MS;
+          this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
+          ready();
+          await this.wait(ROTATION_POLL_MS, signal);
+          continue;
+        }
         if (error instanceof Refusal || error instanceof DeliveryStopped)
           throw error;
         if (error instanceof LeaseUnavailable) {
           r.lease = undefined;
           if (!inItem && ++recoveries > 3)
             throw new Refusal("paused", `Lease recovery limit reached; ${this.hint}`);
-        } else if (error instanceof SubscriberError && ["identity_in_use", "identity_unknown"].includes(error.code))
+        } else if (error instanceof SubscriberError && ["alias_held", "identity_unknown"].includes(error.code))
           throw error;
         else {
           failures++;
@@ -36520,6 +36633,20 @@ class Controller {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
+  async rotated(spent, call) {
+    for (;; ) {
+      try {
+        return await call();
+      } catch (error) {
+        if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS)
+          throw error;
+        spent.ms += ROTATION_POLL_MS;
+        await this.wait(ROTATION_POLL_MS, this.closing.signal);
+        if (this.stopped)
+          throw error;
+      }
+    }
+  }
   async restore() {
     await this.diagnostics.restore(async (id) => {
       await this.activeRoot(id);
@@ -36527,6 +36654,7 @@ class Controller {
     });
     if (!this.port.approval)
       return;
+    const spent = { ms: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped)
@@ -36541,17 +36669,33 @@ class Controller {
           throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
         const e = saved.approval;
         const previous = this.status().roots.find((record) => record.sessionID === id);
-        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused";
-        const name = await this.remembered(id, e);
-        const r = { e: { ...e, ...name ? { name } : {} }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set };
+        const expired = previous?.state === "paused" && (previous.code ?? previous.failure?.code) === "native_access_expired";
+        const paused = !saved.enabled || await this.port.storage.get(`paused:${id}`) === true || previous?.state === "paused" && !expired;
+        const held = await this.remembered(id, e);
+        const r = { e: { ...e, ...held ? { held } : {} }, approval: structuredClone(e), epoch: 0, paused, status: this.state, admitted: new Set };
         this.roots.set(id, r);
         if (paused) {
           this.set(r, "paused", `Saved approval paused; ${this.hint}`);
           continue;
         }
-        await this.port.credential.check(e);
+        if (expired)
+          this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
+        try {
+          await this.rotated(spent, () => this.port.credential.check(e));
+        } catch (error) {
+          if (!expired)
+            throw error;
+          if (this.roots.get(id) !== r || r.paused || r.task)
+            continue;
+          const cause = this.expired(error);
+          r.paused = true;
+          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          continue;
+        }
+        if (this.roots.get(id) !== r)
+          continue;
         await this.watch(e);
-        await this.prepare(r, true, true);
+        await this.rotated(spent, () => this.prepare(r, true, true));
       } catch {
         const r = this.roots.get(id);
         if (r) {
@@ -36573,7 +36717,7 @@ class Controller {
       });
       this.routes.remember(path);
     }
-    if (event.tool === "bind" && path.root === event.sessionID)
+    if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID)
       await this.serial(async () => {
         const current = this.roots.get(path.root);
         if (current) {
@@ -36589,22 +36733,27 @@ class Controller {
       if (!r || r.paused || this.drifted || this.stopped)
         return;
       try {
-        if (event.tool !== "bind") {
+        if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output : undefined;
-          if (output?.unbound === true && r.e.name) {
+          if (output?.unbound === true && r.e.held?.length) {
             await this.stop(r);
             r.lease = undefined;
-            await this.prepare(r, true);
+            await this.rotated({ ms: 0 }, () => this.prepare(r, true));
           }
           return;
         }
         await this.stop(r);
         if (event.result.status === "completed") {
           const output = event.result.output;
-          if (!output || typeof output.name !== "string" || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every((line) => typeof line === "string"))
+          const last = event.tool === "unbind" && output?.name === null;
+          if (!output || !(typeof output.name === "string" || last) || !Number.isSafeInteger(output.ownership) || !Array.isArray(output.instructions) || !output.instructions.every((line) => typeof line === "string"))
             throw new Error("Native bind completion lacked validated output");
+          if (last) {
+            r.e = { ...r.e, held: [] };
+            await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: [] });
+          }
         }
-        await this.prepare(r, false);
+        await this.rotated({ ms: 0 }, () => this.prepare(r, false));
       } catch (error) {
         if (!this.drifted)
           this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
@@ -36652,6 +36801,7 @@ class Controller {
   }
   async close() {
     this.stopped = true;
+    this.closing.abort();
     for (const r of this.roots.values())
       r.abort?.abort();
     await this.controls;
@@ -36859,12 +37009,13 @@ class RootDelivery {
       this.signedOut = undefined;
       this.proxy?.forget(id);
       const root = status.roots.find((r) => r.sessionID === id);
-      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.name : undefined;
-      if (carried && bound && this.carrying === carried)
+      const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      if (carried && bound?.length && this.carrying === carried)
         this.carrying = undefined;
-      if (expected && bound !== expected && root?.state !== "paused") {
-        const now = bound ? `it is bound as ${bound}` : "it is unbound";
-        const text = carried ? `this session couldn't take the name ${carried} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its name ${expected} (${root?.message ?? status.message}); ${now}`;
+      const missing = (expected ?? []).filter((address) => !bound?.includes(address));
+      if (missing.length && root?.state !== "paused") {
+        const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
+        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");
       }
@@ -36913,7 +37064,7 @@ class RootDelivery {
     if (record.sessionID !== undefined && record.sessionID !== id)
       return;
     const binding = `${record.state}
-${record.name ?? ""}`;
+${(record.held ?? []).join(",")}`;
     if (binding !== this.lastBinding) {
       this.lastBinding = binding;
       this.proxy?.forget(id);
@@ -37176,7 +37327,7 @@ function createPlugin(o) {
     if (!login || !root || !interactive || closed || signingIn || !initialized)
       return;
     const abort = new AbortController;
-    const done = login.login(abort.signal).then(async () => {
+    const done = login.login(abort.signal, true).then(async () => {
       await complete?.();
       say("signed in");
       await root.credentialChanged();

@@ -17,6 +17,7 @@ import {
 } from "../../../src/shared/attachments.ts";
 import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
+import { GRAYBOARD_ALIAS_LOST_META } from "../../../src/shared/session_meta.ts";
 
 const NativeToolSchema = z.strictObject({
   name: z.string().min(1),
@@ -62,7 +63,6 @@ export function nativeTool(tool: Tool): NativeTool {
 }
 export const snapshotTools = (): NativeTool[] => z.array(NativeToolSchema).parse(snapshot);
 
-// The local tool server mode serves too (src/plugin/tools.ts).
 const ATTACHMENT_GET = NativeToolSchema.parse(ATTACHMENT_GET_TOOL);
 // The tools a host registers: dm_send and board_post take local file paths
 // (`attachments`) where the server takes uploaded ids, plus a local
@@ -202,9 +202,10 @@ export class ToolProxy {
       if (expired) return failure(expired.message);
       throw error;
     }
-    let outcome: CallOutcome = { status: "error" };
+    let outcome: CallOutcome = { status: "error" }, lost = false;
     try {
       const result = await this.dispatch(name, args, sessionID);
+      lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError) outcome = { status: "completed", output: outputOf(result) };
       return result;
     } catch (error) {
@@ -212,8 +213,8 @@ export class ToolProxy {
       if (expired) return failure(expired.message);
       throw error;
     } finally {
-      // A bind or unbind changes what the server's instructions say.
-      if (name === "bind" || name === "unbind") this.forget(sessionID);
+      // A bind or unbind changes what the server's instructions say, and so does a hold the server took (#453).
+      if (name === "bind" || name === "unbind" || lost) this.forget(sessionID);
       try { await this.options.hooks?.afterCall({ sessionID, tool: name, result: outcome }); }
       catch (error) { this.options.report("after", error); }
     }

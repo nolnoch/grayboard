@@ -495,6 +495,19 @@ export function unbindMissed(name: string, why: string, result: string): string 
   return `unbind("${name}") completed after ${why}. ${result}`;
 }
 
+/**
+ * The notice for holds the server took (alias_lost: an access revocation):
+ * each loss, then what the session sends as now. Names as the agent
+ * sees them. `primary`: its primary now, or null, when `none` says what it is;
+ * `moved`: a lost hold was its primary.
+ */
+export function aliasLostNotice(lost: { alias: string; reason: string }[], primary: string | null, moved: boolean, none: string): string {
+  return [
+    ...lost.map((l) => `This session lost its bus name "${l.alias}": ${l.reason}.`),
+    primary === null ? none : moved ? `It sends as "${primary}" now.` : `It still sends as "${primary}".`,
+  ].join(" ");
+}
+
 /** The refusal for a name that has never existed, without create: true. */
 export function unknownNameError(name: string, known: string[]): string {
   return `no name "${name}" has ever been used${known.length ? `; closest: ${known.join(", ")}` : ""}. Pass create: true to make a new one.`;

@@ -1,11 +1,11 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationError, createApplication, type ApplicationSession, type DeliveryEvent, type DeliverySink } from "./application.ts";
+import { ApplicationError, createApplication, type ApplicationSession } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import { boardResourceUri, createResources, parseBoardResourceUri } from "./resources.ts";
 import { isSubscribed, subscribe } from "../core/boards.ts";
@@ -23,15 +23,20 @@ let dir: string;
 let alice: AuthedUser;
 let bob: AuthedUser;
 let revoked: Set<ApplicationSession>;
-const sink = (events: DeliveryEvent[] = []): DeliverySink => ({ deliver: e => { events.push(e); }, probe: async () => true, closed: () => {} });
 const hooks = () => {
   const counts = { changed: 0, closed: 0 };
   return { counts, changed: () => { counts.changed++; }, closed: () => { counts.closed++; } };
 };
 // An upload is its user's (#284 #367): a send carries only uploads its principal made.
 const quotaOf = (user: AuthedUser) => ({ principal: user.user_email, unsent: 1 << 20, stored: 1 << 20 });
-async function select(user: AuthedUser, name = "be", push = false, events: DeliveryEvent[] = []) {
-  return (await application.selectIdentity(tokenSession(application.repo, user), name, sink(events), { push })).session;
+// push: false is a tools-only session (it writes as the alias and holds nothing), push: true a holder that is delivered to.
+async function open(user: AuthedUser, name = "be", push = false) {
+  const s = new AppSession(application, user, name, { push });
+  await s.connect();
+  return s;
+}
+async function select(user: AuthedUser, name = "be", push = false) {
+  return (await open(user, name, push)).session;
 }
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
@@ -76,9 +81,9 @@ test("resource hook failures emit one fixed diagnostic without forged stack or c
 });
 
 test("separate multiwatcher fanout needs no attention subscriptions and preserves active ownership/status", async () => {
-  const ownerEvents: DeliveryEvent[] = [];
-  const owner = await select(alice, "be", true, ownerEvents);
-  application.call(owner, "peer_status", { text: "working" });
+  const owner = await open(alice, "be", true);
+  const ownerEvents = owner.events;
+  await owner.call("peer_status", { text: "working" });
   const a = await select(alice);
   const b = await select(bob);
   application.call(a, "board_create", { name: "e2e", purpose: "tests" });
@@ -245,7 +250,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, { disconnectUser: application.disconnectUser, disconnectSession: application.disconnectSession, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {

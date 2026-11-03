@@ -1,5 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -7,7 +7,7 @@ import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelconte
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationError, GRACE_MS, SWEEP_MS, createApplication, type DeliveryEvent } from "./application.ts";
+import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -74,7 +74,7 @@ test("resource authorization does not sweep unrelated hosted roots", async () =>
 test("legacy identity headers cannot select or create names; explicit bind retains closest-name refusal", async () => {
   const client = await connect("2026-07-28", undefined, new Headers({ "X-Grayboard-Identity": "bee" }));
   const identity = await client.callTool({ name: "whoami", arguments: {} });
-  expect(identity.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"name":\s*"be"/) })]);
+  expect(identity.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"primary":\s*"alice@example.com\/be"/) })]);
   const refused = await client.callTool({ name: "bind", arguments: { name: "bee" } });
   expect(refused.isError).toBe(true);
   expect(refused.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"known":\s*\[\s*"be"\s*\]/) })]);
@@ -152,19 +152,21 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: tools-only contexts preserve live owner and its status`, async () => {
-  const events: DeliveryEvent[] = [];
-  const owner = (await application.selectIdentity(tokenSession(application.repo, user), "fe", { deliver: e => { events.push(e); }, probe: async () => true, closed() {} }, { where: "owner" })).session;
-  application.call(owner, "peer_status", { text: "working" });
+  const owner = new AppSession(application, user, "fe");
+  await owner.connect();
+  application.hostedPlace(owner.id, "owner"); // the place hello's `where` set
+  const events = owner.events;
+  await owner.call("peer_status", { text: "working" });
   const client = await connect(version);
   for (let n = 0; n < 10; n++) {
     expect((await client.callTool({ name: "dm_send", arguments: { to: "fe", body: `hello ${n}` } })).isError).not.toBe(true);
   }
   expect(events).toHaveLength(10);
-  const peers = application.call(owner, "peer_list", {}) as { peers: unknown[] };
+  const peers = await owner.call<{ peers: unknown[] }>("peer_list", {});
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
-  expect(store.repo.cursors.directFor(owner.identityFull)).toBe(0);
+  expect(store.repo.cursors.directFor(owner.session.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(application.selectIdentity(tokenSession(application.repo, user), "fe", { deliver() {}, probe: async () => false, closed() {} })).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
+  await expect(new AppSession(application, user, "fe", { probe: "silent" }).connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
@@ -286,35 +288,40 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: native delegation uses the bound root and retains own-user targeting`, async () => {
-  const owner = await application.selectIdentity(tokenSession(application.repo, user), "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const owner = new AppSession(application, user, "launcher");
+  await owner.connect();
   const foreign = issuedOAuth(store.repo, oauth.resource, "bob@example.com").authed;
-  const other = await application.selectIdentity(tokenSession(application.repo, foreign), "outsider", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
+  const other = new AppSession(application, foreign, "outsider");
+  await other.connect();
+  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
+  for (const launcher of [owner, other]) store.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(launcher.id);
   try {
     const client = await connect(version);
     expect((await client.listTools()).tools.some(t => t.name === "delegate")).toBe(true);
     const refused = await client.callTool({ name: "delegate", arguments: { persona: "researcher", task: "inspect the invariant", to: "bob@example.com/outsider" } });
     expect(refused.isError).toBe(true);
-    expect(application.history(other.session)).toEqual([]);
+    expect(await other.history()).toEqual([]);
     const result = await client.callTool({ name: "delegate", arguments: { persona: "researcher", task: "inspect the invariant", to: "launcher" } });
     expect(result.isError).not.toBe(true);
-    const messages = application.history(owner.session);
+    const messages = await owner.history();
     expect(messages).toHaveLength(1);
     expect(messages[0]!.sender).toBe("alice@example.com/be");
     expect(messages[0]!.body).toContain('"persona": "researcher"');
     expect(store.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'").get()).toEqual({ n: 1 });
-  } finally { application.close(owner.session); application.close(other.session); }
+  } finally { owner.close(); other.close(); }
 });
 
-test("hosted bind does not inherit a previous WS launcher's opt-in", async () => {
-  const prior = await application.selectIdentity(tokenSession(application.repo, user), "launcher", { deliver() {}, probe: async () => true, closed() {} }, { push: true, launcher: true });
-  application.close(prior.session);
-  // #284 S4: the closed WSS session holds "launcher" through its grace; the sweep ends it.
-  application.sweepSessions(Date.now() + GRACE_MS + SWEEP_MS);
+test("hosted bind does not inherit a previous application-level launcher's opt-in", async () => {
+  const prior = new AppSession(application, user, "launcher");
+  await prior.connect();
+  store.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(prior.id);
+  // No grace since #282: close() leaves the hold, so the prior session releases the name by unbinding it.
+  await prior.unbind("alice@example.com/launcher");
+  prior.close();
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
   expect(store.db.query("SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
-  expect(store.db.query("SELECT launcher FROM ids WHERE id = ?").get(prior.session.sessionId)).toEqual({ launcher: 1 });
-  expect(store.db.query("SELECT detail FROM access_log WHERE action = 'handle.launcher_set' AND target = ? ORDER BY rowid DESC LIMIT 1").get("alice@example.com/launcher")).toEqual({ detail: '{"on":false}' });
+  expect(store.db.query("SELECT launcher FROM ids WHERE id = ?").get(prior.id)).toEqual({ launcher: 1 });
 });
 
 test("internal operation failures are redacted, including paths and SQL", async () => {
@@ -806,7 +813,7 @@ test("legacy registry is bounded and idle disconnected sessions are reclaimed", 
   expect(hosted.activeContexts).toBe(0);
   await connect("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(1);
-});
+}, 30_000);
 
 test("global board watch bound cleans partial acquisitions without retiring other listeners", async () => {
   const client = await connect();

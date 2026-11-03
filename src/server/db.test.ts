@@ -12,7 +12,7 @@ const person = (email: string, name: string) => ({ scope_kind: "person" as const
 test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tree)", async () => {
   // src/local/ is the sanctioned same-machine mode (v0 preserved); it owns its own
   // SQLite layer by design. The migration seam this test guards is the v1 backend —
-  // src/server, src/plugin, src/shared, src/cli — so src/local is excluded.
+  // src/server, src/shared, src/cli — so src/local is excluded.
   // src/core/ (boards + claims, shared by both modes) takes a Database handle and
   // is part of the seam: a Postgres port reimplements it alongside db.ts.
   // src/bridge/ keeps a client-side file of its own (the Slack bridge's thread

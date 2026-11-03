@@ -29,11 +29,11 @@ const domainCode = (error: unknown) => error instanceof ApplicationError && erro
 const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
 function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
   const result: { code: string; known?: string[]; holder?: string } = { code: domainCode(error) };
-  if (!(error instanceof ApplicationError) || (result.code !== "identity_unknown" && result.code !== "identity_in_use")) return result;
+  if (!(error instanceof ApplicationError) || (result.code !== "identity_unknown" && result.code !== "alias_held")) return result;
   try {
     const extra = Object.getOwnPropertyDescriptor(error, "extra")?.value;
     if (!extra || typeof extra !== "object") return result;
-    if (result.code === "identity_in_use") {
+    if (result.code === "alias_held") {
       const holder = Object.getOwnPropertyDescriptor(extra, "holder")?.value;
       if (holderText(holder)) result.holder = holder;
       return result;
@@ -154,10 +154,16 @@ export function registerHostedResources(server: McpServer, context: {
   };
   server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: z.strictObject({}) }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
   server.registerTool("bind", {
-    description: "Bind this root's name; never enrolls it for host admission.",
-    inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }),
+    description: "Add a name to this root's holds; never enrolls it for host admission.",
+    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }),
   }, async (args, ctx) => {
     try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
+    catch (error) { return toolError(error); }
+  });
+  server.registerTool("unbind", {
+    description: "Release one of this root's holds.", inputSchema: z.strictObject({ name: z.string().max(160) }),
+  }, async (args, ctx) => {
+    try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
     catch (error) { return toolError(error); }
   });
   server.registerTool("session_register", {

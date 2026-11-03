@@ -89,11 +89,11 @@ const payload = (result: CallToolResult) => result.structuredContent ?? JSON.par
 type Row = { name: string | null; root_session_id: string | null; ownership_id: number; lease_deadline: number | null };
 const hostedId = (raw: string) => hostedSessionId(user, CLIENT, raw);
 const row = (raw: string) => srv.app.db.query<Row, [string]>(
-  "SELECT name, root_session_id, ownership_id, lease_deadline FROM hosted_sessions WHERE session_id = ?").get(hostedId(raw));
+  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, root_session_id, ownership_id, lease_deadline FROM hosted_sessions WHERE session_id = ?").get(hostedId(raw));
 
 // The root's line in /grayboard status says it is subscribed under `name`.
 const active = (i: Instance, id: string, name: string, ms = 5_000) =>
-  until(async () => (await i.ext.status()).includes(`  ${id} (${name}): active,`), ms, `${id} active as ${name}`);
+  until(async () => (await i.ext.status()).includes(`  ${id} (${EMAIL}/${name}): active,`), ms, `${id} active as ${name}`);
 
 async function root(id: string, name: string, extra: Partial<SessionInfo> = {}, create = true) {
   const i = instance();
@@ -211,7 +211,7 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
   expect(row("carry-3")?.name ?? null).toBeNull();
   const result = await third.call("whoami");
   expect(texts(result)).toHaveLength(2);
-  expect(texts(result)[0]).toMatch(/^grayboard: this session couldn't take the name carrier it carried over \(.*identity_in_use.*\); it is unbound$/);
+  expect(texts(result)[0]).toMatch(/^grayboard: this session couldn't take the name \S+\/carrier it carried over \(.*alias_held.*\); it is unbound$/);
   expect(payload(result)).toMatchObject({ unbound: true });
   expect(texts(await third.call("whoami"))).toHaveLength(1);
 
@@ -372,7 +372,7 @@ test("the same session opened twice: the second runs tools-only, says so in its 
   expect(await second.ext.status()).toContain(`delivery: ${HELD}`);
   const result = await second.call("whoami");
   expect(texts(result)[0]).toBe(`grayboard: ${HELD}`);
-  expect(payload(result)).toMatchObject({ name: "twin" });
+  expect(payload(result)).toMatchObject({ primary: `${EMAIL}/twin` });
   expect(texts(await second.call("whoami"))).toHaveLength(1);
 
   // Only the holder admits.
@@ -398,7 +398,7 @@ test("a lock loser that takes delivery before its first call shows no stale held
   await active(second, "stale", "stale-twin", 15_000);
   const result = await second.call("whoami");
   expect(texts(result)).toHaveLength(1);
-  expect(payload(result)).toMatchObject({ name: "stale-twin" });
+  expect(payload(result)).toMatchObject({ primary: `${EMAIL}/stale-twin` });
 }, 30_000);
 
 test("a logout in one session pauses every session on the agentDir: each other session says once that it's signed out, and status names the login, not resume", async () => {
@@ -410,10 +410,10 @@ test("a logout in one session pauses every session on the agentDir: each other s
   await until(() => b.notices.length > 0);
   expect(b.notices).toEqual([{ level: "warning", message: signedOut }]);
   for (const [i, id] of [[a, "logout-a"], [b, "logout-b"]] as const) {
-    await until(async () => (await i.ext.status()).includes(`  ${id} (${id}): paused, `), 5_000, `${id} paused`);
+    await until(async () => (await i.ext.status()).includes(`  ${id} (${EMAIL}/${id}): paused, `), 5_000, `${id} paused`);
     const status = await i.ext.status();
     expect(status).toContain("sign-in: signed out (logged_out); run /grayboard login");
-    expect(status).toContain(`  ${id} (${id}): paused, signed out; run /grayboard login`);
+    expect(status).toContain(`  ${id} (${EMAIL}/${id}): paused, signed out; run /grayboard login`);
     expect(status).not.toContain("/grayboard resume");
   }
   // The session that logged out already said so; its watch adds nothing.
@@ -471,7 +471,7 @@ test("a sign-in in another pi process restarts this root: one active through a r
   await until(() => a.deliveries.some(d => d.content.includes("after the re-login")), 10_000, "a DM after the re-login");
 
   await logoutElsewhere();
-  await until(async () => (await a.ext.status()).includes("  relogin-a (racer): paused, "), 10_000, "paused by the sign-out");
+  await until(async () => (await a.ext.status()).includes(`  relogin-a (${EMAIL}/racer): paused, `), 10_000, "paused by the sign-out");
   await loginElsewhere("relogin-2");
   // Running again, unbound: a new sign-in never inherits the old grant's name.
   await until(async () => (await a.ext.status()).includes("  relogin-a: unbound, "), 10_000, "restarted after the sign-in");
@@ -482,7 +482,7 @@ test("a sign-in in another pi process restarts this root: one active through a r
 test("/new after a sign-in that dropped the root's name carries nothing: a remembered name counts only under the sign-in it was bound with", async () => {
   const a = await root("stale-a", "stalename");
   await logoutElsewhere();
-  await until(async () => (await a.ext.status()).includes("  stale-a (stalename): paused, "), 10_000, "paused by the sign-out");
+  await until(async () => (await a.ext.status()).includes(`  stale-a (${EMAIL}/stalename): paused, `), 10_000, "paused by the sign-out");
   // The lease lapsed meanwhile, so the name is free to take.
   srv.app.mcp.sessions.release(hostedId("stale-a"), "expired");
   await loginElsewhere("stale-relogin");
@@ -506,7 +506,7 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
 
   const again = instance();
   await again.ext.start({ id: "rebind-s", reason: "resume" });
-  const refused = /^grayboard: this session couldn't take back its name rebinder \(Operation refused \(identity_in_use\).*\); it is unbound$/;
+  const refused = /^grayboard: this session couldn't take back its name \S+\/rebinder \(Operation refused \(alias_held\).*\); it is unbound$/;
   expect(again.notices).toEqual([{ level: "warning", message: expect.stringMatching(refused) }]);
   const result = await again.call("whoami");
   expect(texts(result)[0]).toMatch(refused);
@@ -735,7 +735,7 @@ test("a lease release that fails at shutdown is said once: the server down, then
 test("a lease release that fails at shutdown is said once: a logout elsewhere, then quit", async () => {
   const a = await root("outquit-a", "outquit");
   await logoutElsewhere();
-  await until(async () => (await a.ext.status()).includes("  outquit-a (outquit): paused, "), 10_000, "paused by the sign-out");
+  await until(async () => (await a.ext.status()).includes(`  outquit-a (${EMAIL}/outquit): paused, `), 10_000, "paused by the sign-out");
   await until(() => a.notices.length > 0, 10_000, "the sign-out said");
   const before = a.notices.length;
   await a.ext.shutdown("quit");

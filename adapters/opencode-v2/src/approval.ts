@@ -10,7 +10,7 @@ export const METADATA = "grayboard.enrollment";
 export type OpenCodeEnrollment = Enrollment & { mcpName: string; integrationID: string; connectionID: string };
 export function enrollmentHash(e: OpenCodeEnrollment) {
   const c = e.configuration;
-  return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, e.mcpName, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.integrationID, e.connectionID, e.name])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([e.version, e.sessionID, e.mcpName, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.integrationID, e.connectionID, e.held ?? []])).digest("hex");
 }
 type Saved = { enabled?: boolean; enrollment?: OpenCodeEnrollment } | undefined;
 

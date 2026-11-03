@@ -1,5 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -154,16 +154,16 @@ test("subscriber in-use refusals name the holder as bounded plain text", async (
   await hosted.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": "other-root" }), { name: "fe", create: true, where: "/work/app" });
   const client = await connect("2026-07-28");
   const refused = (await client.callTool({ name: "bind", arguments: { name: "fe", create: false } })).structuredContent as { code: string; holder: string };
-  expect(refused.code).toBe("identity_in_use");
+  expect(refused.code).toBe("alias_held");
   expect(refused.holder).toMatch(/^the hosted session \S+, in \/work\/app, last seen \d+s ago$/);
   const bind = hosted.sessions.bind;
   try {
     for (const holder of ["", "x".repeat(2049), "held\nby", "held\u009bby", "held‮by", 42]) {
-      hosted.sessions.bind = async () => { throw new ApplicationError("identity_in_use", "in use", Object.defineProperty({}, "holder", { value: holder })); };
-      expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "identity_in_use" });
+      hosted.sessions.bind = async () => { throw new ApplicationError("alias_held", "in use", Object.defineProperty({}, "holder", { value: holder })); };
+      expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "alias_held" });
     }
-    hosted.sessions.bind = async () => { throw new ApplicationError("identity_in_use", "in use", { holder: "the live session x", known: ["be"] }); };
-    expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "identity_in_use", holder: "the live session x" });
+    hosted.sessions.bind = async () => { throw new ApplicationError("alias_held", "in use", { holder: "the live session x", known: ["be"] }); };
+    expect((await client.callTool({ name: "bind", arguments: { name: "fe" } })).structuredContent).toEqual({ code: "alias_held", holder: "the live session x" });
   } finally { hosted.sessions.bind = bind; }
 });
 
@@ -262,8 +262,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = await application.selectIdentity(tokenSession(application.repo, grant.authed), "be", { deliver() {}, probe: async () => true, closed() {} });
-      application.close(replacement.session);
+      const replacement = new AppSession(application, grant.authed, "be");
+      await replacement.connect();
+      replacement.close();
     }
   } finally { resume(); hosted.delivery.open = original; }
 });

@@ -41,7 +41,7 @@ export const message = (error: unknown) => (error as Error)?.message ?? String(e
 // refusal and generic text) the error's own message, the only detail there
 // is (a JSON-RPC error, a refused connect's HTTP body). That message is the
 // server's or the network's free text, shown to the model and the user, so
-// control and bidi characters (wire.ts's holderText class) become spaces and
+// control and bidi characters (wire.ts's shownText class) become spaces and
 // it is capped.
 const DETAIL_MAX = 300;
 export function failureText(error: unknown, hint: string): string {

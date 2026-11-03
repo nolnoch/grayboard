@@ -1,12 +1,14 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
+import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE, RESEND_PARAM } from "../core/tools.ts";
+import { BIND_TOOL, UNBIND_TOOL } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
 import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
+import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
@@ -205,7 +207,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const row = hosted.row(context.sessionContext.id);
     if (!row) return false;
     const root = hosted.rootOf(row);
-    return !!root.name && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
+    return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
   const unlistenHosted = hosted.listen(() => {
     for (const live of [...lives]) {
@@ -387,14 +389,26 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     track(Promise.resolve().then(() => legacy.server.close()).catch(report));
     track(Promise.resolve().then(() => legacy.transport.close()).catch(report));
   }
+  // A hosted stream the 1 s timer stops is audited once with why (#472): the
+  // access token's expiry (the hourly rollover), else the refusal's code. A
+  // stream whose client already closed it isn't the server's stop: it goes unaudited.
+  const auditedStreams = new WeakSet<Context>();
+  function streamClosed(context: Context, error: unknown) {
+    if (!("id" in context.sessionContext) || context.request.signal.aborted || auditedStreams.has(context)) return;
+    auditedStreams.add(context);
+    try {
+      const reason = context.principal.accessExpiry <= now() ? "access_expired" : error instanceof ApplicationError ? error.code : "failed";
+      hosted.audit(context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
+    } catch (e) { hostedFailure("mcp.stream", e); }
+  }
   const timer = setInterval(() => {
     for (const legacy of [...legacyAll]) {
       try {
         if (!oauth.isAuthorized(legacy.principal) || !legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
     }
-    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); track(stream.stop()); } }
+    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(live.context, e); live.stop(); } }
+    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(context, e); track(stream.stop()); } }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
@@ -570,24 +584,41 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
 }
 
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
+  // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
+  // marks it, so a host caching this session's instructions fetches them again.
+  const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
+    ? { ...result, content: [...result.content, { type: "text", text: notice }], _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
+    let notice: string | undefined;
     try {
       const context = current(ctx);
-      return text(await hosted.run(context.principal, context.sessionContext, tool, call) ?? "ok");
+      return said(text(await hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
       const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
-      return { ...text(`error: ${message}`), isError: true };
+      return said({ ...text(`error: ${message}`), isError: true }, notice);
     }
   };
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: z.strictObject({}) }, async (_, ctx) => {
     const context = current(ctx);
-    return text(await hosted.whoami(context.principal, context.sessionContext));
+    let notice: string | undefined;
+    return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
   });
-  server.registerTool("bind", { description: "Take or change this session's name; unknown names require create:true.", inputSchema: z.strictObject({ name: z.string().max(32), create: z.boolean().optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
+  const bindRefusal = (e: unknown, tool: string) => {
+    report(e, tool);
+    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request"].includes(e.code)) refuse(e.code);
+    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
+  };
+  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.
+  server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
+    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
-    catch (e) { report(e, "bind"); if (e instanceof ApplicationError && ["identity_unknown", "identity_in_use", "bad_request"].includes(e.code)) refuse(e.code); return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true }; }
+    catch (e) { return bindRefusal(e, "bind"); }
+  });
+  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: z.strictObject({ name: z.string().max(160) }) }, async (args, ctx) => {
+    try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
+    catch (e) { return bindRefusal(e, "unbind"); }
   });
   for (const tool of boardTools({ teams: true })) {
     const properties = { ...tool.inputSchema.properties };
@@ -600,7 +631,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   }
   server.registerTool("dm_send", {
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
-    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), as: z.string().describe(AS_PARAM.description).optional() }),
+    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), resend: z.boolean().describe(RESEND_PARAM.description).optional(), as: z.string().describe(AS_PARAM.description).optional() }),
   }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,

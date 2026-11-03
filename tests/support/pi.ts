@@ -474,7 +474,7 @@ export async function statusOf(pi: Pi): Promise<string> {
 
 // The hosted session `client` keeps for the harness session `raw`.
 export const hostedRow = (srv: HostedServer, client: string, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
-  "SELECT name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(client, raw) ?? undefined;
+  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(client, raw) ?? undefined;
 // `raw`'s hosted session holds `name` and the server's one delivery lease.
 export const leased = (srv: HostedServer, client: string, raw: string, name: string): boolean => {
   const row = hostedRow(srv, client, raw);
@@ -781,7 +781,7 @@ export function piHostedTwiceScenario(dir: string): Promise<void> {
     const checked = await toolResult(b, "whoami");
     expect(checked.isError).toBeFalsy();
     expect(resultText(checked)).toStartWith(`grayboard: ${HELD}\n`);
-    expect(resultText(checked)).toMatch(/"name":\s*"pi-twice"/);
+    expect(resultText(checked)).toMatch(/"primary":\s*"[^"]*\/pi-twice"/);
     await idle(b);
     expect(opened()).toBe(1);
     expect(leasedAs(srv, state.sessionId, "pi-twice")).toBe(true);

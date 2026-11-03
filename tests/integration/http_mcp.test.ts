@@ -6,10 +6,10 @@ import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
-import { writeAudit } from "../../src/server/audit.ts";
+import { verifySessionToken } from "../../src/server/auth.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { WsClient } from "../support/ws_client.ts";
+import { AppSession, type AppSessionOptions } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
@@ -19,7 +19,7 @@ let base: string;
 let blobDir: string;
 let clock: number | undefined;
 const clients: Client[] = [];
-const wsClients: WsClient[] = [];
+const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
@@ -29,7 +29,7 @@ beforeEach(() => {
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
-  for (const client of wsClients.splice(0)) client.close();
+  for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
   app.db.close();
@@ -46,6 +46,15 @@ async function legacyLogin(email = "alice@example.com") {
     if (!app.repo.aliases.find(`${user.email}/${name}`)) app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: name }, user.email);
   }
   return token;
+}
+// An application session (#282) signed in with a session token: the launcher
+// the hosted MCP has no form of yet (#451).
+function appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+  const authed = verifySessionToken(token, app.repo, app.touches);
+  if (!authed) throw new Error("appSession: the token doesn't authenticate");
+  const s = new AppSession(app.application, authed, identity, opts);
+  appSessions.push(s);
+  return s;
 }
 async function connect(token: string, identity = "be", version = "2026-07-28", origin?: string, bind = true) {
   const client = new Client({ name: "http-test", version: "1" }, {
@@ -84,11 +93,13 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
+// hosted twin: #451 (the launcher)
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
   const token = await login();
-  const launcher = new WsClient(base, await legacyLogin(), "allowed", { hello: { launcher: true } });
-  wsClients.push(launcher);
-  expect((await launcher.connect()).type).toBe("hello_ok");
+  const owner = appSession(await legacyLogin(), "allowed");
+  await owner.connect();
+  // The hello's launcher flag is gone (#282); the row is what delegate and peer_list read.
+  app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(owner.id);
   const client = await connect(token, "be", version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("delegate");
   const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));
@@ -97,40 +108,6 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation u
   expect(app.repo.messages.getById(result.message_id)).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
   expect(JSON.parse(app.repo.audit.last("delegation.requested", "alice@example.com/allowed")!.detail!)).toMatchObject({ via: "explicit", message_id: result.message_id });
   expect((value(await client.callTool({ name: "peer_list", arguments: {} })).peers as { handle: string; launcher?: boolean }[]).find(p => p.handle === "alice@example.com/be")?.launcher).toBeUndefined();
-});
-
-for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: tools-only HTTP requests leave bridge death notices for an owning WS hello`, async () => {
-  const token = await login();
-  const legacy = await legacyLogin();
-  const client = await connect(token, "be", version, undefined, false);
-  const target = "alice@example.com/human";
-  const at = new Date().toISOString();
-  writeAudit(app.repo, "bridge.stopped", null, target, { reason: "fixture fatal", at });
-  const notice = `your Slack bridge stopped at ${at} (fixture fatal); linked humans are offline until it reconnects or the server restarts`;
-
-  const tools = await client.listTools();
-  expect(tools.tools.length).toBeGreaterThan(0);
-  expect(JSON.stringify(tools)).not.toContain(notice);
-  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
-  expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
-  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
-  await connect(token, "be", version, undefined, false);
-  expect(app.repo.audit.last("bridge.notified", target)).toBeUndefined();
-
-  const owner = new WsClient(base, legacy, "be");
-  wsClients.push(owner);
-  const hello = await owner.connect();
-  expect(hello.type).toBe("hello_ok");
-  expect(hello.notices).toEqual([notice]);
-  const notified = app.repo.audit.last("bridge.notified", target);
-  expect(notified).toBeDefined();
-
-  const next = new WsClient(base, legacy, "allowed");
-  wsClients.push(next);
-  const again = await next.connect();
-  expect(again.type).toBe("hello_ok");
-  expect(again.notices ?? []).toEqual([]);
-  expect(app.repo.audit.last("bridge.notified", target)).toEqual(notified);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {
@@ -190,7 +167,7 @@ test("all HTTP methods authenticate; identity headers never bind an uncontextual
       requestInit: { headers: { Authorization: `Bearer ${token}`, ...(identity ? { "X-Grayboard-Identity": identity } : {}) } },
     }));
     expect(value(await client.callTool({ name: "board_list", arguments: {} }))).toEqual([]);
-    expect(value(await client.callTool({ name: "whoami", arguments: {} })).name).toBeNull();
+    expect(value(await client.callTool({ name: "whoami", arguments: {} })).primary).toBeNull();
     expect((await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "no context" } })).isError).toBe(true);
     expect((await client.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).toBe(true);
   }
@@ -309,21 +286,12 @@ test("live access, family, disable and admin revocation never reuse a cached pri
   }
 });
 
-test("old session remains accepted on retained API and WS but not new MCP", async () => {
+test("old session remains accepted on retained API but not new MCP", async () => {
   const token = await legacyLogin();
   const headers = { Authorization: `Bearer ${token}` };
-  const api = await fetch(`${base}/api/auth/config`, { headers });
-  expect(api.status).toBe(200);
-  const owned = await fetch(`${base}/api/identities`, { headers });
-  expect(owned.status).toBe(200);
-  const refused = await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } });
-  expect(refused.status).toBe(401);
-  const ws = new WebSocket(base.replace("http:", "ws:"), { headers });
-  const closed = new Promise<void>(resolve => { ws.onclose = () => resolve(); });
-  await new Promise<void>((resolve, reject) => { ws.onopen = () => resolve(); ws.onerror = () => reject(new Error("WS failed")); });
-  expect(ws.readyState).toBe(WebSocket.OPEN);
-  ws.close();
-  await closed;
+  expect((await fetch(`${base}/api/auth/config`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/api/identities`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } })).status).toBe(401);
 });
 
 test("connected clients cannot dispatch after their actual access deadline", async () => {
