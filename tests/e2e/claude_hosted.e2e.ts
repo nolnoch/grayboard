@@ -151,9 +151,12 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's r
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // 2.1.316 keeps the URL prompt up after the plugin's completion notice and
     // its cancel, and the prompt takes the keyboard: the user dismisses it.
+    // Keys typed before the main screen redraws can be lost (CI lost a letter).
     expect(debug()).toContain("Received elicitation completion notification");
+    const mark = tty.screen().length;
     tty.proc.terminal!.write("\x1b");
     await until(() => debug().includes('Elicitation response: {"action":"cancel"}'), 10_000, "Esc to dismiss the sign-in prompt");
+    await until(() => tty!.screen().slice(mark).includes("for shortcuts"), 10_000, "the main screen to redraw after the prompt");
     await tty.submit("WHOAMI-AGAIN");
     const again = "toolu_WHOAMI_AGAIN";
     await until(() => toolResults(model, again).length > 0, 30_000, "the second whoami result");
