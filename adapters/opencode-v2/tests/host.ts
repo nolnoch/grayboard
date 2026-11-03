@@ -14,6 +14,8 @@ import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { SESSION_ID } from "../../../src/core/session_id.ts";
 import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
+import { channelInstructions, DEFAULT_CHANNEL_SOURCE } from "../../../src/core/tools.ts";
+import { launcherInstruction } from "../../../src/core/delegation.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
@@ -43,7 +45,10 @@ const admissions: NativeInput[] = [];
 const admitted: typeof admissions = [];
 const suspendedModel = { target: "", entered: barrier(), released: barrier() };
 let pendingAdmissions = 0;
-const raceGate: AdmissionGate = { holding: false, boundary: process.env.GRAYBOARD_TEST_RACE_BOUNDARY === "after" ? "after" : "before", inputs: [], accepted: [], models: [], entered() {}, released: Promise.resolve() };
+// Every primary model request as OpenCode sent it, after the plugins' context hooks (#531).
+const modelRequests: { sessionID: string; body: string }[] = [];
+let pluginOptions: Record<string, unknown> = {};
+const raceGate: AdmissionGate ={ holding: false, boundary: process.env.GRAYBOARD_TEST_RACE_BOUNDARY === "after" ? "after" : "before", inputs: [], accepted: [], models: [], entered() {}, released: Promise.resolve() };
 const calls: { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null; accessHash: string }[] = [];
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
 const nativeCompleted: string[] = [], wrappers: string[] = [];
@@ -94,7 +99,7 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
   await c.session.hook("title", e => { e.result = "Fixture"; });
   await c.session.hook("http.request", async e => {
     if (e.kind !== "primary") return;
-    raceGate.models.push(e.sessionID);
+    raceGate.models.push(e.sessionID); modelRequests.push({ sessionID: e.sessionID, body: await e.request.clone().text() });
     if (e.sessionID === suspendedModel.target) { suspendedModel.entered.release(); await suspendedModel.released.promise; }
   });
   await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
@@ -110,7 +115,7 @@ const instrumented = instrument(plugin, async (input, forward) => {
     if (raceGate.holding && raceGate.boundary === "after") { raceGate.entered(); await raceGate.released; }
     if (process.env.GRAYBOARD_TEST_REAL_RACE === "expiry") expiryContinuation.returned();
     return value;
-});
+}, () => pluginOptions);
 const createHost = () => createFixtureHost({ plugins: [fromPromise(fixture), instrumented], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "real-home/config"), project: false, claude: false }, fs: { filewatcher: false } });
 let host: Awaited<ReturnType<typeof createHost>> | undefined;
 const location = { directory: join(root, "project") };
@@ -287,6 +292,66 @@ try {
       console.log("REAL_PROCESS_CRASH_RECOVERY_OK", JSON.stringify({ boundary, original: saved.input, historicalModels: saved.models, recoveryModels: result.models, cursor: lost.id }));
       console.log("REAL_BACKEND_CRASH_OK");
     } finally { crashWorker.kill("SIGKILL"); await crashWorker.exited; }
+  } else if (process.env.GRAYBOARD_TEST_REAL_RACE === "instructions") {
+    // #531: OpenCode's MCP client caches the session-less unbound text once per process; the plugin's
+    // context hook puts each enrolled root's current server instructions in its model requests.
+    const said = (sessionID: string, needle?: string) => {
+      const request = modelRequests.findLast(r => r.sessionID === sessionID && (!needle || r.body.includes(JSON.stringify(needle).slice(1, -1))));
+      assert(request, `a model request for ${sessionID}${needle ? " carrying " + needle : ""}`);
+      const strings: string[] = [], walk = (v: unknown): void => { if (typeof v === "string") strings.push(v); else if (v && typeof v === "object") Object.values(v).forEach(walk); };
+      walk(JSON.parse(request.body)); return strings.join("\n");
+    };
+    const unbound = "This session has no bus name yet.", channel = channelInstructions(DEFAULT_CHANNEL_SOURCE)[0]!, launcher = launcherInstruction()[0]!;
+    const boundAs = (name: string) => `You are "you@example.com/${name}" on grayboard.`;
+    const restart = async () => {
+      const prior = ctx;
+      await host!.close(); host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
+      await wait(() => ctx, c => c !== prior, "fixture setup after restart");
+      await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), Boolean, "native discovery after restart");
+      await host.mcp.connect({ server: "grayboard", location }); await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools after restart");
+    };
+    const active = (sessionID: string, label: string) => wait(() => rpc.status({}, { location }), s => rootStatus(s, sessionID)?.state === "active", label);
+    // Bind before enroll, launcher root: the native bind declares no launcher; enroll's wires do.
+    pluginOptions = { launcher: true };
+    await restart();
+    const late = await makeRoot("Bind before enroll");
+    await invoke(late.id, "bind", { name: "late", create: true });
+    assert(said(late.id).includes(unbound), "An unenrolled root's request goes as OpenCode built it");
+    await rpc.enroll({ sessionID: late.id }, { location }); await active(late.id, "late root active");
+    await invoke(late.id, "whoami", {});
+    let text = said(late.id);
+    assert(text.includes(boundAs("late")) && text.includes(channel) && text.includes(launcher), "After enroll the root's request carries its bound, pushed and launcher text");
+    assert(!text.includes(unbound));
+    console.log("REAL_INSTRUCTIONS_BIND_BEFORE_ENROLL_OK");
+    // A delegation request admitted to the launcher root: the request that carries it carries the launcher instruction.
+    const ask = "[delegation request from you@example.com] Fixture delegation " + late.id;
+    app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/late", ask, null, false); app.application.wake(["you@example.com/late"]);
+    await wait(() => modelRequests, rs => rs.some(r => r.sessionID === late.id && r.body.includes("Fixture delegation " + late.id)), "delegation reaches the model");
+    await host.session.wait({ sessionID: late.id });
+    text = said(late.id, "Fixture delegation " + late.id);
+    assert(text.includes(launcher) && text.includes(boundAs("late")), "The delegation's request carries the launcher instruction");
+    console.log("REAL_INSTRUCTIONS_DELEGATION_OK");
+    // Configured name, launcher root: the plugin binds at creation; the agent learns it only through the hook.
+    pluginOptions = { launcher: true, name: "lead", create: true };
+    await restart();
+    const lead = await makeRoot("Configured launcher");
+    await wait(() => row(lead.id)?.name, n => n === "lead", "configured bind at creation");
+    await rpc.enroll({ sessionID: lead.id }, { location }); await active(lead.id, "configured root active");
+    await invoke(lead.id, "whoami", {});
+    text = said(lead.id);
+    assert(text.includes(boundAs("lead")) && text.includes(channel) && text.includes(launcher) && !text.includes(unbound), "Configured launcher root sees its bound and launcher text");
+    console.log("REAL_INSTRUCTIONS_CONFIGURED_LAUNCHER_OK");
+    // No launcher option: bound and pushed, no launcher lines.
+    pluginOptions = {};
+    await restart();
+    const plain = await makeRoot("Plain root");
+    await rpc.enroll({ sessionID: plain.id, name: "plain", create: true }, { location }); await active(plain.id, "plain root active");
+    await invoke(plain.id, "whoami", {});
+    text = said(plain.id);
+    assert(text.includes(boundAs("plain")) && text.includes(channel) && !text.includes(unbound), "Plain root sees its bound text");
+    assert(!text.includes(launcher), "A root that isn't a launcher gets no launcher lines");
+    if (codeMode) assert(text.includes('Use tools from this server through `execute` under `tools["grayboard"]`.'), "The rebuilt entry keeps OpenCode's codemode line");
+    console.log("REAL_INSTRUCTIONS_PLAIN_OK", { requests: modelRequests.length });
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE) {
     await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location, subscriberWork, expiryContinuation,
       enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),

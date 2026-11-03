@@ -4,7 +4,7 @@ export const matrixLoopSHA = "daecaf67fd934d1b37c5fe6eec8df58311388c7f77c897bf33
 
 export const matrixCases = [
   ...["pause", "archive", "delete", "rebind", "enrollment", "account", "account-away-back", "config", "away-back", "revocation", "expiry"].flatMap(scenario => ["before", "after"].map(boundary => ({ scenario, boundary, crash: "" }))),
-  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account"].map(scenario => ({ scenario, boundary: "", crash: "" })),
+  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account", "instructions"].map(scenario => ({ scenario, boundary: "", crash: "" })),
   ...["before", "after"].map(crash => ({ scenario: "", boundary: "", crash })),
 ];
 
