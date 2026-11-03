@@ -21,7 +21,7 @@ import { basename, join } from "node:path";
 import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
 import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
 import { CLAUDE_CODE_VERSION, type ClaudeHome, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
-import { onChannelDm, onUserText, startFakeAnthropic } from "../support/fake_anthropic.ts";
+import { onChannelDm, onUserText, startFakeAnthropic, toolResults } from "../support/fake_anthropic.ts";
 import { browse, hostedServer, seedGrant } from "../support/hosted_oauth.ts";
 import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
@@ -67,12 +67,6 @@ function install(h: ClaudeHome, srv: ReturnType<typeof hostedServer>, mp: string
   claudeCli(bin, h, ["plugin", "install", CLAUDE_PLUGIN, "--config", `server_url=${srv.resource}`]);
   return from;
 }
-
-// The text of each tool_result the model was sent for the tool_use `id`.
-const toolResults = (model: ReturnType<typeof startFakeAnthropic>, id: string): string[] =>
-  model.requests.flatMap((r) => r.body.messages.flatMap((m) => typeof m.content === "string" ? [] : m.content))
-    .filter((b) => b.type === "tool_result" && b.tool_use_id === id)
-    .map((b) => typeof b.content === "string" ? b.content : JSON.stringify(b.content));
 
 test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a channel message, the reply reaches the peer`, async () => {
   const srv = hostedServer();

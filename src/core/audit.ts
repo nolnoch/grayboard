@@ -21,6 +21,14 @@ import type { Database } from "bun:sqlite";
 export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
 
 /**
+ * Local mode's own actions beside the shared ones: Claude Code subagent
+ * attribution (#551), a call refused for a missing hook record and a session
+ * whose settings predate the hook. The hosted plugin refuses a missing record
+ * itself, so the server never sees either.
+ */
+export type LocalAuditAction = CoreAuditAction | "claude.agent_record_missing" | "claude.attribution_off";
+
+/**
  * Where a core function shared by both modes writes its audit row: local
  * mode's audit_log (writeCoreAudit), or the server's access_log through its
  * Repo (#342), so each mode keeps one trail its retention and readers cover.
@@ -32,7 +40,7 @@ export const coreAuditSink = (db: Database): AuditSink => (action, actor, target
 
 export function writeCoreAudit(
   db: Database,
-  action: CoreAuditAction,
+  action: LocalAuditAction,
   actor: string,
   target: string | null,
   detail?: Record<string, unknown>,

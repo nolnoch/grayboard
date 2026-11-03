@@ -11,7 +11,7 @@ on:
       suite:
         description: "Suite to run"
         type: choice
-        options: [upgrade-matrix, claude-hosted, hosted-live, hosted-public, hosted-network]
+        options: [upgrade-matrix, claude-hosted, claude-local, hosted-live, hosted-public, hosted-network]
         default: upgrade-matrix
   workflow_call:
     inputs:
@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix","claude-hosted","hosted-live","hosted-public"]' || inputs.suite == 'hosted-network' && '["hosted-live","hosted-public"]' || format('["{0}"]', inputs.suite)) }}
+        suite: ${{ fromJSON(github.event_name == 'schedule' && '["upgrade-matrix","claude-hosted","claude-local","hosted-live","hosted-public"]' || inputs.suite == 'hosted-network' && '["hosted-live","hosted-public"]' || format('["{0}"]', inputs.suite)) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ["upgrade-matrix", "claude-hosted", "hosted-live", "hosted-public"]   # the schedule's suites, as in e2e's matrix
+        suite: ["upgrade-matrix", "claude-hosted", "claude-local", "hosted-live", "hosted-public"]   # the schedule's suites, as in e2e's matrix
     permissions:
       issues: write
     steps:

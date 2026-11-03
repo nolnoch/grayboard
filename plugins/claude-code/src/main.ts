@@ -8,6 +8,7 @@ import pkg from "../../../package.json" with { type: "json" };
 import { Login } from "../../../adapters/hosted-core/src/login.ts";
 import { readJson } from "../../../adapters/hosted-core/src/storage.ts";
 import { hostFiles } from "../../../src/shared/claude_channels.ts";
+import { procStart } from "../../../src/shared/proc.ts";
 import { parentCommandLine } from "../../../src/shared/toolguard.ts";
 import { CLIENT_ID, createPlugin, HARNESS, LOGIN_INTERACTIVE } from "./plugin.ts";
 
@@ -54,7 +55,9 @@ async function logout(args: string[]): Promise<number> {
 }
 
 async function serve(): Promise<void> {
-  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: pkg.version, cwd: process.cwd(), log });
+  // Claude Code starts this server directly, so its parent is Claude Code (CLAUDE_PID in the hooks).
+  const claude = { pid: process.ppid, start: procStart(process.ppid) ?? null };
+  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: pkg.version, cwd: process.cwd(), claude, log });
   let exiting = false;
   const exit = async () => {
     if (exiting) return;

@@ -8,7 +8,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { BUNDLE, bundle } from "../../scripts/build_claude_plugin.ts";
+import { BUNDLE, BUNDLES, bundle } from "../../scripts/build_claude_plugin.ts";
 import { pinMarketplace, renderMarketplace, SHA_RE, TAG_RE, verifyPin } from "../../scripts/pin_claude_plugin.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -20,11 +20,26 @@ const marketplace = JSON.parse(readFileSync(join(ROOT, ".claude-plugin/marketpla
 // The build resolves hosted-core's dependencies from the root install, so the
 // bundle is the same whether or not hosted-core's own gate has installed
 // adapters/hosted-core/node_modules, and carries one copy of each package.
-test("the committed bundle is a fresh build of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", async () => {
-  const fresh = await bundle();
-  expect(fresh.includes("// adapters/hosted-core/node_modules/")).toBe(false);
-  expect(readFileSync(BUNDLE, "utf8") === fresh).toBe(true);
+test("the committed bundles are fresh builds of plugins/claude-code/src (run `bun scripts/build_claude_plugin.ts`)", async () => {
+  for (const b of BUNDLES) {
+    const fresh = await bundle(b.entry);
+    expect(fresh.includes("// adapters/hosted-core/node_modules/")).toBe(false);
+    expect({ path: b.path, fresh: readFileSync(b.path, "utf8") === fresh }).toEqual({ path: b.path, fresh: true });
+  }
 }, 60_000);
+
+// The hooks that make a subagent's calls its own child session (#551): every
+// grayboard tool's PreToolUse, and the session's start, end and subagent stops.
+test("the plugin's hooks run the hook bundle with bun for each event", () => {
+  const hooks = JSON.parse(readFileSync(join(PLUGIN, "hooks/hooks.json"), "utf8")).hooks;
+  const run = (event: string) => [{ type: "command", command: `bun "\${CLAUDE_PLUGIN_ROOT}/dist/hook.js" ${event} --data "\${CLAUDE_PLUGIN_DATA}"`, timeout: 10 }];
+  expect(hooks).toEqual({
+    SessionStart: [{ matcher: "startup|resume|clear|fork", hooks: run("session-start") }],
+    PreToolUse: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("pre-tool-use") }],
+    SubagentStop: [{ hooks: run("subagent-stop") }],
+    SessionEnd: [{ hooks: run("session-end") }],
+  });
+});
 
 test("the manifest carries package.json's version and runs the bundle with bun, with the server URL from userConfig", () => {
   expect(manifest.name).toBe("grayboard");
