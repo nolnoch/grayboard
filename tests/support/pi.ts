@@ -506,12 +506,38 @@ export const answerPeer = (prefix: string): Rule => onChannelDm(PEER, (id, text)
 });
 
 // A DM from the peer to `name` starts a turn in the session holding it,
-// whose dm_send reply lands in the same thread, sent as `name`. Returns the DM's id.
+// whose dm_send reply lands in the same thread, sent as `name`. Returns the
+// DM's id. `resend`: a scenario pings the same name more than once, and an
+// identical dm_send within 10 minutes returns the first message instead.
 export async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
-  const { message_id: id } = await peer.call("dm_send", { to: `alice@example.com/${name}`, body: `ping ${name}` });
+  const { message_id: id } = await peer.call("dm_send", { to: `alice@example.com/${name}`, body: `ping ${name}`, resend: true });
   const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
   expect(reply.sender).toBe(`alice@example.com/${name}`);
   return id;
+}
+
+// The session file `file` records each of `pings` (DM ids, in order) admitted
+// under `root` and then receipted, and no message body in those records (#441).
+export async function expectDeliveryRecords(file: string, root: string, pings: number[], name: string): Promise<void> {
+  type Entry = { event: "admitted"; root: string; itemId: string; stableID: string; wake: boolean } | { event: "receipted"; root: string; itemIds: string[] };
+  const want = pings.map((p) => `direct:${p}`);
+  const read = () => readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; customType?: string; data?: Entry })
+    .filter((e) => e.type === "custom" && e.customType === "grayboard-delivery").map((e) => e.data!);
+  const entries = await until(() => {
+    const r = read();
+    const receipted = r.flatMap((e) => e.event === "receipted" ? e.itemIds : []);
+    return want.every((id) => receipted.includes(id)) ? r : undefined;
+  }, 15_000, `receipts for ${want.join(", ")} in ${file}`);
+  const admitted = entries.filter((e) => e.event === "admitted");
+  expect(admitted.map((e) => e.itemId)).toEqual(want);
+  for (const e of entries) expect(e.root).toBe(root);
+  for (const e of admitted) expect(e).toMatchObject({ wake: true, stableID: expect.any(String) });
+  // Each receipt follows its admission.
+  for (const id of want) {
+    const at = entries.findIndex((e) => e.event === "admitted" && e.itemId === id);
+    expect(entries.findIndex((e) => e.event === "receipted" && e.itemIds.includes(id))).toBeGreaterThan(at);
+  }
+  expect(JSON.stringify(entries)).not.toContain(`ping ${name}`);
 }
 
 type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
@@ -666,7 +692,7 @@ export function piHostedCarryScenario(dir: string): Promise<void> {
     const first = await pi.command({ type: "get_state" });
     await pi.command({ type: "prompt", message: "bind" });
     await until(() => leasedAs(srv, first.sessionId, "pi-carry"), 30_000, "first session leased as pi-carry");
-    await pingPong(srv, peer, "pi-carry");
+    const p1 = await pingPong(srv, peer, "pi-carry");
     await idle(pi);
     const firstOwnership = piRow(srv, first.sessionId)!.ownership_id;
 
@@ -690,7 +716,7 @@ export function piHostedCarryScenario(dir: string): Promise<void> {
     await until(() => leasedAs(srv, fresh.sessionId, "pi-carry"), 15_000, "new session leased as pi-carry");
     expect(piRow(srv, forked.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, forkOwnership)).toBe(true);
-    await pingPong(srv, peer, "pi-carry");
+    const p3 = await pingPong(srv, peer, "pi-carry");
     await idle(pi);
 
     // /resume of the first session: it rebinds the name it remembers.
@@ -698,9 +724,13 @@ export function piHostedCarryScenario(dir: string): Promise<void> {
     expect((await pi.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
     await until(() => leasedAs(srv, first.sessionId, "pi-carry"), 15_000, "resumed first session leased as pi-carry");
     expect(piRow(srv, fresh.sessionId)).toBeUndefined();
-    await pingPong(srv, peer, "pi-carry");
+    const p4 = await pingPong(srv, peer, "pi-carry");
     await idle(pi);
     expect(grayboardDescendants(pi.pid)).toEqual([]);
+    // Each session's file records its deliveries: the first holds the DMs it
+    // received before the fork and after the resume, /new's the one it did.
+    await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "pi-carry");
+    await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "pi-carry");
     await pi.quit();
   });
 }

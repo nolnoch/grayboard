@@ -17,6 +17,7 @@ import type { Level } from "../hosted-core/src/client.ts";
 import { loadMode } from "../hosted-core/src/proxy.ts";
 import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
 import { registry, rootOf } from "./omp-ancestry.ts";
+import { plan, replaceText } from "./omp-instructions.ts";
 
 // omp's MCP naming (tool-bridge.ts mintMCPToolName): grayboard's tool names
 // are already lowercase snake case, so `mcp__grayboard_<tool>`, as the local
@@ -29,6 +30,24 @@ export default function grayboard(pi: ExtensionAPI) {
   let current: Grayboard | undefined, currentId: string | undefined;
   let agent: ExtensionContext["agent"] | undefined;
   let disposed = false; // session_shutdown ran: no session starts after it
+  // The instructions `before_agent_start` last appended. Here, not in the
+  // Grayboard, so it outlives a session switch's replace(): the hooks below
+  // compare omp's current system prompt against it.
+  let injected: string | undefined;
+  const warned = new Set<string>(); // stale texts a missed rewrite was shown for
+
+  // On screen when there is one, else on stderr.
+  const show = (message: string, level: Level) => {
+    if (ctx?.hasUI) ctx.ui.notify(message, level);
+    else console.error(message);
+  };
+  // Always into omp's log file; on screen too.
+  const notify = (message: string, level: Level) => {
+    if (level === "error") pi.logger.error(message);
+    else if (level === "warning") pi.logger.warn(message);
+    else pi.logger.info(message);
+    show(message, level);
+  };
 
   // Read at each register, so a subagent revived after its main session
   // moved on (/new) registers under the root that is live now.
@@ -66,14 +85,8 @@ export default function grayboard(pi: ExtensionAPI) {
     // wait, hidden, for the next turn.
     deliver: (content, wake) => pi.sendMessage({ customType: "grayboard", content, display: true },
       wake ? { deliverAs: "aside", triggerTurn: true } : { deliverAs: "nextTurn" }),
-    // Always into omp's log file; on screen too when there is one.
-    notify: (message: string, level: Level) => {
-      if (level === "error") pi.logger.error(message);
-      else if (level === "warning") pi.logger.warn(message);
-      else pi.logger.info(message);
-      if (ctx?.hasUI) ctx.ui.notify(message, level);
-      else console.error(message);
-    },
+    notify,
+    record: data => pi.appendEntry("grayboard-delivery", data),
   });
 
   const begin = async (context: ExtensionContext, reason: StartReason) => {
@@ -122,7 +135,36 @@ export default function grayboard(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, context) => {
     if (context.agent.kind !== "main") return undefined;
     const text = await current?.instructions();
+    injected = text || undefined;
     return text ? { systemPrompt: [...event.systemPrompt, text] } : undefined;
+  });
+  // A turn a push started skips before_agent_start, so each main request is
+  // brought to the current instructions here. A system prompt omp rebuilt
+  // (/resume, /new, /fork) holds no grayboard element: that one request gets
+  // the instructions as a hidden message (omp cloned the messages for it).
+  pi.on("context", async (event, context) => {
+    if (context.agent.kind !== "main") return undefined;
+    const next = plan(context.getSystemPrompt(), injected, await current?.instructions());
+    if (next.kind !== "inject") return undefined;
+    const message = { role: "custom", customType: "grayboard-instructions", content: next.text, display: false, attribution: "agent", timestamp: Date.now() } as const;
+    return { messages: [message, ...event.messages] };
+  });
+  // One that still holds the text last appended, now stale (a bind since),
+  // gets it rewritten in the payload, in place: the return value stays
+  // undefined, since some providers ignore it or need their own object.
+  pi.on("before_provider_request", async (event, context) => {
+    if (context.agent.kind !== "main") return undefined;
+    const next = plan(context.getSystemPrompt(), injected, await current?.instructions());
+    if (next.kind !== "replace" || replaceText(event.payload, next.from, next.to) > 0) return undefined;
+    // The text changed on the way (Cursor stringifies the prompt; omp redacts
+    // credentials): this request keeps the stale instructions.
+    const model = context.model ? `${context.model.provider}/${context.model.id}` : "an unknown model";
+    pi.logger.warn(`grayboard: couldn't refresh the instructions in a request to ${model}; it carries the ones from the last prompt`);
+    if (!warned.has(next.from)) {
+      warned.add(next.from);
+      show(`grayboard: this turn's model (${model}) may still see the instructions from before the last bind; send a prompt to refresh them`, "warning");
+    }
+    return undefined;
   });
   pi.registerCommand("grayboard", { ...COMMAND, handler: async (args, context) => { ctx = context; await current?.command(args); } });
 }
