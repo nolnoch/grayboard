@@ -164,7 +164,7 @@ export function createGrayboard(h: Harness): Grayboard {
 
   const client = login ? new HostedClient({
     harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
-    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, log,
+    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, launcher: process.env.BUS_LAUNCHER === "1", log,
   }) : undefined;
 
   // ---- tools ----

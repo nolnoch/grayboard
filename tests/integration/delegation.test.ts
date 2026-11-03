@@ -1,7 +1,7 @@
 // Delegation (#184): local-mode sessions (separate `grayboard mcp --mode
 // local` children) over real processes, and the server's: a requester on a
-// hosted MCP session, a launcher on an application session, since a hosted
-// session can't be a launcher yet (#451). The launcher opt-in, the delegate
+// hosted MCP session, a launcher on an application session registered as a hosted
+// request's launcher declaration is (#473). The launcher opt-in, the delegate
 // tool's resolution rules, the payload's harness-neutrality, the human
 // fallback, refusals and their audit rows (kept by a hosted call since #452),
 // and result-return through the pending/promise machinery.
@@ -26,13 +26,11 @@ type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: str
 // A server whose hosted sessions can poll their inbox freely.
 const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
 
-// The hello's launcher flag is gone with the hello (#282), so nothing in a
-// hosted session sets ids.launcher yet (#451): the fixture sets the row the
-// delegate resolution and peer_list read, on a connected application session.
+// A connected application session that registers as a launcher, as a hosted
+// request's launcher declaration does (#473).
 async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity);
+  const s = srv.appSession(token, identity, { launcher: true });
   await s.connect();
-  srv.app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(s.id);
   return s;
 }
 

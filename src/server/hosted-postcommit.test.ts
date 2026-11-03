@@ -43,10 +43,8 @@ beforeEach(async () => {
   if (authenticated instanceof Response) throw new Error("fixture authentication");
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
-  recipient = new AppSession(application, principal.authed, "launcher");
+  recipient = new AppSession(application, principal.authed, "launcher", { launcher: true });
   await recipient.connect();
-  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
-  database.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(recipient.id);
   events = recipient.events;
 });
 afterEach(async () => {

@@ -31557,6 +31557,7 @@ var StreamableHTTPClientTransport = class {
 // adapters/hosted-core/src/wire.ts
 import { setTimeout as sleep3 } from "timers/promises";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
+var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 
 class SubscriberError extends Error {
   code;
@@ -31720,7 +31721,7 @@ class Connection {
     };
   }
   declaration() {
-    return this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {};
+    return { ...this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}, ...this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {} };
   }
   async reachable(pending) {
     try {
@@ -35902,7 +35903,7 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source } };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {} };
   }
   temporary = async (sessionID, run) => {
     const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
@@ -37338,6 +37339,7 @@ function createPlugin(o) {
     retryHint: RESUME_HINT,
     roots,
     env: o.env,
+    launcher: o.env.BUS_LAUNCHER === "1",
     log: (message) => say(message)
   });
   const initializedOr = (signal) => {

@@ -3,7 +3,8 @@ import type { Delivery } from "./port.js";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export const DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
-export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery };
+export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
+export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true };
 
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
@@ -137,7 +138,9 @@ abstract class Connection {
   // Role headers and the `_meta` every request carries unless it names its own.
   protected abstract decorate(headers: Headers): void;
   protected abstract meta(): Record<string, unknown>;
-  protected declaration(): Record<string, unknown> { return this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}; }
+  protected declaration(): Record<string, unknown> {
+    return { ...(this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}), ...(this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {}) };
+  }
   // An abort of this wire's own signal is the controller stopping, never an outage.
   protected async reachable<T>(pending: Promise<T>): Promise<T> {
     try { return await pending; }

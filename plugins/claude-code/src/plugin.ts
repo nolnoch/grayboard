@@ -173,7 +173,7 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   const client = login && new HostedClient({
     harness: HARNESS, clientId: CLIENT_ID, version: o.version, login, source: SOURCE,
-    loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, log: message => say(message),
+    loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, launcher: o.env.BUS_LAUNCHER === "1", log: message => say(message),
   });
 
   // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.

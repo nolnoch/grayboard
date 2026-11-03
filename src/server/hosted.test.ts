@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
-import { createHostedSessions, deliveryDeclaration, sessionContext } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, sessionContext } from "./hosted.ts";
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import { aliasUser, boundInstructions } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
@@ -564,4 +564,50 @@ test("cleanFact drops format characters before folding the line, and stores NFC,
   expect(cleanFact("x\u200fy\u061c\ufeff")).toBe("xy");
   expect(cleanFact("e\u0301")).toBe("\u00e9");
   expect(cleanFact("\u200b")).toBeNull();
+});
+
+test("a request's launcher declaration is the ownership's: registered and audited, restated by a new ownership, cleared at its end, refused unless a boolean (#473)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-root", ...extra });
+  const id = (ctx() as { id: string }).id;
+  const flag = () => (database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get(id) as { launcher: number }).launcher;
+  const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set'").all();
+  expect(() => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
+  expect(ctx({ [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
+  // Any client's declaration is read, not only a generic key's.
+  expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_LAUNCHER_META]: true })).toMatchObject({ launcher: true });
+  await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
+  expect(flag()).toBe(1);
+  expect(audited()).toEqual([{ target: id, detail: JSON.stringify({ on: true }) }]);
+  // The ownership's end clears it; a new ownership that declares nothing isn't one, and one that declares restates it.
+  await hosted.end(generic, ctx());
+  expect(flag()).toBe(0);
+  await hosted.whoami(generic, ctx());
+  expect(flag()).toBe(0);
+  await hosted.end(generic, ctx());
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
+  expect(flag()).toBe(1);
+  expect(audited()).toHaveLength(2);
+});
+
+test("a declared launcher is a delegation target, and only its own session's initialize and bind text carry the launcher instruction (#473)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (raw: string, extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: raw, ...extra });
+  const bound = await hosted.bind(generic, ctx("lead-root", { [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
+  const plain = await hosted.bind(generic, ctx("plain-root"), { name: "plain", create: true });
+  // A launcher is a target while its delivery is live.
+  await delivery.open(generic, ctx("lead-root", { [GRAYBOARD_LAUNCHER_META]: true }));
+  await delivery.open(generic, ctx("plain-root"));
+  const instructions = (r: { structuredContent?: unknown }) => ((r.structuredContent as { instructions: string[] }).instructions).join(" ");
+  expect(instructions(bound)).toContain("You're a launcher session");
+  expect(instructions(plain)).not.toContain("You're a launcher session");
+  const info = { identity_full: "you@example.com/lead", teams: [], human: { linked: false } } as never;
+  expect(hostedBoundInstruction(info, undefined, true)).toContain("You're a launcher session");
+  expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
+  // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
+  const requester = await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
+  expect(requester).toBeDefined();
+  const result = await hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it" }));
+  expect(result).toMatchObject({ to: "you@example.com/lead" });
+  await expect(hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
 });

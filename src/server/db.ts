@@ -1312,8 +1312,9 @@ function makeHostedStore(db: Database): HostedStore {
       const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id);
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
       // A hosted ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
-      // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it.
-      db.run("UPDATE ids SET writes_as = NULL WHERE id = ?", [session]);
+      // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
+      // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one.
+      db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
       // Every hold the ownership has, not one name's (#451): ending it releases them all.
       for (const { address } of db.query<{ address: string }, [string]>("DELETE FROM alias_holds WHERE id = ? RETURNING address").all(session)) {
         db.run("INSERT INTO binding_events(session_id, name, event, at, detail) VALUES (?, ?, 'released', ?, ?)", [session, address, now, reason]);

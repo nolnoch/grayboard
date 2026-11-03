@@ -289,13 +289,11 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: native delegation uses the bound root and retains own-user targeting`, async () => {
-  const owner = new AppSession(application, user, "launcher");
+  const owner = new AppSession(application, user, "launcher", { launcher: true });
   await owner.connect();
   const foreign = issuedOAuth(store.repo, oauth.resource, "bob@example.com").authed;
-  const other = new AppSession(application, foreign, "outsider");
+  const other = new AppSession(application, foreign, "outsider", { launcher: true });
   await other.connect();
-  // The launcher flag is only the ids.launcher column since #282 (it was hello's `launcher: true`).
-  for (const launcher of [owner, other]) store.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(launcher.id);
   try {
     const client = await connect(version);
     expect((await client.listTools()).tools.some(t => t.name === "delegate")).toBe(true);
@@ -313,9 +311,8 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 });
 
 test("hosted bind does not inherit a previous application-level launcher's opt-in", async () => {
-  const prior = new AppSession(application, user, "launcher");
+  const prior = new AppSession(application, user, "launcher", { launcher: true });
   await prior.connect();
-  store.db.query("UPDATE ids SET launcher = 1 WHERE id = ?").run(prior.id);
   // No grace since #282: close() leaves the hold, so the prior session releases the name by unbinding it.
   await prior.unbind("alice@example.com/launcher");
   prior.close();
