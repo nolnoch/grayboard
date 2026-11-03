@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LEFTOVER_TTL_MS, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
@@ -209,5 +210,28 @@ describe("facts (#545)", () => {
     writeFileSync(join(sessionDir(base, pid), "effort"), "two words");
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     expect(said).toEqual([`effort: ${join(sessionDir(base, pid), "effort")} isn't a Claude Code effort`]);
+  });
+
+  test("a new process's SessionStart drops facts an earlier holder of the pid left; /clear keeps the effort", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "max" } }, true);
+    hook("session-start", { source: "clear", model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "max" });
+    hook("session-start", { source: "startup" }, true);
+    expect(facts()).toEqual({});
+  });
+
+  test("a link, a FIFO or an oversized fact file is said and left out, never followed, waited on or read whole", () => {
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    symlinkSync("/dev/zero", join(dir, "effort"));
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "effort"));
+    execFileSync("mkfifo", [join(dir, "effort")]);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "model"));
+    writeFileSync(join(dir, "model"), "x".repeat(10_000));
+    expect(facts()).toEqual({});
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "effort", "model", "effort"]);
   });
 });

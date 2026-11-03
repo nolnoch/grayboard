@@ -37382,7 +37382,7 @@ ${record.message}`;
 }
 
 // src/shared/claude_agents.ts
-import { mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { closeSync, constants as constants2, fstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
 import { join as join5 } from "path";
 
 // src/shared/protocol.ts
@@ -37437,6 +37437,17 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
     } catch {}
   }
 }
+function readSmall(path, max) {
+  const fd = openSync(path, constants2.O_RDONLY | constants2.O_NOFOLLOW | constants2.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile())
+      throw new Error("not a regular file");
+    const buf = Buffer.alloc(max);
+    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+  } finally {
+    closeSync(fd);
+  }
+}
 function readFacts(base, claudePid, harnessStart, bad) {
   const dir = sessionDir(base, claudePid);
   let start;
@@ -37451,7 +37462,7 @@ function readFacts(base, claudePid, harnessStart, bad) {
   for (const fact of FACTS) {
     let value;
     try {
-      value = readFileSync4(join5(dir, fact), "utf8");
+      value = readSmall(join5(dir, fact), SESSION_FACT_MAX + 1);
     } catch (e) {
       if (e.code !== "ENOENT")
         bad(fact, `couldn't read ${join5(dir, fact)}: ${e.message}`);

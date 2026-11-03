@@ -32,7 +32,7 @@
 //
 // Imports nothing heavy: the local hook entry (src/cli/main.ts) loads this
 // module alone, so a hook costs a process start and a few file operations.
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
@@ -57,9 +57,6 @@ export const validToolUseId = (id: unknown): id is string => typeof id === "stri
 
 export const agentsRoot = (base: string) => join(base, "claude-agents");
 export const sessionDir = (base: string, claudePid: number) => join(agentsRoot(base), String(claudePid));
-
-export type HookEvent = "session-start" | "pre-tool-use" | "model-switch" | "subagent-stop" | "session-end";
-export const HOOK_EVENTS: readonly HookEvent[] = ["session-start", "pre-tool-use", "model-switch", "subagent-stop", "session-end"];
 
 /** The root's facts, one file each. */
 export const FACTS = ["model", "effort"] as const;
@@ -109,7 +106,12 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // An unreadable start time is recorded empty: the reader then can't tell a
       // recycled pid, and treats the dir as its harness's (proc.ts's rule).
       put(join(dir, "start"), start ?? "");
-      if (o.hosted) putFact(dir, "model", input.model);
+      if (o.hosted) {
+        // A new process starts with no facts, even in a dir an earlier holder of
+        // this pid left; a /clear keeps its process's effort.
+        if (input.source !== "clear") for (const fact of FACTS) dropFact(dir, fact);
+        putFact(dir, "model", input.model);
+      }
       pruneSessions(o.base, pid);
     } else if (event === "pre-tool-use") {
       const id = input.tool_use_id;
@@ -234,6 +236,18 @@ export function takeRecord(base: string, claudePid: number, harnessStart: string
   }
 }
 
+// At most `max` bytes of a regular file, never following a link or waiting on a
+// FIFO: a fact file is read on every hosted request, so a same-user process that
+// swaps one for `/dev/zero` or a pipe must not stall or flood the server.
+function readSmall(path: string, max: number): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
+    const buf = Buffer.alloc(max);
+    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+  } finally { closeSync(fd); }
+}
+
 /**
  * The root's latest facts in `claudePid`'s dir, read whole per request: none
  * without a SessionStart record or for a recycled pid's dir, and only the
@@ -248,7 +262,7 @@ export function readFacts(base: string, claudePid: number, harnessStart: string 
   const out: { model?: string; effort?: string } = {};
   for (const fact of FACTS) {
     let value: string;
-    try { value = readFileSync(join(dir, fact), "utf8"); } catch (e) {
+    try { value = readSmall(join(dir, fact), SESSION_FACT_MAX + 1); } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") bad(fact, `couldn't read ${join(dir, fact)}: ${(e as Error).message}`);
       continue;
     }
