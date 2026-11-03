@@ -30,7 +30,9 @@ export type LoginConfig = {
   stateDir: string;
   harness: string;    // "pi" | "omp" | "Claude Code", in messages
   loginAction: string; // how this harness signs in, e.g. "run /grayboard login", in AccessExpired
-  present(url: string): void | Promise<void>; // open or show the authorization URL
+  // Open or show the authorization URL. The flow takes the browser's answer
+  // whether or not this has settled; a rejection before that answer ends it.
+  present(url: string): void | Promise<void>;
   notify(message: string): void;              // a sign-in already running in another session of this harness
   diagnostic(record: Omit<RecordStatus, "time">): void;
 };
@@ -364,8 +366,11 @@ export class Login {
       const url = new URL(meta.authorization_endpoint);
       url.search = new URLSearchParams({ response_type: "code", client_id: this.config.clientId, redirect_uri: callback.redirectUri, scope: SCOPES, resource: this.resource, state,
         code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
-      await this.config.present(url.href);
-      params = await callback.result;
+      // A prompt the user never answers (or a host that shows it late) must
+      // not hold a browser answer that already came back (#497).
+      const presented = Promise.resolve().then(() => this.config.present(url.href));
+      presented.catch(() => {});
+      params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally { callback.close(); }
     // RFC 9207: the response names its issuer, so a mix-up can't land here.
     const iss = params.get("iss");
