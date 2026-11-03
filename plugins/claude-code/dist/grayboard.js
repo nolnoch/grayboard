@@ -32398,8 +32398,9 @@ ${config.clientId}`)}.json`);
         code_challenge: createHash3("sha256").update(verifier).digest("base64url"),
         code_challenge_method: "S256"
       }).toString();
-      await this.config.present(url.href);
-      params = await callback.result;
+      const presented = Promise.resolve().then(() => this.config.present(url.href));
+      presented.catch(() => {});
+      params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
       callback.close();
     }
@@ -37219,10 +37220,11 @@ var CLIENT_ID = "grayboard-claude-code";
 var SOURCE = "plugin:grayboard:grayboard";
 var ENTRY = `plugin:${CLAUDE_PLUGIN}`;
 var RESUME_HINT = "call any grayboard tool to retry";
-var LOGIN_INTERACTIVE = "approve the grayboard sign-in Claude Code shows (any grayboard tool call offers it again)";
+var LOGIN_INTERACTIVE = "open the sign-in link a grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
 var FLOW_MS2 = 10 * 60000;
+var LINK_MS = 20000;
 function pluginConfig(env) {
   const { CLAUDE_CODE_SESSION_ID: id, CLAUDE_PLUGIN_DATA: dataDir } = env, url = env.GRAYBOARD_SERVER_URL?.trim();
   if (!id)
@@ -37251,6 +37253,7 @@ function createPlugin(o) {
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers();
   let signingIn;
+  let failed;
   let server;
   const listChanged = () => {
     if (initialized && !closed)
@@ -37263,20 +37266,35 @@ function createPlugin(o) {
     harness: HARNESS,
     loginAction,
     present: async (url) => {
-      const abort = signingIn?.abort.signal;
-      if (!server.getClientCapabilities()?.elicitation?.url) {
-        const text = `open ${url} to sign in to grayboard`;
-        root?.noticeOnce(text, "last");
-        say(text);
+      const flow = signingIn;
+      flow?.show(url);
+      say(`open ${url} to sign in to grayboard`);
+      if (!server.getClientCapabilities()?.elicitation?.url)
         return;
+      const prompt = { id: randomUUID2(), withdraw: new AbortController };
+      if (flow)
+        flow.prompt = prompt;
+      say(`sign-in prompt sent (elicitation ${prompt.id})`);
+      let result;
+      try {
+        result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+      } catch (error) {
+        if (prompt.withdraw.signal.aborted)
+          return;
+        say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
+        throw error;
       }
-      const elicitationId = randomUUID2();
-      const result = await server.elicitInput({ mode: "url", elicitationId, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, ...abort ? { signal: abort } : {} });
-      if (result.action !== "accept")
-        throw new LoginFailed(result.action === "decline" ? "sign-in declined" : "sign-in cancelled");
-      complete = () => server.createElicitationCompletionNotifier(elicitationId)().catch(() => {});
+      say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action}`);
+      if (result.action === "decline")
+        throw new LoginFailed("sign-in declined");
     },
-    notify: (message) => say(message),
+    notify: (message) => {
+      say(message);
+      if (signingIn) {
+        signingIn.elsewhere = message;
+        signingIn.show(undefined);
+      }
+    },
     diagnostic: (record) => {
       if (record.state !== "degraded" && record.state !== "paused")
         return;
@@ -37284,7 +37302,6 @@ function createPlugin(o) {
       say(record.message);
     }
   });
-  let complete;
   const client = login && new HostedClient({
     harness: HARNESS,
     clientId: CLIENT_ID,
@@ -37327,19 +37344,42 @@ function createPlugin(o) {
     if (!login || !root || !interactive || closed || signingIn || !initialized)
       return;
     const abort = new AbortController;
+    const { promise: link, resolve: show } = Promise.withResolvers();
+    failed = undefined;
     const done = login.login(abort.signal, true).then(async () => {
-      await complete?.();
+      if (flow.prompt)
+        await server.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
       say("signed in");
       await root.credentialChanged();
     }, (error) => {
-      if (!abort.signal.aborted)
-        say(`sign-in failed: ${message(error)}`);
+      if (abort.signal.aborted)
+        return;
+      failed = message(error);
+      say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
     }).finally(() => {
-      complete = undefined;
-      if (signingIn?.done === done)
+      flow.prompt?.withdraw.abort();
+      show(undefined);
+      if (signingIn === flow)
         signingIn = undefined;
     });
-    signingIn = { abort, done };
+    const flow = { abort, done, link, show };
+    signingIn = flow;
+  };
+  const offer = async () => {
+    signIn();
+    const flow = signingIn;
+    if (!flow)
+      return failed ? `sign-in failed: ${failed}` : undefined;
+    const url = await Promise.race([flow.link, after(LINK_MS).then(() => {
+      return;
+    })]);
+    if (url)
+      return `open ${url} to sign in to grayboard`;
+    if (flow.abort.signal.aborted)
+      return;
+    if (flow.elsewhere && signingIn === flow)
+      return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
+    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; call a grayboard tool again for its link";
   };
   const unpause = async () => {
     if (!root || "error" in config)
@@ -37368,10 +37408,8 @@ function createPlugin(o) {
     try {
       await login.token();
     } catch (error) {
-      if (accessExpiry(error)) {
-        signIn();
-        return;
-      }
+      if (accessExpiry(error))
+        return interactive ? offer() : undefined;
     }
     return unpause();
   };

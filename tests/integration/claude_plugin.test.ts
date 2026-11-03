@@ -269,7 +269,7 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
   expect(s.elicits[0]!.url).toStartWith(`${srv.issuer}/`);
   expect(s.elicits[0]!.message).toContain(srv.issuer);
-  await until(() => s.stderr().includes("sign-in failed: sign-in declined"), 10_000, "the decline");
+  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
 
   // Two calls while signed out: one prompt between them.
   const calls = await Promise.all([texts(s, "whoami"), texts(s, "peer_list")]);
@@ -277,6 +277,31 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   await signedIn(s);
   expect(s.elicits).toHaveLength(2);
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
+}, 40_000);
+
+test("a prompt left unanswered (#497): every signed-out result carries the link, opening it signs in, and the prompt is completed and withdrawn", async () => {
+  const s = await plugin("sess-unanswered", { answer: () => new Promise(() => {}) });
+  await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
+  const link = new RegExp(`^grayboard: open (${RegExp.escape(srv.issuer)}/\\S+) to sign in to grayboard$`);
+  const calls = await Promise.all([texts(s, "whoami"), texts(s, "peer_list")]);
+  for (const c of calls) expect(c.texts[0]).toMatch(link);
+  expect(link.exec(calls[0]!.texts[0]!)![1]).toBe(s.elicits[0]!.url);
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await signedIn(s);
+  await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
+  expect(s.elicits).toHaveLength(1);
+  const said = s.stderr();
+  expect(said).toContain("sign-in prompt sent (elicitation ");
+  expect(said).not.toContain("sign-in prompt ended without an answer");
+  expect(said).not.toContain("sign-in failed");
+}, 40_000);
+
+test("a sign-in that can't reach the server says why in the next result", async () => {
+  const s = await plugin("sess-unreachable", { env: { GRAYBOARD_SERVER_URL: "http://127.0.0.1:1/mcp" } });
+  await until(() => s.stderr().includes("sign-in failed: "), 15_000, "the failed startup sign-in");
+  const r = await texts(s, "whoami");
+  expect(r.error).toBe(true);
+  expect(r.texts.join("\n")).toMatch(/^grayboard: sign-in failed: /m);
 }, 40_000);
 
 test("two signed-out processes share one sign-in: one prompt between them, and both come up signed in", async () => {
@@ -332,7 +357,7 @@ test("a logout elsewhere is said once on stderr; the next tool result says it to
   expect(r.error).toBe(true);
   expect(r.texts.join("\n")).toContain(said);
   // The call offered a sign-in, declined: an event later than any sign-out line.
-  await until(() => s.stderr().includes("sign-in failed: sign-in declined"), 10_000, "the declined sign-in");
+  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the declined sign-in");
   expect(count(s.stderr(), said)).toBe(1);
 }, 30_000);
 

@@ -177,6 +177,16 @@ test("a denied consent fails the login and writes nothing", async () => {
   expect(grants()).toBe(0);
 });
 
+test("the browser's answer ends the flow while present() is still pending; a present() that rejects first ends it (#497)", async () => {
+  // A prompt the user never answers, with the link opened from elsewhere.
+  const l = login({ present: url => { void browse(url); return new Promise<void>(() => {}); } });
+  await l.login();
+  expect(await l.token()).toBe((await l.read())!.access!);
+  // A declined prompt, with no browser.
+  const declined = login({ present: async () => { throw new LoginFailed("sign-in declined"); } });
+  await expect(declined.login()).rejects.toThrow("sign-in declined");
+});
+
 test("two concurrent login() calls in two processes create one grant", async () => {
   const a = spawn("login"), b = spawn("login");
   const presented = await Promise.race([a.next(l => !!l.present), b.next(l => !!l.present)]);
