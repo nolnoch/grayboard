@@ -26,7 +26,7 @@ import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.t
 import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
-import { describeLocation } from "../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -127,6 +127,9 @@ export function createGrayboard(h: Harness): Grayboard {
   // The bind's `where` (peer_list, a name refusal's holder text): this
   // process's checkout, as server mode's `grayboard mcp` sent it.
   const place = describeLocation(process.cwd()) ?? h.name;
+  // An explicit BUS_IDENTITY: each new root binds it at its first start (#443).
+  const configured = configuredIdentity(process.env, process.cwd());
+  if (configured && "error" in configured) log(`BUS_IDENTITY is ignored: ${configured.error}`, "warning");
 
   let closed = false;                 // shutdown began
   let done = false;                   // shutdown finished
@@ -283,7 +286,7 @@ export function createGrayboard(h: Harness): Grayboard {
     state.carried = undefined;
     const id = s.id;
     root = new RootDelivery(client!, {
-      sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}),
+      sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}), ...(configured && "name" in configured ? { configured: configured.name } : {}),
       // Idempotent per stableID across this root's runtimes: a /reload keeps
       // the lease, so the reloaded Controller re-reads an item admitted before
       // the reload whose receipt hadn't landed, and must not deliver it twice.

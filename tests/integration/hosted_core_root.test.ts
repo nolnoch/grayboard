@@ -57,12 +57,13 @@ function client(logs: { message: string; level: Level }[], launcher = false) {
 }
 
 type Rig = { id: string; client: HostedClient; root: RootDelivery; logs: { message: string; level: Level }[]; admitted: Item[] };
-function rig(id: string, o: Partial<Pick<RootOptions, "carried" | "admit">> = {}): Rig {
+function rig(id: string, o: Partial<Pick<RootOptions, "carried" | "admit" | "configured" | "push">> = {}): Rig {
   const logs: Rig["logs"] = [], admitted: Item[] = [];
   const c = client(logs);
   const root = new RootDelivery(c, {
-    sessionID: id, stateDir, place: () => "hosted-core-root test", push: true,
+    sessionID: id, stateDir, place: () => "hosted-core-root test", push: o.push ?? true,
     ...(o.carried ? { carried: o.carried } : {}),
+    ...(o.configured ? { configured: o.configured } : {}),
     admit: o.admit ?? (async item => { admitted.push(item); }),
     onTools: () => {},
   });
@@ -202,6 +203,59 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   const next = texts(await refused.root.call("whoami"));
   expect(next[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
   expect(texts(await refused.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+});
+
+// An explicit BUS_IDENTITY (#443): a session with nothing to take back binds it at its first start, creating it.
+test("a configured name binds at a fresh root's first start, created and said nowhere; a remembered or carried name comes first", async () => {
+  const fresh = rig("conf-1", { configured: "conf-new" });
+  await fresh.root.start();
+  await active(fresh, "conf-new");
+  expect(fresh.logs).toEqual([]);
+  expect(texts(await fresh.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(row("conf-1")).toMatchObject({ name: "conf-new" });
+
+  // A resumed session takes back what it held, not the configured name.
+  const before = await live("conf-2", "remembered");
+  await before.root.shutdown("detach");
+  const resumed = rig("conf-2", { configured: "conf-other" });
+  await resumed.root.start();
+  await active(resumed, "remembered");
+  expect(row("conf-2")).toMatchObject({ name: "remembered" });
+
+  // A /new's carried name, likewise.
+  const carrier = await live("conf-3", "carried-name");
+  const carried = await carrier.root.shutdown("release", { carry: true });
+  const successor = rig("conf-4", { carried, configured: "conf-other" });
+  await successor.root.start();
+  await active(successor, "carried-name");
+  expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-other`)).toBeNull();
+});
+
+test("a configured name another session holds is said once and in the next tool result; a later start doesn't try it again", async () => {
+  await live("conf-held-1", "conf-held");
+  const r = rig("conf-held-2", { configured: "conf-held" });
+  await r.root.start();
+  const said = /^BUS_IDENTITY asked for "conf-held", but this session couldn't bind it \(.*alias_held.*\); it is unbound$/;
+  expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
+  expect(texts(await r.root.call("whoami"))[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
+  await r.root.resume();
+  expect(r.logs).toHaveLength(1);
+  expect(row("conf-held-2")).toMatchObject({ name: null });
+});
+
+test("a tools-only root (push off) binds its configured name through its own connection; one another session holds is said once", async () => {
+  const r = rig("conf-tools", { configured: "conf-tools", push: false });
+  await r.root.start();
+  await until(() => row("conf-tools")?.name === "conf-tools", 10_000, "tools-only bound");
+  expect(r.logs).toEqual([]);
+
+  await live("conf-tools-held-1", "conf-tools-held");
+  const held = rig("conf-tools-held-2", { configured: "conf-tools-held", push: false });
+  await held.root.start();
+  const said = /^BUS_IDENTITY asked for "conf-tools-held", but this session couldn't bind it \(.*\); it started unbound$/;
+  await until(() => held.logs.length > 0, 10_000, "tools-only refusal said");
+  expect(held.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
+  expect(texts(await held.root.call("whoami"))[0]).toMatch(/^grayboard: BUS_IDENTITY asked for "conf-tools-held"/);
 });
 
 test("detach keeps the lease and name for the next runtime; release ends the session", async () => {

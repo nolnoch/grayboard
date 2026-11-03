@@ -152,6 +152,17 @@ test("a flagged interactive session: discover is refused, the handshake stays be
   expect(SOURCE).toBe("plugin:grayboard:grayboard");
 }, 40_000);
 
+test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  await plugin("sess-conf", { env: { BUS_IDENTITY: "Conf-Plug" } });
+  await until(() => row("sess-conf")?.name === "conf-plug" && row("sess-conf")?.lease_deadline != null, 10_000, "the configured name's lease");
+
+  const bad = await plugin("sess-conf-bad", { env: { BUS_IDENTITY: "no spaces" } });
+  const first = await texts(bad, "whoami");
+  expect(first.texts[0]).toMatch(/^grayboard: BUS_IDENTITY is ignored: invalid identity name "no spaces"/);
+  expect(row("sess-conf-bad")?.name ?? null).toBeNull();
+}, 30_000);
+
 test("dm_send attaches a file from the session's directory, and attachment_get saves it in the other session", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const sender = await plugin("sess-send"), reader = await plugin("sess-read");

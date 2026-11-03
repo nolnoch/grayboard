@@ -16,7 +16,7 @@ import type { DiagnosticSink } from "./diagnostics.js";
 import type { Lock } from "./lock.js";
 import { accessExpiry, DeliveryHeldElsewhere, Refusal, type AccessExpired, type Identity, type Item } from "./model.js";
 import type { HostPort } from "./port.js";
-import { failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
+import { failure, hostTools, outputOf, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
 import { AncestryError } from "./sessions.js";
 import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "./storage.js";
 
@@ -26,6 +26,10 @@ export type RootOptions = {
   place: () => string;              // the bind's `where`
   push: boolean;                    // false: tools-only (Claude Code with channels off): no lock, no Controller
   carried?: string[];               // a /new or /fork's carried holds (pi/omp), taken by the first start that binds them
+  // An explicit BUS_IDENTITY (normalized, #443): a session with nothing to
+  // take back (no remembered or carried names) binds it at its first start,
+  // creating it if new, as local mode does. Tried once the server answers.
+  configured?: string;
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
   admit(item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
@@ -49,6 +53,11 @@ export class NotStarted extends Error {
 const SLOTS = ["held", "start", "sink", "first", "last"] as const;
 type Slot = typeof SLOTS[number];
 
+// The server's answers that refuse a configured name for good: held, the
+// user's handle, malformed. Anything else (unreachable, signed out) is tried
+// again by the next start.
+const REFUSED = new Set(["alias_held", "refused", "bad_request", "forbidden", "not_found"]);
+
 export class RootDelivery {
   private closed = false;          // shutdown began: nothing new starts
   private done = false;            // shutdown finished: nothing more is said
@@ -64,6 +73,7 @@ export class RootDelivery {
   private signedOut: AccessExpired | undefined;
   private begun: string | undefined;     // the store epoch this root last (re)started under
   private carrying: string[] | undefined;  // the carried holds, until a start takes them
+  private configuring: string | undefined; // the configured name, until the server answers its bind
   private starting: Promise<void> | undefined;   // own(): the Controller and push proxy coming up
   private restarting: Promise<void> | undefined;
   private used = false;                  // a call went out under this session's id
@@ -74,6 +84,7 @@ export class RootDelivery {
 
   constructor(private readonly client: HostedClient, private readonly o: RootOptions) {
     this.carrying = o.carried;
+    this.configuring = o.configured;
   }
 
   // Said through the host until shutdown finishes: the shutdown's own
@@ -98,8 +109,8 @@ export class RootDelivery {
   async start(): Promise<void> {
     if (this.closed || this.watcher) return;
     this.watcher = this.client.watch();
-    this.subscription = this.client.onChange(signedIn => { if (signedIn) void this.restartIfChanged(); });
-    if (!this.o.push) { this.toolsOnly(); return; }
+    this.subscription = this.client.onChange(signedIn => { if (signedIn) void (this.o.push ? this.restartIfChanged() : this.bindConfigured()); });
+    if (!this.o.push) { this.toolsOnly(); void this.bindConfigured(); return; }
     await this.take();
   }
   private async take(): Promise<void> {
@@ -152,6 +163,38 @@ export class RootDelivery {
     void this.client.connect(this.proxy);
   }
   private listed(tools: NativeTool[]) { if (!this.closed) this.o.onTools(tools); }
+
+  // Tools-only by the host's choice (no delivery for anyone to hold): the
+  // configured name binds through this process's own connection, at start
+  // and again after a sign-in if a signed-out start couldn't. Never rejects.
+  private bindingConfigured = false;
+  private async bindConfigured(): Promise<void> {
+    const name = this.configuring;
+    if (!name || !this.proxy || this.closed || this.bindingConfigured) return;
+    this.bindingConfigured = true;
+    try {
+      // Signed out: the sign-in's change binds it; the proxy would only answer "sign in".
+      try { await this.client.login.token(); }
+      catch (error) { if (accessExpiry(error)) return; throw error; }
+      if (this.closed) return;
+      this.used = true;
+      this.configuring = undefined;
+      const result = await this.client.call(this.proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
+      if (result.isError) {
+        const output = outputOf(result) as { message?: unknown } | string | undefined;
+        this.configuredMissed(name, typeof output === "object" && typeof output?.message === "string" ? output.message : String(output ?? "no reason given"));
+      }
+    } catch (error) {
+      if (this.closed) return;
+      this.configuring = undefined;
+      this.configuredMissed(name, message(error));
+    } finally { this.bindingConfigured = false; }
+  }
+  private configuredMissed(name: string, why: string) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it started unbound`;
+    this.notices.set("start", text);
+    this.log(text, "warning");
+  }
 
   // The lock is ours: run the Controller and declare push delivery. Never
   // rejects. Every await re-checks `closed`, so a start the shutdown overtook
@@ -219,8 +262,14 @@ export class RootDelivery {
       // Set before the start: the sink weighs a pause its run loop reaches
       // before resume returns against this epoch.
       this.begun = await this.epoch();
-      const expected = carried ?? await controller.carried(id);
-      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
+      // Taking back what this session held, or a /new's carried names, comes
+      // before BUS_IDENTITY, as a local restart's names do (#443).
+      const remembered = carried ? undefined : await controller.carried(id);
+      const configured = !carried && !remembered ? this.configuring : undefined;
+      const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
+      const status = carried ? await controller.enroll(id, carried, false)
+        : configured ? await controller.enroll(id, [configured], true)
+        : await controller.resume(id);
       if (this.closed) return;
       this.signedOut = undefined;
       // The Controller's own bind changed what the server's instructions say.
@@ -230,10 +279,16 @@ export class RootDelivery {
       // names its root before the rebind, so the name alone proves nothing.
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
       if (carried && bound?.length && this.carrying === carried) this.carrying = undefined;
-      const missing = (expected ?? []).filter(address => !bound?.includes(address));
+      // Bound, or refused by the server (held, the user's handle): tried for
+      // good. Unreachable or signed out: the next start tries again.
+      // The configured name is bare; holds are qualified (`<email>/<name>`).
+      const holds = (address: string) => !!bound?.some(b => b === address || b.endsWith(`/${address}`));
+      if (configured && (holds(configured) || REFUSED.has(root?.code ?? ""))) this.configuring = undefined;
+      const missing = (expected ?? []).filter(address => !holds(address));
       if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
-        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
+        const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}`
+          : carried ?`this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
           : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");

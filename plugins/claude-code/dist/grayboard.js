@@ -34708,6 +34708,13 @@ var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
 var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
 var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
 var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
+function normalizeIdentityName(raw) {
+  const name = raw.toLowerCase();
+  if (!NAME_RE.test(name)) {
+    return { ok: false, error: `invalid identity name "${raw}": after lowercasing, must be 1-32 chars of a-z 0-9 _ -` };
+  }
+  return { ok: true, name };
+}
 var HUMAN_NAME = "human";
 var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
 
@@ -36828,6 +36835,7 @@ class NotStarted extends Error {
   }
 }
 var SLOTS = ["held", "start", "sink", "first", "last"];
+var REFUSED = new Set(["alias_held", "refused", "bad_request", "forbidden", "not_found"]);
 
 class RootDelivery {
   client;
@@ -36846,6 +36854,7 @@ class RootDelivery {
   signedOut;
   begun;
   carrying;
+  configuring;
   starting;
   restarting;
   used = false;
@@ -36857,6 +36866,7 @@ class RootDelivery {
     this.client = client;
     this.o = o;
     this.carrying = o.carried;
+    this.configuring = o.configured;
   }
   log(text, level) {
     if (!this.done)
@@ -36882,10 +36892,11 @@ class RootDelivery {
     this.watcher = this.client.watch();
     this.subscription = this.client.onChange((signedIn) => {
       if (signedIn)
-        this.restartIfChanged();
+        this.o.push ? this.restartIfChanged() : this.bindConfigured();
     });
     if (!this.o.push) {
       this.toolsOnly();
+      this.bindConfigured();
       return;
     }
     await this.take();
@@ -36942,6 +36953,43 @@ class RootDelivery {
   listed(tools) {
     if (!this.closed)
       this.o.onTools(tools);
+  }
+  bindingConfigured = false;
+  async bindConfigured() {
+    const name = this.configuring;
+    if (!name || !this.proxy || this.closed || this.bindingConfigured)
+      return;
+    this.bindingConfigured = true;
+    try {
+      try {
+        await this.client.login.token();
+      } catch (error) {
+        if (accessExpiry(error))
+          return;
+        throw error;
+      }
+      if (this.closed)
+        return;
+      this.used = true;
+      this.configuring = undefined;
+      const result = await this.client.call(this.proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
+      if (result.isError) {
+        const output = outputOf(result);
+        this.configuredMissed(name, typeof output === "object" && typeof output?.message === "string" ? output.message : String(output ?? "no reason given"));
+      }
+    } catch (error) {
+      if (this.closed)
+        return;
+      this.configuring = undefined;
+      this.configuredMissed(name, message(error));
+    } finally {
+      this.bindingConfigured = false;
+    }
+  }
+  configuredMissed(name, why) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it started unbound`;
+    this.notices.set("start", text);
+    this.log(text, "warning");
   }
   async own(taken) {
     if (this.closed) {
@@ -37011,8 +37059,10 @@ class RootDelivery {
     const id = this.o.sessionID, carried = this.carrying;
     try {
       this.begun = await this.epoch();
-      const expected = carried ?? await controller.carried(id);
-      const status = carried ? await controller.enroll(id, carried, false) : await controller.resume(id);
+      const remembered = carried ? undefined : await controller.carried(id);
+      const configured = !carried && !remembered ? this.configuring : undefined;
+      const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
+      const status = carried ? await controller.enroll(id, carried, false) : configured ? await controller.enroll(id, [configured], true) : await controller.resume(id);
       if (this.closed)
         return;
       this.signedOut = undefined;
@@ -37021,10 +37071,13 @@ class RootDelivery {
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
       if (carried && bound?.length && this.carrying === carried)
         this.carrying = undefined;
-      const missing = (expected ?? []).filter((address) => !bound?.includes(address));
+      const holds = (address) => !!bound?.some((b) => b === address || b.endsWith(`/${address}`));
+      if (configured && (holds(configured) || REFUSED.has(root?.code ?? "")))
+        this.configuring = undefined;
+      const missing = (expected ?? []).filter((address) => !holds(address));
       if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
-        const text = carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
+        const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}` : carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
         this.log(text, "warning");
       }
@@ -37174,6 +37227,7 @@ ${record.message}`;
 // src/shared/identity.ts
 import { existsSync, readFileSync as readFileSync3, statSync as statSync2 } from "fs";
 import { basename as basename2, dirname as dirname3, join as join5, resolve as resolve3 } from "path";
+var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname3(dir)) {
     const dotGit = join5(dir, ".git");
@@ -37221,6 +37275,69 @@ function describeLocation(cwd) {
     return null;
   }
 }
+function linkedWorktreeName(cwd) {
+  return gitLocation(cwd)?.worktree ?? null;
+}
+function sanitizeIdentity(name) {
+  return name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, MAX_LEN).replace(/-+$/, "");
+}
+function defaultIdentity(cwd = process.cwd()) {
+  const name = sanitizeIdentity(basename2(gitLocation(cwd)?.repo ?? cwd));
+  if (!name)
+    throw new Error(`can't derive an identity from ${cwd}; set BUS_IDENTITY`);
+  return name;
+}
+function resolveIdentity(base, cwd = process.cwd()) {
+  const wt = linkedWorktreeName(cwd);
+  if (!wt)
+    return base;
+  const b = base.toLowerCase();
+  const name = sanitizeIdentity(wt);
+  if (!name || name === b)
+    return base;
+  return sanitizeIdentity(name.startsWith(`${b}-`) ? name : `${b}-${name}`);
+}
+function pinnedIdentities(cwd = process.cwd()) {
+  const pins = [];
+  for (const file of [".mcp.json", ".omp/mcp.json"]) {
+    try {
+      const full = join5(gitLocation(cwd)?.repo ?? cwd, file);
+      const pin = JSON.parse(readFileSync3(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+      if (typeof pin === "string" && pin)
+        pins.push(pin);
+    } catch {}
+  }
+  return pins;
+}
+function pinnedIdentity(cwd = process.cwd()) {
+  try {
+    const file = join5(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
+    const pin = JSON.parse(readFileSync3(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    return typeof pin === "string" && pin ? pin : undefined;
+  } catch {
+    return;
+  }
+}
+function isExplicitIdentity(env = process.env, cwd = process.cwd()) {
+  if (!env.BUS_IDENTITY)
+    return false;
+  return !pinnedIdentities(cwd).includes(env.BUS_IDENTITY);
+}
+function sessionIdentity(env = process.env, cwd = process.cwd()) {
+  if (isExplicitIdentity(env, cwd))
+    return env.BUS_IDENTITY;
+  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+}
+function configuredIdentity(env = process.env, cwd = process.cwd()) {
+  try {
+    if (!isExplicitIdentity(env, cwd))
+      return;
+    const n = normalizeIdentityName(sessionIdentity(env, cwd));
+    return n.ok ? { name: n.name } : { error: n.error };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
 
 // plugins/claude-code/src/plugin.ts
 var HARNESS = "Claude Code";
@@ -37257,6 +37374,7 @@ function createPlugin(o) {
   const push = verdict.state === "on";
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
+  const configured = configuredIdentity(o.env, o.cwd);
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
   const say = (message) => o.log(`[grayboard] ${message}`);
@@ -37355,6 +37473,7 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     place: () => place,
     push,
+    ...configured && "name" in configured ? { configured: configured.name } : {},
     admit: async (item, _stableID, identity, signal) => {
       if (!initialized)
         await initializedOr(signal);
@@ -37362,8 +37481,12 @@ function createPlugin(o) {
     },
     onTools: () => listChanged()
   }) : undefined;
-  if (offNotice)
-    root?.noticeOnce(offNotice, "first");
+  const badIdentity = configured && "error" in configured ? `BUS_IDENTITY is ignored: ${configured.error}` : undefined;
+  if (badIdentity)
+    say(badIdentity);
+  const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
+  if (firstNotice)
+    root?.noticeOnce(firstNotice, "first");
   const changes = client?.onChange((signedIn) => {
     if (signedIn)
       signingIn?.abort.abort();
