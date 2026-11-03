@@ -134,13 +134,6 @@ export function ackResult(acked: number[], missing: number[]): { text: string; i
     : { text: `error: ${why}`, isError: true };
 }
 
-// dm_inbox and dm_ack by a child session (#523), a harness subagent acting under its root's addresses: the
-// owed-list and its acks are the root's state, which a subagent neither takes on as its own work nor consumes.
-// dm_history and dm_thread, which change nothing, stay its. Refused child_session in both modes.
-export function childInboxRefusal(child: string, rootPrimary: string): string {
-  return `${child} is a subagent of ${rootPrimary}; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
-}
-
 // Sent direct messages still queued a day later, so a stale "told them" in a
 // handoff gets caught when the session starts.
 export const STALE_UNDELIVERED_MS = 86_400_000;

@@ -481,14 +481,15 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
 
 // The root's read state, as the rows a read or an ack would move.
 const readState = () => ({
-  subscriptions: rows(`SELECT handle, board, cursor, notified_id FROM subscriptions ORDER BY handle, board`),
+  subscriptions: rows(`SELECT handle, board, mode, cursor, notified_id FROM subscriptions ORDER BY handle, board`),
+  mutes: rows(`SELECT * FROM thread_mutes ORDER BY root_id`),
   outbox: rows(`SELECT handle, post_id, delivered_at FROM outbox ORDER BY handle, post_id`),
   cursors: rows(`SELECT reader, last_seen_id FROM cursors ORDER BY reader`),
   acks: rows(`SELECT reader, message_id FROM dm_acks ORDER BY reader, message_id`),
   messages: rows(`SELECT id, delivered_at FROM messages ORDER BY id`),
 });
 
-test("a child reads its root's boards and mail without consuming them; dm_inbox and dm_ack are its root's", async () => {
+test("a child reads its root's boards and mail without consuming them; dm_inbox, dm_ack and board_subscribe are its root's", async () => {
   const be = await session("be");
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   const fe = await session("fe");
@@ -517,6 +518,11 @@ test("a child reads its root's boards and mail without consuming them; dm_inbox 
   expect(await childRefusal(fe, "reviewer-1", "dm_inbox")).toBe(refused);
   expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: sent.message_id })).toBe(refused);
   expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: [sent.message_id] })).toBe(refused);
+  // So are its board subscriptions and thread mutes.
+  const subs = `error: child_session: ${child} is a subagent of fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.`;
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "push" })).toBe(subs);
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off" })).toBe(subs);
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off", thread: first.post_id })).toBe(subs);
 
   // Nothing the child did moved the root's read state.
   expect(readState()).toEqual(before);
@@ -540,6 +546,28 @@ test("a child's results carry none of its root's notices: no bind hint, no fresh
   const after = await childCall(s, "reviewer-1", "whoami");
   expect(after.structuredContent).toBeUndefined();
   expect(after.content).toHaveLength(1);
+}, 30_000);
+
+// #523 audit 6: a child's delegate request and refusal name the child in
+// their audit rows, under `child`, beside the routing `via`; a root's name none.
+test("a child's delegation audit rows name the child; the root's don't", async () => {
+  await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  await session("ad"); // live, not a launcher
+  const fe = await session("fe");
+  const child = (await asChild<Who>(fe, "reviewer-1", "whoami")).id;
+  const task = { persona: "a reviewer", task: "review the diff" };
+  const sent = await asChild<Sent>(fe, "reviewer-1", "delegate", task);
+  expect(await childRefusal(fe, "reviewer-1", "delegate", { ...task, to: "ad" })).toContain("isn't a launcher session");
+  const own = await fe.call("delegate", { ...task, task: "the root's own" });
+  const audits = rows<{ action: string; actor: string; target: string | null; detail: string }>(`SELECT action, actor, target, detail FROM audit_log WHERE action LIKE 'delegation.%' ORDER BY rowid`)
+    .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  expect(audits).toEqual([
+    { action: "delegation.requested", actor: "fe", target: "be", detail: { via: "auto", message_id: sent.message_id, child } },
+    { action: "delegation.refused", actor: "fe", target: null, detail: { reason: expect.stringContaining("isn't a launcher session"), child } },
+    { action: "delegation.requested", actor: "fe", target: "be", detail: { via: "auto", message_id: own.message_id } },
+  ]);
+  // The request is the child's DM, as any it sends.
+  expect(rows(`SELECT sender, sender_id, via FROM messages WHERE id = ?`, sent.message_id)).toEqual([{ sender: "fe", sender_id: child, via: child }]);
 }, 30_000);
 
 test("a child's post and claim announcement are its root's own: none of the root's names is pushed one or shown it unread; others get them with via", async () => {

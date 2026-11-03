@@ -78,8 +78,10 @@ export type ErrorCode =
   | "id_ended"
   // a send or mention named an ID that receives nothing (a tools-only session)
   | "no_delivery"
-  // a child session (a harness subagent, #523) called bind, unbind or delivery, which are its root's;
-  // or a send or mention named a child's ID, which is never an address (both modes)
+  // a child session (a harness subagent, #523) called a tool that is its root's: bind, unbind, delivery,
+  // or one that takes on or changes the root's read state (dm_inbox, dm_ack, board_subscribe;
+  // childStateRefusal in src/core/bindings.ts); or a send or mention named a child's ID, which is
+  // never an address (both modes)
   | "child_session"
   // Hosted MCP only (src/server/hosted.ts): a hosted
   // call that needs a bound name, and the hosted child-session registration refusals.

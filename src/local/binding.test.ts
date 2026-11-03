@@ -3,10 +3,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { REFUSED_COALESCE_MS, holdAlias, logBinding } from "../core/bindings.ts";
-import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess } from "../core/boards.ts";
+import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
+import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { acquireName, attachSession, candidateNames, liveSessions, reap, registerChild, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, liveSessions, reap, registerChild, registerSession, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -199,6 +199,56 @@ test("registerChild records a child once, audited; another root's ID or an ended
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
   expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
   expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+});
+
+// #523 audit 3: a root has at most MAX_CHILDREN child sessions at once, as
+// hosted. A local child has no end of its own, so the root's other children
+// count only while seen inside the idle window; a known child seen again
+// keeps its own place.
+test("a root's child past MAX_CHILDREN is refused while the others are fresh, and accepted once they've gone idle", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const root = "id:0123456789abc";
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const kid = (i: number) => `id:k${String(i).padStart(12, "0")}`;
+  const t0 = 1_800_000_000_000;
+  for (let i = 0; i < MAX_CHILDREN; i++) registerChild(db, root, kid(i), `sub-${i}`, t0);
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + 1000)).toThrow(childCapacity(root));
+  expect(db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toBeNull();
+  registerChild(db, root, kid(0), "sub-0", t0 + 1000);
+  // At the window's edge the others still count; one past it, only the two seen since do.
+  const window = DEFAULT_IDLE_SECONDS * 1000;
+  expect(() => registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window)).toThrow(childCapacity(root));
+  touchId(db, kid(1), t0 + window + 1);
+  registerChild(db, root, kid(MAX_CHILDREN), "sub-overflow", t0 + window + 1);
+  expect(db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(kid(MAX_CHILDREN))).toEqual({ root_id: root, ended_at: null });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #523 audit 3: the root process's child cache derives each child's ID from
+// the root's key, registers it once and touches it per call; it forgets a
+// child idle past the window, so its memory stays bounded by the cap, and the
+// forgotten child seen again is the same child, with no second audit row.
+test("ChildSessions keeps only the children seen inside the idle window, refusing past MAX_CHILDREN", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const key = "ab".repeat(32);
+  const root = idAddress(key);
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const children = new ChildSessions(db, root, key);
+  const t0 = 1_800_000_000_000, window = DEFAULT_IDLE_SECONDS * 1000;
+  const first = children.resolve("sub-0", t0);
+  expect(first).toBe(childSessionId(key, "sub-0"));
+  for (let i = 1; i < MAX_CHILDREN; i++) children.resolve(`sub-${i}`, t0);
+  expect(children.size).toBe(MAX_CHILDREN);
+  expect(() => children.resolve("sub-overflow", t0 + 1)).toThrow(childCapacity(root));
+  // A known child resolves again, keeping its place, and is touched.
+  expect(children.resolve("sub-0", t0 + 2)).toBe(first);
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 + 2 });
+  // Past the window every child but sub-0 is forgotten; the newcomer takes a place.
+  children.resolve("sub-overflow", t0 + window + 1);
+  expect(children.size).toBe(2);
+  // sub-1, forgotten, comes back as the same child: no second id.child_seen.
+  expect(children.resolve("sub-1", t0 + window + 2)).toBe(childSessionId(key, "sub-1"));
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
 });
 
 // #523: the orphan sweep (an unended ID with no bindings row) passes over a

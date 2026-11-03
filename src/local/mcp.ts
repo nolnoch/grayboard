@@ -11,7 +11,7 @@ import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, ch
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childSessionId, logBinding, replyPeer, replyPeerError, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, logBinding, replyPeer, replyPeerError, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -49,7 +49,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
+import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { isAlive, launcherName } from "../shared/proc.ts";
@@ -66,7 +66,6 @@ import {
   STALE_UNDELIVERED_MS,
   ackIds,
   ackResult,
-  childInboxRefusal,
   historyLimit,
   inboxDays,
   promised,
@@ -403,9 +402,8 @@ const late = new LateCancels();
 let shuttingDown = false;
 let sessionEnded = false;
 const calls = new Set<Promise<unknown>>();
-// The child sessions this process has seen (#523), by the harness's raw
-// subagent id: registered (registerChild) on first sight, then known.
-const children = new Map<string, string>();
+// The child sessions this process has seen within the idle window (#523).
+const children = new ChildSessions(db, SESSION_ID, SESSION_KEY);
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
@@ -417,18 +415,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     touchId(db, SESSION_ID);
     if (agent === undefined) return call(name, args, signal);
     if (!validSourceId(agent)) return { ...text(`error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`), isError: true };
-    let child = children.get(agent);
-    if (child === undefined) {
-      const id = childSessionId(SESSION_KEY, agent);
-      try {
-        registerChild(db, SESSION_ID, id, agent);
-      } catch (e) {
-        if (e instanceof CoreError) return { ...text(`error: ${e.message}`), isError: true };
-        throw e;
-      }
-      children.set(agent, (child = id));
+    let child: string;
+    try {
+      child = children.resolve(agent);
+    } catch (e) {
+      if (e instanceof CoreError) return { ...text(`error: ${e.message}`), isError: true };
+      throw e;
     }
-    touchId(db, child);
     return call(name, args, signal, child);
   };
   // bind and unbind change the address set: no call overlaps either.
@@ -478,10 +471,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (child !== undefined && (name === "bind" || name === "unbind")) {
     return { ...text(`error: child_session: this session acts under its root ${SESSION_ID}; bind and unbind are the root's. Call them from the root session.`), isError: true };
   }
-  // Nor does it take on or consume the root's inbox; dm_history and dm_thread change nothing, so stay its.
-  if (child !== undefined && (name === "dm_inbox" || name === "dm_ack")) {
-    return { ...text(`error: child_session: ${childInboxRefusal(child, primary())}`), isError: true };
-  }
+  // Nor does it take on or change the root's read state (its inbox, its subscriptions).
+  const refused = child === undefined ? null : childStateRefusal(name, child, primary());
+  if (refused !== null) return { ...text(`error: child_session: ${refused}`), isError: true };
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
   // Local mode has one implicit scope: no principal (#284 S6).
@@ -511,12 +503,14 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // still answer on its socket: filter it like dm_send does (a released
     // name's socket isn't the session).
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
+    // The audit rows name the child that called, beside the routing `via` (#523).
+    const byChild = child === undefined ? {} : { child };
     let d;
     try {
       d = resolveDelegation(db, IDENTITY, a, online);
     } catch (e) {
       if (e instanceof CoreError) {
-        writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message });
+        writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
         return { ...text(`error: ${e.message}`), isError: true };
       }
       throw e;
@@ -529,7 +523,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // The message id tracks the pick that owns the work: a re-pick replaces
     // both (review 16).
     let msgId = (await insertMessage(IDENTITY, WRITER, d.to, d.body, null, true, [], undefined, via)).id;
-    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId });
+    writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId, ...byChild });
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
     if (!delivered && !d.humanFallback) {
@@ -543,7 +537,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
         const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via)).id;
-          writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to });
+          writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
           d = d2;
           msgId = id2;
           delivered = await deliver(d2.to);

@@ -659,10 +659,34 @@ test("#523: a child's raw source ID that later starts as a root is an address ag
   expect((await fe.next(direct((m) => m.body === "root again"))).event.message).not.toHaveProperty("via");
 });
 
+// #523 audit 2: a child binds nothing, so under a root with no name yet it is
+// still a child: told it only reads until its root binds, offered no names in
+// whoami, and refused a write naming its root, never told to bind. Once the
+// root binds, the child writes as it.
+test("#523: a child of a root with no name yet is told it only reads until the root binds; nothing tells it to bind", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, null);
+  const { child, id, root } = await childOf(fe, A, "reviewer-run");
+  const told = child.instructions()!;
+  expect(told).toBe(`You are a subagent on grayboard. Your root session has no bus name yet: until it binds one you can read boards, peers and claims, and you send nothing. Binding is your root's, not yours. Mail and board pushes are your root's: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read.`);
+  expect(fe.instructions()).toStartWith("This session has no bus name yet.");
+  const who = await child.call("whoami");
+  expect(who).toMatchObject({ id, root, child: true, unbound: true });
+  expect(who).not.toHaveProperty("candidates");
+  expect(await fe.call("whoami")).toHaveProperty("candidates");
+  const unbound = `unbound; this session is a subagent of ${root}, which has no bus name yet. Its writes work once ${root} binds one; binding is the root's.`;
+  await expect(child.call("dm_send", { to: "be", body: "too early" })).rejects.toMatchObject({ message: unbound });
+  await expect(child.call("bind", { name: "qa", create: true })).rejects.toMatchObject({ code: "child_session" });
+  // The root binds: the child's next write is the root's, with via.
+  await fe.bind("fe");
+  await child.call("dm_send", { to: "be", body: "now bound" });
+  expect((await be.next(direct((m) => m.body === "now bound"))).event.message).toMatchObject({ sender: `${A}/fe`, via: id });
+});
+
 // A board's unread count in `s`'s board_list.
 const unreadOn = async (s: HostedSession, board: string) => (await s.call<{ name: string; unread: number }[]>("board_list")).find((b) => b.name === board)!.unread;
 
-test("#523: a child is told it's a subagent, and reads its root's boards and mail without consuming them; dm_inbox and dm_ack are its root's", async () => {
+test("#523: a child is told it's a subagent, and reads its root's boards and mail without consuming them; dm_inbox, dm_ack and board_subscribe are its root's", async () => {
   const be = await srv.hosted(A, "be");
   const fe = await srv.hosted(A, "fe");
   const { child, id } = await childOf(fe, A, "reviewer-run");
@@ -684,7 +708,8 @@ test("#523: a child is told it's a subagent, and reads its root's boards and mai
   expect(owed).toEqual([[sent.message_id, "owed by the root"]]);
   expect(await unreadOn(fe, "ops")).toBe(1);
   const state = () => ({
-    subscriptions: srv.app.db.query("SELECT board, cursor, notified_id FROM subscriptions WHERE handle = ? ORDER BY board").all(`${A}/fe`),
+    subscriptions: srv.app.db.query("SELECT board, mode, cursor, notified_id FROM subscriptions WHERE handle = ? ORDER BY board").all(`${A}/fe`),
+    mutes: srv.app.db.query("SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id").all(),
     outbox: srv.app.db.query("SELECT post_id, delivered_at FROM outbox WHERE handle = ? ORDER BY post_id").all(`${A}/fe`),
     message: srv.app.db.query("SELECT delivered_at FROM messages WHERE id = ?").get(sent.message_id),
   });
@@ -704,6 +729,11 @@ test("#523: a child is told it's a subagent, and reads its root's boards and mai
   await expect(child.call("dm_inbox")).rejects.toMatchObject(refused);
   await expect(child.call("dm_ack", { message_id: sent.message_id })).rejects.toMatchObject(refused);
   await expect(child.call("dm_ack", { message_id: [sent.message_id] })).rejects.toMatchObject(refused);
+  // So are its board subscriptions and thread mutes.
+  const subs = { message: `${id} is a subagent of ${A}/fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.` };
+  await expect(child.call("board_subscribe", { board: "ops", mode: "push" })).rejects.toMatchObject(subs);
+  await expect(child.call("board_subscribe", { board: "e2e", mode: "off" })).rejects.toMatchObject(subs);
+  await expect(child.call("board_subscribe", { board: "e2e", mode: "off", thread: pushed.post_id })).rejects.toMatchObject(subs);
 
   // Nothing the child did moved the root's read state.
   expect(state()).toEqual(before);

@@ -89,6 +89,41 @@ export function tooManyHolds(held: string[]): string {
   return `this session already holds ${held.length} names (${held.join(", ")}); unbind one first`;
 }
 
+/**
+ * How long a session may go unseen before it is idle: hosted's default sweep
+ * window (GRAYBOARD_HOSTED_IDLE_SECONDS), and the window within which a local
+ * child counts toward MAX_CHILDREN (#523).
+ */
+export const DEFAULT_IDLE_SECONDS = 900;
+
+/**
+ * How many child sessions (#523) one root may have at once, in both modes. A
+ * hosted child's row ends at its subagent's end; a local child has no end of
+ * its own, so it counts only while seen within DEFAULT_IDLE_SECONDS.
+ */
+export const MAX_CHILDREN = 128;
+
+/** The refusal for a child session past MAX_CHILDREN under `root`. */
+export function childCapacity(root: string): string {
+  return `child capacity reached: session ${root} has ${MAX_CHILDREN} active child sessions, the most one session may have; a child's place frees when it ends or goes idle`;
+}
+
+// What a child session (#523) is told instead of a call that would take on or
+// change its root's read state: the inbox's owed-list and its acks, the root's
+// board subscriptions and thread mutes. dm_history, dm_thread and board_read
+// change nothing, so stay the child's.
+const ROOT_STATE: Record<string, string> = {
+  dm_inbox: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  dm_ack: "its root owns this inbox. dm_thread a thread you wrote to see its replies.",
+  board_subscribe: "its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.",
+};
+
+/** The child_session refusal for `tool` called by child `child` of the root writing as `rootPrimary`, or null if the tool is the child's. */
+export function childStateRefusal(tool: string, child: string, rootPrimary: string): string | null {
+  const why = ROOT_STATE[tool];
+  return why === undefined ? null : `${child} is a subagent of ${rootPrimary}; ${why}`;
+}
+
 /** Session `id` no longer holds `address`; a hold another session took since stays. */
 export function dropHold(db: Database, address: string, id: string): void {
   db.prepare(`DELETE FROM alias_holds WHERE address = ? AND id = ?`).run(address, id);

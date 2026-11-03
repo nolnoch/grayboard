@@ -10,7 +10,7 @@ import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./w
 import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate, type Continuity,
 } from "../core/bindings.ts";
@@ -35,7 +35,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { onAliasCreated } from "./teams.ts";
 import { mayActIn, principalCanSee } from "./access.ts";
-import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, childInboxRefusal, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
+import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import { afterCommit } from "../core/sqlite.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -161,9 +161,11 @@ function fail(code: ApplicationCode, message: string, extra: ApplicationError["e
   throw new ApplicationError(code, message, extra);
 }
 
-// A child (#523) neither takes on nor consumes its root's inbox: dm_inbox and dm_ack are the root's.
-function childInbox(session: ApplicationSession): void {
-  if (session.via !== undefined) fail("child_session", childInboxRefusal(session.via, session.primary));
+// A child (#523) neither takes on nor changes its root's read state: dm_inbox,
+// dm_ack and board_subscribe are the root's (childStateRefusal names them).
+function childState(session: ApplicationSession, tool: string): void {
+  const refused = session.via === undefined ? null : childStateRefusal(tool, session.via, session.primary);
+  if (refused !== null) fail("child_session", refused);
 }
 
 // A refused call's code and message: an ID that can't receive names its own
@@ -780,17 +782,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         session.primary = primaryOf(holds, root ?? id);
         session.addresses = [...holds, root ?? id];
       }
-      if (!session.readOnly && idRow(db, id)?.principal === authed.user_email) {
-        session.writerId = id;
-        if (root !== null) session.via = id;
-      }
+      // A child is one whether or not its root holds a name yet: its text and refusals are a child's.
+      const own = idRow(db, id)?.principal === authed.user_email;
+      if (!session.readOnly && own) session.writerId = id;
+      if (root !== null && own) session.via = id;
       hub.sessions.add(session);
       if (hold && holds.length) hub.hostedHolders.set(id, session);
       if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
-        ...(session.readOnly ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
+        ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
       return { session, info };
     },
@@ -924,7 +926,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     inbox(session: ApplicationSession, days?: number) {
       valid(session);
-      childInbox(session);
+      childState(session, "dm_inbox");
       return handleInbox(hub, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
@@ -986,7 +988,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // sentPending match a.reader = m.recipient, or m.sender.
     acknowledgeDm(session: ApplicationSession, id: number) {
       valid(session);
-      childInbox(session);
+      childState(session, "dm_ack");
       const m = repo.messages.getById(id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
         : mine.includes(m.recipient) ? m.recipient
@@ -1271,7 +1273,9 @@ function handleSend(
 function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">): DelegateResult {
   const { repo, db } = hub;
   const { authed } = session;
-  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, detail));
+  // The audit rows name the child that called, beside the routing `via` (#523).
+  const byChild = session.via === undefined ? {} : { child: session.via };
+  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
@@ -1300,6 +1304,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
         requester: session.primary,
         via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
         message_id: w.msg.id,
+        ...byChild,
       });
       return { payload, ref: w.ref, msg: w.msg };
     });
@@ -1350,6 +1355,7 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
 function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
   const { db } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
+  childState(session, tool);
   const ctx: ToolContext = {
     online: h => hub.registry.get(h)?.active === true,
     files: { limits: hub.repo.attachmentLimits, principal: uploaderOf(session).principal },

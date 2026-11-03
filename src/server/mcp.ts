@@ -336,8 +336,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
       instructions: role === "subscriber" ? undefined
+        : context.session.via ? hostedChildInstruction(info, context.session.via, context.session.readOnly)
         : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? [])
-        : context.session.via ? hostedChildInstruction(info, context.session.via)
         : hostedBoundInstruction(info, context.declared, "id" in context.sessionContext && application.hostedLauncher(context.sessionContext.id)),
     });
     server.server.onerror = error => report(error);

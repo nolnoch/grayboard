@@ -57,6 +57,37 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   }
 });
 
+// #523 audit 5: a hosted child registered before ids.root_id existed (or by an
+// older release sharing the file) gets its root from its live source row when
+// the file opens; a child whose source row is already gone, and a root, stay null.
+test("opening a database from before ids.root_id backfills each live hosted child's root", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-root-db-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  const user = old.repo.users.upsertByEmail("you@example.com", null);
+  const now = Date.now();
+  const [root, child, gone] = ["id:r000000000000", "id:c000000000000", "id:g000000000000"];
+  for (const id of [root, child, gone]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen) VALUES (?, ?, ?, ?)`).run(id, user.email, now, now);
+  const ownership = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?) RETURNING id`).get(root, user.id, "grayboard-pi", now) as { id: number };
+  const row = old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  row.run(root, ownership.id, user.id, "grayboard-pi", "G1", "root-run", null, now, now);
+  row.run(child, ownership.id, user.id, "grayboard-pi", "G1", "child-run", root, now, now);
+  old.db.exec(`DROP INDEX idx_ids_root; ALTER TABLE ids DROP COLUMN root_id`);
+  old.db.close();
+  const reopened = openDatabase(path, opts);
+  try {
+    expect(reopened.db.query(`SELECT id, root_id FROM ids WHERE id IN (?, ?, ?) ORDER BY id`).all(root, child, gone)).toEqual([
+      { id: child, root_id: root },
+      { id: gone, root_id: null },
+      { id: root, root_id: null },
+    ]);
+  } finally {
+    reopened.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
 // auto_vacuum applies only before the file's first page is written (#170).

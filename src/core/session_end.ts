@@ -13,7 +13,7 @@ import type { Database } from "bun:sqlite";
 import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
-import { logBinding } from "./bindings.ts";
+import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
 import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -190,12 +190,11 @@ export function undeliverableId(db: Database, id: string): Undeliverable | null 
  * its writes_as, else (once ended) the first alias it held, else its ID.
  */
 function rootPrimary(db: Database, root: string): string {
-  const hold = db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address LIMIT 1`).get(root) as { address: string } | null;
-  if (hold) return hold.address;
+  const holds = holdsOf(db, root);
+  if (holds.length) return primaryOf(holds, root);
   const r = db.prepare(`SELECT ended_at, held_aliases_json, writes_as FROM ids WHERE id = ?`).get(root) as
     | { ended_at: number | null; held_aliases_json: string | null; writes_as: string | null }
     | null;
   if (r?.writes_as) return r.writes_as;
-  const held = r?.ended_at != null && r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-  return held[0] ?? root;
+  return primaryOf(r?.ended_at != null && r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [], root);
 }
