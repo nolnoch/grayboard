@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ClaudeFiles } from "./claude_channels.ts";
-import { channelsOff } from "./toolguard.ts";
+import { channelsOff, updateNoticeText } from "./toolguard.ts";
 
 const CC = { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" };
 // A host with no Claude Code account or managed files.
@@ -29,5 +29,14 @@ describe("channelsOff", () => {
     expect(off({}, "claude")).toBeNull(); // not under Claude Code
     expect(off(CC, "bun /home/u/.bun/bin/omp --model x")).toBeNull(); // omp launched from a Claude Code shell
     expect(off(CC, null)).toBeNull(); // parent unreadable
+  });
+});
+
+describe("updateNoticeText", () => {
+  test("under omp's local adapter it says restart omp, never /mcp reconnect, which would start a second grayboard (#523)", () => {
+    const omp = updateNoticeText({ BUS_HARNESS: "omp" });
+    expect(omp).toContain("Ask the user to restart omp.");
+    expect(omp).not.toContain("/mcp");
+    expect(updateNoticeText({})).toContain("reconnect it (/mcp → grayboard → reconnect)");
   });
 });

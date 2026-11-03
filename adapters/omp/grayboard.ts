@@ -19,6 +19,9 @@
 // client then runs none, and the disabled entry still shadows a same-named
 // entry omp ranks lower (Claude Code's user config, a repo's .mcp.json).
 import { getAgentDir, settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { expandEnvVarsDeep } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import { extractUriScheme } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -26,10 +29,10 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 type ChannelParams = { content: string; meta?: Record<string, string> };
-type McpEntry = { command?: string; args?: string[]; env?: Record<string, string> };
+type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 type Tool = { name: string; description?: string; inputSchema: { type?: string; properties?: Record<string, unknown> }; _meta?: Record<string, unknown> };
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
-type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; entryPath: string };
+type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; cwd?: string; entryPath: string };
 type Child = {
   proc: ChildProcess;
   ready: Promise<void>;
@@ -43,6 +46,23 @@ const PREFIX = `mcp__${SERVER.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace
 const AGENT_META = "io.github.nolnoch.grayboard/agent";
 // omp gives session_shutdown handlers 2 s; the grayboard process gets most of it to end its session.
 const EXIT_WAIT_MS = 1_500;
+// An unexpected exit restarts the grayboard process after each delay in turn,
+// as omp's MCP manager restarted its stdio servers; one more exit gives up.
+// A process that ran STABLE_MS before exiting starts the count over.
+const RESTART_DELAYS_MS = [0, 1_000, 5_000];
+const STABLE_MS = 60_000;
+
+// A subagent serves grayboard's tools only for the top-level session that runs
+// the grayboard process. One omp process can run several top-level sessions
+// (ACP), each with its own runtime and agent id; a subagent of another would
+// act as that session's names (#470), so it gets none.
+const NOT_OWNERS = "grayboard: this subagent's top-level session doesn't run grayboard (another top-level session in this omp process does), so it gets no grayboard tools";
+
+// Each runtime's agent as omp reports it (`ctx.agent`), by agent id: entries
+// are never removed, since omp keeps a finished subagent revivable for its idle
+// TTL and a nested one revived after its parent's run ended must still reach
+// its root (as adapters/pi-family/omp-ancestry.ts, which this raw file can't import).
+type Agent = { main: boolean; parent?: string; runtime: ExtensionAPI };
 
 // What every runtime in this omp process shares: each subagent's runtime
 // loads its own copy of this module, so module state would be per runtime.
@@ -50,15 +70,36 @@ type Shared = {
   config?: Config;
   tools?: Tool[];
   // The main runtime that runs the grayboard process, and its verdict: the
-  // refusal text, or undefined when it serves the tools. Subagents follow it.
+  // refusal text, or undefined when it serves the tools. Its subagents follow it.
   owner?: ExtensionAPI;
   verdict?: Promise<string | undefined>;
+  agents?: Map<string, Agent>;
+  // Every live top-level runtime, and its agent id.
+  mains?: Map<ExtensionAPI, string>;
   child?: Child;
+  // Consecutive restarts, and the one waiting to start.
+  restarts?: number;
+  restart?: Promise<void>;
   exitReason?: string;
   instructions?: string;
 };
 const KEY = Symbol.for("io.github.nolnoch.grayboard/omp-local");
 const shared = ((globalThis as Record<symbol, unknown>)[KEY] ??= {}) as Shared;
+
+// Whether a subagent belongs to the top-level session that runs grayboard:
+// its chain of parentIds reaches the owner's agent, and no other live
+// top-level session has that agent id (then the chain can't tell them apart).
+function ownersSubagent(parent: string | undefined): boolean {
+  const agents = shared.agents ?? new Map<string, Agent>();
+  let id = parent;
+  for (let hops = 0; id !== undefined && hops <= agents.size; hops++) {
+    const agent = agents.get(id);
+    if (!agent) return false;
+    if (agent.main) return agent.runtime === shared.owner && [...(shared.mains?.values() ?? [])].filter((m) => m === id).length === 1;
+    id = agent.parent;
+  }
+  return false;
+}
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -79,18 +120,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// The child's command and env, from the user-level entry only: a project's
-// config (a cloned repo's) never chooses what this extension runs. The entry's
-// BUS_PUSH=off is for omp's client, were it ever enabled; this process is the
-// delivery owner. BUS_HARNESS=omp has grayboard read a repo's .omp/mcp.json
-// name pin, enabled or not, as it did when omp ran that entry
-// (src/shared/identity.ts pinnedIdentity).
+// The child's command, args, env and cwd, from the user-level entry only: a
+// project's config (a cloned repo's) never chooses what this extension runs.
+// `${VAR}` and `${VAR:-default}` expand as omp's own loader expands them
+// (expandEnvVarsDeep, its discovery/builtin.ts). The entry's BUS_PUSH=off is
+// for omp's client, were it ever enabled; this process is the delivery owner.
+// BUS_HARNESS=omp has grayboard read a repo's .omp/mcp.json name pin, enabled
+// or not, and say "restart omp" where it would say /mcp reconnect
+// (src/shared/identity.ts pinnedIdentity, src/shared/toolguard.ts).
 function config(agentDir: string): Config {
   const entryPath = join(agentDir, "mcp.json");
   let entry: McpEntry | undefined;
   try {
     const servers: unknown = JSON.parse(readFileSync(entryPath, "utf8"))?.mcpServers;
-    if (isRecord(servers) && isRecord(servers[SERVER])) entry = servers[SERVER];
+    if (isRecord(servers) && isRecord(servers[SERVER])) entry = expandEnvVarsDeep(servers[SERVER]) as McpEntry;
   } catch {
     entry = undefined;
   }
@@ -98,17 +141,17 @@ function config(agentDir: string): Config {
   const env: Record<string, string | undefined> = { ...process.env, ...entry?.env };
   delete env.BUS_PUSH;
   env.BUS_HARNESS = "omp";
-  return { cmd: cmd!, args, env, entryPath };
+  return { cmd: cmd!, args, env, ...(typeof entry?.cwd === "string" ? { cwd: entry.cwd } : {}), entryPath };
 }
 
 // The tool list `grayboard mcp` serves in the entry's mode, from the installed
 // binary, so this file and the binary can't drift. A failure fails the
 // extension load, and omp reports it.
-function loadTools({ cmd, args: entryArgs, env, entryPath }: Config): Tool[] {
+function loadTools({ cmd, args: entryArgs, env, cwd, entryPath }: Config): Tool[] {
   const at = entryArgs.indexOf("mcp");
   if (at < 0) throw new Error(`grayboard: can't find "mcp" in the ${SERVER} entry's args in ${entryPath}: ${JSON.stringify(entryArgs)}`);
   const args = [...entryArgs.slice(0, at), "tools", ...entryArgs.slice(at + 1)];
-  const r = spawnSync(cmd, args, { env, encoding: "utf8", timeout: 15_000 });
+  const r = spawnSync(cmd, args, { env, cwd, encoding: "utf8", timeout: 15_000 });
   const what = [cmd, ...args].join(" ");
   if (r.error) throw new Error(`grayboard: \`${what}\` failed to run: ${r.error.message}`);
   if (r.status !== 0) throw new Error(`grayboard: \`${what}\` exited ${r.status ?? r.signal}: ${r.stderr.trim()}`);
@@ -147,44 +190,86 @@ function callResult(value: unknown): { content: Content[]; isError: boolean; ins
   return { content, isError: r.isError === true, ...(instructions ? { instructions } : {}) };
 }
 
-// Whether an MCP server runs `grayboard mcp`: a stdio server with an `mcp`
-// argument whose command is a grayboard binary, or whose command up to that
-// argument is this extension's own (`bun <checkout>/src/cli/main.ts` from source).
-function runsGrayboard(server: { type?: string; command?: string; args?: string[] }, own: Config): boolean {
-  if ((server.type !== undefined && server.type !== "stdio") || !server.command) return false;
-  const args = server.args ?? [];
-  const at = args.indexOf("mcp");
-  if (at < 0) return false;
-  if (/^grayboard(\.exe)?$/i.test(basename(server.command))) return true;
-  const prefix = [server.command, ...args.slice(0, at)];
-  const ownPrefix = [own.cmd, ...own.args.slice(0, own.args.indexOf("mcp"))];
-  return prefix.length === ownPrefix.length && prefix.every((p, i) => p === ownPrefix[i]);
+// A launcher's argv unwrapped to the program it runs: a package runner
+// (bunx, npx, pnpx, `bun x`, `npm exec`, `pnpm dlx`, `yarn dlx`) and its
+// flags, `env` and its assignments, `exec`, or a shell's `-c` line.
+function unwrap(argv: string[]): string[] {
+  const [head = "", ...rest] = argv;
+  const name = basename(head).replace(/\.exe$/i, "");
+  if (["sh", "bash", "zsh", "dash"].includes(name)) {
+    const line = rest[rest.indexOf("-c") + 1];
+    return rest.includes("-c") && line ? unwrap(line.trim().split(/\s+/)) : argv;
+  }
+  if (name === "exec") return unwrap(rest);
+  if (name === "env") return unwrap(rest.filter((a, i) => !rest.slice(0, i + 1).every((b) => b.includes("=") || b.startsWith("-"))));
+  const runner = ["bunx", "npx", "pnpx"].includes(name) ? 1
+    : (name === "bun" && rest[0] === "x") || (["npm", "pnpm"].includes(name) && ["exec", "x", "dlx"].includes(rest[0] ?? "")) || (name === "yarn" && rest[0] === "dlx") ? 2
+    : 0;
+  if (!runner) return argv;
+  const tail = argv.slice(runner);
+  while (tail[0]?.startsWith("-")) tail.shift();
+  return unwrap(tail);
 }
 
-// The refusal when omp itself would run a grayboard: an enabled MCP server,
-// under any name, that runs `grayboard mcp`, as omp's own loader resolves its
-// config (every source, priority, same-name shadowing, disabledServers,
-// enabledServers and mcp.enableProjectConfig). Its tools would collide with
-// these, and its process would be a second delivery owner beside this one's.
-// The disabled user entry shadows only a same-named server omp ranks lower,
-// so a repo's .omp/mcp.json entry, or one under another name, can still run.
-// Undefined when there's none.
+// Whether an MCP server runs `grayboard mcp`: a stdio server whose program,
+// past any launcher, is a grayboard binary or package with an `mcp`
+// argument, or whose argv up to `mcp` is this extension's own
+// (`bun <checkout>/src/cli/main.ts` from source).
+function runsGrayboard(server: { type?: string; command?: string; args?: string[] }, own: Config): boolean {
+  if ((server.type !== undefined && server.type !== "stdio") || !server.command) return false;
+  const argv = unwrap([server.command, ...(server.args ?? [])]);
+  const at = argv.indexOf("mcp");
+  if (at < 1) return false;
+  if (/^grayboard(@[^/]*)?(\.exe)?$/i.test(basename(argv[0]!))) return true;
+  const ownArgv = [own.cmd, ...own.args];
+  return at === ownArgv.indexOf("mcp") && argv.slice(0, at).every((p, i) => p === ownArgv[i]);
+}
+
+// The refusal when omp itself would serve a grayboard beside this one, as
+// omp's own loader resolves its config (every source, priority, same-name
+// shadowing, disabledServers, enabledServers and mcp.enableProjectConfig): an
+// enabled server named "grayboard", whatever it runs (pi's name rule: its
+// tools take this extension's names), or one under any other name that runs
+// `grayboard mcp` (a second delivery owner). The disabled user entry shadows
+// only a same-named server omp ranks lower, so a repo's .omp/mcp.json entry,
+// or one under another name, can still run. Undefined when there's none.
 async function secondGrayboard(cwd: string, own: Config): Promise<string | undefined> {
   const meanwhile = "until then the grayboard extension registers no tools and receives nothing";
   try {
     const { configs, sources } = await loadAllMCPConfigs(cwd, { enableProjectConfig: cfgMcpEnableProjectConfig.get(settings) });
-    const found = Object.entries(configs).find(([, server]) => runsGrayboard(server, own));
+    const found = Object.entries(configs).find(([name, server]) => name === SERVER || runsGrayboard(server, own));
     if (!found) return undefined;
     const [name, server] = found;
     const source = sources[name];
+    const why = name === SERVER ? `is named "${SERVER}", the name this extension serves its tools under` : "runs `grayboard mcp`";
     // The pin grayboard reads itself under omp: the repo's .omp/mcp.json grayboard entry's.
     const pin = "env" in server ? server.env?.BUS_IDENTITY : undefined;
     const pins = name === "grayboard" && source?.level === "project" && basename(dirname(source.path)) === ".omp" && basename(source.path) === "mcp.json" && pin;
     const keeps = pins ? ` (disabled, its BUS_IDENTITY "${pin}" still pins this session's name)` : "";
-    return `grayboard: the "${name}" MCP server in ${source?.path ?? "omp's MCP config"} runs \`grayboard mcp\` and is enabled, so omp would run a second grayboard beside this extension's. Set "enabled": false on it${keeps} or remove it (grayboard setup writes the user-level "${SERVER}" entry disabled); ${meanwhile}.`;
+    return `grayboard: the "${name}" MCP server in ${source?.path ?? "omp's MCP config"} is enabled and ${why}, so omp would run it beside this extension's grayboard. Set "enabled": false on it${keeps} or remove it (grayboard setup writes the user-level "${SERVER}" entry disabled); ${meanwhile}.`;
   } catch (e) {
     return `grayboard: couldn't read omp's MCP config to check for a second grayboard (${(e as Error).message}); ${meanwhile}.`;
   }
+}
+
+// omp's MCP client hands a server a file-backed internal URL argument
+// (local://, artifact://, agent://, skill://, …) as the path behind it
+// (resolveOutboundUrlArgs, its mcp/tool-bridge.ts); this does the same through
+// omp's own router, so an attachment like local://report.md still reaches
+// grayboard as a file it can read.
+async function resolveUrls(value: unknown, ctx: ExtensionContext): Promise<unknown> {
+  if (typeof value === "string") {
+    if (!extractUriScheme(value)) return value;
+    const router = InternalUrlRouter.instance();
+    const url = router.normalize(value);
+    if (!router.canHandle(url)) return value;
+    const scheme = extractUriScheme(url);
+    if (!scheme || router.spec(scheme)?.backing !== "file") return value;
+    return (await router.locate(url, { cwd: ctx.cwd, settings, localProtocolOptions: ctx.localProtocolOptions })) ?? value;
+  }
+  if (Array.isArray(value)) return Promise.all(value.map((v) => resolveUrls(v, ctx)));
+  if (isRecord(value)) return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await resolveUrls(v, ctx)])));
+  return value;
 }
 
 export default function grayboard(pi: ExtensionAPI) {
@@ -216,7 +301,8 @@ export default function grayboard(pi: ExtensionAPI) {
   // Started by the main session, not at load: until something can receive
   // them, messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
-    const proc = spawn(own.cmd, own.args, { cwd: ctx.cwd, env: own.env, stdio: ["pipe", "pipe", "pipe"] });
+    const startedAt = Date.now();
+    const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? ctx.cwd, env: own.env, stdio: ["pipe", "pipe", "pipe"] });
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
     let gone: Error | undefined;
@@ -236,14 +322,29 @@ export default function grayboard(pi: ExtensionAPI) {
       send({ id, method, params });
       return waiter.promise.finally(() => signal?.removeEventListener("abort", onAbort));
     };
+    // An unexpected exit fails the calls in flight with its reason, then
+    // restarts the process (RESTART_DELAYS_MS); it takes its names back from
+    // its name record, as a restart under the same harness does.
     const fail = (reason: string) => {
       gone = new Error(reason);
       for (const p of pending.values()) p.reject(gone);
       pending.clear();
       if (shared.child?.proc !== proc) return;
       shared.child = undefined;
-      shared.exitReason = reason;
-      report(ctx, `${reason}; restart omp to reconnect`);
+      if (Date.now() - startedAt >= STABLE_MS) shared.restarts = 0;
+      const attempt = shared.restarts ?? 0;
+      if (shared.owner !== pi || attempt >= RESTART_DELAYS_MS.length) {
+        shared.exitReason = reason;
+        report(ctx, `${reason}${attempt ? ` after ${attempt} restarts` : ""}; restart omp to reconnect`);
+        return;
+      }
+      shared.restarts = attempt + 1;
+      shared.exitReason = `${reason}; restarting it`;
+      pi.logger.warn(`${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`);
+      shared.restart = Bun.sleep(RESTART_DELAYS_MS[attempt]!).then(() => {
+        shared.restart = undefined;
+        if (shared.owner === pi && !shared.child) shared.child = start(ctx);
+      });
     };
     // JSON-RPC over stdio is LF-delimited; split on "\n" only (readline would
     // also split on U+2028/2029, which are valid inside JSON strings).
@@ -325,13 +426,16 @@ export default function grayboard(pi: ExtensionAPI) {
         strict: false,
         loadMode: tool._meta?.["anthropic/alwaysLoad"] === true ? "essential" : "discoverable",
         async execute(_id, params, signal, _onUpdate, ctx) {
+          const sub = ctx.agent.kind !== "main";
+          // Checked per call too: a top-level session sharing the owner's agent id may have started since.
+          if (sub && !ownersSubagent(ctx.agent.parentId)) throw new Error(NOT_OWNERS);
+          if (!shared.child && shared.restart) await shared.restart;
           const c = shared.child;
           if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
           await c.ready;
-          const sub = ctx.agent.kind !== "main";
           const result = callResult(await c.call("tools/call", {
             name: tool.name,
-            arguments: isRecord(params) ? params : {},
+            arguments: await resolveUrls(isRecord(params) ? params : {}, ctx),
             ...(sub ? { _meta: { [AGENT_META]: ctx.sessionManager.getSessionId() } } : {}),
           }, signal));
           if (result.isError && !result.content.some((b) => b.type === "text" && b.text)) {
@@ -348,16 +452,25 @@ export default function grayboard(pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    // Every runtime records its agent before it can spawn one, so a subagent finds its root.
+    (shared.agents ??= new Map()).set(ctx.agent.id, { main: ctx.agent.kind === "main", ...(ctx.agent.parentId !== undefined ? { parent: ctx.agent.parentId } : {}), runtime: pi });
     if (ctx.agent.kind !== "main") {
-      // A subagent serves the tools when its main session does.
-      if (!registered && shared.verdict && !(await shared.verdict)) register();
+      // A subagent of the session that runs grayboard serves its tools; when
+      // that session's grayboard was refused, its notice already said why.
+      if (registered || !shared.verdict || (await shared.verdict) !== undefined) return;
+      if (ownersSubagent(ctx.agent.parentId)) register();
+      else report(ctx, NOT_OWNERS);
       return;
     }
+    (shared.mains ??= new Map()).set(pi, ctx.agent.id);
     if (shared.owner === pi) return;
     // One grayboard process per omp process: a second top-level session in
-    // it (ACP serves several) would act as the first's.
+    // it (ACP serves several) would act as the first's names.
     if (shared.owner) {
-      return report(ctx, "grayboard: another top-level session in this omp process runs grayboard; this one registers no grayboard tools and receives nothing");
+      const ownerRefused = shared.verdict ? await shared.verdict : undefined;
+      return report(ctx, ownerRefused
+        ? "grayboard: the first top-level session in this omp process didn't start grayboard (its notice says why); this one registers no grayboard tools and receives nothing"
+        : "grayboard: another top-level session in this omp process runs grayboard; this one and its subagents register no grayboard tools and receive nothing");
     }
     shared.owner = pi;
     shared.verdict = secondGrayboard(ctx.cwd, own);
@@ -365,6 +478,7 @@ export default function grayboard(pi: ExtensionAPI) {
     if (refused) return report(ctx, refused);
     register();
     shared.exitReason = undefined;
+    shared.restarts = 0;
     shared.child = start(ctx);
   });
 
@@ -391,11 +505,13 @@ export default function grayboard(pi: ExtensionAPI) {
   // omp keeps the main runtime across /new, /resume and /fork, so this runs
   // once, at quit: close the process's stdin and give it time to end its session.
   pi.on("session_shutdown", async () => {
+    shared.mains?.delete(pi);
     if (shared.owner !== pi) return;
     const c = shared.child;
     shared.owner = undefined;
     shared.verdict = undefined;
     shared.child = undefined;
+    shared.restart = undefined;
     shared.exitReason = "grayboard: the main omp session ended";
     if (!c) return;
     const exited = Promise.withResolvers<void>();

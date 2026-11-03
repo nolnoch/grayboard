@@ -5,7 +5,7 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalTaskScenario } from "../support/omp.ts";
 
 let dir: string;
 
@@ -31,6 +31,10 @@ test("omp hosted: two processes on one agent dir share one refresh; /grayboard l
 
 test("omp local task run: each subagent's DM goes as main's name with its child ID as via, its bind is refused, and it's audited as main's child, which ends with main; a peer's DM while two subagents run reaches main once and no subagent (#523, #526)", () => ompLocalTaskScenario(dir), 120_000);
 
-test("omp local: an enabled MCP server running `grayboard mcp`, in a repo's .omp/mcp.json under the same name or a repo's .mcp.json under another, makes the adapter refuse: a notice (saying a .omp/mcp.json pin survives disabling), no tools, no grayboard process (#523)", () => ompLocalRefusalScenario(dir), 120_000);
+test("omp local: an enabled MCP server omp would run beside the adapter's grayboard (named grayboard in a repo's .omp/mcp.json, stdio or HTTP, or under another name running `grayboard mcp`, directly or behind `sh -c`) makes the adapter refuse: a notice (saying a .omp/mcp.json pin survives disabling), no tools, no grayboard process (#523)", () => ompLocalRefusalScenario(dir), 120_000);
 
 test("omp local: a repo's disabled .omp/mcp.json grayboard entry pins the name an omp session with no BUS_IDENTITY suggests and binds (#523)", () => ompLocalPinScenario(dir), 120_000);
+
+test("omp local: a killed grayboard process is restarted and takes its name back; /new keeps the process and name, and a push-started turn after it carries the instructions as a hidden message; a local:// attachment reaches grayboard as its path; the user entry's ${VAR} expands (#523)", () => ompLocalCarryScenario(dir), 120_000);
+
+test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);

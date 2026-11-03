@@ -37376,26 +37376,25 @@ function resolveIdentity(base, cwd = process.cwd()) {
     return base;
   return sanitizeIdentity(name.startsWith(`${b}-`) ? name : `${b}-${name}`);
 }
-function pinnedIdentities(cwd = process.cwd()) {
-  const pins = [];
-  for (const file of [".mcp.json", ".omp/mcp.json"]) {
-    try {
-      const full = join5(gitLocation(cwd)?.repo ?? cwd, file);
-      const pin = JSON.parse(readFileSync3(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
-      if (typeof pin === "string" && pin)
-        pins.push(pin);
-    } catch {}
-  }
-  return pins;
-}
-function pinnedIdentity(cwd = process.cwd()) {
+var PIN_FILES = [".mcp.json", ".omp/mcp.json"];
+function readPin(cwd, file) {
   try {
-    const file = join5(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
-    const pin = JSON.parse(readFileSync3(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    const pin = JSON.parse(readFileSync3(join5(gitLocation(cwd)?.repo ?? cwd, file), "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
     return typeof pin === "string" && pin ? pin : undefined;
   } catch {
     return;
   }
+}
+function pinnedIdentities(cwd = process.cwd()) {
+  return PIN_FILES.flatMap((file) => readPin(cwd, file) ?? []);
+}
+function pinnedIdentity(cwd = process.cwd(), env = process.env) {
+  for (const file of env.BUS_HARNESS === "omp" ? PIN_FILES : PIN_FILES.slice(0, 1)) {
+    const name = readPin(cwd, file);
+    if (name)
+      return { name, file };
+  }
+  return;
 }
 function isExplicitIdentity(env = process.env, cwd = process.cwd()) {
   if (!env.BUS_IDENTITY)
@@ -37405,7 +37404,7 @@ function isExplicitIdentity(env = process.env, cwd = process.cwd()) {
 function sessionIdentity(env = process.env, cwd = process.cwd()) {
   if (isExplicitIdentity(env, cwd))
     return env.BUS_IDENTITY;
-  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+  return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd, env)?.name || defaultIdentity(cwd), cwd);
 }
 function configuredIdentity(env = process.env, cwd = process.cwd()) {
   try {
