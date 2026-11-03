@@ -12,7 +12,7 @@ import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
-import { fixture } from "./binding.test.js";
+import { fixture } from "./native-fixture.js";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
@@ -78,6 +78,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
       get: async ({ sessionID }: { sessionID: string }) => { const value = nodes.get(sessionID); if (!value) throw new Error("missing"); return structuredClone(value); },
       update: async ({ sessionID, metadata }: { sessionID: string; metadata: Record<string, unknown> }) => { nodes.get(sessionID)!.metadata = structuredClone(metadata); },
       synthetic: async (input: { sessionID: string; id: string; resume: boolean }) => { admissions.push(input); await admit?.(); },
+      hook: async () => ({ dispose: async () => {} }),
     },
     tool: { list: async () => ["bind", "dm_send", "whoami"].map(name => ({ id: `grayboard_${name}`, options: { namespace: "grayboard" } })) },
   } as unknown as Context;

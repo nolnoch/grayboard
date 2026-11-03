@@ -13,13 +13,13 @@ const end = (id: number, exit = 0) => JSON.stringify({ phase: "case", id, state:
 const all = ready + matrixCases.map((_, i) => start(i + 1) + end(i + 1)).join("");
 
 test("matrix parser constructs bounded canonical states and requires every successful case", () => {
-  expect(matrixObservation(all, 0)).toEqual({ phase: "complete", state: "finished", exit: 0, completed: 29, cases: matrixCases.map((_, i) => ({ id: i + 1, exit: 0 })) });
+  expect(matrixObservation(all, 0)).toEqual({ phase: "complete", state: "finished", exit: 0, completed: matrixCases.length, cases: matrixCases.map((_, i) => ({ id: i + 1, exit: 0 })) });
   expect(matrixObservation(prepare, 1)).toEqual({ phase: "prepare", state: "interrupted", exit: 1, completed: 0, cases: [] });
   expect(matrixObservation(ready + start(1), 137)).toEqual({ phase: "case", id: 1, name: "pause/before", state: "interrupted", exit: 137, completed: 0, cases: [] });
   expect(matrixObservation(ready + start(1) + end(1, 7), 7)).toEqual({ phase: "case", id: 1, name: "pause/before", state: "finished", exit: 7, completed: 1, cases: [{ id: 1, exit: 7 }] });
   expect(matrixObservation(all, 1).phase).toBe("complete");
   expect(matrixObservation(ready + start(1) + end(1), 1)).toEqual({ phase: "case", id: 1, name: "pause/before", state: "finished", exit: 0, completed: 1, cases: [{ id: 1, exit: 0 }] });
-  for (const input of ["", prepare.slice(0, -1), "x".repeat(8193), ready, ready + start(2), ready + end(1), ready + start(1) + start(1), all + start(30), ready + start(1) + end(1, 1) + start(2), ready + start(1) + end(1, 256), ready + start(1) + end(1, -1), ready + start(1) + '{"phase":"case","id":1,"state":"finished","exit":0,"extra":"private"}\n', ready + start(1) + '{"phase":"case","id":1,"id":1,"state":"finished","exit":0}\n', ready + start(1) + end(1).replace('"exit":0', '"exit":0.0')]) {
+  for (const input of ["", prepare.slice(0, -1), "x".repeat(8193), ready, ready + start(2), ready + end(1), ready + start(1) + start(1), all + start(matrixCases.length + 1), ready + start(1) + end(1, 1) + start(2), ready + start(1) + end(1, 256), ready + start(1) + end(1, -1), ready + start(1) + '{"phase":"case","id":1,"state":"finished","exit":0,"extra":"private"}\n', ready + start(1) + '{"phase":"case","id":1,"id":1,"state":"finished","exit":0}\n', ready + start(1) + end(1).replace('"exit":0', '"exit":0.0')]) {
     expect(() => matrixObservation(input, 0)).toThrow("Invalid matrix observations");
   }
   for (const code of [-1, 256, 0.1, NaN]) expect(() => matrixObservation(all, code)).toThrow();
@@ -44,7 +44,7 @@ test("observer delegates the unchanged reviewed parent loop and maps its actual 
   writeFileSync(join(f.path, "tests/real-races.sh"), loop); writeFileSync(join(f.path, "tests/real-prepare.sh"), "exit 0\n");
   const result = Bun.spawnSync(["/bin/sh", "tests/real-races.sh"], { cwd: f.path, env: { ...f.env, GRAYBOARD_PACKAGE_TEST_DIR: f.path, GRAYBOARD_TEST_REAL_RACE: "", GRAYBOARD_TEST_RACE_BOUNDARY: "" } });
   expect(result.exitCode).toBe(0);
-  expect(matrixObservation(readFileSync(f.observations, "utf8"), result.exitCode).completed).toBe(29);
+  expect(matrixObservation(readFileSync(f.observations, "utf8"), result.exitCode).completed).toBe(matrixCases.length);
   expect(readFileSync(f.env.GIT_INDEX_FILE, "utf8")).toBe("untouched");
 });
 

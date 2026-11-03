@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { OpenCodeController } from "../src/lifecycle.js";
-import { fixture } from "./binding.test.js";
+import { fixture } from "./native-fixture.js";
 import { until } from "../../../tests/support/until.ts";
 import { startServer } from "../../../src/server/app.ts";
 import { hashToken } from "../../../src/server/auth.ts";

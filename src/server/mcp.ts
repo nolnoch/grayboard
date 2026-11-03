@@ -329,13 +329,20 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       },
     };
   }
+  // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
+  function boundInstruction(context: Context): string {
+    if (!("id" in context.sessionContext)) return hostedBoundInstruction(context.info, context.declared);
+    const row = hosted.row(context.sessionContext.id);
+    const root = row && hosted.rootOf(row);
+    return hostedBoundInstruction(context.info, context.declared, application.hostedLauncher(context.sessionContext.id), root?.lease_deadline != null);
+  }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
     const server = new McpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
-      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : hostedBoundInstruction(info, context.declared, "id" in context.sessionContext && application.hostedLauncher(context.sessionContext.id)),
+      instructions: role === "subscriber" ? undefined : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? []) : boundInstruction(context),
     });
     server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });

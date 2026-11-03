@@ -1,10 +1,10 @@
 import { appendFileSync, readFileSync } from "node:fs";
 
-export const matrixLoopSHA = "daecaf67fd934d1b37c5fe6eec8df58311388c7f77c897bf3325d9d04cb5811a";
+export const matrixLoopSHA = "3e3095c6bbec393b4b19a72ccdae8cafd8e203708715680c07e55e09d5bcff4b";
 
 export const matrixCases = [
   ...["pause", "archive", "delete", "rebind", "enrollment", "account", "account-away-back", "config", "away-back", "revocation", "expiry"].flatMap(scenario => ["before", "after"].map(boundary => ({ scenario, boundary, crash: "" }))),
-  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account"].map(scenario => ({ scenario, boundary: "", crash: "" })),
+  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account", "instructions"].map(scenario => ({ scenario, boundary: "", crash: "" })),
   ...["before", "after"].map(crash => ({ scenario: "", boundary: "", crash })),
 ];
 
@@ -30,7 +30,7 @@ export function matrixObservation(raw: string, runtimeExit: number) {
   const invalid = (): never => { throw new Error("Invalid matrix observations"); };
   if (Buffer.byteLength(raw) > 8192 || !raw.endsWith("\n") || !Number.isInteger(runtimeExit) || runtimeExit < 0 || runtimeExit > 255) invalid();
   const lines = raw.slice(0, -1).split("\n");
-  if (lines.length > 60 || lines[0] !== '{"phase":"prepare","state":"started"}') invalid();
+  if (lines.length > 2 + 2 * matrixCases.length || lines[0] !== '{"phase":"prepare","state":"started"}') invalid();
   let offset = 1;
   const cases: { id: number; exit: number }[] = [];
   let phase: "prepare" | "case" | "complete" = "prepare", state: "interrupted" | "finished" = "interrupted", id: number | undefined, exit = runtimeExit;
