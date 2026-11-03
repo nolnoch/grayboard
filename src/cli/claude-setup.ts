@@ -84,13 +84,16 @@ export function installClaudePlugin(run: ClaudeCli, server: string, which: (cmd:
 
 /**
  * Server mode, plugin installed and enabled: fetch the marketplace's current
- * catalog and update the plugin to it. Returns `claude plugin update`'s own
- * report (the version it updated to, or that it was already current); throws
- * on a failed `claude` command. A running session keeps the old plugin until
- * restarted. The catalog's pin moves only when a release's `plugin-pin` PR
- * merges, so an update right after a release can find nothing newer.
+ * catalog, update the plugin to it, and compare the installed plugin's
+ * version with this grayboard's (`version`). Returns `claude plugin update`'s
+ * own report and that comparison; throws on a failed `claude` command or a
+ * plugin list without the user-scope plugin. A running session keeps the old
+ * plugin until restarted. The catalog's pin moves only when a release's
+ * `plugin-pin` PR merges, after the release publishes: a plugin older than
+ * this grayboard right after an update means that PR hasn't merged yet, and
+ * running the update again later picks the pin up (#511).
  */
-export function refreshClaudePlugin(run: ClaudeCli): string[] {
+export function refreshClaudePlugin(run: ClaudeCli, version: string): string[] {
   if (!pluginEnabled()) return [];
   let report = "";
   for (const args of [["plugin", "marketplace", "update", MARKETPLACE], ["plugin", "update", CLAUDE_PLUGIN]]) {
@@ -98,7 +101,24 @@ export function refreshClaudePlugin(run: ClaudeCli): string[] {
     if (r.exitCode !== 0) throw new Error(`\`${shown(args)}\` failed${r.out ? `: ${r.out}` : ""}`);
     report = r.out;
   }
-  return [`Claude Code plugin ${CLAUDE_PLUGIN}: ${report || "update reported nothing"}. Restart Claude Code sessions to load a new version; a release's pin reaches the marketplace only when its plugin-pin PR merges.`];
+  const plugin = installedPlugin(run);
+  const notes = [`Claude Code plugin ${CLAUDE_PLUGIN}: ${report || "update reported nothing"}. Restart Claude Code sessions to load a new version.`];
+  const order = Bun.semver.order(plugin, version);
+  if (order < 0) notes.push(`The plugin is at ${plugin}, older than this grayboard (${version}): the plugin pin for v${version} hasn't merged into the marketplace yet. Run \`grayboard update\` again later.`);
+  else if (order > 0) notes.push(`The plugin is at ${plugin}, newer than this grayboard (${version}).`);
+  return notes;
+}
+
+/** The installed user-scope plugin's version, from `claude plugin list --json`. Throws when the command fails or lists no such plugin. */
+function installedPlugin(run: ClaudeCli): string {
+  const args = ["plugin", "list", "--json"];
+  const r = run(args);
+  if (r.exitCode !== 0) throw new Error(`\`${shown(args)}\` failed${r.out ? `: ${r.out}` : ""}`);
+  let list: unknown;
+  try { list = JSON.parse(r.out); } catch { throw new Error(`\`${shown(args)}\` printed something other than JSON`); }
+  const entry = Array.isArray(list) ? list.find((p) => p?.id === CLAUDE_PLUGIN && p?.scope === "user") : undefined;
+  if (typeof entry?.version !== "string") throw new Error(`\`${shown(args)}\` lists no user-scope ${CLAUDE_PLUGIN} with a version`);
+  return entry.version;
 }
 
 /** Whether user settings enable the hosted plugin. Throws when the file can't be parsed. */

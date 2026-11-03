@@ -11,11 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeCli } from "./claude-setup.ts";
 import { REPO } from "./update.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 const cli = join(import.meta.dir, "main.ts");
 const SERVER = "http://127.0.0.1:9";
 
-// argv → state, as Claude Code 2.1.316 does it. STUB_FAIL names a subcommand to fail.
+// argv → state, as Claude Code 2.1.316 does it. STUB_FAIL names a subcommand to fail;
+// STUB_PLUGIN_VERSION is the installed plugin's version, STUB_PLUGIN_LIST replaces `plugin list`'s output.
 const STUB = `#!${process.execPath}
 const fs = require("node:fs"), path = require("node:path");
 const home = process.env.HOME, args = process.argv.slice(2);
@@ -35,7 +37,8 @@ switch (cmd) {
     s.pluginConfigs = { ...s.pluginConfigs, [args[2]]: { options: { server_url: args[4].slice("server_url=".length) } } };
     write(settings, s); break;
   }
-  case "plugin update": if (s.enabledPlugins?.[args[2]] === undefined) { console.error("plugin not installed"); process.exit(1); } console.log("already at the latest version (1.0.0)"); break;
+  case "plugin update": if (s.enabledPlugins?.[args[2]] === undefined) { console.error("plugin not installed"); process.exit(1); } console.log("already at the latest version (" + process.env.STUB_PLUGIN_VERSION + ")"); break;
+  case "plugin list": console.log(process.env.STUB_PLUGIN_LIST ?? JSON.stringify(Object.keys(s.enabledPlugins ?? {}).map((id) => ({ id, version: process.env.STUB_PLUGIN_VERSION, scope: "user", enabled: s.enabledPlugins[id] })))); break;
   case "plugin disable": if (s.enabledPlugins?.[args[2]] !== true) { console.error("already disabled"); process.exit(1); } s.enabledPlugins[args[2]] = false; write(settings, s); break;
   default: console.error("stub: unexpected " + cmd); process.exit(2);
 }
@@ -55,7 +58,7 @@ function fixture({ bun = true, claude = true } = {}) {
   if (bun) symlinkSync(process.execPath, join(root, "bin", "bun"));
   const exec = (args: string[], extra: Record<string, string> = {}, cwd = root) => {
     const env = { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, "config"), GRAYBOARD_CREDENTIALS: join(root, "credentials"), PI_CODING_AGENT_DIR: join(root, "pi"),
-      PATH: join(root, "bin"), CLAUDE_CONFIG_DIR: undefined, GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0", ...extra };
+      PATH: join(root, "bin"), CLAUDE_CONFIG_DIR: undefined, GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0", STUB_PLUGIN_VERSION: pkg.version, ...extra };
     const r = Bun.spawnSync([process.execPath, cli, ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
   };
@@ -83,7 +86,7 @@ const PLUGIN_URL = `${SERVER}/mcp`;
 const LOCAL = [`claude mcp remove --scope user grayboard`, `claude mcp add --scope user grayboard -- bun ${cli} mcp`];
 const PLUGIN = [`claude plugin marketplace add ${REPO}`, "claude plugin marketplace update grayboard",
   `claude plugin install grayboard@grayboard --config server_url=${PLUGIN_URL}`, "claude mcp remove --scope user grayboard"];
-const UPDATE = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard"];
+const UPDATE = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard", "claude plugin list --json"];
 const HOOK = [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: `bun ${cli} session-start`, timeout: 10 }] }];
 
 test("setup switches Claude Code local → server → local: the entry and hook, then the plugin, then the entry with the plugin disabled", () => {
@@ -160,7 +163,7 @@ test("refresh-adapters moves a server-mode user's Claude Code entry to the plugi
   // Migrated: nothing left to move, and the installed plugin updates (#443).
   const again = f.run("refresh-adapters");
   expect(f.argv()).toEqual(UPDATE);
-  expect(again).toContain("Claude Code plugin grayboard@grayboard: already at the latest version (1.0.0).");
+  expect(again).toContain(`Claude Code plugin grayboard@grayboard: already at the latest version (${pkg.version}). Restart Claude Code sessions to load a new version.`);
 });
 
 test("refresh-adapters in server mode updates an enabled plugin, skips a disabled or absent one, reports a failed update, and warns about a repo .mcp.json entry (#443)", () => {
@@ -177,7 +180,7 @@ test("refresh-adapters in server mode updates an enabled plugin, skips a disable
   const out = f.exec(["refresh-adapters"], {}, join(f.root, "sub"));
   expect(out.exitCode, out.stderr).toBe(0);
   expect(f.argv()).toEqual(UPDATE);
-  expect(out.stdout).toContain("Claude Code plugin grayboard@grayboard: already at the latest version (1.0.0).");
+  expect(out.stdout).toContain(`Claude Code plugin grayboard@grayboard: already at the latest version (${pkg.version}). Restart Claude Code sessions to load a new version.`);
   expect(out.stdout).toContain(`${join(f.root, ".mcp.json")} has a grayboard entry`);
   // A failed update names the command and fails the run, and the warning still prints.
   const failed = f.exec(["refresh-adapters"], { STUB_FAIL: "plugin update" });
@@ -193,6 +196,42 @@ test("refresh-adapters in server mode updates an enabled plugin, skips a disable
   writeFileSync(join(f.root, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "grayboard@grayboard": false } }));
   f.run("refresh-adapters");
   expect(f.argv()).toEqual([]);
+});
+
+test("the plugin update compares the installed plugin's version with this grayboard's: older names the unmerged pin, newer says so, and a failed or plugin-less list fails the run (#511)", () => {
+  const f = fixture();
+  f.signIn();
+  f.run("setup", "-y");
+  f.argv();
+  const pin = `the plugin pin for v${pkg.version} hasn't merged into the marketplace yet. Run \`grayboard update\` again later.`;
+  // Same version: no comparison note.
+  const same = f.run("refresh-adapters");
+  expect(f.argv()).toEqual(UPDATE);
+  expect(same).not.toContain("The plugin is at");
+  // Older: the release's plugin-pin PR hasn't merged.
+  const older = f.exec(["refresh-adapters"], { STUB_PLUGIN_VERSION: "1.0.0" });
+  expect(older.exitCode, older.stderr).toBe(0);
+  expect(older.stdout).toContain(`The plugin is at 1.0.0, older than this grayboard (${pkg.version}): ${pin}`);
+  // Newer: said, not acted on.
+  const newer = f.exec(["refresh-adapters"], { STUB_PLUGIN_VERSION: "999.0.0" });
+  expect(newer.exitCode, newer.stderr).toBe(0);
+  expect(newer.stdout).toContain(`The plugin is at 999.0.0, newer than this grayboard (${pkg.version}).`);
+  expect(newer.stdout).not.toContain(pin);
+  f.argv();
+  // A failed list names the command and fails the run.
+  const failed = f.exec(["refresh-adapters"], { STUB_FAIL: "plugin list" });
+  expect(failed.exitCode).toBe(1);
+  expect(failed.stdout).toContain("`claude plugin list --json` failed: stub: plugin list failed");
+  expect(f.argv()).toEqual(UPDATE);
+  // A list without the user-scope plugin, or that isn't JSON, fails the run too.
+  for (const [list, message] of [
+    [JSON.stringify([{ id: "grayboard@grayboard", version: "1.0.0", scope: "project" }]), "`claude plugin list --json` lists no user-scope grayboard@grayboard with a version"],
+    ["not json", "`claude plugin list --json` printed something other than JSON"],
+  ]) {
+    const r = f.exec(["refresh-adapters"], { STUB_PLUGIN_LIST: list });
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain(`${message}; fix it, then run \`grayboard setup\``);
+  }
 });
 
 test("without claude on PATH, setup prints the mode's commands", () => {

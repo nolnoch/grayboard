@@ -305,6 +305,28 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(out).not.toContain("Disabled the grayboard entry");
 }, 60_000);
 
+// The plugin's pin merges after the release, so an update that finds the CLI
+// current still updates the plugin and says how its version compares (#511).
+test("update with the CLI already current still updates an enabled Claude Code plugin", async () => {
+  label = "update-current-plugin";
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
+  await expectOk(install({ GRAYBOARD_VERSION: TAG }));
+  mkdirSync(join(home, ".grayboard"), { recursive: true });
+  writeFileSync(CREDENTIALS(), JSON.stringify({ server: "http://127.0.0.1:9", session_token: "t", user_email: "you@example.com" }), { mode: 0o600 });
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "grayboard@grayboard": true } }));
+  // A plugin a release behind: the list reports it, the rest only log.
+  const claude = join(dir, "stubs", "claude");
+  writeFileSync(claude, `#!/bin/sh\necho "claude $*" >> "${join(dir, "argv.log")}"\n` +
+    `[ "$*" = "plugin list --json" ] && echo '[{"id":"grayboard@grayboard","version":"0.0.1","scope":"user","enabled":true}]'\nexit 0\n`);
+
+  const out = await expectOk(grayboard("update"));
+  expect(out).toContain(`grayboard ${pkg.version} is the latest release (${releases.url})`);
+  expect(readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n")).toEqual(
+    ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard", "claude plugin list --json"]);
+  expect(out).toContain(`The plugin is at 0.0.1, older than this grayboard (${pkg.version}): the plugin pin for ${TAG} hasn't merged into the marketplace yet.`);
+}, 60_000);
+
 test("refresh-adapters disables the grayboard entry of each adapter it rewrites, once", async () => {
   label = "refresh-adapters-entries";
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });

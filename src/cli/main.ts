@@ -796,11 +796,40 @@ program
     );
   });
 
+/**
+ * Claude Code, server mode: a user still on the user-scope `grayboard mcp`
+ * entry (setup before the plugin) moves to the hosted plugin; an installed
+ * plugin updates to the marketplace's current pin (#443). A failure sets the
+ * exit code and is printed. Beside the plugin, a project's grayboard entry
+ * runs a second grayboard: checked even when the update failed.
+ */
+function refreshClaude(): void {
+  const failed = (e: unknown) => {
+    console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
+    process.exitCode = 1;
+  };
+  try {
+    const claude = Bun.which("claude");
+    if (busMode() === "server" && claude) {
+      if (hasUserEntry()) {
+        const server = process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
+        if (!server) throw new Error("Server mode with no server URL, so Claude Code wasn't moved to the grayboard plugin");
+        for (const note of installClaudePlugin(claudeCli(claude), server)) console.log(note);
+      } else {
+        for (const note of refreshClaudePlugin(claudeCli(claude), pkg.version)) console.log(note);
+      }
+    }
+  } catch (e) { failed(e); }
+  try {
+    if (busMode() === "server" && Bun.which("claude") && pluginEnabled()) for (const w of projectEntryWarnings(process.cwd())) console.log(`[grayboard] ${w}`);
+  } catch (e) { failed(e); }
+}
+
 // ── update ───────────────────────────────────────────────────────────────────
 
 program
   .command("update")
-  .description("Replace this binary with the latest release")
+  .description("Replace this binary with the latest release, then update the Claude Code plugin to the marketplace's pin")
   .action(async () => {
     let r: UpdateResult;
     try {
@@ -809,7 +838,13 @@ program
       console.error(`[grayboard] update failed: ${(e as Error).message}`);
       process.exit(1);
     }
-    if (!r.updated) { console.log(`grayboard ${pkg.version} is the latest release (${r.origin}).`); return; }
+    if (!r.updated) {
+      // The binary is current, so its adapters are too; the plugin follows the
+      // marketplace's pin, which merges after the release (#511).
+      console.log(`grayboard ${pkg.version} is the latest release (${r.origin}).`);
+      refreshClaude();
+      return;
+    }
     console.log(`Updated grayboard ${pkg.version} → ${r.tag} from ${r.origin} (SHA256SUMS signed by key ${r.keyId}). Running sessions keep the old version until reconnected (/mcp → grayboard → reconnect).`);
     // The new binary rewrites the push adapters it carries. 1.0.0 lacks the
     // command; `setup` reinstalls adapters there.
@@ -863,25 +898,7 @@ program
         for (const note of r.notes) console.log(note);
       } catch (e) { failed(e); }
     }
-    // Claude Code, server mode: a user still on the user-scope `grayboard mcp`
-    // entry (setup before the plugin) moves to the hosted plugin; an installed
-    // plugin updates to the marketplace's current pin (#443).
-    try {
-      const claude = Bun.which("claude");
-      if (busMode() === "server" && claude) {
-        if (hasUserEntry()) {
-          server ??= process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
-          if (!server) throw new Error("Server mode with no server URL, so Claude Code wasn't moved to the grayboard plugin");
-          for (const note of installClaudePlugin(claudeCli(claude), server)) console.log(note);
-        } else {
-          for (const note of refreshClaudePlugin(claudeCli(claude))) console.log(note);
-        }
-      }
-    } catch (e) { failed(e); }
-    // Beside the plugin, a project's grayboard entry runs a second grayboard. Checked even when the update above failed.
-    try {
-      if (busMode() === "server" && Bun.which("claude") && pluginEnabled()) for (const w of projectEntryWarnings(process.cwd())) console.log(`[grayboard] ${w}`);
-    } catch (e) { failed(e); }
+    refreshClaude();
   });
 
 // ── identity ─────────────────────────────────────────────────────────────────
