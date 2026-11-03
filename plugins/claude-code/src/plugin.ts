@@ -7,13 +7,19 @@
 // lease (hosted-core's RootDelivery) only when Claude Code will show its
 // channel notifications (the shared rule, src/shared/claude_channels.ts).
 //
-// Claude Code runs one plugin process per session, and its subagents and
-// in-process work call through it, so they act as the root. The process
-// keeps CLAUDE_CODE_SESSION_ID across /clear (a reconnect starts a new one).
+// Claude Code runs one plugin process per session, and its subagents call
+// through it. The plugin's hooks (hooks/hooks.json, dist/hook.js) record which
+// agent made each grayboard call, keyed by its tool_use_id (#551,
+// src/shared/claude_agents.ts): a subagent's call runs as a child session
+// registered under this root, a main-agent call as the root, and a call with
+// no record is refused, never attributed to the root. The process keeps
+// CLAUDE_CODE_SESSION_ID across /clear (a reconnect starts a new one).
 //
 // The server stays on MCP SDK 1.x: Claude Code skips a channel whose session
 // negotiated protocol 2026-07-28 or later, and 1.x tops out at 2025-11-25.
 import { randomUUID } from "node:crypto";
+import { mkdirSync, watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult as ServerResult, type Tool as ListedTool } from "@modelcontextprotocol/sdk/types.js";
@@ -26,6 +32,7 @@ import { failure, hostTools, snapshotTools, type NativeTool } from "../../../ada
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
+import { MISSING_TEXT, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
@@ -59,6 +66,10 @@ export type PluginOptions = {
   files: ClaudeFiles;
   version: string;
   cwd: string;
+  // Claude Code's process (this server's parent) and its start time, read once
+  // at startup: the hooks' record dir is keyed by it (CLAUDE_PID), and a dir
+  // whose start differs is a recycled pid's.
+  claude: { pid: number; start: string | null };
   log(message: string): void; // stderr: Claude Code keeps it in the MCP log
 };
 
@@ -285,9 +296,43 @@ export function createPlugin(o: PluginOptions): Plugin {
     return unpause();
   };
 
-  const call = async (name: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  // ---- subagents (#551) ----
+
+  // A subagent's hosted child id: its agent id under this root's session id,
+  // unique on the server however Claude Code numbers its agents.
+  const childOf = (agent: string) => `${(config as { id: string }).id}/agent/${agent}`;
+  // SubagentStop's markers end each child's hosted session; watched once the
+  // first child call shows the session's record dir exists.
+  let endWatch: FSWatcher | undefined;
+  const drainEnded = () => {
+    if ("error" in config || closed) return;
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) void root?.endChild(childOf(agent));
+  };
+  const watchEnded = () => {
+    if (endWatch || "error" in config || closed) return;
+    const dir = join(sessionDir(config.dataDir, o.claude.pid), "ended");
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      endWatch = watch(dir, () => drainEnded());
+      endWatch.on("error", error => { say(`stopped watching subagent ends: ${message(error)}; their sessions end at the server's idle sweep`); endWatch?.close(); });
+    } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; their sessions end at the server's idle sweep`); }
+    drainEnded();
+  };
+
+  const call = async (name: string, args: Record<string, unknown>, meta: Record<string, unknown> | undefined): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
-    return root!.call(name, args, before);
+    // No tool_use_id: not a model's call (nothing to join); it acts as the root.
+    const toolUse = meta?.[TOOL_USE_META];
+    if (toolUse === undefined) return root!.call(name, args, before);
+    const taken = takeRecord(config.dataDir, o.claude.pid, o.claude.start, toolUse);
+    if ("missing" in taken) {
+      const cause = MISSING_TEXT[taken.missing];
+      say(`refused ${name} (tool_use_id ${String(toolUse).slice(0, 160)}): no agent record: ${cause}`);
+      return failure(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
+    }
+    if (taken.agent === null) return root!.call(name, args, before);
+    watchEnded();
+    return root!.call(name, args, before, { child: childOf(taken.agent) });
   };
 
   const tools = (): NativeTool[] => root?.tools() ?? hostTools(snapshotTools());
@@ -299,7 +344,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     );
     // The SDK 2 client's tool and result shapes are the 1.x server's, field for field.
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() as ListedTool[] }));
-    s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}) as ServerResult);
+    s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}, req.params._meta) as ServerResult);
     s.oninitialized = () => {
       initialized = true;
       markInitialized();
@@ -356,6 +401,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     if (closed) return;
     closed = true;
     changes?.dispose();
+    endWatch?.close();
     signingIn?.abort.abort();
     await root?.shutdown("release");
     await server?.close().catch(() => {});

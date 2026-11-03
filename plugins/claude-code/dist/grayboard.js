@@ -6922,8 +6922,8 @@ var require_dist2 = __commonJS(function(exports, module) {
 });
 
 // plugins/claude-code/src/main.ts
-import { readdirSync as readdirSync2 } from "fs";
-import { join as join6 } from "path";
+import { readdirSync as readdirSync3 } from "fs";
+import { join as join8 } from "path";
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js
 import process2 from "process";
@@ -32832,15 +32832,90 @@ function claudeChannels({ env, parentCmd, entry, files }) {
   return unknown ? { state: "unknown", reason: unknown } : { state: "on" };
 }
 
+// src/shared/proc.ts
+import { readFileSync as readFileSync2 } from "fs";
+function statFields(pid) {
+  try {
+    const stat = readFileSync2(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  } catch {
+    return null;
+  }
+}
+function ps(column, pids) {
+  const out = new Map;
+  if (pids.length === 0)
+    return out;
+  try {
+    const r = Bun.spawnSync(["ps", "-o", `pid=,${column}=`, "-p", pids.join(",")], { env: { ...process.env, LC_ALL: "C" } });
+    if (r.exitCode !== 0 && r.exitCode !== 1) {
+      warnOnce(`ps:${r.exitCode}`, `ps exited ${r.exitCode ?? r.signalCode}: ${r.stderr.toString().trim()}`);
+      return null;
+    }
+    for (const line of r.stdout.toString().split(`
+`)) {
+      const m = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (m)
+        out.set(Number(m[1]), m[2].trim());
+    }
+  } catch (e) {
+    warnOnce("ps:spawn", `ps failed to run: ${e.message}`);
+    return null;
+  }
+  return out;
+}
+var warned = new Set;
+function warnOnce(key, text) {
+  if (warned.has(key))
+    return;
+  warned.add(key);
+  console.error(`[grayboard] ${text}`);
+}
+function procStarts(pids) {
+  const out = new Map;
+  if (process.platform !== "linux") {
+    const starts = ps("lstart", pids);
+    for (const pid of pids) {
+      const start = starts ? starts.get(pid) : null;
+      if (start !== undefined)
+        out.set(pid, start);
+      else if (pidExists(pid))
+        out.set(pid, null);
+    }
+    return out;
+  }
+  for (const pid of pids) {
+    const start = statFields(pid)?.[19];
+    if (start)
+      out.set(pid, start);
+    else if (pidExists(pid))
+      out.set(pid, null);
+  }
+  return out;
+}
+function procStart(pid) {
+  const starts = procStarts([pid]);
+  return starts.has(pid) ? starts.get(pid) : undefined;
+}
+function pidExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+var SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
+
 // src/shared/toolguard.ts
-import { readFileSync as readFileSync2, statSync } from "fs";
+import { readFileSync as readFileSync3, statSync } from "fs";
 function channelsOffNotice(reason) {
   return `Warning: this Claude Code session is tools-only: grayboard can't push messages or board posts to it, because ${reason}, and peers see it as offline. Tell the user; what's pending arrives once a session with channels on holds this name. Until then, check dm_inbox and board_read yourself.`;
 }
 function parentCommandLine() {
   try {
     if (process.platform === "linux") {
-      return readFileSync2(`/proc/${process.ppid}/cmdline`, "utf8").split("\x00").join(" ").trim() || null;
+      return readFileSync3(`/proc/${process.ppid}/cmdline`, "utf8").split("\x00").join(" ").trim() || null;
     }
     const r = Bun.spawnSync(["ps", "-o", "args=", "-p", String(process.ppid)]);
     return r.exitCode === 0 ? r.stdout.toString().trim() || null : null;
@@ -32851,6 +32926,8 @@ function parentCommandLine() {
 
 // plugins/claude-code/src/plugin.ts
 import { randomUUID as randomUUID2 } from "crypto";
+import { mkdirSync as mkdirSync3, watch } from "fs";
+import { join as join7 } from "path";
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js
 function isZ4Schema(s) {
   const schema = s;
@@ -35517,6 +35594,9 @@ function describeFetchError(e, ms) {
 // src/shared/session_meta.ts
 var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
+function validSourceId(raw) {
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 1024 && !/[\x00-\x1f\x7f]/.test(raw);
+}
 
 // adapters/hosted-core/src/proxy.ts
 var NativeToolSchema = strictObject({
@@ -36892,6 +36972,9 @@ class RootDelivery {
   lastBinding;
   lastRecord;
   storeUnreadable = false;
+  hooked;
+  children = new Set;
+  enlisted = new Map;
   constructor(client, o) {
     this.client = client;
     this.o = o;
@@ -37049,7 +37132,7 @@ class RootDelivery {
         return;
       const proxy = this.client.proxy("push", { hooks: controller, onTools: (tools) => this.listed(tools), onAfterFailure: () => controller.backgroundFailure("after") });
       const old = this.proxy;
-      this.proxy = proxy;
+      this.proxy = this.hooked = proxy;
       if (old)
         this.client.retire(old);
       await this.client.connect(proxy);
@@ -37074,9 +37157,11 @@ class RootDelivery {
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
-        if (sessionID !== id)
-          throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
-        return { sessionID, root: id, via: [] };
+        if (sessionID === id)
+          return { sessionID, root: id, via: [] };
+        if (this.children.has(sessionID))
+          return { sessionID, root: id, via: [] };
+        throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
       },
       credential: this.client.login.credential(),
       approval: null,
@@ -37194,9 +37279,11 @@ ${record.message}`;
     this.notices.set("sink", text);
     this.log(text, "warning");
   };
-  async call(tool, args, before) {
+  async call(tool, args, before, o = {}) {
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
+    if (o.child !== undefined)
+      return this.childCall(o.child, tool, args, before);
     const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
     const early = refused();
     if (early)
@@ -37212,6 +37299,45 @@ ${record.message}`;
     const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
+  }
+  async childCall(child, tool, args, before) {
+    if (this.closed)
+      return failure2(`this ${this.client.options.harness} session is closing`);
+    const after = before ? await before() : undefined;
+    const proxy = this.proxy;
+    this.children.add(child);
+    this.used = true;
+    if (proxy !== this.hooked) {
+      try {
+        await this.enlist(child);
+      } catch (error) {
+        return failure2(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`);
+      }
+    }
+    const result = await this.client.call(proxy, tool, args, child);
+    return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
+  }
+  enlist(child) {
+    const known = this.enlisted.get(child);
+    if (known)
+      return known;
+    const pending = register2(this.client.temporary, { root: this.o.sessionID, via: [], child });
+    this.enlisted.set(child, pending);
+    pending.catch(() => {
+      if (this.enlisted.get(child) === pending)
+        this.enlisted.delete(child);
+    });
+    return pending;
+  }
+  async endChild(child) {
+    if (!this.children.delete(child))
+      return;
+    this.enlisted.delete(child);
+    try {
+      await end(this.client.temporary, { child });
+    } catch (error) {
+      this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning");
+    }
   }
   tools() {
     return this.proxy?.tools() ?? hostTools(snapshotTools());
@@ -37269,9 +37395,99 @@ ${record.message}`;
   }
 }
 
+// src/shared/claude_agents.ts
+import { mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { join as join5 } from "path";
+var ROOT = "-";
+var RECORD_TTL_MS = 10 * 60000;
+var TOOL_USE_META = "claudecode/toolUseId";
+var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
+var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
+var agentsRoot = (base) => join5(base, "claude-agents");
+var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
+function ageMs(path, now) {
+  try {
+    return now - statSync2(path).mtimeMs;
+  } catch {
+    return;
+  }
+}
+var MISSING_TEXT = {
+  bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
+  no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
+  recycled_pid: "the record directory belongs to an earlier process with the same pid",
+  absent: "the grayboard PreToolUse hook wrote no record for this call",
+  stale: "the call's record is older than 10 minutes",
+  bad_record: "the call's record isn't an agent id"
+};
+function takeRecord(base, claudePid, harnessStart, toolUseId, now = Date.now()) {
+  if (!validToolUseId(toolUseId))
+    return { missing: "bad_tool_use_id" };
+  const dir = sessionDir(base, claudePid);
+  let start;
+  try {
+    start = readFileSync4(join5(dir, "start"), "utf8");
+  } catch {
+    return { missing: "no_session" };
+  }
+  if (harnessStart !== null && start !== "" && start !== harnessStart)
+    return { missing: "recycled_pid" };
+  const taken = join5(dir, `${toolUseId}.taken.${process.pid}`);
+  try {
+    renameSync(join5(dir, toolUseId), taken);
+  } catch {
+    return { missing: "absent" };
+  }
+  try {
+    const age = ageMs(taken, now);
+    if (age === undefined || age > RECORD_TTL_MS)
+      return { missing: "stale" };
+    const content = readFileSync4(taken, "utf8");
+    if (content === ROOT)
+      return { agent: null };
+    return validSourceId(content) ? { agent: content } : { missing: "bad_record" };
+  } catch {
+    return { missing: "absent" };
+  } finally {
+    try {
+      unlinkSync(taken);
+    } catch {}
+  }
+}
+function takeEnded(base, claudePid) {
+  const dir = join5(sessionDir(base, claudePid), "ended");
+  let names;
+  try {
+    names = readdirSync2(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    if (name.includes(".tmp.") || name.includes(".taken."))
+      continue;
+    const taken = join5(dir, `${name}.taken.${process.pid}`);
+    try {
+      renameSync(join5(dir, name), taken);
+    } catch {
+      continue;
+    }
+    try {
+      const agent = readFileSync4(taken, "utf8");
+      if (validSourceId(agent) && agent !== ROOT)
+        out.push(agent);
+    } catch {} finally {
+      try {
+        unlinkSync(taken);
+      } catch {}
+    }
+  }
+  return out;
+}
+
 // src/shared/identity.ts
-import { existsSync, readFileSync as readFileSync3, statSync as statSync2 } from "fs";
-import { basename as basename2, dirname as dirname3, join as join5, resolve as resolve3 } from "path";
+import { existsSync, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname3, join as join6, resolve as resolve3 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37309,11 +37525,11 @@ function normalizeAliasName(raw) {
 var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname3(dir)) {
-    const dotGit = join5(dir, ".git");
+    const dotGit = join6(dir, ".git");
     if (existsSync(dotGit)) {
-      if (statSync2(dotGit).isDirectory())
+      if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
-      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync3(dotGit, "utf8"));
+      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
       const gitdir = m ? resolve3(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
@@ -37327,16 +37543,16 @@ function gitLocation(cwd) {
 }
 function gitBranch(cwd) {
   for (let dir = cwd;; dir = dirname3(dir)) {
-    const dotGit = join5(dir, ".git");
+    const dotGit = join6(dir, ".git");
     if (existsSync(dotGit)) {
       let gitdir = dotGit;
-      if (!statSync2(dotGit).isDirectory()) {
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync3(dotGit, "utf8"));
+      if (!statSync3(dotGit).isDirectory()) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
         if (!m)
           return null;
         gitdir = resolve3(dir, m[1].trim());
       }
-      const head = readFileSync3(join5(gitdir, "HEAD"), "utf8").trim();
+      const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
     }
     if (dirname3(dir) === dir)
@@ -37380,8 +37596,8 @@ function pinnedIdentities(cwd = process.cwd()) {
   const pins = [];
   for (const file of [".mcp.json", ".omp/mcp.json"]) {
     try {
-      const full = join5(gitLocation(cwd)?.repo ?? cwd, file);
-      const pin = JSON.parse(readFileSync3(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+      const full = join6(gitLocation(cwd)?.repo ?? cwd, file);
+      const pin = JSON.parse(readFileSync5(full, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
       if (typeof pin === "string" && pin)
         pins.push(pin);
     } catch {}
@@ -37390,8 +37606,8 @@ function pinnedIdentities(cwd = process.cwd()) {
 }
 function pinnedIdentity(cwd = process.cwd()) {
   try {
-    const file = join5(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
-    const pin = JSON.parse(readFileSync3(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    const file = join6(gitLocation(cwd)?.repo ?? cwd, ".mcp.json");
+    const pin = JSON.parse(readFileSync5(file, "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
     return typeof pin === "string" && pin ? pin : undefined;
   } catch {
     return;
@@ -37643,16 +37859,52 @@ function createPlugin(o) {
     }
     return unpause();
   };
-  const call = async (name, args) => {
+  const childOf = (agent) => `${config.id}/agent/${agent}`;
+  let endWatch;
+  const drainEnded = () => {
+    if ("error" in config || closed)
+      return;
+    for (const agent of takeEnded(config.dataDir, o.claude.pid))
+      root?.endChild(childOf(agent));
+  };
+  const watchEnded = () => {
+    if (endWatch || "error" in config || closed)
+      return;
+    const dir = join7(sessionDir(config.dataDir, o.claude.pid), "ended");
+    try {
+      mkdirSync3(dir, { recursive: true, mode: 448 });
+      endWatch = watch(dir, () => drainEnded());
+      endWatch.on("error", (error) => {
+        say(`stopped watching subagent ends: ${message(error)}; their sessions end at the server's idle sweep`);
+        endWatch?.close();
+      });
+    } catch (error) {
+      say(`couldn't watch subagent ends: ${message(error)}; their sessions end at the server's idle sweep`);
+    }
+    drainEnded();
+  };
+  const call = async (name, args, meta) => {
     if ("error" in config)
       return failure2(config.error);
-    return root.call(name, args, before);
+    const toolUse = meta?.[TOOL_USE_META];
+    if (toolUse === undefined)
+      return root.call(name, args, before);
+    const taken = takeRecord(config.dataDir, o.claude.pid, o.claude.start, toolUse);
+    if ("missing" in taken) {
+      const cause = MISSING_TEXT[taken.missing];
+      say(`refused ${name} (tool_use_id ${String(toolUse).slice(0, 160)}): no agent record: ${cause}`);
+      return failure2(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
+    }
+    if (taken.agent === null)
+      return root.call(name, args, before);
+    watchEnded();
+    return root.call(name, args, before, { child: childOf(taken.agent) });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
     const s = new Server({ name: "grayboard", version: o.version }, { capabilities: { experimental: { "claude/channel": {} }, tools: { listChanged: true } }, instructions });
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
-    s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}));
+    s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}, req.params._meta));
     s.oninitialized = () => {
       initialized = true;
       markInitialized();
@@ -37700,6 +37952,7 @@ function createPlugin(o) {
       return;
     closed = true;
     changes?.dispose();
+    endWatch?.close();
     signingIn?.abort.abort();
     await root?.shutdown("release");
     await server?.close().catch(() => {});
@@ -37721,7 +37974,7 @@ async function logout(args) {
   }
   let names;
   try {
-    names = readdirSync2(join6(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
+    names = readdirSync3(join8(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
   } catch (error) {
     if (error.code !== "ENOENT")
       throw error;
@@ -37732,7 +37985,7 @@ async function logout(args) {
   for (const name of names) {
     let store;
     try {
-      store = await readJson(join6(dataDir, "grants", name));
+      store = await readJson(join8(dataDir, "grants", name));
     } catch (error) {
       unreadable.push(`${name}: ${error.message}`);
       continue;
@@ -37776,7 +38029,8 @@ async function logout(args) {
   return failed ? 1 : 0;
 }
 async function serve() {
-  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: package_default.version, cwd: process.cwd(), log });
+  const claude = { pid: process.ppid, start: procStart(process.ppid) ?? null };
+  const plugin = createPlugin({ env: process.env, parentCmd: parentCommandLine(), files: hostFiles(), version: package_default.version, cwd: process.cwd(), claude, log });
   let exiting = false;
   const exit = async () => {
     if (exiting)

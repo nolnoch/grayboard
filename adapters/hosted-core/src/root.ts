@@ -17,6 +17,7 @@ import type { Lock } from "./lock.js";
 import { accessExpiry, DeliveryHeldElsewhere, Refusal, type AccessExpired, type Identity, type Item } from "./model.js";
 import type { HostPort } from "./port.js";
 import { failure, hostTools, outputOf, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
+import { end, register } from "./children.js";
 import { AncestryError } from "./sessions.js";
 import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "./storage.js";
 
@@ -83,6 +84,9 @@ export class RootDelivery {
   private lastBinding: string | undefined;
   private lastRecord: string | undefined;
   private storeUnreadable = false;       // the sign-in store's read failure was said
+  private hooked: ToolProxy | undefined; // the push proxy, whose Controller registers children itself
+  private readonly children = new Set<string>();                  // child ids a host call passed
+  private readonly enlisted = new Map<string, Promise<void>>();   // their registrations made here (tools-only proxy)
 
   constructor(private readonly client: HostedClient, private readonly o: RootOptions) {
     this.carrying = o.carried;
@@ -227,7 +231,7 @@ export class RootDelivery {
       // The tools-only proxy's calls in flight finish on it.
       const proxy = this.client.proxy("push", { hooks: controller, onTools: tools => this.listed(tools), onAfterFailure: () => controller.backgroundFailure("after") });
       const old = this.proxy;
-      this.proxy = proxy;
+      this.proxy = this.hooked = proxy;
       if (old) void this.client.retire(old);
       await this.client.connect(proxy);
       if (this.closed) return;
@@ -242,9 +246,12 @@ export class RootDelivery {
       client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}),
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
+      // This root, or a child a host call passed (Claude Code's subagents, #551);
+      // any other session is refused.
       ancestry: async sessionID => {
-        if (sessionID !== id) throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
-        return { sessionID, root: id, via: [] };
+        if (sessionID === id) return { sessionID, root: id, via: [] };
+        if (this.children.has(sessionID)) return { sessionID, root: id, via: [] };
+        throw new AncestryError(`Grayboard session ${sessionID} isn't this ${c.harness} session's root`);
       },
       credential: this.client.login.credential(),
       approval: null,
@@ -376,8 +383,16 @@ export class RootDelivery {
   // A held root refuses bind and unbind; then the host's `before` (the
   // plugin's sign-in offer and unpause), whose notice is shown last; then
   // the call. The notices go first, each as its own text block.
-  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>): Promise<CallToolResult> {
+  //
+  // `child` (a raw session id): the call is a direct child's of this root
+  // (Claude Code's subagents, #551). It registers under the root first: the
+  // push proxy's Controller does so in its beforeCall, through the ancestry
+  // above; the tools-only proxy has no hooks, so the root registers it here,
+  // once. The server refuses a child's bind and unbind. The root's notices
+  // stay for the root's next result: a child's agent isn't the one to act on them.
+  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string } = {}): Promise<CallToolResult> {
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
+    if (o.child !== undefined) return this.childCall(o.child, tool, args, before);
     // The process holding delivery owns this session's binding: a tools-only
     // one rebinding it would fight the holder. Checked again after `before`,
     // whose retry of a lock error (the plugin's unpause) can find it held.
@@ -394,6 +409,39 @@ export class RootDelivery {
     const shown = [...SLOTS.map(slot => this.notices.get(slot)), after].filter((n): n is string => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
+  }
+
+  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>): Promise<CallToolResult> {
+    if (this.closed) return failure(`this ${this.client.options.harness} session is closing`);
+    const after = before ? await before() : undefined;
+    const proxy = this.proxy!;
+    this.children.add(child);
+    this.used = true;
+    if (proxy !== this.hooked) {
+      try { await this.enlist(child); }
+      catch (error) { return failure(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`); }
+    }
+    const result = await this.client.call(proxy, tool, args, child);
+    return after ? { ...result, content: [{ type: "text" as const, text: `grayboard: ${after}` }, ...result.content] } : result;
+  }
+  // One registration per child on the tools-only proxy; a failed one is tried again by the next call.
+  private enlist(child: string): Promise<void> {
+    const known = this.enlisted.get(child);
+    if (known) return known;
+    const pending = register(this.client.temporary, { root: this.o.sessionID, via: [], child });
+    this.enlisted.set(child, pending);
+    pending.catch(() => { if (this.enlisted.get(child) === pending) this.enlisted.delete(child); });
+    return pending;
+  }
+
+  // A child's agent finished (Claude Code's SubagentStop): its hosted session
+  // ends now, not at the server's idle sweep. Only a child a call passed; said
+  // on failure. Never rejects.
+  async endChild(child: string): Promise<void> {
+    if (!this.children.delete(child)) return;
+    this.enlisted.delete(child);
+    try { await end(this.client.temporary, { child }); }
+    catch (error) { this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning"); }
   }
 
   tools(): NativeTool[] { return this.proxy?.tools() ?? hostTools(snapshotTools()); }

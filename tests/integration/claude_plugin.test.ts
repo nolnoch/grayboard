@@ -32,6 +32,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
+import { descendants } from "../support/claude_code.ts";
 
 const ENTRY = resolve(import.meta.dir, "../../plugins/claude-code/src/main.ts");
 const EMAIL = "alice@example.com";
@@ -150,6 +151,83 @@ test("a flagged interactive session: discover is refused, the handshake stays be
   expect(beta.pushes).toEqual([]);
   // The source Claude Code shows is the plugin's server name.
   expect(SOURCE).toBe("plugin:grayboard:grayboard");
+}, 40_000);
+
+// ---- subagents as child sessions (#551) ----
+
+const HOOK = resolve(import.meta.dir, "../../plugins/claude-code/dist/hook.js");
+// The process the plugin's server runs under: Claude Code's stand-in, the hooks' CLAUDE_PID.
+const claudePid = (s: Session) => descendants(s.harnessPid).find(([, cmd]) => cmd.includes(host))![0];
+// The committed hook bundle as Claude Code runs it, on one event's input.
+const runHook = (s: Session, event: string, input: Record<string, unknown>) => {
+  const r = Bun.spawnSync([process.execPath, HOOK, event, "--data", data], {
+    stdin: new TextEncoder().encode(JSON.stringify(input)), env: { PATH: process.env.PATH!, CLAUDE_PID: String(claudePid(s)) }, stdout: "pipe", stderr: "pipe",
+  });
+  expect({ exit: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() }).toEqual({ exit: 0, out: "", err: "" });
+};
+let uses = 0;
+// One model call as Claude Code makes it: PreToolUse's record (an `agent` for a subagent's), then the call with its tool_use_id.
+const modelCall = async (s: Session, name: string, args: Record<string, unknown>, o: { agent?: string; hook?: boolean } = {}) => {
+  const id = `toolu_01Test${++uses}`;
+  if (o.hook !== false) runHook(s, "pre-tool-use", { hook_event_name: "PreToolUse", tool_name: `mcp__plugin_grayboard_grayboard__${name}`, tool_use_id: id, ...(o.agent ? { agent_id: o.agent } : {}) });
+  const r = await s.c.callTool({ name, arguments: args, _meta: { "claudecode/toolUseId": id } });
+  return { error: r.isError === true, texts: (r.content as { type: string; text: string }[]).filter(b => b.type === "text").map(b => b.text), structured: r.structuredContent as Record<string, unknown> | undefined };
+};
+const childRow = (sessionID: string, agent: string) => srv.app.db.query<{ root_session_id: string | null }, [string]>(
+  "SELECT root_session_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, `${sessionID}/agent/${agent}`));
+
+for (const mode of ["push", "tools-only"] as const) {
+  test(`${mode}: a subagent's call runs as a child of the root, with via; the main agent's as the root; SubagentStop ends the child's session`, async () => {
+    await seedGrant(srv, data, CLIENT_ID, EMAIL);
+    const id = `sess-sub-${mode}`;
+    const root = await plugin(id, mode === "push" ? {} : { flags: [] });
+    runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+    expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
+    if (mode === "push") await until(() => row(id)?.lease_deadline != null, 10_000, "the root's lease");
+    else expect(row(id)?.lease_deadline ?? null).toBeNull();
+    const peer = await plugin("sess-sub-peer");
+    expect((await texts(peer, "bind", { name: "peer", create: true })).error).toBe(false);
+
+    const child = hostedSessionId(user(), CLIENT_ID, `${id}/agent/a573e90bd84bce7ff`);
+    const sent = await modelCall(root, "dm_send", { to: "peer", body: "from the subagent" }, { agent: "a573e90bd84bce7ff" });
+    expect(sent.error).toBe(false);
+    const own = await modelCall(root, "dm_send", { to: "peer", body: "from the main agent" });
+    expect(own.error).toBe(false);
+    const by = (body: string) => srv.app.db.query<{ sender: string; via: string | null }, [string]>("SELECT sender, via FROM messages WHERE body = ?").get(body);
+    expect(by("from the subagent")).toEqual({ sender: `${EMAIL}/lead`, via: child });
+    expect(by("from the main agent")).toEqual({ sender: `${EMAIL}/lead`, via: null });
+    expect(childRow(id, "a573e90bd84bce7ff")?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+    // The peer's history renders the child.
+    const history = await texts(peer, "dm_history", {});
+    expect(history.texts.join("\n")).toContain(child);
+    // A child can't bind: it acts under its root's names.
+    const bind = await modelCall(root, "bind", { name: "other", create: true }, { agent: "a573e90bd84bce7ff" });
+    expect(bind.error).toBe(true);
+    expect(bind.texts.join("\n")).toContain("child");
+
+    runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: "a573e90bd84bce7ff" });
+    await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the child's hosted session to end");
+    // The root is untouched.
+    expect(row(id)?.name).toBe("lead");
+  }, 60_000);
+}
+
+test("a call whose PreToolUse record is missing, stale or from a recycled pid is refused and writes nothing", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const root = await plugin("sess-sub-missing");
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+  expect((await modelCall(root, "bind", { name: "solo", create: true })).error).toBe(false);
+  const missing = await modelCall(root, "dm_send", { to: "solo", body: "unattributed" }, { hook: false });
+  expect(missing.error).toBe(true);
+  expect(missing.texts.join("\n")).toContain("couldn't tell which Claude Code agent made this call (the grayboard PreToolUse hook wrote no record for this call)");
+  expect(root.stderr()).toContain("no agent record");
+  const bad = await root.c.callTool({ name: "whoami", arguments: {}, _meta: { "claudecode/toolUseId": "../start" } });
+  expect(bad.isError).toBe(true);
+  // A start time that isn't Claude Code's: the dir belongs to an earlier process with this pid.
+  writeFileSync(join(data, "claude-agents", String(claudePid(root)), "start"), "Mon Jan  1 00:00:00 2001");
+  const recycled = await modelCall(root, "dm_send", { to: "solo", body: "unattributed" });
+  expect(recycled.texts.join("\n")).toContain("an earlier process with the same pid");
+  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'unattributed'").get()).toEqual({ n: 0 });
 }, 40_000);
 
 test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {
@@ -455,7 +533,7 @@ test("a shutdown while an admit waits for `initialized` records no pause", async
     env: { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "sess-wait", CLAUDE_PLUGIN_DATA: data, GRAYBOARD_SERVER_URL: srv.resource, HOME: join(dir, "home") },
     parentCmd: `claude ${FLAG.join(" ")}`,
     files: { platform: "linux", home: join(dir, "home"), user: "test", read: () => null, list: () => [], plist: () => null },
-    version: "1.0.0", cwd: join(dir, "work"), log: () => {},
+    version: "1.0.0", cwd: join(dir, "work"), claude: { pid: process.pid, start: null }, log: () => {},
   });
   try {
     await p.connect(InMemoryTransport.createLinkedPair()[1]);
