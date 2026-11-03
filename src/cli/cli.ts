@@ -616,13 +616,15 @@ program
   .option("--plugin <directory>", "Fallback: installed grayboard-opencode directory instead of Git")
   .option("--name <name>", "Optional startup mailbox binding; does not enroll delivery")
   .option("--create", "Explicitly allow creating the configured name (default false)")
+  .option("--launcher", "Declare this OpenCode root a delegation launcher (plugin option launcher: true)")
+  .option("--no-launcher", "Remove the launcher declaration; omit both to keep what is configured")
   .requiredOption("--config <path>", "Selected OpenCode JSON/JSONC file")
   .option("--migrate", "Explicitly migrate recognized Grayboard entries and back up owned adapters")
   .option("--dry-run", "Validate and report targeted changes without filesystem writes")
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, OC_PLUGIN.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}.`);
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
