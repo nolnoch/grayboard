@@ -178,8 +178,9 @@ test("retention keeps each name's latest bound or moved event", () => {
 });
 
 // #523: a child session's first sight writes its ids row (the root's facts,
-// delivery 'none', root_id) and one id.child_seen row; a second sight is the
-// same child; a row that isn't this root's live child is refused.
+// delivery 'none', root_id), a copy of the root's liveness row (#539) and one
+// id.child_seen row; a second sight is the same child; a row that isn't this
+// root's live child is refused.
 test("registerChild records a child once, audited; another root's ID or an ended child is refused", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const [root, child, other] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe"];
@@ -188,9 +189,10 @@ test("registerChild records a child once, audited; another root's ID or an ended
   registerChild(db, root, child, "reviewer-1");
   expect(db.prepare(`SELECT harness, cwd, keyed, delivery, root_id, ended_at FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "omp", cwd: "/work/repo", keyed: 1, delivery: "none", root_id: root, ended_at: null });
   const seen = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`).all() as { actor: string; target: string; detail: string }[];
-  expect(seen.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: process.pid } }]);
-  // A child has no process row: it is never a live receiver.
-  expect(db.prepare(`SELECT 1 FROM bindings WHERE session_id = ?`).get(child)).toBeNull();
+  expect(seen.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: process.pid, liveness_pid: process.pid } }]);
+  // Its process row is its root's liveness, unbound and with nothing attached: never a live receiver here.
+  const liveness = `SELECT name, pid, proc_start, harness_pid, harness_rule, attached_pid, attached_start, detached_at FROM bindings WHERE session_id = ?`;
+  expect(db.prepare(liveness).get(child)).toEqual({ ...(db.prepare(liveness).get(root) as object), attached_pid: null, attached_start: null });
   expect(liveSessions(db).alive.map((r) => r.session_id)).toEqual([root]);
 
   registerSession(db, { ...thisSession(other), pid: process.pid, proc_start: procStart(process.pid) ?? null });
@@ -251,9 +253,12 @@ test("ChildSessions keeps only the children seen inside the idle window, refusin
   expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
 });
 
-// #523: the orphan sweep (an unended ID with no bindings row) passes over a
-// live root's children, which never have one; it ends a child whose root is
-// gone, ended by a reap, by an older grayboard that knew no children, or pruned.
+// #523: a live root's children stay live; a child whose root is gone, ended
+// by a reap, by an older grayboard that knew no children, or pruned, ends.
+// HEAD judges a child by its root, never by its own row (#539: a copy of the
+// root's liveness for older releases), which goes when the child ends. Here
+// each copy names this live process, so only the root can end it, except the
+// live root's child's, whose dead copy must not end it.
 test("reading live sessions keeps a live root's children and ends those whose root is dead, ended or pruned", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const live = "id:0123456789abc", dead = "id:0123456789abd", old = "id:0123456789abe", pruned = "id:0123456789abf";
@@ -267,6 +272,7 @@ test("reading live sessions keeps a live root's children and ends those whose ro
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(old);
   db.prepare(`DELETE FROM bindings WHERE session_id IN (?, ?)`).run(old, pruned);
   db.prepare(`DELETE FROM ids WHERE id = ?`).run(pruned);
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(childOf(live));
 
   const r = liveSessions(db);
   expect(r.alive.map((s) => s.session_id)).toEqual([live]);
@@ -277,6 +283,8 @@ test("reading live sessions keeps a live root's children and ends those whose ro
     .map((a) => [a.target, JSON.parse(a.detail).why]));
   expect(whys).toMatchObject({ [childOf(dead)]: `its root ${dead} ended`, [childOf(old)]: `its root ${old} ended`, [childOf(pruned)]: `its root ${pruned} ended` });
   expect(whys).not.toHaveProperty(childOf(live));
+  // The ended children's rows went with them; the live root's child keeps its copy.
+  expect(db.prepare(`SELECT session_id FROM bindings ORDER BY session_id`).all()).toEqual([{ session_id: live }, { session_id: childOf(live) }]);
   // A second read finds nothing more to end.
   expect(liveSessions(db)).toMatchObject({ alive: [{ session_id: live }], ended: [] });
 });
