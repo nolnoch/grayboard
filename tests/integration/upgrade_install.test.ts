@@ -305,6 +305,48 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(out).not.toContain("Disabled the grayboard entry");
 }, 60_000);
 
+// The plugin's pin merges after the release, so an update that finds the CLI
+// current still updates the plugin, and compares the marketplace's pin, the
+// installed plugin and the CLI (#511).
+test("update with the CLI already current still updates an enabled Claude Code plugin, and says when its pin hasn't merged", async () => {
+  label = "update-current-plugin";
+  releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
+  await expectOk(install({ GRAYBOARD_VERSION: TAG }));
+  mkdirSync(join(home, ".grayboard"), { recursive: true });
+  writeFileSync(CREDENTIALS(), JSON.stringify({ server: "http://127.0.0.1:9", session_token: "t", user_email: "you@example.com" }), { mode: 0o600 });
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ enabledPlugins: { "grayboard@grayboard": true } }));
+  // The marketplace's checkout holds the catalog; the stub lists it and reports the installed version from a file.
+  const market = join(dir, "marketplace");
+  const pin = (ref: string, installed: string) => {
+    mkdirSync(join(market, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(market, ".claude-plugin", "marketplace.json"), JSON.stringify({ name: "grayboard", plugins: [{ name: "grayboard", source: { source: "git-subdir", ref } }] }));
+    writeFileSync(join(dir, "installed"), installed);
+  };
+  writeFileSync(join(dir, "stubs", "claude"), `#!/bin/sh\necho "claude $*" >> "${join(dir, "argv.log")}"\n` +
+    `[ "$*" = "plugin marketplace list --json" ] && echo '[{"name":"grayboard","source":"github","installLocation":"${market}"}]'\n` +
+    `[ "$*" = "plugin list --json" ] && echo "[{\\"id\\":\\"grayboard@grayboard\\",\\"version\\":\\"$(cat "${join(dir, "installed")}")\\",\\"scope\\":\\"user\\"}]"\nexit 0\n`);
+  const argv = () => {
+    const lines = readFileSync(join(dir, "argv.log"), "utf8").trim().split("\n");
+    rmSync(join(dir, "argv.log"));
+    return lines;
+  };
+  const steps = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard", "claude plugin marketplace list --json", "claude plugin list --json"];
+
+  // The release published; its pin hasn't merged, so the plugin stays a release behind.
+  pin("v0.0.1", "0.0.1");
+  const before = await expectOk(grayboard("update"));
+  expect(before).toContain(`grayboard ${pkg.version} is the latest release (${releases.url})`);
+  expect(argv()).toEqual(steps);
+  expect(before).toContain(`The marketplace pins the plugin at 0.0.1, older than this grayboard (${pkg.version}): the plugin pin for ${TAG} hasn't merged into the marketplace yet.`);
+  // The pin merged: the next update, with the CLI still current, brings the plugin to it.
+  pin(TAG, pkg.version);
+  const after = await expectOk(grayboard("update"));
+  expect(after).toContain(`grayboard ${pkg.version} is the latest release`);
+  expect(argv()).toEqual(steps);
+  expect(after).not.toContain("The marketplace pins");
+}, 60_000);
+
 test("refresh-adapters disables the grayboard entry of each adapter it rewrites, once", async () => {
   label = "refresh-adapters-entries";
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
