@@ -19,7 +19,7 @@ import { agentsRoot } from "../../src/shared/claude_agents.ts";
 import { CLAUDE_CODE_VERSION, claudeCli, claudeCodeBin, claudeHome, claudeTty } from "../support/claude_code.ts";
 import { localEnv } from "../support/env.ts";
 import { onUserSteps, startFakeAnthropic, toolResults } from "../support/fake_anthropic.ts";
-import { call, closeSessions, localSession } from "../support/mcp.ts";
+import { closeSessions, localSession } from "../support/mcp.ts";
 import { ROOT } from "../support/paths.ts";
 import { keep } from "../support/run_dir.ts";
 import { until } from "../support/until.ts";
@@ -71,7 +71,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: a subagent's grayboard calls act as a 
     tty = claudeTty(bin, h, ["--permission-mode", "default"]);
     await until(() => tty!.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
     const db = new Database(busEnv.BUS_DB_PATH!, { readonly: true });
-    const dms = () => db.query<{ body: string; via: string | null }, []>("SELECT body, via FROM messages WHERE body LIKE 'from-%' ORDER BY id").all();
+    const dms = () => db.query<{ body: string; via: string | null; sender_id: string }, []>("SELECT body, via, sender_id FROM messages WHERE body LIKE 'from-%' ORDER BY id").all();
     const body = (b: string) => dms().find((r) => r.body === b);
 
     await tty.submit("ROOT-GO-1");
@@ -91,16 +91,22 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: a subagent's grayboard calls act as a 
     expect(c1.via).toBeTruthy();
     expect(c2.via).toBeTruthy();
     expect(c2.via).not.toBe(c1.via);
+    // A child's DM is from its own session; the root's from the root's.
+    expect([c1.sender_id, c2.sender_id]).toEqual([c1.via!, c2.via!]);
+    expect(r2.sender_id).toBe(r1.sender_id);
     // Both children act under the one root session (its ID survives /clear: one grayboard mcp process).
     const rows = db.query<{ id: string; root_id: string | null }, [string, string]>("SELECT id, root_id FROM ids WHERE id IN (?, ?)").all(c1.via!, c2.via!);
     expect(rows.length).toBe(2);
     expect(rows[0]!.root_id).toBeTruthy();
     expect(rows.every((r) => r.root_id === rows[0]!.root_id)).toBe(true);
-    expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM audit_log WHERE action = 'id.child_seen'").get()!.n).toBeGreaterThanOrEqual(2);
+    expect(rows[0]!.root_id).toBe(r1.sender_id);
+    // One id.child_seen per subagent; the root's calls (a root marker) make none.
+    expect(db.query<{ target: string }, []>("SELECT target FROM audit_log WHERE action = 'id.child_seen' ORDER BY at").all().map((r) => r.target)).toEqual([c1.via!, c2.via!]);
+    expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM audit_log WHERE action LIKE 'claude.%'").get()!.n).toBe(0);
     for (const n of [1, 2]) expect(toolResults(model, `toolu_SUBTASK_${n}_1`).join("\n")).toContain("child_session");
-    // The peer receives all four, as from cc.
-    const hist = await call(peer, "dm_history", { peer: "cc" });
-    expect(JSON.stringify(hist)).toContain("from-child-2");
+    // The peer's history renders the child's via, and none on the root's.
+    const hist = (await peer.call("dm_history", { peer: "cc" })) as { body: string; via?: string }[];
+    expect(hist.map((m) => [m.body, m.via ?? null])).toEqual([["from-root-1", null], ["from-child-1", c1.via], ["from-root-2", null], ["from-child-2", c2.via]]);
     expect(model.unhandled).toEqual([]);
     db.close();
   } finally {

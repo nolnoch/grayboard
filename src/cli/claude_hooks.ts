@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isExplicitIdentity } from "../shared/identity.ts";
@@ -109,6 +109,36 @@ export function recordHookInstalled(path = claudeSettingsPath()): boolean {
     return (e as NodeJS.ErrnoException).code !== "ENOENT";
   }
   return (cfg?.hooks?.PreToolUse ?? []).some((m) => m?.matcher === LOCAL_TOOL_MATCHER && m.hooks?.some((h) => RECORD.test(h?.command ?? "")));
+}
+
+/** Claude Code's managed-settings directory (2.1.316: macOS and Linux; others have none here). */
+export function managedSettingsDir(platform = process.platform): string | null {
+  return platform === "darwin" ? "/Library/Application Support/ClaudeCode" : platform === "linux" ? "/etc/claude-code" : null;
+}
+
+/**
+ * The first settings file that stops user hooks from running in a session in
+ * `cwd` (`disableAllHooks`, or managed `allowManagedHooksOnly`), or null. Read
+ * only when a record is missing, to name the cause (#551 §3): managed
+ * settings and their drop-ins, then the project's local and shared settings.
+ */
+export function hooksDisabledBy(cwd: string, managed = managedSettingsDir()): string | null {
+  const files: string[] = [];
+  if (managed) {
+    files.push(join(managed, "managed-settings.json"));
+    try {
+      const d = join(managed, "managed-settings.d");
+      files.push(...readdirSync(d).filter((f) => f.endsWith(".json")).sort().map((f) => join(d, f)));
+    } catch { /* no drop-ins */ }
+  }
+  files.push(join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json"));
+  for (const f of files) {
+    let cfg: { disableAllHooks?: unknown; allowManagedHooksOnly?: unknown } | null;
+    try { cfg = JSON.parse(readFileSync(f, "utf8")); } catch { continue; }
+    if (cfg?.disableAllHooks === true) return `${f} sets disableAllHooks`;
+    if (managed && f.startsWith(managed) && cfg?.allowManagedHooksOnly === true) return `${f} sets allowManagedHooksOnly`;
+  }
+  return null;
 }
 
 function withoutOurs(path: string): { cfg: Settings; kept: Record<string, HookEntry[]>; found: boolean; before: string | undefined } {
