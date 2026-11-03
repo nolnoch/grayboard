@@ -116,6 +116,61 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
   }
 }, 240_000);
 
+test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort (#545), after /effort, a confirmed /model switch and /clear`, async () => {
+  const srv = hostedServer();
+  const model = startFakeAnthropic([
+    onUserText("FACTS-1", SOURCE, TOOL("bind"), { name: "facts", create: true }),
+    onUserText("FACTS-2", SOURCE, TOOL("whoami"), {}),
+    onUserText("FACTS-3", SOURCE, TOOL("whoami"), {}),
+  ]);
+  const home = join(dir, "facts");
+  const h = claudeHome(home, model.url, ["mcp__plugin_grayboard_grayboard"]);
+  let tty: ReturnType<typeof claudeTty> | undefined;
+  try {
+    const from = install(h, srv, join(home, "mp"));
+    await seedGrant(srv, join(h.config, "plugins/data/grayboard-grayboard"), "grayboard-claude-code");
+    tty = claudeTty(bin, h, ["--permission-mode", "default"]);
+    const t = tty;
+    const facts = () => srv.app.db.query<{ model: string | null; effort: string | null }, []>(
+      "SELECT i.model, i.effort FROM hosted_sessions s JOIN ids i ON i.id = s.session_id WHERE s.root_session_id IS NULL").all();
+    // A slash command, typed, then answered; `seen` is what the screen shows once it ran.
+    const slash = async (command: string, seen: string, confirm?: string) => {
+      const mark = t.screen().length;
+      await t.submit(command);
+      if (confirm) {
+        await until(() => t.screen().slice(mark).includes(confirm) || t.screen().slice(mark).includes(seen), 20_000, `${command} to ask or run`);
+        if (!t.screen().slice(mark).includes(seen)) t.proc.terminal!.write("\r");
+      }
+      await until(() => t.screen().slice(mark).includes(seen), 20_000, `${command} to run`);
+    };
+    await until(() => t.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
+
+    await t.submit("FACTS-1");
+    await until(() => toolResults(model, "toolu_FACTS_1").length > 0, 60_000, `the bind (plugin from ${from})`);
+    // The model Claude Code started on, as its first request named it.
+    const started = model.requests[0]!.body.model;
+    expect(facts()).toEqual([{ model: started, effort: expect.any(String) }]);
+
+    await slash("/effort high", "Set effort level to high");
+    await slash("/model claude-sonnet-5-5", "Set model to", "Switch model?");
+    await t.submit("FACTS-2");
+    await until(() => toolResults(model, "toolu_FACTS_2").length > 0, 60_000, "the whoami after the switch");
+    expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
+
+    // /clear: the plugin's root continues, and SessionStart(clear) reports the model it continues on.
+    await t.submit("/clear");
+    await t.submit("FACTS-3");
+    await until(() => toolResults(model, "toolu_FACTS_3").length > 0, 60_000, "the whoami after /clear");
+    expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
+    expect(model.unhandled).toEqual([]);
+  } finally {
+    await tty?.stop();
+    model.stop();
+    writeFileSync(join(home, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
+    await srv.stop();
+  }
+}, 240_000);
+
 test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's result carries the sign-in link, and opening it signs the session in`, async () => {
   const srv = hostedServer();
   const model = startFakeAnthropic([

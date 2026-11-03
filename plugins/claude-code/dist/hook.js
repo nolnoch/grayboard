@@ -79,6 +79,9 @@ function pidExists(pid) {
 }
 var SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
 
+// src/shared/protocol.ts
+var SESSION_FACT_MAX = 64;
+
 // src/shared/session_meta.ts
 function validSourceId(raw) {
   return typeof raw === "string" && raw.length > 0 && raw.length <= 1024 && !/[\x00-\x1f\x7f]/.test(raw);
@@ -92,6 +95,15 @@ var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
 var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join(base, "claude-agents");
 var sessionDir = (base, claudePid) => join(agentsRoot(base), String(claudePid));
+var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
+var validFact = (v) => typeof v === "string" && FACT.test(v);
+function putFact(dir, fact, value) {
+  if (!validFact(value))
+    return;
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  put(join(dir, fact), value);
+}
+var dropFact = (dir, fact) => rmSync(join(dir, fact), { force: true });
 function put(path, text) {
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, text, { mode: 384 });
@@ -116,6 +128,8 @@ function runHook(event, stdin, o) {
       mkdirSync(dir, { recursive: true, mode: 448 });
       const start = procStart(pid);
       put(join(dir, "start"), start ?? "");
+      if (o.hosted)
+        putFact(dir, "model", input.model);
       pruneSessions(o.base, pid);
     } else if (event === "pre-tool-use") {
       const id = input.tool_use_id;
@@ -128,8 +142,20 @@ function runHook(event, stdin, o) {
       mkdirSync(dir, { recursive: true, mode: 448 });
       put(join(dir, id), content);
       pruneRecords(dir, now);
+      if (o.hosted && content === ROOT) {
+        const level = input.effort?.level;
+        if (level === undefined)
+          dropFact(dir, "effort");
+        else
+          putFact(dir, "effort", level);
+      }
+    } else if (event === "model-switch") {
+      if (o.hosted && validFact(input.to_model)) {
+        putFact(dir, "model", input.to_model);
+        dropFact(dir, "effort");
+      }
     } else if (event === "subagent-stop") {
-      if (!o.ended)
+      if (!o.hosted)
         return;
       const agent = input.agent_id;
       if (!validSourceId(agent) || agent === ROOT)
@@ -196,4 +222,4 @@ function pruneSessions(base, self) {
 var [event, flag, data] = process.argv.slice(2);
 var base = flag === "--data" && data && !data.startsWith("${") ? data : process.env.CLAUDE_PLUGIN_DATA;
 if (event && base)
-  runHook(event, await Bun.stdin.text(), { base, env: process.env, ended: true });
+  runHook(event, await Bun.stdin.text(), { base, env: process.env, hosted: true });

@@ -32,7 +32,7 @@ import { failure, hostTools, snapshotTools, type NativeTool } from "../../../ada
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
-import { MISSING_TEXT, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { MISSING_TEXT, readFacts, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
@@ -184,9 +184,19 @@ export function createPlugin(o: PluginOptions): Plugin {
     },
   });
 
-  const client = login && new HostedClient({
+  // A bad fact file is said once and left out; the other fact still goes.
+  const badFacts = new Set<string>();
+  const badFact = (fact: string, error: string) => {
+    if (badFacts.has(fact)) return;
+    badFacts.add(fact);
+    say(`the server gets no ${fact} for this session: ${error}`);
+  };
+  const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS, clientId: CLIENT_ID, version: o.version, login, source: SOURCE,
     loginAction, resumeHint: RESUME_HINT, retryHint: RESUME_HINT, roots, env: o.env, launcher: o.env.BUS_LAUNCHER === "1", log: message => say(message),
+    // The root's model and effort as the hooks last wrote them (#545), read per
+    // request; a child session reports none (no hook names a subagent's model).
+    facts: sessionID => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
   });
 
   // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.

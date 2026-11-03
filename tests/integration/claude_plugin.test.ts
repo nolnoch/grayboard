@@ -167,9 +167,9 @@ const runHook = (s: Session, event: string, input: Record<string, unknown>) => {
 };
 let uses = 0;
 // One model call as Claude Code makes it: PreToolUse's record (an `agent` for a subagent's), then the call with its tool_use_id.
-const modelCall = async (s: Session, name: string, args: Record<string, unknown>, o: { agent?: string; hook?: boolean } = {}) => {
+const modelCall = async (s: Session, name: string, args: Record<string, unknown>, o: { agent?: string; hook?: boolean; effort?: string } = {}) => {
   const id = `toolu_01Test${++uses}`;
-  if (o.hook !== false) runHook(s, "pre-tool-use", { hook_event_name: "PreToolUse", tool_name: `mcp__plugin_grayboard_grayboard__${name}`, tool_use_id: id, ...(o.agent ? { agent_id: o.agent } : {}) });
+  if (o.hook !== false) runHook(s, "pre-tool-use", { hook_event_name: "PreToolUse", tool_name: `mcp__plugin_grayboard_grayboard__${name}`, tool_use_id: id, ...(o.agent ? { agent_id: o.agent } : {}), ...(o.effort ? { effort: { level: o.effort } } : {}) });
   const r = await s.c.callTool({ name, arguments: args, _meta: { "claudecode/toolUseId": id } });
   return { error: r.isError === true, texts: (r.content as { type: string; text: string }[]).filter(b => b.type === "text").map(b => b.text), structured: r.structuredContent as Record<string, unknown> | undefined };
 };
@@ -249,6 +249,32 @@ test("a call whose PreToolUse record is missing or from a recycled pid is refuse
   const recycled = await modelCall(root, "dm_send", { to: "solo", body: "unattributed" });
   expect(recycled.texts.join("\n")).toContain("an earlier process with the same pid");
   expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'unattributed'").get()).toEqual({ n: 0 });
+}, 40_000);
+
+test("the root reports the model and effort its hooks wrote (#545); a subagent's call reports none, and a bad fact file sends none", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const id = "sess-facts";
+  const root = await plugin(id);
+  const facts = (session: string) => srv.app.db.query<{ model: string | null; effort: string | null }, [string]>("SELECT model, effort FROM ids WHERE id = ?").get(session);
+  const rootId = hostedSessionId(user(), CLIENT_ID, id), child = hostedSessionId(user(), CLIENT_ID, `${id}/agent/a1b2c3d4e5f6a7b8c`);
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup", model: "claude-opus-5-5" });
+  expect((await modelCall(root, "bind", { name: "facts", create: true }, { effort: "medium" })).error).toBe(false);
+  expect(facts(rootId)).toEqual({ model: "claude-opus-5-5", effort: "medium" });
+  // A confirmed /model switch, then a call under /effort high.
+  runHook(root, "model-switch", { hook_event_name: "PostModelSwitch", from_model: "claude-opus-5-5", to_model: "claude-sonnet-5-5", source: "command" });
+  expect((await modelCall(root, "whoami", {}, { effort: "high" })).error).toBe(false);
+  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
+  // A subagent's call: its child session gets no facts, and the root's stay.
+  expect((await modelCall(root, "whoami", {}, { agent: "a1b2c3d4e5f6a7b8c", effort: "low" })).error).toBe(false);
+  expect(facts(child)).toEqual({ model: null, effort: null });
+  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
+  // A model file that isn't one: the call still runs and sends the effort, and stderr says so once.
+  writeFileSync(join(data, "claude-agents", String(claudePid(root)), "model"), "not a model");
+  expect((await modelCall(root, "whoami", {}, { effort: "low" })).error).toBe(false);
+  expect((await modelCall(root, "whoami", {}, { effort: "max" })).error).toBe(false);
+  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "max" });
+  expect(root.stderr().split("the server gets no model for this session").length - 1).toBe(1);
+  expect(root.stderr()).not.toContain("couldn't read session");
 }, 40_000);
 
 test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {

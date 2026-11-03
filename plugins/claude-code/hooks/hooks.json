@@ -2,6 +2,7 @@
   "hooks": {
     "SessionStart": [{ "matcher": "startup|resume|clear|fork", "hooks": [{ "type": "command", "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/hook.js\" session-start --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 10 }] }],
     "PreToolUse": [{ "matcher": "mcp__plugin_grayboard_grayboard__.*", "hooks": [{ "type": "command", "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/hook.js\" pre-tool-use --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 10 }] }],
+    "PostModelSwitch": [{ "hooks": [{ "type": "command", "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/hook.js\" model-switch --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 10 }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/hook.js\" subagent-stop --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 10 }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bun \"${CLAUDE_PLUGIN_ROOT}/dist/hook.js\" session-end --data \"${CLAUDE_PLUGIN_DATA}\"", "timeout": 10 }] }]
   }
