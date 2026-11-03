@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
@@ -73,6 +73,63 @@ test("PR runs cancel superseded ones, and the required test check fails closed o
   }
   const suites = test.steps.filter((step: any) => step.name === "Typecheck" || step.name === "Test");
   expect(suites.map((step: any) => step.if)).toEqual(["env.PIN_ONLY != 'true'", "env.PIN_ONLY != 'true'"]);
+  const pinSteps = test.steps.filter((step: any) => step.if === "env.PIN_ONLY == 'true'");
+  expect(pinSteps.map((step: any) => step.name)).toEqual(["Marketplace tests", "The file only moves the pin forward", "The pin names an immutable release at its commit"]);
+  expect(pinSteps[1].env.BASE).toBe("${{ github.event.pull_request.base.sha }}");
+  expect(pinSteps[1].run).toContain('bun scripts/pin_claude_plugin.ts verify "$RUNNER_TEMP/base-marketplace.json"');
+});
+
+// #507: scope's routing decides which PRs skip the suites, so it runs here
+// against a real repo: only a lone marketplace.json change is pin-only, and
+// fork-chosen file names print with workflow commands stopped.
+test("scope marks a PR pin-only exactly when its one changed file is the marketplace", () => {
+  const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs.scope.steps.find((s: any) => s.id === "files");
+  const dir = mkdtempSync(resolve(tmpdir(), "gb-scope-"));
+  const repo = resolve(dir, "repo");
+  const output = resolve(dir, "output");
+  try {
+    const git = (...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout.toString().trim();
+    };
+    const write = (files: Record<string, string>) => {
+      for (const [path, text] of Object.entries(files)) {
+        mkdirSync(dirname(resolve(repo, path)), { recursive: true });
+        writeFileSync(resolve(repo, path), text);
+      }
+    };
+    const commit = (files: Record<string, string>, from?: string) => {
+      if (from) git("checkout", "-q", "--detach", from);
+      write(files);
+      git("add", "-A");
+      git("commit", "-q", "--allow-empty", "-m", "c");
+      return git("rev-parse", "HEAD");
+    };
+    const scope = (env: Record<string, string>) => {
+      writeFileSync(output, "");
+      const r = Bun.spawnSync(["bash", "-e", "-c", step.run], { cwd: repo, env: { ...Bun.env, GITHUB_OUTPUT: output, ...env }, stdout: "pipe", stderr: "pipe" });
+      expect(r.stderr.toString()).toBe("");
+      expect(r.exitCode).toBe(0);
+      return { pin: readFileSync(output, "utf8"), stdout: r.stdout.toString() };
+    };
+    mkdirSync(repo);
+    git("init", "-q");
+    const base = commit({ ".claude-plugin/marketplace.json": "{}\n", "README.md": "x\n" });
+    expect(scope({ BASE: base, HEAD: commit({ ".claude-plugin/marketplace.json": '{"pin":1}\n' }, base) }).pin).toBe("pin-only=true\n");
+    expect(scope({ BASE: base, HEAD: commit({ ".claude-plugin/marketplace.json": '{"pin":2}\n', "src/x.ts": "x\n" }, base) }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: base, HEAD: commit({ "README.md": "y\n" }, base) }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: base, HEAD: base }).pin).toBe("pin-only=false\n");
+    expect(scope({ BASE: "", HEAD: "" }).pin).toBe("pin-only=false\n"); // a push: no PR head
+    // A file named like a workflow command prints between stop-commands and its resume token.
+    const { pin, stdout } = scope({ BASE: base, HEAD: commit({ "::error::injected": "x\n" }, base) });
+    expect(pin).toBe("pin-only=false\n");
+    const token = /^::stop-commands::([0-9a-f]{32})$/m.exec(stdout)?.[1];
+    expect(token).toBeDefined();
+    const at = (line: string) => stdout.split("\n").indexOf(line);
+    expect(at(`::stop-commands::${token}`)).toBeLessThan(at("::error::injected"));
+    expect(at("::error::injected")).toBeLessThan(at(`::${token}::`));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("hosted gates preserve the signed tag-only release boundary", () => {

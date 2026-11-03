@@ -34,18 +34,24 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+        # A fork PR names its files, so they're printed with workflow
+        # commands off: a name can't be read as one.
         run: |
           pin=false
           if [ -n "$HEAD" ]; then
             files="$(git diff --name-only "$BASE...$HEAD")"
+            token="$(openssl rand -hex 16)"
+            echo "::stop-commands::$token"
             printf '%s\n' "$files"
+            echo "::$token::"
             [ "$files" = ".claude-plugin/marketplace.json" ] && pin=true
           fi
           echo "pin-only=$pin" | tee -a "$GITHUB_OUTPUT"
 
   # The required "test" check. On a pin-only PR it checks the pin instead:
-  # the marketplace tests, and that the pinned tag is a published, immutable
-  # release whose commit is the pinned sha.
+  # the marketplace tests, that the file is exactly the base's re-pinned to a
+  # newer release (nothing else changed), and that the pinned tag is a
+  # published, immutable release whose commit is the pinned sha.
   # A skipped required check counts as passed, so this job runs even when
   # scope fails, and then fails itself.
   test:
@@ -84,6 +90,15 @@ jobs:
       - name: Marketplace tests
         if: env.PIN_ONLY == 'true'
         run: bun test tests/integration/claude_plugin_package.test.ts
+
+      - name: The file only moves the pin forward
+        if: env.PIN_ONLY == 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          git show "$BASE:.claude-plugin/marketplace.json" > "$RUNNER_TEMP/base-marketplace.json"
+          bun scripts/pin_claude_plugin.ts verify "$RUNNER_TEMP/base-marketplace.json"
 
       - name: The pin names an immutable release at its commit
         if: env.PIN_ONLY == 'true'

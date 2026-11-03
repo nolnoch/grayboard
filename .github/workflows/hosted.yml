@@ -64,4 +64,12 @@ jobs:
         env:
           RESULT: ${{ needs.hosted.result }}
           SKIP: ${{ inputs.skip }}
-        run: test "$RESULT" = success || { test "$SKIP" = true && test "$RESULT" = skipped; }
+        run: |
+          if [ "$RESULT" = success ]; then
+            echo "Every hosted matrix leg passed."
+          elif [ "$SKIP" = true ] && [ "$RESULT" = skipped ]; then
+            echo "The caller skipped the hosted matrix (a pin-only PR, #507); nothing to require."
+          else
+            echo "::error::The hosted matrix result is '$RESULT', not success."
+            exit 1
+          fi
