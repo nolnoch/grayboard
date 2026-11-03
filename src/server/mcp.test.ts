@@ -1102,6 +1102,21 @@ for (const kind of ["database", "internal"] as const) test(`${kind} fault attach
   expect(gets).toHaveLength(1);
 });
 
+test("a refusal attaching an idle legacy GET ends that GET; the subscription stays registered for the reopened one", async () => {
+  const { client, gets, hints, uri } = await legacyWatchFixture("2025-11-25");
+  const original = hosted.sessions.snapshot;
+  // The subscribe POST selects its own context first; the attach is the second selection.
+  let calls = 0;
+  hosted.sessions.snapshot = (...args) => { if (++calls === 2) throw new ApplicationError("unauthenticated", "unauthenticated"); return original(...args); };
+  try { expect(await client.subscribeResource({ uri })).toEqual({}); }
+  finally { hosted.sessions.snapshot = original; }
+  expect(calls).toBe(2);
+  await untilHosted(() => gets.length === 2 && hosted.activeWatches === 1);
+  expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "after refusal" } })).isError).not.toBe(true);
+  await untilHosted(() => hints.length === 1);
+  expect(hints).toEqual([uri]);
+});
+
 test("authentication storage errors return a redacted HTTP 500 before identity selection", async () => {
   const original = store.repo.oauth.findActiveAccess;
   store.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
@@ -1143,10 +1158,10 @@ async function rawLegacyGet(access: string, initMeta?: Record<string, unknown>, 
     return received;
   };
   return {
-    get, until, get ended() { return ended; },
+    get, until, get ended() { return ended; }, abort: () => abort.abort(),
     call: (name: string, args: Record<string, unknown>, meta?: Record<string, unknown>) => post(headers, "tools/call", { name, arguments: args, ...(meta ? { _meta: meta } : {}) }),
     subscribe: (uri: string, meta?: Record<string, unknown>) => post(headers, "resources/subscribe", { uri, ...(meta ? { _meta: meta } : {}) }),
-    async close() { abort.abort(); await reader.cancel().catch(() => {}); await post(headers, "notifications/cancelled").catch(() => {}); await hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers })); },
+    async close() { abort.abort(); await reader.cancel().catch(() => {}); await hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers })); },
   };
 }
 
@@ -1191,6 +1206,51 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`an unbound legacy GET (${l
     const text = await raw.until(t => t.includes("notifications/resources/updated"));
     expect(text).toContain("\"uri\":\"grayboard://boards/attach\"");
     expect(raw.ended).toBe(false);
+    expect(hosted.activeGetStreams).toBe(1);
+  } finally { await raw.close(); }
+});
+
+test("a legacy GET closed while a subscribe attaches it ends quietly; the subscription stays registered", async () => {
+  const raw = await rawLegacyGet(token);
+  const fresh = { "ai.opencode/sessionID": "fresh-root" };
+  const original = hosted.sessions.snapshot;
+  try {
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+    expect((await raw.call("bind", { name: "fe", create: true }, fresh)).text).not.toContain("isError\":true");
+    expect((await raw.call("board_create", { name: "attach", purpose: "legacy attach" }, fresh)).text).not.toContain("isError\":true");
+    // The subscribe POST selects its own context first; the GET closes during the attach's selection.
+    let calls = 0;
+    hosted.sessions.snapshot = (...args) => { if (++calls === 2) raw.abort(); return original(...args); };
+    const subscribed = await raw.subscribe("grayboard://boards/attach", fresh);
+    expect(calls).toBe(2);
+    expect(subscribed.text).toContain("\"result\":{}");
+    await untilHosted(() => hosted.activeGetStreams === 0);
+    expect(hosted.activeWatches).toBe(0);
+  } finally { hosted.sessions.snapshot = original; await raw.close(); }
+});
+
+test("concurrent legacy subscribes from two session contexts register only one", async () => {
+  const raw = await rawLegacyGet(token);
+  const a = { "ai.opencode/sessionID": "root-a" }, b = { "ai.opencode/sessionID": "root-b" };
+  try {
+    expect((await raw.call("bind", { name: "conc-a", create: true }, a)).text).not.toContain("isError\":true");
+    expect((await raw.call("bind", { name: "conc-b", create: true }, b)).text).not.toContain("isError\":true");
+    expect((await raw.call("board_create", { name: "attach", purpose: "legacy attach" }, a)).text).not.toContain("isError\":true");
+    const results = await Promise.all([raw.subscribe("grayboard://boards/attach", a), raw.subscribe("grayboard://boards/attach", b)]);
+    expect(results.map(r => r.text.includes("\"error\""))).toEqual([false, true]);
+    expect(hosted.activeWatches).toBe(1);
+  } finally { await raw.close(); }
+});
+
+for (const { label, initMeta } of UNBOUND_GETS) test(`peer_list doesn't show an idle legacy GET (${label}) as an unbound session`, async () => {
+  const raw = await rawLegacyGet(token, initMeta);
+  const fresh = { "ai.opencode/sessionID": "fresh-root" };
+  try {
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+    expect((await raw.call("bind", { name: "fe", create: true }, fresh)).text).not.toContain("isError\":true");
+    const listed = await raw.call("peer_list", {}, fresh);
+    expect(listed.text).not.toContain("isError\":true");
+    expect(listed.text).not.toContain("unbound_sessions");
     expect(hosted.activeGetStreams).toBe(1);
   } finally { await raw.close(); }
 });

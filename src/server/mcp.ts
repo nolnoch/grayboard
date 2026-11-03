@@ -37,7 +37,8 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 // A legacy session whose access token expired with its grant still active sleeps
 // (#476): its admission is released, its sid stays, and the binding's next
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
-type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; dormant?: { since: number; release(): void } };
+// `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
+type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits }) {
@@ -147,7 +148,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.sweep();
     }
   }
-  async function select(request: Request): Promise<Context> {
+  // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
+  async function select(request: Request, admit = true): Promise<Context> {
     const role = hostedRole(request);
     const principal = oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) return refuse(principal);
@@ -171,7 +173,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     catch (error) { return metaRefusal("delivery_declaration", error); }
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
-      application.admitHosted(principal.authed, "id" in routing ? routing.id : null);
+      if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null);
       selected = await hosted.snapshot(principal, routing);
     } catch (error) {
       const exchange = exchanges.getStore();
@@ -252,13 +254,23 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // A legacy GET with no watched resource carries nothing a binding governs, so it stays
   // open (idle) across bind changes until a resource subscription attaches it (#431).
+  // It receives nothing, so peer_list doesn't show its session (`ApplicationSession.listed`).
   const idle = (live: Live) => !!live.legacy && live.uris.size === 0;
   // Re-selects an idle legacy GET's context from the subscribing POST: its `_meta` routes the
-  // stream and its headers carry the current token and any lease; the GET's signal keeps the lifetime.
+  // stream and its headers carry the current token and any lease; the GET's signal keeps the
+  // lifetime. An idle GET is re-authorized by a POST under the same binding; a GET watching
+  // resources keeps its own credentials. Hosted admission isn't charged again: the POST paid it.
+  // A refusal, or a GET closed meanwhile, is `unauthenticated`; anything else is a fault.
   async function attach(live: Live, via: Request) {
     const request = new Request(via.url, { method: "GET", headers: via.headers, signal: live.context.request.signal });
-    const store = exchanges.getStore();
-    const next = await exchanges.run({ ...store!, request, refusal: undefined, context: undefined }, () => select(request));
+    const exchange: Exchange = { ...exchanges.getStore()!, request, refusal: undefined, context: undefined, failure: undefined, logged: false };
+    let next: Context;
+    try { next = await exchanges.run(exchange, () => select(request, false)); }
+    catch (error) {
+      if (error instanceof ApplicationError) throw error;
+      if (exchange.refusal || closed || request.signal.aborted) throw new ApplicationError("unauthenticated", "unauthenticated");
+      throw error;
+    }
     if (live.stopped || !idle(live)) { next.finish(); return; }
     const previous = live.context;
     live.context = next;
@@ -350,8 +362,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               try { await attach(idleStream, context.request); }
               catch (error) {
                 if (!(error instanceof ApplicationError) || error.code === "internal") throw error;
+                const exchange = exchanges.getStore();
+                if (exchange) logRefusal("legacy_attach", exchange, { code: error.code });
+                streamClosed(idleStream.context, error);
                 idleStream.stop();
               }
+              authorize(context, ctx.mcpReq.signal);
             }
             const stream = legacy.stream;
             if (stream) {
@@ -387,8 +403,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           throw new ProtocolError(expected ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError, expected ? "resource not found" : "internal error");
         }
       };
-      server.server.setRequestHandler("resources/subscribe", (req, ctx) => control(req.params.uri, ctx, true));
-      server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => control(req.params.uri, ctx, false));
+      // One control at a time per protocol session: the one-session-context guard and the idle
+      // GET's attach would otherwise interleave across the attach's await (#431).
+      const serialized = (uri: string, ctx: ServerContext, subscribe: boolean) => {
+        const run = legacy.controls.then(() => control(uri, ctx, subscribe));
+        legacy.controls = run.catch(() => {});
+        return run;
+      };
+      server.server.setRequestHandler("resources/subscribe", (req, ctx) => serialized(req.params.uri, ctx, true));
+      server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => serialized(req.params.uri, ctx, false));
     }
     if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
@@ -620,7 +643,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
                 const release = reserve("legacy", principal);
                 if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
-                legacy = { ref: crypto.randomUUID(), meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false } as Legacy;
+                legacy = { ref: crypto.randomUUID(), meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false, controls: Promise.resolve() } as Legacy;
                 const created = legacy;
                 newLegacy = legacy;
                 legacy.transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID(), keepAliveMs: 5000,
@@ -641,6 +664,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                   uris.set(uri, cap);
                 }
                 live = makeLive(context, uris, undefined, legacy);
+                if (idle(live)) context.session.listed = false;
                 legacy.stream = live;
               }
               if (post) { legacyPost = legacy; legacy.posts++; }
