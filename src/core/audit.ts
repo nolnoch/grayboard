@@ -8,13 +8,15 @@
 // id.detached and id.reattached, a keyed session's child exiting and a
 // restart under the same harness taking its place (#284 decision 3);
 // id.reused, a session key re-presented after retention pruned its ended
-// session's row (#284 S10); and
-// alias.created, a name's first bind or declaration (#284).
+// session's row (#284 S10);
+// alias.created, a name's first bind or declaration (#284); and
+// id.signed_in_local, a local session started on a machine signed in to a
+// server, with whether its entry chose local mode (#491).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
 
 /**
  * Where a core function shared by both modes writes its audit row: local

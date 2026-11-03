@@ -321,10 +321,12 @@ test("a built-in client's delivery declaration selects its initialize and bind t
   expect(pushText).toContain(`Board activity arrives as <channel source="grayboard-pi" board="..."`);
   expect(pushText).not.toContain("Poll dm_inbox");
   const absentText = await instructions([[GRAYBOARD_SESSION_META, "poll root"]]);
-  expect(absentText).toStartWith(`You are "alice@example.com/poll-run" on grayboard. Poll dm_inbox and board_list for pending work. Requests from peer agents`);
+  // No declaration and no lease: it polls, and says why nothing is pushed yet (#531).
+  const noLease = `No delivery lease is open for this session, so DMs to "alice@example.com/poll-run" wait until the client opens one (delivery_open).`;
+  expect(absentText).toStartWith(`You are "alice@example.com/poll-run" on grayboard. Poll dm_inbox and board_list for pending work. ${noLease} Requests from peer agents`);
   expect(absentText).not.toContain("<channel");
   const pollText = await instructions([[GRAYBOARD_SESSION_META, "poll root"], [GRAYBOARD_DELIVERY_META, poll]]);
-  expect(pollText).toBe(absentText!.replace("for pending work.", "for pending work. No pushes reach this session; check dm_inbox and board_read yourself."));
+  expect(pollText).toBe(absentText!.replace(noLease, "No pushes reach this session; check dm_inbox and board_read yourself."));
 });
 
 test("a malformed delivery declaration is bad_request on initialize and on a native tool call; other clients' and roles' are never read", async () => {
@@ -355,6 +357,13 @@ test("a malformed delivery declaration is bad_request on initialize and on a nat
     expect(await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"], [GRAYBOARD_DELIVERY_META, declared]])).client.getInstructions()).toBe(plainText);
   }
   expect(plainText).toStartWith(`You are "alice@example.com/oc-run" on grayboard. Poll dm_inbox and board_list for pending work.`);
+  // With its plugin's lease open, the same session's text says its mail is pushed (#531).
+  const ocSub = await connect(oc, [[OPENCODE_SESSION_META, "oc root"]], { role: "subscriber" });
+  ocSub.headers.set("X-Grayboard-Lease", json(await call(ocSub, "delivery_open")).capability);
+  const leasedText = await (await connect(oc, [[OPENCODE_SESSION_META, "oc root"]])).client.getInstructions();
+  expect(leasedText).toStartWith(`You are "alice@example.com/oc-run" on grayboard. Direct messages arrive as <channel source="grayboard" message_id="..."`);
+  expect(leasedText).not.toContain("Poll dm_inbox");
+  expect(leasedText).not.toContain("delivery_open");
 });
 
 test("no server refusal text names the plugin or OpenCode", () => {

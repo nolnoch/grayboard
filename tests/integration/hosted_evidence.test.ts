@@ -3,6 +3,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { matrixCases } from "../../scripts/hosted-matrix.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -64,7 +65,7 @@ for (const key of ["tests", "failures", "errors", "skipped"]) {
 }
 const matrixReady = '{"phase":"prepare","state":"started"}\n{"phase":"prepare","state":"finished","exit":0}\n';
 const matrixModes: Record<string, { raw: string; exit: number }> = {
-  "matrix-success": { raw: matrixReady + Array.from({ length: 29 }, (_, i) => JSON.stringify({ phase: "case", id: i + 1, state: "started" }) + "\n" + JSON.stringify({ phase: "case", id: i + 1, state: "finished", exit: 0 }) + "\n").join(""), exit: 0 },
+  "matrix-success": { raw: matrixReady + Array.from({ length: matrixCases.length }, (_, i) => JSON.stringify({ phase: "case", id: i + 1, state: "started" }) + "\n" + JSON.stringify({ phase: "case", id: i + 1, state: "finished", exit: 0 }) + "\n").join(""), exit: 0 },
   "matrix-prepare": { raw: matrixReady.split("\n")[0]! + "\n", exit: 1 },
   "matrix-interrupted": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n', exit: 143 },
   "matrix-exit": { raw: matrixReady + '{"phase":"case","id":1,"state":"started"}\n{"phase":"case","id":1,"state":"finished","exit":7}\n', exit: 7 },

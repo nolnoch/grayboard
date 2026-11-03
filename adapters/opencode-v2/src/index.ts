@@ -8,5 +8,5 @@ export { Grayboard } from "./rpc.js";
 export default Plugin.define({ id: "grayboard", effect: host => Effect.gen(function* () {
   const logger = yield* captureLogger;
   yield* Effect.addFinalizer(() => Effect.sync(() => logger.close()));
-  yield* fromPromise({ id: "grayboard", setup: ctx => setup(ctx, record => logger.emit(record)) }).effect(host);
+  yield* fromPromise({ id: "grayboard", setup: ctx => setup(ctx, record => logger.emit(record), (message, fields) => logger.debug(message, fields)) }).effect(host);
 }) });

@@ -114,13 +114,17 @@ export function hostedUnboundInstruction(candidates: Candidate[], notes: string[
 }
 // The line a session that is a team member is told, root or child.
 const TEAM_BOARDS_NOTE = "Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks.";
-// A bound native session's `initialize` text. Without a push declaration it assumes a
-// polling client, so the channel lines don't apply.
-export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery, launcher = false): string {
+// A session with no delivery declaration and no open lease: bind's note, and the bound initialize text's (#531).
+const noLeaseNote = (name: string) => `No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`;
+// A bound native session's `initialize` text. A declaration names its delivery. Without one (OpenCode), the
+// ownership's lease does, as in bind's result (#531): open, its mail is pushed with the default channel source;
+// none, it polls until the client opens one.
+export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery, launcher = false, leased = false): string {
+  const push = declared ? declared.mode === "push" : leased;
   return [
-    ...(declared?.mode === "push"
-      ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared.source)]
-      : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, ...(declared ? [POLL_NOTE] : []), ...COORDINATION_INSTRUCTIONS]),
+    ...(push
+      ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared?.source ?? DEFAULT_CHANNEL_SOURCE)]
+      : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, declared ? POLL_NOTE : noLeaseNote(info.identity_full), ...COORDINATION_INSTRUCTIONS]),
     ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
     ...(launcher ? launcherInstruction() : []),
     ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
@@ -525,7 +529,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       // A notice the bind consumed (the bridge's death, once) rides the answer, even one for a hold already held.
       const notices = result.ok.notices ?? [];
       if (!result.added) return { content: [{ type: "text" as const, text: [`already bound to "${name}"`, ...notices].join(" ") }], structuredContent: { name, instructions: notices, ownership: result.ownership } };
-      const note = !declared ? [`No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
+      const note = !declared ? [noLeaseNote(name)] : declared.mode === "poll" ? [POLL_NOTE] : [];
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       // The general part rides the text on a root's first hold: a hosted root has had no bind to carry it before.
       const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], notices, held.slice(1)), note);

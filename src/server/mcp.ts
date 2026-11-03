@@ -329,6 +329,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       },
     };
   }
+  // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
+  function boundInstruction(context: Context): string {
+    if (!("id" in context.sessionContext)) return hostedBoundInstruction(context.info, context.declared);
+    const row = hosted.row(context.sessionContext.id);
+    const root = row && hosted.rootOf(row);
+    return hostedBoundInstruction(context.info, context.declared, application.hostedLauncher(context.sessionContext.id), root?.lease_deadline != null);
+  }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
     const server = new McpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
@@ -338,7 +345,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       instructions: role === "subscriber" ? undefined
         : context.session.via ? hostedChildInstruction(info, context.session.via, context.session.readOnly)
         : context.session.readOnly ? hostedUnboundInstruction(info.candidates ?? [])
-        : hostedBoundInstruction(info, context.declared, "id" in context.sessionContext && application.hostedLauncher(context.sessionContext.id)),
+        : boundInstruction(context),
     });
     server.server.onerror = error => report(error);
     server.server.registerCapabilities({ resources: { subscribe: true } });
