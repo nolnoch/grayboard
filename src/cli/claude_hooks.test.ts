@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeHooks, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
+import { claudeHooks, hooksDisabledBy, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
 
 const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
 
@@ -144,4 +144,31 @@ test("`hook claude <event>` writes the record through the light entry, prints no
   }
   expect(readFileSync(join(dir, "toolu_1"), "utf8")).toBe("a573e90bd84bce7ff");
   expect(readFileSync(join(dir, "toolu_2"), "utf8")).toBe("-");
+});
+
+test("hooksDisabledBy names the first layer that turns user hooks off (#551)", () => {
+  const root = mkdtempSync(join(tmpdir(), "gb-hd-"));
+  const managed = join(root, "managed");
+  const cwd = join(root, "proj");
+  mkdirSync(join(managed, "managed-settings.d"), { recursive: true });
+  mkdirSync(join(cwd, ".claude"), { recursive: true });
+  expect(hooksDisabledBy(cwd, managed)).toBeNull();
+  // allowManagedHooksOnly counts only in managed settings.
+  writeFileSync(join(cwd, ".claude", "settings.json"), JSON.stringify({ allowManagedHooksOnly: true }));
+  expect(hooksDisabledBy(cwd, managed)).toBeNull();
+  writeFileSync(join(cwd, ".claude", "settings.json"), JSON.stringify({ disableAllHooks: true }));
+  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
+  // Local project settings come before shared ones; unparseable files are skipped.
+  writeFileSync(join(cwd, ".claude", "settings.local.json"), "{not json");
+  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
+  writeFileSync(join(cwd, ".claude", "settings.local.json"), JSON.stringify({ disableAllHooks: true }));
+  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
+  // Managed drop-ins, in name order, come before the project.
+  writeFileSync(join(managed, "managed-settings.d", "20-b.json"), JSON.stringify({ disableAllHooks: true }));
+  writeFileSync(join(managed, "managed-settings.d", "10-a.json"), JSON.stringify({ allowManagedHooksOnly: true }));
+  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(managed, "managed-settings.d", "10-a.json")} sets allowManagedHooksOnly`);
+  writeFileSync(join(managed, "managed-settings.json"), JSON.stringify({ disableAllHooks: true }));
+  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(managed, "managed-settings.json")} sets disableAllHooks`);
+  // A platform with no managed dir reads only the project.
+  expect(hooksDisabledBy(cwd, null)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
 });
