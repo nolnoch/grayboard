@@ -574,8 +574,14 @@ test("a request's launcher declaration is the ownership's: registered and audite
   const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set'").all();
   expect(() => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
   expect(ctx({ [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
-  // Any client's declaration is read, not only a generic key's.
+  // A built-in client's declaration is read, whatever its source key; a third-party client's never is.
   expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_LAUNCHER_META]: true })).toMatchObject({ launcher: true });
+  expect(sessionContext({ ...generic, clientId: "third-party" }, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: true })).not.toHaveProperty("launcher");
+  // A tools-only root can't receive pushes, so its declaration is ignored.
+  const toolsOnly = ctx({ [GRAYBOARD_LAUNCHER_META]: true, [GRAYBOARD_WRITES_AS_META]: "scribe" });
+  await hosted.whoami(generic, toolsOnly);
+  expect(flag()).toBe(0);
+  await hosted.end(generic, toolsOnly);
   await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
   expect(flag()).toBe(1);
   expect(audited()).toEqual([{ target: id, detail: JSON.stringify({ on: true }) }]);
@@ -606,8 +612,10 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
   const requester = await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
-  expect(requester).toBeDefined();
   const result = await hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it" }));
   expect(result).toMatchObject({ to: "you@example.com/lead" });
   await expect(hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
+  // The text follows the stored flag, not the later request: a restart without the declaration still gets the rule.
+  const later = await hosted.bind(generic, ctx("lead-root"), { name: "lead2", create: true });
+  expect(instructions(later)).toContain("You're a launcher session");
 });

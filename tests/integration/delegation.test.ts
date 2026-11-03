@@ -141,7 +141,6 @@ test("local: no live launcher surfaces the request to the declared human", async
   expect(thread[0].body).toContain("BUS_LAUNCHER=1");
 }, 30_000);
 
-// hosted twin: #451 (the launcher)
 test("server: the launcher flag on a session's ID records the capability; delegate delivers", async () => {
   const srv = serve();
   try {
@@ -358,7 +357,6 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
 
 // #284 PR 4: the launcher flag is the session's, so it stands behind every
 // alias the session holds; a delegate to its second alias lands on it.
-// hosted twin: #451 (multi-alias holds, the launcher)
 test("local and server: a delegate to a launcher session's second alias is accepted", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   await call(be.c, "bind", { name: "be2", create: true });

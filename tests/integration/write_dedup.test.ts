@@ -28,13 +28,6 @@ import { ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
-// A session a delegate may name. The hello that said so is gone (#282); the
-// row's flag is what delegate reads.
-function launcher(srv: TestServer, s: AppSession): AppSession {
-  srv.app.db.prepare("UPDATE ids SET launcher = 1 WHERE id = ?").run(s.id);
-  return s;
-}
-
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 // A replay's marker; absent on a write that landed.
 type Replayed = { replayed?: { ref: { kind: string; id: number }; first_at: string }; note?: string };
@@ -109,11 +102,9 @@ describe("a lost answer, then the same call from the same session", () => {
     expect(events.filter(board((i) => i.post?.id === id)).length).toBe(1);
   });
 
-  // hosted twin: #451 (a launcher session)
   test("delegate: one pending DM, one delegation.requested, one launcher push", async () => {
-    const lx = srv.appSession(alice, "lx");
+    const lx = srv.appSession(alice, "lx", { launcher: true });
     await lx.connect();
-    launcher(srv, lx);
     const { again, retry } = await lostThenRepeated("asker", (s) => s.delegate({ persona: "a researcher", task: "survey the options", to: "lx" }));
     const rows = srv.app.db.prepare("SELECT id, pending FROM messages WHERE recipient = 'alice@example.com/lx' AND sender = 'alice@example.com/asker'").all() as { id: number; pending: number }[];
     expect(rows).toEqual([{ id: expect.any(Number), pending: 1 }]);
@@ -394,11 +385,9 @@ describe("dedup and state answers (in process)", () => {
     expect(q("SELECT ref_id FROM write_receipts")).toEqual([{ ref_id: later.message_id }]);
   });
 
-  // hosted twin: #451 (a launcher session)
   test("delegate's inner send isn't a dm_send: the same body sent plainly afterwards sends", async () => {
-    const lx = srv.appSession(you, "lx");
+    const lx = srv.appSession(you, "lx", { launcher: true });
     await lx.connect();
-    launcher(srv, lx);
     await offline("sim");
     const be = await session("be");
     const d = await be.delegate({ persona: "a researcher", task: "t", to: "lx" });

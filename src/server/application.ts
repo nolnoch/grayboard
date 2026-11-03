@@ -850,6 +850,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
       return byOwner;
     },
+    // Whether the session's ownership registered as a launcher (#473): what its instruction text follows, since the
+    // stored flag, not a later request's declaration, decides whether it receives delegation requests.
+    hostedLauncher(id: string): boolean { return (db.prepare(`SELECT launcher FROM ids WHERE id = ?`).get(id) as { launcher: number | null } | null)?.launcher === 1; },
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,

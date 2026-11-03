@@ -93,13 +93,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: official discover
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
-// hosted twin: #451 (the launcher)
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation uses the live owning launcher without becoming one`, async () => {
   const token = await login();
-  const owner = appSession(await legacyLogin(), "allowed");
+  const owner = appSession(await legacyLogin(), "allowed", { launcher: true });
   await owner.connect();
-  // The hello's launcher flag is gone (#282); the row is what delegate and peer_list read.
-  app.db.query(`UPDATE ids SET launcher = 1 WHERE id = ?`).run(owner.id);
   const client = await connect(token, "be", version);
   expect((await client.listTools()).tools.map(t => t.name)).toContain("delegate");
   const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));

@@ -8,7 +8,7 @@ import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE,
 import { normalizeAliasName } from "../core/addresses.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import { harnessFor } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit } from "./audit.ts";
@@ -40,7 +40,7 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
   if (!("id" in base)) return base;
-  const context = { ...base, ...sessionFacts(meta), ...launcherDeclaration(meta) };
+  const context = { ...base, ...sessionFacts(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_WRITES_AS_META];
@@ -60,7 +60,8 @@ function sessionFacts(meta: unknown): { facts?: SessionFacts } {
   }
   return Object.keys(facts).length ? { facts } : {};
 }
-// A launcher declaration (#473), any client's: `true` marks the session a delegation launcher, `false` and absence are
+// A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
+// third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are
 // the same (a session that never declared one). It grants nothing beyond receiving the session's own user's requests.
 function launcherDeclaration(meta: unknown): { launcher?: true } {
   if (!meta || typeof meta !== "object" || !(GRAYBOARD_LAUNCHER_META in meta)) return {};
@@ -173,7 +174,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), { ...context.facts, ...(context.launcher ? { launcher: true } : {}) });
+      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), { ...context.facts, ...(context.launcher && writesAs === null ? { launcher: true } : {}) });
       store.insert(row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -484,7 +485,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const note = !declared ? [`No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`] : declared.mode === "poll" ? [POLL_NOTE] : [];
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       // The general part rides the text on a root's first hold: a hosted root has had no bind to carry it before.
-      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => "id" in context && context.launcher ? launcherInstruction() : [], notices, held.slice(1)), note);
+      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], notices, held.slice(1)), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
@@ -511,7 +512,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (!result.ok.released) return { content: [{ type: "text" as const, text: notHolding(alias) }], structuredContent: { name: held[0] ?? null, instructions: [], ownership: result.ownership } };
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const instructions = held.length
-        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => "id" in context && context.launcher ? launcherInstruction() : [], [], held.slice(1))
+        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], [], held.slice(1))
         : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed))];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? "", result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
