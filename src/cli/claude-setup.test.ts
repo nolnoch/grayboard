@@ -1,8 +1,8 @@
 // `grayboard setup` and `refresh-adapters` register Claude Code for the mode
-// (#281): local mode the user-scope `grayboard mcp` entry and the
-// SessionStart hook, disabling an enabled hosted plugin; server mode the
+// (#281): local mode the user-scope `grayboard mcp` entry and grayboard's
+// hooks (#551), disabling an enabled hosted plugin; server mode the
 // hosted plugin from this repo's marketplace, then removing the entry and the
-// hook. A stub `claude` keeps the state the real one does (2.1.316, measured
+// hooks. A stub `claude` keeps the state the real one does (2.1.316, measured
 // in a scratch CLAUDE_CONFIG_DIR): the entry in ~/.claude.json, the plugin's
 // enabled flag and userConfig in ~/.claude/settings.json, and its exit codes.
 import { afterEach, expect, test } from "bun:test";
@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeCli } from "./claude-setup.ts";
+import { claudeHooks } from "./claude_hooks.ts";
 import { REPO } from "./update.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -82,7 +83,7 @@ function fixture({ bun = true, claude = true } = {}) {
   };
   const entry = () => json(".claude.json").mcpServers?.grayboard;
   const settings = () => json(".claude", "settings.json");
-  const hook = () => settings().hooks?.SessionStart;
+  const hook = () => settings().hooks;
   return { root, exec, run, signIn, argv, entry, settings, hook };
 }
 
@@ -93,7 +94,7 @@ const PLUGIN = [`claude plugin marketplace add ${REPO}`, "claude plugin marketpl
 // After an install or update, the pin and the installed plugin are read (#511).
 const CHECK = ["claude plugin marketplace list --json", "claude plugin list --json"];
 const UPDATE = ["claude plugin marketplace update grayboard", "claude plugin update grayboard@grayboard", ...CHECK];
-const HOOK = [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: `bun ${cli} session-start`, timeout: 10 }] }];
+const HOOK = claudeHooks(["bun", cli]);
 
 test("setup switches Claude Code local → server → local: the entry and hook, then the plugin, then the entry with the plugin disabled", () => {
   const f = fixture();
@@ -107,7 +108,7 @@ test("setup switches Claude Code local → server → local: the entry and hook,
   expect(f.argv()).toEqual(PLUGIN);
   expect(out).toContain(`Installed the Claude Code plugin grayboard@grayboard for ${PLUGIN_URL}`);
   expect(out).toContain("Removed the user-scope grayboard MCP entry");
-  expect(out).toContain("Removed grayboard's SessionStart hook");
+  expect(out).toContain("Removed grayboard's hooks");
   expect(out).toContain("claude --dangerously-load-development-channels plugin:grayboard@grayboard");
   expect(f.entry()).toBeUndefined();
   expect(f.hook()).toBeUndefined();
@@ -170,6 +171,23 @@ test("refresh-adapters moves a server-mode user's Claude Code entry to the plugi
   const again = f.run("refresh-adapters");
   expect(f.argv()).toEqual(UPDATE);
   expect(again).toContain(`Claude Code plugin grayboard@grayboard: already at the latest version (${pkg.version}). Restart Claude Code sessions to load a new version.`);
+});
+
+test("refresh-adapters in local mode installs the hooks on a pre-#551 setup, keeping the user's own, without asking", () => {
+  const f = fixture();
+  f.run("setup", "--local", "-y");
+  f.argv();
+  const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
+  // What setup wrote before #551: the title hook alone.
+  const settings = join(f.root, ".claude", "settings.json");
+  writeFileSync(settings, JSON.stringify({ model: "x", hooks: { SessionStart: [HOOK.SessionStart![0]], PreToolUse: [own] } }));
+  const out = f.run("refresh-adapters");
+  expect(out).toContain(`Installed grayboard's hooks in ${settings}`);
+  expect(f.argv()).toEqual([]);
+  expect(f.settings().model).toBe("x");
+  expect(f.hook()).toEqual({ ...HOOK, PreToolUse: [own, ...HOOK.PreToolUse!] });
+  // Current: nothing to say, nothing rewritten.
+  expect(f.run("refresh-adapters")).not.toContain("Installed grayboard's hooks");
 });
 
 test("refresh-adapters in server mode updates an enabled plugin, skips a disabled or absent one, reports a failed update, and warns about a repo .mcp.json entry (#443)", () => {

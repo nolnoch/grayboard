@@ -11,8 +11,8 @@ import pkg from "../../package.json" with { type: "json" };
 import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
-import { sessionStartOutput } from "./session_start.ts";
-import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
+import { sessionStartOutput } from "./claude_hooks.ts";
+import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -234,10 +234,6 @@ function dropEntry(c: HarnessConfig): boolean {
 type McpInvocation = { command: string; args: string[] };
 
 /** How Claude Code should start grayboard's MCP server: this CLI, `mcp` subcommand. */
-function shellQuote(s: string): string {
-  return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
 function mcpCommand(): McpInvocation {
   // In a `bun build --compile` binary, execPath is the binary itself; from
   // source it's bun, and import.meta.path is this script.
@@ -726,8 +722,7 @@ program
     if (opts.register && claude && (await confirm("Make grayboard available in every Claude Code project?", true))) {
       try {
         const run = claudeCli(claude);
-        const hook = [command, ...args.slice(0, -1), "session-start"].map(shellQuote).join(" ");
-        const notes = server ? installClaudePlugin(run, server) : registerClaudeLocal(run, command, args, hook);
+        const notes = server ? installClaudePlugin(run, server) : registerClaudeLocal(run, command, args);
         for (const note of notes) console.log(note);
       } catch (e) { console.error(`[grayboard] ${(e as Error).message}`); process.exit(1); }
     } else if (opts.register && !claude) {
@@ -806,6 +801,9 @@ function adapterFailed(e: unknown): void {
 }
 
 /**
+ * Claude Code, local mode: a user-scope `grayboard mcp` entry gets grayboard's
+ * hooks, without asking, so a setup that predates one gets it (#551).
+ *
  * Claude Code, server mode: a user still on the user-scope `grayboard mcp`
  * entry (setup before the plugin) moves to the hosted plugin; an installed
  * plugin updates to the marketplace's current pin (#443). Either way the pin,
@@ -814,6 +812,9 @@ function adapterFailed(e: unknown): void {
  * entry runs a second grayboard: checked even when the update failed.
  */
 function refreshClaude(): void {
+  try {
+    if (busMode() !== "server") for (const note of refreshClaudeHooks()) console.log(note);
+  } catch (e) { adapterFailed(e); }
   try {
     const claude = Bun.which("claude");
     if (busMode() === "server" && claude) {
