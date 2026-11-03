@@ -445,6 +445,21 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 30_000);
 
+// #523 audit (PR #556): a name has a session from the moment its hold
+// commits, before the binder listens: a DM sent then queues, and the binder
+// gets it once it does, instead of the sender being told the name never connected.
+test("a DM to a name between its hold's commit and its listener queues and reaches the binder", async () => {
+  const peer = await session("peer");
+  const s = await session(undefined, { extra: pauseEnv("bind:after-acquire") });
+  const bind = s.call("bind", { name: "fresh", create: true });
+  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
+  const sent = await peer.call("dm_send", { to: "fresh", body: "early" });
+  expect(sent.delivered_now).toBe(false);
+  release("bind:after-acquire");
+  expect(await bind).toContain('Bound to "fresh"');
+  await until(() => s.pushes.some((p) => p.content === "early"));
+}, 30_000);
+
 test("12: the human declaration and a bind of the same name: neither order lets both win", async () => {
   // The declaration holds its transaction while a bind starts: the bind waits, then is refused.
   // Each waiter opens first and parks just before its transaction; "pause released" is logged

@@ -11,7 +11,7 @@ import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, ch
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, logBinding, replyPeer, replyPeerError, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -49,7 +49,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
+import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, childFallback, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { hooksDisabledBy, recordHookInstalled } from "../cli/claude_hooks.ts";
@@ -112,9 +112,11 @@ if (typeof HARNESS === "string") {
   process.exit(1);
 }
 // This process's session key, BUS_SESSION_KEY or one minted here and kept:
-// its child sessions' IDs derive from it (#523). Its session ID (#284).
-const SESSION_KEY = KEY ?? mintSessionKey();
-const SESSION_ID = idAddress(SESSION_KEY);
+// its child sessions' IDs derive from it (#523). Its session ID (#284). A
+// runner child that becomes its own session (#523 step 5) mints both anew:
+// its child ID stays a child's.
+let SESSION_KEY = KEY ?? mintSessionKey();
+let SESSION_ID = idAddress(SESSION_KEY);
 // Directories this session may attach files from and save them to.
 const ROOTS = attachRoots();
 // This bus's subdirectory of the default save directory.
@@ -136,22 +138,53 @@ const HUMAN = process.env.BUS_HUMAN === "1";
 // telling peers what its harness can do, and it's the one that acts on a
 // delegation request when one arrives by DM.
 const LAUNCHER = process.env.BUS_LAUNCHER === "1";
-// A launcher must be able to RECEIVE delegation requests: a tools-only
-// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
-// the name, has no socket, and never touches the launcher flag (a sidecar
-// must not overwrite the owner's opt-in).
-const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
 // BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
 // peer_list rows (#284 S12). Self-reported, read once, ended with the session.
 const MODEL = process.env.BUS_MODEL || undefined;
 const EFFORT = process.env.BUS_EFFORT || undefined;
+// BUS_HARNESS_SESSION: the harness's own id for the session this process
+// serves (pi's getSessionId()), recorded as ids.harness_session.
+// BUS_PARENT_SESSION: that id of the session whose subagent process this is
+// (pi-subagents' detached runner, #523 step 5): while that session lives and
+// its harness is among this process's ancestors, this process is its child.
+// Harness-asserted, like a child's `_meta`: a child acts only under its
+// root's addresses. The pi adapter sets both.
+const harnessId = (key: string): string | undefined => {
+  const v = process.env[key] || undefined;
+  if (v !== undefined && !validSourceId(v)) {
+    console.error(`[grayboard] ${key} must be 1 to 1024 characters with no control characters`);
+    process.exit(1);
+  }
+  return v;
+};
+const HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION");
+const PARENT_SESSION = harnessId("BUS_PARENT_SESSION");
+// A runner child stands in for a session that would own its delivery, so
+// it falls back to (or is promoted to) one.
+if (PARENT_SESSION !== undefined && (!PUSH || HUMAN || KEYED)) {
+  console.error("[grayboard] BUS_PARENT_SESSION makes this process a subagent of the session that recorded it, in place of a session that owns its delivery; it can't be combined with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY");
+  process.exit(1);
+}
+// A launcher must be able to RECEIVE delegation requests: a tools-only
+// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
+// the name, has no socket, and never touches the launcher flag (a sidecar
+// must not overwrite the owner's opt-in). Nor is a runner (BUS_PARENT_SESSION),
+// child or its own session: its BUS_LAUNCHER is its launching session's,
+// inherited with its env, and pi-subagents doesn't load in a runner, so it
+// can't spawn the subagent a request asks for.
+const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH && PARENT_SESSION === undefined;
+// What this process registers its own root session as: at start, or when a
+// runner child becomes its own session.
+const ROOT_KIND: SessionKind = { launcher: EFFECTIVE_LAUNCHER, model: MODEL, effort: EFFORT, ...(HARNESS_SESSION ? { harnessSession: HARNESS_SESSION } : {}) };
 // A session binds a name at start only when told which (#182): an explicit
 // BUS_IDENTITY (not a harness re-delivering the repo's pin), or the bridge's
 // child, whose BUS_IDENTITY is the human handle wherever it runs. Otherwise
 // the resolved name is only the first suggestion, and the session starts
 // unbound: binding delivers the name's queued DMs and hands it the name's
-// claims, which should follow the agent knowing its task.
-const EXPLICIT = HUMAN || isExplicitIdentity();
+// claims, which should follow the agent knowing its task. A runner's
+// BUS_IDENTITY is its launching session's, inherited with its env: only a
+// suggestion, whether it is a child or its own session.
+const EXPLICIT = HUMAN || (PARENT_SESSION === undefined && isExplicitIdentity());
 const resolved = (() => {
   try {
     return normalizeIdentityName(HUMAN && process.env.BUS_IDENTITY ? process.env.BUS_IDENTITY : sessionIdentity());
@@ -184,6 +217,35 @@ if (CHANNELS_OFF) console.error(`[grayboard] Claude Code channels are off (${CHA
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
 
+// The live root this process is a runner child of (#523 step 5), while it
+// is one; null for a root. A runner child acts under its root's addresses,
+// as the root's in-process children do, but from a process of its own: no
+// wakeup listener, drain, name record or bindings row of its own (its row is
+// a copy of its root's liveness, registerChild). A bind promotes it to its
+// own session (bind); its root ending makes it one (rootGone).
+let liveParent: string | null = null;
+// Why a BUS_PARENT_SESSION process started as its own session: no live root,
+// or its root refused it as a child.
+let ownWhy: string | null = null;
+if (PARENT_SESSION !== undefined) {
+  const found = runnerRoot(db, PARENT_SESSION);
+  if ("why" in found) ownWhy = found.why;
+  else {
+    const self = thisSession(SESSION_ID);
+    try {
+      registerChild(db, found.root, SESSION_ID, HARNESS_SESSION ?? null, Date.now(), {
+        harness: self.harness, cwd: self.cwd, harnessSession: HARNESS_SESSION, detail: { parent_session: PARENT_SESSION },
+      });
+      liveParent = found.root;
+    } catch (e) {
+      if (!(e instanceof CoreError)) throw e;
+      // Refused (its root ended since the lookup, or has its fill of
+      // children): it runs as its own session, as with no live parent, rather
+      // than lose grayboard for its whole life over a reason only stderr sees.
+      ownWhy = e.message;
+    }
+  }
+}
 // Claude Code subagents (#551): Claude Code tells this server only a call's
 // tool_use_id, and grayboard's PreToolUse hook records which agent made it.
 // Read once at start: whether that hook is in user settings, and the harness
@@ -200,14 +262,19 @@ let attributionOffAudited = false;
 
 // The names this session holds, oldest first (#284 S1): the first is its
 // primary, which it sends as. bind() and unbind() change it, only between
-// drains. A tools-only process holds nothing and writes as WRITES_AS.
+// drains. A tools-only process holds nothing and writes as WRITES_AS. A
+// runner child holds nothing either.
 let held: string[] = [];
 const WRITES_AS = PUSH ? null : SUGGESTED;
+// The session whose addresses this process acts under, and its holds: this
+// one, or a runner child's root, whose holds are re-read on every call.
+const rootId = (): string => liveParent ?? SESSION_ID;
+const holds = (): string[] => (liveParent === null ? held : holdsOf(db, liveParent));
 // The address this session writes as by default, and every address it reads
 // mail, claims and uploads as (#284 S1): its holds and its ID. A tools-only
 // process receives nothing, so its ID isn't one of its addresses.
-const primary = (): string => WRITES_AS ?? primaryOf(held, SESSION_ID);
-const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...held, SESSION_ID]);
+const primary = (): string => WRITES_AS ?? primaryOf(holds(), rootId());
+const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...holds(), rootId()]);
 // The first successful write of a session acting as its ID says how to get a
 // readable name, once per session (#470). A root's notice: never a child's (#523).
 let bindHinted = false;
@@ -244,14 +311,14 @@ if (WRITES_AS) {
   // Its liveness is its own process, keyed or not: it ends on exit, and a
   // key shared with a live session collides rather than attaching.
   try {
-    registerSession(db, thisSession(SESSION_ID), { writesAs: WRITES_AS, keyed: KEYED, model: MODEL, effort: EFFORT });
+    registerSession(db, thisSession(SESSION_ID), { writesAs: WRITES_AS, keyed: KEYED, model: MODEL, effort: EFFORT, ...(HARNESS_SESSION ? { harnessSession: HARNESS_SESSION } : {}) });
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
     writeCoreAudit(db, "id.collision", e.id, e.id, { why: e.why, delivery: "none", ended_at: e.endedAt, pid: process.pid });
     console.error(`[grayboard] ${e.message}`);
     process.exit(1);
   }
-} else {
+} else if (liveParent === null) {
   // The session that owns delivery owns the name: it writes the session's
   // rows, its presence while unbound, and acquires through them.
   // Channels-off sessions too: they own the session, they just don't listen.
@@ -260,7 +327,7 @@ if (WRITES_AS) {
   // it first if the harness had died, so attaching is refused then.
   let attached = false;
   try {
-    registerSession(db, self, { launcher: EFFECTIVE_LAUNCHER, model: MODEL, effort: EFFORT });
+    registerSession(db, self, ROOT_KIND);
     // The flag is the session's (ids.launcher), so it's audited once, here.
     writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
   } catch (e) {
@@ -278,6 +345,13 @@ if (WRITES_AS) {
       console.error(`[grayboard] ${e.message}`);
       process.exit(1);
     }
+  }
+  if (ownWhy !== null) {
+    // A runner with no live parent, or one that refused it as a child, runs
+    // as its own session, logged once (hosted's rule for a subagent with no
+    // parent session).
+    console.error(`[grayboard] BUS_PARENT_SESSION ${PARENT_SESSION}: ${ownWhy}; this process runs as its own session`);
+    writeCoreAudit(db, "id.child_fallback", SESSION_ID, SESSION_ID, { parent_session: PARENT_SESSION, why: ownWhy, pid: process.pid });
   }
   if (RECORDS) sweepRecords(RECORD_DIR);
   // A restart under the same harness takes back its predecessor's names, in
@@ -347,7 +421,7 @@ const SIGNED_IN_SERVER = SIGNED_IN ? serverOrigin(process.env.GRAYBOARD_SERVER) 
 const SIGNED_IN_NOTICE = SIGNED_IN && !launch.modePinned ? signedInLocalNotice(SIGNED_IN_SERVER) : null;
 if (SIGNED_IN) writeCoreAudit(db, "id.signed_in_local", SESSION_ID, SESSION_ID, { server: SIGNED_IN_SERVER, mode_pinned: launch.modePinned });
 if (SIGNED_IN_NOTICE) console.error(`[grayboard] this machine is signed in to ${SIGNED_IN_SERVER ?? "a grayboard server"}, but this entry runs the local bus. Run \`grayboard setup\` to use the server, \`grayboard setup --local\` if this machine should be local, or pass \`--mode local\` to keep this entry local on purpose.`);
-console.error(`[grayboard] local mode, session ${SESSION_ID}, ${held.length ? `identity "${held.join('", "')}"` : WRITES_AS ? `writing as "${WRITES_AS}"` : "unbound"}`);
+console.error(`[grayboard] local mode, session ${SESSION_ID}, ${liveParent !== null ? `a subagent of ${liveParent} (BUS_PARENT_SESSION ${PARENT_SESSION})` : held.length ? `identity "${held.join('", "')}"` : WRITES_AS ? `writing as "${WRITES_AS}"` : "unbound"}`);
 
 // What the session is told as it is now (core's boundInstructions): as its
 // primary, with local mode's human and announcement sentences, and its claims
@@ -356,19 +430,23 @@ console.error(`[grayboard] local mode, session ${SESSION_ID}, ${held.length ? `i
 // `notes` are why it started as it did.
 function localInstructions(general: boolean, notes: string[] = []): string[] {
   const name = primary();
+  const modeGeneral = () => [
+    ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
+    ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
+    ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
+  ];
+  const signedIn = general && SIGNED_IN_NOTICE ? [SIGNED_IN_NOTICE] : [];
+  // A runner child is told what it is: a subagent writing as its root, pushed nothing.
+  if (liveParent !== null) return [...signedIn, ...runnerChildInstructions(SESSION_ID, liveParent, name, modeGeneral())];
   const lead = !WRITES_AS && !held.length ? [unboundInstruction(SESSION_ID, unboundCandidates, notes)] : notes;
   // First in every general render (initialize, and bind and unbind's structured
   // instructions, which the adapters rebuild their prompt from); a result's
   // text, the non-general render, doesn't repeat it.
-  return [...(general && SIGNED_IN_NOTICE ? [SIGNED_IN_NOTICE] : []), ...boundInstructions(
+  return [...signedIn, ...boundInstructions(
     name,
     DEFAULT_CHANNEL_SOURCE,
     general,
-    () => [
-      ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
-      ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
-      ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
-    ],
+    modeGeneral,
     [
       ...lead,
       ...undeliveredInstruction(undeliveredFrom(addresses(), Date.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(db, h)),
@@ -379,7 +457,7 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
 }
 // The candidates an unbound session is offered: read at start, and again when
 // an unbind leaves it holding nothing.
-let unboundCandidates = !WRITES_AS && !held.length ? await candidateNames(db, SUGGESTED) : [];
+let unboundCandidates = !WRITES_AS && liveParent === null && !held.length ? await candidateNames(db, SUGGESTED) : [];
 
 const mcp = new Server(
   { name: DEFAULT_CHANNEL_SOURCE, version: pkg.version },
@@ -452,8 +530,12 @@ function recordMissing(tool: string, toolUseId: unknown, cause: MissingCause) {
   const why = layer ? `${MISSING_TEXT[cause]}; ${layer}` : MISSING_TEXT[cause];
   return { ...text(`error: grayboard can't tell which Claude Code agent made this call (${why}), so it didn't run. Rerun \`grayboard setup\` and restart Claude Code.`), isError: true };
 }
-// The child sessions this process has seen within the idle window (#523).
-const children = new ChildSessions(db, SESSION_ID, SESSION_KEY);
+// The child sessions this process has seen within the idle window (#523),
+// under its root: a runner child's subagents are its root's children, as
+// hosted resolves a nested subagent to its root, so a child's root is always
+// a root. Their IDs are minted over this process's key, which only it holds.
+// A runner child's becoming its own session starts anew (becomeRoot).
+let children = new ChildSessions(db, rootId(), SESSION_KEY);
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
@@ -474,9 +556,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     }
   }
   const run = async () => {
+    // A runner child whose root isn't live (its parent harness exited while
+    // this runner lives on) is its own session from here (#523 step 5).
+    if (liveParent !== null && !runnerRootLive(db, SESSION_ID, liveParent)) await rootGone();
     for (const a of WRITES_AS ? [WRITES_AS] : held) touchAlias(db, a);
     touchId(db, SESSION_ID);
-    if (agent === undefined) return call(name, args, signal);
+    // A runner child's own call is its child session's.
+    if (agent === undefined) return call(name, args, signal, liveParent === null ? undefined : SESSION_ID);
     if (!validSourceId(agent)) return { ...text(`error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`), isError: true };
     let child: string;
     try {
@@ -530,9 +616,11 @@ async function call(name: string, args: Record<string, unknown>, signal: AbortSi
 }
 
 async function dispatch(name: string, a: Record<string, unknown>, signal: AbortSignal, child?: string) {
-  // A child acts under this session's addresses; its names are the root's to change.
-  if (child !== undefined && (name === "bind" || name === "unbind")) {
-    return { ...text(`error: child_session: this session acts under its root ${SESSION_ID}; bind and unbind are the root's. Call them from the root session.`), isError: true };
+  // A child acts under its root's addresses; its names are the root's to
+  // change, but for a runner child's bind, which promotes it (#523 step 5).
+  if (child !== undefined && (name === "unbind" || (name === "bind" && child !== SESSION_ID))) {
+    const whose = child === SESSION_ID ? "unbind is the root's; bind(name) makes this process its own session." : "bind and unbind are the root's. Call them from the root session.";
+    return { ...text(`error: child_session: this session acts under its root ${rootId()}; ${whose}`), isError: true };
   }
   // Nor does it take on or change the root's read state (its inbox, its subscriptions).
   const refused = child === undefined ? null : childStateRefusal(name, child, primary());
@@ -540,7 +628,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
   // Local mode has one implicit scope: no principal (#284 S6).
-  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: held, principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: SESSION_ID, child: true } : {}), ...(ATTRIBUTION_OFF ? { note: ATTRIBUTION_OFF_NOTE } : {}) });
+  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: holds(), principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: rootId(), child: true } : {}), ...(ATTRIBUTION_OFF ? { note: ATTRIBUTION_OFF_NOTE } : {}) });
   // The session the write is from (sender_id, author_id): the child making
   // the call, which its writes also name as `via` (#523), else this one.
   const WRITER = child ?? SESSION_ID;
@@ -634,7 +722,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const parent = parent_id === undefined ? undefined : getMessage(parent_id);
     // `as` wins; a reply defaults to the held alias its parent reached or was
     // sent as (#284 S4); else the primary.
-    const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, held) : null) ?? IDENTITY;
+    const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, holds()) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
     const parsed = addressParts(to);
@@ -797,7 +885,7 @@ async function unboundPeers(): Promise<UnboundPeer[]> {
   const now = Date.now();
   return unbound.map((r) => {
     const s = statuses.get(r.session_id);
-    return unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === SESSION_ID, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+    return unboundPeer(r.session_id, r.cwd ? describeLocation(r.cwd) : null, r.session_id === rootId(), s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
   });
 }
 
@@ -818,9 +906,10 @@ let markInitialized!: () => void;
 const initialized = new Promise<void>((r) => { markInitialized = r; });
 mcp.oninitialized = () => markInitialized();
 
-// A wakeup during a drain joins it: the loop re-queries until empty.
+// A wakeup during a drain joins it: the loop re-queries until empty. A
+// runner child never drains: its root's mail is its root's.
 function drainToClaude(): Promise<void> {
-  if (swapping || shuttingDown) return Promise.resolve();
+  if (swapping || shuttingDown || liveParent !== null) return Promise.resolve();
   inflight ??= drainLoop().finally(() => {
     inflight = null;
   });
@@ -887,7 +976,8 @@ const onWake = () => {
   });
 };
 // Each held alias's wakeup socket, opened once its hold commits and closed
-// before it drops (#284 S7); the ID's is this process's from start to exit.
+// before it drops (#284 S7); the ID's is this process's from start (or from a
+// runner child's becoming its own session) to exit.
 const listeners = new Map<string, () => void>();
 let stopIdListening = () => {};
 
@@ -898,6 +988,55 @@ function listen(alias: string): void {
 function stopListening(alias: string): void {
   listeners.get(alias)?.();
   listeners.delete(alias);
+}
+
+// Delivery for the session this process owns: its ID's wakeup socket, its
+// names' sockets, and a first drain. A runner child has none until it
+// becomes its own session.
+function startDelivery(): void {
+  if (!DELIVER) return;
+  stopIdListening = listenForWakeup(SESSION_ID, onWake);
+  for (const h of held) listen(h);
+  drainToClaude().catch((err) => {
+    console.error("grayboard initial drain error:", err);
+  });
+}
+
+// The root session a runner child becomes (#523 step 5): a new key and ID,
+// since its child ID is never an address, registered unbound as ROOT_KIND.
+function leaving(): { key: string; leave: Leave } {
+  const key = mintSessionKey();
+  const leave: Leave = {
+    child: SESSION_ID, root: liveParent!, self: thisSession(idAddress(key)), kind: ROOT_KIND,
+    detail: { parent_session: PARENT_SESSION, harness_session: HARNESS_SESSION ?? null },
+  };
+  return { key, leave };
+}
+
+// This process is that session from here (`how` says why, for the log) and
+// owns its delivery, as a root that started on its own does.
+function becomeRoot(key: string, how: string): void {
+  const id = idAddress(key);
+  console.error(`[grayboard] subagent session ${SESSION_ID} of ${liveParent} ${how}: this process is session ${id} from here`);
+  SESSION_KEY = key;
+  SESSION_ID = id;
+  liveParent = null;
+  children = new ChildSessions(db, SESSION_ID, SESSION_KEY);
+  // The flag is the session's (ids.launcher), audited where it registers.
+  writeCoreAudit(db, "handle.launcher_set", SESSION_ID, SESSION_ID, { on: EFFECTIVE_LAUNCHER });
+  startDelivery();
+}
+
+// A runner child whose root isn't live (#523 step 5) runs as its own,
+// unbound session from here: once, since it then has no root to check.
+async function rootGone(): Promise<void> {
+  const { key, leave } = leaving();
+  const ended = childFallback(db, leave);
+  becomeRoot(key, "lost its root, which isn't live");
+  writeNames();
+  instructionsStale = true;
+  unboundCandidates = await candidateNames(db, SUGGESTED);
+  await deliverEnded(db, ended);
 }
 
 // The name a bind or unbind names: bare, in local mode's one scope.
@@ -934,9 +1073,13 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
   swapping = true;
   try {
     await inflight;
-    const r = await acquireName(db, SESSION_ID, n.name, { create: a.create === true, meta });
+    // A runner child's bind promotes it to its own session in the
+    // transaction that takes the name (#523 step 5).
+    const promote = liveParent === null ? null : leaving();
+    const r = await acquireName(db, promote?.leave.self.session_id ?? SESSION_ID, n.name, { create: a.create === true, meta, ...(promote ? { promote: promote.leave } : {}) });
     await deliverEnded(db, r.ended);
     if (!r.ok) return fail(r.error);
+    if (promote) becomeRoot(promote.key, `bound "${n.name}", promoted`);
     // The row holds the new name from here: so does this process, whatever
     // follows fails.
     held.push(n.name);
@@ -945,7 +1088,6 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     testPause("bind:after-acquire");
     try {
       listen(n.name);
-      touchAlias(db, n.name);
     } catch (e) {
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
       throw new CoreError(`bound "${n.name}", but setting it up failed: ${(e as Error).message}`);
@@ -1016,6 +1158,10 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
 // over to this session's ID.
 if (restoredFrom) inheritStatus(db, SESSION_ID, restoredFrom);
 for (const h of held) touchAlias(db, h);
+// A runner child starts its delivery when it becomes its own session
+// (becomeRoot), which a call can do before startup's below: so whether
+// startup starts it is read before the first call can arrive.
+const rootAtStart = liveParent === null;
 const transport = new StdioServerTransport();
 await mcp.connect(transport);
 late.watch(transport);
@@ -1065,10 +1211,4 @@ process.stdin.on("close", () => void shutdown());
 // the exit handlers, so a client gone during it still ends this session.
 await deliverEnded(db, openEnded);
 
-if (DELIVER) {
-  stopIdListening = listenForWakeup(SESSION_ID, onWake);
-  for (const h of held) listen(h);
-  drainToClaude().catch((err) => {
-    console.error("grayboard initial drain error:", err);
-  });
-}
+if (rootAtStart) startDelivery();
