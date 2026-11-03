@@ -349,42 +349,103 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
   });
 }
 
-// Local mode, as `grayboard setup` leaves omp: the relay adapter
-// (adapterSource("omp")) at <agentDir>/extensions/grayboard.ts and an enabled
-// grayboard entry in <agentDir>/mcp.json, whose push-mode `grayboard mcp` omp
-// starts and whose tools omp serves. omp runs task subagents in-process on
-// the main session's MCP connections, so each live subagent's copy of the
-// adapter sees every channel notification too (#526). A peer's DM during two
-// subagents' runs, and another after they finish, each reach main once and no
-// subagent.
+// Local mode, as `grayboard setup` leaves omp: the adapter
+// (adapterSource("omp")) at <agentDir>/extensions/grayboard.ts and the
+// disabled grayboard entry in <agentDir>/mcp.json it reads its command from;
+// omp's own MCP client runs no grayboard (#523).
+function installLocal(dir: string, modelPort: number): void {
+  const agentDir = agentDirOf(dir);
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  writeFileSync(join(agentDir, "extensions", "grayboard.ts"), SOURCE);
+  writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({
+    mcpServers: { grayboard: { command: process.execPath, args: [CLI, "mcp", "--mode", "local"], env: { BUS_PUSH: "off" }, enabled: false } },
+  }));
+  writeConfig(agentDir, modelPort, {});
+}
+
+// `identity`: the BUS_IDENTITY it runs with; null runs without one.
+function startLocalOmp(dir: string, cwd: string, procs: ChildProcess[], identity: string | null = "omp-local"): Pi {
+  const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, "--no-session"], {
+    cwd, env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDirOf(dir) }), stdio: ["pipe", "pipe", "pipe"],
+  });
+  procs.push(proc);
+  return new Pi(proc);
+}
+
+function localRows<T>(dir: string, sql: string, ...args: string[]): T[] {
+  using db = new Database(join(dir, "bus.db"), { readonly: true });
+  return db.query<T, string[]>(sql).all(...args);
+}
+
+// A local task run (#523, #526). omp runs task subagents in-process, each
+// with its own copy of the adapter, which sends its calls to main's one
+// grayboard process naming the subagent's omp session. Each subagent's DM is
+// stored and pushed as main's name with its child ID as via, its bind is
+// refused, and each is audited once as a child of main's session, which ends
+// them when it ends. A peer's DM during the run, and another after it, each
+// reach main once and no subagent. A repo .mcp.json's enabled grayboard entry
+// is shadowed by the disabled user entry, so omp doesn't run it and the
+// adapter serves.
 export function ompLocalTaskScenario(dir: string): Promise<void> {
   const gate = join(dir, "go");
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
-      ...taskFanout(2, /^fan out$/, () => [{ tool: "bash", args: { command: `while [ ! -f ${gate} ]; do sleep 0.1; done` } }]),
+      ...taskFanout(2, /^fan out$/, (i) => [
+        { tool: `${PREFIX}dm_send`, args: { to: "peer", body: `child ${i}` } },
+        { tool: `${PREFIX}bind`, args: { name: `omp-sub-${i}`, create: true } },
+        { tool: "bash", args: { command: `while [ ! -f ${gate} ]; do sleep 0.1; done` } },
+      ]),
       onChannelDm("peer", (id) => ({ tool: `${PREFIX}dm_send`, args: { to: "peer", body: "pong", parent_id: id } })),
     ]);
     let peer: Session | undefined;
     try {
-      const agentDir = agentDirOf(dir);
-      mkdirSync(join(agentDir, "extensions"), { recursive: true });
-      writeFileSync(join(agentDir, "extensions", "grayboard.ts"), SOURCE);
-      writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: process.execPath, args: [CLI, "mcp", "--mode", "local"] } } }));
-      writeConfig(agentDir, model.port, {});
+      installLocal(dir, model.port);
+      // No grayboard runs at this command: were the entry not shadowed, omp would try it.
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: join(dir, "missing", "grayboard"), args: ["mcp"] } } }));
       peer = await localSession(dir, "peer");
-      const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, "--no-session"], {
-        cwd: dir, env: localEnv(dir, "omp-local", { PI_CODING_AGENT_DIR: agentDir }), stdio: ["pipe", "pipe", "pipe"],
-      });
-      procs.push(proc);
-      const omp = new Pi(proc);
-      await omp.command({ type: "get_state" }, 30_000);
-      await until(async () => (await peer.call("peer_list")).peers.some((x: any) => x.handle === "omp-local"), 30_000, "omp-local online");
+      const omp = startLocalOmp(dir, dir, procs);
+      const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
+      await until(async () => (await peer!.call("peer_list")).peers.some((x: { handle: string }) => x.handle === "omp-local"), 30_000, "omp-local online");
+      const root = localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-local'")[0]!.id;
+      // One grayboard process, the adapter's, and no refusal.
+      expect(grayboardDescendants(omp.pid)).toHaveLength(1);
+      expect(omp.notices().filter((n) => n.startsWith("grayboard:"))).toEqual([]);
 
-      // The first DM is sent while both subagents are held at the gate; the
-      // gate opens without waiting for it, so it lands mid-run or after.
+      // Both subagents send and try to bind before the gate holds them.
       await omp.command({ type: "prompt", message: "fan out" });
-      await until(() => new Set(model.requests.filter((r) => fromChild(r.body)).map((r) => childOf(r.body))).size === 2, 60_000, "both subagents running");
+      const refused = `error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`;
+      const sawRefusal = (r: ChatRequest) => r.messages.some((m) => m.role === "tool" && messageText(m).includes(refused));
+      await until(() => new Set(model.requests.filter((r) => fromChild(r.body) && sawRefusal(r.body)).map((r) => childOf(r.body))).size === 2, 60_000, "both subagents' binds refused");
+      expect(localRows(dir, "SELECT address FROM alias_holds WHERE address LIKE 'omp-sub-%'")).toEqual([]);
+
+      // Each subagent is its own child of main's session, seen once.
+      const seen = localRows<{ actor: string; target: string; detail: string }>(dir, "SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen' ORDER BY rowid")
+        .map((r) => ({ ...r, detail: JSON.parse(r.detail) as { child: string; root: string; raw: string } }));
+      const children = seen.map((s) => s.detail.child);
+      expect(seen.map((s) => [s.actor, s.target, s.detail.root])).toEqual(children.map((c) => [root, c, root]));
+      expect(new Set(children).size).toBe(2);
+      // Named by its own omp session, not main's.
+      expect(new Set(seen.map((s) => s.detail.raw)).size).toBe(2);
+      expect(seen.map((s) => s.detail.raw)).not.toContain(sessionId);
+
+      // Each DM went as main's name, stored with the child's ID as sender_id and via, and shown as via.
+      await until(() => peer!.pushes.filter((p) => /^child \d$/.test(p.content)).length === 2, 30_000, "both subagents' DMs at peer");
+      const dms = localRows<{ body: string; sender: string; sender_id: string; via: string | null }>(dir, "SELECT body, sender, sender_id, via FROM messages WHERE body LIKE 'child %' ORDER BY body");
+      expect(dms.map((m) => [m.body, m.sender])).toEqual([["child 0", "omp-local"], ["child 1", "omp-local"]]);
+      for (const m of dms) expect(m.via).toBe(m.sender_id);
+      expect(dms.map((m) => m.sender_id).sort()).toEqual([...children].sort());
+      for (const m of dms) expect(peer.pushes.find((p) => p.content === m.body)!.meta).toMatchObject({ from: "omp-local", via: m.via });
+      const history = (await peer.call("dm_history", { peer: "omp-local" })) as { body: string; via?: string }[];
+      expect(history.filter((m) => m.body.startsWith("child ")).map((m) => [m.body, m.via]).sort()).toEqual(dms.map((m) => [m.body, m.via]));
+
+      // Only main's requests carry grayboard's instructions.
+      const instructed = (r: ChatRequest) => promptOf(r).split(`You are identity "omp-local" on the grayboard bus`).length - 1;
+      expect(model.requests.filter((r) => !fromChild(r.body)).map((r) => instructed(r.body))).toEqual(model.requests.filter((r) => !fromChild(r.body)).map(() => 1));
+      expect(model.requests.filter((r) => fromChild(r.body)).map((r) => instructed(r.body))).toEqual(model.requests.filter((r) => fromChild(r.body)).map(() => 0));
+
+      // The first ping lands while both subagents are held at the gate; the
+      // gate opens without waiting for it, so it lands mid-run or after.
       const pings: number[] = [];
       const pongs = () => peer!.pushes.filter((x) => x.content.includes("pong")).length;
       pings.push((await peer.call("dm_send", { to: "omp-local", body: "ping" })).message_id);
@@ -402,14 +463,96 @@ export function ompLocalTaskScenario(dir: string): Promise<void> {
         expect(model.requests.filter((r) => fromChild(r.body) && carries(r.body)).map((r) => childOf(r.body))).toEqual([]);
         expect(model.requests.filter((r) => !fromChild(r.body) && carries(r.body)).length).toBeGreaterThan(0);
         expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
-        expect((await peer.call("dm_thread", { thread: ping })).map((m: any) => [m.sender, m.body])).toEqual([["peer", "ping"], ["omp-local", "pong"]]);
+        expect((await peer.call("dm_thread", { thread: ping })).map((m: { sender: string; body: string }) => [m.sender, m.body])).toEqual([["peer", "ping"], ["omp-local", "pong"]]);
       }
       expect(model.unhandled).toEqual([]);
       expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
       await omp.quit();
+      // Quitting ends main's session, and its children with it.
+      await until(() => localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id IN (?, ?, ?)", root, ...children).every((r) => r.ended_at !== null), 10_000, "main's session and its children ended");
     } finally {
       await stopAll(procs);
       if (peer) await stopSession(peer.c);
+      model.stop();
+    }
+  });
+}
+
+// An enabled MCP server that runs `grayboard mcp` would be a second grayboard
+// beside the adapter's: a repo's .omp/mcp.json entry under the same name (it
+// outranks the disabled user entry), or a repo's .mcp.json entry under another
+// name. Either way the adapter says why, registers no tools and starts no
+// grayboard process. No grayboard runs at either command, so omp's own client
+// starts none either.
+export function ompLocalRefusalScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([]);
+    try {
+      installLocal(dir, model.port);
+      const command = join(dir, "missing", "grayboard");
+      // Both pin a name; only the repo's .omp/mcp.json grayboard entry's pin is read under omp, so only its notice says the pin survives disabling.
+      for (const c of [{ repo: "same-name", file: [".omp", "mcp.json"], name: "grayboard", keeps: ` (disabled, its BUS_IDENTITY "fe" still pins this session's name)` }, { repo: "other-name", file: [".mcp.json"], name: "bus", keeps: "" }]) {
+        const cwd = join(dir, c.repo);
+        mkdirSync(join(cwd, ...c.file.slice(0, -1)), { recursive: true });
+        writeFileSync(join(cwd, ...c.file), JSON.stringify({ mcpServers: { [c.name]: { command, args: ["mcp", "--mode", "local"], env: { BUS_IDENTITY: "fe" } } } }));
+        const omp = startLocalOmp(dir, cwd, procs);
+        await omp.command({ type: "get_state" }, 30_000);
+        const notice = await until(() => omp.notices().find((n) => n.startsWith("grayboard:")), 30_000, `the ${c.repo} refusal`);
+        expect(notice).toMatch(new RegExp(`^grayboard: the "${c.name}" MCP server in \\S*/${RegExp.escape(c.file.join("/"))} runs \`grayboard mcp\` and is enabled, so omp would run a second grayboard beside this extension's\\. Set "enabled": false on it${RegExp.escape(c.keeps)} or remove it`));
+        const before = model.requests.length;
+        await omp.command({ type: "prompt", message: "hello" });
+        await idle(omp);
+        const req = model.requests[before]!.body;
+        expect(requestTools(req).filter((n) => n.startsWith(PREFIX))).toEqual([]);
+        expect(promptOf(req)).not.toContain("grayboard bus");
+        expect(grayboardDescendants(omp.pid)).toEqual([]);
+        expect(omp.notices().filter((n) => n.startsWith("grayboard:"))).toEqual([notice]);
+        expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+        await omp.quit();
+      }
+      expect(model.unhandled).toEqual([]);
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
+// A repo's disabled .omp/mcp.json grayboard entry still names its omp
+// sessions (#523): the adapter runs grayboard with BUS_HARNESS=omp, so a
+// session with no BUS_IDENTITY suggests the entry's pin, not the directory
+// name, and binds it. No grayboard runs at the entry's command: omp's client
+// doesn't run a disabled entry.
+export function ompLocalPinScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "fe", create: true } }])]);
+    try {
+      installLocal(dir, model.port);
+      const cwd = join(dir, "repo");
+      mkdirSync(join(cwd, ".omp"), { recursive: true });
+      writeFileSync(join(cwd, ".omp", "mcp.json"), JSON.stringify({
+        mcpServers: { grayboard: { command: join(dir, "missing", "grayboard"), args: ["mcp"], enabled: false, env: { BUS_IDENTITY: "fe" } } },
+      }));
+      const omp = startLocalOmp(dir, cwd, procs, null);
+      await omp.command({ type: "get_state" }, 30_000);
+      const before = model.requests.length;
+      await omp.command({ type: "prompt", message: "bind" });
+      await idle(omp);
+      const first = promptOf(model.requests[before]!.body);
+      expect(first).toContain("This session has no bus name yet");
+      expect(first).toContain("Candidates (free now): fe (this checkout's default: ");
+      expect(first).not.toContain("repo (this checkout's default: ");
+      expect(localRows<{ address: string }>(dir, "SELECT address FROM alias_holds").map((r) => r.address)).toEqual(["fe"]);
+      expect(resultText(await toolResult(omp, "bind"))).not.toContain("error");
+      expect(grayboardDescendants(omp.pid)).toHaveLength(1);
+      expect(omp.notices().filter((n) => n.startsWith("grayboard:"))).toEqual([]);
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
       model.stop();
     }
   });

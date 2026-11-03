@@ -48,10 +48,11 @@ const PI_DIR  = piAgentDir();
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
-// The opencode and local pi adapters serve grayboard's tools themselves and
-// read their command from the harness's grayboard MCP entry, so that entry is
-// kept disabled (else the harness registers the tools twice), with
-// BUS_PUSH=off so a re-enabled one never adds a second delivery owner.
+// The opencode and local pi and omp adapters serve grayboard's tools
+// themselves and read their command from the harness's grayboard MCP entry,
+// so that entry is kept disabled (else the harness registers the tools
+// twice), with BUS_PUSH=off so a re-enabled one never adds a second delivery
+// owner.
 type Entry = Record<string, unknown>;
 // `local`: the entry as local mode keeps it.
 type HarnessConfig = { path: string; section: "mcp" | "mcpServers"; local: (e: Entry) => Entry };
@@ -66,11 +67,13 @@ const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts"), source: adapte
 // pi and omp have two adapters each, one per mode. Server: the hosted
 // extension (`.js`, a bundle of adapters/pi-family) talks to the server's
 // /mcp itself, holds the delivery lease, and reads only
-// `<agentDir>/grayboard/config.json {url}`; it needs no entry. Local: pi's
-// child adapter (`.ts`) runs a push-mode `grayboard mcp` and reads its
-// command from the disabled entry; omp's relay (`.ts`) wakes the session for
-// the grayboard process omp starts from its enabled entry, whose tools omp
-// serves. Installing one variant removes the other.
+// `<agentDir>/grayboard/config.json {url}`; it needs no entry. Local: the
+// adapter (`.ts`) runs a push-mode `grayboard mcp`, serves its tools and
+// delivers its pushes, reading its command from the disabled user entry; omp's
+// also runs each in-process subagent's calls as a child session (#523).
+// Installing one variant removes the other. In omp the disabled user entry
+// still shadows a repo's same-named .mcp.json entry, so it carries no
+// BUS_IDENTITY: grayboard reads the repo's pin itself.
 type PiFamily = {
   name: "pi" | "omp";
   clientId: string;
@@ -81,32 +84,16 @@ type PiFamily = {
   hostedConfig: string;
   source: string;
   bundle: string;
-  // The local adapter reads its command from the entry, so a refresh
-  // recreates a missing one; else a refresh leaves a removed entry removed.
-  needsEntry: boolean;
-  registered: (path: string) => string;  // the note for a written local entry
-  reshaped?: (path: string) => string;   // the note for an existing entry `config.local` changed
 };
-const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | "bundle" | "needsEntry" | "registered" | "reshaped"> & { local: (e: Entry) => Entry }): PiFamily => ({
-  name, clientId: `grayboard-${name}`, config: { path: join(dir, "mcp.json"), section: "mcpServers", local: f.local }, stateDir: join(dir, "grayboard"),
+const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | "bundle">): PiFamily => ({
+  name, clientId: `grayboard-${name}`, stateDir: join(dir, "grayboard"),
+  // `exposure` is pi's, for its own MCP client, which doesn't run the entry.
+  config: { path: join(dir, "mcp.json"), section: "mcpServers", local: ({ exposure: _, ...e }) => ({ ...e, enabled: false, env: pushOff(e, "env") }) },
   local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), hostedConfig: hostedConfigPath(join(dir, "grayboard")),
-  source: f.source, bundle: f.bundle, needsEntry: f.needsEntry, registered: f.registered, ...(f.reshaped ? { reshaped: f.reshaped } : {}),
+  source: f.source, bundle: f.bundle,
 });
-const PI = piFamily("pi", PI_DIR, {
-  source: adapterSource("pi"), bundle: adapterBundle("pi"), needsEntry: true,
-  local: ({ exposure: _, ...e }) => ({ ...e, enabled: false, env: pushOff(e, "env") }),
-  registered: path => `Registered in ${path} (disabled: the extension serves the tools)`,
-  reshaped: path => `Disabled the grayboard entry in ${path} (the adapter serves the tools)`,
-});
-// omp serves the entry's tools itself (its MCP client keeps notifications),
-// so the local entry stays as written, and a user who moved it (a repo's
-// .mcp.json) keeps it there. The user entry outranks a repo's .mcp.json in
-// omp, so it carries no BUS_IDENTITY; grayboard reads the repo's pin itself.
-const OMP = piFamily("omp", OMP_DIR, {
-  source: adapterSource("omp"), bundle: adapterBundle("omp"), needsEntry: false,
-  local: e => e,
-  registered: path => `Registered in ${path}`,
-});
+const PI = piFamily("pi", PI_DIR, { source: adapterSource("pi"), bundle: adapterBundle("pi") });
+const OMP = piFamily("omp", OMP_DIR, { source: adapterSource("omp"), bundle: adapterBundle("omp") });
 
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
@@ -148,13 +135,12 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     notes.push(`Wrote ${h.hostedConfig}`);
     return { adapter: h.hosted, notes };
   }
-  // pi's local adapter needs the entry, so one that's missing (a server-mode
-  // install removed it, or the user did) is recreated with this binary's
-  // command; omp's is recreated only when leaving a hosted install.
-  const next = entry ?? (existing || !(h.needsEntry || typeof old === "string") ? undefined : mcpCommand());
+  // The local adapter reads its command from the entry, so one that's missing
+  // (a server-mode install removed it, or the user did) is recreated with
+  // this binary's command.
+  const next = entry ?? (existing ? undefined : mcpCommand());
   if (putEntry(h.config, next)) {
-    const note = next ? h.registered : h.reshaped;
-    if (note) notes.push(note(h.config.path));
+    notes.push(next ? `Registered in ${h.config.path} (disabled: the extension serves the tools)` : `Disabled the grayboard entry in ${h.config.path} (the adapter serves the tools)`);
   }
   writeAdapter(h.local, h.source);
   rmSync(h.hosted, { force: true });
