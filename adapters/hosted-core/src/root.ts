@@ -28,7 +28,9 @@ export type RootOptions = {
   carried?: string[];               // a /new or /fork's carried holds (pi/omp), taken by the first start that binds them
   // An explicit BUS_IDENTITY (normalized, #443): a session with nothing to
   // take back (no remembered or carried names) binds it at its first start,
-  // creating it if new, as local mode does. Tried once the server answers.
+  // creating it if new, as local mode does. Done once it binds or the server
+  // refuses it; unreachable or signed out, a later start (tools-only: a later
+  // call) tries again.
   configured?: string;
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
@@ -165,33 +167,41 @@ export class RootDelivery {
   private listed(tools: NativeTool[]) { if (!this.closed) this.o.onTools(tools); }
 
   // Tools-only by the host's choice (no delivery for anyone to hold): the
-  // configured name binds through this process's own connection, at start
-  // and again after a sign-in if a signed-out start couldn't. Never rejects.
-  private bindingConfigured = false;
-  private async bindConfigured(): Promise<void> {
-    const name = this.configuring;
-    if (!name || !this.proxy || this.closed || this.bindingConfigured) return;
-    this.bindingConfigured = true;
+  // configured name binds through this process's own connection, at start,
+  // after a sign-in, and before the agent's next call while an unreachable
+  // try left it unbound. Bound or refused (REFUSED): done. One try at a time;
+  // a call waits for it, so the agent's own bind lands after it. Never rejects.
+  private bindingConfigured: Promise<void> | undefined;
+  private bindConfigured(): Promise<void> {
+    if (!this.configuring || !this.proxy || this.closed) return Promise.resolve();
+    return this.bindingConfigured ??= this.tryConfigured(this.configuring, this.proxy).finally(() => { this.bindingConfigured = undefined; });
+  }
+  private async tryConfigured(name: string, proxy: ToolProxy): Promise<void> {
     try {
       // Signed out: the sign-in's change binds it; the proxy would only answer "sign in".
       try { await this.client.login.token(); }
       catch (error) { if (accessExpiry(error)) return; throw error; }
       if (this.closed) return;
       this.used = true;
-      this.configuring = undefined;
-      const result = await this.client.call(this.proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
-      if (result.isError) {
-        const output = outputOf(result) as { message?: unknown } | string | undefined;
-        this.configuredMissed(name, typeof output === "object" && typeof output?.message === "string" ? output.message : String(output ?? "no reason given"));
-      }
-    } catch (error) {
+      const result = await this.client.call(proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
       if (this.closed) return;
-      this.configuring = undefined;
-      this.configuredMissed(name, message(error));
-    } finally { this.bindingConfigured = false; }
+      if (!result.isError) { this.configuring = undefined; return; }
+      const output = outputOf(result) as { code?: unknown; message?: unknown } | string | undefined;
+      const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
+      const why = typeof output === "object" ? (typeof output?.message === "string" ? output.message : "no reason given") : String(output ?? "no reason given").replace(/^error: /, "");
+      if (code && REFUSED.has(code)) this.configuring = undefined;
+      this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
+    } catch (error) {
+      if (!this.closed) this.configuredMissed(name, message(error), false);
+    }
   }
-  private configuredMissed(name: string, why: string) {
-    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it started unbound`;
+  // Said once per distinct outcome: an unreachable server retried before
+  // every call would otherwise repeat the same line on each.
+  private configuredSaid: string | undefined;
+  private configuredMissed(name: string, why: string, final: boolean) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it ${final ? "started unbound" : "is unbound until a later try binds it"}`;
+    if (text === this.configuredSaid) return;
+    this.configuredSaid = text;
     this.notices.set("start", text);
     this.log(text, "warning");
   }
@@ -265,7 +275,11 @@ export class RootDelivery {
       // Taking back what this session held, or a /new's carried names, comes
       // before BUS_IDENTITY, as a local restart's names do (#443).
       const remembered = carried ? undefined : await controller.carried(id);
-      const configured = !carried && !remembered ? this.configuring : undefined;
+      // Only a session with nothing to take back binds it, and only until it
+      // first lands: a later restart (a sign-in, an unpause) after the agent
+      // unbound never brings it back.
+      if (carried || remembered) this.configuring = undefined;
+      const configured = this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false)
         : configured ? await controller.enroll(id, [configured], true)
@@ -373,6 +387,8 @@ export class RootDelivery {
     const after = before ? await before() : undefined;
     const late = refused();
     if (late) return late;
+    // Tools-only: a configured name not yet bound goes first (#443).
+    if (!this.o.push) await this.bindConfigured();
     this.used = true;
     const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
     const shown = [...SLOTS.map(slot => this.notices.get(slot)), after].filter((n): n is string => !!n);

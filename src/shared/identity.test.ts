@@ -85,6 +85,10 @@ describe("configuredIdentity (#443: a hosted adapter's start bind)", () => {
     expect(configuredIdentity({ BUS_IDENTITY: "Sim" }, at("repo", ".wt", "stream"))).toEqual({ name: "sim" });
     expect(configuredIdentity({ BUS_IDENTITY: "no spaces" }, at("repo"))).toEqual({ error: expect.stringContaining("invalid identity name") });
   });
+  test("a server name may carry a scope (#543 audit 2)", () => {
+    expect(configuredIdentity({ BUS_IDENTITY: "Eng/Deploy" }, at("repo"))).toEqual({ name: "eng/deploy" });
+    expect(configuredIdentity({ BUS_IDENTITY: "you@example.com/sim" }, at("repo"))).toEqual({ name: "you@example.com/sim" });
+  });
 });
 
 describe("sessionIdentity", () => {

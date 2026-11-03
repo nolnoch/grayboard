@@ -127,9 +127,6 @@ export function createGrayboard(h: Harness): Grayboard {
   // The bind's `where` (peer_list, a name refusal's holder text): this
   // process's checkout, as server mode's `grayboard mcp` sent it.
   const place = describeLocation(process.cwd()) ?? h.name;
-  // An explicit BUS_IDENTITY: each new root binds it at its first start (#443).
-  const configured = configuredIdentity(process.env, process.cwd());
-  if (configured && "error" in configured) log(`BUS_IDENTITY is ignored: ${configured.error}`, "warning");
 
   let closed = false;                 // shutdown began
   let done = false;                   // shutdown finished
@@ -146,6 +143,9 @@ export function createGrayboard(h: Harness): Grayboard {
   let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this (non-root) session's id
   const inflight = new Set<Promise<CallToolResult>>(); // calls running now, which an idle end lands after
+  // An explicit BUS_IDENTITY: each new root binds it at its first start (#443),
+  // which also says one the naming rule refuses (the host has no UI at load).
+  const configured = configuredIdentity(process.env, process.cwd());
 
   const login = "url" in config ? new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
@@ -285,6 +285,7 @@ export function createGrayboard(h: Harness): Grayboard {
     const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
     const id = s.id;
+    if (configured && "error" in configured) log(`BUS_IDENTITY is ignored: ${configured.error}`, "warning");
     root = new RootDelivery(client!, {
       sessionID: id, stateDir, place: () => place, push: true, ...(carried ? { carried } : {}), ...(configured && "name" in configured ? { configured: configured.name } : {}),
       // Idempotent per stableID across this root's runtimes: a /reload keeps

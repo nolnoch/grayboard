@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { normalizeIdentityName } from "./addressing.ts";
+import { normalizeAliasName } from "../core/addresses.ts";
 
 const MAX_LEN = 32;
 
@@ -179,13 +179,14 @@ export function sessionIdentity(env = process.env, cwd = process.cwd()): string 
 
 /**
  * The name a hosted adapter binds at start (#443): an explicit BUS_IDENTITY,
- * normalized as local startup does. Nothing without one (a pin echo counts as
- * none); an error for a value the naming rule refuses.
+ * normalized as a server bind is (a bare name or `scope/name`). Nothing
+ * without one (a pin echo counts as none); an error for a value the naming
+ * rule refuses.
  */
 export function configuredIdentity(env: Record<string, string | undefined> = process.env, cwd = process.cwd()): { name: string } | { error: string } | undefined {
   try {
     if (!isExplicitIdentity(env, cwd)) return undefined;
-    const n = normalizeIdentityName(sessionIdentity(env, cwd));
+    const n = normalizeAliasName(sessionIdentity(env, cwd));
     return n.ok ? { name: n.name } : { error: n.error };
   } catch (e) { return { error: (e as Error).message }; }
 }

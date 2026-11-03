@@ -34708,12 +34708,11 @@ var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
 var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
 var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
 var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
-function normalizeIdentityName(raw) {
-  const name = raw.toLowerCase();
-  if (!NAME_RE.test(name)) {
-    return { ok: false, error: `invalid identity name "${raw}": after lowercasing, must be 1-32 chars of a-z 0-9 _ -` };
-  }
-  return { ok: true, name };
+function isValidEmail(email) {
+  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
+}
+function isValidIdentityName(name) {
+  return NAME_RE.test(name.toLowerCase());
 }
 var HUMAN_NAME = "human";
 var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
@@ -36954,12 +36953,15 @@ class RootDelivery {
     if (!this.closed)
       this.o.onTools(tools);
   }
-  bindingConfigured = false;
-  async bindConfigured() {
-    const name = this.configuring;
-    if (!name || !this.proxy || this.closed || this.bindingConfigured)
-      return;
-    this.bindingConfigured = true;
+  bindingConfigured;
+  bindConfigured() {
+    if (!this.configuring || !this.proxy || this.closed)
+      return Promise.resolve();
+    return this.bindingConfigured ??= this.tryConfigured(this.configuring, this.proxy).finally(() => {
+      this.bindingConfigured = undefined;
+    });
+  }
+  async tryConfigured(name, proxy) {
     try {
       try {
         await this.client.login.token();
@@ -36971,23 +36973,30 @@ class RootDelivery {
       if (this.closed)
         return;
       this.used = true;
-      this.configuring = undefined;
-      const result = await this.client.call(this.proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
-      if (result.isError) {
-        const output = outputOf(result);
-        this.configuredMissed(name, typeof output === "object" && typeof output?.message === "string" ? output.message : String(output ?? "no reason given"));
-      }
-    } catch (error) {
+      const result = await this.client.call(proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
       if (this.closed)
         return;
-      this.configuring = undefined;
-      this.configuredMissed(name, message(error));
-    } finally {
-      this.bindingConfigured = false;
+      if (!result.isError) {
+        this.configuring = undefined;
+        return;
+      }
+      const output = outputOf(result);
+      const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
+      const why = typeof output === "object" ? typeof output?.message === "string" ? output.message : "no reason given" : String(output ?? "no reason given").replace(/^error: /, "");
+      if (code && REFUSED.has(code))
+        this.configuring = undefined;
+      this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
+    } catch (error) {
+      if (!this.closed)
+        this.configuredMissed(name, message(error), false);
     }
   }
-  configuredMissed(name, why) {
-    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it started unbound`;
+  configuredSaid;
+  configuredMissed(name, why, final) {
+    const text = `BUS_IDENTITY asked for "${name}", but this session couldn't bind it (${why}); it ${final ? "started unbound" : "is unbound until a later try binds it"}`;
+    if (text === this.configuredSaid)
+      return;
+    this.configuredSaid = text;
     this.notices.set("start", text);
     this.log(text, "warning");
   }
@@ -37060,7 +37069,9 @@ class RootDelivery {
     try {
       this.begun = await this.epoch();
       const remembered = carried ? undefined : await controller.carried(id);
-      const configured = !carried && !remembered ? this.configuring : undefined;
+      if (carried || remembered)
+        this.configuring = undefined;
+      const configured = this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false) : configured ? await controller.enroll(id, [configured], true) : await controller.resume(id);
       if (this.closed)
@@ -37162,6 +37173,8 @@ ${record.message}`;
     const late = refused();
     if (late)
       return late;
+    if (!this.o.push)
+      await this.bindConfigured();
     this.used = true;
     const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
     const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);
@@ -37227,6 +37240,40 @@ ${record.message}`;
 // src/shared/identity.ts
 import { existsSync, readFileSync as readFileSync3, statSync as statSync2 } from "fs";
 import { basename as basename2, dirname as dirname3, join as join5, resolve as resolve3 } from "path";
+
+// src/core/session_id.ts
+var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+var SESSION_ID_PATTERN = `id:[${CROCKFORD}]{13}`;
+var SESSION_ID = new RegExp(`^${SESSION_ID_PATTERN}$`);
+
+// src/core/addresses.ts
+function addressParts(input) {
+  const s = input.toLowerCase();
+  if (SESSION_ID.test(s))
+    return { kind: "id", address: s };
+  if (s.startsWith("team:")) {
+    const name = s.slice(5);
+    return isValidIdentityName(name) ? { kind: "team", address: s, name } : null;
+  }
+  const slash = s.indexOf("/");
+  if (slash === -1)
+    return isValidIdentityName(s) ? { kind: "bare", address: s, name: s } : null;
+  const scope = s.slice(0, slash);
+  const name = s.slice(slash + 1);
+  if (!scope || !isValidIdentityName(name))
+    return null;
+  if (isValidEmail(scope))
+    return { kind: "alias", address: s, scope, scopeKind: "person", name };
+  return scope.includes("@") ? null : { kind: "alias", address: s, scope, scopeKind: "principal", name };
+}
+function normalizeAliasName(raw) {
+  const p = addressParts(raw);
+  if (p?.kind === "bare" || p?.kind === "alias")
+    return { ok: true, name: p.address };
+  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+}
+
+// src/shared/identity.ts
 var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname3(dir)) {
@@ -37332,7 +37379,7 @@ function configuredIdentity(env = process.env, cwd = process.cwd()) {
   try {
     if (!isExplicitIdentity(env, cwd))
       return;
-    const n = normalizeIdentityName(sessionIdentity(env, cwd));
+    const n = normalizeAliasName(sessionIdentity(env, cwd));
     return n.ok ? { name: n.name } : { error: n.error };
   } catch (e) {
     return { error: e.message };

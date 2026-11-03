@@ -16,7 +16,7 @@ import { HostedClient, type Level } from "../../adapters/hosted-core/src/client.
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { DeliveryHeldElsewhere, Refusal, type Item } from "../../adapters/hosted-core/src/model.ts";
-import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
+import { failure, ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { RootDelivery, type RootOptions } from "../../adapters/hosted-core/src/root.ts";
 import { deliveryPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -256,6 +256,24 @@ test("a tools-only root (push off) binds its configured name through its own con
   await until(() => held.logs.length > 0, 10_000, "tools-only refusal said");
   expect(held.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
   expect(texts(await held.root.call("whoami"))[0]).toMatch(/^grayboard: BUS_IDENTITY asked for "conf-tools-held"/);
+});
+
+test("a tools-only configured bind the server couldn't be reached for is said once and tried again before the agent's next call, ahead of its own bind (#543 audit 4)", async () => {
+  const r = rig("conf-tools-retry", { configured: "conf-retry", push: false });
+  // The first bind fails as an unreachable server's does: client.call turns the throw into a failure result.
+  const real = r.client.call.bind(r.client);
+  let down = true;
+  r.client.call = async (proxy, tool, args, sessionID) => tool === "bind" && down ? failure("couldn't reach the grayboard server") : real(proxy, tool, args, sessionID);
+  await r.root.start();
+  await until(() => r.logs.length > 0, 10_000, "the unreachable try said");
+  expect(r.logs).toEqual([{ level: "warning", message: `BUS_IDENTITY asked for "conf-retry", but this session couldn't bind it (couldn't reach the grayboard server); it is unbound until a later try binds it` }]);
+  expect(row("conf-tools-retry")?.name ?? null).toBeNull();
+
+  down = false;
+  await r.root.call("bind", { name: "conf-own", create: true });
+  const held = srv.app.db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at").all(hostedSessionId(user, CLIENT, "conf-tools-retry"));
+  expect(held.map(h => h.address)).toEqual([`${EMAIL}/conf-retry`, `${EMAIL}/conf-own`]);
+  expect(r.logs).toHaveLength(1);
 });
 
 test("detach keeps the lease and name for the next runtime; release ends the session", async () => {

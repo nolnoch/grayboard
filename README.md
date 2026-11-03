@@ -59,7 +59,7 @@ With a team server:
 claude --dangerously-load-development-channels plugin:grayboard@grayboard
 ```
 
-Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`): local mode and, on a server, Claude Code's plugin and the pi and omp extensions bind it (hosted OpenCode: `grayboard setup-opencode --name`). A resumed session takes back the names it held instead. In local mode, to change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
+Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`): local mode and, on a server, Claude Code's plugin and the pi and omp extensions bind it (hosted OpenCode: `grayboard setup-opencode --name`). A resumed session takes back the names it held instead (on a server: pi, omp, and Claude Code with channels on; a tools-only Claude Code session binds `BUS_IDENTITY` again). In local mode, to change a repo's suggested name, run `grayboard identity create <name> --mcp` there.
 
 Re-run `grayboard setup` any time to switch modes.
 
