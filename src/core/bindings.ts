@@ -527,13 +527,16 @@ export function bindOk(name: string, held: string[], instructions: (general: boo
  * unbind's result (#284 S2), built like bindOk's: the release, the claims
  * that stay with the alias, the new primary when it changed, then the
  * instructions for the session as it is now (its new primary's, or its ID's
- * with the unbound line). `structuredContent.name` is the primary now.
+ * with the unbound line). `structuredContent.name` is the primary now: null
+ * where an unbound session sends as nothing (hosted, #542), so an adapter
+ * forgets the hold instead of rebinding it on restart; local mode's unbound
+ * session sends as its ID and passes that.
  */
-export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string, left: string[], instructions: (general: boolean) => string[]) {
+export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string | null, left: string[], instructions: (general: boolean) => string[]) {
   const text = [
     `Released "${alias}"; mail to it queues for its next holder.`,
     ...leftNote(alias, left),
-    ...(primaryAfter !== primaryBefore ? [`You now send as "${primaryAfter}".`] : []),
+    ...(primaryAfter === null ? ["This session is now unbound."] : primaryAfter !== primaryBefore ? [`You now send as "${primaryAfter}".`] : []),
     ...instructions(false),
   ].join(" ");
   return { content: [{ type: "text" as const, text }], structuredContent: { name: primaryAfter, instructions: instructions(true) } };

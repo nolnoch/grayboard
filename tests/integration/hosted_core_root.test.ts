@@ -426,3 +426,18 @@ test("a shutdown while a start's push connection is still connecting releases th
     proxySpy.mockRestore();
   }
 });
+
+test("#542: unbinding the last name answers name null and says unbound; the Controller forgets the hold, so a resume stays unbound", async () => {
+  const a = await live("unbind-last", "x");
+  const result = await a.root.call("unbind", { name: "x" });
+  expect(result.isError, texts(result).join("\n")).toBeUndefined();
+  expect(result.structuredContent).toMatchObject({ name: null });
+  expect(texts(result).join("\n")).toContain("This session is now unbound.");
+  expect(texts(result).join("\n")).not.toContain("send as");
+  await until(() => record(a)?.state === "unbound" && !record(a)?.held?.length, 10_000, "the hold forgotten");
+  const before = record(a)!.time;
+  await a.root.resume();
+  await until(() => record(a)!.time > before && record(a)?.state === "unbound", 10_000, "resumed unbound");
+  expect(record(a)?.held ?? []).toEqual([]);
+  expect(row("unbind-last")).toMatchObject({ name: null });
+}, 30_000);
