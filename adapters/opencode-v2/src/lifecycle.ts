@@ -56,7 +56,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   noteModel(sessionID: string, model: { id: string; providerID: string; variant?: string | undefined } | undefined) {
     if (!model?.id || !model.providerID) return;
     this.facts.delete(sessionID);
-    this.facts.set(sessionID, { model: `${model.providerID}/${model.id}`, ...(model.variant ? { effort: model.variant } : {}) });
+    // No variant is the model's default: none, which clears the server's effort (#558).
+    this.facts.set(sessionID, { model: `${model.providerID}/${model.id}`, effort: model.variant || null });
     if (this.facts.size > FACTS_LIMIT) this.facts.delete(this.facts.keys().next().value!);
   }
   private namespace() { return this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_"); }

@@ -105,6 +105,10 @@ function putFact(dir, fact, value) {
   put(join(dir, fact), value);
 }
 var dropFact = (dir, fact) => rmSync(join(dir, fact), { force: true });
+function noFact(dir, fact) {
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  put(join(dir, fact), "");
+}
 function put(path, text) {
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, text, { mode: 384 });
@@ -150,7 +154,7 @@ function runHook(event, stdin, o) {
       if (o.hosted && content === ROOT) {
         const level = input.effort?.level;
         if (level === undefined)
-          dropFact(dir, "effort");
+          noFact(dir, "effort");
         else
           putFact(dir, "effort", level);
       }

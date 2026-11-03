@@ -46,7 +46,7 @@ export default function grayboard(pi: ExtensionAPI) {
       else console.error(message);
     },
     record: data => pi.appendEntry("grayboard-delivery", data),
-    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? { ...(ctx.model ? { model: modelName(ctx.model) } : {}), effort: pi.getThinkingLevel() } : undefined,
+    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? { model: ctx.model ? modelName(ctx.model) : null, effort: pi.getThinkingLevel() } : undefined,
   });
 
   pi.on("session_start", async (event, context) => {

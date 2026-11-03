@@ -31732,7 +31732,9 @@ class Connection {
     } catch {
       return {};
     }
-    return { ...typeof f?.model === "string" && f.model ? { [MODEL_META]: f.model } : {}, ...typeof f?.effort === "string" && f.effort ? { [EFFORT_META]: f.effort } : {} };
+    const wire = (v) => v === null ? "" : typeof v === "string" && v ? v : undefined;
+    const model = wire(f?.model), effort = wire(f?.effort);
+    return { ...model === undefined ? {} : { [MODEL_META]: model }, ...effort === undefined ? {} : { [EFFORT_META]: effort } };
   }
   async reachable(pending) {
     try {
@@ -37468,7 +37470,9 @@ function readFacts(base, claudePid, harnessStart, bad) {
         bad(fact, `couldn't read ${join5(dir, fact)}: ${e.message}`);
       continue;
     }
-    if (validFact(value))
+    if (value === "")
+      out[fact] = null;
+    else if (validFact(value))
       out[fact] = value;
     else
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);

@@ -91,7 +91,7 @@ test("a root's later subscriber request declares the launcher its native first r
 // throws or answers nothing sends no keys, which never clears what the server holds.
 test("each request carries its session's current model and effort, and a provider that fails sends none (#364)", async () => {
   const token = issue();
-  const facts = new Map<string, { model?: string; effort?: string }>([["raw-a", { model: "anthropic/claude-opus-5-5", effort: "high" }], ["raw-b", { model: "openai/gpt-6" }]]);
+  const facts = new Map<string, { model?: string | null; effort?: string | null }>([["raw-a", { model: "anthropic/claude-opus-5-5", effort: "high" }], ["raw-b", { model: "openai/gpt-6" }]]);
   let broken = false;
   const native = new NativeWire({ ...options(), facts: id => { if (broken) throw new Error("gone"); return facts.get(id); } }, { token: async () => token }, new AbortController().signal);
   wires.push(native);
@@ -121,4 +121,11 @@ test("each request carries its session's current model and effort, and a provide
   await wire.connect();
   await wire.call("whoami");
   expect(await row("b")).toEqual({ model: "openai/gpt-6", effort: "low" });
+  // A provider's null is "none": it clears the server's (#558), on either wire; absent keeps it.
+  facts.set("raw-b", { model: "openai/gpt-6", effort: null });
+  await wire.call("whoami");
+  expect(await row("b")).toEqual({ model: "openai/gpt-6", effort: null });
+  facts.set("raw-a", { model: null });
+  await native.callTool("whoami", {}, "raw-a");
+  expect(await row("a")).toEqual({ model: null, effort: "high" });
 });

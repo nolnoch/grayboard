@@ -15,7 +15,8 @@ import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-
 import { writeAudit } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
-// `facts`: the model and effort the request reports (#364); present only, never a clearing.
+// `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
+// an empty string clears it (#558).
 export type SessionFacts = { model?: string; effort?: string };
 // `suggested`: the name the request's checkout suggests (#443), normalized.
 // `launcher`: the request declares its harness can spawn subagents (#473); any request of a root's ownership turns it on (#520), and it only
@@ -51,6 +52,7 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
 }
 // The model and effort a request reports (#364), any client's: display facts that grant nothing. A value that isn't
 // a string is a client bug, refused like a malformed delivery declaration; one too long is cut when stored (`cleanFact`).
+// An empty one is the host saying it has none, and clears the stored fact (#558); an absent key leaves it.
 function sessionFacts(meta: unknown): { facts?: SessionFacts } {
   if (!meta || typeof meta !== "object") return {};
   const facts: SessionFacts = {};
@@ -58,7 +60,7 @@ function sessionFacts(meta: unknown): { facts?: SessionFacts } {
     if (!(key in meta)) continue;
     const raw = (meta as Record<string, unknown>)[key];
     if (typeof raw !== "string") throw new ApplicationError("bad_request", `_meta["${key}"] must be a string`);
-    if (raw.length) facts[field] = raw;
+    facts[field] = raw;
   }
   return Object.keys(facts).length ? { facts } : {};
 }
