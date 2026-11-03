@@ -11,16 +11,18 @@
 //
 // The session binds through the plugin's tool, a DM from a peer reaches the
 // model as a channel message, the model's dm_send reaches the peer, and no
-// grayboard CLI process runs under Claude Code.
+// grayboard CLI process runs under Claude Code. A session with no grant gets
+// a sign-in link from its first tool call, and opening it signs the session in
+// (#497: Claude Code never received the prompt the plugin sent at startup).
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
 import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
-import { CLAUDE_CODE_VERSION, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
+import { CLAUDE_CODE_VERSION, type ClaudeHome, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
 import { onChannelDm, onUserText, startFakeAnthropic } from "../support/fake_anthropic.ts";
-import { hostedServer, seedGrant } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant } from "../support/hosted_oauth.ts";
 import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
 import { keep } from "../support/run_dir.ts";
@@ -58,6 +60,20 @@ function marketplace(mp: string): string {
   return "this tree";
 }
 
+// The plugin under test installed in `h`, configured for `srv`; returns where it came from.
+function install(h: ClaudeHome, srv: ReturnType<typeof hostedServer>, mp: string): string {
+  const from = marketplace(mp);
+  claudeCli(bin, h, ["plugin", "marketplace", "add", mp]);
+  claudeCli(bin, h, ["plugin", "install", CLAUDE_PLUGIN, "--config", `server_url=${srv.resource}`]);
+  return from;
+}
+
+// The text of each tool_result the model was sent for the tool_use `id`.
+const toolResults = (model: ReturnType<typeof startFakeAnthropic>, id: string): string[] =>
+  model.requests.flatMap((r) => r.body.messages.flatMap((m) => typeof m.content === "string" ? [] : m.content))
+    .filter((b) => b.type === "tool_result" && b.tool_use_id === id)
+    .map((b) => typeof b.content === "string" ? b.content : JSON.stringify(b.content));
+
 test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a channel message, the reply reaches the peer`, async () => {
   const srv = hostedServer();
   const model = startFakeAnthropic([
@@ -66,15 +82,14 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
   ]);
   const h = claudeHome(dir, model.url, ["mcp__plugin_grayboard_grayboard"]);
   const mp = join(dir, "mp");
-  const from = marketplace(mp);
+  let from = "";
   let tty: ReturnType<typeof claudeTty> | undefined;
   try {
     // --strict on the plugin and on a marketplace with its entry (2.1.316
     // refuses the repo's empty pre-pin marketplace under --strict).
     claudeCli(bin, h, ["plugin", "validate", "--strict", join(ROOT, "plugins/claude-code")]);
+    from = install(h, srv, mp);
     claudeCli(bin, h, ["plugin", "validate", "--strict", mp]);
-    claudeCli(bin, h, ["plugin", "marketplace", "add", mp]);
-    claudeCli(bin, h, ["plugin", "install", CLAUDE_PLUGIN, "--config", `server_url=${srv.resource}`]);
     await seedGrant(srv, join(h.config, "plugins/data/grayboard-grayboard"), "grayboard-claude-code");
 
     tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
@@ -103,6 +118,47 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
     await tty?.stop();
     model.stop();
     writeFileSync(join(dir, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
+    await srv.stop();
+  }
+}, 240_000);
+
+test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's result carries the sign-in link, and opening it signs the session in`, async () => {
+  const srv = hostedServer();
+  const model = startFakeAnthropic([
+    onUserText("WHOAMI-FIRST", SOURCE, TOOL("whoami"), {}),
+    onUserText("WHOAMI-AGAIN", SOURCE, TOOL("whoami"), {}),
+  ]);
+  const signedOut = join(dir, "signed-out");
+  const h = claudeHome(signedOut, model.url, ["mcp__plugin_grayboard_grayboard"]);
+  let tty: ReturnType<typeof claudeTty> | undefined;
+  try {
+    const from = install(h, srv, join(signedOut, "mp"));
+    tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
+    await until(() => tty!.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
+    await tty.submit("WHOAMI-FIRST");
+    const first = "toolu_WHOAMI_FIRST";
+    await until(() => toolResults(model, first).length > 0, 60_000, `the first whoami result (plugin from ${from})`);
+    const result = toolResults(model, first).join("\n");
+    const link = new RegExp(`open (${RegExp.escape(srv.issuer)}/\\S+?) to sign in to grayboard`).exec(result);
+    expect(link, result).not.toBeNull();
+    expect(await browse(srv.issuer, link![1]!, "Claude Code")).toContain("Signed in to grayboard");
+    const hosted = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
+    await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
+    // 2.1.316 keeps the URL prompt up after the plugin's completion notice and
+    // its cancel, and the prompt takes the keyboard: the user dismisses it.
+    const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
+    expect(debug()).toContain("Received elicitation completion notification");
+    tty.proc.terminal!.write("\x1b");
+    await until(() => debug().includes('Elicitation response: {"action":"cancel"}'), 10_000, "Esc to dismiss the sign-in prompt");
+    await tty.submit("WHOAMI-AGAIN");
+    const again = "toolu_WHOAMI_AGAIN";
+    await until(() => toolResults(model, again).length > 0, 30_000, "the second whoami result");
+    expect(toolResults(model, again).join("\n")).not.toContain("Signed out");
+    expect(model.unhandled).toEqual([]);
+  } finally {
+    await tty?.stop();
+    model.stop();
+    writeFileSync(join(signedOut, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
     await srv.stop();
   }
 }, 240_000);
