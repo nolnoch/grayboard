@@ -531,10 +531,11 @@ test(`${CHILDLESS_SWEEP} ends a dead root's child with it: the child's row is it
   const fe = await session("fe");
   const root = (await fe.call("whoami")).id as string;
   const child = (await asChild<Who>(fe, "reviewer-1", "whoami")).id;
+  const [{ pid }] = rows(`SELECT pid FROM bindings WHERE session_id = ?`, child) as { pid: number }[];
   await sigkill(pidOfId(root));
   expect(await runCli(["claims"], { bin: old.cli, cwd: dir, env: localEnv(dir) })).toMatchObject({ code: 0 });
   expect(endedAt(root)).not.toBeNull();
-  expect(endedAt(child)).not.toBeNull();
+  expect(endWhy(child)).toEqual([`reaped: pid ${pid} is gone`]);
   expect(rows(`SELECT session_id FROM bindings WHERE session_id IN (?, ?)`, root, child)).toEqual([]);
 }, 120_000);
 

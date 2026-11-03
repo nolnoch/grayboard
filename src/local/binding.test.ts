@@ -257,7 +257,8 @@ test("ChildSessions keeps only the children seen inside the idle window, refusin
 // by a reap, by an older grayboard that knew no children, or pruned, ends.
 // HEAD judges a child by its root, never by its own row (#539: a copy of the
 // root's liveness for older releases), which goes when the child ends. Here
-// each copy names this live process, so only the root can end it.
+// each copy names this live process, so only the root can end it, except the
+// live root's child's, whose dead copy must not end it.
 test("reading live sessions keeps a live root's children and ends those whose root is dead, ended or pruned", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
   const live = "id:0123456789abc", dead = "id:0123456789abd", old = "id:0123456789abe", pruned = "id:0123456789abf";
@@ -271,6 +272,7 @@ test("reading live sessions keeps a live root's children and ends those whose ro
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(old);
   db.prepare(`DELETE FROM bindings WHERE session_id IN (?, ?)`).run(old, pruned);
   db.prepare(`DELETE FROM ids WHERE id = ?`).run(pruned);
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(childOf(live));
 
   const r = liveSessions(db);
   expect(r.alive.map((s) => s.session_id)).toEqual([live]);

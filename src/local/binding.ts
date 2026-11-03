@@ -187,7 +187,7 @@ export function registerChild(db: Database, root: string, child: string, raw: st
     if (prior) return;
     const live = db.prepare(`SELECT pid, proc_start, harness_pid, harness_rule FROM bindings WHERE session_id = ?`).get(root) as
       { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
-    if (!live) throw new Error(`grayboard: session ${root} has no bindings row`);
+    if (!live) throw new CoreError(`id_ended: session ${root} has ended`);
     const r = db.prepare(`SELECT harness, cwd, keyed FROM ids WHERE id = ?`).get(root) as { harness: string | null; cwd: string | null; keyed: number } | null;
     const reused = registerId(db, { id: child, principal: null, harness: r?.harness ?? null, cwd: r?.cwd ?? null, launcher: false, keyed: r?.keyed === 1, rootId: root }, now);
     if (reused) writeCoreAudit(db, "id.reused", child, child, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: process.pid });
