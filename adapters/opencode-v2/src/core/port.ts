@@ -10,6 +10,8 @@ export type Configuration = { type: "remote"; url: string; issuer: string; clien
 // `held`: the root's holds as full addresses, oldest first; the first is the one it sends as (#451).
 export type Enrollment = { version: 2; sessionID: string; configuration: Configuration; held?: string[] };
 export type Delivery = { mode: "push" | "poll"; source: string };
+export type SessionFacts = { model?: string; effort?: string };
+
 export interface KeyValueStorage { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> }
 
 export interface HostPort<E extends Enrollment = Enrollment> {
@@ -20,6 +22,8 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   readonly client: { name: string; version: string };
   readonly delivery?: Delivery;  // adapters only; OpenCode omits it
   readonly launcher?: true;      // the harness can spawn subagents: every wire declares it, and the server turns the ownership's flag on (#473, #520)
+  // Optional: the session's current model and effort, read per request (#364). Omitted where the harness exposes none (Claude Code).
+  facts?(sessionID: string): SessionFacts | undefined;
   readonly storage: KeyValueStorage;
   place(): string;               // bind `where`; captured at construction, guard refuses once it differs
   ancestry(sessionID: string): Promise<SessionPath>; // {sessionID, root, via}; throws AncestryError

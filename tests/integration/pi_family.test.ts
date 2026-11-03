@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
+import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
 import { createGrayboard, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
@@ -64,7 +65,8 @@ type Instance = {
   call(tool: string, args?: Record<string, unknown>): Promise<CallToolResult>;
 };
 // `marker`, a function, is read live (omp's entry: the root as it is now).
-function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void): Instance {
+// `facts`: the harness's current model and effort (#364), read live.
+function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: () => SessionFacts | undefined): Instance {
   let tools: NativeTool[] = [];
   let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
@@ -76,6 +78,7 @@ function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?
       deliver: (content, wake) => { self.deliveries.push({ content, wake }); onDeliver?.(); },
       notify: (message, level) => { self.notices.push({ message, level }); },
       record: data => { self.records.push(data); },
+      ...(facts ? { facts } : {}),
     }),
     tools: () => tools,
     call: (tool, args = {}) => run!(tool, args),
@@ -190,6 +193,26 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(alpha.records.every(r => r.root === "root-alpha")).toBe(true);
   expect(alpha.records.findIndex(r => r.event === "receipted" && r.itemIds.includes(first))).toBeGreaterThan(alpha.records.indexOf(admitted[0]!));
   expect(JSON.stringify(alpha.records)).not.toContain("hello from");
+});
+
+// The harness's model and effort ride its session's requests (#364): peer_list shows the latest, and a switch mid-session
+// moves them on the next call. A child of this root, its own pi process, sends its own harness's facts, never the root's.
+test("a root's model and effort show in peer_list and follow a switch; its child reports its own (#364)", async () => {
+  const facts: SessionFacts = { model: "anthropic/claude-opus-5-5", effort: "high" };
+  const lead = instance(undefined, undefined, () => ({ ...facts }));
+  await lead.ext.start({ id: "facts-root", reason: "startup" });
+  expect((await lead.call("bind", { name: "lead", create: true })).isError).toBeUndefined();
+  type Peers = { peers: Array<{ handle: string; model?: string | null; effort?: string | null }> };
+  const peers = async (i: Instance) => (payload(await i.call("peer_list", { include_offline: true })) as Peers).peers;
+  expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "anthropic/claude-opus-5-5", effort: "high" }));
+  facts.model = "openai/gpt-6";
+  facts.effort = "low";
+  expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "openai/gpt-6", effort: "low" }));
+  const child = instance({ child: true, root: "facts-root" }, undefined, () => ({ model: "anthropic/claude-haiku-5-5" }));
+  await child.ext.start({ id: "facts-child", reason: "startup" });
+  await child.call("whoami");
+  expect(srv.app.db.query<{ model: string | null }, [string]>("SELECT model FROM ids WHERE id = ?").get(hostedId("facts-child"))?.model).toBe("anthropic/claude-haiku-5-5");
+  expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "openai/gpt-6" }));
 });
 
 test("an explicit BUS_IDENTITY binds at a new root's start (#443), created if new (precedence: hosted_core_root.test.ts)", async () => {

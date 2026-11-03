@@ -31558,6 +31558,8 @@ var StreamableHTTPClientTransport = class {
 import { setTimeout as sleep3 } from "timers/promises";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
+var MODEL_META = "io.github.nolnoch.grayboard/model";
+var EFFORT_META = "io.github.nolnoch.grayboard/effort";
 
 class SubscriberError extends Error {
   code;
@@ -31723,6 +31725,15 @@ class Connection {
   declaration() {
     return { ...this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}, ...this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {} };
   }
+  facts(sessionID) {
+    let f;
+    try {
+      f = this.wireOptions.facts?.(sessionID);
+    } catch {
+      return {};
+    }
+    return { ...typeof f?.model === "string" && f.model ? { [MODEL_META]: f.model } : {}, ...typeof f?.effort === "string" && f.effort ? { [EFFORT_META]: f.effort } : {} };
+  }
   async reachable(pending) {
     try {
       return await pending;
@@ -31753,7 +31764,7 @@ class Wire extends Connection {
       headers.set("X-Grayboard-Lease", this.capability);
   }
   meta() {
-    return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration() };
+    return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
   }
   async read(uri) {
     const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch((error) => {
@@ -31795,7 +31806,7 @@ class NativeWire extends Connection {
   }
   decorate() {}
   meta() {
-    return { ...this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID }, ...this.declaration() };
+    return { ...this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID, ...this.facts(this.sessionID) }, ...this.declaration() };
   }
   instructions() {
     return this.client.getInstructions();
@@ -31811,7 +31822,7 @@ class NativeWire extends Connection {
     return tools;
   }
   async callTool(name, args, sessionID) {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration() } }, this.options()));
+    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options()));
   }
 }
 
@@ -35917,7 +35928,7 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {} };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.options.facts } : {} };
   }
   temporary = async (sessionID, run) => {
     const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
@@ -36200,7 +36211,7 @@ class Controller {
     check();
   }
   wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {} };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {} };
   }
   async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
     let current;
@@ -37047,6 +37058,7 @@ class RootDelivery {
       client: wire.client,
       delivery: wire.delivery,
       ...wire.launcher ? { launcher: true } : {},
+      ...wire.facts ? { facts: wire.facts } : {},
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {

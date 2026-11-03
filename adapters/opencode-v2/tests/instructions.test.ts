@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { RootInstructions, rebuild, rewrite } from "../src/instructions.js";
 import { OpenCodeController, nativeFetcher, setup, watchRoots } from "../src/lifecycle.js";
-import { LAUNCHER_META, NativeWire, ServerUnreachable, type Wire } from "../src/core/wire.js";
+import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, ServerUnreachable, type Wire } from "../src/core/wire.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
 import { fixture } from "./native-fixture.js";
@@ -160,6 +160,10 @@ test("the native fetcher names the root on a native connection with the launcher
     expect((await controller.enroll("R")).state).toBe("approved");
     expect(await fetch("R", new AbortController().signal)).toBe(bound);
     expect(seen).toEqual([{ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true }, headers: [] }]);
+    // The root's noted model rides its next native connection (#364).
+    controller.noteModel("R", { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" });
+    await fetch("R", new AbortController().signal);
+    expect(seen[1]).toEqual({ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true, [MODEL_META]: "anthropic/claude-opus-5-5", [EFFORT_META]: "high" }, headers: [] });
     const changed: string[] = [];
     controller.bindingChanged = id => { changed.push(id); };
     for (const tool of ["grayboard_bind", "grayboard_unbind", "grayboard_whoami", "other_bind"]) await controller.after({ sessionID: "R", tool, id: "c", status: "error" });
@@ -168,6 +172,30 @@ test("the native fetcher names the root on a native connection with the launcher
     await controller.close();
     instructions.mockRestore(); connect.mockRestore(); close.mockRestore();
   }
+});
+
+// Each session's model as its latest context request used it (#364): the wires the Controller opens for that session
+// carry it as `providerID/id`, the variant as effort; a request with no model leaves what was noted; the oldest
+// session is forgotten past 256.
+// Each session's model as its latest context request used it (#364): `providerID/id`, the variant as effort; a request
+// with no model leaves what was noted; past 256 sessions the least recently noted is forgotten.
+test("the controller keeps each session's latest model for its wires, for the 256 most recent sessions", async () => {
+  const f = fixture();
+  const ctx = { ...f.ctx, location: { directory: "/worktree" }, session: { get: async () => ({}), update: async () => {}, synthetic: async () => {} }, tool: { list: async () => [] } } as unknown as Context;
+  const controller = new OpenCodeController(ctx, { mcpName: "grayboard" });
+  const facts = (id: string) => controller.port.facts!(id);
+  try {
+    controller.noteModel("R", { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" });
+    controller.noteModel("S", { providerID: "openai", id: "gpt-6" });
+    expect(facts("R")).toEqual({ model: "anthropic/claude-opus-5-5", effort: "high" });
+    expect(facts("S")).toEqual({ model: "openai/gpt-6" });
+    controller.noteModel("R", undefined);
+    expect(facts("R")).toEqual({ model: "anthropic/claude-opus-5-5", effort: "high" });
+    controller.noteModel("R", { providerID: "anthropic", id: "claude-sonnet-5-5" });
+    for (let i = 0; i < 255; i++) controller.noteModel(`X${i}`, { providerID: "p", id: `m${i}` });
+    expect(facts("S")).toBeUndefined();
+    expect(facts("R")).toEqual({ model: "anthropic/claude-sonnet-5-5" });
+  } finally { await controller.close(); }
 });
 
 test("setup's context hook leaves unenrolled sessions as built, never rejects, and shuts down before the controller", async () => {

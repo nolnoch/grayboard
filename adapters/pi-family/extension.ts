@@ -22,6 +22,7 @@ import { failureText, HostedClient, message, type Disposable, type Level } from 
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
+import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
 import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
@@ -56,6 +57,8 @@ export interface Harness {
   // Appends a `grayboard-delivery` entry to the session file (pi.appendEntry):
   // the delivery record of the session an item changed. Never message bodies.
   record(data: DeliveryEntry): void;
+  // This process's session's current model and effort (#364), read per request.
+  facts?(): SessionFacts | undefined;
 }
 
 export const LOGIN_ACTION = "run /grayboard login";
@@ -168,6 +171,8 @@ export function createGrayboard(h: Harness): Grayboard {
   const client = login ? new HostedClient({
     harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
     loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
+    // Only this process's own session: the harness's model is that session's.
+    ...(h.facts ? { facts: (id: string) => session?.id === id ? h.facts!() : undefined } : {}),
   }) : undefined;
 
   // ---- tools ----

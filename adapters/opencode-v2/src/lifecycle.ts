@@ -1,7 +1,7 @@
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller, type Wait } from "./core/controller.js";
 import { failureCode, type DiagnosticSink } from "./core/diagnostics.js";
-import type { HostPort } from "./core/port.js";
+import type { HostPort, SessionFacts } from "./core/port.js";
 import { Refusal, render } from "./core/model.js";
 import { resolveRoot } from "./core/sessions.js";
 import { NativeWire, type Wire } from "./core/wire.js";
@@ -14,18 +14,21 @@ import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructio
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean };
 type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
+// Sessions whose model is remembered: the most recently active ones.
+const FACTS_LIMIT = 256;
 // OpenCode's own root session IDs: restored diagnostics for them skip the root lookup.
 export const OPENCODE_SESSION = /^ses_[a-f0-9]{64}$/;
 
 // The OpenCode host behind the HostPort: its location, plugin storage,
 // session tree, native MCP grant, metadata approval and synthetic admission.
-function hostPort(ctx: Context, options: Options, binding: Binding): HostPort<OpenCodeEnrollment> {
+function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<string, SessionFacts>): HostPort<OpenCodeEnrollment> {
   return {
     harness: "OpenCode", resumeHint: "explicitly enroll again", loginAction: SIGN_IN,
     sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: VERSION },
     // Plugin option `launcher: true`, OpenCode's BUS_LAUNCHER=1 (#520): the Controller's wires declare it.
     ...(options.launcher ? { launcher: true as const } : {}),
     storage: ctx.storage,
+    facts: sessionID => facts.get(sessionID),
     place: () => ctx.location.directory,
     ancestry: sessionID => resolveRoot(sessionID, id => ctx.session.get({ sessionID: id })),
     credential: binding,
@@ -41,9 +44,20 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   constructor(readonly ctx: Context, readonly options: Options, Transport?: typeof Wire, wait?: Wait, sink?: DiagnosticSink) {
     const latch = { drift: (_message: string) => {} };
     const binding = new Binding(ctx, options.mcpName, () => latch.drift("Native binding changed; explicitly enroll again"), options.issuer);
-    super(hostPort(ctx, options, binding), { Transport, wait, sink, knownRoot: OPENCODE_SESSION, ...(options.name ? { configured: { name: options.name, create: options.create === true } } : {}) });
+    const facts = new Map<string, SessionFacts>();
+    super(hostPort(ctx, options, binding, facts), { Transport, wait, sink, knownRoot: OPENCODE_SESSION, ...(options.name ? { configured: { name: options.name, create: options.create === true } } : {}) });
     latch.drift = message => this.drift(message);
     this.binding = binding;
+    this.facts = facts;
+  }
+  // Each session's model as its latest request used it (#364): `providerID/id`,
+  // the variant as effort. The Controller's wires send them for that session.
+  private readonly facts: Map<string, SessionFacts>;
+  noteModel(sessionID: string, model: { id: string; providerID: string; variant?: string | undefined } | undefined) {
+    if (!model?.id || !model.providerID) return;
+    this.facts.delete(sessionID);
+    this.facts.set(sessionID, { model: `${model.providerID}/${model.id}`, ...(model.variant ? { effort: model.variant } : {}) });
+    if (this.facts.size > FACTS_LIMIT) this.facts.delete(this.facts.keys().next().value!);
   }
   private namespace() { return this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_"); }
   // The bare native tool name, or undefined for any other tool.
@@ -110,7 +124,7 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
     if (!e) return;
     const port = controller.port;
     let current: string | undefined;
-    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(port.launcher ? { launcher: true as const } : {}) }, {
+    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(port.launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}) }, {
       token: async () => (current = await controller.binding.token(e)),
       onUnauthorized: async () => controller.binding.unauthorized(e, current ?? ""),
     }, signal, sessionID);
@@ -149,6 +163,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
   // A rejected hook fails OpenCode's step, so it never rejects.
   const context = await ctx.session.hook("context", async request => {
     try {
+      controller.noteModel(request.sessionID, request.model);
       if (!controller.enrollment(request.sessionID)) { instructions?.forget(request.sessionID); return; }
       const plan: Plan = await rewrite(request, options.mcpName, id => instructions!.current(id));
       debug("Grayboard instructions", { root: request.sessionID, plan, text: instructions!.state(request.sessionID) });

@@ -119,6 +119,11 @@ export default function grayboard(pi: ExtensionAPI) {
       if (ctx?.sessionManager.getSessionId() === data.root) pi.appendEntry("grayboard-delivery", data);
       else pi.logger.warn("grayboard: a delivery record for a session no longer current; logged here, not in its file", { ...data });
     },
+    // omp's `inherit` names no level of its own: none is sent.
+    facts: () => {
+      const effort = pi.getThinkingLevel();
+      return { ...(ctx?.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}), ...(effort && effort !== "inherit" ? { effort } : {}) };
+    },
   });
 
   const begin = async (context: ExtensionContext, reason: StartReason) => {
