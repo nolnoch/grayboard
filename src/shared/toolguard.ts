@@ -61,7 +61,7 @@ export function channelsOffNotice(reason: string): string {
  * the sign-in doesn't name one (a truncated, signed-out credentials file).
  */
 export function signedInLocalNotice(server: string | null): string {
-  return `Warning: this machine is signed in to ${server ?? "a grayboard server"}, but this grayboard MCP entry runs the local bus: that server's peers, names and messages aren't here, and an empty peer list isn't the team's. Tell the user: \`grayboard setup\` registers this harness for the server; \`grayboard setup --local\` if this machine should be local; \`--mode local\` on this entry keeps the local bus on purpose.`;
+  return `Warning: this machine is signed in to ${server ?? "a grayboard server"}, but this grayboard MCP entry runs the local bus: that server's peers, names and messages aren't here, and an empty peer list isn't the team's. Tell the user: \`grayboard setup\` moves this machine's harnesses to the server (for opencode it prints the command to run); \`grayboard setup --local\` if this machine should be local; \`--mode local\` on this entry keeps the local bus on purpose.`;
 }
 
 /**

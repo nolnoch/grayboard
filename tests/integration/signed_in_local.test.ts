@@ -50,6 +50,8 @@ test("a bare entry on a signed-in machine leads every render with the notice, lo
   const bound = await bindInstructions(s, "fe");
   expect(bound[0]).toStartWith(notice(SERVER));
   expect(bound.filter((l) => l.startsWith("Warning: this machine is signed in"))).toHaveLength(1);
+  const rebound = await s.c.callTool({ name: "bind", arguments: { name: "be", create: true } });
+  expect((rebound.content as { text: string }[])[0]!.text).not.toContain("is signed in to");
   const unbound = await s.c.callTool({ name: "unbind", arguments: { name: "fe" } });
   expect((unbound.structuredContent as { instructions: string[] }).instructions[0]).toStartWith(notice(SERVER));
   const rows = audits();
@@ -86,4 +88,13 @@ test("a signed-out (truncated) credentials file names no server; GRAYBOARD_SERVE
 test("GRAYBOARD_TOKEN alone counts as signed in", async () => {
   const s = await bare({ GRAYBOARD_TOKEN: "t", GRAYBOARD_SERVER: SERVER });
   expect(s.c.getInstructions()).toStartWith(notice(SERVER));
+});
+
+test("only the server URL's origin is repeated: credentials and a path in it stay out of the text and the row", async () => {
+  signIn(JSON.stringify({ session_token: "t", server: "https://user:hunter2@bus.example.com/team/x", user_email: "you@example.com" }));
+  const s = await bare();
+  expect(s.c.getInstructions()).toStartWith(notice(SERVER));
+  expect(s.c.getInstructions()).not.toContain("hunter2");
+  expect(s.stderr()).not.toContain("hunter2");
+  expect(audits().map((r) => r.detail)).toEqual([{ server: SERVER, mode_pinned: false }]);
 });
