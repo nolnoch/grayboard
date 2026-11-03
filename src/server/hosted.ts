@@ -63,13 +63,14 @@ function sessionFacts(meta: unknown): { facts?: SessionFacts } {
   return Object.keys(facts).length ? { facts } : {};
 }
 // The name a request's checkout suggests (#443), any client's: a hint that orders the unbound candidates and grants
-// nothing. A value that isn't an identity name is a client bug, refused as a malformed fact is.
+// nothing. A value that isn't a string is a client bug, refused as a malformed fact is; a string that isn't an identity
+// name (a checkout directory called `human`, a scoped `BUS_IDENTITY`) is no suggestion, as local mode treats it.
 function suggestedName(meta: unknown): { suggested?: string } {
   if (!meta || typeof meta !== "object" || !(GRAYBOARD_SUGGESTED_META in meta)) return {};
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_SUGGESTED_META];
-  const normalized = typeof raw === "string" ? normalizeIdentityName(raw) : undefined;
-  if (!normalized?.ok || normalized.name === HUMAN_NAME) throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_SUGGESTED_META}"] must be an identity name (1-32 chars of a-z 0-9 _ -, not "${HUMAN_NAME}")`);
-  return { suggested: normalized.name };
+  if (typeof raw !== "string") throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
+  const normalized = normalizeIdentityName(raw);
+  return normalized.ok && normalized.name !== HUMAN_NAME ? { suggested: normalized.name } : {};
 }
 // A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
 // third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are

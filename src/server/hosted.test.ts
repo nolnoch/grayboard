@@ -566,7 +566,7 @@ test("cleanFact drops format characters before folding the line, and stores NFC,
   expect(cleanFact("\u200b")).toBeNull();
 });
 
-test("a root's suggested name is its first request's, offered first among its unbound candidates while free, and refused when it isn't an identity name (#443)", async () => {
+test("a root's suggested name is its first request's, offered first among its unbound candidates while free, refused when not a string, and no suggestion when not an identity name (#443)", async () => {
   const ctx = (raw: string, suggested?: unknown) => sessionContext(principal, { [OPENCODE_SESSION_META]: raw, ...(suggested === undefined ? {} : { [GRAYBOARD_SUGGESTED_META]: suggested }) });
   await hosted.bind(principal, ctx("other"), { name: "older", create: true });
   await hosted.unbind(principal, ctx("other"), { name: "older" });
@@ -582,7 +582,8 @@ test("a root's suggested name is its first request's, offered first among its un
   expect(released.content[0]!.text).toContain("grayboard-gb-aux (this checkout's default: ");
   await hosted.bind(principal, ctx("other"), { name: "grayboard-gb-aux", create: true });
   expect((await hosted.whoami(principal, ctx("root"))).candidates?.map(c => c.name)).not.toContain("grayboard-gb-aux");
-  for (const bad of [5, "", "a/b", "human", "x".repeat(33)]) expect(() => ctx("root", bad)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be an identity name`);
+  expect(() => ctx("root", 5)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
+  for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
 });
 
 test("a request's launcher declaration is the ownership's: registered and audited, restated by a new ownership, cleared at its end, refused unless a boolean (#473)", async () => {
