@@ -561,7 +561,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const instructions = held.length
         ? (general: boolean) => boundInstructions(held[0]!, source, general, () => "id" in context && application.hostedLauncher(context.id) ? launcherInstruction() : [], [], held.slice(1))
         : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed, result.suggested))];
-      const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? "", result.ok.left ?? [], instructions);
+      const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? null, result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     async register(p: OAuthPrincipal, context: SessionContext, child: string, via: string[] = []) {
