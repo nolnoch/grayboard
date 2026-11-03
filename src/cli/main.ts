@@ -12,7 +12,7 @@ import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { sessionStartOutput } from "./session_start.ts";
-import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, printable, projectEntryWarnings, refreshClaudePlugin, registerClaudeLocal } from "./claude-setup.ts";
+import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -796,33 +796,41 @@ program
     );
   });
 
+/** A failed adapter refresh step: printed with what to do, and the run fails. */
+function adapterFailed(e: unknown): void {
+  console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
+  process.exitCode = 1;
+}
+
 /**
  * Claude Code, server mode: a user still on the user-scope `grayboard mcp`
  * entry (setup before the plugin) moves to the hosted plugin; an installed
- * plugin updates to the marketplace's current pin (#443). A failure sets the
- * exit code and is printed. Beside the plugin, a project's grayboard entry
- * runs a second grayboard: checked even when the update failed.
+ * plugin updates to the marketplace's current pin (#443). Either way the pin,
+ * the plugin and this grayboard's version are then compared (#511). A failure
+ * sets the exit code and is printed. Beside the plugin, a project's grayboard
+ * entry runs a second grayboard: checked even when the update failed.
  */
 function refreshClaude(): void {
-  const failed = (e: unknown) => {
-    console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
-    process.exitCode = 1;
-  };
   try {
     const claude = Bun.which("claude");
     if (busMode() === "server" && claude) {
+      let r: PluginReport;
       if (hasUserEntry()) {
         const server = process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
         if (!server) throw new Error("Server mode with no server URL, so Claude Code wasn't moved to the grayboard plugin");
-        for (const note of installClaudePlugin(claudeCli(claude), server)) console.log(note);
+        const installed = installClaudePlugin(claudeCli(claude), server);
+        const check = pluginVersions(claudeCli(claude), pkg.version);
+        r = { notes: [...installed, ...check.notes], problem: check.problem };
       } else {
-        for (const note of refreshClaudePlugin(claudeCli(claude), pkg.version)) console.log(note);
+        r = refreshClaudePlugin(claudeCli(claude), pkg.version);
       }
+      for (const note of r.notes) console.log(note);
+      if (r.problem) { console.log(r.problem); process.exitCode = 1; }
     }
-  } catch (e) { failed(e); }
+  } catch (e) { adapterFailed(e); }
   try {
     if (busMode() === "server" && Bun.which("claude") && pluginEnabled()) for (const w of projectEntryWarnings(process.cwd())) console.log(`[grayboard] ${w}`);
-  } catch (e) { failed(e); }
+  } catch (e) { adapterFailed(e); }
 }
 
 // ── update ───────────────────────────────────────────────────────────────────
@@ -839,8 +847,9 @@ program
       process.exit(1);
     }
     if (!r.updated) {
-      // The binary is current, so its adapters are too; the plugin follows the
-      // marketplace's pin, which merges after the release (#511).
+      // The binary is current, so the adapters it carries are too; the
+      // Claude Code plugin follows the marketplace's pin, which merges after
+      // the release (#511).
       console.log(`grayboard ${pkg.version} is the latest release (${r.origin}).`);
       refreshClaude();
       return;
@@ -867,10 +876,6 @@ program
     // A symlink means a checkout is installed there on purpose: leave it,
     // and the entry its version expects.
     const installed = (path: string) => existsSync(path) && !lstatSync(path).isSymbolicLink();
-    const failed = (e: unknown) => {
-      console.log(`${(e as Error).message}; fix it, then run \`grayboard setup\``);
-      process.exitCode = 1;
-    };
     if (installed(OC_PLUGIN.path)) {
       const guard = opencodeShimGuard(OC_DIR);
       if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
@@ -879,7 +884,7 @@ program
         console.log(`Refreshed ${OC_PLUGIN.path}`);
         try {
           if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
-        } catch (e) { failed(e); }
+        } catch (e) { adapterFailed(e); }
       }
     }
     // omp and pi: where either variant is installed (and neither is a
@@ -890,13 +895,13 @@ program
       if (paths.length === 0 || paths.some(p => lstatSync(p).isSymbolicLink())) continue;
       if (busMode() === "server") {
         server ??= process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server;
-        if (!server) { failed(new Error(`Server mode with no server URL, so ${h.name}'s adapter wasn't refreshed`)); continue; }
+        if (!server) { adapterFailed(new Error(`Server mode with no server URL, so ${h.name}'s adapter wasn't refreshed`)); continue; }
       }
       try {
         const r = await installPiFamily(h, server);
         console.log(`Refreshed ${r.adapter}`);
         for (const note of r.notes) console.log(note);
-      } catch (e) { failed(e); }
+      } catch (e) { adapterFailed(e); }
     }
     refreshClaude();
   });
