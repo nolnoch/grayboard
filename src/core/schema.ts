@@ -254,6 +254,12 @@ export function initCoreSchema(db: Database): void {
   // clears it (hostedRoot).
   if (!idCols.has("root_id")) db.exec(`ALTER TABLE ids ADD COLUMN root_id TEXT`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_root ON ids(root_id) WHERE root_id IS NOT NULL`);
+  // harness_session: the harness's own id for the session this one serves
+  // (BUS_HARNESS_SESSION; pi's getSessionId()), null when the harness passes
+  // none. A subagent process the harness started for that session (pi-subagents'
+  // detached runner, BUS_PARENT_SESSION) finds its root by it (#523 step 5).
+  if (!idCols.has("harness_session")) db.exec(`ALTER TABLE ids ADD COLUMN harness_session TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_harness_session ON ids(harness_session) WHERE harness_session IS NOT NULL`);
   const aliasCols = new Set((db.prepare(`PRAGMA table_info(aliases)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["task", "TEXT"], ["owner", "TEXT"], ["source_board", "TEXT"], ["spec_hash", "TEXT"], ["description", "TEXT"]]) {
     if (!aliasCols.has(col!)) db.exec(`ALTER TABLE aliases ADD COLUMN ${col} ${type}`);

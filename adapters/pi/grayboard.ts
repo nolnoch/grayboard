@@ -11,6 +11,14 @@
 // delivers the child's channel notifications into the session and puts its
 // instructions in the system prompt.
 //
+// Subagents (#523 step 5): pi-subagents' foreground children run in this
+// process with no ambient extensions (its child-launch.js loads them only
+// when the host is its runner), so they have none of these tools and never
+// write to the bus. Its detached runner is a process of its own that does
+// load this extension, so its child is told the id of the session that
+// launched it (BUS_PARENT_SESSION) and acts as that session's child while
+// that session lives, till it binds a name of its own.
+//
 // Install: copy into ~/.pi/agent/extensions/ (grayboard setup does this). The
 // command and env come from the mcpServers.grayboard entry in
 // ~/.pi/agent/mcp.json, which setup writes with "enabled": false so pi's MCP
@@ -64,6 +72,12 @@ const ENTRY = readEntry(join(AGENT_DIR, "mcp.json"));
 const [CMD, ...ARGS] = ENTRY?.command ? [ENTRY.command, ...(ENTRY.args ?? [])] : ["grayboard", "mcp"];
 const ENV: Record<string, string | undefined> = { ...process.env, ...ENTRY?.env };
 delete ENV.BUS_PUSH;
+// pi-subagents' detached runner (PI_SUBAGENT_CHILD=1) is passed the id of the
+// session that launched it (src/runs/background/async-execution.js), whose
+// child this one is: that session's adapter gives its own child the same id
+// (BUS_HARNESS_SESSION, below). The hosted entry reads the same marker
+// (adapters/pi-family/entry-pi.ts).
+const PARENT_SESSION = process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined;
 
 // The file whose entry pi's own MCP client would run, if one does: its tools
 // would collide with these by name (pi warns, and the last registration wins),
@@ -147,7 +161,11 @@ export default function grayboard(pi: ExtensionAPI) {
   // Started per session, not at load: until something can receive them,
   // messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
-    const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env: ENV, stdio: ["pipe", "pipe", "inherit"] });
+    // The session's own id, which its subagent runners' children find it by,
+    // and the launching session's id in a runner; set (or cleared) per start,
+    // since /new, /resume and fork change the id.
+    const env = { ...ENV, BUS_HARNESS_SESSION: ctx.sessionManager.getSessionId(), BUS_PARENT_SESSION: PARENT_SESSION };
+    const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
     let gone: Error | undefined;

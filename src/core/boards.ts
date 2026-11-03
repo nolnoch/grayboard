@@ -182,6 +182,8 @@ export type IdFacts = {
   // A local child session (a harness subagent, #523): the root it acts under.
   // It receives nothing (delivery 'none') and ends with its root.
   rootId?: string;
+  // The harness's own id for the session (ids.harness_session, #523 step 5).
+  harnessSession?: string;
 };
 
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
@@ -213,8 +215,8 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId
   const prior = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(f.id) as { ended_at: number | null } | null;
   if (prior) throw new IdCollision(f.id, prior.ended_at);
   db.prepare(
-    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort, root_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined && f.rootId === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort), f.rootId ?? null);
+    `INSERT INTO ids (id, principal, harness, cwd, place, launcher, started_at, last_seen, delivery, writes_as, viewer, keyed, model, effort, root_id, harness_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(f.id, f.principal, cleanFact(f.harness), f.cwd ?? null, cleanPlace(f.place ?? null), f.launcher ? 1 : 0, now, now, f.writesAs === undefined && f.rootId === undefined ? "push" : "none", f.writesAs ?? null, f.viewer ? 1 : 0, f.keyed ? 1 : 0, cleanFact(f.model), cleanFact(f.effort), f.rootId ?? null, f.harnessSession ?? null);
   return (db.prepare(`DELETE FROM pruned_ids WHERE id = ? RETURNING ended_at, pruned_at`).get(f.id) as ReusedId | null) ?? null;
 }
 

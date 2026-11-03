@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { ChildSessions, acquireName, attachSession, candidateNames, liveSessions, reap, registerChild, registerSession, thisSession, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -201,6 +201,36 @@ test("registerChild records a child once, audited; another root's ID or an ended
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
   expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
   expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+});
+
+// #523 step 5: a runner's root is the live session that recorded its parent
+// session, only if that session's harness is among the runner's ancestors
+// (the nearest when several are; a dead one never); the runner acts under it
+// while both live, and with it gone it is a session of its own.
+test("runnerRoot finds a live root among the runner's ancestors; runnerRootLive and childFallback follow the root's liveness", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const [far, near, dead, child, self] = ["id:0123456789abc", "id:0123456789abd", "id:0123456789abe", "id:0123456789abf", "id:0123456789ab0"];
+  const live = { pid: process.pid, proc_start: procStart(process.pid) ?? null };
+  registerSession(db, { ...thisSession(far), ...live, harness_pid: 4242 }, { harnessSession: "pi-1" });
+  registerSession(db, { ...thisSession(near), ...live, harness_pid: 4244 }, { harnessSession: "pi-1" });
+  registerSession(db, { ...thisSession(dead), pid: 999999, proc_start: null, harness_pid: 4243 }, { harnessSession: "pi-1" });
+  expect(runnerRoot(db, "pi-1", [4243, 4244, 4242])).toEqual({ root: near });
+  expect(runnerRoot(db, "pi-1", [4242])).toEqual({ root: far });
+  expect(runnerRoot(db, "pi-1", [4243, 1234])).toEqual({ why: `the live session ${far} recorded harness session pi-1, but its harness pid 4242 isn't an ancestor of this process` });
+  expect(runnerRoot(db, "pi-2", [4242])).toEqual({ why: "no live session recorded harness session pi-2" });
+
+  registerChild(db, far, child, "runner-1", Date.now(), { harness: "pi", cwd: "/work/repo", harnessSession: "runner-1", detail: { parent_session: "pi-1" } });
+  expect(db.prepare(`SELECT harness, cwd, harness_session, root_id FROM ids WHERE id = ?`).get(child)).toEqual({ harness: "pi", cwd: "/work/repo", harness_session: "runner-1", root_id: far });
+  expect(runnerRootLive(db, child, far)).toBe(true);
+  expect(runnerRootLive(db, child, near)).toBe(false);
+  // The root's process exits while the runner lives on.
+  db.prepare(`UPDATE bindings SET pid = 999999, proc_start = NULL WHERE session_id = ?`).run(far);
+  expect(runnerRootLive(db, child, far)).toBe(false);
+  childFallback(db, { child, root: far, self: { ...thisSession(self), ...live }, kind: { harnessSession: "runner-1" }, detail: { parent_session: "pi-1" } });
+  expect(db.prepare(`SELECT root_id, ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`).get(child)).toEqual({ root_id: far, ended: 1 });
+  expect(db.prepare(`SELECT root_id, harness_session, delivery FROM ids WHERE id = ?`).get(self)).toEqual({ root_id: null, harness_session: "runner-1", delivery: "push" });
+  const fallback = db.prepare(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_fallback'`).all() as { actor: string; target: string; detail: string }[];
+  expect(fallback.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([{ actor: self, target: self, detail: { child, root: far, pid: process.pid, parent_session: "pi-1" } }]);
 });
 
 // #523 audit 3: a root has at most MAX_CHILDREN child sessions at once, as
