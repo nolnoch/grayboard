@@ -655,3 +655,25 @@ test("a declared launcher is a delegation target, and only its own session's ini
   const later = await hosted.bind(generic, ctx("lead-root"), { name: "lead2", create: true });
   expect(instructions(later)).toContain("You're a launcher session");
 });
+
+test("a bound session with no delivery declaration (OpenCode) gets initialize text that follows its lease, as bind's does; a declaration still decides (#531)", () => {
+  const info = { identity_full: "you@example.com/fe", teams: [], human: { linked: false } } as never;
+  const channel = `<channel source="${DEFAULT_CHANNEL_SOURCE}"`;
+  const note = `No delivery lease is open for this session, so DMs to "you@example.com/fe" wait until the client opens one (delivery_open).`;
+  // Lease open: pushed, with the default source, and no poll or lease note.
+  const leased = hostedBoundInstruction(info, undefined, false, true);
+  expect(leased).toContain(channel);
+  for (const line of ["Poll dm_inbox", "delivery_open", "You're a launcher session"]) expect(leased).not.toContain(line);
+  // No lease: it polls, and says why nothing is pushed yet.
+  const unleased = hostedBoundInstruction(info);
+  expect(unleased).toContain("Poll dm_inbox");
+  expect(unleased).toContain(note);
+  expect(unleased).not.toContain("<channel");
+  // The launcher lines ride either, only with the flag.
+  for (const leaseOpen of [false, true]) expect(hostedBoundInstruction(info, undefined, true, leaseOpen)).toContain("You're a launcher session");
+  // A declaration outranks the lease.
+  const poll = hostedBoundInstruction(info, { mode: "poll", source: "x" }, false, true);
+  expect(poll).not.toContain("<channel");
+  expect(poll).not.toContain("delivery_open");
+  expect(hostedBoundInstruction(info, { mode: "push", source: "pi" }, false, false)).toContain(`<channel source="pi"`);
+});
