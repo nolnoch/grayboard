@@ -77,14 +77,14 @@ test("a call with no usable record is refused and audited, never run as the root
   expect(r.isError).toBe(true);
   expect(textOf(r)).toContain("wrote no record");
 
-  // A record older than the TTL.
+  // An old record is still the call's: it may have waited on the permission prompt.
   const old = toolUse();
   hook(b, "pre-tool-use", { tool_use_id: old, agent_id: "agent-a1" });
-  const then = new Date(Date.now() - 11 * 60_000);
+  const then = new Date(Date.now() - 60 * 60_000);
   utimesSync(join(sessionDir(b.dir, b.s.harnessPid), old), then, then);
-  r = await dm(b, "stale", old);
-  expect(r.isError).toBe(true);
-  expect(textOf(r)).toContain("older than 10 minutes");
+  r = await dm(b, "approved-late", old);
+  expect(r.isError).toBeFalsy();
+  expect(sent(b, "approved-late")!.via).toBeString();
 
   // The dir's start time is another process's: a recycled pid.
   const recycled = toolUse();
@@ -94,9 +94,9 @@ test("a call with no usable record is refused and audited, never run as the root
   expect(r.isError).toBe(true);
   expect(textOf(r)).toContain("earlier process with the same pid");
 
-  for (const body of ["no-session", "absent", "stale", "recycled"]) expect(sent(b, body)).toBeNull();
+  for (const body of ["no-session", "absent", "recycled"]) expect(sent(b, body)).toBeNull();
   expect(audits(b, "claude.agent_record_missing").map((d) => [d.tool, d.cause])).toEqual([
-    ["dm_send", "no_session"], ["dm_send", "absent"], ["dm_send", "stale"], ["dm_send", "recycled_pid"],
+    ["dm_send", "no_session"], ["dm_send", "absent"], ["dm_send", "recycled_pid"],
   ]);
   expect(audits(b, "claude.attribution_off")).toEqual([]);
 });

@@ -120,9 +120,10 @@ export function managedSettingsDir(platform = process.platform): string | null {
  * The first settings file that stops user hooks from running in a session in
  * `cwd` (`disableAllHooks`, or managed `allowManagedHooksOnly`), or null. Read
  * only when a record is missing, to name the cause (#551 §3): managed
- * settings and their drop-ins, then the project's local and shared settings.
+ * settings and their drop-ins, then user settings, then the project's local
+ * and shared settings.
  */
-export function hooksDisabledBy(cwd: string, managed = managedSettingsDir()): string | null {
+export function hooksDisabledBy(cwd: string, managed = managedSettingsDir(), user: string | null = claudeSettingsPath()): string | null {
   const files: string[] = [];
   if (managed) {
     files.push(join(managed, "managed-settings.json"));
@@ -131,6 +132,7 @@ export function hooksDisabledBy(cwd: string, managed = managedSettingsDir()): st
       files.push(...readdirSync(d).filter((f) => f.endsWith(".json")).sort().map((f) => join(d, f)));
     } catch { /* no drop-ins */ }
   }
+  if (user) files.push(user);
   files.push(join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json"));
   for (const f of files) {
     let cfg: { disableAllHooks?: unknown; allowManagedHooksOnly?: unknown } | null;

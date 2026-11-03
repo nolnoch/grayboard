@@ -86,7 +86,6 @@ export class RootDelivery {
   private storeUnreadable = false;       // the sign-in store's read failure was said
   private hooked: ToolProxy | undefined; // the push proxy, whose Controller registers children itself
   private readonly children = new Set<string>();                  // child ids a host call passed
-  private readonly enlisted = new Map<string, Promise<void>>();   // their registrations made here (tools-only proxy)
 
   constructor(private readonly client: HostedClient, private readonly o: RootOptions) {
     this.carrying = o.carried;
@@ -417,29 +416,23 @@ export class RootDelivery {
     const proxy = this.proxy!;
     this.children.add(child);
     this.used = true;
+    // The push proxy's Controller registers the child before each call. The
+    // tools-only proxy does the same here: a registration remembered across
+    // calls would outlive a root the server ended (idle, disabled), and the
+    // child's next call would then make it a root of its own (#553 audit 3).
     if (proxy !== this.hooked) {
-      try { await this.enlist(child); }
+      try { await register(this.client.temporary, { root: this.o.sessionID, via: [], child }); }
       catch (error) { return failure(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`); }
     }
     const result = await this.client.call(proxy, tool, args, child);
     return after ? { ...result, content: [{ type: "text" as const, text: `grayboard: ${after}` }, ...result.content] } : result;
   }
-  // One registration per child on the tools-only proxy; a failed one is tried again by the next call.
-  private enlist(child: string): Promise<void> {
-    const known = this.enlisted.get(child);
-    if (known) return known;
-    const pending = register(this.client.temporary, { root: this.o.sessionID, via: [], child });
-    this.enlisted.set(child, pending);
-    pending.catch(() => { if (this.enlisted.get(child) === pending) this.enlisted.delete(child); });
-    return pending;
-  }
-
   // A child's agent finished (Claude Code's SubagentStop): its hosted session
-  // ends now, not at the server's idle sweep. Only a child a call passed; said
-  // on failure. Never rejects.
+  // ends now: the server's idle sweep ends only roots, so a child's session
+  // otherwise lasts until its root's does. Only a child a call passed; said on
+  // failure. Never rejects.
   async endChild(child: string): Promise<void> {
     if (!this.children.delete(child)) return;
-    this.enlisted.delete(child);
     try { await end(this.client.temporary, { child }); }
     catch (error) { this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning"); }
   }

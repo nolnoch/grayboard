@@ -301,8 +301,11 @@ export function createPlugin(o: PluginOptions): Plugin {
   // A subagent's hosted child id: its agent id under this root's session id,
   // unique on the server however Claude Code numbers its agents.
   const childOf = (agent: string) => `${(config as { id: string }).id}/agent/${agent}`;
-  // SubagentStop's markers end each child's hosted session; watched once the
-  // first child call shows the session's record dir exists.
+  // SubagentStop's markers end each child's hosted session: the server's idle
+  // sweep ends only roots, so an unended child lasts until its root does.
+  // Watched once the first child call shows the session's record dir exists,
+  // and drained by every child call too, so a missed or coalesced watch event
+  // (or a failed watch) delays an end by one call at most.
   let endWatch: FSWatcher | undefined;
   const drainEnded = () => {
     if ("error" in config || closed) return;
@@ -314,8 +317,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       endWatch = watch(dir, () => drainEnded());
-      endWatch.on("error", error => { say(`stopped watching subagent ends: ${message(error)}; their sessions end at the server's idle sweep`); endWatch?.close(); });
-    } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; their sessions end at the server's idle sweep`); }
+      endWatch.on("error", error => { say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); endWatch?.close(); });
+    } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); }
     drainEnded();
   };
 
@@ -332,6 +335,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     }
     if (taken.agent === null) return root!.call(name, args, before);
     watchEnded();
+    drainEnded();
     return root!.call(name, args, before, { child: childOf(taken.agent) });
   };
 

@@ -36974,7 +36974,6 @@ class RootDelivery {
   storeUnreadable = false;
   hooked;
   children = new Set;
-  enlisted = new Map;
   constructor(client, o) {
     this.client = client;
     this.o = o;
@@ -37309,7 +37308,7 @@ ${record.message}`;
     this.used = true;
     if (proxy !== this.hooked) {
       try {
-        await this.enlist(child);
+        await register2(this.client.temporary, { root: this.o.sessionID, via: [], child });
       } catch (error) {
         return failure2(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`);
       }
@@ -37317,22 +37316,9 @@ ${record.message}`;
     const result = await this.client.call(proxy, tool, args, child);
     return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
   }
-  enlist(child) {
-    const known = this.enlisted.get(child);
-    if (known)
-      return known;
-    const pending = register2(this.client.temporary, { root: this.o.sessionID, via: [], child });
-    this.enlisted.set(child, pending);
-    pending.catch(() => {
-      if (this.enlisted.get(child) === pending)
-        this.enlisted.delete(child);
-    });
-    return pending;
-  }
   async endChild(child) {
     if (!this.children.delete(child))
       return;
-    this.enlisted.delete(child);
     try {
       await end(this.client.temporary, { child });
     } catch (error) {
@@ -37399,28 +37385,20 @@ ${record.message}`;
 import { mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
 import { join as join5 } from "path";
 var ROOT = "-";
-var RECORD_TTL_MS = 10 * 60000;
+var LEFTOVER_TTL_MS = 10 * 60000;
 var TOOL_USE_META = "claudecode/toolUseId";
 var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
 var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join5(base, "claude-agents");
 var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
-function ageMs(path, now) {
-  try {
-    return now - statSync2(path).mtimeMs;
-  } catch {
-    return;
-  }
-}
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
   recycled_pid: "the record directory belongs to an earlier process with the same pid",
   absent: "the grayboard PreToolUse hook wrote no record for this call",
-  stale: "the call's record is older than 10 minutes",
   bad_record: "the call's record isn't an agent id"
 };
-function takeRecord(base, claudePid, harnessStart, toolUseId, now = Date.now()) {
+function takeRecord(base, claudePid, harnessStart, toolUseId) {
   if (!validToolUseId(toolUseId))
     return { missing: "bad_tool_use_id" };
   const dir = sessionDir(base, claudePid);
@@ -37439,9 +37417,6 @@ function takeRecord(base, claudePid, harnessStart, toolUseId, now = Date.now()) 
     return { missing: "absent" };
   }
   try {
-    const age = ageMs(taken, now);
-    if (age === undefined || age > RECORD_TTL_MS)
-      return { missing: "stale" };
     const content = readFileSync4(taken, "utf8");
     if (content === ROOT)
       return { agent: null };
@@ -37875,11 +37850,11 @@ function createPlugin(o) {
       mkdirSync3(dir, { recursive: true, mode: 448 });
       endWatch = watch(dir, () => drainEnded());
       endWatch.on("error", (error) => {
-        say(`stopped watching subagent ends: ${message(error)}; their sessions end at the server's idle sweep`);
+        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, or with this session`);
         endWatch?.close();
       });
     } catch (error) {
-      say(`couldn't watch subagent ends: ${message(error)}; their sessions end at the server's idle sweep`);
+      say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`);
     }
     drainEnded();
   };
@@ -37898,6 +37873,7 @@ function createPlugin(o) {
     if (taken.agent === null)
       return root.call(name, args, before);
     watchEnded();
+    drainEnded();
     return root.call(name, args, before, { child: childOf(taken.agent) });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());

@@ -26,9 +26,14 @@ import { validSourceId } from "./session_meta.ts";
 
 /** A main-agent call's record. */
 export const ROOT = "-";
-/** A record older than this counts as absent, and a leftover take is pruned. */
-export const RECORD_TTL_MS = 10 * 60_000;
-/** Records kept per session; the hook drops the oldest past it. */
+/**
+ * A leftover take or temporary older than this is pruned. A record itself has
+ * no age limit: Claude Code runs PreToolUse before its permission prompt, so a
+ * call may reach the server any time after its record was written, and a
+ * tool_use_id is never reused (#553 audit 1).
+ */
+export const LEFTOVER_TTL_MS = 10 * 60_000;
+/** Records, and SubagentStop markers, kept per session; the hook drops the oldest past it. */
 export const RECORD_CAP = 256;
 /** The `_meta` key Claude Code puts the call's tool_use_id under. */
 export const TOOL_USE_META = "claudecode/toolUseId";
@@ -88,6 +93,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       const ended = join(dir, "ended");
       mkdirSync(ended, { recursive: true, mode: 0o700 });
       put(join(ended, `${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`), agent);
+      pruneEnded(ended);
     } else if (event === "session-end") {
       // The MCP process outlives a /clear, and so do its records.
       if (input.reason === "clear") return;
@@ -98,14 +104,14 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
   }
 }
 
-// Past the cap, the oldest records go; a take (or a temporary) older than the
-// TTL was left by a process that died between its rename and its unlink.
+// Past the cap, the oldest records go; a take (or a temporary) older than
+// LEFTOVER_TTL_MS was left by a process that died between its rename and its unlink.
 function pruneRecords(dir: string, now: number) {
   const records: { name: string; mtime: number }[] = [];
   for (const name of readdirSync(dir)) {
     if (name.includes(".taken.") || name.includes(".tmp.")) {
       const age = ageMs(join(dir, name), now);
-      if (age !== undefined && age > RECORD_TTL_MS) rmSync(join(dir, name), { force: true });
+      if (age !== undefined && age > LEFTOVER_TTL_MS) rmSync(join(dir, name), { force: true });
     } else if (validToolUseId(name)) {
       const age = ageMs(join(dir, name), now);
       if (age !== undefined) records.push({ name, mtime: now - age });
@@ -114,6 +120,16 @@ function pruneRecords(dir: string, now: number) {
   if (records.length <= RECORD_CAP) return;
   records.sort((a, b) => a.mtime - b.mtime);
   for (const r of records.slice(0, records.length - RECORD_CAP)) rmSync(join(dir, r.name), { force: true });
+}
+
+// Past the cap, the oldest SubagentStop markers go: one is written for every
+// subagent, and only a session whose subagents call grayboard drains them.
+// Names start with the write time, so name order is age order within a ms.
+function pruneEnded(dir: string) {
+  const markers = readdirSync(dir).filter(n => !n.includes(".tmp.") && !n.includes(".taken."));
+  if (markers.length <= RECORD_CAP) return;
+  markers.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+  for (const name of markers.slice(0, markers.length - RECORD_CAP)) rmSync(join(dir, name), { force: true });
 }
 
 // Sibling session dirs whose pid no longer names the process that wrote them:
@@ -135,7 +151,7 @@ function pruneSessions(base: string, self: number) {
 }
 
 /** Why a call has no usable record. */
-export type MissingCause = "bad_tool_use_id" | "no_session" | "recycled_pid" | "absent" | "stale" | "bad_record";
+export type MissingCause = "bad_tool_use_id" | "no_session" | "recycled_pid" | "absent" | "bad_record";
 export type Taken = { agent: string | null } | { missing: MissingCause };
 
 export const MISSING_TEXT: Record<MissingCause, string> = {
@@ -143,7 +159,6 @@ export const MISSING_TEXT: Record<MissingCause, string> = {
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
   recycled_pid: "the record directory belongs to an earlier process with the same pid",
   absent: "the grayboard PreToolUse hook wrote no record for this call",
-  stale: "the call's record is older than 10 minutes",
   bad_record: "the call's record isn't an agent id",
 };
 
@@ -153,7 +168,7 @@ export const MISSING_TEXT: Record<MissingCause, string> = {
  * reader holds for that pid (null when unknown, which accepts any `start`).
  * The take is a rename, so of two concurrent readers exactly one gets it.
  */
-export function takeRecord(base: string, claudePid: number, harnessStart: string | null, toolUseId: unknown, now = Date.now()): Taken {
+export function takeRecord(base: string, claudePid: number, harnessStart: string | null, toolUseId: unknown): Taken {
   if (!validToolUseId(toolUseId)) return { missing: "bad_tool_use_id" };
   const dir = sessionDir(base, claudePid);
   let start: string;
@@ -162,8 +177,6 @@ export function takeRecord(base: string, claudePid: number, harnessStart: string
   const taken = join(dir, `${toolUseId}.taken.${process.pid}`);
   try { renameSync(join(dir, toolUseId), taken); } catch { return { missing: "absent" }; }
   try {
-    const age = ageMs(taken, now);
-    if (age === undefined || age > RECORD_TTL_MS) return { missing: "stale" };
     const content = readFileSync(taken, "utf8");
     if (content === ROOT) return { agent: null };
     return validSourceId(content) ? { agent: content } : { missing: "bad_record" };

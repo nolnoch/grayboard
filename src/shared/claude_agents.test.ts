@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RECORD_CAP, RECORD_TTL_MS, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
+import { LEFTOVER_TTL_MS, RECORD_CAP, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
 import { procStart } from "./proc.ts";
 
 let base: string;
@@ -47,14 +47,15 @@ describe("records", () => {
     expect(takeRecord(base, pid, start(), id(4))).toEqual({ missing: "bad_record" });
   });
 
-  test("no SessionStart, a stale record and a recycled pid each count as absent", () => {
+  test("no SessionStart and a recycled pid each count as absent; an old record is still taken", () => {
     hook("pre-tool-use", { tool_use_id: id(1) });
     expect(takeRecord(base, pid, start(), id(1))).toEqual({ missing: "no_session" });
     hook("session-start", {});
     hook("pre-tool-use", { tool_use_id: id(2) });
-    const old = (Date.now() - RECORD_TTL_MS - 1000) / 1000;
+    // A call can wait on Claude Code's permission prompt for any time after PreToolUse.
+    const old = (Date.now() - 60 * 60_000) / 1000;
     utimesSync(join(sessionDir(base, pid), id(2)), old, old);
-    expect(takeRecord(base, pid, start(), id(2))).toEqual({ missing: "stale" });
+    expect(takeRecord(base, pid, start(), id(2))).toEqual({ agent: null });
     hook("pre-tool-use", { tool_use_id: id(3) });
     expect(takeRecord(base, pid, "Mon Jan  1 00:00:00 2001", id(3))).toEqual({ missing: "recycled_pid" });
     // An unknown start on the reader's side accepts the dir.
@@ -82,7 +83,7 @@ console.log(JSON.stringify(out));`);
   test("the hook keeps at most RECORD_CAP records and prunes old takes", () => {
     hook("session-start", {});
     const dir = sessionDir(base, pid);
-    const old = (Date.now() - RECORD_TTL_MS - 1000) / 1000;
+    const old = (Date.now() - LEFTOVER_TTL_MS - 1000) / 1000;
     writeFileSync(join(dir, `${id("x")}.taken.1`), "a");
     utimesSync(join(dir, `${id("x")}.taken.1`), old, old);
     writeFileSync(join(dir, `${id("y")}.taken.2`), "a");
@@ -131,6 +132,17 @@ describe("session lifecycle", () => {
     hook("subagent-stop", { agent_id: "a2" }, true);
     expect(takeEnded(base, pid).sort()).toEqual(["a1", "a2"]);
     expect(takeEnded(base, pid)).toEqual([]);
+  });
+
+  test("SubagentStop keeps at most RECORD_CAP undrained markers, dropping the oldest", () => {
+    hook("session-start", {});
+    for (let i = 0; i <= RECORD_CAP + 2; i++) {
+      runHook("subagent-stop", JSON.stringify({ agent_id: `a${i}` }), { base, env: { CLAUDE_PID: String(pid) }, ended: true, now: 1_000 + i });
+    }
+    const got = takeEnded(base, pid);
+    expect(got.length).toBe(RECORD_CAP);
+    expect(got).not.toContain("a0");
+    expect(got).toContain(`a${RECORD_CAP + 2}`);
   });
 
   test("a hook without CLAUDE_PID or with bad input does nothing and never throws", () => {

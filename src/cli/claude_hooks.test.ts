@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { claudeHooks, hooksDisabledBy, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
 
 const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
@@ -152,23 +152,43 @@ test("hooksDisabledBy names the first layer that turns user hooks off (#551)", (
   const cwd = join(root, "proj");
   mkdirSync(join(managed, "managed-settings.d"), { recursive: true });
   mkdirSync(join(cwd, ".claude"), { recursive: true });
-  expect(hooksDisabledBy(cwd, managed)).toBeNull();
+  const user = join(root, "user-settings.json");
+  expect(hooksDisabledBy(cwd, managed, user)).toBeNull();
   // allowManagedHooksOnly counts only in managed settings.
   writeFileSync(join(cwd, ".claude", "settings.json"), JSON.stringify({ allowManagedHooksOnly: true }));
-  expect(hooksDisabledBy(cwd, managed)).toBeNull();
+  expect(hooksDisabledBy(cwd, managed, user)).toBeNull();
   writeFileSync(join(cwd, ".claude", "settings.json"), JSON.stringify({ disableAllHooks: true }));
-  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
   // Local project settings come before shared ones; unparseable files are skipped.
   writeFileSync(join(cwd, ".claude", "settings.local.json"), "{not json");
-  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(cwd, ".claude", "settings.json")} sets disableAllHooks`);
   writeFileSync(join(cwd, ".claude", "settings.local.json"), JSON.stringify({ disableAllHooks: true }));
-  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
-  // Managed drop-ins, in name order, come before the project.
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
+  // User settings come before the project's.
+  writeFileSync(user, JSON.stringify({ disableAllHooks: true }));
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${user} sets disableAllHooks`);
+  // Managed drop-ins, in name order, come before user and project settings.
   writeFileSync(join(managed, "managed-settings.d", "20-b.json"), JSON.stringify({ disableAllHooks: true }));
   writeFileSync(join(managed, "managed-settings.d", "10-a.json"), JSON.stringify({ allowManagedHooksOnly: true }));
-  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(managed, "managed-settings.d", "10-a.json")} sets allowManagedHooksOnly`);
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(managed, "managed-settings.d", "10-a.json")} sets allowManagedHooksOnly`);
   writeFileSync(join(managed, "managed-settings.json"), JSON.stringify({ disableAllHooks: true }));
-  expect(hooksDisabledBy(cwd, managed)).toBe(`${join(managed, "managed-settings.json")} sets disableAllHooks`);
+  expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(managed, "managed-settings.json")} sets disableAllHooks`);
   // A platform with no managed dir reads only the project.
-  expect(hooksDisabledBy(cwd, null)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
+  expect(hooksDisabledBy(cwd, null, null)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
+});
+
+test("the hook entry's static imports stay the record module's few: every one evaluates on every grayboard call (#551, 50 ms budget)", () => {
+  const t = new Bun.Transpiler({ loader: "ts" });
+  const seen = new Set<string>();
+  const walk = (file: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    for (const i of t.scanImports(readFileSync(file, "utf8").replace(/^#!.*\n/, ""))) {
+      if (i.kind !== "import-statement" || !i.path.startsWith(".")) continue;
+      walk(join(dirname(file), i.path));
+    }
+  };
+  walk(join(import.meta.dir, "main.ts"));
+  const rel = [...seen].map((f) => relative(join(import.meta.dir, "..", ".."), f)).sort();
+  expect(rel).toEqual(["src/cli/main.ts", "src/shared/claude_agents.ts", "src/shared/proc.ts", "src/shared/session_meta.ts", "src/shared/sockdir.ts"]);
 });

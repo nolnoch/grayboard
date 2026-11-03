@@ -86,7 +86,7 @@ function validSourceId(raw) {
 
 // src/shared/claude_agents.ts
 var ROOT = "-";
-var RECORD_TTL_MS = 10 * 60000;
+var LEFTOVER_TTL_MS = 10 * 60000;
 var RECORD_CAP = 256;
 var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
 var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
@@ -137,6 +137,7 @@ function runHook(event, stdin, o) {
       const ended = join(dir, "ended");
       mkdirSync(ended, { recursive: true, mode: 448 });
       put(join(ended, `${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`), agent);
+      pruneEnded(ended);
     } else if (event === "session-end") {
       if (input.reason === "clear")
         return;
@@ -149,7 +150,7 @@ function pruneRecords(dir, now) {
   for (const name of readdirSync(dir)) {
     if (name.includes(".taken.") || name.includes(".tmp.")) {
       const age = ageMs(join(dir, name), now);
-      if (age !== undefined && age > RECORD_TTL_MS)
+      if (age !== undefined && age > LEFTOVER_TTL_MS)
         rmSync(join(dir, name), { force: true });
     } else if (validToolUseId(name)) {
       const age = ageMs(join(dir, name), now);
@@ -162,6 +163,14 @@ function pruneRecords(dir, now) {
   records.sort((a, b) => a.mtime - b.mtime);
   for (const r of records.slice(0, records.length - RECORD_CAP))
     rmSync(join(dir, r.name), { force: true });
+}
+function pruneEnded(dir) {
+  const markers = readdirSync(dir).filter((n) => !n.includes(".tmp.") && !n.includes(".taken."));
+  if (markers.length <= RECORD_CAP)
+    return;
+  markers.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+  for (const name of markers.slice(0, markers.length - RECORD_CAP))
+    rmSync(join(dir, name), { force: true });
 }
 function pruneSessions(base, self) {
   const root = agentsRoot(base);

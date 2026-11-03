@@ -197,6 +197,11 @@ for (const mode of ["push", "tools-only"] as const) {
     expect(by("from the subagent")).toEqual({ sender: `${EMAIL}/lead`, via: child });
     expect(by("from the main agent")).toEqual({ sender: `${EMAIL}/lead`, via: null });
     expect(childRow(id, "a573e90bd84bce7ff")?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+    // The peer's push carries the child as via; the main agent's carries none.
+    const push = (body: string) => peer.pushes.find((p) => p.content.includes(body));
+    await until(() => push("from the subagent") && push("from the main agent"), 10_000, "the peer's pushes");
+    expect(push("from the subagent")!.meta).toMatchObject({ via: child });
+    expect(push("from the main agent")!.meta).not.toHaveProperty("via");
     // The peer's history renders the child.
     const history = await texts(peer, "dm_history", {});
     expect(history.texts.join("\n")).toContain(child);
@@ -205,6 +210,22 @@ for (const mode of ["push", "tools-only"] as const) {
     expect(bind.error).toBe(true);
     expect(bind.texts.join("\n")).toContain("child");
 
+    if (mode === "tools-only") {
+      // The server ends the root (the idle sweep, say), which ends its child; the
+      // subagent's next call registers it again under the root, never as a root
+      // of its own (#553 audit 3).
+      srv.app.mcp.sessions.release(hostedSessionId(user(), CLIENT_ID, id), "idle");
+      await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the root's end to end its child");
+      // The end freed the root's name, so the new root is unbound: the child is
+      // refused as its subagent, and its row is a child again, not a root.
+      const again = await modelCall(root, "dm_send", { to: "peer", body: "after the root's end" }, { agent: "a573e90bd84bce7ff" });
+      expect(again.error).toBe(true);
+      expect(again.texts.join("\n")).toContain("this session is a subagent of");
+      expect(childRow(id, "a573e90bd84bce7ff")?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+      expect(by("after the root's end")).toBeNull();
+      expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
+    }
+
     runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: "a573e90bd84bce7ff" });
     await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the child's hosted session to end");
     // The root is untouched.
@@ -212,7 +233,7 @@ for (const mode of ["push", "tools-only"] as const) {
   }, 60_000);
 }
 
-test("a call whose PreToolUse record is missing, stale or from a recycled pid is refused and writes nothing", async () => {
+test("a call whose PreToolUse record is missing or from a recycled pid is refused and writes nothing", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const root = await plugin("sess-sub-missing");
   runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
