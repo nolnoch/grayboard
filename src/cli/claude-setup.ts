@@ -12,7 +12,7 @@
 // disabled or absent plugin exits 1; `mcp remove` of an absent entry exits 1.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { CLAUDE_PLUGIN, launchCommand } from "../shared/claude_channels.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { claudeSettingsPath, installSessionStartHook, removeSessionStartHook } from "./session_start.ts";
@@ -24,11 +24,16 @@ const BUN_HINT = "the grayboard Claude Code plugin runs on Bun; install it (http
 type Spawned = { exitCode: number; out: string };
 export type ClaudeCli = (args: string[], show?: boolean) => Spawned;
 
-/** Run `claude` with `args`: shown on this process's stdout/stderr, or captured. */
-export function claudeCli(claude: string): ClaudeCli {
+/** How long one `claude` command may run: a marketplace fetch is a git fetch, which a stalled network would hang. */
+export const CLAUDE_TIMEOUT_MS = 120_000;
+
+/** Run `claude` with `args`: shown on this process's stdout/stderr, or captured. A command past `timeoutMs` is killed and fails, saying so. */
+export function claudeCli(claude: string, timeoutMs = CLAUDE_TIMEOUT_MS): ClaudeCli {
   return (args, show = false) => {
-    const r = Bun.spawnSync([claude, ...args], { stdin: "ignore", stdout: show ? "inherit" : "pipe", stderr: show ? "inherit" : "pipe" });
-    return { exitCode: r.exitCode ?? 1, out: show ? "" : `${r.stdout?.toString() ?? ""}${r.stderr?.toString() ?? ""}`.trim() };
+    const r = Bun.spawnSync([claude, ...args], { stdin: "ignore", stdout: show ? "inherit" : "pipe", stderr: show ? "inherit" : "pipe", timeout: timeoutMs });
+    const out = show ? "" : `${r.stdout?.toString() ?? ""}${r.stderr?.toString() ?? ""}`.trim();
+    if (r.exitedDueToTimeout) return { exitCode: 1, out: [`timed out after ${timeoutMs / 1000}s`, out].filter(Boolean).join(": ") };
+    return { exitCode: r.exitCode ?? 1, out };
   };
 }
 
@@ -78,6 +83,48 @@ export function installClaudePlugin(run: ClaudeCli, server: string, which: (cmd:
 }
 
 /**
+ * Server mode, plugin installed and enabled: fetch the marketplace's current
+ * catalog and update the plugin to it. Returns `claude plugin update`'s own
+ * report (the version it updated to, or that it was already current); throws
+ * on a failed `claude` command. A running session keeps the old plugin until
+ * restarted. The catalog's pin moves only when a release's `plugin-pin` PR
+ * merges, so an update right after a release can find nothing newer.
+ */
+export function refreshClaudePlugin(run: ClaudeCli): string[] {
+  if (!pluginEnabled()) return [];
+  let report = "";
+  for (const args of [["plugin", "marketplace", "update", MARKETPLACE], ["plugin", "update", CLAUDE_PLUGIN]]) {
+    const r = run(args);
+    if (r.exitCode !== 0) throw new Error(`\`${shown(args)}\` failed${r.out ? `: ${r.out}` : ""}`);
+    report = r.out;
+  }
+  return [`Claude Code plugin ${CLAUDE_PLUGIN}: ${report || "update reported nothing"}. Restart Claude Code sessions to load a new version; a release's pin reaches the marketplace only when its plugin-pin PR merges.`];
+}
+
+/** Whether user settings enable the hosted plugin. Throws when the file can't be parsed. */
+export const pluginEnabled = () => userJson<{ enabledPlugins?: Record<string, unknown> }>(claudeSettingsPath())?.enabledPlugins?.[CLAUDE_PLUGIN] === true;
+
+/**
+ * Warnings for `.mcp.json` files in `dir` and its ancestors that hold a
+ * `grayboard` entry, which beside the hosted plugin runs a second grayboard
+ * in a session started there. A file that can't be parsed is named, not
+ * thrown: it belongs to some project, and a check that only warns must not
+ * fail the run.
+ */
+export function projectEntryWarnings(dir: string): string[] {
+  const warnings: string[] = [];
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    const path = join(d, ".mcp.json");
+    try {
+      if (userJson<{ mcpServers?: Record<string, unknown> }>(path)?.mcpServers?.grayboard) warnings.push(`${path} has a grayboard entry, which runs a second grayboard beside the plugin in a session started there; remove it`);
+    } catch {
+      warnings.push(`${path} isn't valid JSON, so it wasn't checked for a grayboard entry`);
+    }
+    if (dirname(d) === d) return warnings;
+  }
+}
+
+/**
  * Local mode: register `command args` at user scope, title sessions with the
  * SessionStart hook, and disable the hosted plugin if it's enabled. Returns
  * what changed; throws on a failed registration.
@@ -93,7 +140,7 @@ export function registerClaudeLocal(run: ClaudeCli, command: string, args: strin
   const notes = [`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`];
   // `disable` fails on a plugin that's disabled or absent, so it runs only
   // where user settings enable it.
-  if (userJson<{ enabledPlugins?: Record<string, unknown> }>(claudeSettingsPath())?.enabledPlugins?.[CLAUDE_PLUGIN] === true) {
+  if (pluginEnabled()) {
     const disable = ["plugin", "disable", CLAUDE_PLUGIN];
     const d = run(disable);
     if (d.exitCode !== 0) throw new Error(`\`${shown(disable)}\` failed${d.out ? `: ${d.out}` : ""}`);
