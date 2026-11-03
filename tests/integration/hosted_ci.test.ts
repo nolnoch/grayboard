@@ -35,17 +35,44 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(job.name).toBe("Hosted required"); expect(job.needs).toBe("hosted");
   expect(job.if).toBe("${{ always() }}"); expect(job.steps).toHaveLength(1);
   expect(job.steps[0].env.RESULT).toBe("${{ needs.hosted.result }}");
-  expect(workflow.jobs.hosted.if).toBeUndefined();
+  // The matrix skips only when the caller asks: a pin-only PR (#507).
+  expect(workflow.jobs.hosted.if).toBe("${{ !inputs.skip }}");
+  expect(job.steps[0].env.SKIP).toBe("${{ inputs.skip }}");
   expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
   expect(workflow.jobs.hosted["continue-on-error"]).toBeUndefined();
   expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["strict", "git", "config", "host", "matrix", "native", "durable"]);
   const caller = Bun.YAML.parse(read(".github/workflows/test.yml")) as any;
   expect(caller.jobs.hosted.name).toBeUndefined();
   expect(caller.jobs.hosted.uses).toBe("./.github/workflows/hosted.yml");
+  expect(caller.jobs.hosted.if).toBe("${{ !cancelled() }}");
+  expect(caller.jobs.hosted.with).toEqual({ skip: "${{ needs.scope.outputs.pin-only == 'true' }}" });
+  for (const skip of ["true", "false", ""]) {
+    for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
+      const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result, SKIP: skip } });
+      expect(process.exitCode === 0).toBe(result === "success" || (skip === "true" && result === "skipped"));
+    }
+  }
+});
+
+// #507: a PR's newer push cancels its older runs, never a master push; a
+// pin-only PR's required test check runs the pin check, and a failed scope
+// fails it rather than skipping it (a skipped required check passes).
+test("PR runs cancel superseded ones, and the required test check fails closed on a failed scope", () => {
+  const workflow = Bun.YAML.parse(read(".github/workflows/test.yml")) as any;
+  expect(workflow.concurrency).toEqual({
+    group: "${{ github.event_name == 'pull_request' && format('test-pr-{0}', github.event.pull_request.number) || format('test-run-{0}', github.run_id) }}",
+    "cancel-in-progress": true,
+  });
+  const test = workflow.jobs.test;
+  expect(test.needs).toBe("scope");
+  expect(test.if).toBe("${{ !cancelled() }}");
+  expect(test.steps[0].env.SCOPE).toBe("${{ needs.scope.result }}");
   for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
-    const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result } });
+    const process = Bun.spawnSync(["bash", "-c", test.steps[0].run], { env: { ...Bun.env, SCOPE: result } });
     expect(process.exitCode === 0).toBe(result === "success");
   }
+  const suites = test.steps.filter((step: any) => step.name === "Typecheck" || step.name === "Test");
+  expect(suites.map((step: any) => step.if)).toEqual(["env.PIN_ONLY != 'true'", "env.PIN_ONLY != 'true'"]);
 });
 
 test("hosted gates preserve the signed tag-only release boundary", () => {
@@ -75,7 +102,7 @@ test("hosted gates preserve the signed tag-only release boundary", () => {
 test("outside-network hosted suites run only nightly, explicitly, or across the release boundary", () => {
   const hosted = Bun.YAML.parse(read(".github/workflows/hosted.yml")) as any;
   expect(Object.keys(hosted.on)).toEqual(["workflow_call"]);
-  expect(Object.keys(hosted.on.workflow_call.inputs)).toEqual(["rep"]);
+  expect(Object.keys(hosted.on.workflow_call.inputs)).toEqual(["rep", "skip"]);
   expect(JSON.stringify(hosted)).not.toMatch(/hosted-(?:live|public)|CIMD_LIVE|PUBLIC_REVISION/);
   const nightly = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;
   expect(Object.keys(nightly.on)).toEqual(["schedule", "workflow_dispatch", "workflow_call"]);
