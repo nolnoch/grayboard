@@ -547,8 +547,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
         isError: true,
       };
     }
-    if (parent && replyPeer(parent, ADDRS) !== recipient) {
-      return { ...text(`error: ${replyPeerError(parent.id, replyPeer(parent, ADDRS))}`), isError: true };
+    const peer = parent ? replyPeer(parent, ADDRS) : null;
+    if (parent && peer !== recipient) {
+      return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }));

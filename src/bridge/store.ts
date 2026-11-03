@@ -75,9 +75,14 @@ export class Store {
       .run(t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id);
   }
 
-  /** Move a thread's reply target forward; never back. */
-  advance(threadTs: string, id: number): void {
-    this.db.prepare(`UPDATE threads SET last_id = MAX(last_id, ?) WHERE thread_ts = ?`).run(id, threadTs);
+  /**
+   * Move a thread's reply target forward; never back. A DM item names its
+   * sender as `peer`, the address the next reply must go to (#524).
+   */
+  advance(threadTs: string, id: number, peer?: string): void {
+    this.db
+      .prepare(`UPDATE threads SET peer = CASE WHEN ? IS NOT NULL AND ? > last_id THEN ? ELSE peer END, last_id = MAX(last_id, ?) WHERE thread_ts = ?`)
+      .run(peer ?? null, id, peer ?? null, id, threadTs);
   }
 
   enqueue(params: unknown): number {

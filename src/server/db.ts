@@ -169,8 +169,8 @@ export interface Repo {
     thread(userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
     threadByTs(userId: number, threadTs: string): SlackThread | undefined;
     addThread(userId: number, t: SlackThread): void;
-    // Moves a thread's reply target forward, never back.
-    advanceThread(userId: number, threadTs: string, id: number): void;
+    // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
+    advanceThread(userId: number, threadTs: string, id: number, peer?: string): void;
     // How far an outbound item got in Slack, keyed by its grayboard ref
     // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
     progress(userId: number, ref: string): unknown;
@@ -947,8 +947,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           [userId, t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id],
         );
       },
-      advanceThread(userId, threadTs, id) {
-        db.run("UPDATE slack_threads SET last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?", [id, userId, threadTs]);
+      advanceThread(userId, threadTs, id, peer) {
+        db.run(
+          "UPDATE slack_threads SET peer = CASE WHEN ? IS NOT NULL AND ? > last_id THEN ? ELSE peer END, last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?",
+          [peer ?? null, id, peer ?? null, id, userId, threadTs],
+        );
       },
       progress(userId, ref) {
         const r = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);

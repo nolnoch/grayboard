@@ -171,7 +171,7 @@ export function replySender(parent: { sender: string; recipient: string }, holds
  * would thread under a message one of whose parties can't read it.
  */
 export function replyPeer(parent: { sender: string; recipient: string }, me: string[]): string {
-  return me.includes(parent.sender) ? parent.recipient : parent.sender;
+  return me.includes(parent.recipient) ? parent.sender : parent.recipient;
 }
 
 export function replyPeerError(parentId: number, peer: string): string {
