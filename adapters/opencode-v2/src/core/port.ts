@@ -29,6 +29,10 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   // `signal` is the run loop's: a host whose admit waits (Claude Code's
   // `initialized`) races it, so a stop releases the wait without a pause.
   admit(e: E, item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
+  // Optional: the server committed the receipt for these item ids (an
+  // admission's `item.id`). A throw is reported to the diagnostic sink and
+  // never fails the run loop. OpenCode V2 and the Claude Code plugin omit it.
+  receipted?(e: E, ids: readonly string[]): void;
 }
 export interface CredentialPort<E extends Enrollment> {
   capture(sessionID: string): Promise<E>;            // a fresh enrollment for this root

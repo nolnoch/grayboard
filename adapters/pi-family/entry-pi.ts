@@ -45,6 +45,7 @@ export default function grayboard(pi: ExtensionAPI) {
       if (ctx?.hasUI) ctx.ui.notify(message, level);
       else console.error(message);
     },
+    record: data => pi.appendEntry("grayboard-delivery", data),
   });
 
   pi.on("session_start", async (event, context) => {

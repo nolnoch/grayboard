@@ -34744,7 +34744,7 @@ class DeliveryStopped extends Error {
 var key = "diagnostics:v1";
 var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register"];
+var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook"];
 var operations = new Set(OPERATIONS);
 var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
@@ -36492,6 +36492,11 @@ class Controller {
                 recoveries = 0;
                 unreachable = 0;
                 pendingItem = undefined;
+                try {
+                  this.port.receipted?.(e, ids);
+                } catch (error) {
+                  this.failure("receipt_hook", error, r);
+                }
               });
               if (items.length === 100)
                 dirty = true;
@@ -36988,7 +36993,8 @@ class RootDelivery {
         if (signal.aborted)
           throw new Refusal("paused", `the ${c.harness} session closed`);
         await this.o.admit(item, stableID, identity, signal);
-      }
+      },
+      ...this.o.receipted ? { receipted: (_e, ids) => this.o.receipted(ids) } : {}
     };
   }
   restart() {
