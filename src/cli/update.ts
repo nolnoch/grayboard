@@ -48,15 +48,21 @@ async function get(url: string, what: string, ms: number, init?: RequestInit): P
   throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${status})`);
 }
 
-/** True if version `a` is newer than `b` ("v1.2.0" vs "1.10.0" compares numerically). */
-export function newer(a: string, b: string): boolean {
-  const parts = (v: string) => v.replace(/^v/, "").split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0);
-  const [x, y] = [parts(a), parts(b)];
-  for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
-  }
-  return false;
+/** A release version, `X.Y.Z[-pre]` with an optional leading `v`: a release tag or a `package.json` version. */
+export const VERSION = /^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/;
+
+/**
+ * Semver order of versions `a` and `b` (negative, zero, positive), so a
+ * pre-release sorts before its release ("2.3.1-rc1" < "2.3.1"). Throws on
+ * anything that isn't a {@link VERSION}, naming it.
+ */
+export function versionOrder(a: string, b: string): number {
+  for (const v of [a, b]) if (!VERSION.test(v)) throw new Error(`${JSON.stringify(v)} isn't a release version`);
+  return Bun.semver.order(a.replace(/^v/, ""), b.replace(/^v/, ""));
 }
+
+/** True if version `a` is newer than `b` ("v1.2.0" vs "1.10.0" compares numerically). */
+export const newer = (a: string, b: string): boolean => versionOrder(a, b) > 0;
 
 // What selfUpdate did: nothing (already current), or installed `tag`, whose
 // SHA256SUMS key `keyId` signed. `origin` is where the release came from.
