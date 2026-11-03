@@ -351,8 +351,9 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 // grayboard entry in <agentDir>/mcp.json, whose push-mode `grayboard mcp` omp
 // starts and whose tools omp serves. omp runs task subagents in-process on
 // the main session's MCP connections, so each live subagent's copy of the
-// adapter sees every channel notification too (#526). A peer's DM while two
-// subagents are held open (a bash gate) reaches main once and no subagent.
+// adapter sees every channel notification too (#526). A peer's DM during two
+// subagents' runs, and another after they finish, each reach main once and no
+// subagent.
 export function ompLocalTaskScenario(dir: string): Promise<void> {
   const gate = join(dir, "go");
   return named(async () => {
@@ -377,19 +378,29 @@ export function ompLocalTaskScenario(dir: string): Promise<void> {
       await omp.command({ type: "get_state" }, 30_000);
       await until(async () => (await peer.call("peer_list")).peers.some((x: any) => x.handle === "omp-local"), 30_000, "omp-local online");
 
-      // Both subagents are mid-run, held at the gate, when the DM lands.
+      // The first DM is sent while both subagents are held at the gate; the
+      // gate opens without waiting for it, so it lands mid-run or after.
       await omp.command({ type: "prompt", message: "fan out" });
       await until(() => new Set(model.requests.filter((r) => fromChild(r.body)).map((r) => childOf(r.body))).size === 2, 60_000, "both subagents running");
-      const ping = (await peer.call("dm_send", { to: "omp-local", body: "ping" })).message_id as number;
+      const pings: number[] = [];
+      const pongs = () => peer!.pushes.filter((x) => x.content.includes("pong")).length;
+      pings.push((await peer.call("dm_send", { to: "omp-local", body: "ping" })).message_id);
       writeFileSync(gate, "");
-      await until(() => peer.pushes.find((x) => x.content.includes("pong")), 60_000, "pong at peer");
+      await until(() => pongs() === 1, 60_000, "first pong at peer");
+      await idle(omp);
+      // The second lands with both subagents finished and still live (omp
+      // keeps them for their idle TTL): a push must not wake one (#470).
+      pings.push((await peer.call("dm_send", { to: "omp-local", body: "ping" })).message_id);
+      await until(() => pongs() === 2, 60_000, "second pong at peer");
       await idle(omp);
 
-      const carries = (r: ChatRequest) => r.messages.some((m) => messageText(m).includes(`message_id="${ping}"`));
-      expect(model.requests.filter((r) => fromChild(r.body) && carries(r.body)).map((r) => childOf(r.body))).toEqual([]);
-      expect(model.requests.filter((r) => !fromChild(r.body) && carries(r.body)).length).toBeGreaterThan(0);
-      expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
-      expect((await peer.call("dm_thread", { thread: ping })).map((m: any) => [m.sender, m.body])).toEqual([["peer", "ping"], ["omp-local", "pong"]]);
+      for (const ping of pings) {
+        const carries = (r: ChatRequest) => r.messages.some((m) => messageText(m).includes(`message_id="${ping}"`));
+        expect(model.requests.filter((r) => fromChild(r.body) && carries(r.body)).map((r) => childOf(r.body))).toEqual([]);
+        expect(model.requests.filter((r) => !fromChild(r.body) && carries(r.body)).length).toBeGreaterThan(0);
+        expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
+        expect((await peer.call("dm_thread", { thread: ping })).map((m: any) => [m.sender, m.body])).toEqual([["peer", "ping"], ["omp-local", "pong"]]);
+      }
       expect(model.unhandled).toEqual([]);
       expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
       await omp.quit();
