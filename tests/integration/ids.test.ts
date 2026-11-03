@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { storeAttachment } from "../../src/core/attachments.ts";
+import { mintSessionKey } from "../../src/core/bindings.ts";
 import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
 import { SqliteBlobs } from "../../src/local/blobs.ts";
 import { runCli } from "../support/cli.ts";
@@ -16,6 +17,7 @@ import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
 import { sigkill } from "../support/procs.ts";
+import { releaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
 
 let dir: string;
@@ -408,7 +410,7 @@ test("a subagent's call is its root's child: its DM and post are stored with its
   expect(read[1]).not.toHaveProperty("via");
 
   // The first sight was audited once, however many calls the child made.
-  expect(childSeen()).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: expect.any(Number) } }]);
+  expect(childSeen()).toEqual([{ actor: root, target: child, detail: { child, root, raw: "reviewer-1", pid: pidOfId(root), liveness_pid: pidOfId(root) } }]);
   // A second subagent is a second child.
   const other = (await asChild<Who>(fe, "reviewer-2", "whoami")).id;
   expect(other).not.toBe(child);
@@ -457,7 +459,7 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
   const listed = JSON.stringify(await be.call("peer_list", {}));
   expect(listed).not.toContain(child);
 
-  // Another process's read of live sessions leaves a live root's child alone: it has no process row of its own.
+  // Another process's read of live sessions leaves a live root's child alone: it is judged by its root, never by its own row.
   const qa = await session("qa");
   await qa.call("peer_list", {});
   expect(await runCli(["claims"], { cwd: dir, env: localEnv(dir) })).toMatchObject({ code: 0 });
@@ -474,10 +476,67 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
   expect(ended[1]!.detail).toMatchObject({ held: ["fe"], children: [child, sibling].sort() });
   expect(ended[0]!.detail).toMatchObject({ held: [], why: `its root ${root} ended` });
   expect(ended[0]!.detail).not.toHaveProperty("children");
+  // Their copies of its liveness row (#539) went in the same end.
+  expect(rows(`SELECT session_id FROM bindings WHERE session_id IN (?, ?, ?)`, root, child, sibling)).toEqual([]);
   // Ended or not, a child's ID is never an address: still child_session, naming the name its root held.
   expect(await refusal(be, "dm_send", { to: child, body: "after" })).toBe(refused);
   expect(await refusal(be, "board_post", { board: "e2e", body: `@${child} after` })).toBe(refused);
 }, 30_000);
+
+// #539: v2.0.0–v2.3.1 end, on every open, each unended ID with no bindings
+// row (their ORPHAN_SQL, src/local/binding.ts:286). A child's liveness row is
+// a copy of its root's (registerChild), so the last of them, sharing the bus,
+// finds the child live: at its own start, at its peer_list, and in a CLI run
+// while the root's grayboard restarts under its harness. The child keeps
+// working as the same ID, and neither version lists it.
+const CHILDLESS_SWEEP = "v2.3.1";
+const endWhy = (id: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'id.ended' AND target = ?`, id).map((r) => JSON.parse(r.detail).why);
+
+test(`${CHILDLESS_SWEEP} sharing the bus leaves a live root's child live through the root's keyed restart; the root's end ends it and drops its row`, async () => {
+  const old = await releaseBinaries(CHILDLESS_SWEEP);
+  let fe = await localSession(dir, "fe", { extra: { BUS_SESSION_KEY: mintSessionKey(), ...pauseEnv("attach:before-txn") } });
+  const root = (await fe.call("whoami")).id as string;
+  const child = (await asChild<Who>(fe, "reviewer-1", "whoami")).id;
+  // The release's grayboard mcp (an older Claude Code plugin) starts on the bus, then lists peers.
+  const be = await localSession(dir, "be", { bin: old.cli });
+  expect(JSON.stringify(await be.call("peer_list", {}))).not.toContain(child);
+  const sent = await asChild<Sent>(fe, "reviewer-1", "dm_send", { to: "be", body: "after the sweep" });
+  expect(rows(`SELECT sender_id, via FROM messages WHERE id = ?`, sent.message_id)).toEqual([{ sender_id: child, via: child }]);
+
+  // The root's grayboard crashes and restarts under its live harness; the release's CLI opens the bus while it's down.
+  const restarted = fe.restart("crash");
+  await until(() => fe.stderr().includes("test pause hit: attach:before-txn"));
+  expect(await runCli(["claims"], { bin: old.cli, cwd: dir, env: localEnv(dir) })).toMatchObject({ code: 0 });
+  release("attach:before-txn");
+  fe = await restarted;
+  // The restarted root resolves the subagent anew: the same child, live, listed by neither version.
+  expect(await asChild<Who>(fe, "reviewer-1", "whoami")).toMatchObject({ id: child, root, child: true });
+  expect(endedAt(child)).toBeNull();
+  expect(JSON.stringify(await fe.call("peer_list", {}))).not.toContain(child);
+  expect(JSON.stringify(await be.call("peer_list", {}))).not.toContain(child);
+  // Its liveness row is its root's process (the harness): no name, no process of its own.
+  expect(rows(`SELECT name, pid, harness_rule, attached_pid FROM bindings WHERE session_id = ?`, child)).toEqual([{ name: null, pid: fe.harnessPid, harness_rule: "ancestor", attached_pid: null }]);
+
+  // The root ends when its harness exits (found by this tree's next open): the child with it, and its row goes.
+  await stopSession(be.c);
+  await stopSession(fe.c);
+  expect(await runCli(["claims"], { cwd: dir, env: localEnv(dir) })).toMatchObject({ code: 0 });
+  expect(endedAt(root)).not.toBeNull();
+  expect(endWhy(child)).toEqual([`its root ${root} ended`]);
+  expect(rows(`SELECT session_id FROM bindings WHERE session_id IN (?, ?)`, root, child)).toEqual([]);
+}, 120_000);
+
+test(`${CHILDLESS_SWEEP} ends a dead root's child with it: the child's row is its root's process`, async () => {
+  const old = await releaseBinaries(CHILDLESS_SWEEP);
+  const fe = await session("fe");
+  const root = (await fe.call("whoami")).id as string;
+  const child = (await asChild<Who>(fe, "reviewer-1", "whoami")).id;
+  await sigkill(pidOfId(root));
+  expect(await runCli(["claims"], { bin: old.cli, cwd: dir, env: localEnv(dir) })).toMatchObject({ code: 0 });
+  expect(endedAt(root)).not.toBeNull();
+  expect(endedAt(child)).not.toBeNull();
+  expect(rows(`SELECT session_id FROM bindings WHERE session_id IN (?, ?)`, root, child)).toEqual([]);
+}, 120_000);
 
 // The root's read state, as the rows a read or an ack would move.
 const readState = () => ({

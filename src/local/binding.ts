@@ -54,11 +54,13 @@ export type Harness = { pid: number; proc_start: string | null; rule: HarnessRul
 
 // One row per session, however many aliases it holds (#284 S7). The holds
 // are sorted in JS, holdsOf's order: an aggregate ORDER BY needs SQLite 3.44,
-// newer than some macOS system libraries Bun links against.
+// newer than some macOS system libraries Bun links against. A child
+// session's row (#539) is a copy of its root's liveness kept for older
+// releases (registerChild), never a session here: it is left out.
 const SESSION_SQL = `SELECT b.session_id, b.name AS legacy_name,
     (SELECT json_group_array(json_array(bound_at, address)) FROM alias_holds WHERE id = b.session_id) AS names_json,
     b.pid, b.proc_start, i.harness, b.harness_pid, i.cwd, b.started_at, b.harness_rule, b.attached_pid, b.attached_start
-  FROM bindings b LEFT JOIN ids i ON i.id = b.session_id`;
+  FROM bindings b LEFT JOIN ids i ON i.id = b.session_id WHERE i.root_id IS NULL`;
 
 type RawSessionRow = Omit<SessionRow, "name" | "names"> & { legacy_name: string | null; names_json: string };
 
@@ -155,7 +157,8 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
  * after it went idle: an ids row with the root's harness, cwd and keyedness,
  * delivery 'none' (it receives nothing and is never an address) and
  * `root_id`, which ends it with its root. The first sight is audited
- * `id.child_seen` with the harness's raw id and this process's pid. A row
+ * `id.child_seen` with the harness's raw id, this process's pid and the pid
+ * its liveness row follows. A row
  * already there is the same child (a root's keyed restart, or a quiet
  * subagent's return) if it names this root and hasn't ended; anything else
  * is refused. A local child has no end of its own, so the root's other
@@ -163,6 +166,15 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
  * DEFAULT_IDLE_SECONDS of `now`, as hosted counts its live child rows.
  * `raw` is harness-asserted: the child acts only under its root's
  * addresses, so the claim grants nothing and attributes the write.
+ *
+ * Its bindings row (#539) copies the root's liveness (pid, start time,
+ * harness pid and rule), unbound, with no attached process: v2.0.0 to v2.3.1
+ * end every unended ID with no bindings row on each open, and judge this one
+ * alive exactly while the root's is, leaving it out of their live sessions
+ * as they do any delivery 'none' ID. A root's row keeps its pid and start
+ * time for its life (a keyed restart re-attaches only to the same harness),
+ * so the copy stays true. This tree never reads it as a session
+ * (SESSION_SQL) and drops it when the root ends (end).
  */
 export function registerChild(db: Database, root: string, child: string, raw: string, now = Date.now()): void {
   db.transaction(() => {
@@ -173,10 +185,15 @@ export function registerChild(db: Database, root: string, child: string, raw: st
       .get(root, child, now - DEFAULT_IDLE_SECONDS * 1000) as { n: number };
     if (n >= MAX_CHILDREN) throw new CoreError(childCapacity(root));
     if (prior) return;
+    const live = db.prepare(`SELECT pid, proc_start, harness_pid, harness_rule FROM bindings WHERE session_id = ?`).get(root) as
+      { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
+    if (!live) throw new Error(`grayboard: session ${root} has no bindings row`);
     const r = db.prepare(`SELECT harness, cwd, keyed FROM ids WHERE id = ?`).get(root) as { harness: string | null; cwd: string | null; keyed: number } | null;
     const reused = registerId(db, { id: child, principal: null, harness: r?.harness ?? null, cwd: r?.cwd ?? null, launcher: false, keyed: r?.keyed === 1, rootId: root }, now);
     if (reused) writeCoreAudit(db, "id.reused", child, child, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: process.pid });
-    writeCoreAudit(db, "id.child_seen", root, child, { child, root, raw, pid: process.pid });
+    db.prepare(`INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(child, live.pid, live.proc_start, live.harness_pid, now, live.harness_rule);
+    writeCoreAudit(db, "id.child_seen", root, child, { child, root, raw, pid: process.pid, liveness_pid: live.pid });
   }).immediate();
 }
 
@@ -317,10 +334,13 @@ function merge(into: Ended, id: string, r: EndedSession): void {
 
 // The session ends (core/session_end.ts): its liveness row goes, and with
 // it everything deliverable against its ID. A 1.x process's name is its
-// bindings row's. Callers are inside a transaction.
+// bindings row's. endSession ends its child sessions too, so their copies of
+// its liveness row (registerChild) go with it. Callers are inside a transaction.
 function end(db: Database, sessionId: string, why: string | null, now: number): EndedSession {
   const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
-  return endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now });
+  const r = endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now });
+  db.prepare(`DELETE FROM bindings WHERE session_id IN (SELECT id FROM ids WHERE root_id = ?)`).run(sessionId);
+  return r;
 }
 
 // Reap rows whose process is gone. Callers are inside a transaction. The
@@ -340,7 +360,8 @@ export function reap(db: Database, rows: SessionRow[], now: number): Ended {
 
 // Unended IDs with no bindings row: an older grayboard sharing the file
 // reaped the row, which deletes only that. Every live local session has one,
-// so these sessions are over. A child session (#523) has none of its own: it
+// so these sessions are over. A child session (#523) is judged by its root,
+// never by its own row (a copy of the root's, for older releases; #539): it
 // is over when its root is (ended, or pruned), which an older grayboard that
 // ended the root without knowing children left unended.
 const ORPHAN_WHERE = `ended_at IS NULL AND (
@@ -349,7 +370,7 @@ const ORPHAN_WHERE = `ended_at IS NULL AND (
 
 /**
  * Every live session row that receives, ending the dead ones: those whose
- * process is gone, and orphans (ORPHAN_SQL). Tools-only processes (#284 S7)
+ * process is gone, and orphans (ORPHAN_WHERE). Tools-only processes (#284 S7)
  * and viewers (S9) are ended like any session but never returned: they own
  * no shell, take no name and can't be reached. The probe runs before the write lock; each
  * candidate is re-checked inside it.
@@ -387,7 +408,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
       const row = db.prepare(`SELECT root_id FROM ids WHERE id = ? AND ${ORPHAN_WHERE}`).get(id) as { root_id: string | null } | null;
       if (row) {
         const why = row.root_id === null ? "its process row was removed by an older grayboard" : `its root ${row.root_id} ended`;
-        merge(out, id, endSession(db, localMail(db), id, { why, now }));
+        merge(out, id, end(db, id, why, now));
       }
       return out;
     });
@@ -421,7 +442,7 @@ function knownNames(db: Database): string[] {
 // 1.x process by its bindings row's name.
 function holdingSession(db: Database, name: string, sessionId: string | null = null): SessionRow | null {
   const row = db.prepare(
-    `${SESSION_SQL} WHERE (EXISTS (SELECT 1 FROM alias_holds WHERE id = b.session_id AND address = ?1) OR b.name = ?1) AND b.session_id IS NOT ?2`,
+    `${SESSION_SQL} AND (EXISTS (SELECT 1 FROM alias_holds WHERE id = b.session_id AND address = ?1) OR b.name = ?1) AND b.session_id IS NOT ?2`,
   ).get(name, sessionId) as RawSessionRow | null;
   return row ? sessionRow(row) : null;
 }
