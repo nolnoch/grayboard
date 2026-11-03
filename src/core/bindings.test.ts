@@ -3,10 +3,21 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 
 import { aliasScope, addressParts } from "./addresses.ts";
-import { actingAs, asSessionId, holdAlias, holdsOf, idAddress, mintSessionKey, primaryOf, sessionAddresses } from "./bindings.ts";
+import { actingAs, asSessionId, holdAlias, holdsOf, idAddress, mintSessionKey, primaryOf, replyPeer, replySender, sessionAddresses } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
 import { SESSION_ID, crockford13 } from "./session_id.ts";
+
+// #524: a reply goes to the parent's other party; when one session holds both,
+// it goes from the recipient (replySender's default) back to the sender.
+test("replyPeer names the parent's other party, the sender when you hold both", () => {
+  const m = { sender: "a", recipient: "b" };
+  expect(replyPeer(m, ["b"])).toBe("a");
+  expect(replyPeer(m, ["a"])).toBe("b");
+  expect(replyPeer(m, ["a", "b"])).toBe("a");
+  expect(replySender(m, ["a", "b"])).toBe("b");
+  expect(replyPeer({ sender: "a", recipient: "a" }, ["a"])).toBe("a");
+});
 
 // #284 decision 2: the session ID is the same 64 bits, as 13 Crockford characters.
 test("crockford13 encodes 64 bits as 13 lowercase Crockford characters, big-endian", () => {

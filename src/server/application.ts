@@ -11,7 +11,7 @@ import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
-  idStatuses, logBinding, orderCandidates, primaryOf, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
+  idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate, type Continuity,
 } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
@@ -1146,8 +1146,11 @@ function prepareSend(
   const decision = canSend(from, { kind: "user", address: to.address }, { db: repo, now: hub.now(), humanReach: hub.humanReach });
   if (!decision.allow) fail(decision.code, decision.reason);
 
-  if (parentId !== null && !participant(repo.messages.getById(parentId), session.addresses)) {
-    fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
+  if (parentId !== null) {
+    const parent = repo.messages.getById(parentId);
+    if (!participant(parent, session.addresses)) fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
+    const peer = replyPeer(parent, session.addresses);
+    if (to.address !== peer) fail("bad_request", replyPeerError(parentId, peer));
   }
   return { from, to: to.address, body, parentId, pending, ids, digests };
 }

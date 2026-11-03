@@ -440,6 +440,33 @@ test("slack: a reply sent while the one before it is still sending threads under
   store.close();
 });
 
+test("slack: a DM thread's peer follows the agent's latest message, so the next reply goes to its other party (#524)", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const bus: Bus = {
+    call: async (name, args) => {
+      if (name === "dm_thread") return { ok: true, value: [{ id: 1 }] };
+      if (name === "dm_send") return sent.push(args), { ok: true, value: { message_id: 4, delivered_now: true } };
+      return { ok: true, value: {} };
+    },
+    ...noFiles,
+  };
+  const store = new Store(join(dir, "b.db"));
+  // The agent opened the thread as its ID (1); the owner replied (2).
+  store.addThread({ thread_ts: "1.0", kind: "dm", board: null, root_id: 1, peer: "id:s", last_id: 2 });
+  const f: Fetch = async () => Response.json({ ok: true, ts: "9.0" });
+  const relay = new Relay(store, bus, new SlackWeb("xoxb-t", "http://slack.test/api/", f), { channel: "G1", owner: "U1", onFatal: () => {} });
+  // It bound `be` and answered 2 as be (3).
+  store.enqueue({ content: "bound now", meta: { message_id: "3", parent_id: "2", from: "be" } });
+  await relay.drain();
+  expect(store.byTs("1.0")).toMatchObject({ peer: "be", last_id: 3 });
+  await relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text: "thanks", ts: "5.0", thread_ts: "1.0" } });
+  expect(sent).toEqual([{ to: "be", body: "thanks", parent_id: 3 }]);
+  // An older item never moves the peer back.
+  store.advance("1.0", 2, "id:s");
+  expect(store.byTs("1.0")).toMatchObject({ peer: "be", last_id: 4 });
+  store.close();
+});
+
 test("slack: an agent's reply that arrives before the owner's post is mapped still threads under it (#232)", async () => {
   const said: Record<string, unknown>[] = [];
   let spoke!: () => void;
