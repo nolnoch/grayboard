@@ -30,6 +30,7 @@ const id = z.number().int().positive();
 const ids = z.array(id);
 const attachmentIds = ids.describe("IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.");
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
+const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
 type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
@@ -221,7 +222,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   const unlistenHosted = hosted.listen(() => {
     for (const live of [...lives]) {
-      try { if (!bindingLive(live.context)) live.stop(); }
+      try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
       catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
   });
@@ -249,6 +250,21 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       changed: () => live.hint(uri), closed: () => live.stop(),
     }));
   }
+  // A legacy GET with no watched resource carries nothing a binding governs, so it stays
+  // open (idle) across bind changes until a resource subscription attaches it (#431).
+  const idle = (live: Live) => !!live.legacy && live.uris.size === 0;
+  // Re-selects an idle legacy GET's context from the subscribing POST: its `_meta` routes the
+  // stream and its headers carry the current token and any lease; the GET's signal keeps the lifetime.
+  async function attach(live: Live, via: Request) {
+    const request = new Request(via.url, { method: "GET", headers: via.headers, signal: live.context.request.signal });
+    const store = exchanges.getStore();
+    const next = await exchanges.run({ ...store!, request, refusal: undefined, context: undefined }, () => select(request));
+    if (live.stopped || !idle(live)) { next.finish(); return; }
+    const previous = live.context;
+    live.context = next;
+    if (live.stream) streamContexts.set(live.stream, next);
+    previous.finish();
+  }
   function makeLive(context: Context, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
     const live: Live = { context, uris, watches: [], handler, legacy, stopped: false,
       hint(uri) {
@@ -263,6 +279,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (live.stopped) return;
         live.stopped = true;
         lives.delete(live);
+        const context = live.context;
         if (legacy && context.role === "native") {
           // A lost board must not poison every later GET on this protocol session.
           // Access rotation alone preserves registrations that remain visible.
@@ -315,7 +332,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       authorize() { authorize(current()); },
     });
     if (legacy) {
-      const control = (uri: string, ctx: ServerContext, subscribe: boolean) => {
+      const control = async (uri: string, ctx: ServerContext, subscribe: boolean) => {
         const context = current(ctx);
         try {
           authorize(context, ctx.mcpReq.signal);
@@ -325,6 +342,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             const previous = sessionContext(context.principal, legacy.meta);
             if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
               throw new ApplicationError("bad_request", "legacy subscriptions require one session context per protocol session");
+            }
+            const idleStream = legacy.stream && idle(legacy.stream) ? legacy.stream : undefined;
+            if (idleStream) {
+              // An expected refusal falls back to the incompatible path below: the GET ends and its
+              // client recovers. A fault fails this registration rather than being masked as success.
+              try { await attach(idleStream, context.request); }
+              catch (error) {
+                if (!(error instanceof ApplicationError) || error.code === "internal") throw error;
+                idleStream.stop();
+              }
             }
             const stream = legacy.stream;
             if (stream) {
@@ -469,11 +496,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (!response.body || !response.headers.get("Content-Type")?.includes("text/event-stream") || !context) {
       live?.stop(); context?.finish(); done?.(); return response;
     }
+    // A legacy GET's headers would otherwise wait for its first hint or the 5 s keepalive, and
+    // omp abandons a GET whose headers take over 1 s (#431). No event store backs this transport,
+    // so the first bytes are the SDK's keepalive comment, not an id-bearing priming event that
+    // would invite a Last-Event-ID resumption it can't serve.
     const wrapped = forwardMcpStream(response, context.request.signal, () => {
       forwarding.delete(wrapped.stream);
       streamContexts.delete(wrapped.stream);
       live?.stop(); context.finish(); done?.();
-    });
+    }, live?.legacy ? new TextEncoder().encode(LEGACY_GET_PRIME) : undefined);
     forwarding.add(wrapped.stream);
     streamContexts.set(wrapped.stream, context);
     if (live) { live.stream = wrapped.stream; if (live.stopped) track(wrapped.stream.stop()); }

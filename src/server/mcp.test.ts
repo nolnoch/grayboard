@@ -1042,6 +1042,9 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
   const grant = issuedOAuth(store.repo, oauth.resource);
   const headers = new Headers({ Authorization: `Bearer ${grant.token}` });
   const { client, gets, hints, uri } = await legacyWatchFixture(version, headers);
+  // A watched resource keeps the GET attached, so the next subscribe checks it with its old token.
+  expect((await client.callTool({ name: "board_create", arguments: { name: "watched", purpose: "keeps the GET attached" } })).isError).not.toBe(true);
+  expect(await client.subscribeResource({ uri: "grayboard://boards/watched" })).toEqual({});
   const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
   expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(grant.refreshToken), tokens: {
     ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
@@ -1060,14 +1063,39 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
     expect(failure.message).toContain("internal error");
     expect(failure.message).not.toContain("private_storage");
     expect(oldChecks).toBe(1);
-    expect(hosted.activeWatches).toBe(0);
+    expect(hosted.activeWatches).toBe(1);
     expect(hosted.activeGetStreams).toBe(1);
     expect(gets).toHaveLength(1);
   } finally { store.repo.oauth.findActiveAccess = original; }
   expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "unregistered" } })).isError).not.toBe(true);
   expect(hints).toEqual([]);
   expect(await client.subscribeResource({ uri })).toEqual({});
-  expect(hosted.activeWatches).toBe(1);
+  expect(hosted.activeWatches).toBe(2);
+  expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "recovered" } })).isError).not.toBe(true);
+  await untilHosted(() => hints.length === 1);
+  expect(hints).toEqual([uri]);
+  expect(gets).toHaveLength(1);
+});
+
+// #431: an idle GET attaches by re-selecting its context; a fault there fails the subscribe.
+for (const kind of ["database", "internal"] as const) test(`${kind} fault attaching an idle legacy GET is an internal error, not a successful registration`, async () => {
+  const { client, gets, hints, uri } = await legacyWatchFixture("2025-11-25");
+  const original = hosted.sessions.snapshot;
+  const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
+  // The subscribe POST selects its own context first; the attach is the second selection.
+  let calls = 0;
+  hosted.sessions.snapshot = (...args) => { if (++calls === 2) throw fault; return original(...args); };
+  try {
+    const failure = await client.subscribeResource({ uri }).catch(error => error);
+    expect(failure).toMatchObject({ code: -32603 });
+    expect(failure.message).toContain("internal error");
+    expect(failure.message).not.toContain("private_storage");
+    expect(calls).toBe(2);
+    expect(hosted.activeWatches).toBe(0);
+  } finally { hosted.sessions.snapshot = original; }
+  expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "unregistered" } })).isError).not.toBe(true);
+  expect(hints).toEqual([]);
+  expect(await client.subscribeResource({ uri })).toEqual({});
   expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "recovered" } })).isError).not.toBe(true);
   await untilHosted(() => hints.length === 1);
   expect(hints).toEqual([uri]);
@@ -1084,4 +1112,85 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
     expect(store.repo.aliases.find(`${user.user_email}/unselected`)).toBeUndefined();
   } finally { store.repo.oauth.findActiveAccess = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
+});
+
+// #431: a raw 2025-11-25 standalone GET, as omp's native client opens it (1 s header timeout, no reopen).
+async function rawLegacyGet(access: string, initMeta?: Record<string, unknown>, extra: Record<string, string> = {}) {
+  const base = { Authorization: `Bearer ${access}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra };
+  let next = 1;
+  const post = async (headers: Record<string, string>, method: string, params?: Record<string, unknown>) => {
+    const response = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...(method.startsWith("notifications/") ? {} : { id: next++ }), method, ...(params ? { params } : {}) }) }));
+    return { response, text: await response.text() };
+  };
+  const init = await post(base, "initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "raw", version: "0" }, ...(initMeta ? { _meta: initMeta } : {}) });
+  const headers = { ...base, "Mcp-Session-Id": init.response.headers.get("Mcp-Session-Id")!, "Mcp-Protocol-Version": "2025-11-25" };
+  await post(headers, "notifications/initialized");
+  const abort = new AbortController();
+  const get = await hosted.fetch(new Request("http://localhost/mcp", { method: "GET", headers, signal: abort.signal }));
+  const reader = get.body!.getReader();
+  let ended = false, received = "";
+  // Resolves once the stream's text so far satisfies `done`, or with what arrived by the deadline.
+  const until = async (done: (text: string) => boolean, ms = 1000) => {
+    const deadline = AbortSignal.timeout(ms);
+    const expired = Promise.withResolvers<undefined>();
+    deadline.addEventListener("abort", () => expired.resolve(undefined), { once: true });
+    while (!ended && !done(received) && !deadline.aborted) {
+      const chunk = await Promise.race([reader.read(), expired.promise]);
+      if (!chunk) break;
+      if (chunk.done) ended = true;
+      else received += new TextDecoder().decode(chunk.value);
+    }
+    return received;
+  };
+  return {
+    get, until, get ended() { return ended; },
+    call: (name: string, args: Record<string, unknown>, meta?: Record<string, unknown>) => post(headers, "tools/call", { name, arguments: args, ...(meta ? { _meta: meta } : {}) }),
+    subscribe: (uri: string, meta?: Record<string, unknown>) => post(headers, "resources/subscribe", { uri, ...(meta ? { _meta: meta } : {}) }),
+    async close() { abort.abort(); await reader.cancel().catch(() => {}); await post(headers, "notifications/cancelled").catch(() => {}); await hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers })); },
+  };
+}
+
+const UNBOUND_GETS = [
+  { label: "initialize without _meta", initMeta: undefined },
+  { label: "_meta for a never-bound session", initMeta: { "ai.opencode/sessionID": "never-bound" } },
+] as const;
+
+for (const { label, initMeta } of [...UNBOUND_GETS, { label: "_meta for a bound session", initMeta: meta }]) test(`legacy GET (${label}) sends its first bytes at once`, async () => {
+  const raw = await rawLegacyGet(token, initMeta);
+  try {
+    expect(raw.get.status).toBe(200);
+    expect(raw.get.headers.get("Content-Type")).toContain("text/event-stream");
+    // Well under the 5 s keepalive, so it can only be the priming bytes.
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+  } finally { await raw.close(); }
+});
+
+test("a subscriber-role legacy GET without a lease stays open, primed, across a hosted change", async () => {
+  const access = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT).token;
+  const raw = await rawLegacyGet(access, undefined, { "X-Grayboard-Client": "subscriber" });
+  try {
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+    // The reconcile runs synchronously inside the sweep's commit, so a stop would already show here.
+    hosted.sessions.sweep();
+    expect(hosted.activeGetStreams).toBe(1);
+  } finally { await raw.close(); }
+});
+
+for (const { label, initMeta } of UNBOUND_GETS) test(`an unbound legacy GET (${label}) stays open through a bind and carries the later subscription's hints`, async () => {
+  const raw = await rawLegacyGet(token, initMeta);
+  try {
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+    const fresh = { "ai.opencode/sessionID": "fresh-root" };
+    // The bind is a hosted change: before #431 its reconcile ended every unbound GET.
+    expect((await raw.call("bind", { name: "fe", create: true }, fresh)).text).not.toContain("isError\":true");
+    expect((await raw.call("board_create", { name: "attach", purpose: "legacy attach" }, fresh)).text).not.toContain("isError\":true");
+    expect(raw.ended).toBe(false);
+    expect((await raw.subscribe("grayboard://boards/attach", fresh)).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(1);
+    expect((await raw.call("board_post", { board: "attach", body: "hint me" }, fresh)).text).not.toContain("isError\":true");
+    const text = await raw.until(t => t.includes("notifications/resources/updated"));
+    expect(text).toContain("\"uri\":\"grayboard://boards/attach\"");
+    expect(raw.ended).toBe(false);
+    expect(hosted.activeGetStreams).toBe(1);
+  } finally { await raw.close(); }
 });
